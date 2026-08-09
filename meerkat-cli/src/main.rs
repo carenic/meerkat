@@ -30,9 +30,10 @@ use meerkat::surface::NoopScheduleMobHost;
 use meerkat::surface::{
     ScheduledEventDispatch, ScheduledPromptDispatch, SharedScheduleTargetAdapter,
     SurfaceScheduleMobHost, SurfaceScheduleSessionHost,
-    recover_mob_member_identity_from_session_target, runtime_delivery_dispatch_from_admission,
-    schedule_host_supported, schedule_runtime_correlation_id,
-    schedule_runtime_delivery_idempotency_key, spawn_schedule_host,
+    accept_schedule_runtime_input_with_reconciliation,
+    recover_mob_member_identity_from_session_target, schedule_host_supported,
+    schedule_runtime_correlation_id, schedule_runtime_delivery_idempotency_key,
+    spawn_schedule_host,
 };
 use meerkat::{
     AgentFactory, EphemeralSessionService, FactoryAgentBuilder, PersistenceBundle, ScheduleService,
@@ -8208,6 +8209,16 @@ async fn handle_workgraph_command(
             let target = workgraph_goal_attention_target_for_session(scope, session_id).await?;
             let result = service
                 .create_goal(meerkat::GoalCreateRequest {
+                    failed_child_join_policy: Default::default(),
+                    cancelled_child_join_policy: Default::default(),
+                    priority: Default::default(),
+                    labels: Default::default(),
+                    due_at: None,
+                    not_before: None,
+                    snoozed_until: None,
+                    external_refs: Vec::new(),
+                    evidence_refs: Vec::new(),
+                    status: None,
                     realm_id: None,
                     namespace: parse_work_namespace(namespace)?,
                     title,
@@ -8599,6 +8610,7 @@ fn work_event_kind_label(kind: meerkat::WorkGraphEventKind) -> &'static str {
     match kind {
         meerkat::WorkGraphEventKind::Created => "created",
         meerkat::WorkGraphEventKind::Updated => "updated",
+        meerkat::WorkGraphEventKind::ReadinessObserved => "readiness_observed",
         meerkat::WorkGraphEventKind::Claimed => "claimed",
         meerkat::WorkGraphEventKind::Released => "released",
         meerkat::WorkGraphEventKind::Blocked => "blocked",
@@ -9197,6 +9209,8 @@ struct CliRuntimeExecutor {
     /// When `Some`, `apply()` uses `apply_runtime_turn()`.
     #[cfg(feature = "session-store")]
     persistent_service: Option<Arc<meerkat::PersistentSessionService<FactoryAgentBuilder>>>,
+    #[cfg(feature = "session-store")]
+    publication_actor_witness: Option<meerkat::LiveSessionActorWitness>,
     session_id: meerkat_core::types::SessionId,
     runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
     workgraph_service: Option<meerkat::WorkGraphService>,
@@ -9309,20 +9323,22 @@ struct CliRuntimeInterruptHandle {
 
 #[async_trait::async_trait]
 impl meerkat_core::lifecycle::CoreExecutorInterruptHandle for CliRuntimeInterruptHandle {
-    async fn hard_cancel_current_run(
+    async fn hard_cancel_run_if_current(
         &self,
+        expected_run_id: &meerkat_core::RunId,
         _reason: String,
-    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+    ) -> Result<bool, meerkat_core::lifecycle::core_executor::CoreExecutorError> {
         #[cfg(feature = "session-store")]
         if let Some(persistent) = self.persistent_service.as_ref() {
             return persistent
-                .interrupt_with_machine_authority(
+                .interrupt_run_with_machine_authority(
                     &self.session_id,
+                    expected_run_id,
                     self.runtime_adapter.session_control_authority(),
                 )
                 .await
                 .or_else(|err| match err {
-                    meerkat::SessionError::NotRunning { .. } => Ok(()),
+                    meerkat::SessionError::NotRunning { .. } => Ok(false),
                     err => Err(err),
                 })
                 .map_err(|err| {
@@ -9332,10 +9348,10 @@ impl meerkat_core::lifecycle::CoreExecutorInterruptHandle for CliRuntimeInterrup
                 });
         }
         self.service
-            .interrupt(&self.session_id)
+            .interrupt_run_if_current(&self.session_id, expected_run_id)
             .await
             .or_else(|err| match err {
-                meerkat::SessionError::NotRunning { .. } => Ok(()),
+                meerkat::SessionError::NotRunning { .. } => Ok(false),
                 err => Err(err),
             })
             .map_err(|err| {
@@ -9376,12 +9392,15 @@ impl meerkat_core::lifecycle::CoreExecutor for CliRuntimeExecutor {
     fn publication_handle(
         &self,
     ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>> {
-        self.persistent_service.as_ref().map(|persistent| {
-            meerkat::surface::persistent_runtime_publication_handle(
-                Arc::clone(persistent),
-                self.session_id.clone(),
-            )
-        })
+        self.persistent_service
+            .as_ref()
+            .zip(self.publication_actor_witness.clone())
+            .map(|(persistent, actor_witness)| {
+                meerkat::surface::persistent_runtime_publication_handle(
+                    Arc::clone(persistent),
+                    actor_witness,
+                )
+            })
     }
 
     fn machine_managed_post_stop_unregister(&self) -> bool {
@@ -9631,8 +9650,14 @@ impl meerkat_core::lifecycle::CoreExecutor for CliRuntimeExecutor {
                 ),
             );
         };
+        let actor_witness = self.publication_actor_witness.as_ref().ok_or_else(|| {
+            meerkat_core::lifecycle::core_executor::CoreExecutorError::Internal(format!(
+                "CLI terminal publication for session {} has no exact actor witness",
+                self.session_id
+            ))
+        })?;
         persistent
-            .publish_interaction_terminals_exact_batch(&self.session_id, events)
+            .publish_interaction_terminals_exact_batch_for_actor(actor_witness, events)
             .await
             .map_err(
                 meerkat_core::lifecycle::core_executor::CoreExecutorError::apply_failed_from_session_error,
@@ -9869,17 +9894,6 @@ impl meerkat_core::service::SessionServiceHistoryExt for RunMobSessionService {
 #[async_trait::async_trait]
 #[cfg(feature = "mob")]
 impl meerkat_mob::MobSessionService for RunMobSessionService {
-    async fn prepare_session_for_resume(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<(), meerkat_core::service::SessionError> {
-        <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::prepare_session_for_resume(
-            &self.inner,
-            session_id,
-        )
-        .await
-    }
-
     async fn observe_session_resume_authority(
         &self,
         session_id: &SessionId,
@@ -9919,11 +9933,13 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         req: meerkat_core::service::CreateSessionRequest,
+        resume_preparation: Option<meerkat_mob::SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
         <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::create_session_with_actor_witness_under_runtime_turn_boundary(
             &self.inner,
             req,
+            resume_preparation,
             actor_witness_slot,
         )
         .await
@@ -9934,6 +9950,19 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         session_id: &SessionId,
     ) -> Result<(), meerkat_core::service::SessionError> {
         <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::archive_with_mob_lifecycle_authority_under_runtime_turn_boundary(&self.inner, session_id).await
+    }
+
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+        &self,
+        session_id: &SessionId,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+            &self.inner,
+            session_id,
+            deadline,
+        )
+        .await
     }
 
     async fn discard_live_session_under_runtime_turn_boundary(
@@ -9979,6 +10008,21 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::interrupt_with_machine_authority(
             &self.inner,
             session_id,
+            authority,
+        )
+        .await
+    }
+
+    async fn interrupt_run_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        expected_run_id: &meerkat_core::RunId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, meerkat_core::service::SessionError> {
+        <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::interrupt_run_with_machine_authority(
+            &self.inner,
+            session_id,
+            expected_run_id,
             authority,
         )
         .await
@@ -10192,22 +10236,6 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         .await
     }
 
-    async fn publish_interaction_terminals(
-        &self,
-        session_id: &SessionId,
-        events: &[meerkat_core::event::AgentEvent],
-    ) -> Result<
-        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
-        meerkat_core::service::SessionError,
-    > {
-        <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::publish_interaction_terminals(
-            &self.inner,
-            session_id,
-            events,
-        )
-        .await
-    }
-
     async fn discard_live_session(
         &self,
         session_id: &SessionId,
@@ -10350,6 +10378,7 @@ fn compose_rpc_mob_external_tools(
 struct CliServiceBuildDefaults {
     default_schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
     default_workgraph_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    default_workgraph_namespace_grant: Option<meerkat::WorkGraphNamespaceGrant>,
     image_generation_machine: Option<Arc<meerkat_runtime::MeerkatMachine>>,
     default_blob_store: Option<Arc<dyn meerkat_core::BlobStore>>,
     default_image_generation_executor: Option<Arc<dyn meerkat_llm_core::ImageGenerationExecutor>>,
@@ -10370,6 +10399,10 @@ fn build_cli_service_with_defaults(
     builder.default_image_generation_executor = defaults.default_image_generation_executor;
     meerkat::surface::set_default_schedule_tools(&builder, defaults.default_schedule_tools);
     meerkat::surface::set_default_workgraph_tools(&builder, defaults.default_workgraph_tools);
+    meerkat::surface::set_default_workgraph_namespace_grant(
+        &builder,
+        defaults.default_workgraph_namespace_grant,
+    );
     meerkat::surface::build_embedded_service_from_builder(builder, max_sessions)
 }
 
@@ -10388,6 +10421,18 @@ fn build_cli_runtime_backed_service_with_defaults(
     let builder = FactoryAgentBuilder::new(factory, config);
     meerkat::surface::set_default_schedule_tools(&builder, default_schedule_tools);
     meerkat::surface::set_default_workgraph_tools(&builder, default_workgraph_tools);
+    if let Some(manifest) = persistence.manifest() {
+        meerkat::surface::set_default_workgraph_namespace_grant(
+            &builder,
+            Some(
+                meerkat::WorkGraphNamespaceGrant::new(
+                    manifest.realm.as_str(),
+                    meerkat::WorkNamespace::default().as_str(),
+                )
+                .expect("persistence manifest carries valid WorkGraph namespace authority"),
+            ),
+        );
+    }
     let (service, runtime_adapter) =
         meerkat::surface::build_runtime_backed_service(builder, max_sessions, persistence);
     (service, runtime_adapter)
@@ -10933,6 +10978,7 @@ async fn run_agent(
             },
             schedule_tools: None,
             workgraph_tools: None,
+            workgraph_namespace_grant: None,
             mob_tool_authority_context: None,
             preload_skills,
             realm_id: Some(storage_scope.locator.realm.clone()),
@@ -11029,10 +11075,20 @@ async fn run_agent(
 
             // Register executor and route turn through runtime adapter.
             let session_id = create_result.session_id.clone();
+            let publication_actor_witness = service
+                .live_session_actor_witness(&session_id)
+                .await
+                .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "created session {session_id} has no exact live actor publication authority"
+                )
+            })?;
             let executor = Box::new(CliRuntimeExecutor {
                 service: service.clone() as Arc<dyn meerkat_core::service::SessionService>,
                 #[cfg(feature = "session-store")]
                 persistent_service: Some(service.clone()),
+                #[cfg(feature = "session-store")]
+                publication_actor_witness: Some(publication_actor_witness),
                 session_id: session_id.clone(),
                 runtime_adapter: runtime_adapter.clone(),
                 workgraph_service: Some(scoped_workgraph_service(storage_scope, &persistence)),
@@ -11697,10 +11753,20 @@ async fn resume_session_with_llm_override(
 
             // Route through runtime adapter (same pattern as run command)
             let session_id = create_result.session_id.clone();
+            let publication_actor_witness = service
+                .live_session_actor_witness(&session_id)
+                .await
+                .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "resumed session {session_id} has no exact live actor publication authority"
+                )
+            })?;
             let executor = Box::new(CliRuntimeExecutor {
                 service: service.clone() as Arc<dyn meerkat_core::service::SessionService>,
                 #[cfg(feature = "session-store")]
                 persistent_service: Some(service.clone()),
+                #[cfg(feature = "session-store")]
+                publication_actor_witness: Some(publication_actor_witness),
                 session_id: session_id.clone(),
                 runtime_adapter: resume_adapter.clone(),
                 workgraph_service: Some(scoped_workgraph_service(scope, &persistence)),
@@ -12206,16 +12272,30 @@ const SCHEDULED_PROMPT_VISIBLE_COMPLETION_INSTRUCTION: &str = "This is a schedul
 
 #[cfg(feature = "session-store")]
 impl CliScheduleSessionHost {
-    fn executor(&self, session_id: SessionId) -> CliRuntimeExecutor {
-        CliRuntimeExecutor {
+    async fn executor(
+        &self,
+        session_id: SessionId,
+    ) -> Result<CliRuntimeExecutor, meerkat::ScheduleDomainError> {
+        let publication_actor_witness = self
+            .service
+            .live_session_actor_witness(&session_id)
+            .await
+            .ok_or_else(|| {
+                meerkat::ScheduleDomainError::Internal(format!(
+                    "scheduled session {session_id} has no exact live actor publication authority"
+                ))
+            })?;
+        Ok(CliRuntimeExecutor {
             service: Arc::clone(&self.service) as Arc<dyn meerkat_core::service::SessionService>,
             #[cfg(feature = "session-store")]
             persistent_service: Some(Arc::clone(&self.service)),
+            #[cfg(feature = "session-store")]
+            publication_actor_witness: Some(publication_actor_witness),
             session_id,
             runtime_adapter: Arc::clone(&self.runtime_adapter),
             workgraph_service: Some(self.workgraph_service.clone()),
             event_tx: None,
-        }
+        })
     }
 
     async fn ensure_runtime_session_registered(
@@ -12238,7 +12318,7 @@ impl CliScheduleSessionHost {
         self.runtime_adapter
             .ensure_session_with_executor(
                 session_id.clone(),
-                Box::new(self.executor(session_id.clone())),
+                Box::new(self.executor(session_id.clone()).await?),
             )
             .await
             .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
@@ -12426,7 +12506,7 @@ impl SurfaceScheduleSessionHost for CliScheduleSessionHost {
         self.runtime_adapter
             .ensure_session_with_executor(
                 result.session_id.clone(),
-                Box::new(self.executor(result.session_id.clone())),
+                Box::new(self.executor(result.session_id.clone()).await?),
             )
             .await
             .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
@@ -12501,19 +12581,17 @@ impl SurfaceScheduleSessionHost for CliScheduleSessionHost {
         ));
         prompt_input.header.correlation_id = Some(schedule_runtime_correlation_id(identity)?);
 
-        let (outcome, handle) = self
-            .runtime_adapter
-            .accept_input_with_completion(session_id, Input::Prompt(prompt_input))
-            .await
-            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
-        runtime_delivery_dispatch_from_admission(
+        accept_schedule_runtime_input_with_reconciliation(
             self.runtime_adapter.as_ref(),
             session_id,
             occurrence,
             identity,
-            outcome,
-            handle,
+            Input::Prompt(prompt_input),
             dispatch.materialized_session_id,
+            |input| {
+                self.runtime_adapter
+                    .accept_input_with_completion(session_id, input)
+            },
         )
         .await
     }
@@ -12555,19 +12633,17 @@ impl SurfaceScheduleSessionHost for CliScheduleSessionHost {
             handling_mode: meerkat_core::types::HandlingMode::Queue,
             render_metadata: dispatch.render_metadata,
         });
-        let (outcome, handle) = self
-            .runtime_adapter
-            .accept_input_with_completion(session_id, input)
-            .await
-            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
-        runtime_delivery_dispatch_from_admission(
+        accept_schedule_runtime_input_with_reconciliation(
             self.runtime_adapter.as_ref(),
             session_id,
             occurrence,
             identity,
-            outcome,
-            handle,
+            input,
             dispatch.materialized_session_id,
+            |input| {
+                self.runtime_adapter
+                    .accept_input_with_completion(session_id, input)
+            },
         )
         .await
     }
@@ -12789,17 +12865,6 @@ impl meerkat_core::service::SessionServiceHistoryExt for MobCliSessionService {
 #[async_trait::async_trait]
 #[cfg(all(feature = "mob", feature = "session-store"))]
 impl meerkat_mob::MobSessionService for MobCliSessionService {
-    async fn prepare_session_for_resume(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<(), meerkat_core::service::SessionError> {
-        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::prepare_session_for_resume(
-            &self.inner,
-            session_id,
-        )
-        .await
-    }
-
     async fn observe_session_resume_authority(
         &self,
         session_id: &SessionId,
@@ -12832,11 +12897,13 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         req: meerkat_core::service::CreateSessionRequest,
+        resume_preparation: Option<meerkat_mob::SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::create_session_with_actor_witness_under_runtime_turn_boundary(
             &self.inner,
             req,
+            resume_preparation,
             actor_witness_slot,
         )
         .await
@@ -12872,12 +12939,14 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         &self,
         req: meerkat_core::service::CreateSessionRequest,
         authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
+        resume_preparation: meerkat_mob::SessionResumePreparationReceipt,
         actor_witness_slot: &meerkat::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::create_session_with_machine_archived_resume_authority_and_actor_witness_under_runtime_turn_boundary(
             &self.inner,
             req,
             authorization,
+            resume_preparation,
             actor_witness_slot,
         )
         .await
@@ -12904,6 +12973,19 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         session_id: &SessionId,
     ) -> Result<(), meerkat_core::service::SessionError> {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::archive_with_mob_lifecycle_authority_under_runtime_turn_boundary(&self.inner, session_id).await
+    }
+
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+        &self,
+        session_id: &SessionId,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+            &self.inner,
+            session_id,
+            deadline,
+        )
+        .await
     }
 
     async fn discard_live_session_under_runtime_turn_boundary(
@@ -12947,6 +13029,21 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::interrupt_with_machine_authority(
             &self.inner,
             session_id,
+            authority,
+        )
+        .await
+    }
+
+    async fn interrupt_run_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        expected_run_id: &meerkat_core::RunId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::interrupt_run_with_machine_authority(
+            &self.inner,
+            session_id,
+            expected_run_id,
             authority,
         )
         .await
@@ -13204,22 +13301,6 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::discard_live_session_after_runtime_stop_terminalized_under_turn_finalization_boundary(
             &self.inner,
             session_id,
-        )
-        .await
-    }
-
-    async fn publish_interaction_terminals(
-        &self,
-        session_id: &SessionId,
-        events: &[meerkat_core::event::AgentEvent],
-    ) -> Result<
-        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
-        meerkat_core::service::SessionError,
-    > {
-        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::publish_interaction_terminals(
-            &self.inner,
-            session_id,
-            events,
         )
         .await
     }
@@ -17107,7 +17188,7 @@ mod tests {
         TrustedPeerDescriptor,
     };
     use meerkat_core::error::ToolError;
-    use meerkat_core::interaction::{InteractionId, PeerInputCandidate};
+    use meerkat_core::interaction::InteractionId;
     use meerkat_core::service::{
         SessionError, SessionInfo, SessionSummary, SessionUsage, SessionView, StartTurnRequest,
     };
@@ -19033,6 +19114,8 @@ default_model = "gemma"
             service,
             #[cfg(feature = "session-store")]
             persistent_service: None,
+            #[cfg(feature = "session-store")]
+            publication_actor_witness: None,
             session_id: session_id.clone(),
             runtime_adapter: runtime_adapter.clone(),
             workgraph_service: None,
@@ -19100,6 +19183,8 @@ default_model = "gemma"
             service,
             #[cfg(feature = "session-store")]
             persistent_service: None,
+            #[cfg(feature = "session-store")]
+            publication_actor_witness: None,
             session_id: session_id.clone(),
             runtime_adapter: runtime_adapter.clone(),
             workgraph_service: None,
@@ -19550,16 +19635,8 @@ default_model = "gemma"
             })
         }
 
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
             self.notify.clone()
-        }
-
-        async fn drain_peer_input_candidates(&self) -> Vec<PeerInputCandidate> {
-            Vec::new()
         }
     }
 
@@ -19855,13 +19932,6 @@ default_model = "gemma"
     #[cfg(feature = "mob")]
     #[async_trait]
     impl meerkat_mob::MobSessionService for TestMobSessionService {
-        async fn prepare_session_for_resume(
-            &self,
-            _session_id: &SessionId,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-
         async fn observe_session_resume_authority(
             &self,
             _session_id: &SessionId,
@@ -19906,6 +19976,7 @@ default_model = "gemma"
         async fn create_session_with_actor_witness_under_runtime_turn_boundary(
             &self,
             req: CreateSessionRequest,
+            _resume_preparation: Option<meerkat_mob::SessionResumePreparationReceipt>,
             actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
         ) -> Result<RunResult, SessionError> {
             self.create_session_with_actor_witness(req, actor_witness_slot)
@@ -19917,6 +19988,15 @@ default_model = "gemma"
             session_id: &SessionId,
         ) -> Result<(), SessionError> {
             self.archive_with_mob_lifecycle_authority(session_id).await
+        }
+
+        async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+            &self,
+            session_id: &SessionId,
+            _deadline: meerkat_core::time_compat::Instant,
+        ) -> Result<(), SessionError> {
+            self.archive_with_mob_lifecycle_authority_under_runtime_turn_boundary(session_id)
+                .await
         }
 
         async fn discard_live_session_under_runtime_turn_boundary(
@@ -20485,6 +20565,8 @@ default_model = "gemma"
             service: service.clone(),
             #[cfg(feature = "session-store")]
             persistent_service: None,
+            #[cfg(feature = "session-store")]
+            publication_actor_witness: None,
             session_id: session_id.clone(),
             runtime_adapter,
             workgraph_service: None,
@@ -20542,6 +20624,16 @@ default_model = "gemma"
         ));
         workgraph_service
             .create_goal(meerkat::GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "cli attention pin".to_string(),
@@ -20561,6 +20653,8 @@ default_model = "gemma"
             service: service.clone(),
             #[cfg(feature = "session-store")]
             persistent_service: None,
+            #[cfg(feature = "session-store")]
+            publication_actor_witness: None,
             session_id: session_id.clone(),
             runtime_adapter,
             workgraph_service: Some(workgraph_service),
@@ -20611,6 +20705,8 @@ default_model = "gemma"
             service: service.clone(),
             #[cfg(feature = "session-store")]
             persistent_service: None,
+            #[cfg(feature = "session-store")]
+            publication_actor_witness: None,
             session_id,
             runtime_adapter,
             workgraph_service: None,
@@ -24217,6 +24313,7 @@ default_model = "gpt-5.4"
             .mob(tooling.mob);
         let workgraph_service =
             meerkat::WorkGraphService::new(Arc::new(meerkat::MemoryWorkGraphStore::new()));
+        let workgraph_namespace_grant = workgraph_service.namespace_grant().clone();
         let service = Arc::new(build_cli_service_with_defaults(
             factory,
             config,
@@ -24224,6 +24321,7 @@ default_model = "gpt-5.4"
                 default_workgraph_tools: Some(Arc::new(meerkat::WorkGraphToolSurface::new(
                     workgraph_service,
                 ))),
+                default_workgraph_namespace_grant: Some(workgraph_namespace_grant),
                 ..CliServiceBuildDefaults::default()
             },
         ));
@@ -25866,7 +25964,7 @@ supports_reasoning = true
 
         // Create mock comms infrastructure
         let keypair = Keypair::generate();
-        let (_inbox, inbox_sender) = Inbox::new();
+        let (_inbox, inbox_sender) = Inbox::new_transport_only();
         let router = std::sync::Arc::new(meerkat_comms::Router::new(
             keypair,
             CommsConfig::default(),

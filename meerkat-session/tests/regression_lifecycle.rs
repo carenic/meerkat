@@ -110,6 +110,7 @@ impl SessionAgent for MockAgent {
             output_tokens: 5,
             cache_creation_tokens: None,
             cache_read_tokens: None,
+            provider_accounting: None,
         };
 
         let _ = event_tx
@@ -118,7 +119,7 @@ impl SessionAgent for MockAgent {
                 result: "Hello from mock".to_string(),
                 structured_output: None,
                 extraction_required: false,
-                usage: usage.clone(),
+                usage: usage.clone().into(),
                 terminal_cause_kind: None,
             })
             .await;
@@ -172,6 +173,7 @@ impl SessionAgent for MockAgent {
                 output_tokens: self.total_output_tokens,
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
+                provider_accounting: None,
             },
             last_assistant_text: Some("Hello from mock".to_string()),
         }

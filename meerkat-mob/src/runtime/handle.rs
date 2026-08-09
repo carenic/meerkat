@@ -39,6 +39,7 @@ use crate::runtime::reconcile::{
 use crate::runtime::terminalization::{TerminalizationOutcome, TerminalizationTarget};
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
+use futures::FutureExt as _;
 use meerkat_core::agent::CommsRuntime;
 use meerkat_core::comms::{CommsCommand, PeerId, SendReceipt, TrustedPeerDescriptor};
 use meerkat_core::lifecycle::run_primitive::{
@@ -72,6 +73,66 @@ const REACHABILITY_STALE_AFTER: Duration = Duration::from_secs(15);
 const READY_WAIT_BRIDGE_SESSION_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const READY_WAIT_BRIDGE_SESSION_RECHECK_INTERVAL: Duration = Duration::from_millis(25);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RetirementTransportIncarnationKey {
+    Session {
+        session_id: String,
+    },
+    Peer {
+        peer_id: String,
+        address: String,
+        pubkey: [u8; 32],
+        session_id: Option<String>,
+    },
+}
+
+impl From<&MemberRef> for RetirementTransportIncarnationKey {
+    fn from(member_ref: &MemberRef) -> Self {
+        match member_ref {
+            MemberRef::Session { session_id } => Self::Session {
+                session_id: session_id.to_string(),
+            },
+            MemberRef::BackendPeer {
+                peer_id,
+                address,
+                pubkey,
+                session_id,
+                ..
+            } => Self::Peer {
+                peer_id: peer_id.clone(),
+                address: address.clone(),
+                pubkey: *pubkey,
+                session_id: session_id.as_ref().map(ToString::to_string),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct RetirementOperationKey {
+    event_store_identity: usize,
+    mob_id: String,
+    agent_identity: AgentIdentity,
+    agent_runtime_id: AgentRuntimeId,
+    generation: Generation,
+    fence_token: FenceToken,
+    transport: RetirementTransportIncarnationKey,
+}
+
+struct PendingRetirementOperation {
+    deadline: Instant,
+    result_rx: tokio::sync::watch::Receiver<Option<Arc<Result<(), Arc<MobError>>>>>,
+    admission_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+fn pending_retirement_operations()
+-> &'static std::sync::Mutex<HashMap<RetirementOperationKey, Arc<PendingRetirementOperation>>> {
+    static OPERATIONS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<RetirementOperationKey, Arc<PendingRetirementOperation>>>,
+    > = std::sync::OnceLock::new();
+    OPERATIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct ReachabilityObservationView {
@@ -1500,6 +1561,11 @@ pub struct PreviousMemberCleanupReport {
 pub(crate) struct MemberSpawnReceipt {
     /// The member identity that was provisioned and committed into the roster.
     pub(crate) member_ref: MemberRef,
+    /// Opaque V5 retirement fence for a directly bound peer-only runtime.
+    /// Absent for session-backed and host-materialized members.
+    #[serde(skip)]
+    pub(crate) direct_member_fence:
+        Option<meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence>,
     /// Canonical mob child operation for the spawned member lifecycle.
     pub(crate) operation_id: OperationId,
     pub(crate) session_origin: super::provisioner::ProvisionSessionOrigin,
@@ -1638,6 +1704,16 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberProvisionFailed { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
+        // Durable-fork provisioning and bounded helper projection are
+        // separate composite operations. None can originate from a
+        // spawn-many row, so exposing a session/transport classification here
+        // would invent a modeled spawn cause that MobMachine never observed.
+        MobError::ForkMemberProvisionFailed { .. }
+        | MobError::InvalidBoundedHelperResult { .. }
+        | MobError::BoundedHelperResultUnavailable { .. }
+        | MobError::BoundedHelperRetirementFailed { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::Internal
+        }
         // Capability-contract replacement is a host bind/rebind concern, not
         // a spawn-many provisioning result.
         MobError::HostCapabilityContractViolation { .. } => {
@@ -1648,6 +1724,12 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         }
         MobError::SupervisorRotationIncomplete { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::SupervisorRotationIncomplete
+        }
+        MobError::DirectMemberAdoptionPending { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::Internal
+        }
+        MobError::SupervisorProtocolUpgradeRequired { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
         // Epoch exhaustion is not reachable from spawn-many provisioning; keep
         // the exhaustive classifier fail-closed if it is ever threaded here.
@@ -1755,6 +1837,19 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::LifecycleOperationPending { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
+        // Retirement-in-progress is a retryable lifecycle state, but it can
+        // never be produced by a spawn-many row. Do not invent a spawn
+        // failure cause for an unrelated lifecycle command.
+        MobError::RetirementInProgress { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::Internal
+        }
+        MobError::MemberRetirementInProgress { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::Internal
+        }
+        MobError::MemberRetirementAdmissionPending { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::Internal
+        }
+        MobError::SharedRetirementFailure(error) => spawn_many_failure_observation(error.as_ref()),
         MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
@@ -2274,16 +2369,177 @@ pub struct HelperOptions {
     pub objective_id: Option<meerkat_core::interaction::ObjectiveId>,
 }
 
-/// Result from a helper spawn-and-wait operation.
+/// Default receiver-side byte ceiling for compact helper projection.
+pub const DEFAULT_BOUNDED_HELPER_RESULT_BYTES: usize = 4 * 1024;
+
+/// Marker appended inside `BoundedHelperResult::text` when receiver-side
+/// projection removes bytes.
+pub const HELPER_RESULT_TRUNCATION_MARKER: &str = "\n[truncated]";
+
+/// Compact helper/member outcome. Truncation is encoded in the typed status as
+/// well as the text marker so structured consumers never have to inspect the
+/// payload suffix to discover loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BoundedHelperResultStatus {
+    Completed,
+    CompletedTruncated,
+    Failed,
+    FailedTruncated,
+    InProgress,
+    InProgressTruncated,
+    Unavailable,
+    UnavailableTruncated,
+}
+
+impl BoundedHelperResultStatus {
+    fn terminal(failed: bool, truncated: bool) -> Self {
+        match (failed, truncated) {
+            (false, false) => Self::Completed,
+            (false, true) => Self::CompletedTruncated,
+            (true, false) => Self::Failed,
+            (true, true) => Self::FailedTruncated,
+        }
+    }
+}
+
+/// Compact receiver-bounded carrier for fork -> work -> project-back flows.
+///
+/// It deliberately contains no comms envelope, runtime binding, token ledger,
+/// or transcript copy. `text` is always at most the caller-selected byte cap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct BoundedHelperResult {
+    label: String,
+    status: BoundedHelperResultStatus,
+    text: String,
+}
+
+impl BoundedHelperResult {
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub const fn status(&self) -> BoundedHelperResultStatus {
+        self.status
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn to_wire(&self) -> meerkat_contracts::MobBoundedHelperResult {
+        let status = match self.status {
+            BoundedHelperResultStatus::Completed => {
+                meerkat_contracts::MobBoundedHelperResultStatus::Completed
+            }
+            BoundedHelperResultStatus::CompletedTruncated => {
+                meerkat_contracts::MobBoundedHelperResultStatus::CompletedTruncated
+            }
+            BoundedHelperResultStatus::Failed => {
+                meerkat_contracts::MobBoundedHelperResultStatus::Failed
+            }
+            BoundedHelperResultStatus::FailedTruncated => {
+                meerkat_contracts::MobBoundedHelperResultStatus::FailedTruncated
+            }
+            BoundedHelperResultStatus::InProgress => {
+                meerkat_contracts::MobBoundedHelperResultStatus::InProgress
+            }
+            BoundedHelperResultStatus::InProgressTruncated => {
+                meerkat_contracts::MobBoundedHelperResultStatus::InProgressTruncated
+            }
+            BoundedHelperResultStatus::Unavailable => {
+                meerkat_contracts::MobBoundedHelperResultStatus::Unavailable
+            }
+            BoundedHelperResultStatus::UnavailableTruncated => {
+                meerkat_contracts::MobBoundedHelperResultStatus::UnavailableTruncated
+            }
+        };
+        meerkat_contracts::MobBoundedHelperResult {
+            label: self.label.clone(),
+            status,
+            text: self.text.clone(),
+        }
+    }
+
+    fn from_exact_terminal_text(
+        label: impl Into<String>,
+        exact_text: impl AsRef<str>,
+        max_text_bytes: usize,
+        failed: bool,
+    ) -> Result<Self, MobError> {
+        const MAX_LABEL_BYTES: usize = 128;
+        let label = label.into();
+        if label.is_empty() || label.len() > MAX_LABEL_BYTES {
+            return Err(MobError::InvalidBoundedHelperResult {
+                reason: format!(
+                    "label must contain 1-{MAX_LABEL_BYTES} UTF-8 bytes (actual {})",
+                    label.len()
+                ),
+            });
+        }
+        let exact_text = exact_text.as_ref();
+        if exact_text.len() > max_text_bytes
+            && max_text_bytes < HELPER_RESULT_TRUNCATION_MARKER.len()
+        {
+            return Err(MobError::InvalidBoundedHelperResult {
+                reason: format!(
+                    "max_text_bytes must be at least {} so the explicit truncation marker fits",
+                    HELPER_RESULT_TRUNCATION_MARKER.len()
+                ),
+            });
+        }
+        let (text, truncated) = if exact_text.len() <= max_text_bytes {
+            (exact_text.to_string(), false)
+        } else {
+            let prefix_limit = max_text_bytes - HELPER_RESULT_TRUNCATION_MARKER.len();
+            let mut prefix_end = prefix_limit.min(exact_text.len());
+            while prefix_end > 0 && !exact_text.is_char_boundary(prefix_end) {
+                prefix_end -= 1;
+            }
+            let mut text = String::with_capacity(max_text_bytes);
+            text.push_str(&exact_text[..prefix_end]);
+            text.push_str(HELPER_RESULT_TRUNCATION_MARKER);
+            (text, true)
+        };
+        Ok(Self {
+            label,
+            status: BoundedHelperResultStatus::terminal(failed, truncated),
+            text,
+        })
+    }
+}
+
+/// Result of persisting a real transcript fork and provisioning its new member
+/// identity through the ordinary resume pipeline.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct ForkMemberResult {
+    pub agent_identity: AgentIdentity,
+    pub session_id: meerkat_core::SessionId,
+    pub cache_inheritance: meerkat_core::ForkCacheInheritance,
+    #[serde(skip)]
+    pub(crate) agent_runtime_id: AgentRuntimeId,
+    #[serde(skip)]
+    pub(crate) fence_token: FenceToken,
+}
+
+/// Result from a helper convenience operation.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct HelperResult {
-    /// The member's final output text.
+    /// The member snapshot's output preview at the registration boundary.
+    /// This is not certified terminal text.
     pub output: Option<String>,
     /// Total tokens used by the helper.
     pub tokens_used: u64,
     /// Stable member identity for the helper run.
     pub agent_identity: AgentIdentity,
+    /// Receiver-owned compact projection over exact canonical assistant text,
+    /// when the operation explicitly performed terminal projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_result: Option<BoundedHelperResult>,
     /// Identity-native runtime ID for this incarnation.
     ///
     /// Binding-era atom: bridge-internal, `pub(crate)` + `#[serde(skip)]`.
@@ -2646,6 +2902,9 @@ pub enum SpawnSource {
     Respawn,
     Resume,
     Fork,
+    /// Ordinary resume provisioning for a child whose durable fork identity
+    /// was already committed by the persistent session owner.
+    PersistedForkResume,
     /// Actor-owned level-triggered materialization from an already sealed
     /// `IdentityIntent`. Portable customization has already happened before
     /// apply and must not run again on recovery.
@@ -2665,6 +2924,7 @@ impl SpawnSource {
             Self::Respawn => "respawn",
             Self::Resume => "resume",
             Self::Fork => "fork",
+            Self::PersistedForkResume => "persisted_fork_resume",
             Self::IdentityReconcile => "identity_reconcile",
         }
     }
@@ -2672,6 +2932,15 @@ impl SpawnSource {
     #[must_use]
     fn for_launch_mode(base: Self, launch_mode: &crate::launch::MemberLaunchMode) -> Self {
         match launch_mode {
+            // A real durable fork is provisioned through MemberLaunchMode::Resume
+            // after its child session commits. Retain the dedicated authorship
+            // source so actor ingress cannot re-customize the identity that is
+            // already canonical in the child metadata.
+            crate::launch::MemberLaunchMode::Resume { .. }
+                if matches!(base, Self::PersistedForkResume) =>
+            {
+                Self::PersistedForkResume
+            }
             crate::launch::MemberLaunchMode::Resume { .. } => Self::Resume,
             crate::launch::MemberLaunchMode::Fork { .. } => Self::Fork,
             crate::launch::MemberLaunchMode::Fresh => base,
@@ -3280,6 +3549,189 @@ impl MobHandle {
             .map_err(|_| MobError::ActorReplyChannelClosed)
     }
 
+    pub(super) fn retirement_operation_key(
+        &self,
+        expected: &super::state::RetireMemberIncarnation,
+    ) -> RetirementOperationKey {
+        RetirementOperationKey {
+            // The event-store allocation is the process-local incarnation of
+            // this durable Mob authority. Handles reconstructed over the same
+            // MobStorage Arc join, while independent realms may reuse every
+            // semantic id without sharing a retirement task. The detached
+            // leader retains `self.events`, preventing pointer reuse until the
+            // slot is removed.
+            event_store_identity: Arc::as_ptr(&self.events) as *const () as usize,
+            mob_id: self.definition.id.to_string(),
+            agent_identity: expected.agent_identity.clone(),
+            agent_runtime_id: expected.agent_runtime_id.clone(),
+            generation: expected.generation,
+            fence_token: expected.fence_token,
+            transport: RetirementTransportIncarnationKey::from(&expected.member_ref),
+        }
+    }
+
+    fn retirement_exactly_durably_admitted(&self, key: &RetirementOperationKey) -> bool {
+        let state = self.machine_state_watch_rx.borrow().clone();
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(&key.agent_identity);
+        let dsl_runtime_id = mob_dsl::AgentRuntimeId::from_domain(&key.agent_runtime_id);
+        state
+            .member_runtime_material_for_identity(&dsl_identity)
+            .map(|material| material.to_domain_for_identity(&key.agent_identity))
+            == Some((key.agent_runtime_id.clone(), key.fence_token))
+            && state.member_state_markers.get(&dsl_runtime_id)
+                == Some(&mob_dsl::MobMemberState::Retiring)
+    }
+
+    async fn wait_for_retirement_operation(
+        &self,
+        key: &RetirementOperationKey,
+        pending: Arc<PendingRetirementOperation>,
+    ) -> Result<(), MobError> {
+        let mut result_rx = pending.result_rx.clone();
+        loop {
+            if let Some(result) = result_rx.borrow().clone() {
+                return match result.as_ref() {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(match error.as_ref() {
+                        MobError::RetirementInProgress { session_id, stage } => {
+                            MobError::RetirementInProgress {
+                                session_id: session_id.clone(),
+                                stage: stage.clone(),
+                            }
+                        }
+                        MobError::MemberRetirementInProgress { member_id, stage } => {
+                            MobError::MemberRetirementInProgress {
+                                member_id: member_id.clone(),
+                                stage: stage.clone(),
+                            }
+                        }
+                        MobError::MemberRetirementAdmissionPending { member_id, stage } => {
+                            MobError::MemberRetirementAdmissionPending {
+                                member_id: member_id.clone(),
+                                stage: stage.clone(),
+                            }
+                        }
+                        _ => MobError::SharedRetirementFailure(Arc::clone(error)),
+                    }),
+                };
+            }
+
+            let remaining = pending.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let admitted =
+                    *pending.admission_rx.borrow() || self.retirement_exactly_durably_admitted(key);
+                return if admitted {
+                    Err(MobError::MemberRetirementInProgress {
+                        member_id: key.agent_identity.clone(),
+                        stage: "actor_retirement_saga".to_string(),
+                    })
+                } else {
+                    Err(MobError::MemberRetirementAdmissionPending {
+                        member_id: key.agent_identity.clone(),
+                        stage: "actor_command_admission".to_string(),
+                    })
+                };
+            }
+
+            match tokio::time::timeout(remaining, result_rx.changed()).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(_)) => {
+                    return Err(MobError::ActorReplyChannelClosed);
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    async fn retire_exact_incarnation(
+        &self,
+        agent_identity: AgentIdentity,
+    ) -> Result<(), MobError> {
+        let operation_deadline = Instant::now() + super::provisioner::MEMBER_RETIRE_TOTAL_TIMEOUT;
+        let entry = {
+            let remaining = operation_deadline.saturating_duration_since(Instant::now());
+            let roster = tokio::time::timeout(remaining, self.roster.read())
+                .await
+                .map_err(|_| MobError::MemberRetirementAdmissionPending {
+                    member_id: agent_identity.clone(),
+                    stage: "roster_incarnation_observation".to_string(),
+                })?;
+            roster.get(&agent_identity).cloned()
+        };
+        let Some(entry) = entry else {
+            // Retirement is idempotent. Once the exact roster incarnation is
+            // absent there is no authority to enqueue an identity-only command
+            // that could retire a later successor.
+            return Ok(());
+        };
+        let expected = super::state::RetireMemberIncarnation {
+            agent_identity: entry.agent_identity.clone(),
+            agent_runtime_id: entry.agent_runtime_id.clone(),
+            generation: entry.generation,
+            fence_token: entry.fence_token,
+            member_ref: entry.member_ref.clone(),
+        };
+        let key = self.retirement_operation_key(&expected);
+
+        let cleanup_spawner = meerkat_runtime::RuntimeCleanupTaskSpawner::acquire()
+            .map_err(|error| MobError::Internal(error.to_string()))?;
+        let pending = {
+            let mut operations = pending_retirement_operations()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(pending) = operations.get(&key) {
+                Arc::clone(pending)
+            } else {
+                let deadline = operation_deadline;
+                let (result_tx, result_rx) = tokio::sync::watch::channel(None);
+                let (admission_tx, admission_rx) = tokio::sync::watch::channel(false);
+                let pending = Arc::new(PendingRetirementOperation {
+                    deadline,
+                    result_rx,
+                    admission_rx,
+                });
+                operations.insert(key.clone(), Arc::clone(&pending));
+
+                let task_handle = self.clone();
+                let task_key = key.clone();
+                let task_pending = Arc::clone(&pending);
+                cleanup_spawner.spawn_detached(async move {
+                    let task_result =
+                        std::panic::AssertUnwindSafe(task_handle.send_actor_command(|reply_tx| {
+                            MobCommand::Retire {
+                                agent_identity,
+                                expected_incarnation: expected,
+                                deadline,
+                                admission_tx,
+                                reply_tx,
+                            }
+                        }))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(MobError::Internal(
+                                "process-owned exact retirement actor command panicked".to_string(),
+                            ))
+                        })
+                        .and_then(std::convert::identity);
+                    result_tx.send_replace(Some(Arc::new(task_result.map_err(Arc::new))));
+                    let mut operations = pending_retirement_operations()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if operations
+                        .get(&task_key)
+                        .is_some_and(|current| Arc::ptr_eq(current, &task_pending))
+                    {
+                        operations.remove(&task_key);
+                    }
+                });
+                pending
+            }
+        };
+
+        self.wait_for_retirement_operation(&key, pending).await
+    }
+
     // Machine commands are issued from inside calling agents' tool-dispatch
     // polls (mob_create/spawn/wire/...). The routing match in
     // `execute_machine_command_inner` has a large opt-level=0 poll frame (a
@@ -3377,11 +3829,7 @@ impl MobHandle {
                 Ok(MobMachineCommandResult::ListMembers(members))
             }
             MobMachineCommand::Retire { agent_identity } => {
-                self.send_actor_command(|reply_tx| MobCommand::Retire {
-                    agent_identity,
-                    reply_tx,
-                })
-                .await??;
+                self.retire_exact_incarnation(agent_identity).await?;
                 Ok(MobMachineCommandResult::Unit)
             }
             MobMachineCommand::Respawn {
@@ -8489,11 +8937,260 @@ impl MobHandle {
         completed
     }
 
-    /// Spawn a fresh helper, wait for it to complete, retire it, and return its result.
+    /// Persist a real transcript fork and seat it as a new mob member through
+    /// the ordinary resume pipeline.
     ///
-    /// Helpers are short-lived TurnDriven tasks by default. Their completion
-    /// truth is the spawn/create boundary plus the canonical post-spawn member
-    /// snapshot, not full member terminality in the mob lifecycle.
+    /// `message_count=None` selects the source's exact committed transcript
+    /// end while the persistent session owner holds its mutation guard. An
+    /// explicit count selects that prefix and is rejected if it splits a
+    /// tool-use/result group. The fork commits before resume provisioning; if
+    /// provisioning fails the typed error retains the durable child session id
+    /// so the branch remains recoverable rather than being silently deleted.
+    pub async fn fork_member(
+        &self,
+        source_identity: &AgentIdentity,
+        mut member: SpawnMemberSpec,
+        message_count: Option<usize>,
+    ) -> Result<ForkMemberResult, MobError> {
+        self.admit_control_scope(mob_dsl::ControlScope::SendCommand)
+            .await?;
+        if &member.identity == source_identity {
+            return Err(MobError::MemberAlreadyExists(member.identity));
+        }
+        if member.placement.is_some() {
+            return Err(MobError::WiringError(
+                "durable fork resume currently requires the source session store's controlling host"
+                    .to_string(),
+            ));
+        }
+        let source_session_id = self
+            .resolve_bridge_session_id(source_identity)
+            .await
+            .ok_or_else(|| MobError::ForkSourceUnavailable {
+                source_member_id: source_identity.to_string(),
+                cause: crate::error::ForkSourceUnavailableCause::NoSession,
+            })?;
+        let child_identity = member.identity.clone();
+        let fork_target = meerkat_core::DurableSessionForkTarget {
+            member_binding: meerkat_core::MobMemberBinding {
+                mob_id: self.definition.id.as_str().to_string(),
+                role: member.role_name.as_str().to_string(),
+                member: child_identity.as_str().to_string(),
+            },
+            // Profile resolution and resume override masks are actor-owned and
+            // occur after this handle admits the spawn. Until that resolved
+            // identity is moved ahead of durable commit, cache inheritance is
+            // conservatively unavailable. The persistent owner therefore
+            // installs no provider proof on this mob child.
+            cache_identity: None,
+        };
+        let fork = self
+            .session_service
+            .fork_persisted_session(
+                &source_session_id,
+                message_count,
+                member.tool_access_policy.clone(),
+                fork_target,
+            )
+            .await
+            .map_err(|error| match error {
+                meerkat_core::SessionError::Busy { .. } => MobError::ForkSourceUnavailable {
+                    source_member_id: source_identity.to_string(),
+                    cause: crate::error::ForkSourceUnavailableCause::Running,
+                },
+                error => MobError::from(error),
+            })?;
+        let fork_session_id = fork.session_id.clone();
+        member.launch_mode = crate::launch::MemberLaunchMode::Resume {
+            bridge_session_id: fork_session_id.clone(),
+        };
+        if let Err(error) = self
+            .spawn_spec_internal_with_source(member, SpawnSource::PersistedForkResume)
+            .await
+        {
+            return Err(MobError::ForkMemberProvisionFailed {
+                member_id: child_identity,
+                fork_session_id,
+                reason: error.to_string(),
+            });
+        }
+        let entry = match self.get_member(&child_identity).await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => {
+                return Err(MobError::ForkMemberProvisionFailed {
+                    member_id: child_identity,
+                    fork_session_id,
+                    reason: "ordinary resume returned without a canonical roster entry".to_string(),
+                });
+            }
+            Err(error) => {
+                return Err(MobError::ForkMemberProvisionFailed {
+                    member_id: child_identity,
+                    fork_session_id,
+                    reason: format!(
+                        "ordinary resume completed but canonical roster observation failed: {error}"
+                    ),
+                });
+            }
+        };
+        Ok(ForkMemberResult {
+            agent_identity: entry.agent_identity,
+            session_id: fork_session_id,
+            agent_runtime_id: entry.agent_runtime_id,
+            fence_token: entry.fence_token,
+            cache_inheritance: fork.cache_inheritance,
+        })
+    }
+
+    /// Read one completed worker result from canonical session authority and
+    /// project it under a receiver-owned UTF-8 byte limit.
+    ///
+    /// This method never consumes `MobMemberSnapshot::output_preview`. It
+    /// requires an idle durable session, reads the exact last assistant text
+    /// through two version-matched `SessionService::read` observations, and
+    /// only then applies the compact cap. An unavailable projection leaves the
+    /// member intact so the receiver can retry after terminal facts converge.
+    pub async fn bounded_terminal_member_result(
+        &self,
+        identity: &AgentIdentity,
+        label: impl Into<String>,
+        max_text_bytes: usize,
+    ) -> Result<BoundedHelperResult, MobError> {
+        self.bounded_terminal_member_projection(identity, label, max_text_bytes)
+            .await
+            .map(|(result, _session_id)| result)
+    }
+
+    async fn bounded_terminal_member_projection(
+        &self,
+        identity: &AgentIdentity,
+        label: impl Into<String>,
+        max_text_bytes: usize,
+    ) -> Result<(BoundedHelperResult, SessionId), MobError> {
+        self.admit_control_scope(mob_dsl::ControlScope::ReadHistory)
+            .await?;
+        let before = self.member_status(identity).await?;
+        let session_id = before.current_bridge_session_id().cloned().ok_or_else(|| {
+            MobError::BoundedHelperResultUnavailable {
+                member_id: identity.clone(),
+                reason: "no canonical session is bound to the member".to_string(),
+            }
+        })?;
+        let before_runtime = before
+            .runtime_identity_fields()
+            .map(|(runtime_id, fence_token)| (runtime_id.clone(), fence_token))
+            .ok_or_else(|| MobError::BoundedHelperResultUnavailable {
+                member_id: identity.clone(),
+                reason: "no canonical runtime generation/fence is bound to the member".to_string(),
+            })?;
+        let before_status = before.status;
+        let before_open_run = before
+            .progress
+            .as_ref()
+            .map(|progress| (progress.run_state, progress.in_flight_work));
+        let first_view = self.session_service.read(&session_id).await?;
+        let middle = self.member_status(identity).await?;
+        let second_view = self.session_service.read(&session_id).await?;
+        let after = self.member_status(identity).await?;
+        let middle_runtime = middle
+            .runtime_identity_fields()
+            .map(|(runtime_id, fence_token)| (runtime_id.clone(), fence_token))
+            .ok_or_else(|| MobError::BoundedHelperResultUnavailable {
+                member_id: identity.clone(),
+                reason: "runtime generation/fence disappeared during projection".to_string(),
+            })?;
+        let after_runtime = after
+            .runtime_identity_fields()
+            .map(|(runtime_id, fence_token)| (runtime_id.clone(), fence_token))
+            .ok_or_else(|| MobError::BoundedHelperResultUnavailable {
+                member_id: identity.clone(),
+                reason: "runtime generation/fence disappeared during projection".to_string(),
+            })?;
+        let middle_open_run = middle
+            .progress
+            .as_ref()
+            .map(|progress| (progress.run_state, progress.in_flight_work));
+        let after_open_run = after
+            .progress
+            .as_ref()
+            .map(|progress| (progress.run_state, progress.in_flight_work));
+        let stable_session = first_view.state.session_id == session_id
+            && second_view.state.session_id == session_id
+            && first_view.state.updated_at == second_view.state.updated_at
+            && first_view.state.message_count == second_view.state.message_count
+            && first_view.state.is_active == second_view.state.is_active
+            && first_view.state.model == second_view.state.model
+            && first_view.state.provider == second_view.state.provider
+            && first_view.state.last_assistant_text == second_view.state.last_assistant_text
+            && first_view.billing.total_tokens == second_view.billing.total_tokens
+            && first_view.billing.usage == second_view.billing.usage;
+        let member_changed = middle.current_bridge_session_id() != Some(&session_id)
+            || after.current_bridge_session_id() != Some(&session_id)
+            || before.agent_identity() != identity
+            || middle.agent_identity() != identity
+            || after.agent_identity() != identity
+            || before_runtime != middle_runtime
+            || before_runtime != after_runtime
+            || before_status != middle.status
+            || before_status != after.status
+            || before_open_run != middle_open_run
+            || before_open_run != after_open_run
+            || before.output_preview != middle.output_preview
+            || before.output_preview != after.output_preview
+            || before.tokens_used != middle.tokens_used
+            || before.tokens_used != after.tokens_used;
+        if !stable_session || member_changed {
+            return Err(MobError::BoundedHelperResultUnavailable {
+                member_id: identity.clone(),
+                reason: "canonical member/session version changed across the exact session read; retry the projection"
+                    .to_string(),
+            });
+        }
+        if first_view.state.is_active {
+            return Err(MobError::BoundedHelperResultUnavailable {
+                member_id: identity.clone(),
+                reason: format!("session '{session_id}' still owns an active turn"),
+            });
+        }
+        if before.progress.as_ref().is_none_or(|progress| {
+            progress.run_state != MemberRunState::Idle || progress.in_flight_work != 0
+        }) {
+            return Err(MobError::BoundedHelperResultUnavailable {
+                member_id: identity.clone(),
+                reason: format!(
+                    "runtime has not published an exact idle/no-work fact for session '{session_id}'"
+                ),
+            });
+        }
+        let exact_text = first_view
+            .state
+            .last_assistant_text
+            .as_deref()
+            .ok_or_else(|| MobError::BoundedHelperResultUnavailable {
+                member_id: identity.clone(),
+                reason: format!(
+                    "session '{session_id}' has not published an exact terminal assistant result"
+                ),
+            })?;
+        let failed = matches!(before_status, MobMemberStatus::Broken);
+        let result = BoundedHelperResult::from_exact_terminal_text(
+            label,
+            exact_text,
+            max_text_bytes,
+            failed,
+        )?;
+        Ok((result, session_id))
+    }
+
+    /// Spawn a fresh helper, observe its admitted member snapshot, retire it,
+    /// and return that snapshot projection.
+    ///
+    /// Helpers are short-lived TurnDriven tasks by default. This convenience
+    /// operation intentionally does not wait for model-turn terminality: spawn
+    /// registers a deferred initial turn, then this method observes and retires
+    /// the member. Consequently `bounded_result` is `None`; callers that run a
+    /// worker and need an exact compact result must retain the member, await
+    /// terminality, and call `bounded_terminal_member_result` before retiring.
     pub async fn spawn_helper(
         &self,
         identity: AgentIdentity,
@@ -8541,21 +9238,26 @@ impl MobHandle {
             helper_snapshot.require_runtime_identity_fields("spawn_helper result")?;
         let agent_identity = helper_snapshot.agent_identity().clone();
         let agent_runtime_id = agent_runtime_id.clone();
+        let output = helper_snapshot.output_preview.clone();
         admitted.retire(identity).await?;
 
         Ok(HelperResult {
-            output: helper_snapshot.output_preview,
+            output,
             tokens_used: helper_snapshot.tokens_used,
             agent_identity,
+            bounded_result: None,
             agent_runtime_id,
             fence_token,
         })
     }
 
-    /// Fork from an existing member's context, wait for completion, retire, and return.
+    /// Fork from an existing member's context, observe the admitted member,
+    /// retire it, and return that snapshot projection.
     ///
-    /// Like `spawn_helper` but uses `MemberLaunchMode::Fork` to share
-    /// conversation context with the source member.
+    /// Like `spawn_helper`, this preserves the historical non-blocking helper
+    /// contract and therefore does not claim an exact terminal bounded result.
+    /// Use `fork_member`, wait for terminality, then call
+    /// `bounded_terminal_member_result` for fork -> work -> project-back.
     pub async fn fork_helper(
         &self,
         source_identity: &AgentIdentity,
@@ -8607,12 +9309,14 @@ impl MobHandle {
             helper_snapshot.require_runtime_identity_fields("fork_helper result")?;
         let agent_identity = helper_snapshot.agent_identity().clone();
         let agent_runtime_id = agent_runtime_id.clone();
+        let output = helper_snapshot.output_preview.clone();
         admitted.retire(identity).await?;
 
         Ok(HelperResult {
-            output: helper_snapshot.output_preview,
+            output,
             tokens_used: helper_snapshot.tokens_used,
             agent_identity,
+            bounded_result: None,
             agent_runtime_id,
             fence_token,
         })
@@ -10463,6 +11167,7 @@ mod tests {
             output: Some("done".to_string()),
             tokens_used: 7,
             agent_identity: AgentIdentity::from("worker"),
+            bounded_result: None,
             agent_runtime_id: runtime_id.clone(),
             fence_token: FenceToken::new(9),
         };
@@ -10479,6 +11184,50 @@ mod tests {
         assert!(value.get("fence_token").is_none());
         assert!(value.get("session_id").is_none());
         assert!(value.get("bridge_session_id").is_none());
+    }
+
+    #[test]
+    fn bounded_helper_result_enforces_utf8_byte_limit_and_explicit_marker() {
+        let max_text_bytes = HELPER_RESULT_TRUNCATION_MARKER.len() + 4;
+        let result = BoundedHelperResult::from_exact_terminal_text(
+            "review",
+            "ab💡cdefghijklmnopqrstuvwxyz",
+            max_text_bytes,
+            false,
+        )
+        .expect("valid receiver bound should project");
+
+        assert_eq!(result.label(), "review");
+        assert_eq!(
+            result.status(),
+            BoundedHelperResultStatus::CompletedTruncated
+        );
+        assert_eq!(
+            result.text(),
+            format!("ab{HELPER_RESULT_TRUNCATION_MARKER}")
+        );
+        assert!(result.text().len() <= max_text_bytes);
+
+        let wire = result.to_wire();
+        assert_eq!(wire.label, "review");
+        assert_eq!(
+            wire.status,
+            meerkat_contracts::MobBoundedHelperResultStatus::CompletedTruncated
+        );
+        assert_eq!(wire.text, result.text());
+    }
+
+    #[test]
+    fn bounded_helper_result_rejects_a_bound_that_cannot_hold_the_marker() {
+        let error = BoundedHelperResult::from_exact_terminal_text(
+            "review",
+            "payload requiring truncation",
+            HELPER_RESULT_TRUNCATION_MARKER.len() - 1,
+            false,
+        )
+        .expect_err("receiver bound must hold the complete truncation marker");
+
+        assert!(matches!(error, MobError::InvalidBoundedHelperResult { .. }));
     }
 
     #[test]
@@ -10567,6 +11316,7 @@ mod tests {
             external_peer_specs: BTreeMap::new(),
             effective_profile_override: None,
             effective_model_override: None,
+            direct_member_fence: None,
         }
     }
 

@@ -3,11 +3,11 @@
 use crate::{SessionFilter, SessionStore, SessionStoreError};
 use async_trait::async_trait;
 use meerkat_core::session_store::{
-    HeadCanonicalAuthorityCrossing, IncrementalSessionStore, PreparedHeadCanonicalParentTransition,
-    SaveGuardWitness, SessionHead, SessionHeadCas, StrandLayout, StrandSegment, StrandSplice,
-    head_canonical_plain_save_guard_with_prefix_witness, reconstruct_rewrite_record,
-    session_head_cas_token, strand_layout_for_history, validate_commit_rewrite_transition,
-    validate_save_head_transition,
+    HeadCanonicalAuthorityCrossing, HeadCanonicalStoreActivation, IncrementalSessionStore,
+    PreparedHeadCanonicalParentTransition, SaveGuardWitness, SessionHead, SessionHeadCas,
+    StrandLayout, StrandSegment, StrandSplice, head_canonical_plain_save_guard_with_prefix_witness,
+    reconstruct_rewrite_record, session_head_cas_token, strand_layout_for_history,
+    validate_commit_rewrite_transition, validate_save_head_transition,
 };
 use meerkat_core::transcript_messages_digest;
 use meerkat_core::types::Message;
@@ -951,6 +951,12 @@ impl SessionStore for MemoryStore {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl IncrementalSessionStore for MemoryStore {
+    async fn activate_head_canonical_store(
+        &self,
+    ) -> Result<HeadCanonicalStoreActivation, SessionStoreError> {
+        Ok(HeadCanonicalStoreActivation::NotApplicable)
+    }
+
     async fn cross_head_canonical_authority(
         &self,
         _id: &SessionId,

@@ -5,7 +5,9 @@ use crate::lifecycle::{
 };
 use crate::service::ScheduleService;
 use crate::store::{
-    ClaimDueRequest, RenewOccurrenceLeaseOutcome, RenewOccurrenceLeaseRequest, ScheduleStore,
+    AcquireScheduleExecutorLeaseOutcome, AcquireScheduleExecutorLeaseRequest, ClaimDueRequest,
+    RenewOccurrenceLeaseOutcome, RenewOccurrenceLeaseRequest, RenewScheduleExecutorLeaseOutcome,
+    RenewScheduleExecutorLeaseRequest, ScheduleExecutorLease, ScheduleStore,
 };
 use crate::types::{
     DeliveryAdmissionOutcome, DeliveryCompletionFailureReason, DeliveryFailureReason,
@@ -132,6 +134,15 @@ pub trait ScheduleTargetProbe: Send + Sync {
 
 #[async_trait]
 pub trait ScheduleTargetDelivery: Send + Sync {
+    /// Realize the already-committed `DispatchStarted` intent.
+    ///
+    /// Implementations must durably deduplicate `identity.idempotency_key`
+    /// before acknowledging admission. `Ok` means the returned dispatch
+    /// describes either that first admission or an exact replay. An ordinary
+    /// `Err` is permitted only when no target-side effect was admitted. If an
+    /// implementation cannot prove whether admission happened, it must return
+    /// [`ScheduleDomainError::DeliveryRepairDeferred`] so the occurrence stays
+    /// reclaimable and the same stable identity is retried.
     async fn deliver_occurrence(
         &self,
         occurrence: &Occurrence,
@@ -156,6 +167,9 @@ impl Default for ScheduleDriverConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct ScheduleTickReport {
+    /// True only when this tick held the store-issued singular firing lease.
+    /// A false report is a healthy standby observation, not progress.
+    pub executor_authorized: bool,
     pub planned_occurrences: usize,
     pub claimed_occurrences: usize,
     pub terminalized_occurrences: usize,
@@ -313,6 +327,9 @@ pub struct ScheduleDriver {
     probe: Arc<dyn ScheduleTargetProbe>,
     delivery: Arc<dyn ScheduleTargetDelivery>,
     owner_id: String,
+    executor_owner_id: String,
+    executor_lease: crate::tokio::sync::Mutex<Option<ScheduleExecutorLease>>,
+    tick_gate: crate::tokio::sync::Mutex<()>,
     config: ScheduleDriverConfig,
 }
 
@@ -325,18 +342,85 @@ impl ScheduleDriver {
         owner_id: impl Into<String>,
         config: ScheduleDriverConfig,
     ) -> Self {
+        let owner_id = owner_id.into();
         Self {
             service,
             store,
             probe,
             delivery,
-            owner_id: owner_id.into(),
+            executor_owner_id: format!("{owner_id}:{}", uuid::Uuid::now_v7()),
+            owner_id,
+            executor_lease: crate::tokio::sync::Mutex::new(None),
+            tick_gate: crate::tokio::sync::Mutex::new(()),
             config,
         }
     }
 
+    async fn acquire_or_renew_executor_lease(
+        &self,
+    ) -> Result<Option<ScheduleExecutorLease>, ScheduleDomainError> {
+        let lease_duration = self.config.lease_duration.max(Duration::seconds(15));
+        let mut slot = self.executor_lease.lock().await;
+        if let Some(current) = slot.clone() {
+            match self
+                .store
+                .renew_executor_lease(RenewScheduleExecutorLeaseRequest {
+                    lease: current,
+                    lease_duration,
+                })
+                .await?
+            {
+                RenewScheduleExecutorLeaseOutcome::Renewed(renewed) => {
+                    *slot = Some(renewed.clone());
+                    return Ok(Some(renewed));
+                }
+                RenewScheduleExecutorLeaseOutcome::Stale => *slot = None,
+            }
+        }
+        match self
+            .store
+            .acquire_executor_lease(AcquireScheduleExecutorLeaseRequest {
+                owner_id: self.executor_owner_id.clone(),
+                lease_duration,
+            })
+            .await?
+        {
+            AcquireScheduleExecutorLeaseOutcome::Acquired(lease) => {
+                *slot = Some(lease.clone());
+                Ok(Some(lease))
+            }
+            AcquireScheduleExecutorLeaseOutcome::Busy { .. } => Ok(None),
+        }
+    }
+
+    pub async fn release_executor_lease(&self) -> Result<(), ScheduleDomainError> {
+        let _tick = self.tick_gate.lock().await;
+        let lease = self.executor_lease.lock().await.take();
+        if let Some(lease) = lease {
+            self.store.release_executor_lease(lease).await?;
+        }
+        Ok(())
+    }
+
+    /// Maximum idle wait that keeps the store-owned executor lease live.
+    /// Hosts clamp every sleep/wake wait to this interval, including stores
+    /// whose ordinary work wake is push-only or process-local.
+    pub fn executor_heartbeat_interval(&self) -> std::time::Duration {
+        let lease_duration = self.config.lease_duration.max(Duration::seconds(15));
+        let half_ms = (lease_duration.num_milliseconds() / 2).max(1);
+        std::time::Duration::from_millis(u64::try_from(half_ms).unwrap_or(u64::MAX))
+    }
+
     pub async fn tick_once(&self) -> Result<ScheduleTickReport, ScheduleDomainError> {
+        // Renewal replaces the exact executor witness. Serialize ticks from
+        // this driver incarnation so one concurrent tick cannot stale the
+        // witness another tick is about to present to the claim transaction.
+        let _tick = self.tick_gate.lock().await;
         let mut report = ScheduleTickReport::default();
+        let Some(executor_lease) = self.acquire_or_renew_executor_lease().await? else {
+            return Ok(report);
+        };
+        report.executor_authorized = true;
 
         // Per-row tolerance end to end: a poisoned schedule row, a poisoned
         // occurrence row, or one schedule whose refill fails must not starve
@@ -364,11 +448,14 @@ impl ScheduleDriver {
 
         let claimed = self
             .store
-            .claim_due_occurrences(ClaimDueRequest {
-                owner_id: self.owner_id.clone(),
-                limit: self.config.claim_limit,
-                lease_duration: self.config.lease_duration,
-            })
+            .claim_due_occurrences(
+                &executor_lease,
+                ClaimDueRequest {
+                    owner_id: self.owner_id.clone(),
+                    limit: self.config.claim_limit,
+                    lease_duration: self.config.lease_duration,
+                },
+            )
             .await?;
         report.occurrence_row_faults = claimed.row_faults;
 
@@ -495,7 +582,8 @@ impl ScheduleDriver {
         let delivery_identity = ScheduleDeliveryIdentity::for_occurrence(&occurrence);
         // Persist durable dispatch intent and its stable external identity
         // before the adapter can perform any target-side effect. A crash:
-        // - after this commit but before delivery leaves a retryable outbox row;
+        // - after this commit but before delivery leaves the intent-bearing
+        //   occurrence row reclaimable;
         // - after delivery but before observation replays the same idempotency
         //   key, never a newly minted effect identity.
         let Some(dispatch_commit) = self
@@ -1573,6 +1661,26 @@ mod tests {
     #![allow(clippy::expect_used, clippy::large_futures, clippy::panic)]
 
     use super::*;
+
+    async fn test_executor_lease<S: ScheduleStore + ?Sized>(
+        store: &Arc<S>,
+    ) -> ScheduleExecutorLease {
+        match store
+            .acquire_executor_lease(AcquireScheduleExecutorLeaseRequest {
+                owner_id: format!("test-executor:{}", uuid::Uuid::now_v7()),
+                lease_duration: Duration::minutes(5),
+            })
+            .await
+            .expect("acquire test executor lease")
+        {
+            AcquireScheduleExecutorLeaseOutcome::Acquired(lease) => lease,
+            AcquireScheduleExecutorLeaseOutcome::Busy {
+                current_owner_id, ..
+            } => {
+                panic!("test executor lease busy under {current_owner_id}")
+            }
+        }
+    }
     use crate::types::{
         CreateScheduleRequest, DeliveryReceiptStage, IntervalTriggerSpec, OccurrenceFailureClass,
         ScheduledSessionAction, SessionMaterializationSpec, SessionTargetBinding, TargetBinding,
@@ -1880,6 +1988,27 @@ mod tests {
             self.inner.wait_for_durable_wake().await
         }
 
+        async fn acquire_executor_lease(
+            &self,
+            request: crate::AcquireScheduleExecutorLeaseRequest,
+        ) -> Result<crate::AcquireScheduleExecutorLeaseOutcome, ScheduleStoreError> {
+            self.inner.acquire_executor_lease(request).await
+        }
+
+        async fn renew_executor_lease(
+            &self,
+            request: crate::RenewScheduleExecutorLeaseRequest,
+        ) -> Result<crate::RenewScheduleExecutorLeaseOutcome, ScheduleStoreError> {
+            self.inner.renew_executor_lease(request).await
+        }
+
+        async fn release_executor_lease(
+            &self,
+            lease: crate::ScheduleExecutorLease,
+        ) -> Result<(), ScheduleStoreError> {
+            self.inner.release_executor_lease(lease).await
+        }
+
         async fn get_store_time_utc(&self) -> Result<DateTime<Utc>, ScheduleStoreError> {
             self.inner.get_store_time_utc().await
         }
@@ -2032,9 +2161,10 @@ mod tests {
 
         async fn claim_due_occurrences(
             &self,
+            lease: &crate::ScheduleExecutorLease,
             request: ClaimDueRequest,
         ) -> Result<crate::ClaimDueResult, ScheduleStoreError> {
-            let mut result = self.inner.claim_due_occurrences(request).await?;
+            let mut result = self.inner.claim_due_occurrences(lease, request).await?;
             result.row_faults.push(crate::ScheduleStoreRowFault {
                 schedule_id: Some("poisoned-schedule-row".to_string()),
                 occurrence_id: Some("poisoned-occurrence-row".to_string()),
@@ -2277,6 +2407,27 @@ mod tests {
             self.inner.wait_for_durable_wake().await
         }
 
+        async fn acquire_executor_lease(
+            &self,
+            request: crate::AcquireScheduleExecutorLeaseRequest,
+        ) -> Result<crate::AcquireScheduleExecutorLeaseOutcome, ScheduleStoreError> {
+            self.inner.acquire_executor_lease(request).await
+        }
+
+        async fn renew_executor_lease(
+            &self,
+            request: crate::RenewScheduleExecutorLeaseRequest,
+        ) -> Result<crate::RenewScheduleExecutorLeaseOutcome, ScheduleStoreError> {
+            self.inner.renew_executor_lease(request).await
+        }
+
+        async fn release_executor_lease(
+            &self,
+            lease: crate::ScheduleExecutorLease,
+        ) -> Result<(), ScheduleStoreError> {
+            self.inner.release_executor_lease(lease).await
+        }
+
         async fn get_store_time_utc(&self) -> Result<DateTime<Utc>, ScheduleStoreError> {
             self.inner.get_store_time_utc().await
         }
@@ -2390,9 +2541,10 @@ mod tests {
 
         async fn claim_due_occurrences(
             &self,
+            lease: &crate::ScheduleExecutorLease,
             request: ClaimDueRequest,
         ) -> Result<crate::ClaimDueResult, ScheduleStoreError> {
-            self.inner.claim_due_occurrences(request).await
+            self.inner.claim_due_occurrences(lease, request).await
         }
 
         async fn renew_occurrence_lease_if_current(
@@ -2460,13 +2612,18 @@ mod tests {
                 planning_horizon_occurrences: Some(1),
             })
             .await?;
+        let executor_lease = test_executor_lease(&store).await;
         let claim = store
-            .claim_due_occurrences(ClaimDueRequest {
-                owner_id: "transition-commit-owner".to_string(),
-                limit: 1,
-                lease_duration: Duration::seconds(30),
-            })
+            .claim_due_occurrences(
+                &executor_lease,
+                ClaimDueRequest {
+                    owner_id: "transition-commit-owner".to_string(),
+                    limit: 1,
+                    lease_duration: Duration::seconds(30),
+                },
+            )
             .await?;
+        store.release_executor_lease(executor_lease).await?;
         let claimed = claim
             .transitions
             .into_iter()
@@ -3818,20 +3975,25 @@ mod tests {
         Ok(())
     }
 
-    /// Commit only the pre-effect outbox intent, with no adapter call or live
-    /// completion waiter. This is the exact durable crash boundary between
-    /// intent and target effect.
+    /// Commit only the pre-effect intent-bearing occurrence state, with no
+    /// adapter call or live completion waiter. This is the exact durable
+    /// crash boundary between intent and target effect.
     async fn claim_and_start_dispatch_without_waiter(
         store: &Arc<dyn ScheduleStore>,
         lease_duration: Duration,
     ) -> Result<Occurrence, ScheduleDomainError> {
+        let executor_lease = test_executor_lease(store).await;
         let claimed = store
-            .claim_due_occurrences(ClaimDueRequest {
-                owner_id: "other-process".into(),
-                limit: 1,
-                lease_duration,
-            })
+            .claim_due_occurrences(
+                &executor_lease,
+                ClaimDueRequest {
+                    owner_id: "other-process".into(),
+                    limit: 1,
+                    lease_duration,
+                },
+            )
             .await?;
+        store.release_executor_lease(executor_lease).await?;
         let occurrence = claimed
             .transitions
             .into_iter()
@@ -3868,13 +4030,18 @@ mod tests {
         store: &Arc<dyn ScheduleStore>,
         lease_duration: Duration,
     ) -> Result<Occurrence, ScheduleDomainError> {
+        let executor_lease = test_executor_lease(store).await;
         let claimed = store
-            .claim_due_occurrences(ClaimDueRequest {
-                owner_id: "other-process".into(),
-                limit: 1,
-                lease_duration,
-            })
+            .claim_due_occurrences(
+                &executor_lease,
+                ClaimDueRequest {
+                    owner_id: "other-process".into(),
+                    limit: 1,
+                    lease_duration,
+                },
+            )
             .await?;
+        store.release_executor_lease(executor_lease).await?;
         let occurrence = claimed
             .transitions
             .into_iter()
@@ -4035,13 +4202,18 @@ mod tests {
                 lease_duration: Duration::seconds(30),
             },
         );
+        let executor_lease = test_executor_lease(&store).await;
         let claimed = store
-            .claim_due_occurrences(ClaimDueRequest {
-                owner_id: "driver-owner".into(),
-                limit: 1,
-                lease_duration: Duration::seconds(30),
-            })
+            .claim_due_occurrences(
+                &executor_lease,
+                ClaimDueRequest {
+                    owner_id: "driver-owner".into(),
+                    limit: 1,
+                    lease_duration: Duration::seconds(30),
+                },
+            )
             .await?;
+        store.release_executor_lease(executor_lease).await?;
         let occurrence = claimed
             .transitions
             .into_iter()
@@ -4113,13 +4285,18 @@ mod tests {
                 lease_duration: Duration::seconds(30),
             },
         );
+        let executor_lease = test_executor_lease(&store).await;
         let claimed = store
-            .claim_due_occurrences(ClaimDueRequest {
-                owner_id: "driver-owner".into(),
-                limit: 1,
-                lease_duration: Duration::seconds(30),
-            })
+            .claim_due_occurrences(
+                &executor_lease,
+                ClaimDueRequest {
+                    owner_id: "driver-owner".into(),
+                    limit: 1,
+                    lease_duration: Duration::seconds(30),
+                },
+            )
             .await?;
+        store.release_executor_lease(executor_lease).await?;
         let occurrence = claimed
             .transitions
             .into_iter()
@@ -4184,13 +4361,18 @@ mod tests {
                 lease_duration: Duration::seconds(30),
             },
         );
+        let executor_lease = test_executor_lease(&store).await;
         let claimed = store
-            .claim_due_occurrences(ClaimDueRequest {
-                owner_id: "driver-owner".into(),
-                limit: 1,
-                lease_duration: Duration::seconds(30),
-            })
+            .claim_due_occurrences(
+                &executor_lease,
+                ClaimDueRequest {
+                    owner_id: "driver-owner".into(),
+                    limit: 1,
+                    lease_duration: Duration::seconds(30),
+                },
+            )
             .await?;
+        store.release_executor_lease(executor_lease).await?;
         let occurrence = claimed
             .transitions
             .into_iter()
@@ -4522,13 +4704,18 @@ mod tests {
                 lease_duration: Duration::seconds(30),
             },
         );
+        let executor_lease = test_executor_lease(&store).await;
         let claimed = store
-            .claim_due_occurrences(ClaimDueRequest {
-                owner_id: "driver-owner".into(),
-                limit: 1,
-                lease_duration: Duration::seconds(30),
-            })
+            .claim_due_occurrences(
+                &executor_lease,
+                ClaimDueRequest {
+                    owner_id: "driver-owner".into(),
+                    limit: 1,
+                    lease_duration: Duration::seconds(30),
+                },
+            )
             .await?;
+        store.release_executor_lease(executor_lease).await?;
         let occurrence = claimed
             .transitions
             .into_iter()

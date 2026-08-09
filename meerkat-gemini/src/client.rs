@@ -1789,15 +1789,22 @@ impl LlmClient for GeminiClient {
             return Ok(None);
         }
         let body = self.build_stream_request_body(&projected_request)?;
-        let encoded_bytes = serde_json::to_vec(&body)
-            .map_err(|error| LlmError::InvalidRequest {
-                message: format!("failed to serialize Gemini request body: {error}"),
-            })?
-            .len() as u64;
-        Ok(Some(meerkat_core::ProviderRequestPressure::new(
-            encoded_bytes,
-            meerkat_models::approximate_request_byte_cap(self.provider()),
-        )))
+        let encoded_body = serde_json::to_vec(&body).map_err(|error| LlmError::InvalidRequest {
+            message: format!("failed to serialize Gemini request body: {error}"),
+        })?;
+        Ok(Some(
+            meerkat_core::ProviderRequestPressure::new(
+                encoded_body.len() as u64,
+                meerkat_models::approximate_request_byte_cap(self.provider()),
+            )
+            .with_lowered_request_provenance(
+                meerkat_core::LoweredRequestProvenance::from_body(
+                    Provider::Gemini,
+                    meerkat_core::LoweredRequestEncoding::GeminiGenerateContentJson,
+                    &encoded_body,
+                ),
+            ),
+        ))
     }
 
     fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
@@ -1872,12 +1879,21 @@ impl LlmClient for GeminiClient {
                     if let Some(resp) = parsed_response {
                         if let Some(usage) = resp.usage_metadata {
                             yield LlmEvent::UsageUpdate {
-                                usage: Usage {
+                                usage: meerkat_core::TurnUsage::try_from_usage(Usage {
                                     input_tokens: usage.prompt_token_count.unwrap_or(0),
                                     output_tokens: usage.candidates_token_count.unwrap_or(0),
                                     cache_creation_tokens: None,
                                     cache_read_tokens: usage.cached_content_token_count,
-                                }
+                                    provider_accounting: Some(
+                                        meerkat_core::ProviderTokenAccounting::gemini(
+                                            &request.model,
+                                            usage.prompt_token_count.unwrap_or(0),
+                                        ),
+                                    ),
+                                })
+                                .map_err(|error| LlmError::Unknown {
+                                    message: error.to_string(),
+                                })?
                             };
                         }
 

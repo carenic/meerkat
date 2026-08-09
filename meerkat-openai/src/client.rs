@@ -12,7 +12,7 @@ use meerkat_core::schema::{CompiledSchema, SchemaError};
 use meerkat_core::{
     AssistantBlock, BlockAssistantMessage, ContentBlock, ImageData, ImageGenerationIntent,
     ImageGenerationWarning, ImageProviderErrorCode, ImageProviderTerminalObservation, Message,
-    OpenAiImageMetadata, OutputSchema, ProviderImageMetadata, ProviderMeta,
+    OpenAiImageMetadata, OutputSchema, Provider, ProviderImageMetadata, ProviderMeta,
     RevisedPromptDisposition, RevisedPromptSource, ServerToolKind, StopReason, SystemNoticeBlock,
     SystemNoticeMessage, ToolResult, Usage, UserMessage,
 };
@@ -625,7 +625,7 @@ impl OpenAiClient {
                         )
                 })
         });
-        let (input, instructions) = if self.is_chatgpt_backend_wire() {
+        let (input, instructions, _) = if self.is_chatgpt_backend_wire() {
             Self::validate_chatgpt_system_messages(&request.messages)?;
             Self::convert_to_responses_input_with_system_mode(
                 &request.messages,
@@ -705,7 +705,11 @@ impl OpenAiClient {
             }
             if let Some(enabled) = tag.prompt_cache_enabled {
                 let required_mode = if enabled {
-                    meerkat_core::model_profile::capabilities::OpenAiPromptCacheMode::Implicit
+                    tag.prompt_cache_options
+                        .and_then(|options| options.mode)
+                        .unwrap_or(
+                        meerkat_core::model_profile::capabilities::OpenAiPromptCacheMode::Implicit,
+                    )
                 } else {
                     meerkat_core::model_profile::capabilities::OpenAiPromptCacheMode::Explicit
                 };
@@ -1052,7 +1056,7 @@ impl OpenAiClient {
             SystemMessageMode::IncludeInInput,
             false,
         )
-        .map(|(input, _)| input)
+        .map(|(input, _, _)| input)
     }
 
     fn content_block_to_responses_part(block: &ContentBlock) -> Value {
@@ -1199,11 +1203,23 @@ impl OpenAiClient {
         messages: &[Message],
         system_mode: SystemMessageMode,
         author_explicit_breakpoints: bool,
-    ) -> Result<(Vec<Value>, Option<String>), LlmError> {
+    ) -> Result<
+        (
+            Vec<Value>,
+            Option<String>,
+            Vec<(meerkat_core::CacheBreakpointBoundary, usize)>,
+        ),
+        LlmError,
+    > {
         let mut items = Vec::new();
         let mut instructions = None;
+        let mut authored_boundaries = Vec::new();
+        let leading_system_count = messages
+            .iter()
+            .take_while(|message| matches!(message, Message::System(_)))
+            .count();
 
-        for msg in messages {
+        for (message_index, msg) in messages.iter().enumerate() {
             match msg {
                 Message::System(s) => match system_mode {
                     SystemMessageMode::IncludeInInput => {
@@ -1212,6 +1228,19 @@ impl OpenAiClient {
                             "role": "system",
                             "content": s.content
                         }));
+                        let lowered_item_count = items.len();
+                        if author_explicit_breakpoints
+                            && message_index + 1 == leading_system_count
+                            && let Some(item) = items.last_mut()
+                            && Self::author_responses_content_breakpoint(&mut item["content"])
+                        {
+                            authored_boundaries.push((
+                                meerkat_core::CacheBreakpointBoundary::SystemProfilePrefix {
+                                    message_count: (message_index + 1) as u64,
+                                },
+                                lowered_item_count,
+                            ));
+                        }
                     }
                     SystemMessageMode::ExtractToInstructions => {
                         if instructions.replace(s.content.clone()).is_some() {
@@ -1229,8 +1258,17 @@ impl OpenAiClient {
                         "role": "user",
                         "content": Self::system_notice_responses_content(notice)
                     }));
-                    if author_explicit_breakpoints && let Some(item) = items.last_mut() {
-                        Self::author_responses_content_breakpoint(&mut item["content"]);
+                    let lowered_item_count = items.len();
+                    if author_explicit_breakpoints
+                        && let Some(item) = items.last_mut()
+                        && Self::author_responses_content_breakpoint(&mut item["content"])
+                    {
+                        authored_boundaries.push((
+                            meerkat_core::CacheBreakpointBoundary::TranscriptAfter {
+                                message_count: (message_index + 1) as u64,
+                            },
+                            lowered_item_count,
+                        ));
                     }
                 }
                 Message::User(u) => {
@@ -1252,8 +1290,17 @@ impl OpenAiClient {
                             "content": u.text_content()
                         }));
                     }
-                    if author_explicit_breakpoints && let Some(item) = items.last_mut() {
-                        Self::author_responses_content_breakpoint(&mut item["content"]);
+                    let lowered_item_count = items.len();
+                    if author_explicit_breakpoints
+                        && let Some(item) = items.last_mut()
+                        && Self::author_responses_content_breakpoint(&mut item["content"])
+                    {
+                        authored_boundaries.push((
+                            meerkat_core::CacheBreakpointBoundary::TranscriptAfter {
+                                message_count: (message_index + 1) as u64,
+                            },
+                            lowered_item_count,
+                        ));
                     }
                 }
                 Message::BlockAssistant(a) => {
@@ -1304,9 +1351,16 @@ impl OpenAiClient {
                             "output": output
                         }));
                     }
+                    let lowered_item_count = items.len();
                     if author_explicit_breakpoints {
                         for item in items[first_result_item..].iter_mut().rev() {
                             if Self::author_responses_content_breakpoint(&mut item["output"]) {
+                                authored_boundaries.push((
+                                    meerkat_core::CacheBreakpointBoundary::TranscriptAfter {
+                                        message_count: (message_index + 1) as u64,
+                                    },
+                                    lowered_item_count,
+                                ));
                                 break;
                             }
                         }
@@ -1315,7 +1369,7 @@ impl OpenAiClient {
             }
         }
 
-        Ok((items, instructions))
+        Ok((items, instructions, authored_boundaries))
     }
 
     /// Parse an SSE event from the Responses API stream.
@@ -2002,29 +2056,140 @@ impl LlmClient for OpenAiClient {
         projected_request.messages = self.project_replay_messages(&request.messages)?;
         let (body, continuation_plan) =
             self.build_request_body_with_continuation(&projected_request)?;
-        let mut encoded_bytes = serde_json::to_vec(&body)
-            .map_err(|error| LlmError::InvalidRequest {
+        let mut encoded_body =
+            serde_json::to_vec(&body).map_err(|error| LlmError::InvalidRequest {
                 message: format!("failed to serialize OpenAI request body: {error}"),
-            })?
-            .len() as u64;
+            })?;
         // A rejected continuation is retried as a full replay. The pressure
         // witness must cover the largest body this one invocation may send.
         if continuation_plan.is_some() {
             let fallback_body = self.build_request_body(&projected_request)?;
-            encoded_bytes = encoded_bytes.max(
-                serde_json::to_vec(&fallback_body)
-                    .map_err(|error| LlmError::InvalidRequest {
-                        message: format!(
-                            "failed to serialize OpenAI fallback request body: {error}"
-                        ),
-                    })?
-                    .len() as u64,
-            );
+            let fallback_encoded =
+                serde_json::to_vec(&fallback_body).map_err(|error| LlmError::InvalidRequest {
+                    message: format!("failed to serialize OpenAI fallback request body: {error}"),
+                })?;
+            if fallback_encoded.len() > encoded_body.len() {
+                encoded_body = fallback_encoded;
+            }
         }
-        Ok(Some(meerkat_core::ProviderRequestPressure::new(
-            encoded_bytes,
-            meerkat_models::approximate_request_byte_cap(self.provider()),
-        )))
+        Ok(Some(
+            meerkat_core::ProviderRequestPressure::new(
+                encoded_body.len() as u64,
+                meerkat_models::approximate_request_byte_cap(self.provider()),
+            )
+            .with_lowered_request_provenance(
+                meerkat_core::LoweredRequestProvenance::from_body(
+                    Provider::OpenAI,
+                    meerkat_core::LoweredRequestEncoding::OpenAiResponsesJson,
+                    &encoded_body,
+                ),
+            ),
+        ))
+    }
+
+    fn authored_cache_breakpoints(
+        &self,
+        request: &LlmRequest,
+        canonical_messages: &[Message],
+    ) -> Result<Vec<meerkat_core::ProviderCacheBreakpointClaim>, LlmError> {
+        let Some(tag) = openai_tag(request) else {
+            return Ok(Vec::new());
+        };
+        let explicit = tag.prompt_cache_enabled != Some(false)
+            && tag.prompt_cache_options.is_some_and(|options| {
+                options.mode
+                    == Some(
+                        meerkat_core::model_profile::capabilities::OpenAiPromptCacheMode::Explicit,
+                    )
+            });
+        if !explicit || request.messages.len() != canonical_messages.len() {
+            return Ok(Vec::new());
+        }
+        // A previous_response_id request lowers only a replay suffix and may
+        // fall back to full replay after provider rejection. It has no single
+        // authored rendered prefix, so cache inheritance is unavailable.
+        if openai_continuation_plan(request).is_some() {
+            return Ok(Vec::new());
+        }
+
+        // Validate the exact full lowering first. Boundary evidence is minted
+        // only if the same renderer successfully authored the body.
+        let body = self.build_request_body(request)?;
+        let encoded_body = serde_json::to_vec(&body).map_err(|error| LlmError::InvalidRequest {
+            message: format!("failed to serialize OpenAI cache evidence body: {error}"),
+        })?;
+        let system_mode = if self.is_chatgpt_backend_wire() {
+            Self::validate_chatgpt_system_messages(&request.messages)?;
+            SystemMessageMode::ExtractToInstructions
+        } else {
+            SystemMessageMode::IncludeInInput
+        };
+        let (_, _, boundaries) = Self::convert_to_responses_input_with_system_mode(
+            &request.messages,
+            system_mode,
+            true,
+        )?;
+        let ttl = if tag
+            .prompt_cache_options
+            .and_then(|options| options.ttl)
+            .is_some()
+        {
+            meerkat_core::ProviderCacheTtl::ThirtyMinutes
+        } else if matches!(
+            tag.prompt_cache_retention,
+            Some(OpenAiPromptCacheRetention::TwentyFourHours)
+        ) {
+            meerkat_core::ProviderCacheTtl::TwentyFourHours
+        } else {
+            meerkat_core::ProviderCacheTtl::ProviderDefault
+        };
+        boundaries
+            .into_iter()
+            .map(|(boundary, input_item_count)| {
+                let input = body
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.get(..input_item_count))
+                    .ok_or_else(|| LlmError::InvalidRequest {
+                        message: "OpenAI cache breakpoint did not map to lowered input items"
+                            .to_string(),
+                    })?;
+                let rendered_prefix = serde_json::to_vec(&serde_json::json!({
+                    "renderer_mode": match system_mode {
+                        SystemMessageMode::IncludeInInput => "responses_full_replay_input_system_v1",
+                        SystemMessageMode::ExtractToInstructions => "responses_full_replay_instructions_v1",
+                    },
+                    "model": body.get("model"),
+                    "instructions": body.get("instructions"),
+                    "tools": body.get("tools"),
+                    "tool_choice": body.get("tool_choice"),
+                    "parallel_tool_calls": body.get("parallel_tool_calls"),
+                    "prompt_cache_key": body.get("prompt_cache_key"),
+                    "prompt_cache_retention": body.get("prompt_cache_retention"),
+                    "prompt_cache_options": body.get("prompt_cache_options"),
+                    "input": input,
+                }))
+                .map_err(|error| LlmError::InvalidRequest {
+                    message: format!("failed to serialize OpenAI rendered cache prefix: {error}"),
+                })?;
+                meerkat_core::provider_cache_breakpoint_claim(
+                    meerkat_core::ProviderCacheBreakpointClaimRequest {
+                        provider: Provider::OpenAI,
+                        model: &request.model,
+                        messages: canonical_messages,
+                        boundary,
+                        ttl,
+                        rendered_prefix: &rendered_prefix,
+                        lowered_request_encoding:
+                            meerkat_core::LoweredRequestEncoding::OpenAiResponsesJson,
+                        lowered_request_body: &encoded_body,
+                    },
+                )
+                .map_err(|error| LlmError::InvalidRequest {
+                    message: format!("invalid OpenAI cache-breakpoint evidence: {error}"),
+                })
+            })
+            .collect()
     }
 
     fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
@@ -2271,8 +2436,13 @@ impl LlmClient for OpenAiClient {
 
                                 // Extract usage
                                 if let Some(usage_obj) = response_obj.get("usage") {
-                                    apply_responses_usage(&mut usage, usage_obj);
-                                    yield LlmEvent::UsageUpdate { usage: usage.clone() };
+                                    apply_responses_usage(&mut usage, usage_obj, &request.model);
+                                    yield LlmEvent::UsageUpdate {
+                                        usage: meerkat_core::TurnUsage::try_from_usage(usage.clone())
+                                            .map_err(|error| LlmError::Unknown {
+                                                message: error.to_string(),
+                                            })?,
+                                    };
                                 }
 
                                 // Determine stop reason
@@ -2520,8 +2690,13 @@ impl LlmClient for OpenAiClient {
                             // Final done event — always update usage
                             if let Some(response_obj) = &event.response {
                                 if let Some(usage_obj) = response_obj.get("usage") {
-                                    apply_responses_usage(&mut usage, usage_obj);
-                                    yield LlmEvent::UsageUpdate { usage: usage.clone() };
+                                    apply_responses_usage(&mut usage, usage_obj, &request.model);
+                                    yield LlmEvent::UsageUpdate {
+                                        usage: meerkat_core::TurnUsage::try_from_usage(usage.clone())
+                                            .map_err(|error| LlmError::Unknown {
+                                                message: error.to_string(),
+                                            })?,
+                                    };
                                 }
 
                                 if !done_emitted {
@@ -2586,9 +2761,17 @@ impl LlmClient for OpenAiClient {
                                     status: 500,
                                     message: error_msg.to_string(),
                                 },
-                                "invalid_request_error" => LlmError::InvalidRequest {
-                                    message: error_msg.to_string(),
-                                },
+                                "context_length_exceeded" | "context_window_exceeded" => {
+                                    LlmError::ContextLengthExceeded {
+                                        max: 0,
+                                        requested: 1,
+                                    }
+                                }
+                                "invalid_request_error" => LlmError::from_http_status(
+                                    400,
+                                    error_msg.to_string(),
+                                    None,
+                                ),
                                 _ => LlmError::Unknown {
                                     message: format!("{error_code}: {error_msg}"),
                                 },
@@ -2624,9 +2807,17 @@ impl LlmClient for OpenAiClient {
                                     status: 500,
                                     message: error_msg.to_string(),
                                 },
-                                "invalid_request_error" => LlmError::InvalidRequest {
-                                    message: error_msg.to_string(),
-                                },
+                                "context_length_exceeded" | "context_window_exceeded" => {
+                                    LlmError::ContextLengthExceeded {
+                                        max: 0,
+                                        requested: 1,
+                                    }
+                                }
+                                "invalid_request_error" => LlmError::from_http_status(
+                                    400,
+                                    error_msg.to_string(),
+                                    None,
+                                ),
                                 _ => LlmError::Unknown {
                                     message: format!("{error_code}: {error_msg}"),
                                 },
@@ -2697,7 +2888,7 @@ struct ResponsesStreamEvent {
     sequence_number: Option<u64>,
 }
 
-fn apply_responses_usage(target: &mut Usage, usage: &Value) {
+fn apply_responses_usage(target: &mut Usage, usage: &Value, model: &str) {
     target.input_tokens = usage
         .get("input_tokens")
         .and_then(Value::as_u64)
@@ -2723,6 +2914,10 @@ fn apply_responses_usage(target: &mut Usage, usage: &Value) {
     if let Some(cache_write_tokens) = cache_write_tokens {
         target.cache_creation_tokens = Some(cache_write_tokens);
     }
+    target.provider_accounting = Some(meerkat_core::ProviderTokenAccounting::openai(
+        model,
+        target.input_tokens,
+    ));
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -4104,7 +4299,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_responses_handles_no_boundary_and_empty_tail_tool_results() {
+    fn explicit_responses_authors_system_prefix_and_handles_empty_tail_tool_results() {
         let client = OpenAiClient::new("test-key".to_string());
         let explicit = |messages| {
             LlmRequest::new("gpt-5.6-sol", messages).with_openai_tag_merge(|tag| {
@@ -4119,8 +4314,11 @@ mod tests {
             .build_request_body(&explicit(vec![Message::System(
                 meerkat_core::SystemMessage::new("system only"),
             )]))
-            .expect("explicit mode without a markable boundary is valid");
-        assert!(!system_only.to_string().contains("prompt_cache_breakpoint"));
+            .expect("explicit system-prefix breakpoint is valid");
+        assert_eq!(
+            system_only["input"][0]["content"][0]["prompt_cache_breakpoint"],
+            serde_json::json!({"mode": "explicit"})
+        );
 
         let tool_results = client
             .build_request_body(&explicit(vec![
@@ -5655,7 +5853,7 @@ mod tests {
         });
         let mut usage = Usage::default();
 
-        apply_responses_usage(&mut usage, &usage_value);
+        apply_responses_usage(&mut usage, &usage_value, "gpt-5.5");
 
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 7);
@@ -5671,7 +5869,7 @@ mod tests {
             }
         });
         let mut fallback_usage = Usage::default();
-        apply_responses_usage(&mut fallback_usage, &fallback);
+        apply_responses_usage(&mut fallback_usage, &fallback, "gpt-5.5");
         assert_eq!(fallback_usage.cache_read_tokens, Some(8));
         assert_eq!(fallback_usage.cache_creation_tokens, Some(4));
     }

@@ -38,6 +38,20 @@ use meerkat_store::MemoryBlobStore;
 
 const DEFAULT_RUNTIME_BACKED_ARCHIVED_HISTORY_CAPACITY: usize = 1024;
 
+/// Exact actor-recovery callback invoked while the prepared executor
+/// attachment still owns its mutation fence. The callback may advance only
+/// executor-local publication authority bound to `attachment_witness` and
+/// returns the immutable publication capability for the newly minted actor.
+pub type AttachedActorPublicationRefreshFn = Arc<
+    dyn Fn(
+            &RuntimeExecutorAttachmentWitness,
+            crate::LiveSessionActorWitness,
+            crate::LiveSessionActorWitnessSlot,
+        ) -> Result<Arc<dyn CoreExecutorPublicationHandle>, RuntimeDriverError>
+        + Send
+        + Sync,
+>;
+
 #[cfg(feature = "session-store")]
 pub fn build_runtime_backed_service(
     builder: FactoryAgentBuilder,
@@ -370,6 +384,7 @@ pub async fn materialize_attached_session_actor_only_with_reserved_admission<
         request,
         reserved_admission,
         false,
+        None,
     )
     .await
 }
@@ -397,6 +412,7 @@ where
             request,
             reserved_admission,
             false,
+            None,
         )
         .await;
     }
@@ -407,7 +423,64 @@ where
         session,
         request,
         reserved_admission,
-        move |session_id, _witness| executor_factory(session_id),
+        move |session_id, _witness, _actor_witness_slot| executor_factory(session_id),
+    )
+    .await?;
+    pending.commit().await?;
+    Ok(result)
+}
+
+/// Reserved-admission materialization that transfers the service-minted exact
+/// actor witness slot into the executor factory before attachment commit.
+///
+/// Surfaces whose publication handle is retained by the machine must use this
+/// form rather than resolving a live actor later by logical SessionId.
+pub async fn materialize_session_with_reserved_admission_and_actor_slot<
+    F,
+    B: SessionAgentBuilder + 'static,
+>(
+    service: &Arc<PersistentSessionService<B>>,
+    adapter: &Arc<MeerkatMachine>,
+    session: Session,
+    request: CreateSessionRequest,
+    reserved_admission: crate::RuntimeContextAdmissionGuard,
+    executor_factory: F,
+) -> Result<RunResult, SurfaceRuntimeMaterializeError>
+where
+    F: FnOnce(
+            SessionId,
+            RuntimeExecutorAttachmentWitness,
+            crate::LiveSessionActorWitnessSlot,
+        ) -> Box<dyn CoreExecutor>
+        + Send
+        + 'static,
+{
+    if let Some(witness) = adapter
+        .current_executor_attachment_witness(session.id())
+        .await
+    {
+        return materialize_attached_session_actor_only_with_admission_and_boundary_mode(
+            service,
+            adapter,
+            witness,
+            session,
+            request,
+            reserved_admission,
+            false,
+            None,
+        )
+        .await;
+    }
+
+    let (result, pending) = materialize_session_with_reserved_admission_transaction(
+        service,
+        adapter,
+        session,
+        request,
+        reserved_admission,
+        move |session_id, witness, actor_witness_slot| {
+            executor_factory(session_id, witness, actor_witness_slot)
+        },
     )
     .await?;
     pending.commit().await?;
@@ -443,18 +516,20 @@ pub async fn materialize_session_actor_unattached_with_reserved_admission<
             request,
             reserved_admission,
             false,
+            None,
         )
         .await;
     }
 
-    let (result, mut prepared) = materialize_unique_session_actor_transaction_with_admission(
-        service,
-        adapter,
-        session,
-        request,
-        reserved_admission,
-    )
-    .await?;
+    let (result, mut prepared, _actor_witness_slot) =
+        materialize_unique_session_actor_transaction_with_admission(
+            service,
+            adapter,
+            session,
+            request,
+            reserved_admission,
+        )
+        .await?;
     prepared.commit_actor_unattached().await?;
     Ok(result)
 }
@@ -502,6 +577,46 @@ where
         request,
         reserved_admission,
         true,
+        None,
+    )
+    .await
+}
+
+/// Actor-only materialization under the runtime loop's already-held turn
+/// boundary, with an exact surface publication refresh performed under the
+/// same prepared attachment mutation fence.
+pub async fn materialize_session_with_reserved_admission_under_runtime_turn_boundary_and_publication_refresh<
+    B: SessionAgentBuilder + 'static,
+>(
+    service: &Arc<PersistentSessionService<B>>,
+    adapter: &Arc<MeerkatMachine>,
+    session: Session,
+    request: CreateSessionRequest,
+    reserved_admission: crate::RuntimeContextAdmissionGuard,
+    publication_refresh: AttachedActorPublicationRefreshFn,
+) -> Result<RunResult, SurfaceRuntimeMaterializeError> {
+    let session_id = session.id().clone();
+    let witness = adapter
+        .current_executor_attachment_witness(&session_id)
+        .await
+        .ok_or_else(|| {
+            SurfaceRuntimeMaterializeError::RuntimeDriver(
+                RuntimeDriverError::ValidationFailed {
+                    reason: format!(
+                        "actor-only materialization under a runtime turn boundary requires an existing committed executor attachment for session {session_id}"
+                    ),
+                },
+            )
+        })?;
+    materialize_attached_session_actor_only_with_admission_and_boundary_mode(
+        service,
+        adapter,
+        witness,
+        session,
+        request,
+        reserved_admission,
+        true,
+        Some(publication_refresh),
     )
     .await
 }
@@ -518,22 +633,29 @@ async fn materialize_session_with_reserved_admission_transaction<
     executor_factory: F,
 ) -> Result<(RunResult, PendingRuntimeExecutorAttachment), SurfaceRuntimeMaterializeError>
 where
-    F: FnOnce(SessionId, RuntimeExecutorAttachmentWitness) -> Box<dyn CoreExecutor>
+    F: FnOnce(
+            SessionId,
+            RuntimeExecutorAttachmentWitness,
+            crate::LiveSessionActorWitnessSlot,
+        ) -> Box<dyn CoreExecutor>
         + Send
         + 'static,
 {
-    let (result, mut prepared) = materialize_unique_session_actor_transaction_with_admission(
-        service,
-        adapter,
-        session,
-        request,
-        reserved_admission,
-    )
-    .await?;
+    let (result, mut prepared, actor_witness_slot) =
+        materialize_unique_session_actor_transaction_with_admission(
+            service,
+            adapter,
+            session,
+            request,
+            reserved_admission,
+        )
+        .await?;
 
     let executor_session_id = result.session_id.clone();
     let attachment = match prepared
-        .ensure_executor_attachment(move |witness| executor_factory(executor_session_id, witness))
+        .ensure_executor_attachment(move |witness| {
+            executor_factory(executor_session_id, witness, actor_witness_slot)
+        })
         .await
     {
         Ok(EnsureRuntimeExecutorAttachment::Pending(pending)) => pending,
@@ -564,7 +686,14 @@ async fn materialize_unique_session_actor_transaction_with_admission<
     session: Session,
     mut request: CreateSessionRequest,
     reserved_admission: crate::RuntimeContextAdmissionGuard,
-) -> Result<(RunResult, PreparedSessionMaterialization), SurfaceRuntimeMaterializeError> {
+) -> Result<
+    (
+        RunResult,
+        PreparedSessionMaterialization,
+        crate::LiveSessionActorWitnessSlot,
+    ),
+    SurfaceRuntimeMaterializeError,
+> {
     let prepared_session_id = session.id().clone();
     let mut prepared = match adapter
         .prepare_session_materialization(prepared_session_id.clone())
@@ -575,8 +704,14 @@ async fn materialize_unique_session_actor_transaction_with_admission<
             return Err(SurfaceRuntimeMaterializeError::RuntimeBindings(error));
         }
     };
-    if let Err(error) =
-        install_prepared_runtime_interrupt_handle(service, adapter, prepared.bindings()).await
+    let actor_witness_slot = crate::LiveSessionActorWitnessSlot::default();
+    if let Err(error) = install_prepared_runtime_interrupt_handle_for_actor_slot(
+        service,
+        adapter,
+        prepared.bindings(),
+        actor_witness_slot.clone(),
+    )
+    .await
     {
         rollback_prepared_runtime_registration(&mut prepared, false).await;
         return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(error));
@@ -590,7 +725,11 @@ async fn materialize_unique_session_actor_transaction_with_admission<
     let (request, initial_turn) = split_runtime_backed_eager_create_request(request);
 
     let create_result = service
-        .create_fresh_session_with_reserved_admission(request, reserved_admission)
+        .create_session_with_reserved_admission_and_actor_witness(
+            request,
+            reserved_admission,
+            &actor_witness_slot,
+        )
         .await;
     let result = match create_result {
         Ok(result) => result,
@@ -646,7 +785,7 @@ async fn materialize_unique_session_actor_transaction_with_admission<
         return Err(error);
     }
 
-    Ok((result, prepared))
+    Ok((result, prepared, actor_witness_slot))
 }
 
 async fn materialize_attached_session_actor_only_with_admission_and_boundary_mode<
@@ -659,6 +798,7 @@ async fn materialize_attached_session_actor_only_with_admission_and_boundary_mod
     mut request: CreateSessionRequest,
     reserved_admission: crate::RuntimeContextAdmissionGuard,
     turn_boundary_already_held: bool,
+    publication_refresh: Option<AttachedActorPublicationRefreshFn>,
 ) -> Result<RunResult, SurfaceRuntimeMaterializeError> {
     let expected_session_id = session.id().clone();
     if witness.session_id() != &expected_session_id {
@@ -686,6 +826,56 @@ async fn materialize_attached_session_actor_only_with_admission_and_boundary_mod
                 .await,
         )
     };
+    let (session, resume_preparation) = match service
+        .prepare_actor_session_seed(&request)
+        .await?
+    {
+        meerkat_session::PreparedActorSessionSeed::FreshGenerationZero => (session, None),
+        meerkat_session::PreparedActorSessionSeed::DurableCommitted { resume } => match resume {
+            meerkat_session::PreparedCommittedBoundaryResume::Materializable {
+                session,
+                materialization:
+                    meerkat_session::PreparedCommittedBoundaryResumeMaterialization::Active,
+                preparation,
+                ..
+            } => (*session, Some(preparation)),
+            meerkat_session::PreparedCommittedBoundaryResume::Materializable {
+                materialization:
+                    meerkat_session::PreparedCommittedBoundaryResumeMaterialization::Revivable,
+                ..
+            }
+            | meerkat_session::PreparedCommittedBoundaryResume::Unavailable { .. } => {
+                return Err(SurfaceRuntimeMaterializeError::Session(
+                    meerkat_core::service::SessionError::NotFound {
+                        id: expected_session_id,
+                    },
+                ));
+            }
+            meerkat_session::PreparedCommittedBoundaryResume::CommittedBoundaryUnprovable {
+                ..
+            } => {
+                return Err(SurfaceRuntimeMaterializeError::Session(
+                    meerkat_core::service::SessionError::DurableTailHeldForRecovery {
+                        id: expected_session_id,
+                    },
+                ));
+            }
+            meerkat_session::PreparedCommittedBoundaryResume::AuthorityChangedDuringMaterialization {
+                ..
+            } => {
+                return Err(SurfaceRuntimeMaterializeError::Session(
+                    meerkat_core::service::SessionError::DurableEvidenceQuarantined {
+                        id: expected_session_id,
+                    },
+                ));
+            }
+        },
+    };
+    // Actor-only recovery preserves the already-serving attachment and does
+    // not normalize durable lifecycle state. A durable owner receipt therefore
+    // crosses this in-memory M claim unchanged and is revalidated exactly by
+    // the persistent service when actor B is inserted. The owner-proven fresh
+    // generation-zero path intentionally carries no receipt.
     let mut prepared = adapter
         .prepare_attached_session_actor_recovery(&witness)
         .await?;
@@ -696,17 +886,91 @@ async fn materialize_attached_session_actor_only_with_admission_and_boundary_mod
     request.build = Some(build);
     let (request, initial_turn) = split_runtime_backed_eager_create_request(request);
 
+    let actor_witness_slot = crate::LiveSessionActorWitnessSlot::default();
     let result = service
-        .create_session_with_reserved_admission_under_runtime_turn_boundary(
+        .create_session_with_reserved_admission_and_actor_witness_under_runtime_turn_boundary(
             request,
             reserved_admission,
+            resume_preparation,
+            &actor_witness_slot,
         )
         .await?;
     ensure_materialized_session_id_matches(&expected_session_id, &result.session_id)?;
 
+    let actor_witness = actor_witness_slot.witness().ok_or_else(|| {
+        SurfaceRuntimeMaterializeError::RuntimeDriver(RuntimeDriverError::ValidationFailed {
+            reason: format!(
+                "session service did not publish exact actor authority for recovered session {expected_session_id}"
+            ),
+        })
+    })?;
+    if actor_witness.session_id() != &expected_session_id || !actor_witness.is_live() {
+        return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(
+            RuntimeDriverError::StaleAuthority {
+                reason: format!(
+                    "session service published stale or mismatched actor authority for recovered session {expected_session_id}"
+                ),
+            },
+        ));
+    }
+    let publication_handle = match publication_refresh {
+        Some(publication_refresh) => match publication_refresh(
+            prepared.witness(),
+            actor_witness.clone(),
+            actor_witness_slot.clone(),
+        ) {
+            Ok(publication_handle) => publication_handle,
+            Err(error) => {
+                let cleanup_error = service
+                    .discard_live_session_actor_under_runtime_turn_boundary(&actor_witness)
+                    .await
+                    .err();
+                return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(
+                    match cleanup_error {
+                        Some(cleanup_error) => RuntimeDriverError::Internal(format!(
+                            "{error}; exact recovered actor cleanup also failed: {cleanup_error}"
+                        )),
+                        None => error,
+                    },
+                ));
+            }
+        },
+        None => persistent_runtime_publication_handle(Arc::clone(service), actor_witness.clone()),
+    };
+
     // Actor publication is the only lifecycle fact owned by this path. The
     // exact executor already serves and must never be replaced or rolled back.
-    prepared.commit_actor()?;
+    if let Err(error) = prepared
+        .replace_publication_handle_for_recovered_actor(publication_handle)
+        .await
+    {
+        let cleanup_error = service
+            .discard_live_session_actor_under_runtime_turn_boundary(&actor_witness)
+            .await
+            .err();
+        return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(
+            match cleanup_error {
+                Some(cleanup_error) => RuntimeDriverError::Internal(format!(
+                    "{error}; exact recovered actor cleanup also failed: {cleanup_error}"
+                )),
+                None => error,
+            },
+        ));
+    }
+    if let Err(error) = prepared.commit_actor() {
+        let cleanup_error = service
+            .discard_live_session_actor_under_runtime_turn_boundary(&actor_witness)
+            .await
+            .err();
+        return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(
+            match cleanup_error {
+                Some(cleanup_error) => RuntimeDriverError::Internal(format!(
+                    "{error}; exact recovered actor cleanup also failed: {cleanup_error}"
+                )),
+                None => error,
+            },
+        ));
+    }
     drop(locally_owned_turn_boundary);
 
     let result = match initial_turn {
@@ -787,6 +1051,15 @@ pub async fn configure_peer_ingress<B: SessionAgentBuilder + 'static>(
         .map(|_spawned| ())
 }
 
+/// Construct a lower-level persistent executor without actor publication
+/// authority.
+///
+/// This intentionally returns no terminal-publication handle until the caller
+/// binds a service-minted witness or slot. Bundled materialization surfaces
+/// use the actor-slot transaction instead. Embedders that need terminal
+/// publication must construct [`PersistentRuntimeExecutor`] directly and bind
+/// `with_publication_actor_witness` or `with_publication_actor_slot` before
+/// handing it to the machine.
 pub fn default_persistent_executor<B: SessionAgentBuilder + 'static>(
     service: Arc<PersistentSessionService<B>>,
     adapter: Arc<MeerkatMachine>,
@@ -812,6 +1085,8 @@ fn assert_runtime_backed_is_builder_generic<B: SessionAgentBuilder + 'static>(
     default_persistent_executor::<B>(service, adapter, session_id)
 }
 
+/// WorkGraph-enabled sibling of [`default_persistent_executor`]. It carries
+/// the same explicit fail-closed publication contract.
 pub fn default_persistent_executor_with_workgraph_service<B: SessionAgentBuilder + 'static>(
     service: Arc<PersistentSessionService<B>>,
     adapter: Arc<MeerkatMachine>,
@@ -830,7 +1105,9 @@ pub struct PersistentRuntimeExecutor<B: SessionAgentBuilder> {
     service: Arc<PersistentSessionService<B>>,
     adapter: Arc<MeerkatMachine>,
     session_id: SessionId,
+    attachment_witness: Option<RuntimeExecutorAttachmentWitness>,
     workgraph_service: Option<WorkGraphService>,
+    publication_actor: Option<PersistentRuntimePublicationActor>,
 }
 
 struct PersistentRuntimeBoundaryHandle<B: SessionAgentBuilder> {
@@ -888,7 +1165,41 @@ struct PersistentRuntimeInterruptHandle<B: SessionAgentBuilder> {
 
 struct PersistentRuntimePublicationHandle<B: SessionAgentBuilder> {
     service: Arc<PersistentSessionService<B>>,
-    session_id: SessionId,
+    actor: PersistentRuntimePublicationActor,
+}
+
+#[derive(Clone)]
+enum PersistentRuntimePublicationActor {
+    Witness(crate::LiveSessionActorWitness),
+    Slot {
+        expected_session_id: SessionId,
+        slot: crate::LiveSessionActorWitnessSlot,
+    },
+}
+
+impl PersistentRuntimePublicationActor {
+    fn witness(&self) -> Result<crate::LiveSessionActorWitness, CoreExecutorError> {
+        match self {
+            Self::Witness(witness) => Ok(witness.clone()),
+            Self::Slot {
+                expected_session_id,
+                slot,
+            } => {
+                let witness = slot.witness().ok_or_else(|| {
+                    CoreExecutorError::control_failed_runtime(format!(
+                        "terminal publication refused because the service has not published the exact actor witness for session {expected_session_id}"
+                    ))
+                })?;
+                if witness.session_id() != expected_session_id {
+                    return Err(CoreExecutorError::control_failed_runtime(format!(
+                        "terminal publication actor witness for session {} was published into the slot for session {expected_session_id}",
+                        witness.session_id()
+                    )));
+                }
+                Ok(witness)
+            }
+        }
+    }
 }
 
 struct PersistentRuntimePostStopCleanupHandle<B: SessionAgentBuilder> {
@@ -909,11 +1220,31 @@ struct PersistentRuntimeTurnFinalizationBoundaryHandle<B: SessionAgentBuilder> {
 /// outside their mutable executor loop (for example, stop terminalization).
 pub fn persistent_runtime_publication_handle<B: SessionAgentBuilder + 'static>(
     service: Arc<PersistentSessionService<B>>,
-    session_id: SessionId,
+    actor_witness: crate::LiveSessionActorWitness,
 ) -> Arc<dyn CoreExecutorPublicationHandle> {
     Arc::new(PersistentRuntimePublicationHandle {
         service,
-        session_id,
+        actor: PersistentRuntimePublicationActor::Witness(actor_witness),
+    })
+}
+
+/// Build terminal-publication authority for an actor-materialization
+/// transaction whose exact service-minted witness has not been published yet.
+///
+/// Publication fails closed while the slot is empty. Once populated, every
+/// callback remains bound to that one actor incarnation and never resolves a
+/// replacement through the logical `SessionId`.
+pub fn persistent_runtime_publication_handle_for_actor_slot<B: SessionAgentBuilder + 'static>(
+    service: Arc<PersistentSessionService<B>>,
+    expected_session_id: SessionId,
+    actor_witness_slot: crate::LiveSessionActorWitnessSlot,
+) -> Arc<dyn CoreExecutorPublicationHandle> {
+    Arc::new(PersistentRuntimePublicationHandle {
+        service,
+        actor: PersistentRuntimePublicationActor::Slot {
+            expected_session_id,
+            slot: actor_witness_slot,
+        },
     })
 }
 
@@ -1049,8 +1380,9 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutorPublicationHandle
         Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
         CoreExecutorError,
     > {
+        let witness = self.actor.witness()?;
         self.service
-            .publish_interaction_terminals_exact_batch(&self.session_id, events)
+            .publish_interaction_terminals_exact_batch_for_actor(&witness, events)
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
@@ -1060,15 +1392,20 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutorPublicationHandle
 impl<B: SessionAgentBuilder + 'static> CoreExecutorInterruptHandle
     for PersistentRuntimeInterruptHandle<B>
 {
-    async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
+    async fn hard_cancel_run_if_current(
+        &self,
+        expected_run_id: &meerkat_core::RunId,
+        _reason: String,
+    ) -> Result<bool, CoreExecutorError> {
         self.service
-            .interrupt_with_machine_authority(
+            .interrupt_run_with_machine_authority(
                 &self.session_id,
+                expected_run_id,
                 self.adapter.session_control_authority(),
             )
             .await
             .or_else(|error| match error {
-                SessionError::NotRunning { .. } => Ok(()),
+                SessionError::NotRunning { .. } => Ok(false),
                 error => Err(error),
             })
             .map_err(|error| CoreExecutorError::control_failed_runtime(error.to_string()))
@@ -1085,7 +1422,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentRuntimeExecutor<B> {
             service,
             adapter,
             session_id,
+            attachment_witness: None,
             workgraph_service: None,
+            publication_actor: None,
         }
     }
 
@@ -1099,8 +1438,66 @@ impl<B: SessionAgentBuilder + 'static> PersistentRuntimeExecutor<B> {
             service,
             adapter,
             session_id,
+            attachment_witness: None,
             workgraph_service: Some(workgraph_service),
+            publication_actor: None,
         }
+    }
+
+    /// Construct the bundled executor inside an exact machine attachment
+    /// factory. The one-shot actor slot is service-minted by the same
+    /// materialization transaction, while the attachment witness prevents a
+    /// mutable executor from sampling publication authority from any later
+    /// same-SessionId replacement.
+    pub(crate) fn new_for_actor_slot_and_attachment(
+        service: Arc<PersistentSessionService<B>>,
+        adapter: Arc<MeerkatMachine>,
+        attachment_witness: RuntimeExecutorAttachmentWitness,
+        actor_witness_slot: crate::LiveSessionActorWitnessSlot,
+        workgraph_service: Option<WorkGraphService>,
+    ) -> Self {
+        let session_id = attachment_witness.session_id().clone();
+        Self {
+            service,
+            adapter,
+            session_id: session_id.clone(),
+            attachment_witness: Some(attachment_witness),
+            workgraph_service,
+            publication_actor: Some(PersistentRuntimePublicationActor::Slot {
+                expected_session_id: session_id,
+                slot: actor_witness_slot,
+            }),
+        }
+    }
+
+    /// Bind terminal publication to one exact service-minted actor witness.
+    pub fn with_publication_actor_witness(
+        mut self,
+        actor_witness: crate::LiveSessionActorWitness,
+    ) -> Result<Self, CoreExecutorError> {
+        if actor_witness.session_id() != &self.session_id {
+            return Err(CoreExecutorError::control_failed_runtime(format!(
+                "terminal publication actor witness for session {} cannot bind executor for session {}",
+                actor_witness.session_id(),
+                self.session_id
+            )));
+        }
+        self.publication_actor = Some(PersistentRuntimePublicationActor::Witness(actor_witness));
+        Ok(self)
+    }
+
+    /// Bind terminal publication to the service's one-shot actor witness slot.
+    /// Calls before service publication fail closed.
+    #[must_use]
+    pub fn with_publication_actor_slot(
+        mut self,
+        actor_witness_slot: crate::LiveSessionActorWitnessSlot,
+    ) -> Self {
+        self.publication_actor = Some(PersistentRuntimePublicationActor::Slot {
+            expected_session_id: self.session_id.clone(),
+            slot: actor_witness_slot,
+        });
+        self
     }
 
     async fn authoritative_non_archived_session_after_not_found<F>(
@@ -1193,10 +1590,12 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutor for PersistentRuntimeExecuto
     }
 
     fn publication_handle(&self) -> Option<Arc<dyn CoreExecutorPublicationHandle>> {
-        Some(persistent_runtime_publication_handle(
-            Arc::clone(&self.service),
-            self.session_id.clone(),
-        ))
+        self.publication_actor.as_ref().map(|actor| {
+            Arc::new(PersistentRuntimePublicationHandle {
+                service: Arc::clone(&self.service),
+                actor: actor.clone(),
+            }) as Arc<dyn CoreExecutorPublicationHandle>
+        })
     }
 
     fn machine_managed_post_stop_unregister(&self) -> bool {
@@ -1343,9 +1742,25 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutor for PersistentRuntimeExecuto
         Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
         CoreExecutorError,
     > {
+        if let Some(attachment_witness) = self.attachment_witness.as_ref() {
+            let publication_handle = self
+                .adapter
+                .publication_handle_for_executor_attachment(attachment_witness)
+                .await
+                .map_err(|error| CoreExecutorError::control_failed_runtime(error.to_string()))?;
+            return publication_handle
+                .publish_interaction_terminals(events)
+                .await;
+        }
+        let actor = self.publication_actor.clone().ok_or_else(|| {
+            CoreExecutorError::control_failed_runtime(format!(
+                "terminal publication refused because executor for session {} has no exact service-minted actor witness",
+                self.session_id
+            ))
+        })?;
         PersistentRuntimePublicationHandle {
             service: Arc::clone(&self.service),
-            session_id: self.session_id.clone(),
+            actor,
         }
         .publish_interaction_terminals(events)
         .await
@@ -1479,6 +1894,24 @@ mod tests {
     #[cfg(feature = "comms")]
     use crate::CommsRuntime;
     use crate::{PersistenceBundle, SessionStore, SessionStoreError};
+
+    #[test]
+    fn terminal_publication_actor_slot_fails_closed_before_service_publication() {
+        let session_id = SessionId::new();
+        let actor = PersistentRuntimePublicationActor::Slot {
+            expected_session_id: session_id.clone(),
+            slot: crate::LiveSessionActorWitnessSlot::default(),
+        };
+
+        let error = actor
+            .witness()
+            .expect_err("an empty service witness slot must not resolve by SessionId");
+        assert!(
+            error.to_string().contains(&session_id.to_string()),
+            "fail-closed error must identify the logical session without resolving it"
+        );
+    }
+
     #[test]
     fn run_primitive_carries_runtime_metadata_into_start_turn_request() {
         let skill = meerkat_core::skills::SkillKey::builtin(
@@ -1619,7 +2052,9 @@ mod tests {
             .expect("build default persistence");
         let factory = crate::AgentFactory::new(temp.path().join("sessions"));
         let mut builder = FactoryAgentBuilder::new(factory, crate::Config::default());
-        builder.default_llm_client = Some(Arc::new(TestClient::default()));
+        builder.default_llm_client = Some(Arc::new(TestClient::for_provider(
+            meerkat_core::Provider::OpenAI,
+        )));
         let (service, runtime_adapter) =
             build_runtime_backed_service(builder, active_session_capacity, persistence);
         (Arc::new(service), runtime_adapter)
@@ -1648,7 +2083,9 @@ mod tests {
         let factory = crate::AgentFactory::new(temp.path().join("sessions"));
 
         let mut builder = FactoryAgentBuilder::new(factory, crate::Config::default());
-        builder.default_llm_client = Some(Arc::new(TestClient::default()));
+        builder.default_llm_client = Some(Arc::new(TestClient::for_provider(
+            meerkat_core::Provider::OpenAI,
+        )));
         let (service, runtime_adapter) = build_runtime_backed_service(builder, 4, persistence);
         (Arc::new(service), runtime_adapter)
     }
@@ -1667,22 +2104,34 @@ mod tests {
             Ok(messages.to_vec())
         }
 
-        fn stream<'a>(&'a self, _request: &'a LlmRequest) -> LlmStream<'a> {
+        fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
             let started = Arc::clone(&self.started);
             let release = Arc::clone(&self.release);
-            Box::pin(futures::stream::once(async move {
+            let model = request.model.clone();
+            let usage = futures::stream::once(async move {
                 started.store(true, Ordering::SeqCst);
                 release.notified().await;
-                Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                Ok(LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::OpenAI,
+                        &model,
+                        meerkat_core::Usage::default(),
+                    ),
                 })
-            }))
+            });
+            let done: Result<LlmEvent, LlmError> = Ok(LlmEvent::Done {
+                outcome: LlmDoneOutcome::Success {
+                    stop_reason: meerkat_core::StopReason::EndTurn,
+                },
+            });
+            Box::pin(futures::StreamExt::chain(
+                usage,
+                futures::stream::iter([done]),
+            ))
         }
 
         fn provider(&self) -> meerkat_core::Provider {
-            meerkat_core::Provider::Other
+            meerkat_core::Provider::OpenAI
         }
 
         async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
@@ -1703,8 +2152,15 @@ mod tests {
             Ok(messages.to_vec())
         }
 
-        fn stream<'a>(&'a self, _request: &'a LlmRequest) -> LlmStream<'a> {
+        fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
             let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            let usage = || LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    meerkat_core::Provider::OpenAI,
+                    &request.model,
+                    meerkat_core::Usage::default(),
+                ),
+            };
             let events = if call_index == 0 {
                 vec![
                     LlmEvent::ToolCallComplete {
@@ -1713,6 +2169,7 @@ mod tests {
                         args: serde_json::json!({}),
                         meta: None,
                     },
+                    usage(),
                     LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat_core::StopReason::ToolUse,
@@ -1725,6 +2182,7 @@ mod tests {
                         delta: "ok".to_string(),
                         meta: None,
                     },
+                    usage(),
                     LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat_core::StopReason::EndTurn,
@@ -1736,7 +2194,7 @@ mod tests {
         }
 
         fn provider(&self) -> meerkat_core::Provider {
-            meerkat_core::Provider::Other
+            meerkat_core::Provider::OpenAI
         }
 
         async fn health_check(&self) -> Result<(), LlmError> {
@@ -1791,7 +2249,7 @@ mod tests {
         }
 
         fn provider(&self) -> meerkat_core::Provider {
-            meerkat_core::Provider::Other
+            meerkat_core::Provider::OpenAI
         }
 
         async fn health_check(&self) -> Result<(), LlmError> {
@@ -2311,6 +2769,13 @@ mod tests {
                 args: serde_json::json!({ "key": "alpha" }),
                 meta: None,
             },
+            LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    meerkat_core::Provider::OpenAI,
+                    "gpt-5.4",
+                    meerkat_core::Usage::default(),
+                ),
+            },
             LlmEvent::Done {
                 outcome: LlmDoneOutcome::Success {
                     stop_reason: meerkat_core::StopReason::ToolUse,
@@ -2574,7 +3039,7 @@ mod tests {
         executor
             .interrupt_handle()
             .expect("interrupt handle")
-            .hard_cancel_current_run("test cancel".to_string())
+            .hard_cancel_run_if_current(&meerkat_core::RunId::new(), "test cancel".to_string())
             .await
             .expect("interrupt without an active run is a no-op");
 

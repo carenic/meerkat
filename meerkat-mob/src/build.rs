@@ -703,10 +703,18 @@ mod tests {
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
 
-    #[derive(Default)]
     struct CaptureClient {
         inner: TestClient,
         seen_tools: Mutex<Vec<String>>,
+    }
+
+    impl Default for CaptureClient {
+        fn default() -> Self {
+            Self {
+                inner: TestClient::for_provider(meerkat_core::Provider::Anthropic),
+                seen_tools: Mutex::default(),
+            }
+        }
     }
 
     impl CaptureClient {
@@ -951,9 +959,15 @@ mod tests {
             .expect("test visibility authority should mint from snapshot")
     }
 
-    fn test_workgraph_tools() -> Arc<dyn meerkat_core::AgentToolDispatcher> {
+    fn test_workgraph_tools(
+        grant: meerkat::WorkGraphNamespaceGrant,
+    ) -> Arc<dyn meerkat_core::AgentToolDispatcher> {
         Arc::new(meerkat::WorkGraphToolSurface::new(
-            meerkat::WorkGraphService::new(Arc::new(meerkat::MemoryWorkGraphStore::new())),
+            meerkat::WorkGraphService::with_namespace_grant(
+                Arc::new(meerkat::MemoryWorkGraphStore::new()),
+                grant,
+            )
+            .expect("test WorkGraph grant must be valid"),
         ))
     }
 
@@ -1396,7 +1410,10 @@ mod tests {
         .await
         .expect("build_agent_config");
         config.llm_client_override = Some(capture.clone());
-        config.workgraph_tools = Some(test_workgraph_tools());
+        let workgraph_grant = meerkat::WorkGraphNamespaceGrant::new("mob.test-mob", "default")
+            .expect("test WorkGraph grant must match the mob realm");
+        config.workgraph_namespace_grant = Some(workgraph_grant.clone());
+        config.workgraph_tools = Some(test_workgraph_tools(workgraph_grant));
 
         let factory = meerkat::AgentFactory::new(temp.path().join("sessions"))
             .builtins(false)

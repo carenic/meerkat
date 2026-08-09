@@ -241,10 +241,14 @@ async fn public_sender_runtime(receiver_name: &str, receiver: &CommsRuntime) -> 
 
 async fn drain_one_volatile(
     runtime: Arc<CommsRuntime>,
-) -> meerkat_core::ClassifiedInboxInteraction {
+) -> meerkat_core::interaction::PeerInputCandidate {
     loop {
         let mut candidates =
-            meerkat_core::agent::CommsRuntime::drain_peer_input_candidates(runtime.as_ref()).await;
+            meerkat_core::agent::CommsRuntime::handoff_volatile_peer_input_candidates(
+                runtime.as_ref(),
+            )
+            .await
+            .expect("volatile peer-input handoff");
         if let Some(candidate) = candidates.pop() {
             return candidate;
         }
@@ -414,10 +418,11 @@ async fn concurrent_revokes_and_admissions_never_admit_untrusted() {
     let drain_receiver = Arc::clone(&receiver);
     let volatile_drain = tokio::spawn(async move {
         loop {
-            let _ = meerkat_core::agent::CommsRuntime::drain_peer_input_candidates(
+            meerkat_core::agent::CommsRuntime::handoff_volatile_peer_input_candidates(
                 drain_receiver.as_ref(),
             )
-            .await;
+            .await
+            .expect("exact volatile handoff");
             tokio::task::yield_now().await;
         }
     });

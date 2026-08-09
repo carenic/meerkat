@@ -7,17 +7,18 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 #[cfg(not(target_arch = "wasm32"))]
 use rusqlite::{
-    Connection, Error, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, Error, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+    params,
 };
 
 use crate::WorkGraphError;
 use crate::types::{
-    AttentionListRequest, AttentionPruneRequest, WorkAttentionBinding, WorkAttentionBindingId,
-    WorkAttentionStatus, WorkEdge, WorkExecutionBinding, WorkExecutionBindingFilter,
-    WorkExecutionBindingId, WorkGraphEvent, WorkGraphEventKind, WorkItem, WorkItemFilter,
-    WorkItemId, WorkNamespace,
+    AttentionListRequest, AttentionPruneRequest, ClaimWorkItemRequest, ObserveReadinessRequest,
+    WorkAttentionBinding, WorkAttentionBindingId, WorkAttentionStatus, WorkEdge,
+    WorkExecutionBinding, WorkExecutionBindingFilter, WorkExecutionBindingId, WorkGraphEvent,
+    WorkGraphEventKind, WorkGraphFact, WorkItem, WorkItemFilter, WorkItemId, WorkNamespace,
 };
-use crate::{WorkAttentionMachine, WorkGraphMachine};
+use crate::{ChildJoinDisposition, WorkAttentionMachine, WorkGraphMachine};
 
 #[cfg(target_arch = "wasm32")]
 use crate::tokio::sync::RwLock;
@@ -60,6 +61,16 @@ pub struct WorkGraphEventFilter {
     pub limit: Option<usize>,
 }
 
+/// One exact namespace snapshot captured under a single store read boundary.
+#[derive(Debug, Clone)]
+pub struct WorkGraphNamespaceRead {
+    pub captured_at: DateTime<Utc>,
+    pub event_high_water_mark: Option<i64>,
+    pub items: Vec<WorkItem>,
+    pub edges: Vec<WorkEdge>,
+    pub attention: Vec<WorkAttentionBinding>,
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait WorkGraphStore: Send + Sync {
@@ -80,6 +91,44 @@ pub trait WorkGraphStore: Send + Sync {
         event: WorkGraphEvent,
     ) -> Result<WorkItem, WorkGraphError>;
 
+    /// Atomically evaluate the current blocker/child graph and admit a claim.
+    /// `Ok(None)` means a failed/cancelled child policy must be reconciled by
+    /// the service before the caller retries; no claim mutation was committed.
+    async fn claim_item_atomically(
+        &self,
+        _realm_id: &str,
+        _namespace: &WorkNamespace,
+        _request: ClaimWorkItemRequest,
+        _observed_at: DateTime<Utc>,
+    ) -> Result<Option<WorkItem>, WorkGraphError> {
+        Err(unsupported(self.kind()))
+    }
+
+    /// Atomically evaluate the current blocker/child graph and record the
+    /// Schedule-owned readiness observation. WorkGraph owns no clock or loop.
+    async fn observe_readiness_atomically(
+        &self,
+        _realm_id: &str,
+        _namespace: &WorkNamespace,
+        _request: ObserveReadinessRequest,
+    ) -> Result<Option<WorkItem>, WorkGraphError> {
+        Err(unsupported(self.kind()))
+    }
+
+    /// Atomically reconcile one parent's failed/cancelled child policy against
+    /// the current graph. A terminal transition and attention shutdown commit
+    /// together; `None` means no propagation is currently authorized.
+    async fn reconcile_child_join_atomically(
+        &self,
+        _realm_id: &str,
+        _namespace: &WorkNamespace,
+        _parent_id: &WorkItemId,
+        _expected_revision: u64,
+        _observed_at: DateTime<Utc>,
+    ) -> Result<Option<WorkItem>, WorkGraphError> {
+        Err(unsupported(self.kind()))
+    }
+
     async fn update_item_and_attention_cas(
         &self,
         item: WorkItem,
@@ -97,6 +146,24 @@ pub trait WorkGraphStore: Send + Sync {
 
     async fn list_items(&self, filter: WorkItemFilter) -> Result<Vec<WorkItem>, WorkGraphError>;
 
+    /// Read one namespace's items, edges, and observation time from one store
+    /// snapshot. This is observational only and grants no claim authority.
+    async fn read_namespace_graph(
+        &self,
+        _realm_id: &str,
+        _namespace: &WorkNamespace,
+    ) -> Result<(DateTime<Utc>, Vec<WorkItem>, Vec<WorkEdge>), WorkGraphError> {
+        Err(unsupported(self.kind()))
+    }
+
+    async fn read_namespace_snapshot(
+        &self,
+        _realm_id: &str,
+        _namespace: &WorkNamespace,
+    ) -> Result<WorkGraphNamespaceRead, WorkGraphError> {
+        Err(unsupported(self.kind()))
+    }
+
     async fn insert_goal(
         &self,
         _item: WorkItem,
@@ -104,6 +171,17 @@ pub trait WorkGraphStore: Send + Sync {
         _attention: WorkAttentionBinding,
         _attention_event: WorkGraphEvent,
     ) -> Result<(WorkItem, WorkAttentionBinding), WorkGraphError> {
+        Err(unsupported(self.kind()))
+    }
+
+    /// Insert attention for an existing item after proving its revision and
+    /// nonterminal lifecycle in the same transaction.
+    async fn insert_attention_for_existing_item(
+        &self,
+        _attention: WorkAttentionBinding,
+        _expected_item_revision: u64,
+        _event: WorkGraphEvent,
+    ) -> Result<WorkAttentionBinding, WorkGraphError> {
         Err(unsupported(self.kind()))
     }
 
@@ -197,11 +275,12 @@ pub trait WorkGraphStore: Send + Sync {
     async fn list_execution_bindings_for_recovery(
         &self,
         realm_id: &str,
+        namespace: &WorkNamespace,
     ) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
         let mut bindings = self
             .list_execution_bindings(WorkExecutionBindingFilter {
                 realm_id: Some(realm_id.to_string()),
-                namespace: None,
+                namespace: Some(namespace.clone()),
                 item_id: None,
                 current_only: true,
                 limit: None,
@@ -473,8 +552,8 @@ impl WorkGraphStore for MemoryWorkGraphStore {
 
     async fn insert_item(
         &self,
-        item: WorkItem,
-        event: WorkGraphEvent,
+        mut item: WorkItem,
+        mut event: WorkGraphEvent,
     ) -> Result<WorkItem, WorkGraphError> {
         WorkGraphMachine::validate_item_projection(&item)?;
         let mut guard = self.inner.write().await;
@@ -485,6 +564,13 @@ impl WorkGraphStore for MemoryWorkGraphStore {
                 item.id
             )));
         }
+        enrich_item_transition_facts(
+            None,
+            &mut item,
+            guard.items.values(),
+            guard.edges.iter(),
+            &mut event,
+        )?;
         guard.items.insert(key, item.clone());
         guard.append_event(event);
         Ok(item)
@@ -492,9 +578,9 @@ impl WorkGraphStore for MemoryWorkGraphStore {
 
     async fn update_item_cas(
         &self,
-        item: WorkItem,
+        mut item: WorkItem,
         expected_previous_revision: u64,
-        event: WorkGraphEvent,
+        mut event: WorkGraphEvent,
     ) -> Result<WorkItem, WorkGraphError> {
         WorkGraphMachine::validate_item_projection(&item)?;
         let mut guard = self.inner.write().await;
@@ -513,9 +599,268 @@ impl WorkGraphStore for MemoryWorkGraphStore {
                 actual: current.revision,
             });
         }
+        let previous = current.clone();
+        enrich_item_transition_facts(
+            Some(&previous),
+            &mut item,
+            guard.items.values(),
+            guard.edges.iter(),
+            &mut event,
+        )?;
         guard.items.insert(key, item.clone());
         guard.append_event(event);
         Ok(item)
+    }
+
+    async fn claim_item_atomically(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+        mut request: ClaimWorkItemRequest,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<WorkItem>, WorkGraphError> {
+        let mut guard = self.inner.write().await;
+        let key = item_key(realm_id, namespace, &request.id);
+        let previous = guard.items.get(&key).cloned().ok_or_else(|| {
+            WorkGraphError::not_found(realm_id.to_string(), namespace.clone(), request.id.clone())
+        })?;
+        if request.expected_revision != previous.revision {
+            return Err(WorkGraphError::StaleRevision {
+                id: previous.id.clone(),
+                expected: request.expected_revision,
+                actual: previous.revision,
+            });
+        }
+        WorkGraphMachine::validate_claim_request(&request, &observed_at)?;
+        let items = guard
+            .items
+            .values()
+            .filter(|item| item.realm_id == realm_id && &item.namespace == namespace)
+            .cloned()
+            .collect::<Vec<_>>();
+        let edges = guard
+            .edges
+            .iter()
+            .filter(|edge| edge.realm_id == realm_id && &edge.namespace == namespace)
+            .cloned()
+            .collect::<Vec<_>>();
+        let disposition = child_join_disposition_with_graph(&previous, &items, &edges)?;
+        if matches!(
+            disposition,
+            ChildJoinDisposition::PropagateFailure | ChildJoinDisposition::PropagateCancellation
+        ) {
+            return Ok(None);
+        }
+        let unresolved = unresolved_blocker_count_with_graph(&previous, &items, &edges)?;
+        let (admission_item, refresh_event) =
+            match WorkGraphMachine::refresh_eligibility(previous.clone(), unresolved, observed_at)?
+            {
+                Some((mut refreshed, mut event)) => {
+                    enrich_item_transition_facts(
+                        Some(&previous),
+                        &mut refreshed,
+                        items.iter(),
+                        edges.iter(),
+                        &mut event,
+                    )?;
+                    (refreshed, Some(event))
+                }
+                None => (previous.clone(), None),
+            };
+        request.expected_revision = admission_item.revision;
+        let (mut item, mut event) = WorkGraphMachine::claim_item_with_unresolved_blockers(
+            admission_item.clone(),
+            unresolved,
+            matches!(disposition, ChildJoinDisposition::Satisfied),
+            request,
+            observed_at,
+        )?;
+        enrich_item_transition_facts(
+            Some(&admission_item),
+            &mut item,
+            items.iter(),
+            edges.iter(),
+            &mut event,
+        )?;
+        guard.items.insert(key, item.clone());
+        if let Some(refresh_event) = refresh_event {
+            guard.append_event(refresh_event);
+        }
+        guard.append_event(event);
+        Ok(Some(item))
+    }
+
+    async fn observe_readiness_atomically(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+        mut request: ObserveReadinessRequest,
+    ) -> Result<Option<WorkItem>, WorkGraphError> {
+        let mut guard = self.inner.write().await;
+        let key = item_key(realm_id, namespace, &request.id);
+        let previous = guard.items.get(&key).cloned().ok_or_else(|| {
+            WorkGraphError::not_found(realm_id.to_string(), namespace.clone(), request.id.clone())
+        })?;
+        if request.expected_revision != previous.revision {
+            return Err(WorkGraphError::StaleRevision {
+                id: previous.id.clone(),
+                expected: request.expected_revision,
+                actual: previous.revision,
+            });
+        }
+        let items = guard
+            .items
+            .values()
+            .filter(|item| item.realm_id == realm_id && &item.namespace == namespace)
+            .cloned()
+            .collect::<Vec<_>>();
+        let edges = guard
+            .edges
+            .iter()
+            .filter(|edge| edge.realm_id == realm_id && &edge.namespace == namespace)
+            .cloned()
+            .collect::<Vec<_>>();
+        let disposition = child_join_disposition_with_graph(&previous, &items, &edges)?;
+        if matches!(
+            disposition,
+            ChildJoinDisposition::PropagateFailure | ChildJoinDisposition::PropagateCancellation
+        ) {
+            return Ok(None);
+        }
+        let unresolved = unresolved_blocker_count_with_graph(&previous, &items, &edges)?;
+        let (admission_item, refresh_event) = match WorkGraphMachine::refresh_eligibility(
+            previous.clone(),
+            unresolved,
+            request.observed_at,
+        )? {
+            Some((mut refreshed, mut event)) => {
+                enrich_item_transition_facts(
+                    Some(&previous),
+                    &mut refreshed,
+                    items.iter(),
+                    edges.iter(),
+                    &mut event,
+                )?;
+                (refreshed, Some(event))
+            }
+            None => (previous.clone(), None),
+        };
+        request.expected_revision = admission_item.revision;
+        let (mut item, mut event) = WorkGraphMachine::observe_readiness(
+            admission_item.clone(),
+            request,
+            unresolved,
+            matches!(disposition, ChildJoinDisposition::Satisfied),
+        )?;
+        enrich_item_transition_facts(
+            Some(&admission_item),
+            &mut item,
+            items.iter(),
+            edges.iter(),
+            &mut event,
+        )?;
+        guard.items.insert(key, item.clone());
+        if let Some(refresh_event) = refresh_event {
+            guard.append_event(refresh_event);
+        }
+        guard.append_event(event);
+        Ok(Some(item))
+    }
+
+    async fn reconcile_child_join_atomically(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+        parent_id: &WorkItemId,
+        expected_revision: u64,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<WorkItem>, WorkGraphError> {
+        let mut guard = self.inner.write().await;
+        let key = item_key(realm_id, namespace, parent_id);
+        let Some(previous) = guard.items.get(&key).cloned() else {
+            return Ok(None);
+        };
+        if previous.revision != expected_revision {
+            return Err(WorkGraphError::StaleRevision {
+                id: previous.id.clone(),
+                expected: expected_revision,
+                actual: previous.revision,
+            });
+        }
+        if WorkGraphMachine::classify_terminality(&previous)? {
+            return Ok(Some(previous));
+        }
+        let items = guard
+            .items
+            .values()
+            .filter(|item| item.realm_id == realm_id && &item.namespace == namespace)
+            .cloned()
+            .collect::<Vec<_>>();
+        let edges = guard
+            .edges
+            .iter()
+            .filter(|edge| edge.realm_id == realm_id && &edge.namespace == namespace)
+            .cloned()
+            .collect::<Vec<_>>();
+        let status = match child_join_disposition_with_graph(&previous, &items, &edges)? {
+            ChildJoinDisposition::PropagateFailure => crate::types::WorkStatus::Failed,
+            ChildJoinDisposition::PropagateCancellation => crate::types::WorkStatus::Cancelled,
+            ChildJoinDisposition::Waiting | ChildJoinDisposition::Satisfied => return Ok(None),
+        };
+        let (mut terminal, mut item_event) = WorkGraphMachine::close_item(
+            previous.clone(),
+            crate::types::CloseWorkItemRequest {
+                id: previous.id.clone(),
+                realm_id: Some(realm_id.to_string()),
+                namespace: Some(namespace.clone()),
+                expected_revision: previous.revision,
+                status,
+            },
+            observed_at,
+        )?;
+        enrich_item_transition_facts(
+            Some(&previous),
+            &mut terminal,
+            items.iter(),
+            edges.iter(),
+            &mut item_event,
+        )?;
+        let active_attention = guard
+            .attention
+            .values()
+            .filter(|binding| {
+                binding.work_ref.realm_id == realm_id
+                    && &binding.work_ref.namespace == namespace
+                    && &binding.work_ref.item_id == parent_id
+                    && !matches!(
+                        binding.status,
+                        WorkAttentionStatus::Stopped | WorkAttentionStatus::Superseded
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut stopped_attention = Vec::with_capacity(active_attention.len());
+        for binding in active_attention {
+            let stopped = WorkAttentionMachine::stop(
+                binding.clone(),
+                binding.machine_state.revision,
+                observed_at,
+            )?;
+            let event = attention_transition_event(&stopped, observed_at);
+            stopped_attention.push((stopped, event));
+        }
+        guard.items.insert(key, terminal.clone());
+        guard.append_event(item_event);
+        for (binding, event) in stopped_attention {
+            let key = attention_key(
+                &binding.work_ref.realm_id,
+                &binding.work_ref.namespace,
+                &binding.binding_id,
+            );
+            guard.attention.insert(key, binding);
+            guard.append_event(event);
+        }
+        Ok(Some(terminal))
     }
 
     async fn get_item(
@@ -562,6 +907,70 @@ impl WorkGraphStore for MemoryWorkGraphStore {
             .collect::<Vec<_>>();
         items.sort_by(compare);
         Ok(items)
+    }
+
+    async fn read_namespace_graph(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+    ) -> Result<(DateTime<Utc>, Vec<WorkItem>, Vec<WorkEdge>), WorkGraphError> {
+        let guard = self.inner.read().await;
+        let observed_at = Utc::now();
+        let items = guard
+            .items
+            .values()
+            .filter(|item| item.realm_id == realm_id && &item.namespace == namespace)
+            .cloned()
+            .collect();
+        let edges = guard
+            .edges
+            .iter()
+            .filter(|edge| edge.realm_id == realm_id && &edge.namespace == namespace)
+            .cloned()
+            .collect();
+        Ok((observed_at, items, edges))
+    }
+
+    async fn read_namespace_snapshot(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+    ) -> Result<WorkGraphNamespaceRead, WorkGraphError> {
+        let guard = self.inner.read().await;
+        let captured_at = Utc::now();
+        let items = guard
+            .items
+            .values()
+            .filter(|item| item.realm_id == realm_id && &item.namespace == namespace)
+            .cloned()
+            .collect();
+        let edges = guard
+            .edges
+            .iter()
+            .filter(|edge| edge.realm_id == realm_id && &edge.namespace == namespace)
+            .cloned()
+            .collect();
+        let attention = guard
+            .attention
+            .values()
+            .filter(|binding| {
+                binding.work_ref.realm_id == realm_id && &binding.work_ref.namespace == namespace
+            })
+            .cloned()
+            .collect();
+        let event_high_water_mark = guard
+            .events
+            .iter()
+            .filter(|event| event.realm_id == realm_id && &event.namespace == namespace)
+            .filter_map(|event| event.seq)
+            .max();
+        Ok(WorkGraphNamespaceRead {
+            captured_at,
+            event_high_water_mark,
+            items,
+            edges,
+            attention,
+        })
     }
 
     async fn insert_execution_binding(
@@ -736,20 +1145,23 @@ impl WorkGraphStore for MemoryWorkGraphStore {
     async fn list_execution_bindings_for_recovery(
         &self,
         realm_id: &str,
+        namespace: &WorkNamespace,
     ) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
         let guard = self.inner.read().await;
         Ok(guard
             .execution_recovery
             .iter()
-            .filter(|(realm, _, _)| realm == realm_id)
+            .filter(|(realm, candidate_namespace, _)| {
+                realm == realm_id && candidate_namespace == namespace
+            })
             .filter_map(|key| guard.execution_bindings.get(key).cloned())
             .collect())
     }
 
     async fn insert_goal(
         &self,
-        item: WorkItem,
-        item_event: WorkGraphEvent,
+        mut item: WorkItem,
+        mut item_event: WorkGraphEvent,
         attention: WorkAttentionBinding,
         attention_event: WorkGraphEvent,
     ) -> Result<(WorkItem, WorkAttentionBinding), WorkGraphError> {
@@ -776,11 +1188,69 @@ impl WorkGraphStore for MemoryWorkGraphStore {
         if let Some(occupant) = active_target_occupant_in(guard.attention.values(), &attention) {
             return Err(active_target_conflict(&attention, &occupant));
         }
+        enrich_item_transition_facts(
+            None,
+            &mut item,
+            guard.items.values(),
+            guard.edges.iter(),
+            &mut item_event,
+        )?;
         guard.items.insert(item_key, item.clone());
         guard.attention.insert(attention_key, attention.clone());
         guard.append_event(item_event);
         guard.append_event(attention_event);
         Ok((item, attention))
+    }
+
+    async fn insert_attention_for_existing_item(
+        &self,
+        attention: WorkAttentionBinding,
+        expected_item_revision: u64,
+        event: WorkGraphEvent,
+    ) -> Result<WorkAttentionBinding, WorkGraphError> {
+        let mut guard = self.inner.write().await;
+        let work_key = item_key(
+            &attention.work_ref.realm_id,
+            &attention.work_ref.namespace,
+            &attention.work_ref.item_id,
+        );
+        let item = guard.items.get(&work_key).ok_or_else(|| {
+            WorkGraphError::not_found(
+                attention.work_ref.realm_id.clone(),
+                attention.work_ref.namespace.clone(),
+                attention.work_ref.item_id.clone(),
+            )
+        })?;
+        if item.revision != expected_item_revision {
+            return Err(WorkGraphError::StaleRevision {
+                id: item.id.clone(),
+                expected: expected_item_revision,
+                actual: item.revision,
+            });
+        }
+        if WorkGraphMachine::classify_terminality(item)? {
+            return Err(WorkGraphError::InvalidTransition(format!(
+                "cannot bind attention to terminal work item {}",
+                item.id
+            )));
+        }
+        let key = attention_key(
+            &attention.work_ref.realm_id,
+            &attention.work_ref.namespace,
+            &attention.binding_id,
+        );
+        if guard.attention.contains_key(&key) {
+            return Err(WorkGraphError::Conflict(format!(
+                "work attention binding {} already exists",
+                attention.binding_id
+            )));
+        }
+        if let Some(occupant) = active_target_occupant_in(guard.attention.values(), &attention) {
+            return Err(active_target_conflict(&attention, &occupant));
+        }
+        guard.attention.insert(key, attention.clone());
+        guard.append_event(event);
+        Ok(attention)
     }
 
     async fn update_attention_cas(
@@ -876,9 +1346,9 @@ impl WorkGraphStore for MemoryWorkGraphStore {
 
     async fn update_item_and_attention_cas(
         &self,
-        item: WorkItem,
+        mut item: WorkItem,
         expected_previous_revision: u64,
-        item_event: WorkGraphEvent,
+        mut item_event: WorkGraphEvent,
         attention_updates: Vec<(WorkAttentionBinding, u64, WorkGraphEvent)>,
     ) -> Result<WorkItem, WorkGraphError> {
         WorkGraphMachine::validate_item_projection(&item)?;
@@ -943,6 +1413,14 @@ impl WorkGraphStore for MemoryWorkGraphStore {
                 return Err(active_target_conflict(attention, &occupant));
             }
         }
+        let previous = current.clone();
+        enrich_item_transition_facts(
+            Some(&previous),
+            &mut item,
+            guard.items.values(),
+            guard.edges.iter(),
+            &mut item_event,
+        )?;
         guard.items.insert(key, item.clone());
         guard.append_event(item_event);
         for (attention, _, event) in attention_updates {
@@ -1351,6 +1829,210 @@ fn item_matches_filter(item: &WorkItem, filter: &WorkItemFilter) -> bool {
         .all(|label| item.labels.contains(label))
 }
 
+fn enrich_item_transition_facts<'a>(
+    previous: Option<&WorkItem>,
+    current: &mut WorkItem,
+    stored_items: impl Iterator<Item = &'a WorkItem>,
+    edges: impl Iterator<Item = &'a WorkEdge>,
+    event: &mut WorkGraphEvent,
+) -> Result<(), WorkGraphError> {
+    let mut items = stored_items
+        .filter(|item| {
+            item.realm_id == current.realm_id
+                && item.namespace == current.namespace
+                && item.id != current.id
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    items.push(current.clone());
+    let scoped_edges = edges
+        .filter(|edge| edge.realm_id == current.realm_id && edge.namespace == current.namespace)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let current_ready = item_ready_with_graph(current, event.at, &items, &scoped_edges)?;
+    let previous_ready = previous
+        .map(|item| item_ready_with_graph(item, event.at, &items, &scoped_edges))
+        .transpose()?
+        .unwrap_or(false);
+    let previous_expired_claim = previous
+        .and_then(|item| item.claim.as_ref())
+        .filter(|claim| claim.expiry_observed_at.is_none())
+        .and_then(|claim| claim.lease_expires_at)
+        .is_some_and(|lease_expires_at| lease_expires_at <= event.at);
+    if (current_ready && !previous_ready)
+        || (matches!(event.kind, WorkGraphEventKind::Claimed) && previous_ready)
+        || (matches!(event.kind, WorkGraphEventKind::Released)
+            && previous_expired_claim
+            && current_ready)
+        || (matches!(event.kind, WorkGraphEventKind::ReadinessObserved) && current_ready)
+    {
+        push_fact_once(
+            event,
+            WorkGraphFact::ItemReady {
+                item_id: current.id.clone(),
+                item_revision: previous
+                    .filter(|_| matches!(event.kind, WorkGraphEventKind::Claimed))
+                    .map_or(current.revision, |item| item.revision),
+            },
+        );
+    }
+    if previous.is_some() && matches!(event.kind, WorkGraphEventKind::Closed) {
+        for edge in scoped_edges.iter().filter(|edge| {
+            edge.kind == crate::types::WorkEdgeKind::Parent && edge.from_id == current.id
+        }) {
+            if let Some(parent) = items.iter().find(|item| item.id == edge.to_id)
+                && item_ready_with_graph(parent, event.at, &items, &scoped_edges)?
+            {
+                push_fact_once(
+                    event,
+                    WorkGraphFact::ItemReady {
+                        item_id: parent.id.clone(),
+                        item_revision: parent.revision,
+                    },
+                );
+            }
+        }
+    }
+
+    if let Some(previous) = previous
+        && let Some(claim) = previous.claim.as_ref()
+        && claim.expiry_observed_at.is_none()
+        && let Some(lease_expires_at) = claim.lease_expires_at
+        && lease_expires_at <= event.at
+    {
+        push_fact_once(
+            event,
+            WorkGraphFact::LeaseExpired {
+                item_id: current.id.clone(),
+                expired_owner: claim.owner.key.clone(),
+                lease_expires_at,
+                observed_at: event.at,
+            },
+        );
+        if let Some(current_claim) = current.claim.as_mut()
+            && current_claim.owner == claim.owner
+            && current_claim.claimed_at == claim.claimed_at
+        {
+            current_claim.expiry_observed_at = Some(event.at);
+            if let Some(item_payload) = event
+                .payload
+                .as_object_mut()
+                .and_then(|payload| payload.get_mut("item"))
+            {
+                *item_payload = serde_json::to_value(&*current)
+                    .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            }
+        }
+    }
+
+    let current_terminal = WorkGraphMachine::classify_terminality(current)?;
+    let newly_terminal = previous
+        .map(|previous| {
+            WorkGraphMachine::classify_terminality(previous)
+                .map(|was_terminal| current_terminal && !was_terminal)
+        })
+        .transpose()?
+        .unwrap_or(current_terminal);
+    let mut namespace_terminal = newly_terminal;
+    if namespace_terminal {
+        for item in &items {
+            if !WorkGraphMachine::classify_terminality(item)? {
+                namespace_terminal = false;
+                break;
+            }
+        }
+    }
+    if namespace_terminal {
+        push_fact_once(
+            event,
+            WorkGraphFact::NamespaceTerminal {
+                namespace: current.namespace.clone(),
+                observed_at: event.at,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn item_ready_with_graph(
+    item: &WorkItem,
+    now: DateTime<Utc>,
+    items: &[WorkItem],
+    edges: &[WorkEdge],
+) -> Result<bool, WorkGraphError> {
+    let joined = matches!(
+        child_join_disposition_with_graph(item, items, edges)?,
+        ChildJoinDisposition::Satisfied
+    );
+    WorkGraphMachine::classify_readiness_from_observation(
+        item,
+        now,
+        unresolved_blocker_count_with_graph(item, items, edges)?,
+        joined,
+    )
+}
+
+fn child_join_disposition_with_graph(
+    item: &WorkItem,
+    items: &[WorkItem],
+    edges: &[WorkEdge],
+) -> Result<ChildJoinDisposition, WorkGraphError> {
+    let children = edges
+        .iter()
+        .filter(|edge| edge.kind == crate::types::WorkEdgeKind::Parent && edge.to_id == item.id)
+        .filter_map(|edge| items.iter().find(|candidate| candidate.id == edge.from_id));
+    let mut active = 0u64;
+    let mut failed = 0u64;
+    let mut cancelled = 0u64;
+    for child in children {
+        match child.status {
+            crate::types::WorkStatus::Completed => {}
+            crate::types::WorkStatus::Failed => failed = failed.saturating_add(1),
+            crate::types::WorkStatus::Cancelled => cancelled = cancelled.saturating_add(1),
+            _ => active = active.saturating_add(1),
+        }
+    }
+    WorkGraphMachine::classify_child_join(item, active, failed, cancelled)
+}
+
+fn unresolved_blocker_count_with_graph(
+    item: &WorkItem,
+    items: &[WorkItem],
+    edges: &[WorkEdge],
+) -> Result<u64, WorkGraphError> {
+    let mut unresolved = 0u64;
+    for edge in edges
+        .iter()
+        .filter(|edge| edge.kind == crate::types::WorkEdgeKind::Blocks && edge.to_id == item.id)
+    {
+        let blocker = items.iter().find(|candidate| candidate.id == edge.from_id);
+        if !WorkGraphMachine::classify_blocker_satisfied(item, blocker)? {
+            unresolved = unresolved.saturating_add(1);
+        }
+    }
+    Ok(unresolved)
+}
+
+fn push_fact_once(event: &mut WorkGraphEvent, fact: WorkGraphFact) {
+    if !event.facts.contains(&fact) {
+        event.facts.push(fact);
+    }
+}
+
+fn attention_transition_event(
+    binding: &WorkAttentionBinding,
+    observed_at: DateTime<Utc>,
+) -> WorkGraphEvent {
+    WorkGraphEvent::graph(
+        binding.work_ref.realm_id.clone(),
+        binding.work_ref.namespace.clone(),
+        WorkGraphEventKind::AttentionUpdated,
+        observed_at,
+        serde_json::json!({ "attention": binding }),
+    )
+}
+
 fn attention_matches_filter(binding: &WorkAttentionBinding, filter: &AttentionListRequest) -> bool {
     if let Some(realm_id) = &filter.realm_id
         && &binding.work_ref.realm_id != realm_id
@@ -1434,6 +2116,13 @@ pub struct SqliteWorkGraphStore {
 impl SqliteWorkGraphStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, WorkGraphError> {
         let store = Self { path: path.into() };
+        let legacy_tables = pre_namespace_tables_with_rows(&store.path)?;
+        if !legacy_tables.is_empty() {
+            return Err(WorkGraphError::NamespaceAssignmentRequired {
+                backend: store.path.display().to_string(),
+                tables: legacy_tables,
+            });
+        }
         // Probe open: `with_connection` brings the schema domain up to date.
         store.with_connection(|_| Ok(()))?;
         Ok(store)
@@ -1507,6 +2196,61 @@ impl SqliteWorkGraphStore {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn pre_namespace_tables_with_rows(path: &Path) -> Result<Vec<String>, WorkGraphError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+    let mut legacy = Vec::new();
+    for table in [
+        "workgraph_items",
+        "workgraph_attention",
+        "workgraph_edges",
+        "workgraph_events",
+        "workgraph_execution_bindings",
+    ] {
+        let exists = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+        if !exists {
+            continue;
+        }
+        let mut columns = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+        let has_namespace = columns
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| WorkGraphError::Store(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| WorkGraphError::Store(error.to_string()))?
+            .iter()
+            .any(|column| column == "namespace");
+        if has_namespace {
+            continue;
+        }
+        let has_rows = connection
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+        if has_rows {
+            legacy.push(table.to_string());
+        }
+    }
+    Ok(legacy)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl WorkGraphStore for SqliteWorkGraphStore {
     fn kind(&self) -> WorkGraphStoreKind {
@@ -1519,14 +2263,25 @@ impl WorkGraphStore for SqliteWorkGraphStore {
 
     async fn insert_item(
         &self,
-        item: WorkItem,
-        event: WorkGraphEvent,
+        mut item: WorkItem,
+        mut event: WorkGraphEvent,
     ) -> Result<WorkItem, WorkGraphError> {
         WorkGraphMachine::validate_item_projection(&item)?;
         self.with_connection(|conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|err| WorkGraphError::Store(err.to_string()))?;
+            let items = list_sqlite_items(
+                &tx,
+                &WorkItemFilter {
+                    realm_id: Some(item.realm_id.clone()),
+                    namespace: Some(item.namespace.clone()),
+                    include_terminal: true,
+                    ..WorkItemFilter::default()
+                },
+            )?;
+            let edges = list_sqlite_edges(&tx, &item.realm_id, &item.namespace, None)?;
+            enrich_item_transition_facts(None, &mut item, items.iter(), edges.iter(), &mut event)?;
             insert_item_tx(&tx, &item)?;
             insert_event_tx(&tx, &event)?;
             tx.commit()
@@ -1537,15 +2292,33 @@ impl WorkGraphStore for SqliteWorkGraphStore {
 
     async fn update_item_cas(
         &self,
-        item: WorkItem,
+        mut item: WorkItem,
         expected_previous_revision: u64,
-        event: WorkGraphEvent,
+        mut event: WorkGraphEvent,
     ) -> Result<WorkItem, WorkGraphError> {
         WorkGraphMachine::validate_item_projection(&item)?;
         self.with_connection(|conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|err| WorkGraphError::Store(err.to_string()))?;
+            let previous = select_item(&tx, &item.realm_id, &item.namespace, &item.id)?;
+            let items = list_sqlite_items(
+                &tx,
+                &WorkItemFilter {
+                    realm_id: Some(item.realm_id.clone()),
+                    namespace: Some(item.namespace.clone()),
+                    include_terminal: true,
+                    ..WorkItemFilter::default()
+                },
+            )?;
+            let edges = list_sqlite_edges(&tx, &item.realm_id, &item.namespace, None)?;
+            enrich_item_transition_facts(
+                previous.as_ref(),
+                &mut item,
+                items.iter(),
+                edges.iter(),
+                &mut event,
+            )?;
             let changed = update_item_tx(&tx, &item, expected_previous_revision)?;
             if changed == 0 {
                 let actual = current_revision_tx(&tx, &item.realm_id, &item.namespace, &item.id)?;
@@ -1569,6 +2342,306 @@ impl WorkGraphStore for SqliteWorkGraphStore {
         })
     }
 
+    async fn claim_item_atomically(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+        mut request: ClaimWorkItemRequest,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<WorkItem>, WorkGraphError> {
+        self.with_connection(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            let previous =
+                select_item(&tx, realm_id, namespace, &request.id)?.ok_or_else(|| {
+                    WorkGraphError::not_found(
+                        realm_id.to_string(),
+                        namespace.clone(),
+                        request.id.clone(),
+                    )
+                })?;
+            if request.expected_revision != previous.revision {
+                return Err(WorkGraphError::StaleRevision {
+                    id: previous.id.clone(),
+                    expected: request.expected_revision,
+                    actual: previous.revision,
+                });
+            }
+            WorkGraphMachine::validate_claim_request(&request, &observed_at)?;
+            let items = list_sqlite_items(
+                &tx,
+                &WorkItemFilter {
+                    realm_id: Some(realm_id.to_string()),
+                    namespace: Some(namespace.clone()),
+                    include_terminal: true,
+                    ..WorkItemFilter::default()
+                },
+            )?;
+            let edges = list_sqlite_edges(&tx, realm_id, namespace, None)?;
+            let disposition = child_join_disposition_with_graph(&previous, &items, &edges)?;
+            if matches!(
+                disposition,
+                ChildJoinDisposition::PropagateFailure
+                    | ChildJoinDisposition::PropagateCancellation
+            ) {
+                return Ok(None);
+            }
+            let unresolved = unresolved_blocker_count_with_graph(&previous, &items, &edges)?;
+            let (admission_item, refresh_event) = match WorkGraphMachine::refresh_eligibility(
+                previous.clone(),
+                unresolved,
+                observed_at,
+            )? {
+                Some((mut refreshed, mut event)) => {
+                    enrich_item_transition_facts(
+                        Some(&previous),
+                        &mut refreshed,
+                        items.iter(),
+                        edges.iter(),
+                        &mut event,
+                    )?;
+                    (refreshed, Some(event))
+                }
+                None => (previous.clone(), None),
+            };
+            request.expected_revision = admission_item.revision;
+            let (mut item, mut event) = WorkGraphMachine::claim_item_with_unresolved_blockers(
+                admission_item.clone(),
+                unresolved,
+                matches!(disposition, ChildJoinDisposition::Satisfied),
+                request,
+                observed_at,
+            )?;
+            enrich_item_transition_facts(
+                Some(&admission_item),
+                &mut item,
+                items.iter(),
+                edges.iter(),
+                &mut event,
+            )?;
+            let changed = update_item_tx(&tx, &item, previous.revision)?;
+            if changed == 0 {
+                return Err(WorkGraphError::StaleRevision {
+                    id: item.id.clone(),
+                    expected: previous.revision,
+                    actual: current_revision_tx(&tx, realm_id, namespace, &item.id)?
+                        .unwrap_or(previous.revision),
+                });
+            }
+            if let Some(refresh_event) = refresh_event {
+                insert_event_tx(&tx, &refresh_event)?;
+            }
+            insert_event_tx(&tx, &event)?;
+            tx.commit()
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            Ok(Some(item))
+        })
+    }
+
+    async fn observe_readiness_atomically(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+        mut request: ObserveReadinessRequest,
+    ) -> Result<Option<WorkItem>, WorkGraphError> {
+        self.with_connection(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            let previous =
+                select_item(&tx, realm_id, namespace, &request.id)?.ok_or_else(|| {
+                    WorkGraphError::not_found(
+                        realm_id.to_string(),
+                        namespace.clone(),
+                        request.id.clone(),
+                    )
+                })?;
+            if request.expected_revision != previous.revision {
+                return Err(WorkGraphError::StaleRevision {
+                    id: previous.id.clone(),
+                    expected: request.expected_revision,
+                    actual: previous.revision,
+                });
+            }
+            let items = list_sqlite_items(
+                &tx,
+                &WorkItemFilter {
+                    realm_id: Some(realm_id.to_string()),
+                    namespace: Some(namespace.clone()),
+                    include_terminal: true,
+                    ..WorkItemFilter::default()
+                },
+            )?;
+            let edges = list_sqlite_edges(&tx, realm_id, namespace, None)?;
+            let disposition = child_join_disposition_with_graph(&previous, &items, &edges)?;
+            if matches!(
+                disposition,
+                ChildJoinDisposition::PropagateFailure
+                    | ChildJoinDisposition::PropagateCancellation
+            ) {
+                return Ok(None);
+            }
+            let unresolved = unresolved_blocker_count_with_graph(&previous, &items, &edges)?;
+            let (admission_item, refresh_event) = match WorkGraphMachine::refresh_eligibility(
+                previous.clone(),
+                unresolved,
+                request.observed_at,
+            )? {
+                Some((mut refreshed, mut event)) => {
+                    enrich_item_transition_facts(
+                        Some(&previous),
+                        &mut refreshed,
+                        items.iter(),
+                        edges.iter(),
+                        &mut event,
+                    )?;
+                    (refreshed, Some(event))
+                }
+                None => (previous.clone(), None),
+            };
+            request.expected_revision = admission_item.revision;
+            let (mut item, mut event) = WorkGraphMachine::observe_readiness(
+                admission_item.clone(),
+                request,
+                unresolved,
+                matches!(disposition, ChildJoinDisposition::Satisfied),
+            )?;
+            enrich_item_transition_facts(
+                Some(&admission_item),
+                &mut item,
+                items.iter(),
+                edges.iter(),
+                &mut event,
+            )?;
+            let changed = update_item_tx(&tx, &item, previous.revision)?;
+            if changed == 0 {
+                return Err(WorkGraphError::StaleRevision {
+                    id: item.id.clone(),
+                    expected: previous.revision,
+                    actual: current_revision_tx(&tx, realm_id, namespace, &item.id)?
+                        .unwrap_or(previous.revision),
+                });
+            }
+            if let Some(refresh_event) = refresh_event {
+                insert_event_tx(&tx, &refresh_event)?;
+            }
+            insert_event_tx(&tx, &event)?;
+            tx.commit()
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            Ok(Some(item))
+        })
+    }
+
+    async fn reconcile_child_join_atomically(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+        parent_id: &WorkItemId,
+        expected_revision: u64,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<WorkItem>, WorkGraphError> {
+        self.with_connection(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            let Some(previous) = select_item(&tx, realm_id, namespace, parent_id)? else {
+                return Ok(None);
+            };
+            if previous.revision != expected_revision {
+                return Err(WorkGraphError::StaleRevision {
+                    id: previous.id.clone(),
+                    expected: expected_revision,
+                    actual: previous.revision,
+                });
+            }
+            if WorkGraphMachine::classify_terminality(&previous)? {
+                return Ok(Some(previous));
+            }
+            let items = list_sqlite_items(
+                &tx,
+                &WorkItemFilter {
+                    realm_id: Some(realm_id.to_string()),
+                    namespace: Some(namespace.clone()),
+                    include_terminal: true,
+                    ..WorkItemFilter::default()
+                },
+            )?;
+            let edges = list_sqlite_edges(&tx, realm_id, namespace, None)?;
+            let status = match child_join_disposition_with_graph(&previous, &items, &edges)? {
+                ChildJoinDisposition::PropagateFailure => crate::types::WorkStatus::Failed,
+                ChildJoinDisposition::PropagateCancellation => crate::types::WorkStatus::Cancelled,
+                ChildJoinDisposition::Waiting | ChildJoinDisposition::Satisfied => {
+                    return Ok(None);
+                }
+            };
+            let (mut terminal, mut item_event) = WorkGraphMachine::close_item(
+                previous.clone(),
+                crate::types::CloseWorkItemRequest {
+                    id: previous.id.clone(),
+                    realm_id: Some(realm_id.to_string()),
+                    namespace: Some(namespace.clone()),
+                    expected_revision: previous.revision,
+                    status,
+                },
+                observed_at,
+            )?;
+            enrich_item_transition_facts(
+                Some(&previous),
+                &mut terminal,
+                items.iter(),
+                edges.iter(),
+                &mut item_event,
+            )?;
+            let attention = list_sqlite_attention(
+                &tx,
+                &AttentionListRequest {
+                    realm_id: Some(realm_id.to_string()),
+                    namespace: Some(namespace.clone()),
+                    target: None,
+                    status: None,
+                },
+                None,
+            )?;
+            let mut stopped_attention = Vec::new();
+            for binding in attention.into_iter().filter(|binding| {
+                &binding.work_ref.item_id == parent_id
+                    && !matches!(
+                        binding.status,
+                        WorkAttentionStatus::Stopped | WorkAttentionStatus::Superseded
+                    )
+            }) {
+                let expected_revision = binding.machine_state.revision;
+                let stopped = WorkAttentionMachine::stop(binding, expected_revision, observed_at)?;
+                let event = attention_transition_event(&stopped, observed_at);
+                stopped_attention.push((stopped, expected_revision, event));
+            }
+            let changed = update_item_tx(&tx, &terminal, previous.revision)?;
+            if changed == 0 {
+                return Err(WorkGraphError::StaleRevision {
+                    id: terminal.id.clone(),
+                    expected: previous.revision,
+                    actual: current_revision_tx(&tx, realm_id, namespace, &terminal.id)?
+                        .unwrap_or(previous.revision),
+                });
+            }
+            insert_event_tx(&tx, &item_event)?;
+            for (binding, expected_revision, event) in &stopped_attention {
+                let changed = update_attention_tx(&tx, binding, *expected_revision)?;
+                if changed == 0 {
+                    return Err(WorkGraphError::Conflict(format!(
+                        "attention binding {} changed during atomic child-join reconciliation",
+                        binding.binding_id
+                    )));
+                }
+                insert_event_tx(&tx, event)?;
+            }
+            tx.commit()
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            Ok(Some(terminal))
+        })
+    }
+
     async fn get_item(
         &self,
         realm_id: &str,
@@ -1580,6 +2653,88 @@ impl WorkGraphStore for SqliteWorkGraphStore {
 
     async fn list_items(&self, filter: WorkItemFilter) -> Result<Vec<WorkItem>, WorkGraphError> {
         self.with_connection(|conn| list_sqlite_items(conn, &filter))
+    }
+
+    async fn read_namespace_graph(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+    ) -> Result<(DateTime<Utc>, Vec<WorkItem>, Vec<WorkEdge>), WorkGraphError> {
+        self.with_connection(|conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            let observed_at = Utc::now();
+            let items = list_sqlite_items(
+                &tx,
+                &WorkItemFilter {
+                    realm_id: Some(realm_id.to_string()),
+                    namespace: Some(namespace.clone()),
+                    include_terminal: true,
+                    ..WorkItemFilter::default()
+                },
+            )?;
+            let edges = list_sqlite_edges(&tx, realm_id, namespace, None)?;
+            tx.commit()
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            Ok((observed_at, items, edges))
+        })
+    }
+
+    async fn read_namespace_snapshot(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+    ) -> Result<WorkGraphNamespaceRead, WorkGraphError> {
+        self.with_connection(|conn| {
+            let tx = conn
+                // Fence writers before sampling captured_at. A deferred SQLite
+                // transaction does not establish its read snapshot until the
+                // first SELECT, which could otherwise include a commit newer
+                // than the timestamp used for readiness classification.
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            let captured_at = Utc::now();
+            let items = list_sqlite_items(
+                &tx,
+                &WorkItemFilter {
+                    realm_id: Some(realm_id.to_string()),
+                    namespace: Some(namespace.clone()),
+                    include_terminal: true,
+                    ..WorkItemFilter::default()
+                },
+            )?;
+            let edges = list_sqlite_edges(&tx, realm_id, namespace, None)?;
+            let attention = list_sqlite_attention(
+                &tx,
+                &AttentionListRequest {
+                    realm_id: Some(realm_id.to_string()),
+                    namespace: Some(namespace.clone()),
+                    target: None,
+                    status: None,
+                },
+                None,
+            )?;
+            let event_high_water_mark = latest_sqlite_event_seq(
+                &tx,
+                &WorkGraphEventFilter {
+                    realm_id: Some(realm_id.to_string()),
+                    namespace: Some(namespace.clone()),
+                    all_namespaces: false,
+                    after_seq: None,
+                    limit: Some(1),
+                },
+            )?;
+            tx.commit()
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            Ok(WorkGraphNamespaceRead {
+                captured_at,
+                event_high_water_mark,
+                items,
+                edges,
+                attention,
+            })
+        })
     }
 
     async fn insert_execution_binding(
@@ -1786,17 +2941,20 @@ impl WorkGraphStore for SqliteWorkGraphStore {
     async fn list_execution_bindings_for_recovery(
         &self,
         realm_id: &str,
+        namespace: &WorkNamespace,
     ) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
         self.with_connection(|conn| {
             let mut statement = conn
                 .prepare(
                     "SELECT binding_json FROM workgraph_execution_bindings
-                     WHERE realm_id = ?1 AND recovery_pending = 1
+                     WHERE realm_id = ?1 AND namespace = ?2 AND recovery_pending = 1
                      ORDER BY created_at_utc ASC, binding_id ASC",
                 )
                 .map_err(|error| WorkGraphError::Store(error.to_string()))?;
             let rows = statement
-                .query_map([realm_id], |row| row_json::<WorkExecutionBinding>(row, 0))
+                .query_map(params![realm_id, namespace.as_str()], |row| {
+                    row_json::<WorkExecutionBinding>(row, 0)
+                })
                 .map_err(|error| WorkGraphError::Store(error.to_string()))?;
             rows.map(|row| row.map_err(|error| WorkGraphError::Store(error.to_string())))
                 .collect()
@@ -1805,8 +2963,8 @@ impl WorkGraphStore for SqliteWorkGraphStore {
 
     async fn insert_goal(
         &self,
-        item: WorkItem,
-        item_event: WorkGraphEvent,
+        mut item: WorkItem,
+        mut item_event: WorkGraphEvent,
         attention: WorkAttentionBinding,
         attention_event: WorkGraphEvent,
     ) -> Result<(WorkItem, WorkAttentionBinding), WorkGraphError> {
@@ -1818,6 +2976,23 @@ impl WorkGraphStore for SqliteWorkGraphStore {
             if let Some(occupant) = active_target_occupant_tx(&tx, &attention)? {
                 return Err(active_target_conflict(&attention, &occupant));
             }
+            let items = list_sqlite_items(
+                &tx,
+                &WorkItemFilter {
+                    realm_id: Some(item.realm_id.clone()),
+                    namespace: Some(item.namespace.clone()),
+                    include_terminal: true,
+                    ..WorkItemFilter::default()
+                },
+            )?;
+            let edges = list_sqlite_edges(&tx, &item.realm_id, &item.namespace, None)?;
+            enrich_item_transition_facts(
+                None,
+                &mut item,
+                items.iter(),
+                edges.iter(),
+                &mut item_event,
+            )?;
             insert_item_tx(&tx, &item)?;
             insert_attention_tx(&tx, &attention)?;
             insert_event_tx(&tx, &item_event)?;
@@ -1825,6 +3000,53 @@ impl WorkGraphStore for SqliteWorkGraphStore {
             tx.commit()
                 .map_err(|err| WorkGraphError::Store(err.to_string()))?;
             Ok((item, attention))
+        })
+    }
+
+    async fn insert_attention_for_existing_item(
+        &self,
+        attention: WorkAttentionBinding,
+        expected_item_revision: u64,
+        event: WorkGraphEvent,
+    ) -> Result<WorkAttentionBinding, WorkGraphError> {
+        self.with_connection(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|err| WorkGraphError::Store(err.to_string()))?;
+            let item = select_item(
+                &tx,
+                &attention.work_ref.realm_id,
+                &attention.work_ref.namespace,
+                &attention.work_ref.item_id,
+            )?
+            .ok_or_else(|| {
+                WorkGraphError::not_found(
+                    attention.work_ref.realm_id.clone(),
+                    attention.work_ref.namespace.clone(),
+                    attention.work_ref.item_id.clone(),
+                )
+            })?;
+            if item.revision != expected_item_revision {
+                return Err(WorkGraphError::StaleRevision {
+                    id: item.id,
+                    expected: expected_item_revision,
+                    actual: item.revision,
+                });
+            }
+            if WorkGraphMachine::classify_terminality(&item)? {
+                return Err(WorkGraphError::InvalidTransition(format!(
+                    "cannot bind attention to terminal work item {}",
+                    item.id
+                )));
+            }
+            if let Some(occupant) = active_target_occupant_tx(&tx, &attention)? {
+                return Err(active_target_conflict(&attention, &occupant));
+            }
+            insert_attention_tx(&tx, &attention)?;
+            insert_event_tx(&tx, &event)?;
+            tx.commit()
+                .map_err(|err| WorkGraphError::Store(err.to_string()))?;
+            Ok(attention)
         })
     }
 
@@ -1922,9 +3144,9 @@ impl WorkGraphStore for SqliteWorkGraphStore {
 
     async fn update_item_and_attention_cas(
         &self,
-        item: WorkItem,
+        mut item: WorkItem,
         expected_previous_revision: u64,
-        item_event: WorkGraphEvent,
+        mut item_event: WorkGraphEvent,
         attention_updates: Vec<(WorkAttentionBinding, u64, WorkGraphEvent)>,
     ) -> Result<WorkItem, WorkGraphError> {
         WorkGraphMachine::validate_item_projection(&item)?;
@@ -1932,6 +3154,24 @@ impl WorkGraphStore for SqliteWorkGraphStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|err| WorkGraphError::Store(err.to_string()))?;
+            let previous = select_item(&tx, &item.realm_id, &item.namespace, &item.id)?;
+            let items = list_sqlite_items(
+                &tx,
+                &WorkItemFilter {
+                    realm_id: Some(item.realm_id.clone()),
+                    namespace: Some(item.namespace.clone()),
+                    include_terminal: true,
+                    ..WorkItemFilter::default()
+                },
+            )?;
+            let edges = list_sqlite_edges(&tx, &item.realm_id, &item.namespace, None)?;
+            enrich_item_transition_facts(
+                previous.as_ref(),
+                &mut item,
+                items.iter(),
+                edges.iter(),
+                &mut item_event,
+            )?;
             let changed = update_item_tx(&tx, &item, expected_previous_revision)?;
             if changed == 0 {
                 let actual = current_revision_tx(&tx, &item.realm_id, &item.namespace, &item.id)?;
@@ -3465,6 +4705,7 @@ fn replay_event_tx(tx: &Transaction<'_>, event: &WorkGraphEvent) -> Result<(), W
         }
         WorkGraphEventKind::Created
         | WorkGraphEventKind::Updated
+        | WorkGraphEventKind::ReadinessObserved
         | WorkGraphEventKind::Claimed
         | WorkGraphEventKind::Released
         | WorkGraphEventKind::Blocked
@@ -3844,6 +5085,8 @@ mod tests {
                 description: None,
                 priority: Default::default(),
                 completion_policy: Default::default(),
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
                 labels: BTreeSet::new(),
                 due_at: None,
                 not_before: None,
@@ -3862,6 +5105,8 @@ mod tests {
                 description: None,
                 priority: Default::default(),
                 completion_policy: Default::default(),
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
                 labels: BTreeSet::new(),
                 due_at: None,
                 not_before: None,
@@ -3902,6 +5147,8 @@ mod tests {
                 description: None,
                 priority: Default::default(),
                 completion_policy: Default::default(),
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
                 labels: BTreeSet::new(),
                 due_at: None,
                 not_before: None,
@@ -4054,6 +5301,8 @@ mod tests {
                 description: None,
                 priority: Default::default(),
                 completion_policy: Default::default(),
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
                 labels: BTreeSet::new(),
                 due_at: None,
                 not_before: None,
@@ -4095,6 +5344,16 @@ mod tests {
             WorkGraphService::with_scope(store.clone(), "realm", WorkNamespace::default());
         let goal = service
             .create_goal(GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "unique goal".to_string(),
@@ -4151,6 +5410,8 @@ mod tests {
                 description: None,
                 priority: Default::default(),
                 completion_policy: Default::default(),
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
                 labels: BTreeSet::new(),
                 due_at: None,
                 not_before: None,
@@ -4184,6 +5445,8 @@ mod tests {
                 description: None,
                 priority: Default::default(),
                 completion_policy: Default::default(),
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
                 labels: BTreeSet::new(),
                 due_at: None,
                 not_before: None,
@@ -4264,6 +5527,8 @@ mod tests {
                 description: None,
                 priority: Default::default(),
                 completion_policy: Default::default(),
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
                 labels: BTreeSet::new(),
                 due_at: None,
                 not_before: None,
@@ -4282,6 +5547,8 @@ mod tests {
                 description: None,
                 priority: Default::default(),
                 completion_policy: Default::default(),
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
                 labels: BTreeSet::new(),
                 due_at: None,
                 not_before: None,
@@ -4355,6 +5622,16 @@ mod tests {
             .expect("session id");
         let goal = service
             .create_goal(GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "terminal goal".to_string(),

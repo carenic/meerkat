@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use meerkat_core::service::WorkGraphNamespaceGrant;
 use serde_json::json;
 
 use crate::machine::{WorkAttentionMachine, WorkGraphMachine, completion_policy_name};
@@ -13,19 +14,21 @@ use crate::types::{
     AttentionProjectionText, AttentionPruneRequest, AttentionPruneResult, AttentionReassignRequest,
     AttentionReassignResult, AttentionResumeRequest, BreakGlassAttentionReassignRequest,
     ClaimWorkItemRequest, CloseWorkItemRequest, CreateWorkItemRequest, GoalAttentionTarget,
-    GoalConfirmRequest, GoalConfirmResult, GoalCreateRequest, GoalCreateResult,
-    GoalRequestCloseRequest, GoalRequestCloseResult, GoalStatusRequest, GoalStatusResult,
-    LinkWorkItemsRequest, PolicyEscalateRequest, ProjectedAttentionAuthority, ReadyWorkFilter,
-    ReleaseWorkItemRequest, UpdateWorkItemRequest, WorkAttentionBinding, WorkAttentionBindingId,
-    WorkAttentionMode, WorkAttentionStatus, WorkCompletionPolicy, WorkEdge, WorkEdgeKind,
-    WorkEvidenceKind, WorkEvidenceRef, WorkExecutionBinding, WorkExecutionBindingFilter,
-    WorkExecutionBindingId, WorkExecutionEvidenceKind, WorkExecutionEvidenceProjection,
-    WorkGraphEvent, WorkGraphEventKind, WorkGraphSnapshot, WorkGraphSnapshotFilter, WorkItem,
-    WorkItemFilter, WorkItemId, WorkItemRef, WorkNamespace, WorkOwnerKey, WorkStatus,
+    GoalBindExistingRequest, GoalConfirmRequest, GoalConfirmResult, GoalCreateRequest,
+    GoalCreateResult, GoalRequestCloseRequest, GoalRequestCloseResult, GoalStatusRequest,
+    GoalStatusResult, LinkWorkItemsRequest, ObserveLeaseExpiryRequest, ObserveReadinessRequest,
+    PolicyEscalateRequest, ProjectedAttentionAuthority, ReadyWorkFilter, ReleaseWorkItemRequest,
+    UpdateWorkItemRequest, WorkAttentionBinding, WorkAttentionBindingId, WorkAttentionMode,
+    WorkAttentionStatus, WorkCompletionPolicy, WorkEdge, WorkEdgeKind, WorkEvidenceKind,
+    WorkEvidenceRef, WorkExecutionBinding, WorkExecutionBindingFilter, WorkExecutionBindingId,
+    WorkExecutionEvidenceKind, WorkExecutionEvidenceProjection, WorkGraphEvent, WorkGraphEventKind,
+    WorkGraphSnapshot, WorkGraphSnapshotFilter, WorkItem, WorkItemFilter, WorkItemId, WorkItemRef,
+    WorkNamespace, WorkOwnerKey, WorkStatus,
 };
 use crate::{
-    WorkExecutionLifecycleEffect, WorkExecutionMachine, WorkExecutionObservation,
-    WorkExecutionTransition, WorkGraphError, validate_workgraph_attention_projection_current,
+    ChildJoinDisposition, WorkExecutionLifecycleEffect, WorkExecutionMachine,
+    WorkExecutionObservation, WorkExecutionTransition, WorkGraphError,
+    validate_workgraph_attention_projection_current,
 };
 
 fn validate_execution_evidence(
@@ -62,7 +65,6 @@ const fn execution_evidence_provenance_kind(kind: WorkExecutionEvidenceKind) -> 
     }
 }
 
-const BEST_EFFORT_REFRESH_ATTEMPTS: usize = 3;
 const EXECUTION_PROJECTION_CAS_ATTEMPTS: usize = 8;
 const MAX_REVIEWER_QUORUM_THRESHOLD: u16 = 64;
 const DEFAULT_COLLECTION_LIMIT: usize = 100;
@@ -86,6 +88,7 @@ pub struct WorkGraphService {
     store: Arc<dyn WorkGraphStore>,
     default_realm_id: Arc<str>,
     default_namespace: WorkNamespace,
+    namespace_grant: WorkGraphNamespaceGrant,
 }
 
 /// Capability-bearing coordinator for WorkGraph execution observations.
@@ -116,11 +119,36 @@ impl WorkGraphService {
         default_realm_id: impl Into<String>,
         default_namespace: WorkNamespace,
     ) -> Self {
+        let realm_id = default_realm_id.into();
         Self {
             store,
-            default_realm_id: Arc::<str>::from(default_realm_id.into()),
-            default_namespace,
+            default_realm_id: Arc::<str>::from(realm_id.clone()),
+            default_namespace: default_namespace.clone(),
+            namespace_grant: WorkGraphNamespaceGrant {
+                realm_id,
+                namespace: default_namespace.as_str().to_string(),
+            },
         }
+    }
+
+    pub fn with_namespace_grant(
+        store: Arc<dyn WorkGraphStore>,
+        namespace_grant: WorkGraphNamespaceGrant,
+    ) -> Result<Self, WorkGraphError> {
+        let namespace_grant =
+            WorkGraphNamespaceGrant::new(namespace_grant.realm_id, namespace_grant.namespace)
+                .map_err(WorkGraphError::InvalidInput)?;
+        let default_namespace = WorkNamespace::new(namespace_grant.namespace.clone())?;
+        Ok(Self {
+            store,
+            default_realm_id: Arc::<str>::from(namespace_grant.realm_id.clone()),
+            default_namespace,
+            namespace_grant,
+        })
+    }
+
+    pub fn namespace_grant(&self) -> &WorkGraphNamespaceGrant {
+        &self.namespace_grant
     }
 
     pub fn store(&self) -> &Arc<dyn WorkGraphStore> {
@@ -166,7 +194,8 @@ impl WorkGraphService {
             }
         }
         reject_reserved_evidence_refs(&request.evidence_refs)?;
-        let (realm_id, namespace) = self.scope(request.realm_id.clone(), request.namespace.clone());
+        let (realm_id, namespace) =
+            self.scope(request.realm_id.clone(), request.namespace.clone())?;
         let (item, event) = WorkGraphMachine::create_item(request, realm_id, namespace, now)?;
         self.store.insert_item(item, event).await
     }
@@ -177,14 +206,24 @@ impl WorkGraphService {
     ) -> Result<GoalCreateResult, WorkGraphError> {
         let now = self.store.get_store_time_utc().await?;
         validate_completion_policy(&request.completion_policy)?;
-        let (realm_id, namespace) = self.scope(request.realm_id.clone(), request.namespace.clone());
+        let (realm_id, namespace) =
+            self.scope(request.realm_id.clone(), request.namespace.clone())?;
         let create_request = CreateWorkItemRequest {
             realm_id: Some(realm_id.clone()),
             namespace: Some(namespace.clone()),
             title: request.title,
             description: request.description,
             completion_policy: request.completion_policy,
-            ..CreateWorkItemRequest::default()
+            failed_child_join_policy: request.failed_child_join_policy,
+            cancelled_child_join_policy: request.cancelled_child_join_policy,
+            priority: request.priority,
+            labels: request.labels,
+            due_at: request.due_at,
+            not_before: request.not_before,
+            snoozed_until: request.snoozed_until,
+            external_refs: request.external_refs,
+            evidence_refs: request.evidence_refs,
+            status: request.status,
         };
         let (item, item_event) = WorkGraphMachine::create_item(
             create_request,
@@ -222,6 +261,53 @@ impl WorkGraphService {
         Ok(GoalCreateResult { item, attention })
     }
 
+    pub async fn bind_goal_attention(
+        &self,
+        request: GoalBindExistingRequest,
+    ) -> Result<GoalCreateResult, WorkGraphError> {
+        let now = self.store.get_store_time_utc().await?;
+        let (realm_id, namespace) = self.scope(request.realm_id, request.namespace)?;
+        let item = self
+            .store
+            .get_item(&realm_id, &namespace, &request.item_id)
+            .await?
+            .ok_or_else(|| {
+                WorkGraphError::not_found(
+                    realm_id.clone(),
+                    namespace.clone(),
+                    request.item_id.clone(),
+                )
+            })?;
+        let attention = WorkAttentionBinding {
+            binding_id: WorkAttentionBindingId::generated(),
+            work_ref: WorkItemRef {
+                realm_id: realm_id.clone(),
+                namespace: namespace.clone(),
+                item_id: item.id.clone(),
+            },
+            target: request.target.to_attention_target(),
+            mode: request.mode,
+            status: WorkAttentionStatus::Active,
+            machine_state: Default::default(),
+            delegated_authority: request.delegated_authority,
+            projection_policy: request.projection_policy,
+            created_at: now,
+            updated_at: now,
+        };
+        let event = WorkGraphEvent::graph(
+            realm_id,
+            namespace,
+            WorkGraphEventKind::AttentionCreated,
+            now,
+            json!({ "attention": attention }),
+        );
+        let attention = self
+            .store
+            .insert_attention_for_existing_item(attention, request.expected_item_revision, event)
+            .await?;
+        Ok(GoalCreateResult { item, attention })
+    }
+
     pub async fn goal_status(
         &self,
         request: GoalStatusRequest,
@@ -248,7 +334,7 @@ impl WorkGraphService {
         &self,
         request: AttentionBindingRequest,
     ) -> Result<AttentionBindingResult, WorkGraphError> {
-        let (realm_id, namespace) = self.scope(request.realm_id, request.namespace);
+        let (realm_id, namespace) = self.scope(request.realm_id, request.namespace)?;
         let attention = self
             .store
             .get_attention(&realm_id, &namespace, &request.binding_id)
@@ -274,6 +360,7 @@ impl WorkGraphService {
         if filter.namespace.is_none() {
             filter.namespace = Some(self.default_namespace.clone());
         }
+        self.scope(filter.realm_id.clone(), filter.namespace.clone())?;
         let status_filter = filter.status.take();
         let now = self.store.get_store_time_utc().await?;
         let candidates = self
@@ -306,7 +393,8 @@ impl WorkGraphService {
         &self,
         request: AttentionPruneRequest,
     ) -> Result<AttentionPruneResult, WorkGraphError> {
-        let (realm_id, namespace) = self.scope(request.realm_id.clone(), request.namespace.clone());
+        let (realm_id, namespace) =
+            self.scope(request.realm_id.clone(), request.namespace.clone())?;
         let pruned = self
             .store
             .prune_terminal_attention(AttentionPruneRequest {
@@ -382,7 +470,8 @@ impl WorkGraphService {
         &self,
         request: AttentionReassignRequest,
     ) -> Result<AttentionReassignResult, WorkGraphError> {
-        let (realm_id, namespace) = self.scope(request.realm_id.clone(), request.namespace.clone());
+        let (realm_id, namespace) =
+            self.scope(request.realm_id.clone(), request.namespace.clone())?;
         if request.authority_projection.binding_id != request.binding_id {
             return Err(WorkGraphError::InvalidInput(format!(
                 "attention reassignment projection is scoped to binding {}, got {}",
@@ -443,7 +532,8 @@ impl WorkGraphService {
                 "break-glass reassignment requires a non-empty reason".to_string(),
             ));
         }
-        let (realm_id, namespace) = self.scope(request.realm_id.clone(), request.namespace.clone());
+        let (realm_id, namespace) =
+            self.scope(request.realm_id.clone(), request.namespace.clone())?;
         tracing::warn!(
             binding_id = %request.binding_id,
             principal = %request.principal,
@@ -726,7 +816,7 @@ impl WorkGraphService {
         namespace: Option<WorkNamespace>,
         id: WorkItemId,
     ) -> Result<WorkItem, WorkGraphError> {
-        let (realm_id, namespace) = self.scope(realm_id, namespace);
+        let (realm_id, namespace) = self.scope(realm_id, namespace)?;
         self.store
             .get_item(&realm_id, &namespace, &id)
             .await?
@@ -741,17 +831,11 @@ impl WorkGraphService {
 
     pub async fn ready(&self, filter: ReadyWorkFilter) -> Result<Vec<WorkItem>, WorkGraphError> {
         let output_limit = bounded_collection_limit(filter.limit)?;
-        let now = self.store.get_store_time_utc().await?;
-        let (realm_id, namespace) = self.scope(filter.realm_id.clone(), filter.namespace.clone());
-        let all_items = self
+        let (realm_id, namespace) =
+            self.scope(filter.realm_id.clone(), filter.namespace.clone())?;
+        let (now, all_items, edges) = self
             .store
-            .list_items(WorkItemFilter {
-                realm_id: Some(realm_id.clone()),
-                namespace: Some(namespace.clone()),
-                include_terminal: true,
-                limit: Some(MAX_ATOMIC_READY_ITEMS.saturating_add(1)),
-                ..WorkItemFilter::default()
-            })
+            .read_namespace_graph(&realm_id, &namespace)
             .await?;
         if all_items.len() > MAX_ATOMIC_READY_ITEMS {
             return Err(WorkGraphError::InvalidInput(format!(
@@ -759,13 +843,36 @@ impl WorkGraphService {
             )));
         }
         let labels = filter.labels.clone();
-        let mut ready = WorkGraphMachine::ready_items(
-            all_items
-                .into_iter()
-                .filter(|item| labels.iter().all(|label| item.labels.contains(label)))
-                .collect(),
-            now,
-        );
+        let items_by_id = all_items
+            .iter()
+            .cloned()
+            .map(|item| (item.id.clone(), item))
+            .collect::<BTreeMap<_, _>>();
+        let mut ready = Vec::new();
+        for item in all_items
+            .iter()
+            .filter(|item| labels.iter().all(|label| item.labels.contains(label)))
+        {
+            let joined = matches!(
+                child_join_disposition(item, &all_items, &edges)?,
+                ChildJoinDisposition::Satisfied
+            );
+            if WorkGraphMachine::classify_readiness_from_observation(
+                item,
+                now,
+                unresolved_blocker_count(item, &items_by_id, &edges)?,
+                joined,
+            )? {
+                ready.push(item.clone());
+            }
+        }
+        ready.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .reverse()
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
         ready.truncate(output_limit);
         Ok(ready)
     }
@@ -774,114 +881,106 @@ impl WorkGraphService {
         &self,
         filter: WorkGraphSnapshotFilter,
     ) -> Result<WorkGraphSnapshot, WorkGraphError> {
-        let captured_at = self.store.get_store_time_utc().await?;
         let filter = self.normalize_snapshot_filter(filter)?;
         let realm_id = filter
             .realm_id
             .clone()
             .unwrap_or_else(|| self.default_realm_id.to_string());
-        let event_high_water_mark = self
+        let namespace = filter
+            .namespace
+            .clone()
+            .unwrap_or_else(|| self.default_namespace.clone());
+        let read = self
             .store
-            .latest_event_seq(WorkGraphEventFilter {
-                realm_id: Some(realm_id.clone()),
-                namespace: if filter.all_namespaces {
-                    None
-                } else {
-                    filter.namespace.clone()
-                },
-                all_namespaces: filter.all_namespaces,
-                after_seq: None,
-                limit: Some(1),
-            })
+            .read_namespace_snapshot(&realm_id, &namespace)
             .await?;
-        let items = self
-            .store
-            .list_items(WorkItemFilter {
-                realm_id: Some(realm_id.clone()),
-                namespace: filter.namespace.clone(),
-                all_namespaces: filter.all_namespaces,
-                statuses: filter.statuses.clone(),
-                labels: filter.labels.clone(),
-                include_terminal: filter.include_terminal,
-                limit: filter.limit,
+        if read.items.len() > MAX_ATOMIC_READY_ITEMS {
+            return Err(WorkGraphError::InvalidInput(format!(
+                "snapshot ready-set evaluation exceeds the atomic {MAX_ATOMIC_READY_ITEMS}-item limit; narrow the scope"
+            )));
+        }
+        if read.edges.len() > MAX_ATOMIC_SNAPSHOT_EDGES {
+            return Err(WorkGraphError::InvalidInput(format!(
+                "snapshot exceeds the atomic {MAX_ATOMIC_SNAPSHOT_EDGES}-edge scan limit; narrow the namespace/item scope"
+            )));
+        }
+        if read.attention.len() > MAX_ATOMIC_SNAPSHOT_ATTENTION {
+            return Err(WorkGraphError::InvalidInput(format!(
+                "snapshot exceeds the atomic {MAX_ATOMIC_SNAPSHOT_ATTENTION}-attention scan limit; narrow the namespace/item scope"
+            )));
+        }
+        let mut items = read
+            .items
+            .iter()
+            .filter(|item| {
+                (filter.statuses.is_empty() || filter.statuses.contains(&item.status))
+                    && filter
+                        .labels
+                        .iter()
+                        .all(|label| item.labels.contains(label))
+                    && (filter.include_terminal
+                        || !WorkGraphMachine::classify_terminality(item).unwrap_or(true))
             })
-            .await?;
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        items.truncate(filter.limit.unwrap_or(DEFAULT_COLLECTION_LIMIT));
         let included_item_refs = items
             .iter()
             .map(|item| (item.namespace.clone(), item.id.clone()))
             .collect::<BTreeSet<_>>();
-        let included_item_ids = items
+        let edges = read
+            .edges
             .iter()
-            .map(|item| item.id.clone())
-            .collect::<BTreeSet<_>>();
-
-        let namespaces = self.snapshot_namespaces(&realm_id, &filter, &items).await?;
-        let mut edges = Vec::new();
-        let mut attention = Vec::new();
-        let mut scanned_edges = 0usize;
-        let mut scanned_attention = 0usize;
-        for namespace in &namespaces {
-            let remaining_edges = MAX_ATOMIC_SNAPSHOT_EDGES.saturating_sub(scanned_edges);
-            let edge_candidates = self
-                .store
-                .list_edges_bounded(&realm_id, namespace, remaining_edges.saturating_add(1))
-                .await?;
-            if edge_candidates.len() > remaining_edges {
-                return Err(WorkGraphError::InvalidInput(format!(
-                    "snapshot exceeds the atomic {MAX_ATOMIC_SNAPSHOT_EDGES}-edge scan limit; narrow the namespace/item scope"
-                )));
-            }
-            scanned_edges = scanned_edges.saturating_add(edge_candidates.len());
-            edges.extend(edge_candidates.into_iter().filter(|edge| {
+            .filter(|edge| {
                 included_item_refs.contains(&(edge.namespace.clone(), edge.from_id.clone()))
                     && included_item_refs.contains(&(edge.namespace.clone(), edge.to_id.clone()))
-            }));
-
-            let remaining_attention =
-                MAX_ATOMIC_SNAPSHOT_ATTENTION.saturating_sub(scanned_attention);
-            let attention_candidates = self
-                .store
-                .list_attention_bounded(
-                    AttentionListRequest {
-                        realm_id: Some(realm_id.clone()),
-                        namespace: Some(namespace.clone()),
-                        target: None,
-                        status: None,
-                    },
-                    remaining_attention.saturating_add(1),
-                )
-                .await?;
-            if attention_candidates.len() > remaining_attention {
-                return Err(WorkGraphError::InvalidInput(format!(
-                    "snapshot exceeds the atomic {MAX_ATOMIC_SNAPSHOT_ATTENTION}-attention scan limit; narrow the namespace/item scope"
-                )));
-            }
-            scanned_attention = scanned_attention.saturating_add(attention_candidates.len());
-            for binding in attention_candidates {
-                if included_item_refs.contains(&(
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let attention = read
+            .attention
+            .iter()
+            .filter(|binding| {
+                included_item_refs.contains(&(
                     binding.work_ref.namespace.clone(),
                     binding.work_ref.item_id.clone(),
-                )) {
-                    attention.push(binding);
-                }
+                ))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let all_items_by_id = read
+            .items
+            .iter()
+            .cloned()
+            .map(|item| (item.id.clone(), item))
+            .collect::<BTreeMap<_, _>>();
+        let mut ready_item_ids = Vec::new();
+        for item in &items {
+            let joined = matches!(
+                child_join_disposition(item, &read.items, &read.edges)?,
+                ChildJoinDisposition::Satisfied
+            );
+            if WorkGraphMachine::classify_readiness_from_observation(
+                item,
+                read.captured_at,
+                unresolved_blocker_count(item, &all_items_by_id, &read.edges)?,
+                joined,
+            )? {
+                ready_item_ids.push(item.id.clone());
             }
         }
 
-        let mut ready_item_ids = self
-            .ready_item_ids_in_namespaces(&realm_id, &namespaces, &filter.labels, captured_at)
-            .await?;
-        ready_item_ids.retain(|id| included_item_ids.contains(id));
-
         Ok(WorkGraphSnapshot {
             realm_id,
-            namespace: if filter.all_namespaces {
-                None
-            } else {
-                filter.namespace
-            },
-            all_namespaces: filter.all_namespaces,
-            captured_at,
-            event_high_water_mark,
+            namespace: Some(namespace),
+            all_namespaces: false,
+            captured_at: read.captured_at,
+            event_high_water_mark: read.event_high_water_mark,
             items,
             edges,
             attention,
@@ -891,27 +990,26 @@ impl WorkGraphService {
 
     pub async fn claim(&self, request: ClaimWorkItemRequest) -> Result<WorkItem, WorkGraphError> {
         let now = self.store.get_store_time_utc().await?;
-        let (realm_id, namespace) = self.scope(request.realm_id.clone(), request.namespace.clone());
-        let item = self
+        let (realm_id, namespace) =
+            self.scope(request.realm_id.clone(), request.namespace.clone())?;
+        let item_id = request.id.clone();
+        let expected_revision = request.expected_revision;
+        if let Some(claimed) = self
             .store
-            .get_item(&realm_id, &namespace, &request.id)
+            .claim_item_atomically(&realm_id, &namespace, request, now)
+            .await?
+        {
+            return Ok(claimed);
+        }
+        let terminal = self
+            .propagate_parent_join(&realm_id, &namespace, &item_id, expected_revision, now)
             .await?
             .ok_or_else(|| {
-                WorkGraphError::not_found(realm_id.clone(), namespace.clone(), request.id.clone())
+                WorkGraphError::InvalidTransition(format!(
+                    "work item {item_id} child-join propagation was no longer applicable"
+                ))
             })?;
-        let expected_previous_revision = item.revision;
-        let unresolved_blockers = self
-            .unresolved_blocker_count_for_item(&realm_id, &namespace, &item)
-            .await?;
-        let (item, event) = WorkGraphMachine::claim_item_with_unresolved_blockers(
-            item,
-            unresolved_blockers,
-            request,
-            now,
-        )?;
-        self.store
-            .update_item_cas(item, expected_previous_revision, event)
-            .await
+        Ok(terminal)
     }
 
     pub async fn release(
@@ -931,6 +1029,58 @@ impl WorkGraphService {
         self.store
             .update_item_cas(item, expected_previous_revision, event)
             .await
+    }
+
+    /// Trusted host seam for a Schedule-owned lease sweep. No background task
+    /// is started here; the caller supplies the item and observation time.
+    pub async fn observe_lease_expiry(
+        &self,
+        request: ObserveLeaseExpiryRequest,
+    ) -> Result<WorkItem, WorkGraphError> {
+        let (realm_id, namespace) =
+            self.scope(request.realm_id.clone(), request.namespace.clone())?;
+        let item = self
+            .store
+            .get_item(&realm_id, &namespace, &request.id)
+            .await?
+            .ok_or_else(|| WorkGraphError::not_found(realm_id, namespace, request.id.clone()))?;
+        let expected = item.revision;
+        let (item, event) = WorkGraphMachine::observe_lease_expiry(item, request)?;
+        self.store.update_item_cas(item, expected, event).await
+    }
+
+    /// Trusted host seam for a Schedule-owned readiness sweep. The caller
+    /// supplies observation time; WorkGraph validates graph state and commits
+    /// the `ItemReady` fact without owning a timer.
+    pub async fn observe_readiness(
+        &self,
+        request: ObserveReadinessRequest,
+    ) -> Result<WorkItem, WorkGraphError> {
+        let (realm_id, namespace) =
+            self.scope(request.realm_id.clone(), request.namespace.clone())?;
+        let item_id = request.id.clone();
+        let expected_revision = request.expected_revision;
+        let observed_at = request.observed_at;
+        if let Some(observed) = self
+            .store
+            .observe_readiness_atomically(&realm_id, &namespace, request)
+            .await?
+        {
+            return Ok(observed);
+        }
+        self.propagate_parent_join(
+            &realm_id,
+            &namespace,
+            &item_id,
+            expected_revision,
+            observed_at,
+        )
+        .await?
+        .ok_or_else(|| {
+            WorkGraphError::InvalidTransition(format!(
+                "work item {item_id} child-join propagation was no longer applicable"
+            ))
+        })
     }
 
     pub async fn update(&self, request: UpdateWorkItemRequest) -> Result<WorkItem, WorkGraphError> {
@@ -973,7 +1123,8 @@ impl WorkGraphService {
         request: PolicyEscalateRequest,
     ) -> Result<WorkItem, WorkGraphError> {
         validate_completion_policy(&request.completion_policy)?;
-        let (realm_id, namespace) = self.scope(request.realm_id.clone(), request.namespace.clone());
+        let (realm_id, namespace) =
+            self.scope(request.realm_id.clone(), request.namespace.clone())?;
         if request.authority_projection.work_ref.realm_id != realm_id
             || request.authority_projection.work_ref.namespace != namespace
         {
@@ -1046,8 +1197,9 @@ impl WorkGraphService {
                 attention_updates,
             )
             .await?;
-        self.best_effort_refresh_dependents_after_blocker_change(&closed, now)
-            .await;
+        // Dependent readiness and parent joins are derived from the committed
+        // graph by the next atomic claim/readiness observation. Returning from
+        // this method never reports failure after the close already committed.
         Ok(closed)
     }
 
@@ -1085,7 +1237,8 @@ impl WorkGraphService {
 
     pub async fn link(&self, request: LinkWorkItemsRequest) -> Result<WorkEdge, WorkGraphError> {
         let now = self.store.get_store_time_utc().await?;
-        let (realm_id, namespace) = self.scope(request.realm_id.clone(), request.namespace.clone());
+        let (realm_id, namespace) =
+            self.scope(request.realm_id.clone(), request.namespace.clone())?;
         let edge = WorkEdge {
             realm_id,
             namespace,
@@ -1102,15 +1255,9 @@ impl WorkGraphService {
             json!({ "edge": edge }),
         );
         let inserted = self.store.insert_edge_validated(edge, event).await?;
-        if inserted.kind == WorkEdgeKind::Blocks {
-            self.best_effort_refresh_item_eligibility(
-                &inserted.realm_id,
-                &inserted.namespace,
-                &inserted.to_id,
-                now,
-            )
-            .await;
-        }
+        // Link insertion is the complete canonical write. Readiness and child
+        // joins are reconciled by a later atomic item observation, so this API
+        // cannot return a plain error after the edge already committed.
         Ok(inserted)
     }
 
@@ -1275,6 +1422,10 @@ impl WorkGraphService {
         binding: WorkExecutionBinding,
         expected_item_revision: u64,
     ) -> Result<WorkExecutionTransition, WorkGraphError> {
+        self.scope(
+            Some(binding.work_ref.realm_id.clone()),
+            Some(binding.work_ref.namespace.clone()),
+        )?;
         let commit = WorkExecutionMachine::prepare_bind(binding)?;
         let binding = commit.binding().clone();
         let effect = commit.effect().clone();
@@ -1337,7 +1488,7 @@ impl WorkGraphService {
         namespace: Option<WorkNamespace>,
         binding_id: WorkExecutionBindingId,
     ) -> Result<Option<WorkExecutionBinding>, WorkGraphError> {
-        let (realm_id, namespace) = self.scope(realm_id, namespace);
+        let (realm_id, namespace) = self.scope(realm_id, namespace)?;
         let binding = self
             .store
             .get_execution_binding(&realm_id, &namespace, &binding_id)
@@ -1355,7 +1506,7 @@ impl WorkGraphService {
         namespace: Option<WorkNamespace>,
         binding_id: WorkExecutionBindingId,
     ) -> Result<WorkExecutionBinding, WorkGraphError> {
-        let (realm_id, namespace) = self.scope(realm_id, namespace);
+        let (realm_id, namespace) = self.scope(realm_id, namespace)?;
         let binding = self.store
             .get_execution_binding(&realm_id, &namespace, &binding_id)
             .await?
@@ -1379,6 +1530,10 @@ impl WorkGraphService {
             .store
             .get_execution_binding_by_target_run(&self.default_realm_id, run_id)
             .await?;
+        let binding = binding.filter(|binding| {
+            binding.work_ref.realm_id == self.namespace_grant.realm_id
+                && binding.work_ref.namespace.as_str() == self.namespace_grant.namespace.as_str()
+        });
         if let Some(binding) = binding.as_ref() {
             binding.validate()?;
             WorkExecutionMachine::validate_projection(binding)?;
@@ -1390,12 +1545,9 @@ impl WorkGraphService {
         &self,
         mut filter: WorkExecutionBindingFilter,
     ) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
-        if filter.realm_id.is_none() {
-            filter.realm_id = Some(self.default_realm_id.to_string());
-        }
-        if filter.namespace.is_none() {
-            filter.namespace = Some(self.default_namespace.clone());
-        }
+        let (realm_id, namespace) = self.scope(filter.realm_id, filter.namespace)?;
+        filter.realm_id = Some(realm_id);
+        filter.namespace = Some(namespace);
         filter.limit = Some(bounded_collection_limit(filter.limit)?);
         let bindings = self.store.list_execution_bindings(filter).await?;
         for binding in &bindings {
@@ -1412,11 +1564,10 @@ impl WorkGraphService {
         &self,
         realm_id: Option<String>,
     ) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
+        let (realm_id, namespace) = self.scope(realm_id, None)?;
         let bindings = self
             .store
-            .list_execution_bindings_for_recovery(
-                &realm_id.unwrap_or_else(|| self.default_realm_id.to_string()),
-            )
+            .list_execution_bindings_for_recovery(&realm_id, &namespace)
             .await?;
         for binding in &bindings {
             binding.validate()?;
@@ -1464,6 +1615,12 @@ impl WorkGraphService {
         &self,
         mut filter: WorkGraphEventFilter,
     ) -> Result<Vec<WorkGraphEvent>, WorkGraphError> {
+        if filter.all_namespaces {
+            return Err(WorkGraphError::InvalidInput(
+                "all_namespaces requires a separate host capability; a namespace grant authorizes exactly one immutable namespace"
+                    .to_string(),
+            ));
+        }
         if filter.realm_id.is_none() {
             filter.realm_id = Some(self.default_realm_id.to_string());
         }
@@ -1471,6 +1628,7 @@ impl WorkGraphService {
             filter.namespace = Some(self.default_namespace.clone());
         }
         filter.limit = Some(bounded_collection_limit(filter.limit)?);
+        self.scope(filter.realm_id.clone(), filter.namespace.clone())?;
         self.store.list_public_events(filter).await
     }
 
@@ -1478,17 +1636,30 @@ impl WorkGraphService {
         &self,
         realm_id: Option<String>,
         namespace: Option<WorkNamespace>,
-    ) -> (String, WorkNamespace) {
-        (
-            realm_id.unwrap_or_else(|| self.default_realm_id.to_string()),
-            namespace.unwrap_or_else(|| self.default_namespace.clone()),
-        )
+    ) -> Result<(String, WorkNamespace), WorkGraphError> {
+        let realm_id = realm_id.unwrap_or_else(|| self.default_realm_id.to_string());
+        let namespace = namespace.unwrap_or_else(|| self.default_namespace.clone());
+        if realm_id != self.namespace_grant.realm_id
+            || namespace.as_str() != self.namespace_grant.namespace
+        {
+            return Err(WorkGraphError::InvalidInput(format!(
+                "WorkGraph namespace grant authorizes realm '{}' namespace '{}', requested realm '{}' namespace '{}'",
+                self.namespace_grant.realm_id, self.namespace_grant.namespace, realm_id, namespace
+            )));
+        }
+        Ok((realm_id, namespace))
     }
 
     fn normalize_item_filter(
         &self,
         mut filter: WorkItemFilter,
     ) -> Result<WorkItemFilter, WorkGraphError> {
+        if filter.all_namespaces {
+            return Err(WorkGraphError::InvalidInput(
+                "all_namespaces requires a separate host capability; a namespace grant authorizes exactly one immutable namespace"
+                    .to_string(),
+            ));
+        }
         if filter.realm_id.is_none() {
             filter.realm_id = Some(self.default_realm_id.to_string());
         }
@@ -1496,6 +1667,7 @@ impl WorkGraphService {
             filter.namespace = Some(self.default_namespace.clone());
         }
         filter.limit = Some(bounded_collection_limit(filter.limit)?);
+        self.scope(filter.realm_id.clone(), filter.namespace.clone())?;
         Ok(filter)
     }
 
@@ -1503,6 +1675,12 @@ impl WorkGraphService {
         &self,
         mut filter: WorkGraphSnapshotFilter,
     ) -> Result<WorkGraphSnapshotFilter, WorkGraphError> {
+        if filter.all_namespaces {
+            return Err(WorkGraphError::InvalidInput(
+                "all_namespaces requires a separate host capability; a namespace grant authorizes exactly one immutable namespace"
+                    .to_string(),
+            ));
+        }
         if filter.realm_id.is_none() {
             filter.realm_id = Some(self.default_realm_id.to_string());
         }
@@ -1510,179 +1688,45 @@ impl WorkGraphService {
             filter.namespace = Some(self.default_namespace.clone());
         }
         filter.limit = Some(bounded_collection_limit(filter.limit)?);
+        self.scope(filter.realm_id.clone(), filter.namespace.clone())?;
         Ok(filter)
     }
 
-    async fn snapshot_namespaces(
-        &self,
-        _realm_id: &str,
-        filter: &WorkGraphSnapshotFilter,
-        items: &[WorkItem],
-    ) -> Result<BTreeSet<WorkNamespace>, WorkGraphError> {
-        if !filter.all_namespaces {
-            return Ok(BTreeSet::from_iter([filter
-                .namespace
-                .clone()
-                .unwrap_or_else(|| self.default_namespace.clone())]));
-        }
-
-        let namespaces = items
-            .iter()
-            .map(|item| item.namespace.clone())
-            .collect::<BTreeSet<_>>();
-        Ok(namespaces)
-    }
-
-    async fn ready_item_ids_in_namespaces(
-        &self,
-        realm_id: &str,
-        namespaces: &BTreeSet<WorkNamespace>,
-        labels: &[String],
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<WorkItemId>, WorkGraphError> {
-        let mut ready_ids = Vec::new();
-        let mut scanned_items = 0usize;
-        for namespace in namespaces {
-            let remaining = MAX_ATOMIC_READY_ITEMS.saturating_sub(scanned_items);
-            let all_items = self
-                .store
-                .list_items(WorkItemFilter {
-                    realm_id: Some(realm_id.to_string()),
-                    namespace: Some(namespace.clone()),
-                    include_terminal: true,
-                    limit: Some(remaining.saturating_add(1)),
-                    ..WorkItemFilter::default()
-                })
-                .await?;
-            if all_items.len() > remaining {
-                return Err(WorkGraphError::InvalidInput(format!(
-                    "snapshot ready-set evaluation exceeds the atomic {MAX_ATOMIC_READY_ITEMS}-item limit; narrow the scope"
-                )));
-            }
-            scanned_items = scanned_items.saturating_add(all_items.len());
-            let ready_items = WorkGraphMachine::ready_items(
-                all_items
-                    .into_iter()
-                    .filter(|item| labels.iter().all(|label| item.labels.contains(label)))
-                    .collect(),
-                now,
-            );
-            ready_ids.extend(ready_items.into_iter().map(|item| item.id));
-        }
-        Ok(ready_ids)
-    }
-
-    async fn refresh_dependents_after_blocker_change(
-        &self,
-        blocker: &WorkItem,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), WorkGraphError> {
-        let edges = self
-            .store
-            .list_edges(&blocker.realm_id, &blocker.namespace)
-            .await?;
-        for edge in edges
-            .iter()
-            .filter(|edge| edge.kind == WorkEdgeKind::Blocks && edge.from_id == blocker.id)
-        {
-            self.refresh_item_eligibility(&blocker.realm_id, &blocker.namespace, &edge.to_id, now)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn best_effort_refresh_dependents_after_blocker_change(
-        &self,
-        blocker: &WorkItem,
-        now: chrono::DateTime<chrono::Utc>,
-    ) {
-        for _ in 0..BEST_EFFORT_REFRESH_ATTEMPTS {
-            match self
-                .refresh_dependents_after_blocker_change(blocker, now)
-                .await
-            {
-                Ok(()) => return,
-                Err(WorkGraphError::StaleRevision { .. }) => continue,
-                Err(_) => return,
-            }
-        }
-    }
-
-    async fn best_effort_refresh_item_eligibility(
+    async fn propagate_parent_join(
         &self,
         realm_id: &str,
         namespace: &WorkNamespace,
-        id: &WorkItemId,
+        parent_id: &WorkItemId,
+        expected_revision: u64,
         now: chrono::DateTime<chrono::Utc>,
-    ) {
-        for _ in 0..BEST_EFFORT_REFRESH_ATTEMPTS {
-            match self
-                .refresh_item_eligibility(realm_id, namespace, id, now)
-                .await
-            {
-                Ok(()) => return,
-                Err(WorkGraphError::StaleRevision { .. }) => continue,
-                Err(_) => return,
-            }
+    ) -> Result<Option<WorkItem>, WorkGraphError> {
+        self.store
+            .reconcile_child_join_atomically(realm_id, namespace, parent_id, expected_revision, now)
+            .await
+    }
+}
+
+fn child_join_disposition(
+    item: &WorkItem,
+    items: &[WorkItem],
+    edges: &[WorkEdge],
+) -> Result<ChildJoinDisposition, WorkGraphError> {
+    let children = edges
+        .iter()
+        .filter(|edge| edge.kind == WorkEdgeKind::Parent && edge.to_id == item.id)
+        .filter_map(|edge| items.iter().find(|candidate| candidate.id == edge.from_id));
+    let mut active = 0u64;
+    let mut failed = 0u64;
+    let mut cancelled = 0u64;
+    for child in children {
+        match child.status {
+            WorkStatus::Completed => {}
+            WorkStatus::Failed => failed = failed.saturating_add(1),
+            WorkStatus::Cancelled => cancelled = cancelled.saturating_add(1),
+            _ => active = active.saturating_add(1),
         }
     }
-
-    async fn refresh_item_eligibility(
-        &self,
-        realm_id: &str,
-        namespace: &WorkNamespace,
-        id: &WorkItemId,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), WorkGraphError> {
-        let Some(item) = self.store.get_item(realm_id, namespace, id).await? else {
-            return Ok(());
-        };
-        let all_items = self
-            .store
-            .list_items(WorkItemFilter {
-                realm_id: Some(realm_id.to_string()),
-                namespace: Some(namespace.clone()),
-                include_terminal: true,
-                ..WorkItemFilter::default()
-            })
-            .await?
-            .into_iter()
-            .map(|item| (item.id.clone(), item))
-            .collect::<BTreeMap<_, _>>();
-        let edges = self.store.list_edges(realm_id, namespace).await?;
-        let unresolved_blockers = unresolved_blocker_count(&item, &all_items, &edges)?;
-        let expected_previous_revision = item.revision;
-        if let Some((item, event)) =
-            WorkGraphMachine::refresh_eligibility(item, unresolved_blockers, now)?
-        {
-            self.store
-                .update_item_cas(item, expected_previous_revision, event)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn unresolved_blocker_count_for_item(
-        &self,
-        realm_id: &str,
-        namespace: &WorkNamespace,
-        item: &WorkItem,
-    ) -> Result<u64, WorkGraphError> {
-        let all_items = self
-            .store
-            .list_items(WorkItemFilter {
-                realm_id: Some(realm_id.to_string()),
-                namespace: Some(namespace.clone()),
-                include_terminal: true,
-                ..WorkItemFilter::default()
-            })
-            .await?
-            .into_iter()
-            .map(|item| (item.id.clone(), item))
-            .collect::<BTreeMap<_, _>>();
-        let edges = self.store.list_edges(realm_id, namespace).await?;
-        unresolved_blocker_count(item, &all_items, &edges)
-    }
+    WorkGraphMachine::classify_child_join(item, active, failed, cancelled)
 }
 
 fn attention_updated_event(
@@ -2126,14 +2170,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, Duration, Utc};
     use serde_json::json;
 
     use crate::store::WorkGraphEventFilter;
     use crate::types::{
-        AttentionListRequest, ClaimWorkItemRequest, LinkWorkItemsRequest, WorkAttentionBinding,
-        WorkAttentionBindingId, WorkEdge, WorkEdgeKind, WorkGraphEvent, WorkGraphEventKind,
-        WorkItem, WorkItemFilter, WorkOwner, WorkOwnerKey,
+        AttentionListRequest, ClaimWorkItemRequest, LinkWorkItemsRequest, ObserveReadinessRequest,
+        WorkAttentionBinding, WorkAttentionBindingId, WorkEdge, WorkEdgeKind, WorkGraphEvent,
+        WorkGraphEventKind, WorkGraphFact, WorkItem, WorkItemFilter, WorkOwner, WorkOwnerKey,
     };
     use crate::{
         AddEvidenceRequest, CreateWorkItemRequest, MemoryWorkGraphStore, UpdateWorkItemRequest,
@@ -2151,6 +2195,8 @@ mod tests {
             description: None,
             priority: Default::default(),
             completion_policy: Default::default(),
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
             labels: BTreeSet::new(),
             due_at: None,
             not_before: None,
@@ -2222,6 +2268,48 @@ mod tests {
                 .await
         }
 
+        async fn claim_item_atomically(
+            &self,
+            realm_id: &str,
+            namespace: &WorkNamespace,
+            request: crate::ClaimWorkItemRequest,
+            observed_at: DateTime<Utc>,
+        ) -> Result<Option<WorkItem>, crate::WorkGraphError> {
+            self.inner
+                .claim_item_atomically(realm_id, namespace, request, observed_at)
+                .await
+        }
+
+        async fn observe_readiness_atomically(
+            &self,
+            realm_id: &str,
+            namespace: &WorkNamespace,
+            request: ObserveReadinessRequest,
+        ) -> Result<Option<WorkItem>, crate::WorkGraphError> {
+            self.inner
+                .observe_readiness_atomically(realm_id, namespace, request)
+                .await
+        }
+
+        async fn reconcile_child_join_atomically(
+            &self,
+            realm_id: &str,
+            namespace: &WorkNamespace,
+            parent_id: &WorkItemId,
+            expected_revision: u64,
+            observed_at: DateTime<Utc>,
+        ) -> Result<Option<WorkItem>, crate::WorkGraphError> {
+            self.inner
+                .reconcile_child_join_atomically(
+                    realm_id,
+                    namespace,
+                    parent_id,
+                    expected_revision,
+                    observed_at,
+                )
+                .await
+        }
+
         async fn update_item_and_attention_cas(
             &self,
             item: WorkItem,
@@ -2253,6 +2341,24 @@ mod tests {
             filter: WorkItemFilter,
         ) -> Result<Vec<WorkItem>, crate::WorkGraphError> {
             self.inner.list_items(filter).await
+        }
+
+        async fn read_namespace_graph(
+            &self,
+            realm_id: &str,
+            namespace: &WorkNamespace,
+        ) -> Result<(DateTime<Utc>, Vec<WorkItem>, Vec<WorkEdge>), crate::WorkGraphError> {
+            self.inner.read_namespace_graph(realm_id, namespace).await
+        }
+
+        async fn read_namespace_snapshot(
+            &self,
+            realm_id: &str,
+            namespace: &WorkNamespace,
+        ) -> Result<crate::WorkGraphNamespaceRead, crate::WorkGraphError> {
+            self.inner
+                .read_namespace_snapshot(realm_id, namespace)
+                .await
         }
 
         async fn insert_goal(
@@ -2463,6 +2569,16 @@ mod tests {
             .expect("valid session id");
         let goal = service
             .create_goal(crate::types::GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "self-attest".to_string(),
@@ -2895,7 +3011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn events_can_span_all_namespaces_when_requested() {
+    async fn namespace_grant_refuses_cross_namespace_event_reads() {
         let store = Arc::new(MemoryWorkGraphStore::new());
         let default_service =
             WorkGraphService::with_scope(store.clone(), "realm", WorkNamespace::default());
@@ -2920,14 +3036,14 @@ mod tests {
             .expect("default events");
         assert_eq!(default_events.len(), 1);
 
-        let all_events = default_service
+        let error = default_service
             .events(WorkGraphEventFilter {
                 all_namespaces: true,
                 ..WorkGraphEventFilter::default()
             })
             .await
-            .expect("all events");
-        assert_eq!(all_events.len(), 2);
+            .expect_err("one namespace grant cannot authorize cross-namespace reads");
+        assert!(matches!(error, WorkGraphError::InvalidInput(_)));
     }
 
     // ------------------------------------------------------------------
@@ -3371,5 +3487,46 @@ mod tests {
                 .expect("terminal binding leaves recovery queue")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn schedule_owned_readiness_observation_commits_item_ready_fact() {
+        let service = WorkGraphService::with_scope(
+            Arc::new(MemoryWorkGraphStore::new()),
+            "realm",
+            WorkNamespace::default(),
+        );
+        let observed_at = Utc::now() + Duration::hours(1);
+        let mut request = create_req("time-gated item");
+        request.not_before = Some(observed_at);
+        let item = service
+            .create(request)
+            .await
+            .expect("create time-gated item");
+
+        let observed = service
+            .observe_readiness(ObserveReadinessRequest {
+                id: item.id.clone(),
+                realm_id: None,
+                namespace: None,
+                expected_revision: item.revision,
+                observed_at,
+            })
+            .await
+            .expect("Schedule-owned observation records readiness");
+        assert_eq!(observed.revision, item.revision + 1);
+
+        let events = service
+            .events(WorkGraphEventFilter::default())
+            .await
+            .expect("read WorkGraph facts");
+        let event = events
+            .iter()
+            .find(|event| event.kind == WorkGraphEventKind::ReadinessObserved)
+            .expect("readiness observation event");
+        assert!(event.facts.contains(&WorkGraphFact::ItemReady {
+            item_id: observed.id,
+            item_revision: observed.revision,
+        }));
     }
 }

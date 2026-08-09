@@ -235,9 +235,9 @@ impl Budget {
             .fetch_add(count as u64, Ordering::Relaxed);
     }
 
-    /// Record usage from a Usage struct
-    pub fn record_usage(&self, usage: &crate::types::Usage) {
-        self.record_tokens(usage.total_tokens());
+    /// Record one provider turn from normalized accounting evidence.
+    pub fn record_turn_usage(&self, usage: &crate::types::TurnUsage) {
+        self.record_tokens(usage.normalized_total_tokens());
     }
 
     /// Record a single tool call

@@ -201,16 +201,130 @@ pub enum SessionResumeVerdict {
         authority: SessionResumeAuthority,
         materialization: SessionResumeMaterialization,
         session: Box<Session>,
+        preparation: SessionResumePreparationReceipt,
     },
     Rejected(SessionResumeRejection),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AuthorizedSessionResume {
     pub lifecycle: SessionResumeLifecycle,
     pub authority: SessionResumeAuthority,
     pub materialization: SessionResumeMaterialization,
     pub session: Box<Session>,
+    pub(crate) preparation: SessionResumePreparationReceipt,
+}
+
+/// Owner-issued proof that the durable committed-boundary preparation used by
+/// one bracketed resume materialization has completed.
+///
+/// The fields are private so callers cannot manufacture a receipt or pair it
+/// with a different authority observation. Persistent actor creation consumes
+/// the receipt instead of repeating recovery after the mob already holds
+/// Prepared+B and has revalidated the exact authority carried here.
+#[derive(Debug)]
+pub struct SessionResumePreparationReceipt {
+    session_id: SessionId,
+    authority: SessionResumeAuthority,
+    kind: SessionResumePreparationKind,
+}
+
+#[derive(Debug)]
+enum SessionResumePreparationKind {
+    NonPersistent,
+    #[cfg(not(target_arch = "wasm32"))]
+    PersistentCommittedBoundary(meerkat_session::CommittedBoundaryResumePreparationReceipt),
+}
+
+impl SessionResumePreparationReceipt {
+    fn issue(
+        session_id: &SessionId,
+        authority: &SessionResumeAuthority,
+        kind: SessionResumePreparationKind,
+    ) -> Self {
+        Self {
+            session_id: session_id.clone(),
+            authority: authority.clone(),
+            kind,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn from_persistent(
+        session_id: &SessionId,
+        authority: &SessionResumeAuthority,
+        preparation: meerkat_session::CommittedBoundaryResumePreparationReceipt,
+    ) -> Self {
+        Self {
+            session_id: session_id.clone(),
+            authority: authority.clone(),
+            kind: SessionResumePreparationKind::PersistentCommittedBoundary(preparation),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn into_persistent_for(
+        self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_session::CommittedBoundaryResumePreparationReceipt, SessionError> {
+        if &self.session_id != session_id {
+            return Err(SessionError::Agent(
+                meerkat_core::error::AgentError::InternalError(format!(
+                    "resume preparation receipt for '{}' cannot materialize session '{session_id}'",
+                    self.session_id
+                )),
+            ));
+        }
+        match self.kind {
+            SessionResumePreparationKind::PersistentCommittedBoundary(preparation) => {
+                Ok(preparation)
+            }
+            SessionResumePreparationKind::NonPersistent => Err(SessionError::Agent(
+                meerkat_core::error::AgentError::InternalError(format!(
+                    "persistent resume for session '{session_id}' did not carry owner-issued committed-boundary preparation"
+                )),
+            )),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn advance_after_machine_prepare(
+        self,
+        prepared: &meerkat_runtime::PreparedSessionMaterialization,
+    ) -> Result<Self, SessionError> {
+        let Self {
+            session_id,
+            authority,
+            kind,
+        } = self;
+        let kind = match kind {
+            SessionResumePreparationKind::NonPersistent => {
+                SessionResumePreparationKind::NonPersistent
+            }
+            SessionResumePreparationKind::PersistentCommittedBoundary(preparation) => {
+                SessionResumePreparationKind::PersistentCommittedBoundary(
+                    preparation.advance_after_machine_prepare(prepared).await?,
+                )
+            }
+        };
+        Ok(Self {
+            session_id,
+            authority,
+            kind,
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn advance_after_machine_prepare(
+        self,
+        _prepared: &meerkat_runtime::PreparedSessionMaterialization,
+    ) -> Result<Self, SessionError> {
+        Ok(self)
+    }
+
+    pub(crate) fn matches_authority(&self, authority: &SessionResumeAuthority) -> bool {
+        &self.authority == authority
+    }
 }
 
 impl SessionResumeVerdict {
@@ -221,11 +335,13 @@ impl SessionResumeVerdict {
                 authority,
                 materialization,
                 session,
+                preparation,
             } => Ok(AuthorizedSessionResume {
                 lifecycle,
                 authority,
                 materialization,
                 session,
+                preparation,
             }),
             Self::Rejected(rejection) => Err(rejection),
         }
@@ -235,6 +351,7 @@ impl SessionResumeVerdict {
         session_id: &SessionId,
         load: ResumeSessionLoad,
         authority: SessionResumeAuthority,
+        preparation: Option<SessionResumePreparationReceipt>,
     ) -> Result<Self, SessionError> {
         let runtime_state = authority.runtime_state();
         let occurrence_generation = authority.occurrence_generation();
@@ -262,6 +379,11 @@ impl SessionResumeVerdict {
         }
         match load {
             ResumeSessionLoad::Active(session) => {
+                let preparation = preparation.ok_or_else(|| {
+                    SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                        "active resume for session '{session_id}' omitted owner-issued preparation"
+                    )))
+                })?;
                 let lifecycle = match authority_lifecycle {
                     lifecycle @ SessionResumeLifecycle::Active { .. } => lifecycle,
                     SessionResumeLifecycle::NoCurrentDurableAuthority
@@ -290,9 +412,15 @@ impl SessionResumeVerdict {
                     authority,
                     materialization: SessionResumeMaterialization::Active,
                     session,
+                    preparation,
                 })
             }
             ResumeSessionLoad::Revivable(session) => {
+                let preparation = preparation.ok_or_else(|| {
+                    SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                        "revivable resume for session '{session_id}' omitted owner-issued preparation"
+                    )))
+                })?;
                 // The atomic owner observation decides whether this is an
                 // archived document or a non-archived document paired with a
                 // Retired runtime. The portable Session projection is not
@@ -318,6 +446,7 @@ impl SessionResumeVerdict {
                     authority,
                     materialization: SessionResumeMaterialization::Revivable,
                     session,
+                    preparation,
                 })
             }
             ResumeSessionLoad::ArchivedNotRevivable {
@@ -468,12 +597,11 @@ impl SessionResumeVerdict {
 
     fn committed_boundary_unprovable(
         session_id: &SessionId,
-        load: ResumeSessionLoad,
+        _load: ResumeSessionLoad,
         authority: SessionResumeAuthority,
         detail: String,
     ) -> Result<Self, SessionError> {
-        let classified = Self::from_authoritative_load_with_authority(session_id, load, authority)?;
-        let (lifecycle, authority) = classified.into_lifecycle_authority();
+        let lifecycle = Self::lifecycle_from_authority(&authority);
         let runtime_state = authority.runtime_state();
         Ok(Self::Rejected(SessionResumeRejection {
             session_id: session_id.clone(),
@@ -504,17 +632,38 @@ impl SessionResumeVerdict {
             terminality: ResumeVerdictTerminality::TransientRetryable,
         })
     }
+}
 
-    fn into_lifecycle_authority(self) -> (SessionResumeLifecycle, SessionResumeAuthority) {
-        match self {
-            Self::ResumeAuthorized {
-                lifecycle,
-                authority,
-                ..
-            } => (lifecycle, authority),
-            Self::Rejected(rejection) => (rejection.lifecycle, *rejection.authority),
-        }
+pub(crate) async fn materialize_nonpersistent_session_resume_verdict<S>(
+    session_service: &S,
+    session_id: &SessionId,
+) -> Result<SessionResumeVerdict, SessionError>
+where
+    S: MobSessionService + ?Sized,
+{
+    let before = session_service
+        .observe_session_resume_authority(session_id)
+        .await?;
+    let load = session_service.load_session_for_resume(session_id).await?;
+    let authority = session_service
+        .observe_session_resume_authority(session_id)
+        .await?;
+    if before != authority {
+        return Ok(
+            SessionResumeVerdict::authority_changed_during_materialization(session_id, authority),
+        );
     }
+    let preparation = SessionResumePreparationReceipt::issue(
+        session_id,
+        &authority,
+        SessionResumePreparationKind::NonPersistent,
+    );
+    SessionResumeVerdict::from_authoritative_load_with_authority(
+        session_id,
+        load,
+        authority,
+        Some(preparation),
+    )
 }
 
 /// Typed actor-materialization route selected by the mob provisioner after
@@ -530,13 +679,18 @@ pub(crate) enum SessionActorMaterializationRoute {
     /// Create a newly admitted session actor.
     Fresh,
     /// Recreate an actor from an active durable session body.
-    Resume,
+    Resume {
+        preparation: SessionResumePreparationReceipt,
+    },
     /// Recreate an actor from a machine-authorized revivable session body.
     Revivable {
         authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
+        preparation: SessionResumePreparationReceipt,
     },
     /// Recreate only the actor for an already-serving exact attachment.
-    AttachedActorRecovery,
+    AttachedActorRecovery {
+        preparation: SessionResumePreparationReceipt,
+    },
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -544,6 +698,28 @@ impl SessionActorMaterializationRoute {
     #[must_use]
     pub(crate) fn is_revivable(&self) -> bool {
         matches!(self, Self::Revivable { .. })
+    }
+
+    pub(crate) async fn advance_resume_preparation_after_machine_prepare(
+        self,
+        prepared: &meerkat_runtime::PreparedSessionMaterialization,
+    ) -> Result<Self, SessionError> {
+        match self {
+            Self::Fresh => Ok(Self::Fresh),
+            Self::Resume { preparation } => Ok(Self::Resume {
+                preparation: preparation.advance_after_machine_prepare(prepared).await?,
+            }),
+            Self::Revivable {
+                authorization,
+                preparation,
+            } => Ok(Self::Revivable {
+                authorization,
+                preparation: preparation.advance_after_machine_prepare(prepared).await?,
+            }),
+            Self::AttachedActorRecovery { preparation } => Ok(Self::AttachedActorRecovery {
+                preparation: preparation.advance_after_machine_prepare(prepared).await?,
+            }),
+        }
     }
 }
 
@@ -686,6 +862,7 @@ pub trait MobSessionService:
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         _req: meerkat_core::service::CreateSessionRequest,
+        _resume_preparation: Option<SessionResumePreparationReceipt>,
         _actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, SessionError> {
         Err(SessionError::Unsupported(
@@ -722,6 +899,7 @@ pub trait MobSessionService:
         &self,
         _req: meerkat_core::service::CreateSessionRequest,
         _authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
+        _resume_preparation: SessionResumePreparationReceipt,
         _actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, SessionError> {
         Err(SessionError::Unsupported(
@@ -818,6 +996,21 @@ pub trait MobSessionService:
     ) -> Result<(), SessionError> {
         Err(SessionError::Unsupported(format!(
             "interrupt for runtime-backed mob session {session_id} must be implemented by the machine-owned session service"
+        )))
+    }
+
+    /// Apply a live hard cancel to one exact run after machine admission.
+    /// Implementations must return `false` for a stale run and must never
+    /// widen the request to the ambient successor.
+    #[cfg(feature = "runtime-adapter")]
+    async fn interrupt_run_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        _expected_run_id: &RunId,
+        _authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, SessionError> {
+        Err(SessionError::Unsupported(format!(
+            "exact-run interrupt for runtime-backed mob session {session_id} must be implemented by the machine-owned session service"
         )))
     }
 
@@ -932,6 +1125,23 @@ pub trait MobSessionService:
         Ok(None)
     }
 
+    /// Persist a transcript fork for a concrete new mob identity.
+    ///
+    /// Durable services override this with their store-owned fork authority.
+    /// The target binding is applied before child commit so the ordinary
+    /// resume pipeline can validate, rather than invent, the child identity.
+    async fn fork_persisted_session(
+        &self,
+        _source_session_id: &SessionId,
+        _message_count: Option<usize>,
+        _tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
+        _target: meerkat_core::DurableSessionForkTarget,
+    ) -> Result<meerkat_core::SessionForkResult, SessionError> {
+        Err(SessionError::Unsupported(
+            "session service does not expose durable transcript fork authority".into(),
+        ))
+    }
+
     /// Load an archived session only for an explicit resume/revival operation.
     /// Ordinary reads remain archive-filtered.
     ///
@@ -957,16 +1167,6 @@ pub trait MobSessionService:
     ) -> Result<Option<Session>, SessionError> {
         Ok(None)
     }
-
-    /// Converge store-owned durable-tail authority before an operational
-    /// resume materializes a Session body.
-    ///
-    /// REQUIRED, deliberately without a default: a persistent wrapper that
-    /// forgets this transition would compile while recreating an actor from
-    /// stale committed authority whenever the physical head is ahead after a
-    /// power cut. Classification and status paths use
-    /// [`Self::observe_session_resume_authority`] and remain read-only.
-    async fn prepare_session_for_resume(&self, session_id: &SessionId) -> Result<(), SessionError>;
 
     /// Typed resume-seam read: never collapses "archived", "absent", and
     /// "archived but not revivable" into one `None`.
@@ -1027,18 +1227,7 @@ pub trait MobSessionService:
         &self,
         session_id: &SessionId,
     ) -> Result<SessionResumeVerdict, SessionError> {
-        self.prepare_session_for_resume(session_id).await?;
-        let before = self.observe_session_resume_authority(session_id).await?;
-        let load = self.load_session_for_resume(session_id).await?;
-        let authority = self.observe_session_resume_authority(session_id).await?;
-        if before != authority {
-            return Ok(
-                SessionResumeVerdict::authority_changed_during_materialization(
-                    session_id, authority,
-                ),
-            );
-        }
-        SessionResumeVerdict::from_authoritative_load_with_authority(session_id, load, authority)
+        materialize_nonpersistent_session_resume_verdict(self, session_id).await
     }
 
     /// Load the persisted session METADATA view when available.
@@ -1096,6 +1285,20 @@ pub trait MobSessionService:
         &self,
         session_id: &SessionId,
     ) -> Result<(), SessionError>;
+
+    /// Deadline-aware sibling used by retirement. Services with a
+    /// process-owned archive implementation override this to preserve the
+    /// caller's one absolute teardown budget; simpler services may retain the
+    /// required archive contract above.
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+        &self,
+        session_id: &SessionId,
+        _deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<(), SessionError> {
+        Err(SessionError::Unsupported(format!(
+            "session service must implement deadline-aware mob archive for session {session_id}"
+        )))
+    }
 
     async fn apply_runtime_turn(
         &self,
@@ -1193,9 +1396,13 @@ pub trait MobSessionService:
             .await
     }
 
-    async fn publish_interaction_terminals(
+    /// Publish predecessor terminals only through one service-minted actor
+    /// incarnation. Runtime retirement drops its mutation gate before calling
+    /// arbitrary publication code, so resolving only by SessionId here would
+    /// allow a delayed predecessor callback to target a successor actor.
+    async fn publish_interaction_terminals_for_actor(
         &self,
-        _session_id: &SessionId,
+        _actor_witness: &meerkat_session::LiveSessionActorWitness,
         events: &[meerkat_core::event::AgentEvent],
     ) -> Result<
         Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
@@ -1205,7 +1412,7 @@ pub trait MobSessionService:
             return Ok(Vec::new());
         }
         Err(SessionError::Unsupported(
-            "exact interaction terminal publication requires a persistent session service"
+            "exact interaction terminal publication requires actor-incarnation authority"
                 .to_string(),
         ))
     }
@@ -1271,21 +1478,34 @@ pub(crate) async fn execute_session_actor_materialization_under_runtime_turn_bou
     actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
 ) -> Result<meerkat_core::RunResult, SessionError> {
     match route {
-        SessionActorMaterializationRoute::Fresh
-        | SessionActorMaterializationRoute::Resume
-        | SessionActorMaterializationRoute::AttachedActorRecovery => {
+        SessionActorMaterializationRoute::Fresh => {
             session_service
                 .create_session_with_actor_witness_under_runtime_turn_boundary(
                     req,
+                    None,
                     actor_witness_slot,
                 )
                 .await
         }
-        SessionActorMaterializationRoute::Revivable { authorization } => {
+        SessionActorMaterializationRoute::Resume { preparation }
+        | SessionActorMaterializationRoute::AttachedActorRecovery { preparation } => {
+            session_service
+                .create_session_with_actor_witness_under_runtime_turn_boundary(
+                    req,
+                    Some(preparation),
+                    actor_witness_slot,
+                )
+                .await
+        }
+        SessionActorMaterializationRoute::Revivable {
+            authorization,
+            preparation,
+        } => {
             session_service
                 .create_session_with_machine_archived_resume_authority_and_actor_witness_under_runtime_turn_boundary(
                     req,
                     authorization,
+                    preparation,
                     actor_witness_slot,
                 )
                 .await
@@ -1304,13 +1524,6 @@ where
         req: meerkat_core::service::CreateSessionRequest,
     ) -> Result<meerkat_core::RunResult, SessionError> {
         <Self as meerkat_core::service::SessionService>::create_session(self, req).await
-    }
-
-    async fn prepare_session_for_resume(
-        &self,
-        _session_id: &SessionId,
-    ) -> Result<(), SessionError> {
-        Ok(())
     }
 
     async fn observe_session_resume_authority(
@@ -1338,6 +1551,7 @@ where
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         req: meerkat_core::service::CreateSessionRequest,
+        _resume_preparation: Option<SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, SessionError> {
         #[cfg(feature = "runtime-adapter")]
@@ -1459,6 +1673,21 @@ where
     }
 
     #[cfg(feature = "runtime-adapter")]
+    async fn interrupt_run_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        expected_run_id: &RunId,
+        _authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, SessionError> {
+        meerkat_session::EphemeralSessionService::<B>::interrupt_run_if_current(
+            self,
+            session_id,
+            expected_run_id,
+        )
+        .await
+    }
+
+    #[cfg(feature = "runtime-adapter")]
     async fn cancel_after_boundary_with_machine_authority(
         &self,
         session_id: &SessionId,
@@ -1500,6 +1729,19 @@ where
         session_id: &SessionId,
     ) -> Result<(), SessionError> {
         self.archive_with_mob_lifecycle_authority(session_id).await
+    }
+
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+        &self,
+        session_id: &SessionId,
+        _deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<(), SessionError> {
+        // MemberSessionDisposalArc transfers the held B lease and this entire
+        // first-party ephemeral archive into a process-owned task before it
+        // waits on the owner deadline. This explicit implementation records
+        // that contract instead of inheriting a deadline-ignoring default.
+        self.archive_with_mob_lifecycle_authority_under_runtime_turn_boundary(session_id)
+            .await
     }
 
     async fn execution_snapshot(
@@ -1559,6 +1801,7 @@ where
         match runtime.peer_ingress_runtime_snapshot().await {
             Ok(snapshot) => Ok(Some(snapshot)),
             Err(CommsCapabilityError::Unsupported(_)) => Ok(None),
+            Err(error) => Err(SessionError::Unsupported(error.to_string())),
         }
     }
 
@@ -1659,73 +1902,112 @@ where
             .await
     }
 
-    async fn prepare_session_for_resume(&self, session_id: &SessionId) -> Result<(), SessionError> {
-        match self.recover_committed_boundary(session_id).await {
-            Ok(
-                meerkat_session::CommittedBoundaryRecovery::AlreadyCommitted
-                | meerkat_session::CommittedBoundaryRecovery::Recovered { .. },
-            ) => {
-                // Rewrite-audit replay/finalization is an operational repair,
-                // not an observation side effect. Keep it behind the explicit
-                // preparation seam, after store-owned A/H convergence.
-                let _ = self.load_authoritative_session(session_id).await?;
-                Ok(())
-            }
-            Err(SessionError::NotFound { .. }) => Ok(()),
-            Ok(meerkat_session::CommittedBoundaryRecovery::Unprovable { reason }) => Err(
-                SessionError::Agent(meerkat_core::error::AgentError::InternalError(reason)),
-            ),
-            Err(error) => Err(error),
-        }
-    }
-
     async fn materialize_session_resume_verdict(
         &self,
         session_id: &SessionId,
     ) -> Result<SessionResumeVerdict, SessionError> {
-        let unprovable = match self.recover_committed_boundary(session_id).await {
-            Ok(
-                meerkat_session::CommittedBoundaryRecovery::AlreadyCommitted
-                | meerkat_session::CommittedBoundaryRecovery::Recovered { .. },
-            ) => {
-                // Preserve the rewrite-audit replay/finalization performed by
-                // the ordinary preparation seam after A/H convergence.
-                let _ = self.load_authoritative_session(session_id).await?;
-                None
+        match self.prepare_committed_boundary_resume(session_id).await? {
+            meerkat_session::PreparedCommittedBoundaryResume::Materializable {
+                session,
+                materialization,
+                observation,
+                preparation,
+            } => {
+                let authority = SessionResumeAuthority {
+                    observation: Some(observation),
+                };
+                let load = match materialization {
+                    meerkat_session::PreparedCommittedBoundaryResumeMaterialization::Active => {
+                        ResumeSessionLoad::Active(session)
+                    }
+                    meerkat_session::PreparedCommittedBoundaryResumeMaterialization::Revivable => {
+                        ResumeSessionLoad::Revivable(session)
+                    }
+                };
+                let preparation = SessionResumePreparationReceipt::from_persistent(
+                    session_id,
+                    &authority,
+                    preparation,
+                );
+                SessionResumeVerdict::from_authoritative_load_with_authority(
+                    session_id,
+                    load,
+                    authority,
+                    Some(preparation),
+                )
             }
-            Err(SessionError::NotFound { .. }) => None,
-            Ok(meerkat_session::CommittedBoundaryRecovery::Unprovable { reason }) => Some(reason),
-            Err(error) => return Err(error),
-        };
-        let before = self.observe_session_resume_authority(session_id).await?;
-        let load = self.load_session_for_resume(session_id).await?;
-        let authority = self.observe_session_resume_authority(session_id).await?;
-        if before != authority {
-            return Ok(
-                SessionResumeVerdict::authority_changed_during_materialization(
-                    session_id, authority,
-                ),
-            );
-        }
-        match unprovable {
-            Some(reason) => SessionResumeVerdict::committed_boundary_unprovable(
-                session_id, load, authority, reason,
+            meerkat_session::PreparedCommittedBoundaryResume::Unavailable {
+                unavailable,
+                observation,
+            } => {
+                let authority = SessionResumeAuthority {
+                    observation: Some(observation),
+                };
+                let load = match unavailable {
+                    meerkat_session::PreparedCommittedBoundaryResumeUnavailable::Absent => {
+                        ResumeSessionLoad::Absent
+                    }
+                    meerkat_session::PreparedCommittedBoundaryResumeUnavailable::ArchivedNotRevivable {
+                        runtime_state,
+                    } => ResumeSessionLoad::ArchivedNotRevivable { runtime_state },
+                };
+                SessionResumeVerdict::from_authoritative_load_with_authority(
+                    session_id,
+                    load,
+                    authority,
+                    None,
+                )
+            }
+            meerkat_session::PreparedCommittedBoundaryResume::CommittedBoundaryUnprovable {
+                observation,
+                reason,
+            } => SessionResumeVerdict::committed_boundary_unprovable(
+                session_id,
+                ResumeSessionLoad::Absent,
+                SessionResumeAuthority {
+                    observation: Some(observation),
+                },
+                reason,
             ),
-            None => SessionResumeVerdict::from_authoritative_load_with_authority(
-                session_id, load, authority,
-            ),
+            meerkat_session::PreparedCommittedBoundaryResume::AuthorityChangedDuringMaterialization {
+                observation,
+            } => Ok(SessionResumeVerdict::authority_changed_during_materialization(
+                session_id,
+                SessionResumeAuthority {
+                    observation: Some(observation),
+                },
+            )),
         }
     }
 
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         req: meerkat_core::service::CreateSessionRequest,
+        resume_preparation: Option<SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, SessionError> {
+        let resume_preparation = match resume_preparation {
+            Some(preparation) => {
+                let session_id = req
+                    .build
+                    .as_ref()
+                    .and_then(|build| build.resume_session.as_ref())
+                    .map(|session| session.id())
+                    .ok_or_else(|| {
+                        SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                            "persistent actor materialization carried a resume preparation receipt without its session body"
+                                .to_string(),
+                        ))
+                    })?;
+                Some(preparation.into_persistent_for(session_id)?)
+            }
+            None => None,
+        };
         let admission = self.reserve_create_session_admission().await?;
         self.create_session_with_reserved_admission_and_actor_witness_under_runtime_turn_boundary(
             req,
             admission,
+            resume_preparation,
             actor_witness_slot,
         )
         .await
@@ -1766,13 +2048,26 @@ where
         &self,
         req: meerkat_core::service::CreateSessionRequest,
         authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
+        resume_preparation: SessionResumePreparationReceipt,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, SessionError> {
+        let session_id = req
+            .build
+            .as_ref()
+            .and_then(|build| build.resume_session.as_ref())
+            .map(|session| session.id())
+            .ok_or_else(|| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    "machine-authorized archived resume omitted its session body".to_string(),
+                ))
+            })?;
+        let resume_preparation = resume_preparation.into_persistent_for(session_id)?;
         let admission = self.reserve_create_session_admission().await?;
         self.create_session_with_reserved_machine_archived_resume_admission_and_actor_witness_under_runtime_turn_boundary(
             req,
             admission,
             authorization,
+            resume_preparation,
             actor_witness_slot,
         )
         .await
@@ -1896,6 +2191,23 @@ where
             return Ok(None);
         }
         Ok(Some(session))
+    }
+
+    async fn fork_persisted_session(
+        &self,
+        source_session_id: &SessionId,
+        message_count: Option<usize>,
+        tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
+        target: meerkat_core::DurableSessionForkTarget,
+    ) -> Result<meerkat_core::SessionForkResult, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::fork_durable_session(
+            self,
+            source_session_id,
+            message_count,
+            tool_access_policy,
+            Some(target),
+        )
+        .await
     }
 
     async fn load_revivable_retired_session(
@@ -2041,6 +2353,27 @@ where
         <Self as SessionService>::archive(self, session_id).await
     }
 
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+        &self,
+        session_id: &SessionId,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<(), SessionError> {
+        #[cfg(feature = "runtime-adapter")]
+        if let Some(runtime_adapter) = self.runtime_adapter() {
+            return meerkat_session::PersistentSessionService::<B>::archive_with_machine_protocol_under_runtime_turn_boundary_before(
+                self,
+                session_id,
+                meerkat_session::MachineSessionArchiveProtocol::from_machine(
+                    runtime_adapter.as_ref(),
+                ),
+                deadline,
+            )
+            .await;
+        }
+
+        <Self as SessionService>::archive(self, session_id).await
+    }
+
     #[cfg(feature = "runtime-adapter")]
     async fn interrupt_with_machine_authority(
         &self,
@@ -2049,6 +2382,22 @@ where
     ) -> Result<(), SessionError> {
         meerkat_session::PersistentSessionService::<B>::interrupt_with_machine_authority(
             self, session_id, authority,
+        )
+        .await
+    }
+
+    #[cfg(feature = "runtime-adapter")]
+    async fn interrupt_run_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        expected_run_id: &RunId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::interrupt_run_with_machine_authority(
+            self,
+            session_id,
+            expected_run_id,
+            authority,
         )
         .await
     }
@@ -2113,6 +2462,7 @@ where
         match runtime.peer_ingress_runtime_snapshot().await {
             Ok(snapshot) => Ok(Some(snapshot)),
             Err(CommsCapabilityError::Unsupported(_)) => Ok(None),
+            Err(error) => Err(SessionError::Unsupported(error.to_string())),
         }
     }
 
@@ -2268,16 +2618,18 @@ where
         .await
     }
 
-    async fn publish_interaction_terminals(
+    async fn publish_interaction_terminals_for_actor(
         &self,
-        session_id: &SessionId,
+        actor_witness: &meerkat_session::LiveSessionActorWitness,
         events: &[meerkat_core::event::AgentEvent],
     ) -> Result<
         Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
         SessionError,
     > {
-        meerkat_session::PersistentSessionService::<B>::publish_interaction_terminals_exact_batch(
-            self, session_id, events,
+        meerkat_session::PersistentSessionService::<B>::publish_interaction_terminals_exact_batch_for_actor(
+            self,
+            actor_witness,
+            events,
         )
         .await
     }

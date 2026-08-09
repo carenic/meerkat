@@ -13,6 +13,7 @@ import pytest
 from meerkat.errors import MeerkatError
 
 from .live_smoke_support import (
+    anthropic_mid_system_model,
     gemini_image_model,
     has_anthropic_api_key,
     has_gemini_api_key,
@@ -301,7 +302,7 @@ if include_scenario(38):
         async with live_client() as client:
             session = await client.create_session(
                 "Remember the codeword ORBIT-38 for later and reply READY.",
-                model=smoke_model(),
+                model=anthropic_mid_system_model(),
                 provider="anthropic",
             )
 

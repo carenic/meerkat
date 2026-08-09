@@ -75,9 +75,9 @@ impl WorkGraphToolError {
 /// `ALL` slice to drift. Adding a variant automatically extends the advertised
 /// tool list and the dispatch surface, and the compiler forces the exhaustive
 /// `name()`/`description()`/`schema()` matches (and the dispatch match in
-/// [`handle_workgraph_tools_call`]) to acknowledge it.
+/// the attention-scoped dispatcher) to acknowledge it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
-enum WorkGraphToolContract {
+pub enum WorkGraphToolContract {
     Create,
     Get,
     List,
@@ -96,7 +96,7 @@ enum WorkGraphToolContract {
 }
 
 impl WorkGraphToolContract {
-    const fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Create => "workgraph_create",
             Self::Get => "workgraph_get",
@@ -116,7 +116,7 @@ impl WorkGraphToolContract {
         }
     }
 
-    const fn description(self) -> &'static str {
+    pub const fn description(self) -> &'static str {
         match self {
             Self::Create => "Create a durable WorkGraph item.",
             Self::Get => "Read one WorkGraph item.",
@@ -155,7 +155,7 @@ impl WorkGraphToolContract {
         }
     }
 
-    const fn is_unscoped_surface_allowed(self) -> bool {
+    pub const fn is_unscoped_surface_allowed(self) -> bool {
         !matches!(self, Self::AttentionReassign | Self::PolicyEscalate)
     }
 
@@ -169,6 +169,74 @@ impl WorkGraphToolContract {
                 )
             })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkGraphToolSource {
+    Platform,
+    Mcp,
+    Host,
+}
+
+/// Host-consumable capability row. Provenance is explicit and is never
+/// inferred from a `workgraph_` name prefix. For example, a host-composed
+/// `workgraph_ensure_items` remains `Host`; it is not part of the 15-operation
+/// platform catalog above.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkGraphToolCapability {
+    pub name: String,
+    pub source: WorkGraphToolSource,
+    pub declared: bool,
+    pub resolved: bool,
+    pub dispatch_gated: bool,
+}
+
+impl WorkGraphToolCapability {
+    pub fn external(
+        name: impl Into<String>,
+        source: WorkGraphToolSource,
+        resolved: bool,
+        dispatch_gated: bool,
+    ) -> Result<Self, WorkGraphToolError> {
+        if source == WorkGraphToolSource::Platform {
+            return Err(WorkGraphToolError::new(
+                WorkGraphToolErrorCode::InvalidArguments,
+                "platform WorkGraph capability rows are catalog-owned",
+            ));
+        }
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(WorkGraphToolError::new(
+                WorkGraphToolErrorCode::InvalidArguments,
+                "external WorkGraph capability name must be non-empty",
+            ));
+        }
+        Ok(Self {
+            name,
+            source,
+            declared: true,
+            resolved,
+            dispatch_gated,
+        })
+    }
+}
+
+pub fn workgraph_platform_capability_manifest(
+    attention_bound: bool,
+) -> Vec<WorkGraphToolCapability> {
+    WorkGraphToolContract::iter()
+        .map(|contract| {
+            let gated = !contract.is_unscoped_surface_allowed();
+            WorkGraphToolCapability {
+                name: contract.name().to_string(),
+                source: WorkGraphToolSource::Platform,
+                declared: true,
+                resolved: !gated || attention_bound,
+                dispatch_gated: gated,
+            }
+        })
+        .collect()
 }
 
 pub fn workgraph_tools_list() -> Vec<Value> {
@@ -205,7 +273,7 @@ pub async fn handle_unscoped_workgraph_tools_call(
     handle_workgraph_tools_call(service, name, arguments).await
 }
 
-pub async fn handle_workgraph_tools_call(
+pub(crate) async fn handle_workgraph_tools_call(
     service: &WorkGraphService,
     name: &str,
     arguments: &Value,
@@ -406,7 +474,9 @@ fn map_error(error: WorkGraphError) -> WorkGraphToolError {
             WorkGraphToolErrorCode::InvalidArguments
         }
         WorkGraphError::UnsupportedBackend(_) => WorkGraphToolErrorCode::CapabilityUnavailable,
-        WorkGraphError::Store(_) => WorkGraphToolErrorCode::StoreError,
+        WorkGraphError::Store(_) | WorkGraphError::NamespaceAssignmentRequired { .. } => {
+            WorkGraphToolErrorCode::StoreError
+        }
     };
     WorkGraphToolError::new(code, error.to_string())
 }
@@ -543,6 +613,14 @@ fn create_schema() -> Value {
             json!({ "type": "string", "enum": ["low", "medium", "high"] }),
         ),
         (
+            "failed_child_join_policy".to_string(),
+            json!({ "type": "string", "enum": ["require_success", "propagate", "accept"] }),
+        ),
+        (
+            "cancelled_child_join_policy".to_string(),
+            json!({ "type": "string", "enum": ["require_success", "propagate", "accept"] }),
+        ),
+        (
             "labels".to_string(),
             json!({ "type": "array", "items": { "type": "string" } }),
         ),
@@ -663,14 +741,25 @@ fn claim_schema() -> Value {
         ),
         (
             "lease_seconds".to_string(),
-            json!({ "type": "integer", "minimum": 1 }),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": crate::types::MAX_WORK_CLAIM_LEASE_SECONDS
+            }),
         ),
         (
             "lease_expires_at".to_string(),
             json!({ "type": "string", "format": "date-time" }),
         ),
     ]);
-    object(properties, &["id", "expected_revision", "owner"])
+    let mut schema = object(properties, &["id", "expected_revision", "owner"]);
+    if let Some(schema) = schema.as_object_mut() {
+        schema.insert(
+            "not".to_string(),
+            json!({ "required": ["lease_seconds", "lease_expires_at"] }),
+        );
+    }
+    schema
 }
 
 fn update_schema() -> Value {
@@ -942,6 +1031,46 @@ mod tests {
         let unknown = WorkGraphToolContract::parse("workgraph_not_a_real_tool")
             .expect_err("dispatch must reject operations outside the catalog");
         assert_eq!(unknown.code, WorkGraphToolErrorCode::NotFound);
+    }
+
+    #[test]
+    fn platform_capability_manifest_is_explicit_about_resolution_and_provenance() {
+        let unbound = workgraph_platform_capability_manifest(false);
+        assert_eq!(unbound.len(), CANONICAL_WORKGRAPH_TOOL_NAMES.len());
+        assert!(unbound.iter().all(|row| {
+            row.source == WorkGraphToolSource::Platform
+                && row.declared
+                && row.name != "workgraph_ensure_items"
+        }));
+        for name in ["workgraph_policy_escalate", "workgraph_attention_reassign"] {
+            let row = unbound
+                .iter()
+                .find(|row| row.name == name)
+                .expect("attention-bound operation is declared by the platform catalog");
+            assert!(!row.resolved);
+            assert!(row.dispatch_gated);
+        }
+
+        let bound = workgraph_platform_capability_manifest(true);
+        assert!(bound.iter().all(|row| row.resolved));
+        assert!(
+            bound
+                .iter()
+                .filter(|row| row.dispatch_gated)
+                .all(|row| matches!(
+                    row.name.as_str(),
+                    "workgraph_policy_escalate" | "workgraph_attention_reassign"
+                ))
+        );
+
+        let host = WorkGraphToolCapability::external(
+            "workgraph_ensure_items",
+            WorkGraphToolSource::Host,
+            true,
+            false,
+        )
+        .expect("host composition may explicitly declare its own operation");
+        assert_eq!(host.source, WorkGraphToolSource::Host);
     }
 
     #[tokio::test]

@@ -30,8 +30,8 @@ use meerkat_core::{
     AssistantBlock, BlobId, BlockAssistantMessage, ContentBlock, ContentInput, ImageData, Message,
     ProviderMeta, ServerToolKind, SessionHistoryPage, SessionId, SessionInfo, SessionSummary,
     SessionTranscriptRevisionList, SessionTranscriptRevisionPage, StopReason, SystemMessage,
-    SystemMessageIdentity, SystemNoticeKind, SystemNoticeMessage, ToolResult,
-    TranscriptEditRunningBehavior, TranscriptReplacement, TranscriptRewriteReason,
+    SystemMessageIdentity, SystemNoticeKind, SystemNoticeMessage, SystemPromptVersionIdentity,
+    ToolResult, TranscriptEditRunningBehavior, TranscriptReplacement, TranscriptRewriteReason,
     TranscriptRewriteSelection, TranscriptSource, UserMessage, VideoData,
 };
 use meerkat_core::{InteractionId, RunId};
@@ -112,6 +112,13 @@ pub enum TranscriptRewriteMessage {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         created_at: Option<String>,
+        /// Existing typed prompt-version identity for exact-row reuse.
+        ///
+        /// The core generic-rewrite authority accepts this only when the full
+        /// System row already exists in the current or retained lineage. New
+        /// versions remain mintable only through `update_system_prompt`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_version: Option<SystemPromptVersionIdentity>,
     },
     SystemNotice {
         kind: SystemNoticeKind,
@@ -169,6 +176,42 @@ pub struct RewriteSessionTranscriptParams {
     pub expected_parent_revision: Option<String>,
     #[serde(default)]
     pub running_behavior: TranscriptEditRunningBehavior,
+}
+
+/// Request payload for `session/update_system_prompt`.
+///
+/// Unlike a generic transcript rewrite, this operation can only mint the next
+/// version of one typed prompt key. `target_message_index` is required only
+/// for the first explicit adoption of an existing unversioned System row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSystemPromptParams {
+    pub session_id: String,
+    pub key: meerkat_core::SystemPromptKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<meerkat_core::SystemPromptVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_message_index: Option<usize>,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_parent_revision: Option<String>,
+}
+
+impl UpdateSystemPromptParams {
+    #[must_use]
+    pub fn into_core(self) -> meerkat_core::SystemPromptUpdateRequest {
+        meerkat_core::SystemPromptUpdateRequest {
+            key: self.key,
+            expected_version: self.expected_version,
+            target_message_index: self.target_message_index,
+            content: self.content,
+            actor: self.actor,
+            expected_parent_revision: self.expected_parent_revision,
+        }
+    }
 }
 
 /// Request payload for `session/restore_transcript_revision`.
@@ -1111,10 +1154,12 @@ impl TranscriptRewriteMessage {
             Self::System {
                 content,
                 created_at,
+                prompt_version,
             } => Ok(Message::System(SystemMessage {
                 content,
                 created_at: transcript_message_timestamp(created_at)?,
                 identity: None,
+                prompt_version,
             })),
             Self::SystemNotice {
                 kind,
@@ -1320,6 +1365,11 @@ pub enum WireSessionMessage {
         /// transcript message. Provider adapters ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         identity: Option<WireSystemMessageIdentity>,
+        /// Typed replacement-slot identity. Historical versions remain
+        /// visible on history/revision reads even though model materialization
+        /// selects only the latest version for each key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_version: Option<SystemPromptVersionIdentity>,
     },
     SystemNotice {
         kind: SystemNoticeKind,
@@ -1391,6 +1441,7 @@ impl From<Message> for WireSessionMessage {
                 content: message.content,
                 created_at: message.created_at.to_rfc3339(),
                 identity: message.identity.map(Into::into),
+                prompt_version: message.prompt_version,
             },
             Message::SystemNotice(message) => Self::SystemNotice {
                 kind: message.kind,
@@ -1682,6 +1733,46 @@ mod tests {
         assert_eq!(json["selection"]["type"], "message_range");
         assert_eq!(json["replacement"][0]["role"], "block_assistant");
         assert_eq!(json["running_behavior"], "reject");
+    }
+
+    #[test]
+    fn test_rewrite_system_message_preserves_existing_prompt_version_identity() {
+        let params: RewriteSessionTranscriptParams = serde_json::from_value(serde_json::json!({
+            "session_id": "session_123",
+            "selection": {
+                "type": "message_range",
+                "start": 0,
+                "end": 1
+            },
+            "replacement": [
+                {
+                    "role": "system",
+                    "content": "version two",
+                    "created_at": "2026-08-08T08:00:00Z",
+                    "prompt_version": {
+                        "key": "primary",
+                        "version": 2
+                    }
+                }
+            ],
+            "reason": {
+                "kind": "operator_edit"
+            }
+        }))
+        .unwrap();
+
+        let lowered = params.replacement[0].clone().into_core().unwrap();
+        assert!(matches!(
+            lowered,
+            Message::System(SystemMessage {
+                prompt_version: Some(SystemPromptVersionIdentity { key, version }),
+                ..
+            }) if key.as_str() == "primary" && version.get() == 2
+        ));
+
+        let json = serde_json::to_value(params).unwrap();
+        assert_eq!(json["replacement"][0]["prompt_version"]["key"], "primary");
+        assert_eq!(json["replacement"][0]["prompt_version"]["version"], 2);
     }
 
     #[test]
@@ -2149,6 +2240,7 @@ mod tests {
                     content: "You are helpful".to_string(),
                     created_at: "2026-04-27T00:00:00Z".to_string(),
                     identity: None,
+                    prompt_version: None,
                 },
                 WireSessionMessage::User {
                     content: WireContentInput::Text("hello".to_string()),

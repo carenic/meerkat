@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // Trait imports for method-call resolution on `Arc<meerkat_comms::CommsRuntime>`
-// (`send`, `drain_peer_input_candidates`) and on `Arc<MeerkatMachine>`
+// (`send`, `handoff_volatile_peer_input_candidates`) and on `Arc<MeerkatMachine>`
 // (`list_active_inputs`) — the meerkat-mob/src/runtime/tests.rs and
 // smoke_mob_flow_runtime.rs import discipline.
 use meerkat_core::agent::CommsRuntime as _;
@@ -707,11 +707,13 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
             .await
     }
 
-    async fn prepare_session_for_resume(
+    async fn materialize_session_resume_verdict(
         &self,
         session_id: &meerkat_core::SessionId,
-    ) -> Result<(), meerkat_core::service::SessionError> {
-        self.inner.prepare_session_for_resume(session_id).await
+    ) -> Result<meerkat_mob::SessionResumeVerdict, meerkat_core::service::SessionError> {
+        self.inner
+            .materialize_session_resume_verdict(session_id)
+            .await
     }
 
     async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
@@ -756,12 +758,17 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         req: meerkat_core::service::CreateSessionRequest,
+        resume_preparation: Option<meerkat_mob::SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
         let call = self.begin_create_call()?;
         let result = self
             .inner
-            .create_session_with_actor_witness_under_runtime_turn_boundary(req, actor_witness_slot)
+            .create_session_with_actor_witness_under_runtime_turn_boundary(
+                req,
+                resume_preparation,
+                actor_witness_slot,
+            )
             .await?;
         Ok(self.finish_create_call(call, result))
     }
@@ -799,6 +806,7 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         &self,
         req: meerkat_core::service::CreateSessionRequest,
         authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
+        resume_preparation: meerkat_mob::SessionResumePreparationReceipt,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
         let call = self.begin_create_call()?;
@@ -807,6 +815,7 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
             .create_session_with_machine_archived_resume_authority_and_actor_witness_under_runtime_turn_boundary(
                 req,
                 authorization,
+                resume_preparation,
                 actor_witness_slot,
             )
             .await?;
@@ -2415,7 +2424,10 @@ pub async fn spawn_scripted_host_peer(name: &str) -> ScriptedHostPeer {
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let candidates = runtime.drain_peer_input_candidates().await;
+            let candidates = runtime
+                .handoff_volatile_peer_input_candidates()
+                .await
+                .expect("volatile peer-input handoff");
             if candidates.is_empty() {
                 (&mut notified).await;
                 continue;
@@ -2972,6 +2984,13 @@ pub fn persistent_service_with_client(
     builder.default_llm_client = Some(client);
     // Workgraph-profiled members build fail-closed without installed
     // WorkGraph tools (the persistence-bundle default in production).
+    meerkat::surface::set_default_workgraph_namespace_grant(
+        &builder,
+        Some(
+            meerkat::WorkGraphNamespaceGrant::new("test-realm", "default")
+                .expect("valid test WorkGraph grant"),
+        ),
+    );
     meerkat::surface::set_default_workgraph_tools(
         &builder,
         Some(Arc::new(meerkat::WorkGraphToolSurface::new(
@@ -3823,14 +3842,22 @@ impl meerkat_client::LlmClient for OneShotToolCallClient {
 
     fn stream<'a>(
         &'a self,
-        _request: &'a meerkat_client::LlmRequest,
+        request: &'a meerkat_client::LlmRequest,
     ) -> meerkat_client::types::LlmStream<'a> {
+        let usage = || meerkat_client::LlmEvent::UsageUpdate {
+            usage: meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Anthropic,
+                &request.model,
+                meerkat_core::Usage::default(),
+            ),
+        };
         let events = if self.fired.swap(true, Ordering::SeqCst) {
             vec![
                 meerkat_client::LlmEvent::TextDelta {
                     delta: "ok".to_string(),
                     meta: None,
                 },
+                usage(),
                 meerkat_client::LlmEvent::Done {
                     outcome: meerkat_client::LlmDoneOutcome::Success {
                         stop_reason: meerkat_core::StopReason::EndTurn,
@@ -3845,6 +3872,7 @@ impl meerkat_client::LlmClient for OneShotToolCallClient {
                     args: self.args.clone(),
                     meta: None,
                 },
+                usage(),
                 meerkat_client::LlmEvent::Done {
                     outcome: meerkat_client::LlmDoneOutcome::Success {
                         stop_reason: meerkat_core::StopReason::ToolUse,
@@ -3858,7 +3886,7 @@ impl meerkat_client::LlmClient for OneShotToolCallClient {
     }
 
     fn provider(&self) -> meerkat_core::Provider {
-        meerkat_core::Provider::Other
+        meerkat_core::Provider::Anthropic
     }
 
     async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
@@ -4344,12 +4372,19 @@ impl meerkat_client::LlmClient for ScriptedCompletingClient {
 
     fn stream<'a>(
         &'a self,
-        _request: &'a meerkat_client::LlmRequest,
+        request: &'a meerkat_client::LlmRequest,
     ) -> meerkat_client::types::LlmStream<'a> {
         let events = vec![
             meerkat_client::LlmEvent::TextDelta {
                 delta: self.text.clone(),
                 meta: None,
+            },
+            meerkat_client::LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    meerkat_core::Provider::Anthropic,
+                    &request.model,
+                    meerkat_core::Usage::default(),
+                ),
             },
             meerkat_client::LlmEvent::Done {
                 outcome: meerkat_client::LlmDoneOutcome::Success {
@@ -4361,7 +4396,7 @@ impl meerkat_client::LlmClient for ScriptedCompletingClient {
     }
 
     fn provider(&self) -> meerkat_core::Provider {
-        meerkat_core::Provider::Other
+        meerkat_core::Provider::Anthropic
     }
 
     async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
@@ -4786,7 +4821,10 @@ pub fn spawn_scripted_member_turn_responder(
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let candidates = runtime.drain_peer_input_candidates().await;
+            let candidates = runtime
+                .handoff_volatile_peer_input_candidates()
+                .await
+                .expect("volatile peer-input handoff");
             if candidates.is_empty() {
                 (&mut notified).await;
                 continue;

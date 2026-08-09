@@ -4,7 +4,6 @@
 use super::comms_config::ResolvedCommsConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::InboxSender;
-use crate::agent::types::CommsMessage;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::handle_connection;
 #[cfg(not(target_arch = "wasm32"))]
@@ -38,7 +37,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::net::TcpListener;
@@ -538,7 +536,7 @@ impl Drop for InteractionStream {
 
 fn classified_entry_to_interaction(
     entry: crate::inbox::ClassifiedInboxEntry,
-) -> Option<meerkat_core::ClassifiedInboxInteraction> {
+) -> Option<meerkat_core::interaction::PeerInputCandidate> {
     use crate::agent::types::MessageIntent;
     use crate::types::MessageKind;
 
@@ -668,7 +666,7 @@ fn classified_entry_to_interaction(
                 }
             };
 
-            Some(meerkat_core::ClassifiedInboxInteraction {
+            Some(meerkat_core::interaction::PeerInputCandidate {
                 interaction: meerkat_core::InboxInteraction {
                     id: meerkat_core::InteractionId(envelope.id),
                     from_route: from_peer_id,
@@ -694,7 +692,7 @@ fn classified_entry_to_interaction(
             blocks,
             render_metadata,
             ..
-        } => Some(meerkat_core::ClassifiedInboxInteraction {
+        } => Some(meerkat_core::interaction::PeerInputCandidate {
             interaction: meerkat_core::InboxInteraction {
                 id: meerkat_core::InteractionId(interaction_id.unwrap_or(raw_item_id.0)),
                 from_route: None,
@@ -755,27 +753,6 @@ impl CoreCommsRuntime for CommsRuntime {
         Ok(())
     }
 
-    async fn drain_messages(&self) -> Vec<String> {
-        // Delegate through classified drain so messages from the classified
-        // inbox (the sole consumer since 0.4.10) are returned. The legacy
-        // string projection cannot validate member residency, so it must fail
-        // closed for incarnation-fenced messages. The structured drain below
-        // remains their only runtime admission path.
-        self.drain_inbox_interactions()
-            .await
-            .into_iter()
-            .filter_map(|interaction| {
-                if matches!(
-                    &interaction.content,
-                    meerkat_core::InteractionContent::IncarnationFencedMessage { .. }
-                ) {
-                    None
-                } else {
-                    Some(interaction.rendered_text)
-                }
-            })
-            .collect()
-    }
     fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
         self.inbox_notify.clone()
     }
@@ -1303,6 +1280,7 @@ impl CoreCommsRuntime for CommsRuntime {
                     stream == InputStreamMode::ReserveInteraction,
                     objective_id,
                     None,
+                    None,
                 )
                 .await
             }
@@ -1482,6 +1460,7 @@ impl CoreCommsRuntime for CommsRuntime {
                         true,
                         objective_id,
                         None,
+                        None,
                     )
                     .await?;
                 let event_stream = self
@@ -1510,17 +1489,6 @@ impl CoreCommsRuntime for CommsRuntime {
 
     async fn peer_count(&self) -> usize {
         self.resolve_peer_count().await
-    }
-
-    async fn drain_inbox_interactions(&self) -> Vec<meerkat_core::InboxInteraction> {
-        // Delegate to classified drain and strip classification metadata.
-        // This ensures a single drain path: classified queue is the sole consumer.
-        self.drain_classified_inbox_interactions()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|ci| ci.interaction)
-            .collect()
     }
 
     fn interaction_subscriber(
@@ -1562,18 +1530,6 @@ impl CoreCommsRuntime for CommsRuntime {
         }
     }
 
-    async fn drain_classified_inbox_interactions(
-        &self,
-    ) -> Result<Vec<meerkat_core::ClassifiedInboxInteraction>, meerkat_core::CommsCapabilityError>
-    {
-        let mut inbox = self.inbox.lock().await;
-        let classified_entries = inbox.try_drain_classified();
-        Ok(classified_entries
-            .into_iter()
-            .filter_map(classified_entry_to_interaction)
-            .collect())
-    }
-
     async fn claim_classified_inbox_interaction(
         &self,
     ) -> Result<Option<meerkat_core::PeerIngressQueueClaim>, meerkat_core::CommsCapabilityError>
@@ -1610,7 +1566,7 @@ impl CoreCommsRuntime for CommsRuntime {
     async fn peer_ingress_runtime_snapshot(
         &self,
     ) -> Result<meerkat_core::PeerIngressRuntimeSnapshot, meerkat_core::CommsCapabilityError> {
-        let (queue, authority_phase, submission_queue_len) = {
+        let (queue, authority_phase) = {
             let inbox = self.inbox.lock().await;
             inbox.peer_runtime_snapshot().ok_or_else(|| {
                 meerkat_core::CommsCapabilityError::Unsupported(
@@ -1625,7 +1581,6 @@ impl CoreCommsRuntime for CommsRuntime {
             auth_required: self.require_peer_auth,
             authority_phase: map_peer_ingress_phase(authority_phase),
             trusted_peers,
-            submission_queue_len,
             queue,
         })
     }
@@ -1848,7 +1803,6 @@ pub struct CommsRuntime {
     meerkat_machine_trust_owner:
         parking_lot::RwLock<Option<meerkat_core::comms::GeneratedPeerCommsOwnerToken>>,
     mob_machine_trust_owner: parking_lot::RwLock<Option<Arc<dyn std::any::Any + Send + Sync>>>,
-    require_peer_comms_machine_authority: Arc<AtomicBool>,
     /// Narrow notify that fires only for actionable peer input (messages/requests).
     /// Set during construction when classified inbox is used.
     actionable_notify: Option<Arc<tokio::sync::Notify>>,
@@ -2012,34 +1966,7 @@ impl CommsRuntime {
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn new_with_silent_intents(
         config: ResolvedCommsConfig,
-        silent_intents: Arc<HashSet<String>>,
-    ) -> Result<Self, CommsRuntimeError> {
-        Self::new_with_silent_intents_and_machine_authority_requirement(
-            config,
-            silent_intents,
-            false,
-        )
-        .await
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub async fn new_machine_authority_required_with_silent_intents(
-        config: ResolvedCommsConfig,
-        silent_intents: Arc<HashSet<String>>,
-    ) -> Result<Self, CommsRuntimeError> {
-        Self::new_with_silent_intents_and_machine_authority_requirement(
-            config,
-            silent_intents,
-            true,
-        )
-        .await
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn new_with_silent_intents_and_machine_authority_requirement(
-        config: ResolvedCommsConfig,
         _silent_intents: Arc<HashSet<String>>,
-        require_machine_authority: bool,
     ) -> Result<Self, CommsRuntimeError> {
         // Always load keypair regardless of auth mode. Trust rows are not
         // seeded from config; live trust changes must arrive through generated
@@ -2056,8 +1983,6 @@ impl CommsRuntime {
 
         // Build classified inbox using the same trusted_peers Arc
         let peer_comms_handle = Arc::new(parking_lot::RwLock::new(None));
-        let require_peer_comms_machine_authority =
-            Arc::new(AtomicBool::new(require_machine_authority));
         let bridge_reply_waiters: Arc<Mutex<HashMap<Uuid, BridgeReplyWaiterEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let classification_context = Arc::new(crate::classify::IngressClassificationContext {
@@ -2101,7 +2026,6 @@ impl CommsRuntime {
             peer_comms_handle,
             meerkat_machine_trust_owner: parking_lot::RwLock::new(None),
             mob_machine_trust_owner: parking_lot::RwLock::new(None),
-            require_peer_comms_machine_authority,
             actionable_notify,
             blob_store: None,
             peer_interaction_handle: parking_lot::RwLock::new(None),
@@ -2215,7 +2139,6 @@ impl CommsRuntime {
         let trusted_peers = Arc::new(parking_lot::RwLock::new(TrustStore::new()));
 
         let peer_comms_handle = Arc::new(parking_lot::RwLock::new(None));
-        let require_peer_comms_machine_authority = Arc::new(AtomicBool::new(false));
         let bridge_reply_waiters: Arc<Mutex<HashMap<Uuid, BridgeReplyWaiterEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let classification_context = Arc::new(crate::classify::IngressClassificationContext {
@@ -2287,7 +2210,6 @@ impl CommsRuntime {
             peer_comms_handle,
             meerkat_machine_trust_owner: parking_lot::RwLock::new(None),
             mob_machine_trust_owner: parking_lot::RwLock::new(None),
-            require_peer_comms_machine_authority,
             actionable_notify,
             blob_store: None,
             peer_interaction_handle: parking_lot::RwLock::new(None),
@@ -2341,7 +2263,6 @@ impl CommsRuntime {
         let trusted_peers = Arc::new(parking_lot::RwLock::new(TrustStore::new()));
 
         let peer_comms_handle = Arc::new(parking_lot::RwLock::new(None));
-        let require_peer_comms_machine_authority = Arc::new(AtomicBool::new(true));
         let bridge_reply_waiters: Arc<Mutex<HashMap<Uuid, BridgeReplyWaiterEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let classification_context = Arc::new(crate::classify::IngressClassificationContext {
@@ -2402,7 +2323,6 @@ impl CommsRuntime {
             peer_comms_handle,
             meerkat_machine_trust_owner: parking_lot::RwLock::new(None),
             mob_machine_trust_owner: parking_lot::RwLock::new(None),
-            require_peer_comms_machine_authority,
             actionable_notify,
             blob_store: None,
             peer_interaction_handle: parking_lot::RwLock::new(None),
@@ -2447,19 +2367,6 @@ impl CommsRuntime {
         authority
             .validate_target_source_owner_token(expected_meerkat.as_ref(), expected_mob.as_ref())
             .map_err(SendError::Validation)
-    }
-
-    /// Mark this runtime as requiring peer-comms machine authority.
-    /// Missing `PeerCommsHandle` already fails closed for classified ingress;
-    /// this flag remains as an observable session-mode marker for callers.
-    pub fn require_peer_comms_machine_authority(&self) {
-        self.require_peer_comms_machine_authority
-            .store(true, Ordering::SeqCst);
-    }
-
-    pub fn peer_comms_machine_authority_required(&self) -> bool {
-        self.require_peer_comms_machine_authority
-            .load(Ordering::SeqCst)
     }
 
     pub fn peer_comms_handle(&self) -> Option<Arc<dyn meerkat_core::handles::PeerCommsHandle>> {
@@ -3300,6 +3207,7 @@ impl CommsRuntime {
         stream_reserved: bool,
         objective_id: Option<meerkat_core::interaction::ObjectiveId>,
         reply_endpoint: Option<meerkat_core::comms::PeerAddress>,
+        send_deadline: Option<Instant>,
     ) -> Result<SendReceipt, SendError> {
         if reply_endpoint
             .as_ref()
@@ -3337,23 +3245,47 @@ impl CommsRuntime {
             return Err(err);
         }
 
-        let send_outcome = match self
-            .send_peer_command_with_id(
-                to,
-                interaction_id,
-                crate::types::MessageKind::Request {
-                    intent,
-                    params,
-                    blocks,
-                    reply_endpoint,
-                    content_taint: None,
-                    handling_mode: Some(handling_mode),
-                    objective_id,
-                },
-                content_taint,
-            )
-            .await
-        {
+        let send_future = self.send_peer_command_with_id(
+            to,
+            interaction_id,
+            crate::types::MessageKind::Request {
+                intent,
+                params,
+                blocks,
+                reply_endpoint,
+                content_taint: None,
+                handling_mode: Some(handling_mode),
+                objective_id,
+            },
+            content_taint,
+        );
+        let send_result = if let Some(deadline) = send_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                Err(SendError::AmbiguousDelivery {
+                    envelope_id: interaction_id,
+                    detail: "peer transport deadline elapsed after request lifecycle admission"
+                        .to_string(),
+                })
+            } else {
+                #[cfg(not(target_arch = "wasm32"))]
+                let timed =
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), send_future)
+                        .await;
+                #[cfg(target_arch = "wasm32")]
+                let timed = tokio::time::timeout(remaining, send_future).await;
+                timed.unwrap_or_else(|_| {
+                    Err(SendError::AmbiguousDelivery {
+                        envelope_id: interaction_id,
+                        detail: "peer transport deadline elapsed after request lifecycle admission"
+                            .to_string(),
+                    })
+                })
+            }
+        } else {
+            send_future.await
+        };
+        let send_outcome = match send_result {
             Ok(outcome) => outcome,
             Err(error @ SendError::AmbiguousDelivery { .. }) => {
                 // Receiver admission may already have committed. Preserve the
@@ -3394,8 +3326,89 @@ impl CommsRuntime {
         params: serde_json::Value,
         reply_endpoint: meerkat_core::comms::PeerAddress,
     ) -> Result<SendReceipt, SendError> {
-        self.send_peer_request_with_id_lifecycle(
+        self.send_peer_request_at_endpoint_with_id(
             Uuid::new_v4(),
+            to,
+            intent,
+            params,
+            reply_endpoint,
+        )
+        .await
+    }
+
+    /// Send a standard peer Request with a caller-minted exact correlation id.
+    ///
+    /// This is the no-declared-endpoint counterpart of
+    /// [`Self::send_peer_request_at_endpoint_with_id`].
+    pub async fn send_peer_request_with_id(
+        &self,
+        interaction_id: Uuid,
+        to: PeerRoute,
+        intent: &str,
+        params: serde_json::Value,
+    ) -> Result<SendReceipt, SendError> {
+        self.send_peer_request_with_id_lifecycle(
+            interaction_id,
+            &to,
+            intent.to_string(),
+            params,
+            None,
+            None,
+            meerkat_core::types::HandlingMode::Queue,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Deadline-aware exact-correlation send. The peer-request lifecycle is
+    /// admitted synchronously before the deadline is applied to hydration and
+    /// transport I/O. An elapsed deadline therefore returns
+    /// [`SendError::AmbiguousDelivery`] and deliberately does not drive
+    /// `request_send_failed`.
+    pub async fn send_peer_request_with_id_before(
+        &self,
+        interaction_id: Uuid,
+        to: PeerRoute,
+        intent: &str,
+        params: serde_json::Value,
+        deadline: Instant,
+    ) -> Result<SendReceipt, SendError> {
+        self.send_peer_request_with_id_lifecycle(
+            interaction_id,
+            &to,
+            intent.to_string(),
+            params,
+            None,
+            None,
+            meerkat_core::types::HandlingMode::Queue,
+            false,
+            None,
+            None,
+            Some(deadline),
+        )
+        .await
+    }
+
+    /// Exact-correlation variant of [`Self::send_peer_request_at_endpoint`].
+    ///
+    /// The caller mints the interaction/envelope id before dispatch so it can
+    /// conservatively terminalize an elapsed or cancelled socket operation as
+    /// ambiguous without losing the peer-interaction retry witness. This does
+    /// not impose a transport deadline itself; the owner that minted the id
+    /// applies its one absolute operation deadline around this future.
+    pub async fn send_peer_request_at_endpoint_with_id(
+        &self,
+        interaction_id: Uuid,
+        to: PeerRoute,
+        intent: &str,
+        params: serde_json::Value,
+        reply_endpoint: meerkat_core::comms::PeerAddress,
+    ) -> Result<SendReceipt, SendError> {
+        self.send_peer_request_with_id_lifecycle(
+            interaction_id,
             &to,
             intent.to_string(),
             params,
@@ -3405,6 +3418,35 @@ impl CommsRuntime {
             false,
             None,
             Some(reply_endpoint),
+            None,
+        )
+        .await
+    }
+
+    /// Deadline-aware counterpart of
+    /// [`Self::send_peer_request_at_endpoint_with_id`]. See
+    /// [`Self::send_peer_request_with_id_before`] for the lifecycle contract.
+    pub async fn send_peer_request_at_endpoint_with_id_before(
+        &self,
+        interaction_id: Uuid,
+        to: PeerRoute,
+        intent: &str,
+        params: serde_json::Value,
+        reply_endpoint: meerkat_core::comms::PeerAddress,
+        deadline: Instant,
+    ) -> Result<SendReceipt, SendError> {
+        self.send_peer_request_with_id_lifecycle(
+            interaction_id,
+            &to,
+            intent.to_string(),
+            params,
+            None,
+            None,
+            meerkat_core::types::HandlingMode::Queue,
+            false,
+            None,
+            Some(reply_endpoint),
+            Some(deadline),
         )
         .await
     }
@@ -3490,6 +3532,7 @@ impl CommsRuntime {
                 false,
                 None,
                 reply_endpoint,
+                None,
             )
             .await
         {
@@ -3856,48 +3899,6 @@ impl CommsRuntime {
             StreamRegistryEntry::new(sender, receiver, lifecycle_authority),
         );
         Ok(())
-    }
-
-    pub async fn drain_messages(&self) -> Vec<CommsMessage> {
-        // Drain from the classified queue (sole consumer since 0.4.10).
-        // Convert classified entries back to CommsMessage using the
-        // ingress-stored metadata (from_peer, class) rather than
-        // re-resolving against live trust state. This preserves the
-        // ingress-snapshot guarantee: a message accepted at ingress
-        // cannot disappear or change from_peer if the peer is
-        // removed/renamed before drain.
-        let mut inbox = self.inbox.lock().await;
-        let entries = inbox.try_drain_classified();
-        entries
-            .into_iter()
-            .filter_map(|entry| CommsMessage::from_classified_entry(&entry))
-            .collect()
-    }
-
-    pub async fn recv_message(&self) -> Option<CommsMessage> {
-        loop {
-            // Register the waiter BEFORE draining so a message that arrives
-            // between the drain returning empty and the await cannot be lost.
-            // inbox_notify uses notify_waiters() which only wakes already-
-            // registered listeners, and a `Notified` future is not registered
-            // until it is pinned and `enable()`d (or first polled) — so do that
-            // here, before the drain, not at the trailing `.await`.
-            let mut notified = std::pin::pin!(self.inbox_notify.notified());
-            notified.as_mut().enable();
-            {
-                let mut inbox = self.inbox.lock().await;
-                // Consume one entry at a time so back-to-back messages are
-                // preserved. The previous implementation drained the entire
-                // classified queue and discarded everything after the first
-                // decodable message.
-                while let Some(entry) = inbox.try_recv_one_classified() {
-                    if let Some(msg) = CommsMessage::from_classified_entry(&entry) {
-                        return Some(msg);
-                    }
-                }
-            }
-            notified.as_mut().await;
-        }
     }
 
     pub fn shutdown(&mut self) {
@@ -4565,7 +4566,7 @@ mod tests {
 
     async fn snapshot_runtime_candidates(
         runtime: &CommsRuntime,
-    ) -> Vec<meerkat_core::ClassifiedInboxInteraction> {
+    ) -> Vec<meerkat_core::interaction::PeerInputCandidate> {
         let inbox = runtime.inbox.lock().await;
         inbox
             .test_classified_entries_snapshot()
@@ -6174,12 +6175,9 @@ mod tests {
         let mut config = test_runtime_config("pairing-target", &tmp);
         config.listen_tcp = Some("127.0.0.1:0".parse().unwrap());
         config.pairing_password = Some("0123456789abcdef0123456789abcdef".to_string());
-        let mut runtime = CommsRuntime::new_machine_authority_required_with_silent_intents(
-            config,
-            Arc::new(HashSet::new()),
-        )
-        .await
-        .unwrap();
+        let mut runtime = CommsRuntime::new_with_silent_intents(config, Arc::new(HashSet::new()))
+            .await
+            .unwrap();
         runtime.start_listeners().await.unwrap();
         let addr = runtime.config.listen_tcp.unwrap();
 
@@ -6267,12 +6265,9 @@ mod tests {
         let mut config = test_runtime_config("pairing-delayed-target", &tmp);
         config.listen_tcp = Some("127.0.0.1:0".parse().unwrap());
         config.pairing_password = Some("0123456789abcdef0123456789abcdef".to_string());
-        let mut runtime = CommsRuntime::new_machine_authority_required_with_silent_intents(
-            config,
-            Arc::new(HashSet::new()),
-        )
-        .await
-        .unwrap();
+        let mut runtime = CommsRuntime::new_with_silent_intents(config, Arc::new(HashSet::new()))
+            .await
+            .unwrap();
         runtime.start_listeners().await.unwrap();
         let addr = runtime.config.listen_tcp.unwrap();
 
@@ -6304,12 +6299,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = test_runtime_config("wildcard-target", &tmp);
         config.listen_tcp = Some("0.0.0.0:0".parse().unwrap());
-        let mut runtime = CommsRuntime::new_machine_authority_required_with_silent_intents(
-            config,
-            Arc::new(HashSet::new()),
-        )
-        .await
-        .unwrap();
+        let mut runtime = CommsRuntime::new_with_silent_intents(config, Arc::new(HashSet::new()))
+            .await
+            .unwrap();
 
         let error = runtime
             .start_listeners()
@@ -6329,12 +6321,9 @@ mod tests {
         let mut config = test_runtime_config("advertised-target", &tmp);
         config.listen_tcp = Some("127.0.0.1:0".parse().unwrap());
         config.advertise_address = Some("tcp://203.0.113.10:4200".to_string());
-        let mut runtime = CommsRuntime::new_machine_authority_required_with_silent_intents(
-            config,
-            Arc::new(HashSet::new()),
-        )
-        .await
-        .unwrap();
+        let mut runtime = CommsRuntime::new_with_silent_intents(config, Arc::new(HashSet::new()))
+            .await
+            .unwrap();
 
         assert_eq!(
             runtime.bound_tcp_listener_address(),
@@ -6357,12 +6346,9 @@ mod tests {
         let requested_address: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut config = test_runtime_config(&participant_name, &tmp);
         config.listen_tcp = Some(requested_address);
-        let mut runtime = CommsRuntime::new_machine_authority_required_with_silent_intents(
-            config,
-            Arc::new(HashSet::new()),
-        )
-        .await
-        .unwrap();
+        let mut runtime = CommsRuntime::new_with_silent_intents(config, Arc::new(HashSet::new()))
+            .await
+            .unwrap();
 
         {
             let mut fault = LISTENER_START_FAULT_AFTER_SIGNED_TCP
@@ -6422,12 +6408,9 @@ mod tests {
         let requested_address: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut config = test_runtime_config(&participant_name, &tmp);
         config.listen_tcp = Some(requested_address);
-        let mut runtime = CommsRuntime::new_machine_authority_required_with_silent_intents(
-            config,
-            Arc::new(HashSet::new()),
-        )
-        .await
-        .unwrap();
+        let mut runtime = CommsRuntime::new_with_silent_intents(config, Arc::new(HashSet::new()))
+            .await
+            .unwrap();
 
         let (reached, reached_rx) = tokio::sync::oneshot::channel();
         let (release, release_rx) = tokio::sync::oneshot::channel();
@@ -6500,14 +6483,10 @@ mod tests {
         let mut config = test_runtime_config(&receiver_name, &tmp);
         config.listen_tcp = Some("127.0.0.1:0".parse().unwrap());
         config.require_peer_auth = false;
-        let receiver = CommsRuntime::new_machine_authority_required_with_silent_intents(
-            config,
-            Arc::new(HashSet::new()),
-        )
-        .await
-        .unwrap();
+        let receiver = CommsRuntime::new_with_silent_intents(config, Arc::new(HashSet::new()))
+            .await
+            .unwrap();
 
-        assert!(receiver.peer_comms_machine_authority_required());
         assert!(receiver.peer_comms_handle().is_none());
 
         add_trusted_peer_with_generated_authority(
@@ -6670,7 +6649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drain_inbox_interactions_converts_all_authenticated_content_variants() {
+    async fn classified_snapshot_converts_all_authenticated_content_variants() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = test_runtime_config("variants", &tmp);
         let runtime = CommsRuntime::new(config).await.unwrap();
@@ -6783,7 +6762,7 @@ mod tests {
     /// `None` (no declaration) and `Some(Clean)` stay distinct typed states —
     /// the drain never coalesces an absent declaration into `Clean`.
     #[tokio::test]
-    async fn drain_inbox_interactions_carries_sender_content_taint() {
+    async fn classified_snapshot_carries_sender_content_taint() {
         use meerkat_core::comms::SenderContentTaint;
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6910,7 +6889,12 @@ mod tests {
             .into_result()
             .unwrap();
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&runtime).await;
+        let interactions = CoreCommsRuntime::handoff_volatile_peer_input_candidates(&runtime)
+            .await
+            .expect("exact volatile lifecycle handoff")
+            .into_iter()
+            .map(|candidate| candidate.interaction)
+            .collect::<Vec<_>>();
         assert_eq!(interactions.len(), 1);
         assert!(matches!(
             &interactions[0].content,
@@ -6924,7 +6908,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drain_inbox_interactions_multimodal_message_keeps_body_as_projection() {
+    async fn classified_snapshot_multimodal_message_keeps_body_as_projection() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = test_runtime_config("multimodal-body-projection", &tmp);
         let runtime = CommsRuntime::new(config).await.unwrap();
@@ -6985,7 +6969,7 @@ mod tests {
     }
 
     /// ROW #267 gate: a peer message whose body is "DISMISS" must NOT control
-    /// runtime lifecycle. It is drained as an ordinary peer message, never
+    /// runtime lifecycle. It is queued as an ordinary peer message, never
     /// swallowed into a dismiss signal. Lifecycle dismissal is a typed signal
     /// owned by the runtime authority, not a peer-controlled string body.
     #[tokio::test]
@@ -7020,8 +7004,8 @@ mod tests {
             .into_result()
             .unwrap();
 
-        // The body-string trigger is gone: the message survives the drain as a
-        // normal peer message rather than being consumed as a dismiss signal.
+        // The body-string trigger is gone: the message remains ordinary durable
+        // input rather than being consumed as a lifecycle signal.
         let interactions = snapshot_runtime_interactions(&runtime).await;
         assert_eq!(
             interactions.len(),
@@ -7033,13 +7017,7 @@ mod tests {
                 &interactions[0].content,
                 meerkat_core::InteractionContent::Message { body, .. } if body == "DISMISS"
             ),
-            "the 'DISMISS' body must drain as an ordinary peer message"
-        );
-        // And the runtime exposes no dismiss signal from a peer body: with the
-        // override removed, the real runtime uses the trait default (`false`).
-        assert!(
-            !CoreCommsRuntime::dismiss_received(&runtime),
-            "a peer message body must never raise a runtime dismiss signal"
+            "the 'DISMISS' body must remain an ordinary peer message"
         );
     }
 
@@ -7947,7 +7925,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_plain_event_interaction_id_is_preserved_in_drain_inbox_interactions() {
+    async fn plain_event_interaction_id_is_preserved_in_classified_snapshot() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = test_runtime_config("plain-id", &tmp);
         let runtime = CommsRuntime::new(config).await.unwrap();
@@ -8159,7 +8137,7 @@ mod tests {
             meerkat_core::PeerIngressAuthorityPhase::Absent
         );
         assert_eq!(snapshot.trusted_peers, vec![trusted_peer]);
-        assert_eq!(snapshot.submission_queue_len, 1);
+        assert_eq!(snapshot.queue.queue_depth(), 1);
         assert_eq!(snapshot.queue.total_count, 1);
         assert_eq!(snapshot.queue.plain_event_count, 1);
         assert_eq!(snapshot.queue.queued_entries.len(), 1);
@@ -8219,7 +8197,7 @@ mod tests {
             snapshot.authority_phase,
             meerkat_core::PeerIngressAuthorityPhase::Dropped
         );
-        assert_eq!(snapshot.submission_queue_len, 0);
+        assert_eq!(snapshot.queue.queue_depth(), 0);
         assert_eq!(snapshot.queue.total_count, 0);
         assert!(snapshot.trusted_peers.is_empty());
     }
@@ -8315,7 +8293,7 @@ mod tests {
             snapshot.authority_phase,
             meerkat_core::PeerIngressAuthorityPhase::Received
         );
-        assert_eq!(snapshot.submission_queue_len, 1);
+        assert_eq!(snapshot.queue.queue_depth(), 1);
         assert_eq!(snapshot.queue.total_count, 1);
         assert_eq!(
             snapshot.queue.queued_entries[0].admission_diagnostic,
@@ -8902,14 +8880,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inherent_message_drain_excludes_fenced_but_keeps_ordinary_message() {
+    async fn volatile_handoff_retains_fenced_and_ordinary_durable_messages() {
         let (sender, receiver, receiver_name) = trusted_inproc_pair("legacy-drain-fence").await;
         let sends = enqueue_fenced_then_plain(sender, Arc::clone(&receiver), &receiver_name).await;
 
-        let messages = CommsRuntime::drain_messages(receiver.as_ref()).await;
+        let messages = CoreCommsRuntime::handoff_volatile_peer_input_candidates(receiver.as_ref())
+            .await
+            .expect("exact volatile handoff");
         assert!(
             messages.is_empty(),
-            "legacy drain must stop at a durable fenced head instead of bypassing it"
+            "volatile handoff must stop at a durable fenced head instead of bypassing it"
         );
         let snapshot = CoreCommsRuntime::peer_ingress_queue_snapshot(receiver.as_ref())
             .await
@@ -8919,31 +8899,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inherent_message_recv_skips_fenced_queue_head() {
+    async fn test_only_volatile_pop_does_not_bypass_fenced_queue_head() {
         let (sender, receiver, receiver_name) = trusted_inproc_pair("legacy-recv-fence").await;
         let sends = enqueue_fenced_then_plain(sender, Arc::clone(&receiver), &receiver_name).await;
 
         let next = receiver.inbox.lock().await.try_recv_one_classified();
         assert!(
             next.is_none(),
-            "legacy recv primitive must not bypass a durable fenced queue head"
-        );
-        let snapshot = CoreCommsRuntime::peer_ingress_queue_snapshot(receiver.as_ref())
-            .await
-            .expect("classified queue snapshot");
-        assert_eq!(snapshot.total_count, 2);
-        abort_pending_runtime_sends(sends).await;
-    }
-
-    #[tokio::test]
-    async fn core_string_drain_excludes_fenced_but_keeps_ordinary_message() {
-        let (sender, receiver, receiver_name) = trusted_inproc_pair("core-string-fence").await;
-        let sends = enqueue_fenced_then_plain(sender, Arc::clone(&receiver), &receiver_name).await;
-
-        let messages = CoreCommsRuntime::drain_messages(receiver.as_ref()).await;
-        assert!(
-            messages.is_empty(),
-            "legacy string drain must stop at the durable head"
+            "test-only volatile pop must not bypass a durable fenced queue head"
         );
         let snapshot = CoreCommsRuntime::peer_ingress_queue_snapshot(receiver.as_ref())
             .await

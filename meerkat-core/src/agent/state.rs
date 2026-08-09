@@ -28,7 +28,7 @@ use crate::turn_execution_authority::{
 };
 use crate::types::{
     AssistantBlock, BlockAssistantMessage, Message, RunResult, StopReason, SystemNoticeKind,
-    SystemNoticeMessage, ToolCallView, ToolDef, ToolNameSet, UserMessage,
+    SystemNoticeMessage, ToolCallView, ToolDef, ToolNameSet, TurnUsage, UserMessage,
 };
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -38,7 +38,7 @@ use tokio::sync::mpsc;
 
 use super::{
     Agent, AgentLlmClient, AgentLlmFallbackSwitch, AgentSessionStore, AgentToolDispatcher,
-    LlmStreamResult, select_tool_catalog_mode,
+    LlmStreamResult, select_tool_catalog_mode, validate_provider_turn_usage_identity,
 };
 
 /// Pre-selected timeout source — determined before the LLM await, not inferred after.
@@ -97,6 +97,37 @@ enum LlmRetryOutcome {
     /// path committed a rewrite. The caller must rebuild every request-owned
     /// projection from the new canonical session before dispatch.
     RepollAfterCompaction,
+}
+
+fn promote_cache_breakpoint_claims(
+    claims: &[crate::ProviderCacheBreakpointClaim],
+    active_provider: crate::Provider,
+    active_model: &str,
+) -> Result<Vec<crate::AuthoredCacheBreakpoint>, AgentError> {
+    if let Some(mismatch) = claims
+        .iter()
+        .find(|claim| claim.provider() != active_provider || claim.model() != active_model)
+    {
+        return Err(AgentError::llm(
+            active_provider.as_str(),
+            LlmFailureReason::ProviderError(crate::error::LlmProviderError::non_retryable(
+                crate::error::LlmProviderErrorKind::IncompleteResponse,
+                serde_json::json!({
+                    "reason": "cache_breakpoint_claim_identity_mismatch",
+                    "expected_provider": active_provider,
+                    "expected_model": active_model,
+                    "reported_provider": mismatch.provider(),
+                    "reported_model": mismatch.model(),
+                }),
+            )),
+            "provider cache-breakpoint claim did not match the active provider/model identity",
+        ));
+    }
+    Ok(claims
+        .iter()
+        .cloned()
+        .map(crate::AuthoredCacheBreakpoint::from_provider_claim)
+        .collect())
 }
 
 type AppliedModelFallbackSwitch = (
@@ -493,7 +524,7 @@ struct CallingLlmAssistantTurn {
     assistant_msg: BlockAssistantMessage,
     assistant_text: String,
     stop_reason: crate::types::StopReason,
-    usage: crate::types::Usage,
+    usage: TurnUsage,
 }
 
 /// Accumulated outcome of one dispatched tool batch.
@@ -2142,6 +2173,7 @@ where
                 };
                 let provider_request_pressure = self.pending_compaction_request_pressure.take();
                 if let Some(compactor) = self.compactor.clone() {
+                    let model_messages = self.session.messages_for_model_boundary();
                     let last_guarded_boundary = [
                         self.compaction_cadence.last_compaction_boundary_index,
                         self.compaction_cadence
@@ -2151,7 +2183,7 @@ where
                     .flatten()
                     .max();
                     let ctx = crate::agent::compact::build_compaction_context(
-                        self.session.messages(),
+                        &model_messages,
                         self.last_input_tokens,
                         provider_request_pressure,
                         last_guarded_boundary,
@@ -2177,6 +2209,7 @@ where
                                     &compactor,
                                     self.compaction_curator.as_ref(),
                                     crate::agent::compact::CompactionInvocation {
+                                        model_messages: &model_messages,
                                         window: crate::compact::CompactionWindow {
                                             messages: self.session.messages(),
                                             last_input_tokens: self.last_input_tokens,
@@ -2207,8 +2240,8 @@ where
                             // projection is later rejected. Charge it before
                             // any rewrite/projection branch so no failure path
                             // can silently refund usage.
-                            self.session.record_usage(outcome.summary_usage.clone());
-                            self.budget.record_usage(&outcome.summary_usage);
+                            self.session.record_turn_usage(&outcome.summary_usage);
+                            self.budget.record_turn_usage(&outcome.summary_usage);
                             // Prepare the transcript rewrite on an isolated
                             // session value. Its exact TranscriptRewriteCommit
                             // becomes the identity of any paired memory stage.
@@ -3034,30 +3067,12 @@ where
                 ))
             })
         }
-        fn optional_delta(
-            live: Option<u64>,
-            rollback: Option<u64>,
-            field: &str,
-        ) -> Result<Option<u64>, AgentError> {
-            if live.is_none() && rollback.is_none() {
-                return Ok(None);
-            }
-            delta(live.unwrap_or(0), rollback.unwrap_or(0), field).map(Some)
-        }
-
         Ok(crate::types::Usage {
             input_tokens: delta(live.input_tokens, rollback.input_tokens, "input-token")?,
             output_tokens: delta(live.output_tokens, rollback.output_tokens, "output-token")?,
-            cache_creation_tokens: optional_delta(
-                live.cache_creation_tokens,
-                rollback.cache_creation_tokens,
-                "cache-creation-token",
-            )?,
-            cache_read_tokens: optional_delta(
-                live.cache_read_tokens,
-                rollback.cache_read_tokens,
-                "cache-read-token",
-            )?,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+            provider_accounting: None,
         })
     }
 
@@ -3083,7 +3098,7 @@ where
             let attempted_cadence = self.compaction_cadence.clone();
             let mut restored_session = rollback.rollback_session;
             if retained_usage != crate::types::Usage::default() {
-                restored_session.record_usage(retained_usage);
+                restored_session.record_cumulative_usage(retained_usage);
             }
             let mut restored_cadence = rollback.rollback_compaction_cadence;
             restored_cadence.session_boundary_index = attempted_cadence.session_boundary_index;
@@ -3980,7 +3995,8 @@ where
         // 4. Apply tool scope staged updates atomically at the CallingLlm boundary.
         let tool_defs = {
             let dispatcher_tools = self.tools.tools();
-            let exact_catalog = self.tools.tool_catalog_capabilities().exact_catalog;
+            let catalog_capabilities = self.tools.tool_catalog_capabilities();
+            let exact_catalog = catalog_capabilities.exact_catalog;
             let catalog_mode = select_tool_catalog_mode(self.tools.as_ref());
             let current_catalog = exact_catalog.then(|| self.tools.tool_catalog());
             let current_pending_catalog_sources = if exact_catalog {
@@ -3996,7 +4012,8 @@ where
                             .filter(|entry| entry.plane == ToolPlaneClass::Control)
                             .map(|entry| entry.tool.name.clone())
                             .collect::<std::collections::HashSet<_>>();
-                        let deferred_names = if !control_names.is_empty()
+                        let deferred_names = if (!control_names.is_empty()
+                            || catalog_capabilities.may_require_catalog_control_plane)
                             && matches!(catalog_mode, ToolCatalogMode::Deferred)
                         {
                             catalog
@@ -4770,10 +4787,40 @@ where
         in_extraction: bool,
         result: LlmStreamResult,
     ) -> Result<CallingLlmGate<CallingLlmAssistantTurn>, AgentError> {
-        // Update budget + session usage
-        self.budget.record_usage(&result.usage);
-        self.last_input_tokens = result.usage.input_tokens;
-        self.session.record_usage(result.usage.clone());
+        let authored_cache_breakpoints = promote_cache_breakpoint_claims(
+            result.cache_breakpoint_claims(),
+            self.client.provider(),
+            self.client.model(),
+        )?;
+        let turn_usage = TurnUsage::try_from_usage(result.usage.clone()).map_err(|error| {
+            AgentError::llm(
+                self.client.provider().as_str(),
+                LlmFailureReason::ProviderError(crate::error::LlmProviderError::non_retryable(
+                    crate::error::LlmProviderErrorKind::IncompleteResponse,
+                    serde_json::json!({
+                        "reason": "normalized_provider_accounting_unavailable",
+                        "model": self.client.model(),
+                    }),
+                )),
+                error.to_string(),
+            )
+        })?;
+        validate_provider_turn_usage_identity(
+            &turn_usage,
+            self.client.provider(),
+            self.client.model(),
+        )?;
+        self.session
+            .record_authored_cache_breakpoints(&authored_cache_breakpoints)
+            .map_err(|error| {
+                AgentError::InternalError(format!(
+                    "provider-authored cache breakpoint did not bind to the committed transcript head: {error}"
+                ))
+            })?;
+        // Update budget + session usage only from normalized provider evidence.
+        self.budget.record_turn_usage(&turn_usage);
+        self.last_input_tokens = turn_usage.presented_tokens();
+        self.session.record_turn_usage(&turn_usage);
         if let Some(exceeded) = self.budget.observe().exceeded() {
             emit_phase_event!(self, ctx, budget_warning_event(exceeded));
             if in_extraction {
@@ -4797,7 +4844,7 @@ where
             ));
         }
 
-        let (blocks, stop_reason, usage) = result.into_parts();
+        let (blocks, stop_reason, _raw_usage) = result.into_parts();
         let has_reasoning = blocks
             .iter()
             .any(|block| matches!(block, AssistantBlock::Reasoning { .. }));
@@ -4874,7 +4921,7 @@ where
                     .map(|call| call.name.to_string())
                     .collect(),
                 stop_reason: Some(stop_reason),
-                usage: Some(usage.clone()),
+                usage: Some(turn_usage.clone().into_inner()),
                 // Typed projection of the response's provider-executed
                 // server-tool evidence blocks, in block order, so a
                 // foreground PostLlmResponse hook classifies
@@ -4955,7 +5002,7 @@ where
             assistant_msg,
             assistant_text,
             stop_reason,
-            usage,
+            usage: turn_usage,
         }))
     }
     /// Tool-call turn: admission, dispatch, outcome collection, and the
@@ -5729,7 +5776,14 @@ where
                 }
             };
 
-            emit_phase_event!(self, ctx, AgentEvent::TurnCompleted { stop_reason, usage });
+            emit_phase_event!(
+                self,
+                ctx,
+                AgentEvent::TurnCompleted {
+                    stop_reason,
+                    usage: usage.clone(),
+                }
+            );
 
             // The main agentic turn has committed. Extraction
             // is a separate post-run validation phase.
@@ -6140,7 +6194,8 @@ fn dispatch_tool_calls_boxed<T: AgentToolDispatcher + ?Sized + 'static>(
 mod tests {
     use super::{
         SystemNoticeKind, ToolCallOwned, background_job_completion_notice,
-        dispatch_tool_calls_boxed, is_synthetic_notice,
+        dispatch_tool_calls_boxed, is_synthetic_notice, promote_cache_breakpoint_claims,
+        validate_provider_turn_usage_identity,
     };
     use crate::agent::{AgentBuilder, AgentLlmClient, AgentSessionStore, AgentToolDispatcher};
     use crate::blob::{BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError};
@@ -6179,6 +6234,72 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
     use tokio::sync::{Notify, mpsc};
+
+    fn normalized_test_usage(client: &dyn AgentLlmClient, usage: Usage) -> Usage {
+        crate::TurnUsage::host_declared(client.provider(), client.model(), usage).into_inner()
+    }
+
+    fn normalized_test_result(
+        client: &dyn AgentLlmClient,
+        mut result: super::LlmStreamResult,
+    ) -> super::LlmStreamResult {
+        result.usage = normalized_test_usage(client, result.usage);
+        result
+    }
+
+    #[test]
+    fn custom_client_cache_claim_with_wrong_model_is_not_promoted() {
+        let messages = vec![Message::System(crate::SystemMessage::new("system"))];
+        let claim =
+            crate::provider_cache_breakpoint_claim(crate::ProviderCacheBreakpointClaimRequest {
+                provider: crate::Provider::OpenAI,
+                model: "forged-model",
+                messages: &messages,
+                boundary: crate::CacheBreakpointBoundary::SystemProfilePrefix { message_count: 1 },
+                ttl: crate::ProviderCacheTtl::ProviderDefault,
+                rendered_prefix: br#"{"renderer_mode":"test"}"#,
+                lowered_request_encoding: crate::LoweredRequestEncoding::OpenAiResponsesJson,
+                lowered_request_body: br#"{"model":"forged-model"}"#,
+            })
+            .expect("claim shape");
+
+        let error =
+            promote_cache_breakpoint_claims(&[claim], crate::Provider::OpenAI, "active-model")
+                .expect_err("mismatched custom-client claim must fail closed");
+        assert!(matches!(
+            error,
+            AgentError::Llm {
+                reason: LlmFailureReason::ProviderError(ref provider_error),
+                ..
+            } if provider_error.kind == LlmProviderErrorKind::IncompleteResponse
+        ));
+    }
+
+    #[test]
+    fn same_provider_wrong_model_accounting_is_rejected() {
+        let turn_usage = crate::TurnUsage::new(
+            Usage {
+                input_tokens: 5,
+                output_tokens: 1,
+                ..Usage::default()
+            },
+            crate::ProviderTokenAccounting::openai("wrong-model", 5),
+        );
+
+        let error = validate_provider_turn_usage_identity(
+            &turn_usage,
+            crate::Provider::OpenAI,
+            "active-model",
+        )
+        .expect_err("same-provider wrong-model accounting must fail closed");
+        assert!(matches!(
+            error,
+            AgentError::Llm {
+                reason: LlmFailureReason::ProviderError(ref provider_error),
+                ..
+            } if provider_error.kind == LlmProviderErrorKind::IncompleteResponse
+        ));
+    }
 
     /// Attach an in-core phase-tracking `TurnStateHandle` to a raw
     /// `AgentBuilder` and explicitly stamp the test run as a content turn.
@@ -6244,7 +6365,7 @@ mod tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_test_usage(self, Usage::default()),
             ))
         }
 
@@ -6610,7 +6731,7 @@ mod tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_test_usage(self, Usage::default()),
             ))
         }
 
@@ -6658,7 +6779,7 @@ mod tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_test_usage(self, Usage::default()),
             ))
         }
 
@@ -6738,7 +6859,7 @@ mod tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_test_usage(self, Usage::default()),
             ))
         }
 
@@ -6853,7 +6974,7 @@ mod tests {
             Ok(super::LlmStreamResult::new(
                 vec![AssistantBlock::Text { text, meta: None }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_test_usage(self, Usage::default()),
             ))
         }
 
@@ -7054,11 +7175,14 @@ mod tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage {
-                    input_tokens: 200_000,
-                    output_tokens: 5,
-                    ..Usage::default()
-                },
+                normalized_test_usage(
+                    self,
+                    Usage {
+                        input_tokens: 200_000,
+                        output_tokens: 5,
+                        ..Usage::default()
+                    },
+                ),
             ))
         }
 
@@ -7690,11 +7814,14 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::EndTurn,
-                    Usage {
-                        input_tokens: 7,
-                        output_tokens: 3,
-                        ..Usage::default()
-                    },
+                    normalized_test_usage(
+                        self,
+                        Usage {
+                            input_tokens: 7,
+                            output_tokens: 3,
+                            ..Usage::default()
+                        },
+                    ),
                 ));
             }
 
@@ -7715,7 +7842,7 @@ mod tests {
                             meta: None,
                         }],
                         StopReason::ToolUse,
-                        Usage::default(),
+                        normalized_test_usage(self, Usage::default()),
                     )),
                     PostCompactionOutcome::Failure => Err(AgentError::InternalError(
                         "synthetic post-compaction turn failure".to_string(),
@@ -7726,12 +7853,16 @@ mod tests {
                             meta: None,
                         }],
                         StopReason::EndTurn,
-                        Usage {
-                            input_tokens: 11,
-                            output_tokens: 4,
-                            cache_creation_tokens: Some(6),
-                            cache_read_tokens: Some(9),
-                        },
+                        normalized_test_usage(
+                            self,
+                            Usage {
+                                input_tokens: 11,
+                                output_tokens: 4,
+                                cache_creation_tokens: Some(6),
+                                cache_read_tokens: Some(9),
+                                provider_accounting: None,
+                            },
+                        ),
                     )),
                 };
             }
@@ -7751,7 +7882,7 @@ mod tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                usage,
+                normalized_test_usage(self, usage),
             ))
         }
 
@@ -8002,6 +8133,7 @@ mod tests {
             output_tokens: 4,
             cache_creation_tokens: Some(6),
             cache_read_tokens: Some(9),
+            provider_accounting: None,
         });
         assert_eq!(agent.session().total_usage(), expected);
         assert_eq!(
@@ -8049,6 +8181,7 @@ mod tests {
             output_tokens: 4,
             cache_creation_tokens: Some(6),
             cache_read_tokens: Some(9),
+            provider_accounting: None,
         });
         assert_eq!(agent.session().total_usage(), expected);
         assert_eq!(
@@ -8191,8 +8324,11 @@ mod tests {
             output_tokens: 7,
             cache_creation_tokens: Some(5),
             cache_read_tokens: Some(3),
+            provider_accounting: None,
         };
-        agent.session_mut().record_usage(attempted_usage.clone());
+        agent
+            .session_mut()
+            .record_cumulative_usage(attempted_usage.clone());
         agent.last_input_tokens = rollback_last_input_tokens + 13;
         agent.compaction_cadence.session_boundary_index = attempted_boundary;
         agent
@@ -8654,7 +8790,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::ToolUse,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 )
             } else {
                 super::LlmStreamResult::new(
@@ -8663,7 +8799,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::EndTurn,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 )
             };
             *calls += 1;
@@ -9013,7 +9149,7 @@ mod tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_test_usage(self, Usage::default()),
             ))
         }
 
@@ -9053,7 +9189,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::ToolUse,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 )
             } else {
                 super::LlmStreamResult::new(
@@ -9062,7 +9198,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::EndTurn,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 )
             };
             *calls += 1;
@@ -9126,7 +9262,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::ToolUse,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 )
             } else {
                 super::LlmStreamResult::new(
@@ -9135,7 +9271,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::EndTurn,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 )
             };
             *calls += 1;
@@ -9199,7 +9335,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::ToolUse,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 )
             } else {
                 super::LlmStreamResult::new(
@@ -9208,7 +9344,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::EndTurn,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 )
             };
             *calls += 1;
@@ -9221,76 +9357,6 @@ mod tests {
 
         fn model(&self) -> &'static str {
             "mock-model"
-        }
-    }
-
-    struct StagedDrainCommsRuntime {
-        batches: tokio::sync::Mutex<Vec<Vec<String>>>,
-        notify: Arc<Notify>,
-    }
-
-    impl StagedDrainCommsRuntime {
-        fn with_batches(batches: Vec<Vec<String>>) -> Self {
-            Self {
-                batches: tokio::sync::Mutex::new(batches),
-                notify: Arc::new(Notify::new()),
-            }
-        }
-    }
-
-    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-    impl crate::agent::CommsRuntime for StagedDrainCommsRuntime {
-        async fn drain_messages(&self) -> Vec<String> {
-            let mut guard = self.batches.lock().await;
-            if guard.is_empty() {
-                Vec::new()
-            } else {
-                guard.remove(0)
-            }
-        }
-
-        fn inbox_notify(&self) -> Arc<Notify> {
-            self.notify.clone()
-        }
-
-        async fn drain_peer_input_candidates(&self) -> Vec<crate::interaction::PeerInputCandidate> {
-            self.drain_messages()
-                .await
-                .into_iter()
-                .map(|text| {
-                    let id = crate::interaction::InteractionId(uuid::Uuid::new_v4());
-                    crate::interaction::PeerInputCandidate {
-                        interaction: crate::interaction::InboxInteraction {
-                            objective_id: None,
-                            id,
-                            from_route: None,
-                            from: "unknown".into(),
-                            content: crate::interaction::InteractionContent::Message {
-                                body: text.clone(),
-                                blocks: None,
-                            },
-                            rendered_text: text,
-                            handling_mode: crate::types::HandlingMode::Queue,
-                            render_metadata: None,
-                            sender_taint: None,
-                        },
-                        ingress: crate::interaction::PeerIngressFact::peer(
-                            id,
-                            crate::interaction::PeerInputClass::ActionableMessage,
-                            crate::interaction::PeerIngressKind::Message,
-                            Some(crate::interaction::PeerIngressAuthDecision::Required),
-                            crate::interaction::PeerIngressIdentity::new(
-                                crate::comms::PeerId::new(),
-                                "unknown",
-                                crate::interaction::PeerIngressConvention::Message,
-                            ),
-                        ),
-                        lifecycle_peer: None,
-                        response_terminality: None,
-                    }
-                })
-                .collect()
         }
     }
 
@@ -9397,9 +9463,6 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl crate::agent::CommsRuntime for InboxOnlyRuntime {
-            async fn drain_messages(&self) -> Vec<String> {
-                Vec::new()
-            }
             fn inbox_notify(&self) -> Arc<Notify> {
                 Arc::new(Notify::new())
             }
@@ -10550,7 +10613,7 @@ mod tests {
                             },
                         ],
                         StopReason::ToolUse,
-                        Usage::default(),
+                        normalized_test_usage(self, Usage::default()),
                     )
                 } else {
                     super::LlmStreamResult::new(
@@ -10559,7 +10622,7 @@ mod tests {
                             meta: None,
                         }],
                         StopReason::EndTurn,
-                        Usage::default(),
+                        normalized_test_usage(self, Usage::default()),
                     )
                 };
                 *calls += 1;
@@ -11106,10 +11169,6 @@ mod tests {
             }
         }
 
-        let comms = Arc::new(StagedDrainCommsRuntime::with_batches(vec![
-            Vec::new(),
-            vec!["late boundary message".to_string()],
-        ]));
         let turn_handle =
             Arc::new(crate::agent::test_turn_state_handle::TestTurnStateHandle::new());
         let mut agent = AgentBuilder::new()
@@ -11118,7 +11177,6 @@ mod tests {
                 crate::lifecycle::RuntimeExecutionKind::ContentTurn,
             )
             .with_hook_engine(Arc::new(DenyTurnBoundaryHook))
-            .with_comms_runtime(comms)
             .build_standalone(
                 Arc::new(StaticLlmClient),
                 Arc::new(NoTools),
@@ -11138,14 +11196,6 @@ mod tests {
                 ..
             }
         ));
-
-        assert!(
-            !agent.session().messages().iter().any(|message| matches!(
-                message,
-                Message::User(user) if user.text_content().contains("late boundary message")
-            )),
-            "boundary-denied turns should not commit late comms boundary side effects"
-        );
 
         let mut saw_turn_completed = false;
         let mut saw_run_failed = false;
@@ -12316,7 +12366,7 @@ mod tests {
                             meta: None,
                         }],
                         StopReason::ToolUse,
-                        Usage::default(),
+                        normalized_test_usage(self, Usage::default()),
                     )
                 } else {
                     super::LlmStreamResult::new(
@@ -12325,7 +12375,7 @@ mod tests {
                             meta: None,
                         }],
                         StopReason::EndTurn,
-                        Usage::default(),
+                        normalized_test_usage(self, Usage::default()),
                     )
                 };
                 *calls += 1;
@@ -12522,7 +12572,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::ToolUse,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 ))
             }
 
@@ -12750,7 +12800,7 @@ mod tests {
                         },
                     ],
                     StopReason::ToolUse,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 ))
             }
 
@@ -13049,7 +13099,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::EndTurn,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 ))
             }
 
@@ -13146,7 +13196,7 @@ mod tests {
                         },
                     ],
                     StopReason::ToolUse,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 ))
             }
 
@@ -13291,7 +13341,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::ToolUse,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 ))
             }
 
@@ -13407,7 +13457,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::ToolUse,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 ))
             }
 
@@ -13641,7 +13691,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::ToolUse,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 )
             } else {
                 super::LlmStreamResult::new(
@@ -13650,7 +13700,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::EndTurn,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 )
             };
             *calls += 1;
@@ -13690,10 +13740,14 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::ToolUse,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 )
             } else {
-                super::LlmStreamResult::new(Vec::new(), StopReason::EndTurn, Usage::default())
+                super::LlmStreamResult::new(
+                    Vec::new(),
+                    StopReason::EndTurn,
+                    normalized_test_usage(self, Usage::default()),
+                )
             };
             *calls += 1;
             Ok(response)
@@ -13734,7 +13788,7 @@ mod tests {
                     meta: crate::ProviderImageMetadata::NotEmitted,
                 }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_test_usage(self, Usage::default()),
             ))
         }
 
@@ -14578,11 +14632,14 @@ mod tests {
                     })),
                 }],
                 StopReason::MaxTokens,
-                Usage {
-                    input_tokens: 11,
-                    output_tokens: 7,
-                    ..Usage::default()
-                },
+                normalized_test_usage(
+                    self,
+                    Usage {
+                        input_tokens: 11,
+                        output_tokens: 7,
+                        ..Usage::default()
+                    },
+                ),
             ))
         }
 
@@ -15324,12 +15381,16 @@ mod tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage {
-                    input_tokens: 500,
-                    output_tokens: 500,
-                    cache_creation_tokens: None,
-                    cache_read_tokens: None,
-                },
+                normalized_test_usage(
+                    self,
+                    Usage {
+                        input_tokens: 500,
+                        output_tokens: 500,
+                        cache_creation_tokens: None,
+                        cache_read_tokens: None,
+                        provider_accounting: None,
+                    },
+                ),
             ))
         }
 
@@ -15505,7 +15566,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::EndTurn,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 ))
             }
         }
@@ -15564,7 +15625,7 @@ mod tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_test_usage(self, Usage::default()),
             ))
         }
 
@@ -15663,7 +15724,7 @@ mod tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_test_usage(self, Usage::default()),
             ))
         }
 
@@ -16173,7 +16234,7 @@ mod tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_test_usage(self, Usage::default()),
             ))
         }
 
@@ -16387,7 +16448,7 @@ mod tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_test_usage(self, Usage::default()),
             ))
         }
 
@@ -17614,7 +17675,7 @@ mod tests {
                 Ok(super::LlmStreamResult::new(
                     Vec::new(),
                     StopReason::EndTurn,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 ))
             } else {
                 Ok(super::LlmStreamResult::new(
@@ -17623,7 +17684,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::EndTurn,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 ))
             }
         }
@@ -17703,9 +17764,12 @@ mod tests {
         ) -> Result<super::LlmStreamResult, AgentError> {
             *self.call_count.lock().unwrap() += 1;
             let mut responses = self.responses.lock().unwrap();
-            responses.pop().ok_or_else(|| {
-                AgentError::InternalError("ScriptedExtractionClient: no more responses".into())
-            })
+            responses
+                .pop()
+                .map(|result| normalized_test_result(self, result))
+                .ok_or_else(|| {
+                    AgentError::InternalError("ScriptedExtractionClient: no more responses".into())
+                })
         }
 
         fn provider(&self) -> crate::provider::Provider {
@@ -17975,7 +18039,7 @@ mod tests {
                 + 1;
 
             match call {
-                1 => Ok(text_response("main answer")),
+                1 => Ok(normalized_test_result(self, text_response("main answer"))),
                 2 => Err(AgentError::llm(
                     "openai",
                     crate::error::LlmFailureReason::ProviderError(
@@ -17986,7 +18050,10 @@ mod tests {
                     ),
                     "extraction retryable failure",
                 )),
-                3 => Ok(text_response(r#"{"answer": "42"}"#)),
+                3 => Ok(normalized_test_result(
+                    self,
+                    text_response(r#"{"answer": "42"}"#),
+                )),
                 _ => Err(AgentError::InternalError(
                     "ExtractionFallbackOverrideClient: unexpected extra call".to_string(),
                 )),
@@ -18134,7 +18201,8 @@ mod tests {
                 meta: None,
             }],
             StopReason::EndTurn,
-            Usage::default(),
+            crate::TurnUsage::host_declared(crate::Provider::Other, "mock-model", Usage::default())
+                .into_inner(),
         )
     }
 
@@ -18147,7 +18215,8 @@ mod tests {
                 meta: None,
             }],
             StopReason::ToolUse,
-            Usage::default(),
+            crate::TurnUsage::host_declared(crate::Provider::Other, "mock-model", Usage::default())
+                .into_inner(),
         )
     }
 
@@ -19886,7 +19955,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::EndTurn,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 ))
             }
 
@@ -20016,7 +20085,7 @@ mod tests {
                         meta: None,
                     }],
                     StopReason::EndTurn,
-                    Usage::default(),
+                    normalized_test_usage(self, Usage::default()),
                 ))
             }
 

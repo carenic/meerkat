@@ -299,6 +299,16 @@ impl AgentLlmClient for LlmClientAdapter {
     ) -> Result<LlmStreamResult, AgentError> {
         let request =
             self.build_request(messages, tools, max_tokens, temperature, provider_params)?;
+        let cache_breakpoint_claims = self
+            .client
+            .authored_cache_breakpoints(&request, messages)
+            .map_err(|error| {
+                AgentError::llm(
+                    self.provider.as_str(),
+                    error.failure_reason(),
+                    error.to_string(),
+                )
+            })?;
 
         let mut stream = self.client.stream(&request);
 
@@ -428,7 +438,7 @@ impl AgentLlmClient for LlmClientAdapter {
                         }
                     }
                     LlmEvent::UsageUpdate { usage: u } => {
-                        usage = u;
+                        usage = u.into_inner();
                     }
                     LlmEvent::Done { outcome } => match outcome {
                         LlmDoneOutcome::Success { stop_reason: sr } => {
@@ -470,11 +480,10 @@ impl AgentLlmClient for LlmClientAdapter {
                     .await;
             }
         }
-        Ok(LlmStreamResult::new(
-            assembler.finalize(),
-            stop_reason,
-            usage,
-        ))
+        Ok(
+            LlmStreamResult::new(assembler.finalize(), stop_reason, usage)
+                .with_cache_breakpoint_claims(cache_breakpoint_claims),
+        )
     }
 
     fn request_pressure(
@@ -494,6 +503,37 @@ impl AgentLlmClient for LlmClientAdapter {
                 error.to_string(),
             )
         })
+    }
+
+    fn target_cache_lowering_capabilities(
+        &self,
+        issuer: &meerkat_core::TargetCacheLoweringIssuer,
+        messages: &[Message],
+        tools: &[Arc<ToolDef>],
+        max_tokens: u32,
+        temperature: Option<f32>,
+        provider_params: Option<&ProviderParamsOverride>,
+    ) -> Result<Vec<meerkat_core::TargetCacheLoweringCapability>, AgentError> {
+        let request =
+            self.build_request(messages, tools, max_tokens, temperature, provider_params)?;
+        self.client
+            .authored_cache_breakpoints(&request, messages)
+            .map_err(|error| {
+                AgentError::llm(
+                    self.provider.as_str(),
+                    error.failure_reason(),
+                    error.to_string(),
+                )
+            })?
+            .into_iter()
+            .map(|evidence| {
+                issuer.mint(evidence).map_err(|error| {
+                    AgentError::InternalError(format!(
+                        "target cache lowering produced invalid evidence: {error}"
+                    ))
+                })
+            })
+            .collect()
     }
 
     fn provider(&self) -> meerkat_core::Provider {
@@ -697,11 +737,15 @@ mod tests {
                         delta: "thinking before silence".to_string(),
                     }),
                     Ok(LlmEvent::UsageUpdate {
-                        usage: Usage {
-                            input_tokens: 3,
-                            output_tokens: 5,
-                            ..Usage::default()
-                        },
+                        usage: meerkat_core::TurnUsage::host_declared(
+                            Provider::Other,
+                            "scripted-model",
+                            Usage {
+                                input_tokens: 3,
+                                output_tokens: 5,
+                                ..Usage::default()
+                            },
+                        ),
                     }),
                     Ok(LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
@@ -746,7 +790,11 @@ mod tests {
                 events: vec![
                     // Non-visible events must still count as stream liveness.
                     Ok(LlmEvent::UsageUpdate {
-                        usage: Usage::default(),
+                        usage: meerkat_core::TurnUsage::host_declared(
+                            Provider::Other,
+                            "scripted-model",
+                            Usage::default(),
+                        ),
                     }),
                     Ok(LlmEvent::TextDelta {
                         delta: "hello".to_string(),

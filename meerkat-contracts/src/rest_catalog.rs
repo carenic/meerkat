@@ -171,13 +171,15 @@ pub fn rest_path_catalog() -> Vec<RestPathDescriptor> {
                 "WireSessionHistory",
             )],
         ),
-        // NOTE: the transcript-edit family (`transcript-revisions/{revision}`,
+        // NOTE: the generic transcript-edit family (`transcript-revisions/{revision}`,
         // `rewrite-transcript`, `restore-transcript-revision`) is deliberately
-        // NOT served by REST — it is exposed only via JSON-RPC
+        // NOT served by REST - it is exposed only via JSON-RPC
         // (`session/rewrite_transcript` etc.) and SessionService. These paths
         // were briefly catalogued (#739) then dropped from the axum router in
         // the v0.6.27 rebase while the catalog entries lingered, advertising
-        // phantom 404 endpoints. Re-adding them here without a matching
+        // phantom 404 endpoints. The keyed `system_prompt` control below is a
+        // narrower typed operation with a matching router arm. Re-adding the
+        // generic paths here without matching
         // `router()` arm will fail `verify-rest-surface-alignment`.
         RestPathDescriptor::new(
             "/sessions/{id}/interrupt",
@@ -194,6 +196,15 @@ pub fn rest_path_catalog() -> Vec<RestPathDescriptor> {
                 "Append one ordinary durable ordered System message to a session",
                 "RestAppendSystemContextRequest",
                 "StatusResponse",
+            )],
+        ),
+        RestPathDescriptor::new(
+            "/sessions/{id}/system_prompt",
+            vec![RestOperationDescriptor::with_json_request(
+                "post",
+                "Explicitly replace one durable versioned system-prompt key",
+                "SystemPromptUpdateRequest",
+                "SystemPromptUpdateResult",
             )],
         ),
         RestPathDescriptor::new(

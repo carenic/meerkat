@@ -4869,7 +4869,6 @@ pub fn build_host_comms_runtime(
     .map_err(|err| MobHostActorError::Comms {
         detail: format!("failed to install host peer-comms authority '{participant_name}': {err}"),
     })?;
-    runtime.require_peer_comms_machine_authority();
     runtime.install_peer_request_response_authority(
         meerkat_comms::PeerRequestResponseAuthority::new(
             Arc::new(meerkat_runtime::RuntimePeerInteractionHandle::new(
@@ -5283,7 +5282,17 @@ async fn run_host_responder(
         // sink attempt runs per due tick/batch boundary, and the pending state
         // retains its capped-backoff deadline across unrelated actor traffic.
         actor.retry_pending_descriptor_refresh_if_due();
-        let candidates = actor.host_comms.drain_peer_input_candidates().await;
+        let candidates = match actor
+            .host_comms
+            .handoff_volatile_peer_input_candidates()
+            .await
+        {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                tracing::error!(%error, "host peer-input responder stopped with FIFO head retained");
+                break;
+            }
+        };
         if candidates.is_empty() {
             let descriptor_refresh_retry_at = actor
                 .pending_descriptor_refresh
@@ -9524,10 +9533,6 @@ mod tests {
 
     #[async_trait]
     impl CoreCommsRuntime for RecordingReplyStageRuntime {
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
             Arc::clone(&self.notify)
         }

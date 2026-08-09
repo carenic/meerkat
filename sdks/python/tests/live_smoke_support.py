@@ -103,6 +103,11 @@ def smoke_model() -> str:
     return os.environ.get("SMOKE_MODEL", "claude-sonnet-4-5")
 
 
+def anthropic_mid_system_model() -> str:
+    """Select an Anthropic model that can represent ordered mid-thread System rows."""
+    return os.environ.get("SMOKE_MODEL_ANTHROPIC_MID_SYSTEM", "claude-fable-5")
+
+
 def openai_model() -> str:
     # Default to the current approved OpenAI smoke model per CLAUDE.md;
     # the previous default `gpt-4.1-mini` is obsolete and was silently

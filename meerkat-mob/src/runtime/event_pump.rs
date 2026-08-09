@@ -4872,7 +4872,7 @@ mod tests {
             result: "stale".to_string(),
             structured_output: None,
             extraction_required: false,
-            usage: meerkat_core::Usage::default(),
+            usage: meerkat_core::Usage::default().into(),
             terminal_cause_kind: None,
         };
         registry.observe_member_event_row_exact(&old_member, 5, &stale_event);

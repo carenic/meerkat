@@ -439,8 +439,64 @@ impl RealtimeTranscriptItemState {
 #[serde(rename_all = "snake_case")]
 struct RealtimeAssistantCompletion {
     stop_reason: StopReason,
-    usage: Usage,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_realtime_completion_usage"
+    )]
+    usage: Option<crate::types::TurnUsage>,
     usage_consumed: bool,
+}
+
+fn deserialize_realtime_completion_usage<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::types::TurnUsage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum PersistedCompletionUsage {
+        Typed(crate::types::TurnUsage),
+        LegacyRaw(Usage),
+    }
+
+    let persisted =
+        <Option<PersistedCompletionUsage> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(match persisted {
+        Some(PersistedCompletionUsage::Typed(usage)) => Some(usage),
+        // Raw pre-normalization usage has no provider-authored convention or
+        // provenance. It remains durable history but cannot become charging
+        // authority after restart.
+        Some(PersistedCompletionUsage::LegacyRaw(usage)) => {
+            let _ = usage;
+            None
+        }
+        None => None,
+    })
+}
+
+#[cfg(test)]
+mod completion_usage_tests {
+    use super::RealtimeAssistantCompletion;
+
+    #[test]
+    fn legacy_raw_completion_usage_restores_without_minting_authority()
+    -> Result<(), serde_json::Error> {
+        let completion: RealtimeAssistantCompletion = serde_json::from_value(serde_json::json!({
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 7,
+                "output_tokens": 3,
+                "cache_creation_tokens": null,
+                "cache_read_tokens": null
+            },
+            "usage_consumed": true
+        }))?;
+
+        assert!(completion.usage.is_none());
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1416,7 +1472,7 @@ fn apply_assistant_turn_completed(
     state: &mut SessionRealtimeTranscriptState,
     response_id: String,
     stop_reason: StopReason,
-    usage: Usage,
+    usage: crate::types::TurnUsage,
 ) -> Result<RealtimeTranscriptApplyCommit, RealtimeTranscriptShellError> {
     let response_id = normalize_realtime_response_id(response_id);
     let response_discarded = response_id
@@ -1443,7 +1499,7 @@ fn apply_assistant_turn_completed(
                 .entry(response_id.clone())
                 .or_insert(RealtimeAssistantCompletion {
                     stop_reason,
-                    usage,
+                    usage: Some(usage),
                     usage_consumed: false,
                 });
         }
@@ -1473,7 +1529,7 @@ fn apply_assistant_turn_interrupted(
                 .entry(response_id.clone())
                 .or_insert(RealtimeAssistantCompletion {
                     stop_reason: StopReason::Cancelled,
-                    usage: Usage::default(),
+                    usage: None,
                     usage_consumed: false,
                 });
         }
@@ -1533,7 +1589,7 @@ fn materialize_realtime_transcript_ready_items(
     let mut pending_blocks: Vec<AssistantBlock> = Vec::new();
     let mut pending_response_id: Option<String> = None;
     let mut pending_stop_reason: StopReason = StopReason::EndTurn;
-    let mut pending_usage: Usage = Usage::default();
+    let mut pending_usage: Option<crate::types::TurnUsage> = None;
 
     loop {
         let order = realtime_transcript_order(state);
@@ -1575,7 +1631,7 @@ fn materialize_realtime_transcript_ready_items(
                     let usage = if decision.consume_usage {
                         completion.usage.clone()
                     } else {
-                        Usage::default()
+                        None
                     };
                     batch.push(ResolvedMaterialization::Assistant {
                         item_id: item_id.clone(),
@@ -1707,7 +1763,7 @@ enum ResolvedMaterialization {
         response_id: String,
         text: String,
         stop_reason: StopReason,
-        usage: Usage,
+        usage: Option<crate::types::TurnUsage>,
         lane: TranscriptLane,
         consume_usage: bool,
     },
@@ -1718,10 +1774,10 @@ fn flush_pending_assistant_blocks(
     committed_usage: &mut Usage,
     pending_blocks: &mut Vec<AssistantBlock>,
     pending_stop_reason: StopReason,
-    pending_usage: &mut Usage,
+    pending_usage: &mut Option<crate::types::TurnUsage>,
 ) {
     if pending_blocks.is_empty() {
-        *pending_usage = Usage::default();
+        *pending_usage = None;
         return;
     }
     let blocks = std::mem::take(pending_blocks);
@@ -1729,9 +1785,10 @@ fn flush_pending_assistant_blocks(
         blocks,
         pending_stop_reason,
     )));
-    if *pending_usage != Usage::default() {
-        committed_usage.add(pending_usage);
-        *pending_usage = Usage::default();
+    if let Some(turn_usage) = pending_usage.take() {
+        let mut cumulative = crate::types::CumulativeUsage::from_usage(committed_usage.clone());
+        cumulative.add_turn(&turn_usage);
+        *committed_usage = cumulative.into_inner();
     }
 }
 

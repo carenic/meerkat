@@ -110,6 +110,10 @@ struct Inner {
     runtime_lifecycle: HashMap<String, Vec<u8>>,
     /// Persisted ops lifecycle snapshots.
     ops_lifecycle_snapshots: HashMap<String, PersistedOpsSnapshot>,
+    /// Durable semantic high-water for peer-only member sessions. Runtime
+    /// bearer tokens are deliberately never persisted here.
+    direct_member_incarnation_high_waters:
+        HashMap<String, meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation>,
     /// Exact ops epochs retired by atomic unregister finalization. Tombstones
     /// outlive row deletion so detached callbacks cannot resurrect them.
     retired_ops_epochs: HashSet<(String, meerkat_core::RuntimeEpochId)>,
@@ -475,9 +479,17 @@ pub struct InMemoryRuntimeStore {
     #[cfg(test)]
     input_state_batch_cas_after_commit: Arc<StdMutex<Option<InputStateBatchCasTestBlock>>>,
     #[cfg(test)]
+    machine_lifecycle_load_before: Arc<StdMutex<Option<InputStateBatchCasTestBlock>>>,
+    #[cfg(test)]
+    machine_lifecycle_load_calls: Arc<AtomicUsize>,
+    #[cfg(test)]
+    machine_lifecycle_load_panics_remaining: Arc<AtomicUsize>,
+    #[cfg(test)]
     machine_lifecycle_cas_conflicts_remaining: Arc<AtomicUsize>,
     #[cfg(test)]
     machine_lifecycle_observe_errors_remaining: Arc<AtomicUsize>,
+    #[cfg(test)]
+    direct_member_high_water_before: Arc<StdMutex<Option<InputStateBatchCasTestBlock>>>,
     /// Candidate bytes shipped into the snapshot byte-equality compare.
     /// Observability seam for the length-gate regression tests only.
     #[cfg(test)]
@@ -494,9 +506,17 @@ impl InMemoryRuntimeStore {
             #[cfg(test)]
             input_state_batch_cas_after_commit: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
+            machine_lifecycle_load_before: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            machine_lifecycle_load_calls: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            machine_lifecycle_load_panics_remaining: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
             machine_lifecycle_cas_conflicts_remaining: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             machine_lifecycle_observe_errors_remaining: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            direct_member_high_water_before: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             snapshot_byte_probe_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -523,6 +543,18 @@ impl InMemoryRuntimeStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn block_next_direct_member_high_water_admission(
+        &self,
+        entered: Arc<crate::tokio::sync::Notify>,
+        release: Arc<crate::tokio::sync::Notify>,
+    ) {
+        *self
+            .direct_member_high_water_before
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((entered, release));
+    }
+
+    #[cfg(test)]
     pub(crate) fn block_next_input_state_batch_cas_after_commit(
         &self,
         entered: Arc<crate::tokio::sync::Notify>,
@@ -532,6 +564,29 @@ impl InMemoryRuntimeStore {
             .input_state_batch_cas_after_commit
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((entered, release));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_next_machine_lifecycle_load(
+        &self,
+        entered: Arc<crate::tokio::sync::Notify>,
+        release: Arc<crate::tokio::sync::Notify>,
+    ) {
+        *self
+            .machine_lifecycle_load_before
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((entered, release));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn machine_lifecycle_load_calls(&self) -> usize {
+        self.machine_lifecycle_load_calls.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_next_machine_lifecycle_load(&self) {
+        self.machine_lifecycle_load_panics_remaining
+            .fetch_add(1, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -1555,6 +1610,16 @@ impl super::RuntimeSessionAuthorityOps for InMemoryRuntimeStore {
 
     fn session_boundary_authority_read_cost(&self) -> RuntimeSessionAuthorityReadCost {
         RuntimeSessionAuthorityReadCost::Bounded
+    }
+
+    async fn activate_head_canonical_runtime_authority(
+        &self,
+        authority: meerkat_core::VerifiedHeadCanonicalAuthority,
+    ) -> Result<super::HeadCanonicalRuntimeAuthorityActivation, RuntimeStoreError> {
+        Err(RuntimeStoreError::SessionPersistenceAuthorityConflict {
+            runtime_id: LogicalRuntimeId::for_session(&authority.head().id).to_string(),
+            detail: "HeadCanonical activation cannot enter a WholeBlob runtime store".to_string(),
+        })
     }
 
     async fn write_prepared_head_canonical_provisional_tail(
@@ -3247,6 +3312,30 @@ impl RuntimeStore for InMemoryRuntimeStore {
         &self,
         runtime_id: &LogicalRuntimeId,
     ) -> Result<Option<Vec<u8>>, RuntimeStoreError> {
+        #[cfg(test)]
+        self.machine_lifecycle_load_calls
+            .fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
+        if self
+            .machine_lifecycle_load_panics_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            panic!("synthetic machine lifecycle load panic");
+        }
+        #[cfg(test)]
+        let before_block = self
+            .machine_lifecycle_load_before
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        if let Some((entered, release)) = before_block {
+            entered.notify_one();
+            release.notified().await;
+        }
         let inner = self.inner.lock().await;
         Ok(inner.runtime_lifecycle.get(&runtime_id.0).cloned())
     }
@@ -3386,6 +3475,45 @@ impl RuntimeStore for InMemoryRuntimeStore {
         inner.ops_lifecycle_snapshots.remove(&runtime_id.0);
         Ok(())
     }
+
+    async fn admit_direct_member_incarnation_high_water(
+        &self,
+        member_session_id: &str,
+        candidate: &meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+    ) -> Result<
+        meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+        RuntimeStoreError,
+    > {
+        super::validate_direct_member_high_water_candidate(member_session_id, candidate)?;
+        #[cfg(test)]
+        let test_block = self
+            .direct_member_high_water_before
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        if let Some((entered, release)) = test_block {
+            entered.notify_one();
+            release.notified().await;
+        }
+        let mut inner = self.inner.lock().await;
+        let current = inner
+            .direct_member_incarnation_high_waters
+            .get(member_session_id)
+            .cloned();
+        match current {
+            Some(current) if !super::direct_member_high_water_accepts(&current, candidate) => {
+                Ok(current)
+            }
+            Some(current) if current == *candidate => Ok(current),
+            _ => {
+                inner
+                    .direct_member_incarnation_high_waters
+                    .insert(member_session_id.to_string(), candidate.clone());
+                Ok(candidate.clone())
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3395,6 +3523,45 @@ mod tests {
     use crate::RuntimeState;
     use crate::store::MachineLifecycleBindingFacts;
     use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
+
+    #[tokio::test]
+    async fn direct_member_high_water_rejects_delayed_predecessor() {
+        let store = InMemoryRuntimeStore::new();
+        let predecessor =
+            meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+                mob_id: "mob-high-water".to_string(),
+                agent_identity: "worker-high-water".to_string(),
+                generation: 1,
+                fence_token: 1,
+            };
+        let successor = meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+            generation: 2,
+            fence_token: 2,
+            ..predecessor.clone()
+        };
+        assert_eq!(
+            store
+                .admit_direct_member_incarnation_high_water("session-high-water", &predecessor)
+                .await
+                .unwrap(),
+            predecessor
+        );
+        assert_eq!(
+            store
+                .admit_direct_member_incarnation_high_water("session-high-water", &successor)
+                .await
+                .unwrap(),
+            successor
+        );
+        assert_eq!(
+            store
+                .admit_direct_member_incarnation_high_water("session-high-water", &predecessor)
+                .await
+                .unwrap(),
+            successor,
+            "delayed predecessor must observe, not replace, durable successor authority"
+        );
+    }
 
     #[tokio::test]
     async fn pending_terminal_owner_index_satisfies_store_contract() {

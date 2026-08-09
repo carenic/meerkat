@@ -1386,36 +1386,10 @@ impl MethodRouter {
             ));
         }
 
-        let executor: Box<dyn meerkat_core::lifecycle::CoreExecutor> = match owner {
-            Some(SessionOwner::Runtime) => {
-                Box::new(crate::session_executor::SessionRuntimeExecutor::new(
-                    self.runtime.clone(),
-                    session_id.clone(),
-                ))
-            }
-            #[cfg(feature = "mob")]
-            Some(SessionOwner::Mob) => {
-                Box::new(crate::session_executor::MobRpcRuntimeExecutor::new(
-                    self.mob_state.session_service(),
-                    Some(self.runtime.clone()),
-                    session_id.clone(),
-                    self.notification_sink.clone(),
-                ))
-            }
-            None => return Ok(()),
-        };
-        if let Err(error) = self
-            .runtime_adapter
-            .ensure_session_with_executor(session_id.clone(), executor)
+        self.runtime
+            .ensure_runtime_executor(session_id)
             .await
-        {
-            return Err(RpcResponse::error(
-                None,
-                error::INTERNAL_ERROR,
-                format!("runtime executor registration failed: {error}"),
-            ));
-        }
-        Ok(())
+            .map_err(|error| RpcResponse::from_error(None, error))
     }
 
     async fn handle_blob_get(
@@ -1826,6 +1800,9 @@ impl MethodRouter {
             }
             "session/rewrite_transcript" => {
                 self.handle_session_rewrite_transcript(id, params).await
+            }
+            "session/update_system_prompt" => {
+                self.handle_session_update_system_prompt(id, params).await
             }
             "session/restore_transcript_revision" => {
                 self.handle_session_restore_transcript_revision(id, params)
@@ -2866,6 +2843,48 @@ impl MethodRouter {
                 id,
                 error::INVALID_PARAMS,
                 "mob-owned session transcripts cannot be edited through the generic session surface",
+            ),
+            None => RpcResponse::error(
+                id,
+                error::SESSION_NOT_FOUND,
+                format!("Session not found: {session_id}"),
+            ),
+        }
+    }
+
+    async fn handle_session_update_system_prompt(
+        &self,
+        id: Option<crate::protocol::RpcId>,
+        params: Option<&serde_json::value::RawValue>,
+    ) -> RpcResponse {
+        let params: meerkat_contracts::UpdateSystemPromptParams =
+            match handlers::parse_params(params) {
+                Ok(params) => params,
+                Err(response) => return response.with_id(id),
+            };
+        let session_id = match handlers::parse_session_id_for_runtime(
+            id.clone(),
+            &params.session_id,
+            &self.runtime,
+        ) {
+            Ok(session_id) => session_id,
+            Err(response) => return response,
+        };
+
+        match self.resolve_session_owner(&session_id).await {
+            Some(SessionOwner::Runtime) => match self
+                .runtime
+                .update_system_prompt(&session_id, params.into_core())
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(rpc_error) => RpcResponse::error(id, rpc_error.code, rpc_error.message),
+            },
+            #[cfg(feature = "mob")]
+            Some(SessionOwner::Mob) => RpcResponse::error(
+                id,
+                error::INVALID_PARAMS,
+                "mob-owned system prompts must be updated through the mob owner",
             ),
             None => RpcResponse::error(
                 id,
@@ -4418,7 +4437,23 @@ mod tests {
     // Mock LLM client (same as session_runtime tests)
     // -----------------------------------------------------------------------
 
-    struct MockLlmClient;
+    struct MockLlmClient {
+        provider: meerkat_core::Provider,
+    }
+
+    impl MockLlmClient {
+        fn anthropic() -> Self {
+            Self {
+                provider: meerkat_core::Provider::Anthropic,
+            }
+        }
+
+        fn openai() -> Self {
+            Self {
+                provider: meerkat_core::Provider::OpenAI,
+            }
+        }
+    }
 
     #[async_trait]
     impl LlmClient for MockLlmClient {
@@ -4431,7 +4466,7 @@ mod tests {
 
         fn stream<'a>(
             &'a self,
-            _request: &'a meerkat_client::LlmRequest,
+            request: &'a meerkat_client::LlmRequest,
         ) -> Pin<
             Box<dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>> + Send + 'a>,
         > {
@@ -4439,6 +4474,13 @@ mod tests {
                 Ok(meerkat_client::LlmEvent::TextDelta {
                     delta: "Hello from mock".to_string(),
                     meta: None,
+                }),
+                Ok(meerkat_client::LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        self.provider,
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
                     outcome: meerkat_client::LlmDoneOutcome::Success {
@@ -4449,7 +4491,7 @@ mod tests {
         }
 
         fn provider(&self) -> meerkat_core::Provider {
-            meerkat_core::Provider::Other
+            self.provider
         }
 
         async fn health_check(&self) -> Result<(), LlmError> {
@@ -4498,35 +4540,50 @@ mod tests {
                 .expect("recorded requests lock poisoned")
                 .push(request.messages.clone());
             let delay = self.delay_ms;
-            Box::pin(stream::unfold(0u8, move |state| async move {
-                match state {
-                    0 => {
-                        if let Some(delay_ms) = delay {
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let usage = meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Anthropic,
+                &request.model,
+                meerkat_core::Usage::default(),
+            );
+            Box::pin(stream::unfold(0u8, move |state| {
+                let usage = usage.clone();
+                async move {
+                    match state {
+                        0 => {
+                            if let Some(delay_ms) = delay {
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                                    .await;
+                            }
+                            Some((
+                                Ok(meerkat_client::LlmEvent::TextDelta {
+                                    delta: "Hello from mock".to_string(),
+                                    meta: None,
+                                }),
+                                1,
+                            ))
                         }
-                        Some((
-                            Ok(meerkat_client::LlmEvent::TextDelta {
-                                delta: "Hello from mock".to_string(),
-                                meta: None,
+                        1 => Some((
+                            Ok(meerkat_client::LlmEvent::UsageUpdate {
+                                usage: usage.clone(),
                             }),
-                            1,
-                        ))
+                            2,
+                        )),
+                        2 => Some((
+                            Ok(meerkat_client::LlmEvent::Done {
+                                outcome: meerkat_client::LlmDoneOutcome::Success {
+                                    stop_reason: StopReason::EndTurn,
+                                },
+                            }),
+                            3,
+                        )),
+                        _ => None,
                     }
-                    1 => Some((
-                        Ok(meerkat_client::LlmEvent::Done {
-                            outcome: meerkat_client::LlmDoneOutcome::Success {
-                                stop_reason: StopReason::EndTurn,
-                            },
-                        }),
-                        2,
-                    )),
-                    _ => None,
                 }
             }))
         }
 
         fn provider(&self) -> meerkat_core::Provider {
-            meerkat_core::Provider::Other
+            meerkat_core::Provider::Anthropic
         }
 
         async fn health_check(&self) -> Result<(), LlmError> {
@@ -4540,6 +4597,18 @@ mod tests {
 
     fn memory_blob_store() -> Arc<dyn meerkat_core::BlobStore> {
         Arc::new(meerkat_store::MemoryBlobStore::new())
+    }
+
+    fn anthropic_test_config() -> Config {
+        let mut config = Config::default();
+        config.agent.model = "claude-sonnet-4-5".to_string();
+        config
+    }
+
+    fn openai_live_test_config() -> Config {
+        let mut config = Config::default();
+        config.agent.model = "gpt-realtime-2".to_string();
+        config
     }
 
     fn runtime_backed_persistence(
@@ -4574,8 +4643,9 @@ mod tests {
     }
 
     async fn test_router() -> (MethodRouter, mpsc::Receiver<RpcNotification>) {
+        let config = anthropic_test_config();
         test_router_with_config_store(Arc::new(MemoryConfigStore::new(
-            Config::default(),
+            config,
             meerkat_models::canonical(),
         )))
         .await
@@ -4586,7 +4656,7 @@ mod tests {
     ) -> (MethodRouter, mpsc::Receiver<RpcNotification>) {
         let temp = tempfile::tempdir().unwrap();
         let factory = AgentFactory::new(temp.path().join("sessions"));
-        let config = Config::default();
+        let config = anthropic_test_config();
         let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
         let runtime = SessionRuntime::new(
             factory,
@@ -4595,7 +4665,7 @@ mod tests {
             runtime_backed_persistence(store),
             NotificationSink::noop(),
         );
-        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient::anthropic())));
         runtime.set_config_runtime(Arc::new(ConfigRuntime::new(
             Arc::clone(&config_store),
             temp.path().join("config_state.json"),
@@ -4616,7 +4686,7 @@ mod tests {
     ) -> (MethodRouter, mpsc::Receiver<RpcNotification>) {
         let temp = tempfile::tempdir().unwrap();
         let factory = AgentFactory::new(temp.path().join("sessions"));
-        let mut config = Config::default();
+        let mut config = anthropic_test_config();
         config.limits.max_sessions = Some(max_sessions);
         let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
         let runtime = SessionRuntime::new(
@@ -4628,7 +4698,7 @@ mod tests {
         );
         let config_store: Arc<dyn ConfigStore> =
             Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
-        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient::anthropic())));
         runtime.set_config_runtime(Arc::new(ConfigRuntime::new(
             Arc::clone(&config_store),
             temp.path().join("config_state.json"),
@@ -4989,21 +5059,25 @@ mod tests {
     async fn test_router_with_llm(
         llm_client: Arc<dyn LlmClient>,
     ) -> (MethodRouter, mpsc::Receiver<RpcNotification>) {
+        test_router_with_llm_for_config(anthropic_test_config(), llm_client).await
+    }
+
+    async fn test_router_with_llm_for_config(
+        config: Config,
+        llm_client: Arc<dyn LlmClient>,
+    ) -> (MethodRouter, mpsc::Receiver<RpcNotification>) {
         let temp = tempfile::tempdir().unwrap();
         let factory = AgentFactory::new(temp.path().join("sessions"));
-        let config = Config::default();
         let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
         let runtime = SessionRuntime::new(
             factory,
-            config,
+            config.clone(),
             10,
             runtime_backed_persistence(store),
             NotificationSink::noop(),
         );
-        let config_store: Arc<dyn ConfigStore> = Arc::new(MemoryConfigStore::new(
-            Config::default(),
-            meerkat_models::canonical(),
-        ));
+        let config_store: Arc<dyn ConfigStore> =
+            Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
         runtime.set_default_llm_client(Some(llm_client));
         runtime.set_config_runtime(Arc::new(ConfigRuntime::new(
             Arc::clone(&config_store),
@@ -5016,25 +5090,31 @@ mod tests {
         (router, notif_rx)
     }
 
+    async fn test_openai_live_router() -> (MethodRouter, mpsc::Receiver<RpcNotification>) {
+        test_router_with_llm_for_config(
+            openai_live_test_config(),
+            Arc::new(MockLlmClient::openai()),
+        )
+        .await
+    }
+
     async fn test_router_with_llm_and_notification_capacity(
         llm_client: Arc<dyn LlmClient>,
         notification_capacity: usize,
     ) -> (MethodRouter, mpsc::Receiver<RpcNotification>) {
         let temp = tempfile::tempdir().unwrap();
         let factory = AgentFactory::new(temp.path().join("sessions"));
-        let config = Config::default();
+        let config = anthropic_test_config();
         let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
         let runtime = SessionRuntime::new(
             factory,
-            config,
+            config.clone(),
             10,
             runtime_backed_persistence(store),
             NotificationSink::noop(),
         );
-        let config_store: Arc<dyn ConfigStore> = Arc::new(MemoryConfigStore::new(
-            Config::default(),
-            meerkat_models::canonical(),
-        ));
+        let config_store: Arc<dyn ConfigStore> =
+            Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
         runtime.set_default_llm_client(Some(llm_client));
         runtime.set_config_runtime(Arc::new(ConfigRuntime::new(
             Arc::clone(&config_store),
@@ -5053,20 +5133,18 @@ mod tests {
     ) -> (MethodRouter, mpsc::Receiver<RpcNotification>) {
         let temp = tempfile::tempdir().unwrap();
         let factory = AgentFactory::new(temp.path().join("sessions"));
-        let config = Config::default();
+        let config = anthropic_test_config();
         let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
         let runtime = SessionRuntime::new(
             factory,
-            config,
+            config.clone(),
             10,
             runtime_backed_persistence(store),
             NotificationSink::noop(),
         );
-        let config_store: Arc<dyn ConfigStore> = Arc::new(MemoryConfigStore::new(
-            Config::default(),
-            meerkat_models::canonical(),
-        ));
-        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        let config_store: Arc<dyn ConfigStore> =
+            Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient::anthropic())));
         runtime.set_config_runtime(Arc::new(ConfigRuntime::new(
             Arc::clone(&config_store),
             temp.path().join("config_state.json"),
@@ -5197,20 +5275,18 @@ mod tests {
     ) -> (MethodRouter, mpsc::Receiver<RpcNotification>) {
         let temp = tempfile::tempdir().unwrap();
         let factory = AgentFactory::new(temp.path().join("sessions"));
-        let config = Config::default();
+        let config = anthropic_test_config();
         let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
         let runtime = SessionRuntime::new(
             factory,
-            config,
+            config.clone(),
             10,
             runtime_backed_persistence(store),
             NotificationSink::noop(),
         );
-        let config_store: Arc<dyn ConfigStore> = Arc::new(MemoryConfigStore::new(
-            Config::default(),
-            meerkat_models::canonical(),
-        ));
-        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        let config_store: Arc<dyn ConfigStore> =
+            Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient::anthropic())));
         runtime.set_config_runtime(Arc::new(ConfigRuntime::new(
             Arc::clone(&config_store),
             temp.path().join("config_state.json"),
@@ -6292,7 +6368,7 @@ mod tests {
         SessionId,
         Arc<tokio::sync::Mutex<Vec<meerkat_core::live_adapter::LiveAdapterCommand>>>,
     ) {
-        let (router, _notif_rx) = test_router().await;
+        let (router, _notif_rx) = test_openai_live_router().await;
         let host = Arc::new(meerkat_live::LiveAdapterHost::new(Arc::new(
             meerkat_live::NoOpProjectionSink,
         )));
@@ -7349,7 +7425,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let _spawn_resp = router
+        let spawn_resp = router
             .dispatch(make_request(
                 "mob/spawn",
                 serde_json::json!({
@@ -7361,6 +7437,10 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert!(
+            spawn_resp.error.is_none(),
+            "worker spawn should establish its bridge session before the late-response scenario: {spawn_resp:?}"
+        );
         let session_id =
             resolve_mob_bridge_session_id(&router, "mob-peer-response-run-completed", "worker-1")
                 .await;
@@ -10461,7 +10541,7 @@ mod tests {
     #[tokio::test]
     async fn turn_interrupt_service_owned_idle_session_returns_ok() {
         let (router, _notif_rx) = test_router().await;
-        let llm_override: Arc<dyn LlmClient> = Arc::new(MockLlmClient);
+        let llm_override: Arc<dyn LlmClient> = Arc::new(MockLlmClient::anthropic());
         let created = router
             .runtime
             .core_session_service()

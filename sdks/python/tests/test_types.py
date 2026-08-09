@@ -4332,6 +4332,8 @@ async def test_client_workgraph_wrappers_use_expected_rpc_methods():
         "status": "open",
         "priority": "high",
         "completion_policy": {"kind": "self_attest"},
+        "cancelled_child_join_policy": "require_success",
+        "failed_child_join_policy": "require_success",
         "labels": ["autism-support", "dentist"],
         "revision": 1,
         "machine_state": {},
@@ -6577,6 +6579,41 @@ async def test_client_live_open_passes_provider_managed_turning_mode():
 # ---------------------------------------------------------------------------
 
 
+def _fork_cache_available() -> dict[str, object]:
+    return {
+        "status": "available",
+        "fork_point": {
+            "message_count": 4,
+            "authored_cache_breakpoint": {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "boundary": {
+                    "kind": "transcript_after",
+                    "message_count": 4,
+                },
+                "canonical_prefix_sha256": "sha256:canonical",
+                "canonical_prefix_bytes": 512,
+                "rendered_prefix_sha256": "sha256:rendered",
+                "rendered_prefix_bytes": 480,
+                "lowered_request_provenance": {
+                    "provider": "openai",
+                    "encoding": "open_ai_responses_json",
+                    "body_sha256": [7] * 32,
+                },
+                "ttl": "provider_default",
+            },
+        },
+    }
+
+
+def _fork_cache_unavailable(message_count: int = 1) -> dict[str, object]:
+    return {
+        "status": "unavailable",
+        "message_count": message_count,
+        "reason": "no_authored_breakpoint_at_boundary",
+    }
+
+
 @pytest.mark.asyncio
 async def test_fork_session_rejects_missing_session_id() -> None:
     """A session/fork response missing `session_id` raises INVALID_RESPONSE
@@ -6617,6 +6654,8 @@ async def test_fork_session_rejects_non_numeric_message_count() -> None:
 @pytest.mark.asyncio
 async def test_fork_session_parses_valid_result() -> None:
     """A well-formed fork response round-trips into a SessionForkResult."""
+    from meerkat import ForkCacheInheritanceAvailable
+
     client = MeerkatClient()
 
     async def fake_request(_method, _params):
@@ -6625,6 +6664,7 @@ async def test_fork_session_parses_valid_result() -> None:
             "session_id": "fork-1",
             "session_ref": None,
             "message_count": 7,
+            "cache_inheritance": _fork_cache_available(),
         }
 
     client._request = fake_request  # type: ignore[method-assign]
@@ -6633,6 +6673,78 @@ async def test_fork_session_parses_valid_result() -> None:
     assert result.source_session_id == "src-1"
     assert result.session_id == "fork-1"
     assert result.message_count == 7
+    assert isinstance(result.cache_inheritance, ForkCacheInheritanceAvailable)
+    assert result.cache_inheritance.status == "available"
+    assert result.cache_inheritance.fork_point.message_count == 4
+    assert (
+        result.cache_inheritance.fork_point.authored_cache_breakpoint.boundary.kind
+        == "transcript_after"
+    )
+    assert (
+        result.cache_inheritance.fork_point.authored_cache_breakpoint
+        .lowered_request_provenance.body_sha256
+        == (7,) * 32
+    )
+
+
+def test_fork_session_parses_unavailable_cache_inheritance() -> None:
+    from meerkat import ForkCacheInheritanceUnavailable
+
+    result = MeerkatClient._parse_session_fork_result(
+        {
+            "source_session_id": "src-1",
+            "session_id": "fork-1",
+            "message_count": 3,
+            "cache_inheritance": {
+                "status": "unavailable",
+                "message_count": 3,
+                "reason": "provider_model_mismatch",
+            },
+        }
+    )
+
+    assert isinstance(result.cache_inheritance, ForkCacheInheritanceUnavailable)
+    assert result.cache_inheritance.status == "unavailable"
+    assert result.cache_inheritance.message_count == 3
+    assert result.cache_inheritance.reason == "provider_model_mismatch"
+
+
+def test_fork_session_rejects_missing_cache_inheritance() -> None:
+    with pytest.raises(MeerkatError) as exc_info:
+        MeerkatClient._parse_session_fork_result(
+            {
+                "source_session_id": "src-1",
+                "session_id": "fork-1",
+                "message_count": 3,
+            }
+        )
+    assert exc_info.value.code == "INVALID_RESPONSE"
+
+
+@pytest.mark.parametrize(
+    "cache_inheritance",
+    [
+        None,
+        [],
+        "available",
+        {"status": "unknown"},
+        {"status": "available", "fork_point": {}},
+        {"status": "unavailable", "message_count": 3, "reason": "unknown"},
+    ],
+)
+def test_fork_session_rejects_malformed_cache_inheritance(
+    cache_inheritance: object,
+) -> None:
+    with pytest.raises(MeerkatError) as exc_info:
+        MeerkatClient._parse_session_fork_result(
+            {
+                "source_session_id": "src-1",
+                "session_id": "fork-1",
+                "message_count": 3,
+                "cache_inheritance": cache_inheritance,
+            }
+        )
+    assert exc_info.value.code == "INVALID_RESPONSE"
 
 
 @pytest.mark.parametrize("session_ref", [1, False, {}, []])
@@ -6684,6 +6796,7 @@ async def test_deferred_session_forks_forward_tool_access_policy() -> None:
             "source_session_id": "src-1",
             "session_id": "fork-1",
             "message_count": 1,
+            "cache_inheritance": _fork_cache_unavailable(),
         }
 
     client._request = fake_request  # type: ignore[method-assign]
@@ -6816,6 +6929,8 @@ async def test_get_workgraph_item_rejects_invalid_status_enum() -> None:
             "status": "not_a_status",
             "priority": "high",
             "completion_policy": {"kind": "self_attest"},
+            "cancelled_child_join_policy": "require_success",
+            "failed_child_join_policy": "require_success",
             "revision": 1,
             "machine_state": {},
             "created_at": timestamp,
@@ -6844,6 +6959,8 @@ async def test_get_workgraph_item_requires_typed_claim_owner() -> None:
             "status": "in_progress",
             "priority": "high",
             "completion_policy": {"kind": "self_attest"},
+            "cancelled_child_join_policy": "require_success",
+            "failed_child_join_policy": "require_success",
             "revision": 1,
             "machine_state": {},
             "created_at": timestamp,

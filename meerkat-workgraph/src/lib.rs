@@ -31,7 +31,9 @@ pub use execution_machine::{
     WorkExecutionMachine, WorkExecutionObservation, WorkExecutionObservationCommit,
     WorkExecutionTransition,
 };
-pub use machine::{WorkAttentionMachine, WorkGraphMachine, WorkGraphPublicErrorClass};
+pub use machine::{
+    ChildJoinDisposition, WorkAttentionMachine, WorkGraphMachine, WorkGraphPublicErrorClass,
+};
 pub use rest_contract::{
     WORKGRAPH_REST_PATHS, WorkGraphRestOperationDescriptor, WorkGraphRestPathDescriptor,
     WorkGraphRestRoute, workgraph_rest_path_catalog, workgraph_rest_request_response_schema,
@@ -39,8 +41,8 @@ pub use rest_contract::{
 };
 pub use service::{WorkExecutionBridge, WorkGraphService};
 pub use store::{
-    DisabledWorkGraphStore, MemoryWorkGraphStore, WorkGraphEventFilter, WorkGraphStore,
-    WorkGraphStoreKind,
+    DisabledWorkGraphStore, MemoryWorkGraphStore, WorkGraphEventFilter, WorkGraphNamespaceRead,
+    WorkGraphStore, WorkGraphStoreKind,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use store::{SqliteWorkGraphStore, WORKGRAPH_DOMAIN, prepare_pre_0_8_10_workgraph_attention};
@@ -52,8 +54,9 @@ pub use tool_surface::{
     workgraph_attention_turn_append,
 };
 pub use tools::{
-    WorkGraphToolError, WorkGraphToolErrorCode, handle_unscoped_workgraph_tools_call,
-    handle_workgraph_tools_call, unscoped_workgraph_tools_list, workgraph_tools_list,
+    WorkGraphToolCapability, WorkGraphToolContract, WorkGraphToolError, WorkGraphToolErrorCode,
+    WorkGraphToolSource, handle_unscoped_workgraph_tools_call, unscoped_workgraph_tools_list,
+    workgraph_platform_capability_manifest, workgraph_tools_list,
 };
 pub use types::{
     AddEvidenceRequest, AttentionBindingRequest, AttentionBindingResult,
@@ -62,10 +65,12 @@ pub use types::{
     AttentionProjectionPolicy, AttentionProjectionRequest, AttentionProjectionResult,
     AttentionProjectionText, AttentionPruneRequest, AttentionPruneResult, AttentionReassignRequest,
     AttentionReassignResult, AttentionResumeRequest, BreakGlassAttentionReassignRequest,
-    ClaimWorkItemRequest, CloseWorkItemRequest, CreateWorkItemRequest, ExternalWorkRef,
-    GoalAttentionTarget, GoalConfirmRequest, GoalConfirmResult, GoalCreateRequest,
-    GoalCreateResult, GoalRequestCloseRequest, GoalRequestCloseResult, GoalStatusRequest,
-    GoalStatusResult, GoalTerminalStatus, LinkWorkItemsRequest, PolicyEscalateRequest,
+    CancelledChildJoinPolicy, ClaimWorkItemRequest, CloseWorkItemRequest, CreateWorkItemRequest,
+    ExternalWorkRef, FailedChildJoinPolicy, GoalAttentionTarget, GoalBindExistingRequest,
+    GoalConfirmRequest, GoalConfirmResult, GoalCreateRequest, GoalCreateResult,
+    GoalRequestCloseRequest, GoalRequestCloseResult, GoalStatusRequest, GoalStatusResult,
+    GoalTerminalStatus, LinkWorkItemsRequest, MAX_WORK_CLAIM_LEASE_SECONDS,
+    ObserveLeaseExpiryRequest, ObserveReadinessRequest, PolicyEscalateRequest,
     ProjectedAttentionAuthority, PublicGoalCompletionPolicy, PublicGoalCreateRequest,
     PublicGoalRequestCloseRequest, ReadyWorkFilter, ReleaseWorkItemRequest, UpdateWorkItemRequest,
     WorkAttentionBinding, WorkAttentionBindingId, WorkAttentionMachineState, WorkAttentionMode,
@@ -73,7 +78,7 @@ pub use types::{
     WorkEdgeKind, WorkEvidenceKind, WorkEvidenceRef, WorkExecutionAuthority, WorkExecutionBinding,
     WorkExecutionBindingFilter, WorkExecutionBindingId, WorkExecutionEvidenceKind,
     WorkExecutionEvidenceProjection, WorkExecutionMachineState, WorkExecutionTarget,
-    WorkGraphEvent, WorkGraphEventKind, WorkGraphEventsResponse, WorkGraphIdParams,
+    WorkGraphEvent, WorkGraphEventKind, WorkGraphEventsResponse, WorkGraphFact, WorkGraphIdParams,
     WorkGraphItemsResponse, WorkGraphMachineState, WorkGraphSnapshot, WorkGraphSnapshotFilter,
     WorkItem, WorkItemFilter, WorkItemId, WorkItemRef, WorkNamespace, WorkOwner, WorkOwnerKey,
     WorkOwnerKind, WorkPriority, WorkStatus,

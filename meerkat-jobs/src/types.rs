@@ -52,7 +52,62 @@ string_id!(JobFailureCode, "job failure code");
 string_id!(OriginMemberId, "origin member id");
 string_id!(NotificationId, "notification id");
 string_id!(NotificationIdempotencyKey, "notification idempotency key");
+string_id!(
+    PredicateDeliveryIdempotencyKey,
+    "predicate delivery idempotency key"
+);
 string_id!(JobSubscriptionId, "job subscription id");
+
+/// Stable identity of one Schedule-owned predicate realization.
+///
+/// The idempotency key is unique only inside the owning job. The occurrence
+/// and runnable fields are persisted with it so accidental reuse for a
+/// different effect fails closed instead of silently deduplicating.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredicateDeliveryIdentity {
+    idempotency_key: PredicateDeliveryIdempotencyKey,
+    occurrence_id: String,
+    runnable: String,
+}
+
+impl PredicateDeliveryIdentity {
+    pub fn new(
+        idempotency_key: PredicateDeliveryIdempotencyKey,
+        occurrence_id: impl Into<String>,
+        runnable: impl Into<String>,
+    ) -> Result<Self, DetachedJobError> {
+        if idempotency_key.as_str().len() > 4 * 1_024 {
+            return Err(DetachedJobError::InvalidInput(
+                "predicate delivery idempotency key exceeds the 4096-byte limit".into(),
+            ));
+        }
+        Ok(Self {
+            idempotency_key,
+            occurrence_id: validate_bounded_component(
+                "predicate delivery occurrence id",
+                occurrence_id.into(),
+                4 * 1_024,
+            )?,
+            runnable: validate_bounded_component(
+                "predicate delivery runnable",
+                runnable.into(),
+                4 * 1_024,
+            )?,
+        })
+    }
+
+    pub fn idempotency_key(&self) -> &PredicateDeliveryIdempotencyKey {
+        &self.idempotency_key
+    }
+
+    pub fn occurrence_id(&self) -> &str {
+        &self.occurrence_id
+    }
+
+    pub fn runnable(&self) -> &str {
+        &self.runnable
+    }
+}
 
 impl JobId {
     pub fn generated() -> Self {
@@ -576,6 +631,53 @@ pub struct PredicateEvaluationReceipt {
     pub evaluation: crate::PredicateEvaluation,
     pub notification: Option<JobNotificationReceipt>,
     pub snapshot: JobSnapshot,
+}
+
+/// Compact immutable result retained by the predicate-delivery ledger.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PredicateDeliveryReceipt {
+    pub job_id: JobId,
+    pub identity: PredicateDeliveryIdentity,
+    pub committed_revision: u64,
+    pub evaluation: crate::PredicateEvaluation,
+    pub notification: Option<PredicateDeliveryNotificationReceipt>,
+}
+
+/// Exact notification disposition produced by a predicate delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredicateDeliveryNotificationReceipt {
+    pub notification_id: NotificationId,
+    pub delivery_sequence: u64,
+    pub deduplicated: bool,
+}
+
+/// Proposed immutable result supplied to the atomic store commit.
+///
+/// The store mints `committed_revision` only after the job replacement and
+/// this result can commit in the same transaction.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PredicateDeliveryCommit {
+    pub identity: PredicateDeliveryIdentity,
+    pub evaluation: crate::PredicateEvaluation,
+    pub notification: Option<PredicateDeliveryNotificationReceipt>,
+}
+
+/// Durable disposition of one Schedule-owned predicate occurrence.
+///
+/// Both variants carry the exact immutable receipt first committed for this
+/// job/occurrence/runnable identity. `snapshot` is the current job projection
+/// at the time of the call and may be newer on a replay.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PredicateDeliveryOutcome {
+    Applied {
+        receipt: PredicateDeliveryReceipt,
+        snapshot: JobSnapshot,
+    },
+    Deduplicated {
+        receipt: PredicateDeliveryReceipt,
+        snapshot: JobSnapshot,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

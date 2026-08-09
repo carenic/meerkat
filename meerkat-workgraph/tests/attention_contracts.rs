@@ -69,6 +69,16 @@ async fn completion_policy_is_item_state_and_survives_memory_store_round_trip() 
         SessionId::parse("019e63c2-0000-7000-8000-000000000044").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Ship a match-3 game".to_string(),
@@ -106,6 +116,16 @@ async fn policy_escalate_tightens_self_attest_without_widening_update() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000056").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Require host confirmation".to_string(),
@@ -176,6 +196,16 @@ async fn policy_escalate_reviewer_quorum_only_raises_threshold() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000057").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Require more reviewers".to_string(),
@@ -297,14 +327,26 @@ async fn attention_pause_is_machine_owned_and_does_not_snooze_item() {
 
 #[tokio::test]
 async fn goal_create_is_atomic_and_attention_status_is_service_owned() {
-    let service = WorkGraphService::new(std::sync::Arc::new(
-        meerkat_workgraph::MemoryWorkGraphStore::new(),
-    ));
+    let service = WorkGraphService::with_scope(
+        std::sync::Arc::new(meerkat_workgraph::MemoryWorkGraphStore::new()),
+        "realm-a",
+        WorkNamespace::new("session-123").expect("namespace"),
+    );
     let session_id =
         SessionId::parse("019e63c2-0000-7000-8000-000000000005").expect("valid session id");
 
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: Some("realm-a".to_string()),
             namespace: Some(WorkNamespace::new("session-123").expect("namespace")),
             title: "Ship a match-3 game".to_string(),
@@ -374,14 +416,26 @@ async fn goal_create_is_atomic_and_attention_status_is_service_owned() {
 
 #[tokio::test]
 async fn attention_reassign_supersedes_old_binding_and_targets_owner_key() {
-    let service = WorkGraphService::new(std::sync::Arc::new(
-        meerkat_workgraph::MemoryWorkGraphStore::new(),
-    ));
+    let service = WorkGraphService::with_scope(
+        std::sync::Arc::new(meerkat_workgraph::MemoryWorkGraphStore::new()),
+        "realm-reassign",
+        WorkNamespace::new("goals").expect("namespace"),
+    );
     let session_id =
         SessionId::parse("019e63c2-0000-7000-8000-000000000056").expect("valid session id");
     let owner_key = WorkOwnerKey::agent("mob/team-a/agent/reviewer").expect("owner key");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: Some("realm-reassign".to_string()),
             namespace: Some(WorkNamespace::new("goals").expect("namespace")),
             title: "Move goal attention to a durable owner".to_string(),
@@ -460,13 +514,25 @@ async fn attention_reassign_supersedes_old_binding_and_targets_owner_key() {
 
 #[tokio::test]
 async fn attention_reassign_requires_derived_from_authority_projection() {
-    let service = WorkGraphService::new(std::sync::Arc::new(
-        meerkat_workgraph::MemoryWorkGraphStore::new(),
-    ));
+    let service = WorkGraphService::with_scope(
+        std::sync::Arc::new(meerkat_workgraph::MemoryWorkGraphStore::new()),
+        "realm-reassign-deny",
+        WorkNamespace::new("goals").expect("namespace"),
+    );
     let session_id =
         SessionId::parse("019e63c2-0000-7000-8000-000000000057").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: Some("realm-reassign-deny".to_string()),
             namespace: Some(WorkNamespace::new("goals").expect("namespace")),
             title: "Insufficient authority".to_string(),
@@ -534,14 +600,29 @@ async fn missing_attention_binding_is_not_found_not_invalid_input() {
 async fn goal_attention_status_contract_is_identical_on_sqlite_store() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("workgraph.sqlite3");
-    let service = WorkGraphService::new(std::sync::Arc::new(
-        meerkat_workgraph::SqliteWorkGraphStore::open(&path).expect("open sqlite workgraph store"),
-    ));
+    let service = WorkGraphService::with_scope(
+        std::sync::Arc::new(
+            meerkat_workgraph::SqliteWorkGraphStore::open(&path)
+                .expect("open sqlite workgraph store"),
+        ),
+        "realm-sqlite",
+        WorkNamespace::new("goals").expect("namespace"),
+    );
     let session_id =
         SessionId::parse("019e63c2-0000-7000-8000-000000000055").expect("valid session id");
 
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: Some("realm-sqlite".to_string()),
             namespace: Some(WorkNamespace::new("goals").expect("namespace")),
             title: "Persist goal attention".to_string(),
@@ -613,6 +694,16 @@ async fn goal_confirmation_and_close_are_policy_gated() {
 
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Need host acceptance".to_string(),
@@ -689,6 +780,16 @@ async fn goal_confirm_and_request_close_reject_stale_item_revision() {
 
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Confirm exact revision".to_string(),
@@ -753,6 +854,16 @@ async fn goal_confirm_and_request_close_reject_stale_item_revision() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000111").expect("valid session id");
     let closable = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Close exact revision".to_string(),
@@ -813,6 +924,16 @@ async fn goal_policy_only_gates_successful_completion() {
     for status in [GoalTerminalStatus::Failed, GoalTerminalStatus::Cancelled] {
         let goal = service
             .create_goal(GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: format!("Close as {status:?} without acceptance"),
@@ -852,6 +973,16 @@ async fn raw_evidence_cannot_satisfy_reserved_completion_policy() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000109").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Needs host acceptance".to_string(),
@@ -898,6 +1029,16 @@ async fn public_self_attest_confirm_rejects_reserved_completion_evidence() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000056").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Public self-attest".to_string(),
@@ -947,6 +1088,8 @@ async fn create_rejects_reserved_completion_evidence() {
         .create(CreateWorkItemRequest {
             title: "Spoofed evidence".to_string(),
             completion_policy: WorkCompletionPolicy::HostConfirmed,
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
             evidence_refs: vec![WorkEvidenceRef {
                 kind: "host_confirmation".to_string(),
                 id: "spoofed".to_string(),
@@ -979,6 +1122,16 @@ async fn add_evidence_rejects_forged_typed_confirmation_kind() {
         SessionId::parse("019e63c2-0000-7000-8000-0000000001a0").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Needs host acceptance".to_string(),
@@ -1028,6 +1181,8 @@ async fn create_rejects_forged_typed_confirmation_kind() {
         .create(CreateWorkItemRequest {
             title: "Spoofed typed evidence".to_string(),
             completion_policy: WorkCompletionPolicy::HostConfirmed,
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
             evidence_refs: vec![WorkEvidenceRef {
                 kind: "review-note".to_string(),
                 id: "spoofed".to_string(),
@@ -1056,6 +1211,16 @@ async fn public_self_attest_confirm_rejects_forged_typed_confirmation_kind() {
         SessionId::parse("019e63c2-0000-7000-8000-0000000001a1").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Public self-attest".to_string(),
@@ -1104,6 +1269,16 @@ async fn direct_completed_close_is_policy_gated() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000111").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Needs acceptance".to_string(),
@@ -1142,6 +1317,16 @@ async fn attention_bound_update_cannot_change_completion_policy() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000112").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Protected policy".to_string(),
@@ -1192,6 +1377,16 @@ async fn update_with_unchanged_completion_policy_is_admitted_by_machine() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000118").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Stable policy".to_string(),
@@ -1244,6 +1439,16 @@ async fn update_changing_supervisor_owner_key_is_denied_by_machine() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000119").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Supervised goal".to_string(),
@@ -1294,6 +1499,16 @@ async fn direct_terminal_close_stops_attention_bindings_for_item() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000110").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Closable item".to_string(),
@@ -1340,6 +1555,16 @@ async fn supervisor_goal_confirmation_requires_named_supervisor() {
     let supervisor = WorkOwnerKey::principal("lead").expect("principal");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Needs lead approval".to_string(),
@@ -1415,6 +1640,16 @@ async fn attention_projection_is_eligible_bounded_and_role_aware() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000010").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Find the bug".to_string(),
@@ -1504,6 +1739,16 @@ async fn attention_projection_policy_controls_parent_context() {
 
     let with_parent = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Review child".to_string(),
@@ -1559,6 +1804,16 @@ async fn attention_projection_policy_controls_parent_context() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000012").expect("valid session id");
     let without_parent = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Review child without parent".to_string(),
@@ -1618,6 +1873,16 @@ async fn attention_projection_currentness_detects_truncated_parent_context_stale
         SessionId::parse("019e63c2-0000-7000-8000-000000000061").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Tiny projection child".to_string(),
@@ -1702,6 +1967,16 @@ async fn closed_goal_stops_attention_and_cannot_resume() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000041").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Closable".to_string(),
@@ -1754,6 +2029,16 @@ async fn expired_timed_pause_reads_are_pure_but_time_eligible() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000042").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Paused briefly".to_string(),
@@ -1834,6 +2119,16 @@ async fn snapshot_attention_reads_are_pure() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000043").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Snapshot paused briefly".to_string(),
@@ -1891,6 +2186,16 @@ async fn attention_continuation_supersession_is_binding_scoped_not_projection_sc
         SessionId::parse("019e63c2-0000-7000-8000-000000000044").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Supersede stale continuations".to_string(),
@@ -1940,6 +2245,16 @@ async fn request_closure_delegation_does_not_grant_close_authority() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000046").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Request closure only".to_string(),
@@ -1983,6 +2298,16 @@ async fn close_if_policy_projection_grants_self_close_without_parent_mutation() 
         SessionId::parse("019e63c2-0000-7000-8000-000000000047").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Close self only".to_string(),
@@ -2030,6 +2355,16 @@ async fn filtered_snapshot_does_not_include_attention_edges_or_ready_ids_for_fil
         SessionId::parse("019e63c2-0000-7000-8000-000000000048").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Filtered out goal".to_string(),
@@ -2077,6 +2412,16 @@ async fn stale_close_revision_wins_over_unsatisfied_completion_policy() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000049").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Needs host confirmation".to_string(),
@@ -2130,6 +2475,16 @@ async fn pause_and_resume_require_current_binding_revision() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000044").expect("valid session id");
     let goal = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "CAS attention".to_string(),
@@ -2211,6 +2566,8 @@ async fn completion_policy_legality_is_enforced_by_service() {
         .create(CreateWorkItemRequest {
             title: "Ordinary item".to_string(),
             completion_policy: WorkCompletionPolicy::HostConfirmed,
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
             ..CreateWorkItemRequest::default()
         })
         .await
@@ -2222,6 +2579,16 @@ async fn completion_policy_legality_is_enforced_by_service() {
 
     let zero_quorum_err = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Impossible quorum".to_string(),
@@ -2249,6 +2616,16 @@ async fn disabled_store_rejects_goal_create_fail_closed() {
         SessionId::parse("019e63c2-0000-7000-8000-000000000006").expect("valid session id");
     let err = service
         .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "No hidden fallback".to_string(),
@@ -2270,6 +2647,16 @@ async fn disabled_store_rejects_goal_create_fail_closed() {
 #[test]
 fn goal_create_request_pins_host_contract_shape() {
     let request = GoalCreateRequest {
+        failed_child_join_policy: Default::default(),
+        cancelled_child_join_policy: Default::default(),
+        priority: Default::default(),
+        labels: Default::default(),
+        due_at: None,
+        not_before: None,
+        snoozed_until: None,
+        external_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+        status: None,
         realm_id: Some("realm-a".to_string()),
         namespace: Some(WorkNamespace::new("session-123").expect("namespace")),
         title: "Ship a match-3 game".to_string(),
@@ -2441,6 +2828,16 @@ fn narrow_goal_and_attention_control_contracts_round_trip() {
 
 fn contract_goal_request(session_id: SessionId, title: &str) -> GoalCreateRequest {
     GoalCreateRequest {
+        failed_child_join_policy: Default::default(),
+        cancelled_child_join_policy: Default::default(),
+        priority: Default::default(),
+        labels: Default::default(),
+        due_at: None,
+        not_before: None,
+        snoozed_until: None,
+        external_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+        status: None,
         realm_id: Some("realm-a".to_string()),
         namespace: Some(WorkNamespace::new("session-123").expect("namespace")),
         title: title.to_string(),
@@ -2460,9 +2857,11 @@ fn contract_goal_request(session_id: SessionId, title: &str) -> GoalCreateReques
 /// NAMING the occupant.
 #[tokio::test]
 async fn active_binding_per_target_conflicts_at_create() {
-    let service = WorkGraphService::new(std::sync::Arc::new(
-        meerkat_workgraph::MemoryWorkGraphStore::new(),
-    ));
+    let service = WorkGraphService::with_scope(
+        std::sync::Arc::new(meerkat_workgraph::MemoryWorkGraphStore::new()),
+        "realm-a",
+        WorkNamespace::new("session-123").expect("namespace"),
+    );
     let session_id =
         SessionId::parse("019e63c2-0000-7000-8000-000000000021").expect("valid session id");
 
@@ -2485,9 +2884,11 @@ async fn active_binding_per_target_conflicts_at_create() {
 
 #[tokio::test]
 async fn reassign_onto_occupied_target_conflicts_and_frees_previous_target() {
-    let service = WorkGraphService::new(std::sync::Arc::new(
-        meerkat_workgraph::MemoryWorkGraphStore::new(),
-    ));
+    let service = WorkGraphService::with_scope(
+        std::sync::Arc::new(meerkat_workgraph::MemoryWorkGraphStore::new()),
+        "realm-a",
+        WorkNamespace::new("session-123").expect("namespace"),
+    );
     let session_a =
         SessionId::parse("019e63c2-0000-7000-8000-0000000000a1").expect("valid session id");
     let session_b =
@@ -2549,9 +2950,11 @@ async fn reassign_onto_occupied_target_conflicts_and_frees_previous_target() {
 
 #[tokio::test]
 async fn resume_onto_occupied_target_conflicts() {
-    let service = WorkGraphService::new(std::sync::Arc::new(
-        meerkat_workgraph::MemoryWorkGraphStore::new(),
-    ));
+    let service = WorkGraphService::with_scope(
+        std::sync::Arc::new(meerkat_workgraph::MemoryWorkGraphStore::new()),
+        "realm-a",
+        WorkNamespace::new("session-123").expect("namespace"),
+    );
     let session_id =
         SessionId::parse("019e63c2-0000-7000-8000-0000000000d1").expect("valid session id");
 
@@ -2598,9 +3001,11 @@ async fn resume_onto_occupied_target_conflicts() {
 
 #[tokio::test]
 async fn prune_terminal_attention_removes_only_terminal_bindings() {
-    let service = WorkGraphService::new(std::sync::Arc::new(
-        meerkat_workgraph::MemoryWorkGraphStore::new(),
-    ));
+    let service = WorkGraphService::with_scope(
+        std::sync::Arc::new(meerkat_workgraph::MemoryWorkGraphStore::new()),
+        "realm-a",
+        WorkNamespace::new("session-123").expect("namespace"),
+    );
     let session_a =
         SessionId::parse("019e63c2-0000-7000-8000-0000000000e1").expect("valid session id");
     let session_b =
@@ -2677,9 +3082,11 @@ async fn prune_terminal_attention_removes_only_terminal_bindings() {
 /// attribution into the audit stream.
 #[tokio::test]
 async fn break_glass_reassign_moves_non_coordinate_binding_with_audit() {
-    let service = WorkGraphService::new(std::sync::Arc::new(
-        meerkat_workgraph::MemoryWorkGraphStore::new(),
-    ));
+    let service = WorkGraphService::with_scope(
+        std::sync::Arc::new(meerkat_workgraph::MemoryWorkGraphStore::new()),
+        "realm-a",
+        WorkNamespace::new("session-123").expect("namespace"),
+    );
     let session_a =
         SessionId::parse("019e63c2-0000-7000-8000-0000000000f1").expect("valid session id");
     let session_b =
@@ -2739,9 +3146,11 @@ async fn break_glass_reassign_moves_non_coordinate_binding_with_audit() {
 
 #[tokio::test]
 async fn break_glass_reassign_requires_principal_and_reason() {
-    let service = WorkGraphService::new(std::sync::Arc::new(
-        meerkat_workgraph::MemoryWorkGraphStore::new(),
-    ));
+    let service = WorkGraphService::with_scope(
+        std::sync::Arc::new(meerkat_workgraph::MemoryWorkGraphStore::new()),
+        "realm-a",
+        WorkNamespace::new("session-123").expect("namespace"),
+    );
     let session_id =
         SessionId::parse("019e63c2-0000-7000-8000-0000000000f9").expect("valid session id");
     let goal = service

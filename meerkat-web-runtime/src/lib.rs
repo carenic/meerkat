@@ -662,12 +662,16 @@ fn spawn_member_result_payload(
 
 fn helper_result_payload(mob_id: &MobId, result: &meerkat_mob::HelperResult) -> serde_json::Value {
     let identity_str = result.agent_identity.to_string();
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "output": result.output,
         "tokens_used": result.tokens_used,
         "agent_identity": result.agent_identity,
         "member_ref": meerkat_contracts::WireMemberRef::encode(mob_id.as_str(), &identity_str),
-    })
+    });
+    if let Some(bounded_result) = result.bounded_result.as_ref() {
+        payload["bounded_result"] = serde_json::json!(bounded_result.to_wire());
+    }
+    payload
 }
 
 // ═══════════════════════════════════════════════════════════

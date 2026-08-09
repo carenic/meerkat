@@ -3553,25 +3553,46 @@ pub fn sample_mob_host_authority_record(host_id: &str, epoch: u64) -> MobHostAut
 /// Projection status for legacy external binding metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ExternalBindingOverlayStatus {
+    /// Exact V5 semantic incarnation is durably reserved before BindMember
+    /// crosses the transport boundary. This row is cleanup/retry authority,
+    /// never roster membership.
+    DirectBindPending,
+    /// The receiver returned and the controller persisted the exact opaque
+    /// runtime/session fence. Membership may still be uncommitted.
+    DirectBindBound,
     /// The legacy external binding was normalized to a peer-only member ref.
     Normalized,
     /// Normalization failed and the member should surface as broken.
     Failed { reason: String },
 }
 
-/// Compatibility projection metadata for a legacy external binding.
+/// External binding projection plus narrowly scoped V5 direct-bind effect
+/// authority.
 ///
-/// This record never creates roster membership and is not restart authority for
-/// member material, bridge binding, lifecycle status, or restore failure state.
-/// Resume rebuilds those facts from `MemberSpawned`/`MemberRetired` events and
-/// MobMachine-owned state; overlays remain persisted only for compatibility
-/// projection, diagnostics, and cleanup of older runtimes that wrote them.
+/// This record never creates roster membership and never owns topology or
+/// lifecycle truth. `Normalized` and `Failed` remain compatibility projection
+/// only. `DirectBindPending` and `DirectBindBound` are durable effect-intent
+/// authority: they let recovery reissue the byte-identical semantic bind or
+/// retire the exact returned runtime fence without inferring authority from a
+/// session id. Structural membership still comes only from Mob events and
+/// MobMachine state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExternalBindingOverlayRecord {
     /// Stable member identity.
     pub agent_identity: AgentIdentity,
     /// Generation the overlay applies to.
     pub generation: Generation,
+    /// Exact Mob fence paired with `generation` for a V5 direct bind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_token: Option<crate::FenceToken>,
+    /// Byte-identical semantic bind identity persisted before transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_member_incarnation:
+        Option<meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation>,
+    /// Receiver-minted exact runtime/session fence persisted after bind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_member_fence:
+        Option<meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence>,
     /// Peer-only runtime binding when normalization succeeds.
     ///
     /// Crate-private alongside `MemberRef` itself (finding A7): the pre-0.6
@@ -4207,6 +4228,35 @@ pub trait MobRuntimeMetadataStore: Send + Sync {
         mob_id: &MobId,
         record: &ExternalBindingOverlayRecord,
     ) -> Result<(), MobStoreError>;
+
+    /// Atomically advance one exact V5 direct-bind intent. Implementations
+    /// compare the complete pending record, so a delayed reply cannot
+    /// overwrite a successor fence. Returning `false` means neither the
+    /// expected row nor the byte-identical desired terminal was present.
+    async fn compare_and_set_external_direct_bind(
+        &self,
+        _mob_id: &MobId,
+        _expected: &ExternalBindingOverlayRecord,
+        _desired: &ExternalBindingOverlayRecord,
+    ) -> Result<bool, MobStoreError> {
+        Err(MobStoreError::WriteFailed(
+            "exact direct-bind overlay CAS is unavailable".to_string(),
+        ))
+    }
+
+    /// Atomically delete one exact V5 direct-bind authority record.
+    ///
+    /// The complete-record comparison prevents a delayed predecessor cleanup
+    /// from deleting a same-key successor fence after a receiver rebind.
+    async fn compare_and_delete_external_direct_bind(
+        &self,
+        _mob_id: &MobId,
+        _expected: &ExternalBindingOverlayRecord,
+    ) -> Result<bool, MobStoreError> {
+        Err(MobStoreError::WriteFailed(
+            "exact direct-bind overlay compare-delete is unavailable".to_string(),
+        ))
+    }
 
     /// Delete the overlay for a specific identity/generation key.
     async fn delete_external_binding_overlay(

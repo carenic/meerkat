@@ -69,6 +69,25 @@ pub enum RuntimeDriverError {
     #[error("Runtime stop cleanup is still in progress for runtime {runtime_id}")]
     RuntimeStopInProgress { runtime_id: LogicalRuntimeId },
 
+    /// An exact hard-interrupt callback exceeded the caller acknowledgement
+    /// bound. The process-owned callback still owns reconciliation; callers
+    /// may retry the same run to join its result and must retain their durable
+    /// lifecycle retry anchor.
+    #[error("Hard interrupt outcome is still pending for run {run_id}: {reason}")]
+    InterruptDispatchOutcomeUnknown { run_id: RunId, reason: String },
+
+    /// A custom exact hard-interrupt callback panicked. The process-owned
+    /// dispatch caught the unwind and released its retry slot, so durable
+    /// lifecycle authority may retry the same exact run.
+    #[error("Hard interrupt callback panicked for run {run_id}: {reason}")]
+    InterruptDispatchPanicked { run_id: RunId, reason: String },
+
+    /// The exact runless-terminal publication callback outlived the caller's
+    /// acknowledgement budget. Its process-owned dispatch and durable outbox
+    /// remain the only retry authority.
+    #[error("Runtime terminal publication remains in progress for {runtime_id}")]
+    RuntimeTerminalPublicationInProgress { runtime_id: LogicalRuntimeId },
+
     /// The caller's exact durable ownership witness was superseded by another
     /// runtime owner. Retrying from the same in-memory state is forbidden.
     #[error("Stale runtime authority: {reason}")]
@@ -94,6 +113,14 @@ pub enum RuntimeControlPlaneError {
     /// Store error.
     #[error("Store error: {0}")]
     StoreError(String),
+
+    /// The exact retirement transaction remains process-owned beyond this
+    /// caller's absolute deadline. Retrying joins the same transaction.
+    #[error("Runtime retirement remains in progress for {runtime_id} at {stage}")]
+    RetirementInProgress {
+        runtime_id: LogicalRuntimeId,
+        stage: String,
+    },
 
     /// Internal error.
     #[error("Internal error: {0}")]

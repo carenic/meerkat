@@ -991,6 +991,14 @@ pub fn workgraph_attention_bundle_composition() -> CompositionSchema {
                         ),
                         witness_field("completion_supervisor_owner_key", Expr::None),
                         witness_field("completion_reviewer_quorum_threshold", Expr::None),
+                        witness_field(
+                            "failed_child_join_policy",
+                            named_variant("FailedChildJoinPolicy", "RequireSuccess"),
+                        ),
+                        witness_field(
+                            "cancelled_child_join_policy",
+                            named_variant("CancelledChildJoinPolicy", "RequireSuccess"),
+                        ),
                         witness_field("unresolved_blocker_count", Expr::U64(0)),
                     ],
                 ),

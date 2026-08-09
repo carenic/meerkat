@@ -20,3 +20,6 @@ WorkGraph for shared durable work when WorkGraph tools are available.
   to peer-added or peer-removed notices.
 - Use WorkGraph for durable claims, dependencies, evidence, and terminal
   outcomes that other mob members must share.
+- Treat peer delivery as wakeup acceleration. Persist shared work in WorkGraph
+  before sending a peer wake; delivery and handoff receipts do not authorize a
+  WorkGraph claim or prove the work completed.

@@ -56,7 +56,8 @@ use meerkat_core::{
     AgentExecutionSnapshot, Config, ConfigStore, ContentInput, ExternalToolSurfaceSnapshot,
     PeerIngressRuntimeSnapshot, Session, SessionLlmIdentity, SessionLlmIdentityOverride,
     SurfaceSessionRecoveryContext, SurfaceSessionRecoveryError, SurfaceSessionRecoveryOverrides,
-    SystemMessage, ToolScopeSnapshot, build_recovered_session,
+    SystemMessage, SystemPromptUpdateRequest, SystemPromptUpdateResult, ToolScopeSnapshot,
+    build_recovered_session,
 };
 use meerkat_core::{EventEnvelope, EventStream, InputId, RunId, StreamError};
 use meerkat_runtime::input_state::InputStatePersistenceRecord;
@@ -242,6 +243,10 @@ fn set_default_workgraph_tools(
         default_realm_id,
         meerkat::WorkNamespace::default(),
     );
+    meerkat::surface::set_default_workgraph_namespace_grant(
+        builder,
+        Some(service.namespace_grant().clone()),
+    );
     let dispatcher =
         Arc::new(meerkat::WorkGraphToolSurface::new(service)) as Arc<dyn AgentToolDispatcher>;
     meerkat::surface::set_default_workgraph_tools(builder, Some(dispatcher));
@@ -402,11 +407,18 @@ pub(crate) use meerkat::session_runtime::staged_promotion::{
 };
 
 #[cfg(feature = "mob")]
+type RpcMobActorWitnesses = Arc<StdRwLock<HashMap<SessionId, meerkat::LiveSessionActorWitness>>>;
+
+#[cfg(feature = "mob")]
 struct RpcMobSessionService {
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
     staged_sessions: Arc<StagedSessionRegistry>,
     runtime_adapter: Arc<MeerkatMachine>,
     mob_state: Arc<StdRwLock<Option<Arc<meerkat_mob_mcp::MobMcpState>>>>,
+    actor_witnesses: RpcMobActorWitnesses,
+    runtime_actor_witness_slots:
+        Arc<StdRwLock<HashMap<SessionId, meerkat::LiveSessionActorWitnessSlot>>>,
+    runtime_publication_handles: Arc<StdRwLock<HashMap<SessionId, RpcPublicationAttachment>>>,
     #[cfg(test)]
     direct_create_after_ack_hook: Option<Arc<PendingPromotionPreTurnHook>>,
 }
@@ -436,12 +448,20 @@ impl RpcMobSessionService {
         staged_sessions: Arc<StagedSessionRegistry>,
         runtime_adapter: Arc<MeerkatMachine>,
         mob_state: Arc<StdRwLock<Option<Arc<meerkat_mob_mcp::MobMcpState>>>>,
+        actor_witnesses: RpcMobActorWitnesses,
+        runtime_actor_witness_slots: Arc<
+            StdRwLock<HashMap<SessionId, meerkat::LiveSessionActorWitnessSlot>>,
+        >,
+        runtime_publication_handles: Arc<StdRwLock<HashMap<SessionId, RpcPublicationAttachment>>>,
     ) -> Self {
         Self {
             service,
             staged_sessions,
             runtime_adapter,
             mob_state,
+            actor_witnesses,
+            runtime_actor_witness_slots,
+            runtime_publication_handles,
             #[cfg(test)]
             direct_create_after_ack_hook: None,
         }
@@ -462,6 +482,62 @@ impl RpcMobSessionService {
         let session_id = session.id().clone();
         build.resume_session = Some(session);
         session_id
+    }
+
+    fn record_actor_witness(&self, actor_witness: meerkat::LiveSessionActorWitness) {
+        self.actor_witnesses
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(actor_witness.session_id().clone(), actor_witness);
+    }
+
+    fn publication_attachment_witness(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<meerkat_runtime::RuntimeExecutorAttachmentWitness> {
+        self.runtime_publication_handles
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .map(|attachment| attachment.witness.clone())
+    }
+
+    fn clear_publication_sidecars_if_current(
+        &self,
+        session_id: &SessionId,
+        expected_attachment: Option<&meerkat_runtime::RuntimeExecutorAttachmentWitness>,
+    ) {
+        clear_rpc_publication_sidecars_if_current(
+            session_id,
+            expected_attachment,
+            &self.runtime_publication_handles,
+            &self.runtime_actor_witness_slots,
+            &self.actor_witnesses,
+        );
+    }
+
+    fn capture_published_actor(
+        &self,
+        actor_witness_slot: &meerkat::LiveSessionActorWitnessSlot,
+        result: meerkat_core::RunResult,
+    ) -> Result<meerkat_core::RunResult, SessionError> {
+        let actor_witness = actor_witness_slot.witness().ok_or_else(|| {
+            SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                "session service materialized {} without publishing exact actor authority",
+                result.session_id
+            )))
+        })?;
+        if actor_witness.session_id() != &result.session_id {
+            return Err(SessionError::Agent(
+                meerkat_core::error::AgentError::InternalError(format!(
+                    "session service published actor authority for {}, not materialized session {}",
+                    actor_witness.session_id(),
+                    result.session_id
+                )),
+            ));
+        }
+        self.record_actor_witness(actor_witness);
+        Ok(result)
     }
 
     fn is_pre_run_start_turn_failure(result: &Result<RunResult, SessionError>) -> bool {
@@ -667,13 +743,18 @@ impl RpcMobSessionService {
         _initial_turn: InitialTurnPolicy,
         req: CreateSessionRequest,
         admission: ActiveCapacityGuard,
+        actor_witness_slot: meerkat::LiveSessionActorWitnessSlot,
         #[cfg(test)] after_ack_hook: Option<Arc<PendingPromotionPreTurnHook>>,
     ) -> Result<RunResult, SessionError> {
         let result_session_id = session_id.clone();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let result = service
-                .create_session_with_reserved_admission(req, admission)
+                .create_session_with_reserved_admission_and_actor_witness(
+                    req,
+                    admission,
+                    &actor_witness_slot,
+                )
                 .await;
             #[cfg(test)]
             if _initial_turn == InitialTurnPolicy::Defer
@@ -792,12 +873,14 @@ impl SessionService for RpcMobSessionService {
         req.build
             .get_or_insert_with(Default::default)
             .runtime_build_mode = meerkat_core::RuntimeBuildMode::SessionOwned(bindings);
+        let actor_witness_slot = meerkat::LiveSessionActorWitnessSlot::default();
         let result = Self::await_guarded_create_session(
             Arc::clone(&self.service),
             session_id.clone(),
             initial_turn,
             req,
             admission,
+            actor_witness_slot.clone(),
             #[cfg(test)]
             self.direct_create_after_ack_hook.clone(),
         )
@@ -842,7 +925,7 @@ impl SessionService for RpcMobSessionService {
                         ));
                     }
                 }
-                Ok(result)
+                self.capture_published_actor(&actor_witness_slot, result)
             }
             Err(error) => {
                 if let Some(prepared) = prepared_materialization.as_mut()
@@ -987,6 +1070,7 @@ impl SessionService for RpcMobSessionService {
         if self.staged_sessions.contains(id).await {
             return Err(SessionError::Busy { id: id.clone() });
         }
+        let expected_attachment = self.publication_attachment_witness(id);
         let cleanup = self.archive_runtime_cleanup();
         let result = self
             .service
@@ -998,6 +1082,7 @@ impl SessionService for RpcMobSessionService {
         let service_not_found = matches!(&result, Err(SessionError::NotFound { .. }));
         if result.is_ok() || service_not_found {
             cleanup.run(id).await?;
+            self.clear_publication_sidecars_if_current(id, expected_attachment.as_ref());
         }
         result
     }
@@ -1067,14 +1152,6 @@ impl SessionServiceHistoryExt for RpcMobSessionService {
 #[cfg(feature = "mob")]
 #[async_trait::async_trait]
 impl meerkat_mob::MobSessionService for RpcMobSessionService {
-    async fn prepare_session_for_resume(&self, session_id: &SessionId) -> Result<(), SessionError> {
-        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::prepare_session_for_resume(
-            &self.service,
-            session_id,
-        )
-        .await
-    }
-
     async fn observe_session_resume_authority(
         &self,
         session_id: &SessionId,
@@ -1097,24 +1174,51 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         .await
     }
 
+    async fn publish_interaction_terminals_for_actor(
+        &self,
+        actor_witness: &meerkat::LiveSessionActorWitness,
+        events: &[AgentEvent],
+    ) -> Result<
+        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
+        SessionError,
+    > {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::publish_interaction_terminals_for_actor(
+            &self.service,
+            actor_witness,
+            events,
+        )
+        .await
+    }
+
     async fn create_session_under_runtime_turn_boundary(
         &self,
         req: meerkat_core::service::CreateSessionRequest,
     ) -> Result<meerkat_core::RunResult, SessionError> {
-        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::create_session_under_runtime_turn_boundary(&self.service, req).await
+        let actor_witness_slot = meerkat::LiveSessionActorWitnessSlot::default();
+        let result = <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::create_session_with_actor_witness_under_runtime_turn_boundary(
+            &self.service,
+            req,
+            None,
+            &actor_witness_slot,
+        )
+        .await?;
+        self.capture_published_actor(&actor_witness_slot, result)
     }
 
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         req: meerkat_core::service::CreateSessionRequest,
+        resume_preparation: Option<meerkat_mob::SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, SessionError> {
-        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::create_session_with_actor_witness_under_runtime_turn_boundary(
+        let result = <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::create_session_with_actor_witness_under_runtime_turn_boundary(
             &self.service,
             req,
+            resume_preparation,
             actor_witness_slot,
         )
-        .await
+        .await?;
+        self.capture_published_actor(actor_witness_slot, result)
     }
 
     async fn create_session_with_machine_archived_resume_authority(
@@ -1147,15 +1251,18 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         &self,
         req: meerkat_core::service::CreateSessionRequest,
         authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
+        resume_preparation: meerkat_mob::SessionResumePreparationReceipt,
         actor_witness_slot: &meerkat::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, SessionError> {
-        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::create_session_with_machine_archived_resume_authority_and_actor_witness_under_runtime_turn_boundary(
+        let result = <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::create_session_with_machine_archived_resume_authority_and_actor_witness_under_runtime_turn_boundary(
             &self.service,
             req,
             authorization,
+            resume_preparation,
             actor_witness_slot,
         )
-        .await
+        .await?;
+        self.capture_published_actor(actor_witness_slot, result)
     }
 
     async fn authorize_revivable_retired_session(
@@ -1179,6 +1286,20 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
             .archive_with_machine_protocol_under_runtime_turn_boundary(
                 session_id,
                 MachineSessionArchiveProtocol::from_machine(self.runtime_adapter.as_ref()),
+            )
+            .await
+    }
+
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+        &self,
+        session_id: &SessionId,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<(), SessionError> {
+        self.service
+            .archive_with_machine_protocol_under_runtime_turn_boundary_before(
+                session_id,
+                MachineSessionArchiveProtocol::from_machine(self.runtime_adapter.as_ref()),
+                deadline,
             )
             .await
     }
@@ -1209,6 +1330,17 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
     ) -> Result<(), SessionError> {
         self.service
             .interrupt_with_machine_authority(session_id, authority)
+            .await
+    }
+
+    async fn interrupt_run_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        expected_run_id: &RunId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, SessionError> {
+        self.service
+            .interrupt_run_with_machine_authority(session_id, expected_run_id, authority)
             .await
     }
 
@@ -1325,6 +1457,7 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         match runtime.peer_ingress_runtime_snapshot().await {
             Ok(snapshot) => Ok(Some(snapshot)),
             Err(meerkat_core::CommsCapabilityError::Unsupported(_)) => Ok(None),
+            Err(error) => Err(SessionError::Unsupported(error.to_string())),
         }
     }
 
@@ -1457,19 +1590,6 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
             .discard_live_session_after_runtime_stop_terminalized_under_runtime_turn_boundary(
                 session_id,
             )
-            .await
-    }
-
-    async fn publish_interaction_terminals(
-        &self,
-        session_id: &SessionId,
-        events: &[AgentEvent],
-    ) -> Result<
-        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
-        SessionError,
-    > {
-        self.service
-            .publish_interaction_terminals_exact_batch(session_id, events)
             .await
     }
 
@@ -1646,6 +1766,66 @@ struct RuntimeCompletionCleanupFailure {
     error: meerkat_runtime::CompletionWaitError,
 }
 
+#[derive(Clone)]
+struct RpcPublicationAttachment {
+    witness: meerkat_runtime::RuntimeExecutorAttachmentWitness,
+    publication_handle: crate::session_executor::RpcRuntimePublicationHandle,
+    owner: RpcPublicationOwner,
+}
+
+#[derive(Clone)]
+enum RpcPublicationOwner {
+    Persistent,
+    #[cfg(feature = "mob")]
+    Mob {
+        session_service: Arc<dyn meerkat_mob::MobSessionService>,
+    },
+}
+
+fn clear_rpc_publication_sidecars_if_current(
+    session_id: &SessionId,
+    expected_attachment: Option<&meerkat_runtime::RuntimeExecutorAttachmentWitness>,
+    runtime_publication_handles: &Arc<StdRwLock<HashMap<SessionId, RpcPublicationAttachment>>>,
+    runtime_actor_witness_slots: &Arc<
+        StdRwLock<HashMap<SessionId, meerkat::LiveSessionActorWitnessSlot>>,
+    >,
+    #[cfg(feature = "mob")] mob_actor_witnesses: &RpcMobActorWitnesses,
+) -> bool {
+    let mut attachments = runtime_publication_handles
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let owns_cleanup = match (attachments.get(session_id), expected_attachment) {
+        (Some(current), Some(expected)) => current.witness == *expected,
+        (None, None) => true,
+        _ => false,
+    };
+    if !owns_cleanup {
+        return false;
+    }
+    attachments.remove(session_id);
+    runtime_actor_witness_slots
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(session_id);
+    #[cfg(feature = "mob")]
+    mob_actor_witnesses
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(session_id);
+    true
+}
+
+enum RpcExecutorActorAuthority {
+    PersistentWitness(meerkat::LiveSessionActorWitness),
+    PersistentSlot(meerkat::LiveSessionActorWitnessSlot),
+    #[cfg(feature = "mob")]
+    Mob {
+        session_service: Arc<dyn meerkat_mob::MobSessionService>,
+        actor_witness: meerkat::LiveSessionActorWitness,
+        notification_sink: crate::router::NotificationSink,
+    },
+}
+
 fn gate_runtime_completion_outcome(
     outcome: meerkat_runtime::CompletionOutcome,
     cleanup_result: Result<Option<bool>, RuntimeCompletionCleanupFailure>,
@@ -1683,6 +1863,9 @@ pub struct SessionRuntime {
     staged_capacity_admissions: StagedCapacityAdmissions,
     runtime_pre_admissions: Arc<StdMutex<HashMap<SessionId, Vec<RuntimePreAdmissionEntry>>>>,
     runtime_registration_locks: Arc<StdMutex<HashMap<SessionId, Weak<Mutex<()>>>>>,
+    runtime_actor_witness_slots:
+        Arc<StdRwLock<HashMap<SessionId, meerkat::LiveSessionActorWitnessSlot>>>,
+    runtime_publication_handles: Arc<StdRwLock<HashMap<SessionId, RpcPublicationAttachment>>>,
     #[cfg(test)]
     pending_promotion_pre_turn_hook: Arc<StdMutex<Option<Arc<PendingPromotionPreTurnHook>>>>,
     #[cfg(test)]
@@ -1731,6 +1914,8 @@ pub struct SessionRuntime {
     skill_identity_user_root: Arc<StdRwLock<Option<PathBuf>>>,
     #[cfg(feature = "mob")]
     mob_state: Arc<StdRwLock<Option<Arc<meerkat_mob_mcp::MobMcpState>>>>,
+    #[cfg(feature = "mob")]
+    mob_actor_witnesses: RpcMobActorWitnesses,
     #[cfg(feature = "mcp")]
     mcp_sessions: Arc<RwLock<std::collections::HashMap<SessionId, SessionMcpState>>>,
     /// Channel for sending callback tool requests to the RPC server loop.
@@ -2533,6 +2718,8 @@ impl SessionRuntime {
             staged_capacity_admissions,
             runtime_pre_admissions: Arc::new(StdMutex::new(HashMap::new())),
             runtime_registration_locks: Arc::new(StdMutex::new(HashMap::new())),
+            runtime_actor_witness_slots: Arc::new(StdRwLock::new(HashMap::new())),
+            runtime_publication_handles: Arc::new(StdRwLock::new(HashMap::new())),
             #[cfg(test)]
             pending_promotion_pre_turn_hook: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -2559,6 +2746,8 @@ impl SessionRuntime {
             skill_identity_user_root,
             #[cfg(feature = "mob")]
             mob_state: Arc::new(StdRwLock::new(None)),
+            #[cfg(feature = "mob")]
+            mob_actor_witnesses: Arc::new(StdRwLock::new(HashMap::new())),
             #[cfg(feature = "mcp")]
             mcp_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             callback_request_tx: StdRwLock::new(None),
@@ -2683,6 +2872,8 @@ impl SessionRuntime {
             staged_capacity_admissions,
             runtime_pre_admissions: Arc::new(StdMutex::new(HashMap::new())),
             runtime_registration_locks: Arc::new(StdMutex::new(HashMap::new())),
+            runtime_actor_witness_slots: Arc::new(StdRwLock::new(HashMap::new())),
+            runtime_publication_handles: Arc::new(StdRwLock::new(HashMap::new())),
             #[cfg(test)]
             pending_promotion_pre_turn_hook: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -2709,6 +2900,8 @@ impl SessionRuntime {
             skill_identity_user_root,
             #[cfg(feature = "mob")]
             mob_state: Arc::new(StdRwLock::new(None)),
+            #[cfg(feature = "mob")]
+            mob_actor_witnesses: Arc::new(StdRwLock::new(HashMap::new())),
             #[cfg(feature = "mcp")]
             mcp_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             callback_request_tx: StdRwLock::new(None),
@@ -3620,10 +3813,12 @@ impl SessionRuntime {
     ) -> ServiceApplyRuntimeTurnResultReceiver {
         let comms_refresh = self.comms_context_refresh_callback(keep_alive);
         let pre_turn_hook = self.pending_promotion_pre_turn_hook_callback();
+        let publication_refresh = self.actor_publication_refresh_callback(&session_id);
         meerkat::session_runtime::staged_promotion::spawn_pending_create_and_apply_runtime_turn_with_admission_guard(
             Arc::clone(&self.service),
             Arc::clone(&self.staged_sessions),
             Arc::clone(&self.runtime_adapter),
+            publication_refresh,
             comms_refresh,
             pre_turn_hook,
             session_id,
@@ -3651,9 +3846,11 @@ impl SessionRuntime {
         keep_alive: bool,
     ) -> ServiceApplyRuntimeTurnResultReceiver {
         let comms_refresh = self.comms_context_refresh_callback(keep_alive);
+        let publication_refresh = self.actor_publication_refresh_callback(&session_id);
         meerkat::session_runtime::staged_promotion::spawn_recovered_create_and_apply_runtime_turn_with_admission_guard(
             Arc::clone(&self.service),
             Arc::clone(&self.runtime_adapter),
+            publication_refresh,
             comms_refresh,
             session_id,
             create_req,
@@ -3780,6 +3977,20 @@ impl SessionRuntime {
         self.service
             .interrupt_with_machine_authority(
                 session_id,
+                self.runtime_adapter.session_control_authority(),
+            )
+            .await
+    }
+
+    pub(crate) async fn interrupt_run_live_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        expected_run_id: &RunId,
+    ) -> Result<bool, SessionError> {
+        self.service
+            .interrupt_run_with_machine_authority(
+                session_id,
+                expected_run_id,
                 self.runtime_adapter.session_control_authority(),
             )
             .await
@@ -5390,6 +5601,9 @@ impl SessionRuntime {
             Arc::clone(&self.staged_sessions),
             Arc::clone(&self.runtime_adapter),
             Arc::clone(&self.mob_state),
+            Arc::clone(&self.mob_actor_witnesses),
+            Arc::clone(&self.runtime_actor_witness_slots),
+            Arc::clone(&self.runtime_publication_handles),
         ))
     }
 
@@ -5802,35 +6016,349 @@ impl SessionRuntime {
             .await
     }
 
-    async fn runtime_executor_for_session(
+    pub(crate) fn runtime_actor_witness_slot(
+        &self,
+        session_id: &SessionId,
+    ) -> meerkat::LiveSessionActorWitnessSlot {
+        self.runtime_actor_witness_slots
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.clone())
+            .or_default()
+            .clone()
+    }
+
+    fn replace_runtime_actor_witness_slot(
+        &self,
+        session_id: &SessionId,
+    ) -> meerkat::LiveSessionActorWitnessSlot {
+        let slot = meerkat::LiveSessionActorWitnessSlot::default();
+        self.runtime_actor_witness_slots
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.clone(), slot.clone());
+        slot
+    }
+
+    fn runtime_actor_witness(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat::LiveSessionActorWitness, RpcError> {
+        self.runtime_actor_witness_slots
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .and_then(meerkat::LiveSessionActorWitnessSlot::witness)
+            .filter(meerkat::LiveSessionActorWitness::is_live)
+            .ok_or_else(|| RpcError {
+                code: error::INTERNAL_ERROR,
+                message: format!(
+                    "session {session_id} has no captured live actor authority for runtime executor publication"
+                ),
+                data: None,
+            })
+    }
+
+    fn record_runtime_publication_handle(
+        &self,
+        witness: meerkat_runtime::RuntimeExecutorAttachmentWitness,
+        publication_handle: crate::session_executor::RpcRuntimePublicationHandle,
+        owner: RpcPublicationOwner,
+    ) {
+        #[cfg(feature = "mob")]
+        if matches!(&owner, RpcPublicationOwner::Persistent) {
+            self.mob_actor_witnesses
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(witness.session_id());
+        }
+        self.runtime_publication_handles
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                witness.session_id().clone(),
+                RpcPublicationAttachment {
+                    witness,
+                    publication_handle,
+                    owner,
+                },
+            );
+    }
+
+    fn publication_attachment_witness(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<meerkat_runtime::RuntimeExecutorAttachmentWitness> {
+        self.runtime_publication_handles
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .map(|attachment| attachment.witness.clone())
+    }
+
+    fn clear_publication_sidecars_if_current(
+        &self,
+        session_id: &SessionId,
+        expected_attachment: Option<&meerkat_runtime::RuntimeExecutorAttachmentWitness>,
+    ) -> bool {
+        clear_rpc_publication_sidecars_if_current(
+            session_id,
+            expected_attachment,
+            &self.runtime_publication_handles,
+            &self.runtime_actor_witness_slots,
+            #[cfg(feature = "mob")]
+            &self.mob_actor_witnesses,
+        )
+    }
+
+    fn runtime_publication_handle_for_attachment(
+        &self,
+        witness: &meerkat_runtime::RuntimeExecutorAttachmentWitness,
+    ) -> Result<crate::session_executor::RpcRuntimePublicationHandle, RpcError> {
+        let attachments = self
+            .runtime_publication_handles
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        attachments
+            .get(witness.session_id())
+            .filter(|attachment| attachment.witness == *witness)
+            .map(|attachment| attachment.publication_handle.clone())
+            .ok_or_else(|| RpcError {
+                code: error::INTERNAL_ERROR,
+                message: format!(
+                    "runtime attachment for session {} has no exact RPC publication authority",
+                    witness.session_id()
+                ),
+                data: None,
+            })
+    }
+
+    fn actor_publication_refresh_callback(
+        &self,
+        session_id: &SessionId,
+    ) -> meerkat::surface::AttachedActorPublicationRefreshFn {
+        let expected_session_id = session_id.clone();
+        let runtime_publication_handles = Arc::clone(&self.runtime_publication_handles);
+        let runtime_actor_witness_slots = Arc::clone(&self.runtime_actor_witness_slots);
+        let persistent_service = Arc::clone(&self.service);
+        #[cfg(feature = "mob")]
+        let mob_actor_witnesses = Arc::clone(&self.mob_actor_witnesses);
+
+        Arc::new(
+            move |attachment_witness, actor_witness, actor_witness_slot| {
+                if attachment_witness.session_id() != &expected_session_id
+                    || actor_witness.session_id() != &expected_session_id
+                    || !actor_witness.is_live()
+                {
+                    return Err(RuntimeDriverError::StaleAuthority {
+                        reason: format!(
+                            "RPC actor publication refresh for session {expected_session_id} received mismatched or stale exact authority"
+                        ),
+                    });
+                }
+
+                let (publication_handle, publication_owner) = {
+                    let attachments = runtime_publication_handles
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    attachments
+                        .get(&expected_session_id)
+                        .filter(|attachment| attachment.witness == *attachment_witness)
+                        .map(|attachment| {
+                            (
+                                attachment.publication_handle.clone(),
+                                attachment.owner.clone(),
+                            )
+                        })
+                        .ok_or_else(|| RuntimeDriverError::StaleAuthority {
+                            reason: format!(
+                                "RPC actor publication refresh for session {expected_session_id} does not own the prepared executor attachment and publication owner"
+                            ),
+                        })?
+                };
+
+                #[cfg(feature = "mob")]
+                let immutable_actor_handle = match &publication_owner {
+                    RpcPublicationOwner::Mob { session_service } => {
+                        crate::session_executor::mob_runtime_publication_handle_for_actor(
+                            Arc::clone(session_service),
+                            actor_witness.clone(),
+                        )
+                    }
+                    RpcPublicationOwner::Persistent => {
+                        meerkat::surface::persistent_runtime_publication_handle(
+                            Arc::clone(&persistent_service),
+                            actor_witness.clone(),
+                        )
+                    }
+                };
+                #[cfg(not(feature = "mob"))]
+                let immutable_actor_handle =
+                    meerkat::surface::persistent_runtime_publication_handle(
+                        Arc::clone(&persistent_service),
+                        actor_witness.clone(),
+                    );
+
+                // This callback runs while PreparedAttachedSessionActorRecovery
+                // still owns the exact attachment mutation fence. The exact map
+                // comparison above therefore cannot be invalidated by a pending
+                // successor factory before these local authorities advance to B.
+                publication_handle.replace(Arc::clone(&immutable_actor_handle));
+                runtime_actor_witness_slots
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(expected_session_id.clone(), actor_witness_slot);
+                #[cfg(feature = "mob")]
+                {
+                    let mut witnesses = mob_actor_witnesses
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match publication_owner {
+                        RpcPublicationOwner::Mob { .. } => {
+                            witnesses.insert(expected_session_id.clone(), actor_witness);
+                        }
+                        RpcPublicationOwner::Persistent => {
+                            witnesses.remove(&expected_session_id);
+                        }
+                    }
+                }
+                Ok(immutable_actor_handle)
+            },
+        )
+    }
+
+    fn session_runtime_executor_for_actor_slot(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        attachment_witness: meerkat_runtime::RuntimeExecutorAttachmentWitness,
+        actor_witness_slot: meerkat::LiveSessionActorWitnessSlot,
+    ) -> Box<dyn meerkat_core::lifecycle::CoreExecutor> {
+        let executor = crate::session_executor::SessionRuntimeExecutor::new_for_actor_slot(
+            Arc::clone(self),
+            session_id.clone(),
+            actor_witness_slot.clone(),
+        );
+        self.record_runtime_publication_handle(
+            attachment_witness,
+            executor.replaceable_publication_handle(),
+            RpcPublicationOwner::Persistent,
+        );
+        self.runtime_actor_witness_slots
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id, actor_witness_slot);
+        Box::new(executor)
+    }
+
+    #[cfg(feature = "mob")]
+    pub(crate) fn mob_actor_witness(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat::LiveSessionActorWitness, RpcError> {
+        self.mob_actor_witnesses
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .filter(|actor_witness| actor_witness.is_live())
+            .cloned()
+            .ok_or_else(|| RpcError {
+                code: error::INTERNAL_ERROR,
+                message: format!(
+                    "mob session {session_id} has no captured live actor authority for runtime executor publication"
+                ),
+                data: None,
+            })
+    }
+
+    async fn runtime_executor_actor_authority(
         self: &Arc<Self>,
         session_id: &SessionId,
-    ) -> Box<dyn meerkat_core::lifecycle::CoreExecutor> {
+    ) -> Result<RpcExecutorActorAuthority, RpcError> {
         #[cfg(feature = "mob")]
         {
             if let Some(mob_state) = self.mob_state().as_ref()
                 && (mob_state.owns_live_bridge_session(session_id).await
                     || mob_state.owns_persisted_bridge_session(session_id).await)
             {
+                let actor_witness = self.mob_actor_witness(session_id)?;
                 let sink = self
                     .notification_sink
                     .read()
                     .ok()
                     .map(|slot| slot.clone())
                     .unwrap_or_else(crate::router::NotificationSink::noop);
-                return Box::new(crate::session_executor::MobRpcRuntimeExecutor::new(
-                    mob_state.session_service(),
-                    Some(Arc::clone(self)),
-                    session_id.clone(),
-                    sink,
-                ));
+                return Ok(RpcExecutorActorAuthority::Mob {
+                    session_service: mob_state.session_service(),
+                    actor_witness,
+                    notification_sink: sink,
+                });
             }
         }
 
-        Box::new(crate::session_executor::SessionRuntimeExecutor::new(
-            Arc::clone(self),
-            session_id.clone(),
-        ))
+        match self.runtime_actor_witness(session_id) {
+            Ok(actor_witness) => Ok(RpcExecutorActorAuthority::PersistentWitness(actor_witness)),
+            Err(missing_authority) => {
+                let live_actor_exists = match self.service.has_live_session(session_id).await {
+                    Ok(exists) => exists,
+                    Err(SessionError::NotFound { .. }) => false,
+                    Err(error) => return Err(session_error_to_rpc(error)),
+                };
+                if live_actor_exists {
+                    return Err(missing_authority);
+                }
+                Ok(RpcExecutorActorAuthority::PersistentSlot(
+                    self.runtime_actor_witness_slot(session_id),
+                ))
+            }
+        }
+    }
+
+    fn runtime_executor_for_session(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        attachment_witness: meerkat_runtime::RuntimeExecutorAttachmentWitness,
+        actor_authority: RpcExecutorActorAuthority,
+    ) -> Box<dyn meerkat_core::lifecycle::CoreExecutor> {
+        debug_assert_eq!(attachment_witness.session_id(), &session_id);
+        match actor_authority {
+            RpcExecutorActorAuthority::PersistentWitness(actor_witness) => {
+                let executor = crate::session_executor::SessionRuntimeExecutor::new(
+                    Arc::clone(self),
+                    actor_witness,
+                );
+                self.record_runtime_publication_handle(
+                    attachment_witness,
+                    executor.replaceable_publication_handle(),
+                    RpcPublicationOwner::Persistent,
+                );
+                Box::new(executor)
+            }
+            RpcExecutorActorAuthority::PersistentSlot(actor_witness_slot) => self
+                .session_runtime_executor_for_actor_slot(
+                    session_id,
+                    attachment_witness,
+                    actor_witness_slot,
+                ),
+            #[cfg(feature = "mob")]
+            RpcExecutorActorAuthority::Mob {
+                session_service,
+                actor_witness,
+                notification_sink,
+            } => {
+                let executor = crate::session_executor::MobRpcRuntimeExecutor::new(
+                    Arc::clone(&session_service),
+                    Some(Arc::clone(self)),
+                    actor_witness,
+                    notification_sink,
+                );
+                self.record_runtime_publication_handle(
+                    attachment_witness,
+                    executor.replaceable_publication_handle(),
+                    RpcPublicationOwner::Mob { session_service },
+                );
+                Box::new(executor)
+            }
+        }
     }
 
     async fn ensure_runtime_executor_on_adapter(
@@ -5851,35 +6379,98 @@ impl SessionRuntime {
         // Check for a live executor (not just registration). Sessions
         // registered via `prepare_bindings()` exist in the adapter map but
         // have no RuntimeLoop — inputs would queue without being processed.
-        if !adapter
+        if adapter
             .session_has_executor(session_id)
             .await
             .map_err(runtime_driver_error_to_rpc)?
         {
-            let persisted_session = self.load_persisted_session(session_id).await?;
-            let persisted_session_exists = persisted_session.is_some();
-            let adapter_registration_exists = adapter.contains_session(session_id).await;
-            let live_session_exists = match self.service.has_live_session(session_id).await {
-                Ok(exists) => exists,
-                Err(SessionError::NotFound { .. }) => false,
-                Err(error) => return Err(session_error_to_rpc(error)),
-            };
-            let session_exists = adapter_registration_exists
-                || self.staged_sessions.contains(session_id).await
-                || live_session_exists
-                || persisted_session_exists;
-            if !session_exists {
-                return Err(RpcError {
-                    code: error::SESSION_NOT_FOUND,
-                    message: format!("session not found: {session_id}"),
-                    data: None,
-                });
-            }
-            let executor = self.runtime_executor_for_session(session_id).await;
-            adapter
-                .ensure_session_with_executor(session_id.clone(), executor)
+            return Ok(());
+        }
+
+        let persisted_session = self.load_persisted_session(session_id).await?;
+        let persisted_session_exists = persisted_session.is_some();
+        let adapter_registration_exists = adapter.contains_session(session_id).await;
+        let live_session_exists = match self.service.has_live_session(session_id).await {
+            Ok(exists) => exists,
+            Err(SessionError::NotFound { .. }) => false,
+            Err(error) => return Err(session_error_to_rpc(error)),
+        };
+        let session_exists = adapter_registration_exists
+            || self.staged_sessions.contains(session_id).await
+            || live_session_exists
+            || persisted_session_exists;
+        if !session_exists {
+            return Err(RpcError {
+                code: error::SESSION_NOT_FOUND,
+                message: format!("session not found: {session_id}"),
+                data: None,
+            });
+        }
+
+        // Actor witness consumption and attachment follow the canonical B -> M
+        // order. Holding B through pending commit prevents the selected actor
+        // incarnation from being revoked between sidecar capture and exact
+        // executor publication.
+        let _actor_attachment_boundary = self
+            .service
+            .acquire_runtime_turn_finalization_guard(session_id)
+            .await;
+        if adapter
+            .session_has_executor(session_id)
+            .await
+            .map_err(runtime_driver_error_to_rpc)?
+        {
+            let witness = adapter
+                .current_executor_attachment_witness(session_id)
                 .await
-                .map_err(runtime_driver_error_to_rpc)?;
+                .ok_or_else(|| RpcError {
+                    code: error::INTERNAL_ERROR,
+                    message: format!(
+                        "session {session_id} became serving without exact attachment authority"
+                    ),
+                    data: None,
+                })?;
+            self.runtime_publication_handle_for_attachment(&witness)?;
+            return Ok(());
+        }
+
+        let actor_authority = self.runtime_executor_actor_authority(session_id).await?;
+        let runtime = Arc::clone(self);
+        let executor_session_id = session_id.clone();
+        match adapter
+            .ensure_session_with_executor_factory_under_runtime_turn_finalization_boundary(
+                session_id.clone(),
+                move |witness| {
+                    runtime.runtime_executor_for_session(
+                        executor_session_id,
+                        witness,
+                        actor_authority,
+                    )
+                },
+            )
+            .await
+            .map_err(runtime_driver_error_to_rpc)?
+        {
+            meerkat_runtime::EnsureRuntimeExecutorAttachment::Pending(mut pending) => {
+                if let Err(commit_error) = pending
+                    .try_commit_with_under_runtime_turn_finalization_boundary(false, |_| Ok(()))
+                    .await
+                {
+                    let cleanup_error = pending
+                        .abort_under_runtime_turn_finalization_boundary()
+                        .await
+                        .err();
+                    return Err(runtime_driver_error_to_rpc(match cleanup_error {
+                        Some(cleanup_error) => RuntimeDriverError::Internal(format!(
+                            "{commit_error}; boundary-aware exact attachment cleanup also failed: {cleanup_error}"
+                        )),
+                        None => commit_error,
+                    }));
+                }
+            }
+            meerkat_runtime::EnsureRuntimeExecutorAttachment::Existing(witness) => {
+                self.runtime_publication_handle_for_attachment(&witness)?;
+            }
         }
         Ok(())
     }
@@ -5915,12 +6506,13 @@ impl SessionRuntime {
         {
             return Ok(());
         }
-        let executor = self.runtime_executor_for_session(session_id).await;
-        self.runtime_adapter
-            .ensure_session_with_executor(session_id.clone(), executor)
+        self.ensure_runtime_executor_on_adapter(&self.runtime_adapter, session_id)
             .await
-            .map_err(runtime_driver_error_to_session_error)?;
-        Ok(())
+            .map_err(|error| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    error.message,
+                ))
+            })
     }
 
     /// Start a turn by routing through the runtime input/completion waiter path.
@@ -8816,6 +9408,7 @@ impl SessionRuntime {
 
     /// Archive (remove) a session.
     pub async fn archive_session(&self, session_id: &SessionId) -> Result<(), RpcError> {
+        let expected_attachment = self.publication_attachment_witness(session_id);
         // Check pending sessions first.
         match self.staged_sessions.begin_archive(session_id).await {
             Ok(true) => {
@@ -8856,6 +9449,10 @@ impl SessionRuntime {
                 )
                 .await
                 .map_err(session_error_to_rpc)?;
+                self.clear_publication_sidecars_if_current(
+                    session_id,
+                    expected_attachment.as_ref(),
+                );
                 return Ok(());
             }
             Ok(false) => {}
@@ -8875,13 +9472,16 @@ impl SessionRuntime {
             }
         }
 
-        await_session_archive_with_runtime_cleanup(
+        let result = await_session_archive_with_runtime_cleanup(
             Arc::clone(&self.service),
             self.archive_runtime_cleanup(),
             session_id.clone(),
         )
-        .await
-        .map_err(session_error_to_rpc)
+        .await;
+        if result.is_ok() || matches!(&result, Err(SessionError::NotFound { .. })) {
+            self.clear_publication_sidecars_if_current(session_id, expected_attachment.as_ref());
+        }
+        result.map_err(session_error_to_rpc)
     }
 
     /// List all active sessions, optionally filtered by query parameters.
@@ -9378,6 +9978,30 @@ impl SessionRuntime {
 
         self.service
             .rewrite_session_transcript(session_id, req)
+            .await
+            .map_err(session_error_to_rpc)
+    }
+
+    /// Explicitly replace one durable keyed system prompt through the same
+    /// idle-session mutation authority as other transcript rewrites.
+    pub async fn update_system_prompt(
+        &self,
+        session_id: &SessionId,
+        req: SystemPromptUpdateRequest,
+    ) -> Result<SystemPromptUpdateResult, RpcError> {
+        if self.staged_sessions.contains(session_id).await {
+            return Err(RpcError {
+                code: error::SESSION_BUSY,
+                message: format!(
+                    "session {session_id} is not materialized; system prompt update is available only for idle materialized sessions"
+                ),
+                data: None,
+            });
+        }
+        self.reject_active_transcript_edit(session_id).await?;
+
+        self.service
+            .update_system_prompt(session_id, req)
             .await
             .map_err(session_error_to_rpc)
     }
@@ -11080,6 +11704,20 @@ mod tests {
     // Mock LLM client
     // -----------------------------------------------------------------------
 
+    fn provider_for_successful_rpc_test_model(model: &str) -> meerkat_core::Provider {
+        if model == "gemma-4-e2b" {
+            meerkat_core::Provider::SelfHosted
+        } else if model.starts_with("claude-") {
+            meerkat_core::Provider::Anthropic
+        } else if model.starts_with("gpt-") || model.starts_with("o1-") {
+            meerkat_core::Provider::OpenAI
+        } else if model.starts_with("gemini-") {
+            meerkat_core::Provider::Gemini
+        } else {
+            meerkat_core::Provider::Other
+        }
+    }
+
     struct MockLlmClient;
 
     #[async_trait]
@@ -11093,7 +11731,7 @@ mod tests {
 
         fn stream<'a>(
             &'a self,
-            _request: &'a meerkat_client::LlmRequest,
+            request: &'a meerkat_client::LlmRequest,
         ) -> Pin<
             Box<dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>> + Send + 'a>,
         > {
@@ -11101,6 +11739,13 @@ mod tests {
                 Ok(meerkat_client::LlmEvent::TextDelta {
                     delta: "Hello from mock".to_string(),
                     meta: None,
+                }),
+                Ok(meerkat_client::LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider_for_successful_rpc_test_model(&request.model),
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
                     outcome: meerkat_client::LlmDoneOutcome::Success {
@@ -11156,6 +11801,13 @@ mod tests {
                 Ok(meerkat_client::LlmEvent::TextDelta {
                     delta: "recorded".to_string(),
                     meta: None,
+                }),
+                Ok(meerkat_client::LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider_for_successful_rpc_test_model(&request.model),
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
                     outcome: meerkat_client::LlmDoneOutcome::Success {
@@ -11249,7 +11901,7 @@ mod tests {
 
         fn stream<'a>(
             &'a self,
-            _request: &'a meerkat_client::LlmRequest,
+            request: &'a meerkat_client::LlmRequest,
         ) -> Pin<
             Box<dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>> + Send + 'a>,
         > {
@@ -11259,6 +11911,13 @@ mod tests {
                 yield Ok(meerkat_client::LlmEvent::TextDelta {
                     delta: "Slow response".to_string(),
                     meta: None,
+                });
+                yield Ok(meerkat_client::LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider_for_successful_rpc_test_model(&request.model),
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
                 });
                 yield Ok(meerkat_client::LlmEvent::Done {
                     outcome: meerkat_client::LlmDoneOutcome::Success {
@@ -12248,7 +12907,7 @@ mod tests {
 
         fn stream<'a>(
             &'a self,
-            _request: &'a meerkat_client::LlmRequest,
+            request: &'a meerkat_client::LlmRequest,
         ) -> Pin<
             Box<dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>> + Send + 'a>,
         > {
@@ -12260,6 +12919,13 @@ mod tests {
                 yield Ok(meerkat_client::LlmEvent::TextDelta {
                     delta: "Blocked response".to_string(),
                     meta: None,
+                });
+                yield Ok(meerkat_client::LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider_for_successful_rpc_test_model(&request.model),
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
                 });
                 yield Ok(meerkat_client::LlmEvent::Done {
                     outcome: meerkat_client::LlmDoneOutcome::Success {
@@ -12294,7 +12960,7 @@ mod tests {
 
         fn stream<'a>(
             &'a self,
-            _request: &'a meerkat_client::LlmRequest,
+            request: &'a meerkat_client::LlmRequest,
         ) -> Pin<
             Box<dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>> + Send + 'a>,
         > {
@@ -12307,6 +12973,13 @@ mod tests {
                 yield Ok(meerkat_client::LlmEvent::TextDelta {
                     delta: "Slow response".to_string(),
                     meta: None,
+                });
+                yield Ok(meerkat_client::LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider_for_successful_rpc_test_model(&request.model),
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
                 });
                 yield Ok(meerkat_client::LlmEvent::Done {
                     outcome: meerkat_client::LlmDoneOutcome::Success {
@@ -12348,7 +13021,7 @@ mod tests {
 
         fn stream<'a>(
             &'a self,
-            _request: &'a meerkat_client::LlmRequest,
+            request: &'a meerkat_client::LlmRequest,
         ) -> Pin<
             Box<dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>> + Send + 'a>,
         > {
@@ -12358,6 +13031,13 @@ mod tests {
                     Ok(meerkat_client::LlmEvent::TextDelta {
                         delta: "first turn succeeds".to_string(),
                         meta: None,
+                    }),
+                    Ok(meerkat_client::LlmEvent::UsageUpdate {
+                        usage: meerkat_core::TurnUsage::host_declared(
+                            provider_for_successful_rpc_test_model(&request.model),
+                            &request.model,
+                            meerkat_core::Usage::default(),
+                        ),
                     }),
                     Ok(meerkat_client::LlmEvent::Done {
                         outcome: meerkat_client::LlmDoneOutcome::Success {
@@ -15293,8 +15973,13 @@ mod tests {
             .expect("content primitive metadata")
             .self_hosted_server_id = Some("other".to_string());
 
-        let mut executor =
-            crate::session_executor::SessionRuntimeExecutor::new(Arc::clone(&runtime), session_id);
+        let actor_witness = runtime
+            .runtime_actor_witness(&session_id)
+            .expect("materialized session must retain exact actor authority");
+        let mut executor = crate::session_executor::SessionRuntimeExecutor::new(
+            Arc::clone(&runtime),
+            actor_witness,
+        );
         let error = executor
             .apply(RunId::new(), primitive)
             .await
@@ -16768,9 +17453,10 @@ mod tests {
             .expect("archive should retain retired runtime registration for cleanup");
 
         let primitive = runtime_content_turn_primitive();
-        let mut executor = crate::session_executor::SessionRuntimeExecutor::new(
+        let mut executor = crate::session_executor::SessionRuntimeExecutor::new_for_actor_slot(
             Arc::clone(&runtime),
             archived_id.clone(),
+            meerkat::LiveSessionActorWitnessSlot::default(),
         );
         let rejected =
             meerkat_core::lifecycle::CoreExecutor::apply(&mut executor, RunId::new(), primitive)
@@ -17774,9 +18460,12 @@ mod tests {
             .stop_runtime_executor(&session_id, "successful RPC runtime stop")
             .await
             .expect("runtime stop should terminalize pending input");
+        let actor_witness = runtime
+            .runtime_actor_witness(&session_id)
+            .expect("materialized session must retain exact actor authority");
         let mut executor = crate::session_executor::SessionRuntimeExecutor::new(
             Arc::clone(&runtime),
-            session_id.clone(),
+            actor_witness,
         );
         meerkat_core::lifecycle::CoreExecutor::cleanup_after_runtime_stop_terminalized(
             &mut executor,
@@ -17867,9 +18556,12 @@ mod tests {
             .stop_runtime_executor(&session_id, "prepare external RPC cleanup")
             .await
             .expect("runtime stop should terminalize before external cleanup");
+        let actor_witness = runtime
+            .runtime_actor_witness(&session_id)
+            .expect("materialized session must retain exact actor authority");
         let mut executor = crate::session_executor::SessionRuntimeExecutor::new(
             Arc::clone(&runtime),
-            session_id.clone(),
+            actor_witness,
         );
         meerkat_core::lifecycle::CoreExecutor::cleanup_after_runtime_stop_terminalized(
             &mut executor,
@@ -18349,6 +19041,9 @@ mod tests {
                 Arc::clone(&runtime.staged_sessions),
                 Arc::clone(&runtime.runtime_adapter),
                 Arc::clone(&runtime.mob_state),
+                Arc::clone(&runtime.mob_actor_witnesses),
+                Arc::clone(&runtime.runtime_actor_witness_slots),
+                Arc::clone(&runtime.runtime_publication_handles),
             )
             .with_direct_create_after_ack_hook(Arc::clone(&hook)),
         );
@@ -19016,21 +19711,19 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let runtime = make_runtime(temp_factory(&temp), 1);
-
-        let session_id = runtime
-            .create_session(mock_build_config(), None, None, Vec::new())
+        let service = runtime.session_service();
+        let direct = service
+            .create_session(service_create_request(
+                mock_build_config(),
+                InitialTurnPolicy::Defer,
+            ))
             .await
-            .expect("create staged session");
-        let (event_tx, _event_rx) = mpsc::channel(100);
-        runtime
+            .expect("mob/direct deferred create must capture actor authority");
+        let session_id = direct.session_id;
+        service
             .start_turn(
                 &session_id,
-                "materialize before mob runtime executor apply".into(),
-                event_tx,
-                None,
-                None,
-                None,
-                None,
+                service_start_turn_request("materialize before mob runtime executor apply"),
             )
             .await
             .expect("materialize session");
@@ -19052,7 +19745,9 @@ mod tests {
         let mut executor = crate::session_executor::MobRpcRuntimeExecutor::new(
             runtime.session_service(),
             Some(Arc::clone(&runtime)),
-            session_id.clone(),
+            runtime
+                .mob_actor_witness(&session_id)
+                .expect("materialization must capture exact live actor authority"),
             crate::router::NotificationSink::noop(),
         );
         executor
@@ -19100,7 +19795,9 @@ mod tests {
         let mut executor = crate::session_executor::MobRpcRuntimeExecutor::new(
             runtime.session_service(),
             Some(Arc::clone(&runtime)),
-            direct.session_id.clone(),
+            runtime
+                .mob_actor_witness(&direct.session_id)
+                .expect("deferred materialization must capture exact live actor authority"),
             crate::router::NotificationSink::noop(),
         );
         executor
@@ -19151,7 +19848,9 @@ mod tests {
         let mut executor = crate::session_executor::MobRpcRuntimeExecutor::new(
             runtime.session_service(),
             Some(Arc::clone(&runtime)),
-            direct.session_id.clone(),
+            runtime
+                .mob_actor_witness(&direct.session_id)
+                .expect("promoted materialization must capture exact live actor authority"),
             crate::router::NotificationSink::noop(),
         );
         let output = executor
@@ -20796,6 +21495,622 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovered_actor_replaces_rpc_publication_authority_for_exact_attachment() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manifest, persistence) = meerkat::open_realm_persistence_in(
+            temp.path(),
+            "rpc-recovered-actor-publication",
+            Some(meerkat_store::RealmBackend::Jsonl),
+            None,
+        )
+        .await
+        .expect("open runtime and EventStore-backed persistence");
+        let runtime = Arc::new(SessionRuntime::new(
+            temp_factory(&temp),
+            Config::default(),
+            1,
+            persistence,
+            crate::router::NotificationSink::noop(),
+        ));
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .expect("create recoverable session");
+        let primitive_a = runtime_content_turn_primitive();
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        runtime
+            .apply_runtime_turn(
+                &session_id,
+                RunId::new(),
+                &primitive_a,
+                ContentInput::Text("materialize actor A".to_string()),
+                event_tx,
+                None,
+                None,
+            )
+            .await
+            .expect("materialize actor A through the attached RPC runtime executor");
+        let attachment_a = runtime
+            .runtime_adapter
+            .current_executor_attachment_witness(&session_id)
+            .await
+            .expect("actor A must retain an exact executor attachment");
+        let rpc_publication = runtime
+            .runtime_publication_handle_for_attachment(&attachment_a)
+            .expect("RPC sidecar must be bound to the exact attachment");
+        let actor_a_publication = rpc_publication.snapshot();
+        let actor_a_witness = runtime
+            .runtime_actor_witness(&session_id)
+            .expect("actor A witness must be captured");
+
+        let turn_boundary = runtime
+            .service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        runtime
+            .service
+            .discard_live_session_under_runtime_turn_boundary(&session_id)
+            .await
+            .expect("discard actor A while preserving its exact runtime attachment");
+        runtime
+            .service
+            .event_log_await_projection_drain(&session_id)
+            .await
+            .expect("actor A event projection must settle after the recovery cut");
+        assert!(
+            !actor_a_witness.is_live(),
+            "discard must revoke actor A before actor B materializes"
+        );
+        assert_eq!(
+            runtime
+                .runtime_adapter
+                .current_executor_attachment_witness(&session_id)
+                .await,
+            Some(attachment_a.clone()),
+            "actor-only recovery must preserve the serving attachment"
+        );
+
+        let stored = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load actor A committed session")
+            .expect("actor A committed session must remain available");
+        let recovered = runtime
+            .recovered_create_request(
+                &session_id,
+                stored,
+                SurfaceSessionRecoveryOverrides::default(),
+            )
+            .await
+            .expect("build actor B recovery request");
+        assert!(
+            recovered.runtime_was_registered,
+            "actor B recovery must preserve the existing runtime attachment"
+        );
+        let actor_b_seed = recovered
+            .request
+            .build
+            .as_ref()
+            .and_then(|build| build.resume_session.clone())
+            .expect("actor B recovery request must carry the exact session locator");
+        let admission = runtime
+            .service
+            .reserve_create_session_admission()
+            .await
+            .expect("reserve actor B service admission");
+        meerkat::surface::materialize_session_with_reserved_admission_under_runtime_turn_boundary_and_publication_refresh(
+            &runtime.service,
+            &runtime.runtime_adapter,
+            actor_b_seed,
+            recovered.request,
+            admission,
+            runtime.actor_publication_refresh_callback(&session_id),
+        )
+        .await
+        .expect("actor B must materialize under the unchanged attachment");
+        drop(turn_boundary);
+
+        assert_eq!(
+            runtime
+                .runtime_adapter
+                .current_executor_attachment_witness(&session_id)
+                .await,
+            Some(attachment_a),
+            "actor B recovery must not replace the runtime executor attachment"
+        );
+        let actor_b_publication = rpc_publication.snapshot();
+        assert!(
+            !Arc::ptr_eq(&actor_a_publication, &actor_b_publication),
+            "the executor-local publication authority must advance from A to B"
+        );
+        let actor_b_witness = runtime
+            .runtime_actor_witness(&session_id)
+            .expect("actor B witness must replace the revoked actor A witness");
+        assert!(actor_b_witness.is_live());
+
+        let terminal = AgentEvent::InteractionComplete {
+            interaction_id: meerkat_core::interaction::InteractionId(
+                meerkat_core::time_compat::new_uuid_v7(),
+            ),
+            result: "exact actor B publication".to_string(),
+            structured_output: None,
+        };
+        actor_a_publication
+            .publish_interaction_terminals(std::slice::from_ref(&terminal))
+            .await
+            .expect_err("revoked actor A publication must fail closed");
+        let receipts = actor_b_publication
+            .publish_interaction_terminals(std::slice::from_ref(&terminal))
+            .await
+            .expect("actor B publication must remain live");
+        assert_eq!(receipts.len(), 1);
+    }
+
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn mob_rpc_same_attachment_actor_recovery_advances_only_exact_publication_authority() {
+        use meerkat_core::lifecycle::core_executor::CoreExecutor;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (_manifest, persistence) = meerkat::open_realm_persistence_in(
+            temp.path(),
+            "rpc-mob-recovered-actor-publication",
+            Some(meerkat_store::RealmBackend::Jsonl),
+            None,
+        )
+        .await
+        .expect("open runtime and EventStore-backed persistence");
+        let runtime = Arc::new(SessionRuntime::new(
+            temp_factory(&temp),
+            Config::default(),
+            1,
+            persistence,
+            crate::router::NotificationSink::noop(),
+        ));
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        let service = runtime.session_service();
+        runtime.set_mob_state(Arc::new(meerkat_mob_mcp::MobMcpState::new(
+            Arc::clone(&service),
+            meerkat_mob::MobControlPrincipal::Owner,
+        )));
+
+        let created = service
+            .create_session(service_create_request(
+                mock_build_config(),
+                InitialTurnPolicy::Defer,
+            ))
+            .await
+            .expect("create Mob RPC actor A");
+        let session_id = created.session_id;
+        service
+            .start_turn(
+                &session_id,
+                service_start_turn_request("persist Mob RPC actor A"),
+            )
+            .await
+            .expect("persist Mob RPC actor A");
+        let actor_a_witness = runtime
+            .mob_actor_witness(&session_id)
+            .expect("Mob service must capture actor A authority");
+
+        let runtime_for_factory = Arc::clone(&runtime);
+        let service_for_factory = Arc::clone(&service);
+        let actor_a_for_factory = actor_a_witness.clone();
+        let attachment_a = match runtime
+            .runtime_adapter
+            .ensure_session_with_executor_factory(session_id.clone(), move |witness| {
+                let executor = crate::session_executor::MobRpcRuntimeExecutor::new(
+                    Arc::clone(&service_for_factory),
+                    Some(Arc::clone(&runtime_for_factory)),
+                    actor_a_for_factory,
+                    crate::router::NotificationSink::noop(),
+                );
+                runtime_for_factory.record_runtime_publication_handle(
+                    witness,
+                    executor.replaceable_publication_handle(),
+                    RpcPublicationOwner::Mob {
+                        session_service: Arc::clone(&service_for_factory),
+                    },
+                );
+                Box::new(executor) as Box<dyn CoreExecutor>
+            })
+            .await
+            .expect("prepare exact Mob RPC executor attachment")
+        {
+            meerkat_runtime::EnsureRuntimeExecutorAttachment::Pending(pending) => pending
+                .commit()
+                .await
+                .expect("commit exact Mob RPC executor attachment"),
+            meerkat_runtime::EnsureRuntimeExecutorAttachment::Existing(_) => {
+                panic!("direct Mob actor must begin without an executor attachment")
+            }
+        };
+        let rpc_publication = runtime
+            .runtime_publication_handle_for_attachment(&attachment_a)
+            .expect("Mob RPC publication cell must bind to attachment A");
+        let issued_actor_a = rpc_publication.snapshot();
+
+        let turn_boundary = runtime
+            .service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        runtime
+            .service
+            .discard_live_session_under_runtime_turn_boundary(&session_id)
+            .await
+            .expect("discard actor A while preserving the exact attachment");
+        assert!(!actor_a_witness.is_live(), "actor A must be revoked");
+
+        let stored = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load actor A committed session")
+            .expect("actor A committed session must remain available");
+        let recovered = runtime
+            .recovered_create_request(
+                &session_id,
+                stored,
+                SurfaceSessionRecoveryOverrides::default(),
+            )
+            .await
+            .expect("build actor B recovery request");
+        let actor_b_seed = recovered
+            .request
+            .build
+            .as_ref()
+            .and_then(|build| build.resume_session.clone())
+            .expect("actor B request must retain its exact session snapshot");
+        let admission = runtime
+            .service
+            .reserve_create_session_admission()
+            .await
+            .expect("reserve actor B admission");
+        meerkat::surface::materialize_session_with_reserved_admission_under_runtime_turn_boundary_and_publication_refresh(
+            &runtime.service,
+            &runtime.runtime_adapter,
+            actor_b_seed,
+            recovered.request,
+            admission,
+            runtime.actor_publication_refresh_callback(&session_id),
+        )
+        .await
+        .expect("recover Mob RPC actor B under attachment A");
+        drop(turn_boundary);
+
+        assert_eq!(
+            runtime
+                .runtime_adapter
+                .current_executor_attachment_witness(&session_id)
+                .await,
+            Some(attachment_a.clone()),
+            "actor recovery must preserve exact attachment A"
+        );
+        let actor_b_witness = runtime
+            .mob_actor_witness(&session_id)
+            .expect("Mob callback branch must publish actor B into the Mob sidecar");
+        assert!(actor_b_witness.is_live());
+        assert_ne!(actor_a_witness, actor_b_witness);
+        let issued_actor_b = rpc_publication.snapshot();
+        assert!(
+            !Arc::ptr_eq(&issued_actor_a, &issued_actor_b),
+            "executor-local authority must advance without mutating issued actor A"
+        );
+
+        let terminal = AgentEvent::InteractionComplete {
+            interaction_id: meerkat_core::interaction::InteractionId(
+                meerkat_core::time_compat::new_uuid_v7(),
+            ),
+            result: "exact Mob RPC actor B publication".to_string(),
+            structured_output: None,
+        };
+        issued_actor_a
+            .publish_interaction_terminals(std::slice::from_ref(&terminal))
+            .await
+            .expect_err("issued actor A capability must remain revoked");
+        issued_actor_b
+            .publish_interaction_terminals(std::slice::from_ref(&terminal))
+            .await
+            .expect("actor B capability must publish through Mob exact authority");
+
+        // Model a pending same-ID successor from a different exact machine
+        // generation. Even if its sidecar replaces the logical map index, a
+        // delayed callback carrying attachment A must not mutate its cell.
+        let successor_machine = Arc::new(MeerkatMachine::ephemeral());
+        let successor_cell_slot = Arc::new(StdMutex::new(None));
+        let successor_cell_for_factory = Arc::clone(&successor_cell_slot);
+        let runtime_for_successor = Arc::clone(&runtime);
+        let successor_session_id = session_id.clone();
+        let successor_attachment = match successor_machine
+            .ensure_session_with_executor_factory(session_id.clone(), move |_witness| {
+                let executor = crate::session_executor::SessionRuntimeExecutor::new_for_actor_slot(
+                    runtime_for_successor,
+                    successor_session_id,
+                    meerkat::LiveSessionActorWitnessSlot::default(),
+                );
+                *successor_cell_for_factory
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(executor.replaceable_publication_handle());
+                Box::new(executor) as Box<dyn CoreExecutor>
+            })
+            .await
+            .expect("prepare same-ID successor attachment")
+        {
+            meerkat_runtime::EnsureRuntimeExecutorAttachment::Pending(pending) => pending
+                .commit()
+                .await
+                .expect("commit same-ID successor attachment"),
+            meerkat_runtime::EnsureRuntimeExecutorAttachment::Existing(_) => {
+                panic!("separate machine must mint a distinct successor attachment")
+            }
+        };
+        let successor_cell = successor_cell_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("successor factory must publish its local cell");
+        let successor_before = successor_cell.snapshot();
+        runtime
+            .runtime_publication_handles
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                session_id.clone(),
+                RpcPublicationAttachment {
+                    witness: successor_attachment,
+                    publication_handle: successor_cell.clone(),
+                    owner: RpcPublicationOwner::Persistent,
+                },
+            );
+        let actor_b_slot = runtime.runtime_actor_witness_slot(&session_id);
+        let stale_refresh = runtime.actor_publication_refresh_callback(&session_id)(
+            &attachment_a,
+            actor_b_witness,
+            actor_b_slot,
+        );
+        assert!(
+            stale_refresh.is_err(),
+            "attachment A must not refresh a same-ID successor cell"
+        );
+        assert!(
+            Arc::ptr_eq(&successor_before, &successor_cell.snapshot()),
+            "stale predecessor callback must leave the successor authority untouched"
+        );
+
+        let input = meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+            "machine retained publication must use actor B",
+            None,
+        ));
+        runtime
+            .runtime_adapter
+            .accept_input_with_completion(&session_id, input)
+            .await
+            .expect("queue input under recovered actor B");
+        runtime
+            .runtime_adapter
+            .stop_runtime_executor(&session_id, "verify retained actor B publication")
+            .await
+            .expect("machine-retained publication handle must advance to actor B");
+    }
+
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn retired_mob_same_id_persistent_reuse_ignores_stale_mob_owner_state() {
+        use meerkat_core::lifecycle::core_executor::CoreExecutor;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (_manifest, persistence) = meerkat::open_realm_persistence_in(
+            temp.path(),
+            "rpc-retired-mob-persistent-reuse-publication",
+            Some(meerkat_store::RealmBackend::Jsonl),
+            None,
+        )
+        .await
+        .expect("open runtime and EventStore-backed persistence");
+        let runtime = Arc::new(SessionRuntime::new(
+            temp_factory(&temp),
+            Config::default(),
+            1,
+            persistence,
+            crate::router::NotificationSink::noop(),
+        ));
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        let mob_service = runtime.session_service();
+        runtime.set_mob_state(Arc::new(meerkat_mob_mcp::MobMcpState::new(
+            Arc::clone(&mob_service),
+            meerkat_mob::MobControlPrincipal::Owner,
+        )));
+
+        let created = mob_service
+            .create_session(service_create_request(
+                mock_build_config(),
+                InitialTurnPolicy::Defer,
+            ))
+            .await
+            .expect("create Mob-owned actor A");
+        let session_id = created.session_id;
+        mob_service
+            .start_turn(
+                &session_id,
+                service_start_turn_request("persist Mob-owned actor A"),
+            )
+            .await
+            .expect("persist Mob-owned actor A");
+        let actor_a_witness = runtime
+            .mob_actor_witness(&session_id)
+            .expect("Mob actor A authority must be captured");
+
+        let runtime_for_factory = Arc::clone(&runtime);
+        let mob_service_for_factory = Arc::clone(&mob_service);
+        let actor_a_for_factory = actor_a_witness.clone();
+        let attachment_a = match runtime
+            .runtime_adapter
+            .ensure_session_with_executor_factory(session_id.clone(), move |witness| {
+                let executor = crate::session_executor::MobRpcRuntimeExecutor::new(
+                    Arc::clone(&mob_service_for_factory),
+                    Some(Arc::clone(&runtime_for_factory)),
+                    actor_a_for_factory,
+                    crate::router::NotificationSink::noop(),
+                );
+                runtime_for_factory.record_runtime_publication_handle(
+                    witness,
+                    executor.replaceable_publication_handle(),
+                    RpcPublicationOwner::Mob {
+                        session_service: mob_service_for_factory,
+                    },
+                );
+                Box::new(executor) as Box<dyn CoreExecutor>
+            })
+            .await
+            .expect("prepare Mob-owned attachment A")
+        {
+            meerkat_runtime::EnsureRuntimeExecutorAttachment::Pending(pending) => pending
+                .commit()
+                .await
+                .expect("commit Mob-owned attachment A"),
+            meerkat_runtime::EnsureRuntimeExecutorAttachment::Existing(_) => {
+                panic!("Mob actor A must begin without an executor attachment")
+            }
+        };
+        assert!(matches!(
+            runtime
+                .runtime_publication_handles
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&session_id)
+                .map(|attachment| &attachment.owner),
+            Some(RpcPublicationOwner::Mob { .. })
+        ));
+
+        runtime
+            .runtime_adapter
+            .unregister_session(&session_id)
+            .await
+            .expect("retire exact Mob attachment A");
+        assert!(
+            runtime.clear_publication_sidecars_if_current(&session_id, Some(&attachment_a)),
+            "retirement cleanup must remove only attachment A's owner sidecars"
+        );
+        assert!(
+            !runtime
+                .mob_actor_witnesses
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&session_id),
+            "retirement cleanup must remove the logical Mob witness cache"
+        );
+        assert!(!actor_a_witness.is_live(), "retirement must revoke actor A");
+
+        let stored = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load retired actor A session")
+            .expect("retired actor A session must remain recoverable");
+        let recovered = runtime
+            .recovered_create_request(
+                &session_id,
+                stored,
+                SurfaceSessionRecoveryOverrides::default(),
+            )
+            .await
+            .expect("build ordinary persistent actor B recovery");
+        let actor_b_seed = recovered
+            .request
+            .build
+            .as_ref()
+            .and_then(|build| build.resume_session.clone())
+            .expect("persistent actor B recovery must carry the exact session snapshot");
+        let admission = runtime
+            .service
+            .reserve_create_session_admission()
+            .await
+            .expect("reserve persistent actor B admission");
+        let runtime_for_factory = Arc::clone(&runtime);
+        meerkat::surface::materialize_session_with_reserved_admission_and_actor_slot(
+            &runtime.service,
+            &runtime.runtime_adapter,
+            actor_b_seed,
+            recovered.request,
+            admission,
+            move |session_id, attachment_witness, actor_witness_slot| {
+                runtime_for_factory.session_runtime_executor_for_actor_slot(
+                    session_id,
+                    attachment_witness,
+                    actor_witness_slot,
+                )
+            },
+        )
+        .await
+        .expect("materialize same-ID ordinary persistent actor B");
+        let attachment_b = runtime
+            .runtime_adapter
+            .current_executor_attachment_witness(&session_id)
+            .await
+            .expect("persistent actor B must own an exact attachment");
+        assert_ne!(attachment_a, attachment_b);
+        assert!(matches!(
+            runtime
+                .runtime_publication_handles
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&session_id)
+                .filter(|attachment| attachment.witness == attachment_b)
+                .map(|attachment| &attachment.owner),
+            Some(RpcPublicationOwner::Persistent)
+        ));
+
+        // Recreate the historical leak after B is exact-bound. Refresh must
+        // still derive owner class only from attachment B's inseparable row,
+        // never from this logical SessionId cache.
+        runtime
+            .mob_actor_witnesses
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.clone(), actor_a_witness);
+        let actor_b_witness = runtime
+            .runtime_actor_witness(&session_id)
+            .expect("persistent actor B witness must be captured");
+        let actor_b_slot = runtime.runtime_actor_witness_slot(&session_id);
+        let persistent_b_handle = runtime.actor_publication_refresh_callback(&session_id)(
+            &attachment_b,
+            actor_b_witness,
+            actor_b_slot,
+        )
+        .expect("exact persistent attachment B must ignore stale logical Mob state");
+        assert!(
+            !runtime
+                .mob_actor_witnesses
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&session_id),
+            "persistent refresh must erase stale Mob owner state"
+        );
+        assert!(matches!(
+            runtime
+                .runtime_publication_handles
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&session_id)
+                .map(|attachment| &attachment.owner),
+            Some(RpcPublicationOwner::Persistent)
+        ));
+
+        let terminal = AgentEvent::InteractionComplete {
+            interaction_id: meerkat_core::interaction::InteractionId(
+                meerkat_core::time_compat::new_uuid_v7(),
+            ),
+            result: "same-ID persistent actor B publication".to_string(),
+            structured_output: None,
+        };
+        persistent_b_handle
+            .publish_interaction_terminals(std::slice::from_ref(&terminal))
+            .await
+            .expect("same-ID actor B must publish through persistent exact authority");
+    }
+
+    #[tokio::test]
     async fn recovered_staging_failure_unregisters_prepared_runtime_state() {
         let temp = tempfile::tempdir().unwrap();
         let runtime = make_runtime(temp_factory(&temp), 1);
@@ -21805,9 +23120,12 @@ mod tests {
                 .expect("query live recovered session before handoff cleanup"),
             "direct apply must retain the recovered live session until the exact executor is handed off"
         );
+        let actor_witness = runtime
+            .runtime_actor_witness(&session_id)
+            .expect("recovered session must retain exact actor authority");
         let mut executor = crate::session_executor::SessionRuntimeExecutor::new(
             Arc::clone(&runtime),
-            session_id.clone(),
+            actor_witness,
         );
         meerkat_core::lifecycle::CoreExecutor::cleanup_after_runtime_stop_terminalized(
             &mut executor,
@@ -24644,14 +25962,8 @@ mod tests {
 
         #[async_trait::async_trait]
         impl CommsRuntimeTrait for StubCommsRuntime {
-            async fn drain_messages(&self) -> Vec<String> {
-                Vec::new()
-            }
             fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
                 Arc::new(tokio::sync::Notify::new())
-            }
-            fn dismiss_received(&self) -> bool {
-                true
             }
         }
 

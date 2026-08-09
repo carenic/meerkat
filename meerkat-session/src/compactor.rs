@@ -6,7 +6,10 @@ use meerkat_core::compact::{
     COMPACTION_SUMMARY_PREFIX, CompactionConfig, CompactionContext, CompactionResult,
     CompactionSummary, Compactor,
 };
-use meerkat_core::types::{AssistantBlock, BlockAssistantMessage, ContentBlock, Message};
+use meerkat_core::types::{
+    AssistantBlock, BlockAssistantMessage, ContentBlock, Message,
+    materialize_latest_system_prompt_versions, superseded_system_prompt_offsets,
+};
 
 /// Summarization prompt sent to the LLM with the current history.
 const COMPACTION_PROMPT: &str = "\
@@ -300,8 +303,9 @@ impl Compactor for DefaultCompactor {
     }
 
     fn prepare_for_summarization(&self, messages: &[Message]) -> Vec<Message> {
+        let messages = materialize_latest_system_prompt_versions(messages);
         bound_summarization_projection(
-            project_messages_for_summarization(messages),
+            project_messages_for_summarization(&messages),
             self.summarization_source_budget_bytes(),
         )
     }
@@ -320,6 +324,7 @@ impl Compactor for DefaultCompactor {
         summary: &str,
         pressure: Option<meerkat_core::ProviderRequestPressure>,
     ) -> CompactionResult {
+        let superseded_system_prompts = superseded_system_prompt_offsets(messages);
         let mut rebuilt = Vec::new();
         let mut retained = Vec::new();
         let mut discarded = Vec::new();
@@ -379,7 +384,8 @@ impl Compactor for DefaultCompactor {
                 .iter()
                 .enumerate()
                 .filter(|(source_offset, message)| {
-                    matches!(message, Message::System(_)) || *source_offset >= candidate
+                    !superseded_system_prompts.contains(source_offset)
+                        && (matches!(message, Message::System(_)) || *source_offset >= candidate)
                 })
                 .try_fold(0usize, |total, (_, message)| {
                     serde_json::to_vec(message)
@@ -393,15 +399,17 @@ impl Compactor for DefaultCompactor {
             retain_turn_count -= 1;
         };
 
-        // System is an ordinary ordered event: retain every occurrence exactly.
-        // Insert the summary where the first discarded source row stood, so an
-        // arbitrary retained prefix (including any number of Systems) remains
-        // before it without granting row zero a singleton/config role.
+        // Unkeyed System rows and the latest version for each prompt key are
+        // ordinary ordered events and remain exact. Superseded keyed versions
+        // are historical rows: compaction discards them from the active body,
+        // while the typed rewrite graph keeps their prior revision reachable.
+        // Insert the summary where the first discarded source row stood.
         let first_discarded_source_offset = messages
             .iter()
             .enumerate()
             .find_map(|(source_offset, message)| {
-                (!matches!(message, Message::System(_)) && source_offset < retain_from)
+                (superseded_system_prompts.contains(&source_offset)
+                    || (!matches!(message, Message::System(_)) && source_offset < retain_from))
                     .then_some(source_offset)
             })
             .unwrap_or(messages.len());
@@ -414,7 +422,8 @@ impl Compactor for DefaultCompactor {
                 ));
                 rebuilt.push(summary_message.clone());
             }
-            let retain = matches!(message, Message::System(_)) || source_offset >= retain_from;
+            let retain = !superseded_system_prompts.contains(&source_offset)
+                && (matches!(message, Message::System(_)) || source_offset >= retain_from);
             if retain {
                 retained.push(meerkat_core::compact::CompactionRetained::new(
                     u64::try_from(source_offset).unwrap_or(u64::MAX),
@@ -456,7 +465,10 @@ impl Compactor for DefaultCompactor {
 mod tests {
     use super::*;
     use meerkat_core::BlobId;
-    use meerkat_core::types::{ImageData, SystemMessage, UserMessage, VideoData};
+    use meerkat_core::types::{
+        ImageData, SystemMessage, SystemPromptKey, SystemPromptVersion,
+        SystemPromptVersionIdentity, UserMessage, VideoData,
+    };
 
     fn make_config() -> CompactionConfig {
         CompactionConfig {
@@ -816,6 +828,46 @@ mod tests {
         ));
         assert_eq!(result.retained[0].source_offset, 0);
         assert_eq!(result.retained[0].rebuilt_offset, 0);
+    }
+
+    #[test]
+    fn compaction_selects_latest_versioned_system_prompt_and_discards_prior_versions() {
+        let c = DefaultCompactor::new(make_config());
+        let key = SystemPromptKey::new("primary").expect("prompt key");
+        let mut first = SystemMessage::new("version one");
+        first.prompt_version = Some(SystemPromptVersionIdentity {
+            key: key.clone(),
+            version: SystemPromptVersion::INITIAL,
+        });
+        let mut second = SystemMessage::new("version two");
+        second.prompt_version = Some(SystemPromptVersionIdentity {
+            key,
+            version: SystemPromptVersion::new(2).expect("version two"),
+        });
+        let messages = vec![
+            Message::System(first),
+            Message::System(second),
+            Message::User(UserMessage::text("old turn")),
+            Message::User(UserMessage::text("recent turn")),
+        ];
+
+        let summary_input = c.prepare_for_summarization(&messages);
+        assert!(summary_input.iter().all(
+            |message| !matches!(message, Message::System(system) if system.content == "version one")
+        ));
+        assert!(summary_input.iter().any(
+            |message| matches!(message, Message::System(system) if system.content == "version two")
+        ));
+
+        let result = c.rebuild_history(&messages, "summary");
+        assert!(result.discarded.iter().any(|discard| {
+            discard.source_offset == 0
+                && matches!(&discard.message, Message::System(system) if system.content == "version one")
+        }));
+        assert!(result.retained.iter().any(|retention| {
+            retention.source_offset == 1
+                && matches!(&retention.message, Message::System(system) if system.content == "version two")
+        }));
     }
 
     #[test]

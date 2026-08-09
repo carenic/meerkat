@@ -18,6 +18,18 @@ use meerkat_rpc::session_runtime::SessionRuntime;
 use meerkat_store::MemoryBlobStore;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+fn provider_for_successful_rpc_test_model(model: &str) -> meerkat_core::Provider {
+    if model.starts_with("claude-") {
+        meerkat_core::Provider::Anthropic
+    } else if model.starts_with("gpt-") || model.starts_with("o1-") {
+        meerkat_core::Provider::OpenAI
+    } else if model.starts_with("gemini-") {
+        meerkat_core::Provider::Gemini
+    } else {
+        meerkat_core::Provider::Other
+    }
+}
+
 struct MockLlmClient;
 
 #[async_trait]
@@ -39,6 +51,13 @@ impl LlmClient for MockLlmClient {
             Ok(meerkat_client::LlmEvent::TextDelta {
                 delta: format!("runtime-backed [{model}]"),
                 meta: None,
+            }),
+            Ok(meerkat_client::LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    provider_for_successful_rpc_test_model(&request.model),
+                    &request.model,
+                    meerkat_core::Usage::default(),
+                ),
             }),
             Ok(meerkat_client::LlmEvent::Done {
                 outcome: meerkat_client::LlmDoneOutcome::Success {

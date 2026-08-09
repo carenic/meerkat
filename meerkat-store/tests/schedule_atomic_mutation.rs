@@ -250,12 +250,25 @@ async fn sqlite_claim_due_canonical_phase_decides_within_the_column_prefilter()
     )?;
     drop(conn);
 
-    let claimed = store
-        .claim_due_occurrences(ClaimDueRequest {
-            owner_id: "sqlite-canonical-phase-test".to_string(),
-            limit: 1,
+    let executor_lease = match store
+        .acquire_executor_lease(meerkat_schedule::AcquireScheduleExecutorLeaseRequest {
+            owner_id: "sqlite-canonical-phase-executor".into(),
             lease_duration: Duration::minutes(5),
         })
+        .await?
+    {
+        meerkat_schedule::AcquireScheduleExecutorLeaseOutcome::Acquired(lease) => lease,
+        meerkat_schedule::AcquireScheduleExecutorLeaseOutcome::Busy { .. } => unreachable!(),
+    };
+    let claimed = store
+        .claim_due_occurrences(
+            &executor_lease,
+            ClaimDueRequest {
+                owner_id: "sqlite-canonical-phase-test".to_string(),
+                limit: 1,
+                lease_duration: Duration::minutes(5),
+            },
+        )
         .await?;
 
     assert!(

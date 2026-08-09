@@ -13,76 +13,186 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+## [0.8.22] - 2026-08-09
+
 ### Breaking
 
-- `IncrementalSessionStore` implementations must now implement
-  `cross_head_canonical_authority` and return the typed authority-crossing
-  result before HeadCanonical v1 data is used through the v2 write path.
-- `RuntimeSessionAuthorityOps` implementations must now provide one atomic
-  `load_session_resume_observation` over session authority, catalog state, and
-  the machine-lifecycle row.
-- Schedule stores now return trusted-backend transition commits from schedule
-  and occurrence mutations. Raw lifecycle-mutator destructors and
-  `ScheduleStore::append_receipt` have been removed, and claim, renewal,
-  mutation, and terminalization callers must consume the returned effects.
-- Removed the body-only Mob resume compatibility projection. Resume consumers
-  must retain and revalidate the owner-issued `SessionResumeVerdict` authority.
-- Removed `EphemeralRuntimeDriver::queue` and
-  `EphemeralRuntimeDriver::steer_queue`. Runtime lane membership and ordering
-  are now exposed only through the machine-owned `queue_lane` and
-  `steer_lane` views.
+- Provider usage is split into typed per-turn and cumulative carriers.
+  `LlmEvent::UsageUpdate`, `AgentEvent::TurnCompleted`, realtime completion,
+  compaction, budgeting, and assistant-block append paths now consume
+  `TurnUsage`; `AgentEvent::RunCompleted` consumes `CumulativeUsage`;
+  `Usage` gains `provider_accounting`; and `Session::record_usage` is replaced
+  by `record_turn_usage` plus `record_cumulative_usage`. Custom adapters must
+  emit matching provider/model accounting or the turn fails closed.
+- Turn-completion wire payloads now require normalized accounting through
+  `WireTurnUsage`, including provider, model, convention, aggregation
+  provenance, and presented-token total.
+- Durable peer delivery removes drain/pop compatibility authority.
+  `CommsRuntime` consumers must use `claim_classified_inbox_interaction` and
+  exact volatile handoff methods. `Inbox::new` becomes
+  `Inbox::new_transport_only`, `ClassifiedInboxInteraction` is removed, and
+  public sender bypasses and drain/receive authority methods are removed or
+  narrowed.
+- `PeerDeliveryOutcome::HandedOff` becomes `VolatileHandedOff`,
+  `DurablyResolved { outcome }` is added, every peer send receipt gains a
+  delivery disposition, and durable rejection or ambiguity are typed send
+  errors.
+- The supervisor bridge advances to protocol V5 for direct-member retirement.
+  `BindMember` installs and returns a host-minted exact incarnation fence, and
+  `RetireMember` must present that fence. A delayed command for an older
+  generation can no longer retire a same-endpoint successor. Persisted V4
+  peer-only mobs resume without mutating their authority, but direct-member
+  lifecycle operations fail closed with `SupervisorProtocolUpgradeRequired`
+  until the operator calls `MobHandle::rotate_supervisor`; that generated,
+  durable rotation crosses to a new V5 key and epoch before exact member-fence
+  adoption.
+- `CoreExecutorInterruptHandle::hard_cancel_current_run(reason) -> Result<()>`
+  becomes `hard_cancel_run_if_current(&RunId, reason) -> Result<bool>`, fencing
+  stale cancellation from successor runs.
+- System messages and generic System rewrite values gain optional
+  `prompt_version`. Keyed prompt versions may be minted only by explicit
+  update, and materialization or compaction suppresses superseded keyed rows.
+- `SessionForkResult` gains required `cache_inheritance`. Fork points that
+  split tool-use/result groups now reject instead of truncating.
+- `MobSessionService::prepare_session_for_resume` is removed. Persistent
+  create and materialization paths consume `SessionResumePreparationReceipt`,
+  and runtime executors bind an exact `LiveSessionActorWitness` or actor slot
+  instead of deriving publication authority from `SessionId`.
+- `PersistentRuntimeExecutor::{new,new_with_workgraph_service}` no longer
+  imply terminal-publication authority. Callers that publish terminals must
+  bind a service-minted actor witness or slot. Runtime archive publication
+  uses owned exact capabilities and deadline-aware convergence.
+- Custom HeadCanonical backends must implement store-wide
+  `IncrementalSessionStore::activate_head_canonical_store`; runtime stores must
+  implement `activate_head_canonical_runtime_authority`.
+- Schedule due claims require the exact `&ScheduleExecutorLease`; a host
+  without that lease is standby. `ScheduleTickReport` gains
+  `executor_authorized`.
+- WorkGraph enablement requires `WorkGraphNamespaceGrant`. Services reject
+  cross-namespace and `all_namespaces` access, and session/factory build
+  configuration gains exact grant fields.
+- WorkGraph public construction gains failed and cancelled child-join policy,
+  claim-expiry observation, durable event facts, complete goal item inputs,
+  and `WorkGraphEventKind::ReadinessObserved`. Recovery listing now requires
+  an exact namespace, and unsupported atomic operations fail closed.
+- WorkGraph claims accept exactly one relative or absolute lease. Relative
+  leases are capped, readiness includes deterministic blockers and child-join
+  policy, and expiry is released only by an observing mutation.
+- Known-degraded JSONL listing changes from warning-and-serve to typed
+  `SessionStoreError::ProjectionReadRefused` until canonical verification or
+  rebuild succeeds.
+- Provider cache behavior changes: OpenAI uses explicit stable prefix evidence
+  where supported; Anthropic caching is profile opt-in,
+  `AnthropicCacheControlPolicy` adds `SystemAndConversation`, and
+  `AnthropicProviderTag` gains `cache_ttl`.
+- Public WorkGraph bypass dispatch `handle_workgraph_tools_call` becomes
+  crate-private. Hosts must compose the declared capability dispatcher.
+- `PeerIngressRuntimeSnapshot::submission_queue_len` is removed. Consumers use
+  `queue.queue_depth()` plus claim and handoff counters.
+- `ProviderRequestPressure` gains lowered-request provenance,
+  `MobHelperResult`/`HelperResult` gains optional `bounded_result`, and the
+  associated public enums gain variants that exhaustive consumers must handle.
+
+### Added
+
+- Added explicit keyed system-prompt replacement for durable sessions with
+  monotonic versions, optimistic checks, duplicate detection, REST
+  `POST /sessions/{id}/system_prompt`, RPC `session/update_system_prompt`, and
+  Python and TypeScript wrappers. Boot, resume, generic append, rewrite, and
+  compaction cannot mint prompt versions.
+- Added real `MobHandle::fork_member`: an idle source forks to a new durable
+  session and member identity, validates blobs and complete tool groups before
+  commit, and provisions through ordinary resume. Provisioning failure leaves
+  the committed child recoverable.
+- Added typed provider-cache inheritance to durable fork results. `Available`
+  proves a byte-identical rendered prefix ending at a provider-authored
+  breakpoint; every unproved case reports typed `Unavailable`.
+- Added receiver-bounded helper projection with `{label,status,text}`,
+  UTF-8-safe byte limits, and explicit truncated status and marker.
+- Added opt-in cache authoring: OpenAI stable system/profile-prefix evidence
+  and Anthropic five-minute or one-hour TTL plus system-and-conversation
+  breakpoints, with no backend-global Anthropic economic default.
+- Added a store-owned, fenced Schedule executor lease with acquire, renew,
+  release, observation, firing-host status, and in-transaction claim
+  authorization.
+- Added typed WorkGraph `ItemReady`, `LeaseExpired`, and `NamespaceTerminal`
+  facts committed in the same mutation that observes them, plus attention
+  binding to an existing item.
+- Added read-only peer ingress observability for queue depth, outstanding claim
+  age, handoff and durable-admission counts, terminal outcomes, handover state,
+  and delivery correlation. These projections cannot authorize mutation.
+
+### Changed
+
+- Provider adapters emit one normalized per-turn total for tokens presented to
+  the model, with provider/model identity, convention, and aggregation
+  provenance. Turn and cumulative usage remain distinct, and budgeting never
+  interprets raw provider cache counters.
+- Crash-replayable schedule dispatch, detached-job delivery, runtime terminal
+  publication, and compaction projection persist typed effect intents with
+  their owning state commit and realize them idempotently. Non-replayable hooks
+  retain their narrower contracts.
+- WorkGraph is the shared-work ledger, not a scheduler. It owns deterministic
+  readiness, child-join policy, claims, namespace terminality, complete goal
+  inputs, and attention binding. Schedule alone owns timers, recurrence,
+  sweeps, latency bounds, and redrive; peer messages are wake acceleration,
+  not durable work authority.
 
 ### Fixed
 
-- Mob restore, revival, host materialization, and reconciliation now consume
-  one authority-bracketed resume verdict. A body, catalog row, lifecycle row,
-  or runtime generation cannot be independently reclassified or swapped
-  between configuration and actor creation.
-- Schedule lifecycle outputs are retained through the durable store commit and
-  validated by services and drivers. Missing lease, dispatch, terminal,
-  supersession, and revision effects now fail closed instead of degrading to a
-  unit result or precommit projection.
-- SQLite session stores provide a transactional HeadCanonical v1-to-v2
-  crossing with exact source CAS verification, physical replay verification,
-  retry classification, rollback, and schema-v4 migration.
-- Context-budget forecasts are provenance-labeled observations whose ceiling
-  comes only from `ModelProfileWitness`; they do not control dispatch or invent
-  a universal token constant. Provider context rejection still terminalizes as
-  typed `ContextExceeded`, so admitted input cannot disappear silently.
-- JSONL index failures after a canonical save or delete no longer turn a
-  committed durable write into an apparent failure. The projection is marked
-  degraded, reads warn, and the doctor reports restart-visible divergence.
-- Runtime input execution no longer maintains mutable physical queue copies
-  beside the generated `input_lane` authority. Authorized batches validate the
-  exact machine-owned prefix and hydrate payloads from the ledger; staging is
-  the sole lane-removal transition, so rollback, recovery, and task loss cannot
-  strand work in a diverged shell queue.
-- Runtime comms drains now admit one classified input at a time, preserving
-  the durable FIFO tail when a drain task is cancelled or replaced.
-- Mob-member rematerialization never replays system-prompt configuration as a
-  new System message, regardless of whether that configuration came from a
-  profile, persisted spawn material, or a resume caller. Callers that intend
-  new ordered System input must use the typed System-context admission API.
-- Audited transcript-history hydration and rewrite now accept a semantically
-  identical live prefix when adapter rematerialization changed only physical
-  row bookkeeping. Exact row lineage remains the fast path; the typed
-  content-addressed append path reanchors current row authority and still
-  rejects divergent semantic prefixes.
+- Durable peer ingress retains the exact FIFO head until an opaque runtime
+  terminal receipt commits it. Cancellation, actor replacement, restart, and
+  redelivery release or deduplicate the stable envelope/claim instead of
+  losing admitted input; volatile control traffic uses a separate handoff.
+- Context and compaction decisions carry normalized provider evidence and
+  lowered-request provenance. Forecasts remain observational, only exact
+  provider evidence may refuse before dispatch, and provider context errors
+  terminalize as typed `ContextExceeded`.
+- Persistent Mob resume carries one owner-issued committed-boundary preparation
+  receipt through one bracketed resume/materialization pipeline. The redundant
+  second recovery route is removed and parkable failures remain typed.
+- Externally injected HeadCanonical stores cross exactly once before
+  session-service construction. The facade consumes store-issued activation
+  authority and rejects missing, duplicate, or semantically drifting results.
+- Known-degraded JSONL reads refuse with typed `ProjectionReadRefused` when
+  canonical data could answer. A post-commit projection failure never rolls
+  back a canonical save or delete.
+- Exact actor-bound terminal publication now survives actor-only recovery,
+  rejects stale predecessors and unrelated successors, runs custom publication
+  outside machine and recovery locks, and retains durable retry authority
+  across callback failure, panic, deadline, and restart.
+- Runtime and Mob interruption are exact-run fenced, process-owned,
+  panic-safe, deduplicated, and caller-bounded. A late custom interrupt cannot
+  cancel a successor run.
+- Mob retirement publishes durable `Retiring` before external cleanup, keeps
+  one exact incarnation saga for retries, and returns typed retryable
+  in-progress results without laundering them to invalid-parameter or generic
+  transport errors.
+- Concurrent detached-job delivery acknowledgements now reload and reapply
+  generated-machine authority after exact CAS conflicts instead of leaking a
+  stale revision from an otherwise idempotent acknowledgement.
+- Named authority-erasing comms drain/receive APIs, redundant Mob resume
+  preparation, and misleading peer-authority constructors are removed.
 
 ### Known limitations
 
-- Peer-send `HandedOff` remains a volatile wake acknowledgement, not durable
-  delivery authority. Applications with consequential multi-hop routing must
-  retain the work decision in durable graph or application state and use peer
-  delivery only to reduce wake latency.
-- Exact predispatch context refusal requires an adapter-supplied exact token
-  count. Bundled adapters currently expose lowered-body evidence for
-  observation and rely on the provider's typed context rejection when no exact
-  synchronous count exists.
-
-Meerkat 0.8.21 should be paired with MobKit 0.8.15. The pair consumes the
-store-issued schedule and resume carriers directly and removes downstream
-reclassification of Meerkat lifecycle authority.
+- `VolatileHandedOff` proves exact FIFO handoff to a volatile consumer, not
+  durable runtime admission or completed work. Consequential work still
+  belongs in WorkGraph or application state.
+- Exact pre-dispatch context refusal requires adapter-supplied exact token
+  evidence. Bundled adapters expose lowered-body provenance and retain the
+  provider's typed context rejection when exact synchronous counting is
+  unavailable.
+- `MobHandle::fork_member` currently resolves the child profile, provider, and
+  model after durable commit, so it conservatively reports cache inheritance
+  unavailable instead of installing unproved evidence.
+- `spawn_helper` and `fork_helper` are non-blocking snapshot conveniences and
+  initially return no certified bounded result. Callers must await terminality
+  and call `bounded_terminal_member_result`.
+- Meerkat contains the Schedule lease contract, but removing MobKit's
+  process-local firing-host gate remains paired downstream release work.
+- The compatible MobKit release is not yet named. Do not retain the previous
+  Meerkat 0.8.21/MobKit 0.8.15 pairing for this release.
 
 ## [0.8.15] - 2026-08-03
 

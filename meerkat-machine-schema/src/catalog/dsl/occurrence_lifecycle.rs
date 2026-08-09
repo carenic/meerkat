@@ -365,14 +365,17 @@ machine! {
             self.late_completion_detail == None || self.late_completion_resolution != None
         }
 
-        disposition Claimed => external seam SurfaceResultAlignment,
-        disposition DispatchStarted => external seam SurfaceResultAlignment,
-        disposition DispatchAccepted => external seam SurfaceResultAlignment,
-        disposition AwaitingCompletion => external seam SurfaceResultAlignment,
-        disposition Completed => external seam SurfaceResultAlignment,
-        disposition Skipped => external seam SurfaceResultAlignment,
-        disposition Misfired => external seam SurfaceResultAlignment,
-        disposition Superseded => external seam SurfaceResultAlignment,
+        // These lifecycle effects align committed rows with typed results.
+        // Only DispatchStarted authorizes target-side I/O; the occurrence row
+        // plus stable delivery identity is its durable replay intent.
+        disposition Claimed => local seam SurfaceResultAlignment,
+        disposition DispatchStarted => external seam OwnerRealizationOnly,
+        disposition DispatchAccepted => local seam SurfaceResultAlignment,
+        disposition AwaitingCompletion => local seam SurfaceResultAlignment,
+        disposition Completed => local seam SurfaceResultAlignment,
+        disposition Skipped => local seam SurfaceResultAlignment,
+        disposition Misfired => local seam SurfaceResultAlignment,
+        disposition Superseded => local seam SurfaceResultAlignment,
         disposition OccurrencesSuperseded => routed [ScheduleLifecycleMachine] seam NoOwnerRealization,
         disposition DueNoAction => local seam NoOwnerRealization,
         disposition DueClaimEligible => local seam NoOwnerRealization,
@@ -381,8 +384,8 @@ machine! {
         disposition OccurrenceTerminalityClassified => local seam NoOwnerRealization,
         disposition ClaimedDispatchDispositionClassified => local seam NoOwnerRealization,
         disposition CompletionSupersessionClassified => local seam NoOwnerRealization,
-        disposition DeliveryFailed => external seam SurfaceResultAlignment,
-        disposition LeaseExpired => external seam SurfaceResultAlignment,
+        disposition DeliveryFailed => local seam SurfaceResultAlignment,
+        disposition LeaseExpired => local seam SurfaceResultAlignment,
         // Lease renewal acknowledgement: the renewing driver observes it via
         // the store seam's returned effects; no receipt is minted for it.
         disposition LeaseRenewed => local seam NoOwnerRealization,

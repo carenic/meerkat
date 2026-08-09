@@ -404,10 +404,15 @@ impl LlmClient for OpenAiRealtimeTextAdapter {
                     }
                     ServerEvent::ResponseDone { response, .. } => {
                         if let Some(usage) = response.usage.as_ref() {
-                            last_usage = Some(map_usage(usage));
+                            last_usage = Some(map_usage(usage, &request.model));
                         }
                         if let Some(usage) = last_usage.clone() {
-                            yield LlmEvent::UsageUpdate { usage };
+                            yield LlmEvent::UsageUpdate {
+                                usage: meerkat_core::TurnUsage::try_from_usage(usage)
+                                    .map_err(|error| LlmError::Unknown {
+                                        message: error.to_string(),
+                                    })?,
+                            };
                         }
                         yield LlmEvent::Done {
                             outcome: LlmDoneOutcome::Success { stop_reason },
@@ -595,7 +600,7 @@ fn build_tools(request: &LlmRequest) -> Vec<Tool> {
         .collect()
 }
 
-fn map_usage(u: &OaiUsage) -> Usage {
+fn map_usage(u: &OaiUsage, model: &str) -> Usage {
     let cache_read_tokens = u
         .input_token_details
         .as_ref()
@@ -607,6 +612,10 @@ fn map_usage(u: &OaiUsage) -> Usage {
         output_tokens: u64::from(u.output_tokens),
         cache_creation_tokens: None,
         cache_read_tokens,
+        provider_accounting: Some(meerkat_core::ProviderTokenAccounting::openai(
+            model,
+            u64::from(u.input_tokens),
+        )),
     }
 }
 
@@ -666,6 +675,11 @@ fn map_server_error(err: oai_rt_rs::error::ServerError) -> LlmError {
         ApiErrorType::InvalidRequestError => {
             if code == "model_not_found" {
                 LlmError::ModelNotFound { model: message }
+            } else if matches!(code, "context_length_exceeded" | "context_window_exceeded") {
+                LlmError::ContextLengthExceeded {
+                    max: 0,
+                    requested: 1,
+                }
             } else {
                 LlmError::InvalidRequest { message }
             }
@@ -1081,6 +1095,39 @@ mod tests {
         });
 
         assert!(matches!(mapped, LlmError::ModelNotFound { .. }));
+    }
+
+    #[test]
+    fn server_error_context_limit_uses_structured_code() {
+        for code in ["context_length_exceeded", "context_window_exceeded"] {
+            let mapped = map_server_error(oai_rt_rs::error::ServerError {
+                error_type: oai_rt_rs::error::ApiErrorType::InvalidRequestError,
+                code: Some(code.to_string()),
+                message: "the request exceeds the model context".to_string(),
+                param: None,
+                event_id: None,
+            });
+
+            assert!(matches!(mapped, LlmError::ContextLengthExceeded { .. }));
+        }
+    }
+
+    #[test]
+    fn server_error_context_words_without_structured_code_stay_invalid_request() {
+        let message = "free-form context_length_exceeded text is not provider evidence".to_string();
+        let mapped = map_server_error(oai_rt_rs::error::ServerError {
+            error_type: oai_rt_rs::error::ApiErrorType::InvalidRequestError,
+            code: Some("invalid_request_error".to_string()),
+            message: message.clone(),
+            param: None,
+            event_id: None,
+        });
+
+        assert!(matches!(
+            mapped,
+            LlmError::InvalidRequest { message: mapped_message }
+                if mapped_message == message
+        ));
     }
 
     #[test]

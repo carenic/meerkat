@@ -3502,13 +3502,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MobSessionService for BoundarySessionService {
-        async fn prepare_session_for_resume(
-            &self,
-            _session_id: &meerkat_core::SessionId,
-        ) -> Result<(), meerkat_core::service::SessionError> {
-            Ok(())
-        }
-
         async fn observe_session_resume_authority(
             &self,
             _session_id: &meerkat_core::SessionId,
@@ -3765,7 +3758,7 @@ mod tests {
             result: output.to_string(),
             structured_output: None,
             extraction_required: false,
-            usage: meerkat_core::types::Usage::default(),
+            usage: meerkat_core::types::Usage::default().into(),
             terminal_cause_kind: None,
         }
     }

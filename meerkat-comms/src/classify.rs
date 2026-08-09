@@ -900,7 +900,7 @@ mod tests {
         let namespace = format!("classify-{}", Uuid::new_v4().simple());
         let trusted = make_trusted_peers(&canonical_label, &sender_pubkey);
         let ctx = make_context_with_namespace(true, trusted, vec![], Some(namespace.clone()));
-        let (_, inbox_sender) = crate::Inbox::new();
+        let (_, inbox_sender) = crate::Inbox::new_transport_only();
         InprocRegistry::global().register_with_meta_in_namespace(
             &namespace,
             source_label.clone(),

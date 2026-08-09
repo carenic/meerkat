@@ -928,7 +928,7 @@ mod tests {
     use crate::peer_meta::PeerMeta;
 
     fn test_router() -> Router {
-        let (_inbox, inbox_sender) = Inbox::new();
+        let (_inbox, inbox_sender) = Inbox::new_transport_only();
         Router::new(
             Keypair::generate(),
             CommsConfig::default(),
@@ -1000,7 +1000,7 @@ mod tests {
 
         let router_kp = Keypair::generate();
         let router_pubkey = router_kp.public_key();
-        let (_inbox, inbox_sender) = Inbox::new();
+        let (_inbox, inbox_sender) = Inbox::new_transport_only();
         let router = Router::new(router_kp, CommsConfig::default(), inbox_sender, true);
 
         let peer_kp = Keypair::generate();
@@ -1151,7 +1151,7 @@ mod tests {
         );
 
         // Router is scoped to namespace "realm-a" and trusts the receiver.
-        let (_inbox, inbox_sender) = Inbox::new();
+        let (_inbox, inbox_sender) = Inbox::new_transport_only();
         let router = Router::new(
             Keypair::generate(),
             CommsConfig::default(),
@@ -1239,7 +1239,7 @@ mod tests {
         );
         let finalize_a = spawn_runtime_finalization(Arc::new(inbox_a), finalizer_a);
 
-        let (_inbox, inbox_sender) = Inbox::new();
+        let (_inbox, inbox_sender) = Inbox::new_transport_only();
         let router = Router::new(
             Keypair::generate(),
             CommsConfig::default(),
@@ -1466,7 +1466,7 @@ mod tests {
             PeerMeta::default(),
         );
 
-        let (_inbox, inbox_sender) = Inbox::new();
+        let (_inbox, inbox_sender) = Inbox::new_transport_only();
         let router = Router::new(
             Keypair::generate(),
             CommsConfig::default(),

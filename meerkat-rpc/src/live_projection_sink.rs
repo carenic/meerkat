@@ -737,7 +737,7 @@ impl LiveProjectionSink for SessionServiceProjectionSink {
         &self,
         session_id: &SessionId,
         stop_reason: StopReason,
-        usage: Usage,
+        usage: meerkat_core::TurnUsage,
         response_id: Option<&str>,
     ) -> Result<(), LiveProjectionError> {
         // CC2 architectural reconciliation: the realtime-staging pipeline is
@@ -794,28 +794,32 @@ impl LiveProjectionSink for SessionServiceProjectionSink {
         // realtime-staging materializer above, not here.
         //
         // Usage accounting: if the realtime materializer fired for this
-        // response, it has already recorded `usage` for the turn. Pass
-        // `Usage::default()` to the buffered drain so we do not
-        // double-count tokens in `Session::usage`. If the materializer
-        // was inert (no staged transcript for this response), the
-        // buffered path is the only commit seam, so we forward the real
-        // `usage`.
+        // response, it has already recorded `usage` for the turn. Pass typed
+        // zero usage to the buffered drain so we do not double-count tokens in
+        // `Session::usage`. If the materializer was inert (no staged
+        // transcript for this response), the buffered path is the only commit
+        // seam, so we forward the real `usage`.
         let pending = self.drain_pending_turn(session_id, response_id);
         let blocks = collapse_pending_blocks(pending.blocks);
         // If realtime fired and there is no buffered text either, the
         // materializer already produced the canonical assistant message;
         // skip the empty `append_external_assistant_output` call to avoid
         // a synthetic empty `BlockAssistant` and (more importantly) avoid
-        // re-recording usage. If realtime fired but text *did* arrive on
-        // the display-text lane, commit those blocks with `Usage::default`
-        // so the per-turn token accounting stays single-counted.
+        // re-recording usage. If realtime fired but text *did* arrive on the
+        // display-text lane, commit those blocks with typed zero usage so the
+        // per-turn token accounting stays single-counted.
         if realtime_materialized && blocks.is_empty() {
             return Ok(());
         }
         let usage_for_drain = if realtime_materialized {
-            Usage::default()
+            meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Other,
+                "realtime-usage-already-recorded",
+                Usage::default(),
+            )
+            .into_inner()
         } else {
-            usage
+            usage.into_inner()
         };
         self.runtime
             .append_external_assistant_output(session_id, blocks, stop_reason, usage_for_drain)
@@ -1166,7 +1170,7 @@ mod tests {
             &self,
             session_id: &SessionId,
             _stop_reason: StopReason,
-            _usage: Usage,
+            _usage: meerkat_core::TurnUsage,
             _response_id: Option<&str>,
         ) -> Result<(), LiveProjectionError> {
             self.completed.lock().unwrap().push(session_id.clone());
@@ -1588,7 +1592,7 @@ mod tests {
             &self,
             session_id: &SessionId,
             stop_reason: StopReason,
-            usage: Usage,
+            usage: meerkat_core::TurnUsage,
             response_id: Option<&str>,
         ) {
             self.signal_turn_completed_with_realtime(
@@ -1611,7 +1615,7 @@ mod tests {
             &self,
             session_id: &SessionId,
             stop_reason: StopReason,
-            usage: Usage,
+            usage: meerkat_core::TurnUsage,
             response_id: Option<&str>,
             realtime_materialized: bool,
         ) {
@@ -1639,9 +1643,14 @@ mod tests {
                 return;
             }
             let usage_for_drain = if realtime_materialized {
-                Usage::default()
+                meerkat_core::TurnUsage::host_declared(
+                    meerkat_core::Provider::Other,
+                    "realtime-usage-already-recorded",
+                    Usage::default(),
+                )
+                .into_inner()
             } else {
-                usage
+                usage.into_inner()
             };
             self.calls
                 .lock()
@@ -1687,13 +1696,16 @@ mod tests {
         Usage::default()
     }
 
-    fn real_usage() -> Usage {
-        Usage {
-            input_tokens: 17,
-            output_tokens: 23,
-            cache_creation_tokens: None,
-            cache_read_tokens: None,
-        }
+    fn real_usage() -> meerkat_core::TurnUsage {
+        meerkat_core::TurnUsage::host_declared(
+            meerkat_core::Provider::Other,
+            "live-projection-test",
+            Usage {
+                input_tokens: 17,
+                output_tokens: 23,
+                ..Usage::default()
+            },
+        )
     }
 
     #[test]
@@ -1756,7 +1768,7 @@ mod tests {
         }
         // The authoritative values flow through, not the sentinel.
         assert_eq!(*stop_reason, StopReason::EndTurn);
-        assert_eq!(*usage, real_usage());
+        assert_eq!(*usage, real_usage().into_inner());
         assert_ne!(
             *usage,
             sentinel_usage(),
@@ -2041,7 +2053,7 @@ mod tests {
                 }
                 // realtime_materialized=false in this fixture (the
                 // materializer is a stub and did not consume usage).
-                assert_eq!(*usage, real_usage());
+                assert_eq!(*usage, real_usage().into_inner());
             }
             other => panic!("expected ExternalAssistantOutput, got {other:?}"),
         }
@@ -2084,10 +2096,10 @@ mod tests {
     #[test]
     fn round4_cc2_realtime_materialized_with_text_drains_zero_usage() {
         // CC2: when the realtime-staging materializer fired AND the
-        // display-text buffer has fragments, both commits happen but
-        // the buffered drain forwards `Usage::default()` so per-turn
-        // token accounting stays single-counted (the materializer
-        // already recorded the authoritative usage).
+        // display-text buffer has fragments, both commits happen but the
+        // display-text drain forwards typed zero usage so per-turn token
+        // accounting stays single-counted (the materializer already recorded
+        // the authoritative usage).
         let sink = BufferingTestSink::new();
         let session_id = test_session_id();
 
@@ -2112,10 +2124,25 @@ mod tests {
             } => {
                 assert_eq!(blocks.len(), 1);
                 assert_eq!(*stop_reason, StopReason::EndTurn);
-                // The materializer already booked usage for this turn;
-                // the buffered drain MUST forward Usage::default() to
-                // avoid double-counting tokens in `Session::usage`.
-                assert_eq!(*usage, Usage::default());
+                // The materializer already booked usage for this turn. The
+                // display-text drain must carry zero counters to avoid
+                // double-counting, while retaining explicit typed evidence so
+                // the external-assistant seam remains fail-closed.
+                assert_eq!(usage.input_tokens, 0);
+                assert_eq!(usage.output_tokens, 0);
+                assert_eq!(usage.cache_creation_tokens, None);
+                assert_eq!(usage.cache_read_tokens, None);
+                let accounting = usage
+                    .provider_accounting
+                    .as_ref()
+                    .expect("display-only zero usage must retain typed accounting evidence");
+                assert_eq!(accounting.provider, meerkat_core::Provider::Other);
+                assert_eq!(accounting.model, "realtime-usage-already-recorded");
+                assert_eq!(accounting.presented_tokens, 0);
+                assert_eq!(
+                    accounting.convention,
+                    meerkat_core::PresentedTokenConvention::HostDeclaredInclusiveInputTotal
+                );
             }
             other => panic!("expected ExternalAssistantOutput, got {other:?}"),
         }

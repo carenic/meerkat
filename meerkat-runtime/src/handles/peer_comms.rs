@@ -716,10 +716,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl meerkat_core::agent::CommsRuntime for RejectingPeerCommsInstallTarget {
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
             Arc::clone(&self.notify)
         }

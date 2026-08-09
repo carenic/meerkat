@@ -32,6 +32,13 @@ pub enum WorkGraphError {
     InvalidTimestampMillis { field: &'static str, millis: i64 },
     #[error("work graph store error: {0}")]
     Store(String),
+    #[error(
+        "work graph backend '{backend}' contains pre-namespace rows in {tables:?}; store open requires an explicit default-namespace assignment"
+    )]
+    NamespaceAssignmentRequired {
+        backend: String,
+        tables: Vec<String>,
+    },
     #[error("work graph backend '{0}' does not support this operation")]
     UnsupportedBackend(String),
 }

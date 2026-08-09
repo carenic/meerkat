@@ -27,6 +27,17 @@ pub fn set_default_workgraph_tools(
         .unwrap_or_else(std::sync::PoisonError::into_inner) = default_workgraph_tools;
 }
 
+/// Pair a host-issued namespace grant with the default WorkGraph dispatcher.
+pub fn set_default_workgraph_namespace_grant(
+    builder: &FactoryAgentBuilder,
+    grant: Option<meerkat_core::service::WorkGraphNamespaceGrant>,
+) {
+    *builder
+        .default_workgraph_namespace_grant
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = grant;
+}
+
 /// Build an embedded/ephemeral session service with optional default scheduler tools.
 pub fn build_embedded_service(
     factory: AgentFactory,
@@ -67,7 +78,7 @@ mod tests {
     impl Default for CaptureToolClient {
         fn default() -> Self {
             Self {
-                inner: meerkat_client::TestClient::default(),
+                inner: meerkat_client::TestClient::for_provider(meerkat_core::Provider::Anthropic),
                 seen_tools: Mutex::new(Vec::new()),
             }
         }

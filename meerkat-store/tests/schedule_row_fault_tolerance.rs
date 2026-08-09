@@ -19,11 +19,11 @@
 use chrono::{Duration, TimeZone, Utc};
 use meerkat_core::{ContentInput, SessionId};
 use meerkat_schedule::{
-    ClaimDueRequest, CreateScheduleRequest, IntervalTriggerSpec, MisfirePolicy,
-    MissingTargetPolicy, Occurrence, OccurrenceOrdinal, OverlapPolicy, Schedule, ScheduleFilter,
-    ScheduleLifecycleInput, SchedulePhase, ScheduleService, ScheduleStore,
-    ScheduleStoreRowFaultKind, ScheduledSessionAction, SessionTargetBinding, TargetBinding,
-    TriggerSpec,
+    AcquireScheduleExecutorLeaseOutcome, AcquireScheduleExecutorLeaseRequest, ClaimDueRequest,
+    ClaimDueResult, CreateScheduleRequest, IntervalTriggerSpec, MisfirePolicy, MissingTargetPolicy,
+    Occurrence, OccurrenceOrdinal, OverlapPolicy, Schedule, ScheduleFilter, ScheduleLifecycleInput,
+    SchedulePhase, ScheduleService, ScheduleStore, ScheduleStoreRowFaultKind,
+    ScheduledSessionAction, SessionTargetBinding, TargetBinding, TriggerSpec,
 };
 use meerkat_store::SqliteScheduleStore;
 use rusqlite::{Connection, params};
@@ -121,6 +121,25 @@ fn claim_request() -> ClaimDueRequest {
     }
 }
 
+async fn claim_due(
+    store: &SqliteScheduleStore,
+    request: ClaimDueRequest,
+) -> Result<ClaimDueResult, meerkat_schedule::ScheduleStoreError> {
+    let lease = match store
+        .acquire_executor_lease(AcquireScheduleExecutorLeaseRequest {
+            owner_id: "row-fault-test-executor".into(),
+            lease_duration: Duration::minutes(5),
+        })
+        .await?
+    {
+        AcquireScheduleExecutorLeaseOutcome::Acquired(lease) => lease,
+        AcquireScheduleExecutorLeaseOutcome::Busy { .. } => unreachable!("single test executor"),
+    };
+    let result = store.claim_due_occurrences(&lease, request).await;
+    store.release_executor_lease(lease).await?;
+    result
+}
+
 #[tokio::test]
 async fn zero_limit_claim_is_a_true_noop() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -129,14 +148,16 @@ async fn zero_limit_claim_is_a_true_noop() {
     let schedule = commit_schedule(&store, "zero-limit").await;
     let occurrence = commit_due_occurrence(&store, &schedule).await;
 
-    let result = store
-        .claim_due_occurrences(ClaimDueRequest {
+    let result = claim_due(
+        &store,
+        ClaimDueRequest {
             owner_id: "must-not-own".to_string(),
             limit: 0,
             lease_duration: Duration::seconds(60),
-        })
-        .await
-        .expect("zero-limit claim");
+        },
+    )
+    .await
+    .expect("zero-limit claim");
     assert!(result.transitions.is_empty());
     assert!(result.row_faults.is_empty());
     let unchanged = store
@@ -147,8 +168,7 @@ async fn zero_limit_claim_is_a_true_noop() {
     assert_eq!(unchanged.attempt_count, 0);
     assert_eq!(unchanged.claimed_by, None);
 
-    let claimed = store
-        .claim_due_occurrences(claim_request())
+    let claimed = claim_due(&store, claim_request())
         .await
         .expect("later non-zero claim");
     assert_eq!(claimed.transitions.len(), 1);
@@ -203,15 +223,13 @@ async fn poisoned_front_page_cannot_permanently_starve_later_due_work() {
         limit: 1,
         lease_duration: Duration::seconds(60),
     };
-    let first = store
-        .claim_due_occurrences(request.clone())
+    let first = claim_due(&store, request.clone())
         .await
         .expect("first bounded scan");
     assert!(first.transitions.is_empty());
     assert_eq!(first.row_faults.len(), 64);
 
-    let second = store
-        .claim_due_occurrences(request)
+    let second = claim_due(&store, request)
         .await
         .expect("cursor-advanced scan");
     let healthy = healthy.expect("healthy tail occurrence");
@@ -244,8 +262,7 @@ async fn claim_scan_skips_poisoned_occurrence_row_and_claims_healthy_neighbor() 
         &poisoned.occurrence_id.to_string(),
     );
 
-    let result = store
-        .claim_due_occurrences(claim_request())
+    let result = claim_due(&store, claim_request())
         .await
         .expect("claim must not fail wholesale on a poisoned row");
     assert_eq!(
@@ -388,8 +405,7 @@ async fn claim_scan_skips_occurrences_of_a_poisoned_schedule_row() {
         &poisoned_schedule.schedule_id.to_string(),
     );
 
-    let result = store
-        .claim_due_occurrences(claim_request())
+    let result = claim_due(&store, claim_request())
         .await
         .expect("claim must not fail wholesale on a poisoned schedule row");
     assert_eq!(
@@ -432,8 +448,7 @@ async fn claim_scan_never_deserializes_terminal_rows() {
     let healthy_schedule = commit_schedule(&store, "healthy").await;
     let healthy = commit_due_occurrence(&store, &healthy_schedule).await;
 
-    let result = store
-        .claim_due_occurrences(claim_request())
+    let result = claim_due(&store, claim_request())
         .await
         .expect("claim over terminal poison must succeed");
     assert_eq!(
@@ -482,8 +497,7 @@ async fn claim_scan_never_deserializes_rows_of_non_active_schedules() {
     let healthy_schedule = commit_schedule(&store, "healthy").await;
     let healthy = commit_due_occurrence(&store, &healthy_schedule).await;
 
-    let result = store
-        .claim_due_occurrences(claim_request())
+    let result = claim_due(&store, claim_request())
         .await
         .expect("claim over a non-active poisoned schedule row must succeed");
     assert_eq!(
@@ -539,8 +553,7 @@ async fn claim_misfire_store_write_failure_aborts_the_whole_claim() {
         .expect("install failing trigger");
     }
 
-    let error = store
-        .claim_due_occurrences(claim_request())
+    let error = claim_due(&store, claim_request())
         .await
         .expect_err("a store write failure must abort the claim wholesale");
     assert!(

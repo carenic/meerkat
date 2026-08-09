@@ -1429,6 +1429,8 @@ describe("WorkGraph parsers", () => {
     title: "Prep A for non-preferred dentist car",
     status: "in_progress",
     priority: "high",
+    failed_child_join_policy: "require_success",
+    cancelled_child_join_policy: "require_success",
     completion_policy: { kind: "host_confirmed" },
     labels: ["autism-support", "dentist"],
     owner: {
@@ -2970,6 +2972,8 @@ describe("Parity wrappers", () => {
       title: "Prep A for non-preferred dentist car",
       status: "open",
       priority: "high",
+      failed_child_join_policy: "require_success",
+      cancelled_child_join_policy: "require_success",
       completion_policy: { kind: "self_attest" },
       labels: ["autism-support", "dentist"],
       machine_state: { lifecycle_phase: "open", revision: 1 },
@@ -5030,6 +5034,38 @@ describe("Member-send handling-mode parse boundary (row 357)", () => {
   });
 });
 
+function forkCacheAvailable() {
+  return {
+    status: "available",
+    fork_point: {
+      message_count: 4,
+      authored_cache_breakpoint: {
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        boundary: { kind: "transcript_after", message_count: 4 },
+        canonical_prefix_sha256: "sha256:canonical",
+        canonical_prefix_bytes: 512,
+        rendered_prefix_sha256: "sha256:rendered",
+        rendered_prefix_bytes: 480,
+        lowered_request_provenance: {
+          provider: "openai",
+          encoding: "open_ai_responses_json",
+          body_sha256: Array(32).fill(7),
+        },
+        ttl: "provider_default",
+      },
+    },
+  };
+}
+
+function forkCacheUnavailable(messageCount = 1) {
+  return {
+    status: "unavailable",
+    message_count: messageCount,
+    reason: "no_authored_breakpoint_at_boundary",
+  };
+}
+
 describe("Session fork result parse boundary (row 88)", () => {
   it("serializes fork-only tool policy on both fork request shapes", async () => {
     const client = new MeerkatClient();
@@ -5040,6 +5076,7 @@ describe("Session fork result parse boundary (row 88)", () => {
         source_session_id: "src-1",
         session_id: "fork-1",
         message_count: 1,
+        cache_inheritance: forkCacheUnavailable(),
       };
     };
     const options = {
@@ -5077,12 +5114,71 @@ describe("Session fork result parse boundary (row 88)", () => {
       session_id: "fork-1",
       session_ref: "ref-1",
       message_count: 4,
+      cache_inheritance: forkCacheAvailable(),
     });
     assert.equal(result.sourceSessionId, "src-1");
     assert.equal(result.sessionId, "fork-1");
     assert.equal(result.sessionRef, "ref-1");
     assert.equal(result.messageCount, 4);
+    assert.equal(result.cacheInheritance.status, "available");
+    assert.equal(result.cacheInheritance.forkPoint.messageCount, 4);
+    assert.equal(
+      result.cacheInheritance.forkPoint.authoredCacheBreakpoint.boundary.kind,
+      "transcript_after",
+    );
   });
+
+  it("parses an unavailable cache inheritance result", () => {
+    const result = MeerkatClient.parseSessionForkResult({
+      source_session_id: "src-1",
+      session_id: "fork-1",
+      message_count: 3,
+      cache_inheritance: {
+        status: "unavailable",
+        message_count: 3,
+        reason: "provider_model_mismatch",
+      },
+    });
+    assert.deepEqual(result.cacheInheritance, {
+      status: "unavailable",
+      messageCount: 3,
+      reason: "provider_model_mismatch",
+    });
+  });
+
+  it("throws INVALID_RESPONSE when cache_inheritance is missing", () => {
+    assert.throws(
+      () =>
+        MeerkatClient.parseSessionForkResult({
+          source_session_id: "src-1",
+          session_id: "fork-1",
+          message_count: 3,
+        }),
+      (error) => error instanceof MeerkatError && error.code === "INVALID_RESPONSE",
+    );
+  });
+
+  for (const cacheInheritance of [
+    null,
+    [],
+    "available",
+    { status: "unknown" },
+    { status: "available", fork_point: {} },
+    { status: "unavailable", message_count: 3, reason: "unknown" },
+  ]) {
+    it(`throws INVALID_RESPONSE for malformed cache_inheritance ${JSON.stringify(cacheInheritance)}`, () => {
+      assert.throws(
+        () =>
+          MeerkatClient.parseSessionForkResult({
+            source_session_id: "src-1",
+            session_id: "fork-1",
+            message_count: 3,
+            cache_inheritance: cacheInheritance,
+          }),
+        (error) => error instanceof MeerkatError && error.code === "INVALID_RESPONSE",
+      );
+    });
+  }
 
   it("throws INVALID_RESPONSE when session_id is missing instead of fabricating an empty handle", () => {
     assert.throws(

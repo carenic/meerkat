@@ -835,6 +835,7 @@ export interface ScheduleToolsResult {
 }
 
 export interface SessionForkResult {
+  cache_inheritance: Record<string, unknown>;
   message_count: number;
   session_id: string;
   session_ref?: string | null;
@@ -850,12 +851,32 @@ export interface SessionPeerResponseTerminalParams {
   status: "completed" | "failed" | "cancelled";
 }
 
+export interface SystemPromptUpdateResult {
+  commit?: Record<string, unknown> | null;
+  key: SystemPromptKey;
+  message_index: number;
+  session_id: string;
+  status: "applied" | "duplicate";
+  transcript_revision: string;
+  version: SystemPromptVersion;
+}
+
 export interface SessionTranscriptRewriteResult {
   commit: Record<string, unknown>;
   message_count: number;
   parent_revision: string;
   revision: string;
   session_id: string;
+}
+
+export interface UpdateSystemPromptParams {
+  actor?: string | null;
+  content: string;
+  expected_parent_revision?: string | null;
+  expected_version?: SystemPromptVersion | null;
+  key: SystemPromptKey;
+  session_id: string;
+  target_message_index?: number | null;
 }
 
 export interface WireProvisionApiKeyResult {
@@ -1575,6 +1596,7 @@ export interface MobForkHelperParams {
 
 export interface MobHelperResult {
   agent_identity: string;
+  bounded_result?: Record<string, unknown> | null;
   member_ref: WireMemberRef;
   output?: string | null;
   tokens_used: number;
@@ -2214,6 +2236,7 @@ export interface WorkGraphSnapshotFilter {
 }
 
 export interface WorkItem {
+  cancelled_child_join_policy: "require_success" | "propagate" | "accept";
   claim?: WorkItemClaim | null;
   completion_policy: WorkCompletionPolicy;
   created_at: string;
@@ -2221,6 +2244,7 @@ export interface WorkItem {
   due_at?: string | null;
   evidence_refs?: WorkEvidenceRef[];
   external_refs?: WorkItemExternalRef[];
+  failed_child_join_policy: "require_success" | "propagate" | "accept";
   id: string;
   labels?: string[];
   machine_state: Record<string, unknown>;
@@ -2274,6 +2298,7 @@ export interface WorkEvidenceRef {
 
 export interface WorkGraphEvent {
   at: string;
+  facts?: unknown[];
   item_id?: string | null;
   kind: WorkGraphEventKind;
   namespace: string;
@@ -2289,6 +2314,7 @@ export interface WorkOwnerKey {
 
 export interface WorkItemClaim {
   claimed_at: string;
+  expiry_observed_at?: string | null;
   lease_expires_at?: string | null;
   owner: WorkItemOwner;
 }
@@ -3110,7 +3136,7 @@ export type WorkEdgeKind = "blocks" | "parent" | "related" | "supersedes" | "der
 
 export type WorkEvidenceKind = "host_confirmation" | "principal_confirmation" | "supervisor_confirmation" | "reviewer_confirmation" | "self_attest";
 
-export type WorkGraphEventKind = "created" | "updated" | "claimed" | "released" | "blocked" | "closed" | "linked" | "evidence_added" | "attention_created" | "attention_updated" | "execution_bound" | "execution_transitioned";
+export type WorkGraphEventKind = "created" | "updated" | "readiness_observed" | "claimed" | "released" | "blocked" | "closed" | "linked" | "evidence_added" | "attention_created" | "attention_updated" | "execution_bound" | "execution_transitioned";
 
 export type WorkOwnerKind = "principal" | "agent" | "session" | "mob" | "label";
 
@@ -3122,7 +3148,7 @@ export type WorkGraphStatus = typeof WORK_GRAPH_STATUSES[number];
 export const WORK_GRAPH_PRIORITIES = ["low", "medium", "high"] as const;
 export type WorkGraphPriority = typeof WORK_GRAPH_PRIORITIES[number];
 
-export const WORK_GRAPH_EVENT_KINDS = ["created", "updated", "claimed", "released", "blocked", "closed", "linked", "evidence_added", "attention_created", "attention_updated", "execution_bound", "execution_transitioned"] as const;
+export const WORK_GRAPH_EVENT_KINDS = ["created", "updated", "readiness_observed", "claimed", "released", "blocked", "closed", "linked", "evidence_added", "attention_created", "attention_updated", "execution_bound", "execution_transitioned"] as const;
 
 export type McpLiveOperation = "add" | "remove" | "reload";
 
@@ -4001,17 +4027,19 @@ export interface CommsSendResultInputAccepted {
 }
 
 export interface CommsSendResultPeerMessageSent {
-  delivery: "acked" | "handed_off" | "queued";
+  delivery: { durably_resolved: Record<string, unknown> } | "acked" | "volatile_handed_off" | "queued";
   envelope_id: string;
   kind: "peer_message_sent";
 }
 
 export interface CommsSendResultPeerLifecycleSent {
+  delivery: { durably_resolved: Record<string, unknown> } | "acked" | "volatile_handed_off" | "queued";
   envelope_id: string;
   kind: "peer_lifecycle_sent";
 }
 
 export interface CommsSendResultPeerRequestSent {
+  delivery: { durably_resolved: Record<string, unknown> } | "acked" | "volatile_handed_off" | "queued";
   envelope_id: string;
   interaction_id: string;
   kind: "peer_request_sent";
@@ -4020,6 +4048,7 @@ export interface CommsSendResultPeerRequestSent {
 }
 
 export interface CommsSendResultPeerResponseSent {
+  delivery: { durably_resolved: Record<string, unknown> } | "acked" | "volatile_handed_off" | "queued";
   envelope_id: string;
   in_reply_to: string;
   kind: "peer_response_sent";
@@ -5282,6 +5311,15 @@ export type SystemNoticeBlock = SystemNoticeBlockComms | SystemNoticeBlockExtern
 
 export type SystemNoticeKind = "generic" | "comms" | "external_event" | "mcp_pending" | "mcp" | "background_job" | "tool_scope" | "tool_scope_warning" | "auth_reauth_required";
 
+export type SystemPromptKey = string;
+
+export type SystemPromptVersion = number;
+
+export interface SystemPromptVersionIdentity {
+  key: SystemPromptKey;
+  version: SystemPromptVersion;
+}
+
 export type TranscriptUserRole = "conversational" | "compaction_summary" | "injected_context";
 
 export type AssistantImageId = string;
@@ -5372,6 +5410,7 @@ export type WireServerToolKind = WireServerToolKindWebSearch | WireServerToolKin
 export interface TranscriptRewriteMessageSystem {
   content: string;
   created_at?: string | null;
+  prompt_version?: SystemPromptVersionIdentity | null;
   role: "system";
 }
 
@@ -5487,6 +5526,7 @@ export interface WireSessionMessageSystem {
   content: string;
   created_at: string;
   identity?: Record<string, unknown> | null;
+  prompt_version?: SystemPromptVersionIdentity | null;
   role: "system";
 }
 
@@ -5530,6 +5570,7 @@ export type WireHistoryRow = WireSessionMessage;
 export function parseWorkItem(value: unknown): WorkItem {
   const data = expectWireObject(value, "WorkItem");
   return {
+    cancelled_child_join_policy: expectWireEnum(requireWireField(data, "cancelled_child_join_policy", "WorkItem"), ["require_success", "propagate", "accept"], "WorkItem.cancelled_child_join_policy") as "require_success" | "propagate" | "accept",
     ...(data["claim"] === undefined || data["claim"] === null ? {} : { claim: parseWorkItemClaim(data["claim"]) }),
     completion_policy: parseWorkCompletionPolicy(requireWireField(data, "completion_policy", "WorkItem")),
     created_at: expectWireString(requireWireField(data, "created_at", "WorkItem"), "WorkItem.created_at"),
@@ -5537,6 +5578,7 @@ export function parseWorkItem(value: unknown): WorkItem {
     ...(data["due_at"] === undefined || data["due_at"] === null ? {} : { due_at: expectWireString(data["due_at"], "WorkItem.due_at") }),
     ...(data["evidence_refs"] === undefined || data["evidence_refs"] === null ? {} : { evidence_refs: expectWireArray(data["evidence_refs"], "WorkItem.evidence_refs").map((entry) => parseWorkEvidenceRef(entry)) }),
     ...(data["external_refs"] === undefined || data["external_refs"] === null ? {} : { external_refs: expectWireArray(data["external_refs"], "WorkItem.external_refs").map((entry) => parseWorkItemExternalRef(entry)) }),
+    failed_child_join_policy: expectWireEnum(requireWireField(data, "failed_child_join_policy", "WorkItem"), ["require_success", "propagate", "accept"], "WorkItem.failed_child_join_policy") as "require_success" | "propagate" | "accept",
     id: expectWireString(requireWireField(data, "id", "WorkItem"), "WorkItem.id"),
     ...(data["labels"] === undefined || data["labels"] === null ? {} : { labels: expectWireArray(data["labels"], "WorkItem.labels").map((entry) => expectWireString(entry, "WorkItem.labels[]")) }),
     machine_state: expectWireObject(requireWireField(data, "machine_state", "WorkItem"), "WorkItem.machine_state"),
@@ -5572,6 +5614,7 @@ export function parseWorkGraphEvent(value: unknown): WorkGraphEvent {
   const data = expectWireObject(value, "WorkGraphEvent");
   return {
     at: expectWireString(requireWireField(data, "at", "WorkGraphEvent"), "WorkGraphEvent.at"),
+    ...(data["facts"] === undefined || data["facts"] === null ? {} : { facts: expectWireArray(data["facts"], "WorkGraphEvent.facts") }),
     ...(data["item_id"] === undefined || data["item_id"] === null ? {} : { item_id: expectWireString(data["item_id"], "WorkGraphEvent.item_id") }),
     kind: parseWorkGraphEventKind(requireWireField(data, "kind", "WorkGraphEvent")),
     namespace: expectWireString(requireWireField(data, "namespace", "WorkGraphEvent"), "WorkGraphEvent.namespace"),
@@ -5651,6 +5694,7 @@ export function parseWorkItemClaim(value: unknown): WorkItemClaim {
   const data = expectWireObject(value, "WorkItemClaim");
   return {
     claimed_at: expectWireString(requireWireField(data, "claimed_at", "WorkItemClaim"), "WorkItemClaim.claimed_at"),
+    ...(data["expiry_observed_at"] === undefined || data["expiry_observed_at"] === null ? {} : { expiry_observed_at: expectWireString(data["expiry_observed_at"], "WorkItemClaim.expiry_observed_at") }),
     ...(data["lease_expires_at"] === undefined || data["lease_expires_at"] === null ? {} : { lease_expires_at: expectWireString(data["lease_expires_at"], "WorkItemClaim.lease_expires_at") }),
     owner: parseWorkItemOwner(requireWireField(data, "owner", "WorkItemClaim")),
   };
@@ -5728,7 +5772,7 @@ export function parseWorkEdgeKind(value: unknown): WorkEdgeKind {
 
 /** Fail-closed wire parser for WorkGraphEventKind (K21): throws MeerkatError(INVALID_RESPONSE). */
 export function parseWorkGraphEventKind(value: unknown): WorkGraphEventKind {
-  return expectWireEnum(value, ["created", "updated", "claimed", "released", "blocked", "closed", "linked", "evidence_added", "attention_created", "attention_updated", "execution_bound", "execution_transitioned"], "WorkGraphEventKind") as WorkGraphEventKind;
+  return expectWireEnum(value, ["created", "updated", "readiness_observed", "claimed", "released", "blocked", "closed", "linked", "evidence_added", "attention_created", "attention_updated", "execution_bound", "execution_transitioned"], "WorkGraphEventKind") as WorkGraphEventKind;
 }
 
 /** Fail-closed wire parser for WorkAttentionBinding (K21): throws MeerkatError(INVALID_RESPONSE). */

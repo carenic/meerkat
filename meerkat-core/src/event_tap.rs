@@ -223,7 +223,7 @@ mod tests {
                 result: "done".to_string(),
                 structured_output: None,
                 extraction_required: false,
-                usage: crate::types::Usage::default(),
+                usage: crate::types::Usage::default().into(),
                 terminal_cause_kind: None,
             },
         )
@@ -244,7 +244,7 @@ mod tests {
                 result: "done".to_string(),
                 structured_output: None,
                 extraction_required: false,
-                usage: crate::types::Usage::default(),
+                usage: crate::types::Usage::default().into(),
                 terminal_cause_kind: None,
             },
         )

@@ -2096,6 +2096,49 @@ impl MobRuntimeMetadataStore for InMemoryMobRuntimeMetadataStore {
         Ok(())
     }
 
+    async fn compare_and_set_external_direct_bind(
+        &self,
+        mob_id: &MobId,
+        expected: &ExternalBindingOverlayRecord,
+        desired: &ExternalBindingOverlayRecord,
+    ) -> Result<bool, MobStoreError> {
+        let key = (
+            mob_id.clone(),
+            expected.agent_identity.clone(),
+            expected.generation,
+        );
+        let mut overlays = self.external_binding_overlays.write().await;
+        match overlays.get(&key) {
+            Some(current) if current == desired => Ok(true),
+            Some(current) if current == expected => {
+                overlays.insert(key, desired.clone());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn compare_and_delete_external_direct_bind(
+        &self,
+        mob_id: &MobId,
+        expected: &ExternalBindingOverlayRecord,
+    ) -> Result<bool, MobStoreError> {
+        let key = (
+            mob_id.clone(),
+            expected.agent_identity.clone(),
+            expected.generation,
+        );
+        let mut overlays = self.external_binding_overlays.write().await;
+        match overlays.get(&key) {
+            Some(current) if current == expected => {
+                overlays.remove(&key);
+                Ok(true)
+            }
+            None => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
     async fn delete_external_binding_overlay(
         &self,
         mob_id: &MobId,
@@ -4517,6 +4560,9 @@ mod tests {
         let overlay = ExternalBindingOverlayRecord {
             agent_identity: crate::AgentIdentity::from("worker-1"),
             generation: crate::Generation::INITIAL,
+            fence_token: None,
+            direct_member_incarnation: None,
+            direct_member_fence: None,
             normalized_member_ref: Some(crate::event::MemberRef::BackendPeer {
                 peer_id: "ed25519:test-worker-1".to_string(),
                 address: "inproc://worker-1".to_string(),

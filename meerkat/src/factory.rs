@@ -461,6 +461,9 @@ pub struct AgentBuildConfig {
     pub schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
     /// Agent-facing WorkGraph tools supplied by the embedding surface.
     pub workgraph_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    /// Host-issued authority for the one immutable WorkGraph namespace exposed
+    /// by `workgraph_tools`. WorkGraph enablement fails closed without it.
+    pub workgraph_namespace_grant: Option<meerkat_core::service::WorkGraphNamespaceGrant>,
     /// Runtime-injected mob operator authority context.
     ///
     /// Tool visibility may depend on this context being present, but
@@ -679,6 +682,7 @@ impl std::fmt::Debug for AgentBuildConfig {
             .field("override_web_search", &self.override_web_search)
             .field("schedule_tools", &self.schedule_tools.is_some())
             .field("workgraph_tools", &self.workgraph_tools.is_some())
+            .field("workgraph_namespace_grant", &self.workgraph_namespace_grant)
             .field(
                 "mob_tool_authority_context",
                 &self.mob_tool_authority_context.is_some(),
@@ -772,6 +776,7 @@ impl AgentBuildConfig {
             override_web_search: ToolCategoryOverride::Inherit,
             schedule_tools: None,
             workgraph_tools: None,
+            workgraph_namespace_grant: None,
             mob_tool_authority_context: None,
             mob_tools: None,
             preload_skills: None,
@@ -895,6 +900,7 @@ impl AgentBuildConfig {
         self.override_web_search = build.override_web_search;
         self.schedule_tools = build.schedule_tools.clone();
         self.workgraph_tools = build.workgraph_tools.clone();
+        self.workgraph_namespace_grant = build.workgraph_namespace_grant.clone();
         self.mob_tool_authority_context = mob_tool_authority_context;
         self.mob_tools = build.mob_tools.clone();
         self.preload_skills = build.preload_skills.clone();
@@ -966,6 +972,7 @@ impl AgentBuildConfig {
             override_comms: ToolCategoryOverride::Inherit,
             schedule_tools: self.schedule_tools.clone(),
             workgraph_tools: self.workgraph_tools.clone(),
+            workgraph_namespace_grant: self.workgraph_namespace_grant.clone(),
             mob_tool_authority_context: self.mob_tool_authority_context.clone(),
             mob_tools: self.mob_tools.clone(),
             preload_skills: self.preload_skills.clone(),
@@ -1134,7 +1141,7 @@ fn provider_request_defaults_for(
     config: &Config,
     model_profile: Option<&meerkat_core::model_profile::ModelProfile>,
     web_search_override: ToolCategoryOverride,
-    session_id: Option<&meerkat_core::SessionId>,
+    _session_id: Option<&meerkat_core::SessionId>,
     openai_cache_defaults_supported: bool,
 ) -> Option<meerkat_core::lifecycle::run_primitive::ProviderTag> {
     use meerkat_core::lifecycle::run_primitive::{
@@ -1164,21 +1171,34 @@ fn provider_request_defaults_for(
                 None
             };
             let prompt_cache_options = cache_capabilities.and_then(|capabilities| {
-                capabilities
+                let mode = if capabilities
+                    .prompt_cache_modes
+                    .contains(&OpenAiPromptCacheMode::Explicit)
+                {
+                    Some(OpenAiPromptCacheMode::Explicit)
+                } else if capabilities
                     .prompt_cache_modes
                     .contains(&OpenAiPromptCacheMode::Implicit)
-                    .then_some(OpenAiPromptCacheOptions {
-                        mode: Some(OpenAiPromptCacheMode::Implicit),
-                        ttl: capabilities
-                            .prompt_cache_ttls
-                            .contains(&OpenAiPromptCacheTtl::ThirtyMinutes)
-                            .then_some(OpenAiPromptCacheTtl::ThirtyMinutes),
-                    })
+                {
+                    Some(OpenAiPromptCacheMode::Implicit)
+                } else {
+                    None
+                }?;
+                Some(OpenAiPromptCacheOptions {
+                    mode: Some(mode),
+                    ttl: capabilities
+                        .prompt_cache_ttls
+                        .contains(&OpenAiPromptCacheTtl::ThirtyMinutes)
+                        .then_some(OpenAiPromptCacheTtl::ThirtyMinutes),
+                })
             });
+            // Keep the default bucket stable across sessions so identical
+            // system/profile prefixes can reuse OpenAI's native prefix cache.
+            // The provider still requires byte-identical lowered prefixes;
+            // this key never promotes a model/profile bucket into cache proof.
             let prompt_cache_key = prompt_cache_options
                 .is_some()
-                .then(|| session_id.map(|id| format!("meerkat:session:{id}")))
-                .flatten();
+                .then(|| format!("meerkat:profile:openai:{model}"));
             let prompt_cache_enabled = prompt_cache_options.is_some().then_some(true);
             let web_search =
                 (web_search_enabled && config.provider_tools.openai.web_search).then(|| {
@@ -2382,8 +2402,13 @@ impl AgentFactory {
                 .map_err(|e| e.to_string());
         };
         if selected_realm.is_env_default() {
-            return Self::resolve_realm_binding_for_provider(config, provider, None, None)
-                .map_err(|e| e.to_string());
+            return Self::resolve_realm_binding_for_provider(
+                config,
+                provider,
+                None,
+                Some(selected_realm),
+            )
+            .map_err(|e| e.to_string());
         }
         if !config.realm.contains_key(selected_realm.as_str()) {
             return Self::resolve_realm_binding_for_provider(
@@ -2897,10 +2922,6 @@ impl AgentFactory {
     /// peer-to-peer addressing.
     #[cfg(feature = "comms")]
     pub fn with_comms_runtime(mut self, runtime: Arc<meerkat_comms::CommsRuntime>) -> Self {
-        // A factory-owned runtime can later be wired into `SessionOwned`
-        // builds, so local compatibility classification must be inert as soon
-        // as the runtime enters this surface.
-        runtime.require_peer_comms_machine_authority();
         self.comms_runtime = Some(runtime);
         self
     }
@@ -5067,7 +5088,6 @@ impl AgentFactory {
                 silent_intents,
             )
             .map_err(BuildAgentError::from)?;
-            runtime.require_peer_comms_machine_authority();
             if let Some(ref meta) = build_config.peer_meta {
                 runtime.set_peer_meta(meta.clone());
             }
@@ -5095,9 +5115,6 @@ impl AgentFactory {
         if let RuntimeBuildMode::SessionOwned(bindings) = resolved_mode
             && let Some(runtime) = &comms_runtime
         {
-            // Close the runtime-backed ingress window before any later build
-            // work can interleave with already-started shared listeners.
-            runtime.require_peer_comms_machine_authority();
             bindings
                 .install_peer_comms_on(runtime.as_ref())
                 .map_err(BuildAgentError::Comms)?;
@@ -5372,6 +5389,29 @@ impl AgentFactory {
             .override_workgraph
             .resolve(self.enable_workgraph);
         if effective_workgraph {
+            let Some(workgraph_grant) = build_config.workgraph_namespace_grant.clone() else {
+                return Err(BuildAgentError::Config(
+                    "WorkGraph tools enabled without a host-issued namespace grant".to_string(),
+                ));
+            };
+            meerkat_core::service::WorkGraphNamespaceGrant::new(
+                workgraph_grant.realm_id.clone(),
+                workgraph_grant.namespace.clone(),
+            )
+            .map_err(BuildAgentError::Config)?;
+            meerkat_core::RealmId::parse(workgraph_grant.realm_id.as_str())
+                .map_err(|error| BuildAgentError::Config(error.to_string()))?;
+            meerkat_workgraph::WorkNamespace::new(workgraph_grant.namespace.clone())
+                .map_err(|error| BuildAgentError::Config(error.to_string()))?;
+            if let Some(realm_id) = build_config.realm_id.as_ref()
+                && realm_id.as_str() != workgraph_grant.realm_id
+            {
+                return Err(BuildAgentError::Config(format!(
+                    "WorkGraph namespace grant realm '{}' does not match build realm '{}'",
+                    workgraph_grant.realm_id,
+                    realm_id.as_str()
+                )));
+            }
             let workgraph_dispatcher = match build_config.workgraph_tools.take() {
                 Some(dispatcher) => dispatcher,
                 None => {
@@ -5388,20 +5428,12 @@ impl AgentFactory {
                         // Wasm has no host SQLite persistence bundle; keep the
                         // explicitly documented in-memory fallback scoped by the
                         // typed realm identity.
-                        let Some(realm_id) = build_config.realm_id.as_ref() else {
-                            return Err(BuildAgentError::Config(
-                                "WorkGraph tools enabled with no supplied dispatcher and no realm \
-                                 identity; supply a WorkGraph dispatcher or a realm-scoped build"
-                                    .to_string(),
-                            ));
-                        };
-                        let realm_scope = realm_id.as_str().to_string();
                         meerkat_workgraph::wire_workgraph_tools(
-                            meerkat_workgraph::WorkGraphService::with_scope(
+                            meerkat_workgraph::WorkGraphService::with_namespace_grant(
                                 Arc::new(meerkat_workgraph::MemoryWorkGraphStore::new()),
-                                realm_scope,
-                                meerkat_workgraph::WorkNamespace::default(),
-                            ),
+                                workgraph_grant,
+                            )
+                            .map_err(|error| BuildAgentError::Config(error.to_string()))?,
                         )
                     }
                 }
@@ -6956,6 +6988,13 @@ mod tests {
                     delta: "ok".to_string(),
                     meta: None,
                 }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        Provider::OpenAI,
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
+                }),
                 Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {
                         stop_reason: StopReason::EndTurn,
@@ -8129,13 +8168,13 @@ mod tests {
         };
         assert_eq!(
             defaults.prompt_cache_key.as_deref(),
-            Some("meerkat:session:018f2f0d-7b1d-7a34-8c09-0a1b2c3d4e5f")
+            Some("meerkat:profile:openai:gpt-5.6-sol")
         );
         assert_eq!(defaults.prompt_cache_enabled, Some(true));
         assert_eq!(
             defaults.prompt_cache_options,
             Some(OpenAiPromptCacheOptions {
-                mode: Some(OpenAiPromptCacheMode::Implicit),
+                mode: Some(OpenAiPromptCacheMode::Explicit),
                 ttl: Some(OpenAiPromptCacheTtl::ThirtyMinutes),
             })
         );
@@ -8165,7 +8204,7 @@ mod tests {
         assert_eq!(
             effective.prompt_cache_options,
             Some(OpenAiPromptCacheOptions {
-                mode: Some(OpenAiPromptCacheMode::Implicit),
+                mode: Some(OpenAiPromptCacheMode::Explicit),
                 ttl: Some(OpenAiPromptCacheTtl::ThirtyMinutes),
             }),
             "cache policy remains first-class when only the host key is explicit"
@@ -8309,13 +8348,13 @@ mod tests {
         };
         assert_eq!(
             tag.prompt_cache_key.as_deref(),
-            Some("meerkat:session:018f2f0d-7b1d-7a34-8c09-0a1b2c3d4e5f")
+            Some("meerkat:profile:openai:gpt-5.6-sol")
         );
         assert_eq!(tag.prompt_cache_enabled, Some(true));
         assert_eq!(
             tag.prompt_cache_options,
             Some(OpenAiPromptCacheOptions {
-                mode: Some(OpenAiPromptCacheMode::Implicit),
+                mode: Some(OpenAiPromptCacheMode::Explicit),
                 ttl: Some(OpenAiPromptCacheTtl::ThirtyMinutes),
             })
         );
@@ -8457,7 +8496,7 @@ mod tests {
 
         fn stream<'a>(
             &'a self,
-            _request: &'a meerkat_client::LlmRequest,
+            request: &'a meerkat_client::LlmRequest,
         ) -> std::pin::Pin<
             Box<
                 dyn futures::Stream<
@@ -8476,6 +8515,13 @@ mod tests {
                     Ok(meerkat_client::LlmEvent::TextDelta {
                         delta: "backup success".to_string(),
                         meta: None,
+                    }),
+                    Ok(meerkat_client::LlmEvent::UsageUpdate {
+                        usage: meerkat_core::TurnUsage::host_declared(
+                            self.provider,
+                            &request.model,
+                            meerkat_core::Usage::default(),
+                        ),
                     }),
                     Ok(meerkat_client::LlmEvent::Done {
                         outcome: meerkat_client::LlmDoneOutcome::Success {
@@ -11072,7 +11118,11 @@ mod tests {
 
     #[test]
     fn selected_env_default_image_binding_can_synthesize_env_default() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.realm.insert(
+            "global".to_string(),
+            inline_realm_section(&[("gemini", "configured-global-gemini-key")]),
+        );
         let (realm, binding_id, auth_binding) = AgentFactory::resolve_image_binding_for_provider(
             &config,
             Provider::Gemini,
@@ -11084,6 +11134,7 @@ mod tests {
         assert_eq!(binding_id, "default");
         assert_eq!(auth_binding.realm.as_str(), "env_default");
         assert_eq!(auth_binding.binding.as_str(), "default");
+        assert!(auth_binding.is_env_default());
     }
 
     #[test]
@@ -12897,7 +12948,6 @@ mod tests {
         let shared_name = format!("shared-session-owned-{}", meerkat_core::SessionId::new());
         let shared_runtime =
             Arc::new(meerkat_comms::CommsRuntime::inproc_only(&shared_name).unwrap());
-        assert!(!shared_runtime.peer_comms_machine_authority_required());
         assert!(shared_runtime.peer_comms_handle().is_none());
 
         let session = Session::new();
@@ -12915,20 +12965,12 @@ mod tests {
         let factory = AgentFactory::new(temp.path().join("sessions"))
             .builtins(false)
             .with_comms_runtime(Arc::clone(&shared_runtime));
-        assert!(
-            shared_runtime.peer_comms_machine_authority_required(),
-            "factory attachment must fail closed before a session-owned build can install machine authority"
-        );
 
         let _agent = factory
             .build_agent(build, &Config::default())
             .await
             .expect("session-owned build should succeed");
 
-        assert!(
-            shared_runtime.peer_comms_machine_authority_required(),
-            "shared runtime must fail closed before any session-owned ingress can use local classifier authority"
-        );
         assert!(
             shared_runtime.peer_comms_handle().is_some(),
             "session-owned shared runtime should install the PeerComms machine handle"

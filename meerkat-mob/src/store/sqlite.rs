@@ -5589,6 +5589,123 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         .await
     }
 
+    async fn compare_and_set_external_direct_bind(
+        &self,
+        mob_id: &MobId,
+        expected: &ExternalBindingOverlayRecord,
+        desired: &ExternalBindingOverlayRecord,
+    ) -> Result<bool, MobStoreError> {
+        let path = self.path.clone();
+        let mob_id = mob_id.clone();
+        let expected = expected.clone();
+        let desired = desired.clone();
+        run_sqlite_task(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = begin_immediate(&mut conn)?;
+            let current = tx
+                .query_row(
+                    "SELECT record_json FROM mob_runtime_binding_overlays
+                     WHERE mob_id = ?1 AND agent_identity = ?2 AND generation = ?3",
+                    params![
+                        mob_id.as_str(),
+                        expected.agent_identity.as_str(),
+                        i64::try_from(expected.generation.get()).map_err(|_| {
+                            MobStoreError::Internal(format!(
+                                "generation {} exceeds i64::MAX",
+                                expected.generation.get()
+                            ))
+                        })?,
+                    ],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .map_err(se)?
+                .map(|bytes| decode_json::<ExternalBindingOverlayRecord>(&bytes))
+                .transpose()?;
+            let applied = match current {
+                Some(current) if current == desired => true,
+                Some(current) if current == expected => {
+                    tx.execute(
+                        "UPDATE mob_runtime_binding_overlays SET record_json = ?4
+                         WHERE mob_id = ?1 AND agent_identity = ?2 AND generation = ?3",
+                        params![
+                            mob_id.as_str(),
+                            expected.agent_identity.as_str(),
+                            i64::try_from(expected.generation.get()).map_err(|_| {
+                                MobStoreError::Internal(format!(
+                                    "generation {} exceeds i64::MAX",
+                                    expected.generation.get()
+                                ))
+                            })?,
+                            encode_json(&desired)?,
+                        ],
+                    )
+                    .map_err(se)?;
+                    true
+                }
+                _ => false,
+            };
+            tx.commit().map_err(se)?;
+            Ok(applied)
+        })
+        .await
+    }
+
+    async fn compare_and_delete_external_direct_bind(
+        &self,
+        mob_id: &MobId,
+        expected: &ExternalBindingOverlayRecord,
+    ) -> Result<bool, MobStoreError> {
+        let path = self.path.clone();
+        let mob_id = mob_id.clone();
+        let expected = expected.clone();
+        run_sqlite_task(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = begin_immediate(&mut conn)?;
+            let generation = i64::try_from(expected.generation.get()).map_err(|_| {
+                MobStoreError::Internal(format!(
+                    "generation {} exceeds i64::MAX",
+                    expected.generation.get()
+                ))
+            })?;
+            let current = tx
+                .query_row(
+                    "SELECT record_json FROM mob_runtime_binding_overlays
+                     WHERE mob_id = ?1 AND agent_identity = ?2 AND generation = ?3",
+                    params![
+                        mob_id.as_str(),
+                        expected.agent_identity.as_str(),
+                        generation
+                    ],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .map_err(se)?
+                .map(|bytes| decode_json::<ExternalBindingOverlayRecord>(&bytes))
+                .transpose()?;
+            let applied = match current {
+                None => true,
+                Some(current) if current == expected => {
+                    tx.execute(
+                        "DELETE FROM mob_runtime_binding_overlays
+                         WHERE mob_id = ?1 AND agent_identity = ?2 AND generation = ?3",
+                        params![
+                            mob_id.as_str(),
+                            expected.agent_identity.as_str(),
+                            generation
+                        ],
+                    )
+                    .map_err(se)?;
+                    true
+                }
+                Some(_) => false,
+            };
+            tx.commit().map_err(se)?;
+            Ok(applied)
+        })
+        .await
+    }
+
     async fn delete_external_binding_overlay(
         &self,
         mob_id: &MobId,
@@ -10176,6 +10293,9 @@ mod tests {
         let overlay = ExternalBindingOverlayRecord {
             agent_identity: AgentIdentity::from("worker-1"),
             generation: Generation::new(2),
+            fence_token: None,
+            direct_member_incarnation: None,
+            direct_member_fence: None,
             normalized_member_ref: Some(MemberRef::BackendPeer {
                 peer_id: "peer-worker-1".to_string(),
                 address: "tcp://worker-1".to_string(),

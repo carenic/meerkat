@@ -57,6 +57,9 @@ pub enum StoreError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    #[error("schedule executor lease is stale or expired")]
+    ScheduleExecutorLeaseStale,
+
     #[cfg(not(target_arch = "wasm32"))]
     #[error("timed out acquiring realm manifest lock for '{realm_id}'")]
     RealmManifestLockTimeout { realm_id: String },

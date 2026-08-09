@@ -174,7 +174,7 @@ async fn apply_generated_trust(
 }
 
 fn register_zero_pubkey_inproc_target(registry: &InprocRegistry, name: &str) -> Inbox {
-    let (inbox, sender) = Inbox::new();
+    let (inbox, sender) = Inbox::new_transport_only();
     registry.register_with_meta_in_namespace("", name, zero_pubkey(), sender, PeerMeta::default());
     inbox
 }
@@ -188,7 +188,7 @@ async fn zero_pubkey_identity_is_never_sendable() {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let target_name = format!("raw-zero-router-{suffix}");
     let _target_inbox = register_zero_pubkey_inproc_target(registry, &target_name);
-    let (_, router_inbox_sender) = Inbox::new();
+    let (_, router_inbox_sender) = Inbox::new_transport_only();
     let router = Router::new(
         Keypair::generate(),
         CommsConfig::default(),
@@ -216,7 +216,7 @@ async fn router_auth_disabled_inproc_fallback_rejects_zero_pubkey_registry_ident
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let target_name = format!("auth-disabled-zero-fallback-{suffix}");
     let _target_inbox = register_zero_pubkey_inproc_target(registry, &target_name);
-    let (_, router_inbox_sender) = Inbox::new();
+    let (_, router_inbox_sender) = Inbox::new_transport_only();
     let router = Router::new(
         Keypair::generate(),
         CommsConfig::default(),
@@ -272,7 +272,7 @@ async fn runtime_auth_disabled_directory_skips_zero_pubkey_inproc_identity() {
     .await
     .expect("auth-disabled runtime");
 
-    let (_zero_inbox, zero_sender) = Inbox::new();
+    let (_zero_inbox, zero_sender) = Inbox::new_transport_only();
     registry.register_with_meta_in_namespace(
         "",
         &zero_name,
@@ -300,7 +300,7 @@ async fn public_router_rejects_late_shared_zero_pubkey_registry_mutation() {
 
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let target_name = format!("late-zero-registry-target-{suffix}");
-    let (_, router_inbox_sender) = Inbox::new();
+    let (_, router_inbox_sender) = Inbox::new_transport_only();
     let router = Router::new(
         Keypair::generate(),
         CommsConfig::default(),
@@ -407,7 +407,7 @@ async fn runtime_auth_disabled_directory_suppresses_inproc_for_duplicate_trust()
     let target_keypair = Keypair::generate();
     let target_pubkey = target_keypair.public_key();
     let peer_id = target_pubkey.to_peer_id();
-    let (_target_inbox, target_sender) = Inbox::new();
+    let (_target_inbox, target_sender) = Inbox::new_transport_only();
 
     apply_generated_trust(
         &runtime,
@@ -481,8 +481,8 @@ async fn runtime_auth_disabled_directory_suppresses_inproc_for_duplicate_live_ca
     let target_keypair = Keypair::generate();
     let target_pubkey = target_keypair.public_key();
     let peer_id = target_pubkey.to_peer_id();
-    let (_local_inbox, local_sender) = Inbox::new();
-    let (_remote_inbox, remote_sender) = Inbox::new();
+    let (_local_inbox, local_sender) = Inbox::new_transport_only();
+    let (_remote_inbox, remote_sender) = Inbox::new_transport_only();
 
     registry.register_with_meta_in_namespace(
         "realm-local",
@@ -521,7 +521,7 @@ async fn untrusted_sender_has_no_canonical_inproc_route() {
     let shadow_keypair = Keypair::generate();
     let shadow_pubkey = shadow_keypair.public_key();
 
-    let (_shadow_inbox, shadow_sender) = Inbox::new();
+    let (_shadow_inbox, shadow_sender) = Inbox::new_transport_only();
 
     registry.register_with_meta_in_namespace(
         "",
@@ -539,7 +539,7 @@ async fn untrusted_sender_has_no_canonical_inproc_route() {
         trusted_descriptor_for("sender", sender_pubkey),
     )
     .await;
-    let (_, router_inbox_sender) = Inbox::new();
+    let (_, router_inbox_sender) = Inbox::new_transport_only();
     let router = Router::new(
         sender_keypair,
         CommsConfig::default(),
@@ -556,7 +556,9 @@ async fn untrusted_sender_has_no_canonical_inproc_route() {
         "only generated trust mutations create send authority: {result:?}"
     );
 
-    let target_items = CoreCommsRuntime::drain_inbox_interactions(&target_runtime).await;
+    let target_items = CoreCommsRuntime::handoff_volatile_peer_input_candidates(&target_runtime)
+        .await
+        .expect("exact volatile target handoff");
     assert!(
         target_items.is_empty(),
         "an untrusted sender must not deliver to the canonical target"

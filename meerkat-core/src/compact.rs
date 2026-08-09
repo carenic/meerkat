@@ -80,6 +80,9 @@ pub struct ProviderRequestPressure {
     /// when the provider exposes a synchronous counting API before dispatch.
     /// Byte measurement alone must never populate this field.
     pub provider_issued_input_tokens: Option<u64>,
+    /// Explicit identity of the fully lowered request body. `None` is truthful
+    /// for custom clients that expose only a byte count.
+    pub lowered_request_provenance: Option<crate::LoweredRequestProvenance>,
 }
 
 impl ProviderRequestPressure {
@@ -88,12 +91,21 @@ impl ProviderRequestPressure {
             encoded_bytes,
             max_bytes,
             provider_issued_input_tokens: None,
+            lowered_request_provenance: None,
         }
     }
 
     /// Attach an exact provider-issued input-token count.
     pub fn with_provider_issued_input_tokens(mut self, input_tokens: u64) -> Self {
         self.provider_issued_input_tokens = Some(input_tokens);
+        self
+    }
+
+    pub fn with_lowered_request_provenance(
+        mut self,
+        provenance: crate::LoweredRequestProvenance,
+    ) -> Self {
+        self.lowered_request_provenance = Some(provenance);
         self
     }
 
@@ -316,9 +328,11 @@ pub trait Compactor: Send + Sync {
     /// Implementations may strip content that is not suitable for the
     /// summarization pass (e.g. base64-encoded images).
     ///
-    /// The default implementation returns an unmodified clone.
+    /// The default implementation removes only superseded versions of typed
+    /// keyed system prompts. Every unkeyed System row and latest keyed version
+    /// remains byte-identical and ordered.
     fn prepare_for_summarization(&self, messages: &[Message]) -> Vec<Message> {
-        messages.to_vec()
+        crate::types::materialize_latest_system_prompt_versions(messages)
     }
 
     /// Rebuild history while carrying the exact provider request pressure that
@@ -339,8 +353,8 @@ pub trait Compactor: Send + Sync {
     /// Rebuild the session history from a summary and current messages.
     ///
     /// The implementation should:
-    /// 1. Preserve every ordered `Message::System` verbatim and in relative
-    ///    source order.
+    /// 1. Preserve every unkeyed and latest-version `Message::System` verbatim
+    ///    and in relative source order; discard superseded keyed versions.
     /// 2. Inject a summary message.
     /// 3. Retain recent complete turns per `recent_turn_budget`.
     /// 4. Return retained source messages as `retained`, with their offsets in

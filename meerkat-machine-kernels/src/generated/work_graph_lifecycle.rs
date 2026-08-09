@@ -27,6 +27,172 @@ pub fn schema() -> meerkat_machine_schema::MachineSchema {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum CancelledChildJoinPolicy {
+    #[default]
+    #[serde(rename = "RequireSuccess")]
+    RequireSuccess,
+    #[serde(rename = "Propagate")]
+    Propagate,
+    #[serde(rename = "Accept")]
+    Accept,
+}
+impl CancelledChildJoinPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RequireSuccess => "RequireSuccess",
+            Self::Propagate => "Propagate",
+            Self::Accept => "Accept",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for CancelledChildJoinPolicy {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "RequireSuccess" => Ok(Self::RequireSuccess),
+            "Propagate" => Ok(Self::Propagate),
+            "Accept" => Ok(Self::Accept),
+            other => Err(format!("invalid CancelledChildJoinPolicy value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for CancelledChildJoinPolicy {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for CancelledChildJoinPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum ChildJoinDisposition {
+    #[default]
+    #[serde(rename = "Waiting")]
+    Waiting,
+    #[serde(rename = "Satisfied")]
+    Satisfied,
+    #[serde(rename = "PropagateFailure")]
+    PropagateFailure,
+    #[serde(rename = "PropagateCancellation")]
+    PropagateCancellation,
+}
+impl ChildJoinDisposition {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Waiting => "Waiting",
+            Self::Satisfied => "Satisfied",
+            Self::PropagateFailure => "PropagateFailure",
+            Self::PropagateCancellation => "PropagateCancellation",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for ChildJoinDisposition {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Waiting" => Ok(Self::Waiting),
+            "Satisfied" => Ok(Self::Satisfied),
+            "PropagateFailure" => Ok(Self::PropagateFailure),
+            "PropagateCancellation" => Ok(Self::PropagateCancellation),
+            other => Err(format!("invalid ChildJoinDisposition value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for ChildJoinDisposition {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for ChildJoinDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum FailedChildJoinPolicy {
+    #[default]
+    #[serde(rename = "RequireSuccess")]
+    RequireSuccess,
+    #[serde(rename = "Propagate")]
+    Propagate,
+    #[serde(rename = "Accept")]
+    Accept,
+}
+impl FailedChildJoinPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RequireSuccess => "RequireSuccess",
+            Self::Propagate => "Propagate",
+            Self::Accept => "Accept",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for FailedChildJoinPolicy {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "RequireSuccess" => Ok(Self::RequireSuccess),
+            "Propagate" => Ok(Self::Propagate),
+            "Accept" => Ok(Self::Accept),
+            other => Err(format!("invalid FailedChildJoinPolicy value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for FailedChildJoinPolicy {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for FailedChildJoinPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum WorkCloseStatusAdmissionKind {
     #[default]
     #[serde(rename = "DeniedNonTerminal")]
@@ -588,6 +754,8 @@ pub enum WorkGraphErrorKind {
     InvalidInput,
     #[serde(rename = "InvalidTimestampMillis")]
     InvalidTimestampMillis,
+    #[serde(rename = "NamespaceAssignmentRequired")]
+    NamespaceAssignmentRequired,
     #[serde(rename = "Store")]
     Store,
     #[serde(rename = "UnsupportedBackend")]
@@ -603,6 +771,7 @@ impl WorkGraphErrorKind {
             Self::InvalidTransition => "InvalidTransition",
             Self::InvalidInput => "InvalidInput",
             Self::InvalidTimestampMillis => "InvalidTimestampMillis",
+            Self::NamespaceAssignmentRequired => "NamespaceAssignmentRequired",
             Self::Store => "Store",
             Self::UnsupportedBackend => "UnsupportedBackend",
         }
@@ -619,6 +788,7 @@ impl std::convert::TryFrom<&str> for WorkGraphErrorKind {
             "InvalidTransition" => Ok(Self::InvalidTransition),
             "InvalidInput" => Ok(Self::InvalidInput),
             "InvalidTimestampMillis" => Ok(Self::InvalidTimestampMillis),
+            "NamespaceAssignmentRequired" => Ok(Self::NamespaceAssignmentRequired),
             "Store" => Ok(Self::Store),
             "UnsupportedBackend" => Ok(Self::UnsupportedBackend),
             other => Err(format!("invalid WorkGraphErrorKind value `{other}`")),
@@ -1008,6 +1178,8 @@ pub struct State {
     pub principal_confirmation_count: u64,
     pub supervisor_confirmation_owner_keys: std::collections::BTreeSet<WorkOwnerKey>,
     pub reviewer_confirmation_owner_keys: std::collections::BTreeSet<WorkOwnerKey>,
+    pub failed_child_join_policy: FailedChildJoinPolicy,
+    pub cancelled_child_join_policy: CancelledChildJoinPolicy,
 }
 impl Default for State {
     fn default() -> Self {
@@ -1027,6 +1199,8 @@ pub mod inputs {
         pub completion_supervisor_owner_key: Option<WorkOwnerKey>,
         pub completion_reviewer_quorum_threshold: Option<u64>,
         pub unresolved_blocker_count: u64,
+        pub failed_child_join_policy: FailedChildJoinPolicy,
+        pub cancelled_child_join_policy: CancelledChildJoinPolicy,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct CreateBlocked {
@@ -1037,6 +1211,8 @@ pub mod inputs {
         pub completion_supervisor_owner_key: Option<WorkOwnerKey>,
         pub completion_reviewer_quorum_threshold: Option<u64>,
         pub unresolved_blocker_count: u64,
+        pub failed_child_join_policy: FailedChildJoinPolicy,
+        pub cancelled_child_join_policy: CancelledChildJoinPolicy,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct Update {
@@ -1062,10 +1238,22 @@ pub mod inputs {
         pub owner_key: WorkOwnerKey,
         pub now_utc_ms: u64,
         pub lease_expires_at_utc_ms: Option<u64>,
+        pub child_join_satisfied: bool,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct Release {
         pub expected_revision: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ObserveLeaseExpiry {
+        pub expected_revision: u64,
+        pub observed_at_utc_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ObserveReadiness {
+        pub expected_revision: u64,
+        pub observed_at_utc_ms: u64,
+        pub child_join_satisfied: bool,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct Block {
@@ -1074,6 +1262,12 @@ pub mod inputs {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RefreshEligibility {
         pub unresolved_blocker_count: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ClassifyChildJoin {
+        pub active_child_count: u64,
+        pub failed_child_count: u64,
+        pub cancelled_child_count: u64,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ValidateLink {
@@ -1148,6 +1342,7 @@ pub mod inputs {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ClassifyReadiness {
         pub now_utc_ms: u64,
+        pub child_join_satisfied: bool,
     }
 }
 
@@ -1159,8 +1354,11 @@ pub enum Input {
     PolicyEscalate(inputs::PolicyEscalate),
     Claim(inputs::Claim),
     Release(inputs::Release),
+    ObserveLeaseExpiry(inputs::ObserveLeaseExpiry),
+    ObserveReadiness(inputs::ObserveReadiness),
     Block(inputs::Block),
     RefreshEligibility(inputs::RefreshEligibility),
+    ClassifyChildJoin(inputs::ClassifyChildJoin),
     ValidateLink(inputs::ValidateLink),
     CloseCompleted(inputs::CloseCompleted),
     CloseCancelled(inputs::CloseCancelled),
@@ -1186,8 +1384,11 @@ impl Input {
             Self::PolicyEscalate(_) => InputKind::PolicyEscalate,
             Self::Claim(_) => InputKind::Claim,
             Self::Release(_) => InputKind::Release,
+            Self::ObserveLeaseExpiry(_) => InputKind::ObserveLeaseExpiry,
+            Self::ObserveReadiness(_) => InputKind::ObserveReadiness,
             Self::Block(_) => InputKind::Block,
             Self::RefreshEligibility(_) => InputKind::RefreshEligibility,
+            Self::ClassifyChildJoin(_) => InputKind::ClassifyChildJoin,
             Self::ValidateLink(_) => InputKind::ValidateLink,
             Self::CloseCompleted(_) => InputKind::CloseCompleted,
             Self::CloseCancelled(_) => InputKind::CloseCancelled,
@@ -1220,8 +1421,11 @@ pub enum InputKind {
     PolicyEscalate,
     Claim,
     Release,
+    ObserveLeaseExpiry,
+    ObserveReadiness,
     Block,
     RefreshEligibility,
+    ClassifyChildJoin,
     ValidateLink,
     CloseCompleted,
     CloseCancelled,
@@ -1252,6 +1456,10 @@ pub mod effects {
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct Released {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LeaseExpiryObserved {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ReadinessObserved {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct Blocked {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1308,6 +1516,10 @@ pub mod effects {
     pub struct WorkItemReadinessClassified {
         pub ready: bool,
     }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ChildJoinClassified {
+        pub disposition: ChildJoinDisposition,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1316,6 +1528,8 @@ pub enum Effect {
     Updated(effects::Updated),
     Claimed(effects::Claimed),
     Released(effects::Released),
+    LeaseExpiryObserved(effects::LeaseExpiryObserved),
+    ReadinessObserved(effects::ReadinessObserved),
     Blocked(effects::Blocked),
     LinkValidated(effects::LinkValidated),
     Closed(effects::Closed),
@@ -1333,6 +1547,7 @@ pub enum Effect {
     PolicyEscalationAdmissionClassified(effects::PolicyEscalationAdmissionClassified),
     ConfirmationAdmissionClassified(effects::ConfirmationAdmissionClassified),
     WorkItemReadinessClassified(effects::WorkItemReadinessClassified),
+    ChildJoinClassified(effects::ChildJoinClassified),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EffectKind {
@@ -1340,6 +1555,8 @@ pub enum EffectKind {
     Updated,
     Claimed,
     Released,
+    LeaseExpiryObserved,
+    ReadinessObserved,
     Blocked,
     LinkValidated,
     Closed,
@@ -1355,6 +1572,7 @@ pub enum EffectKind {
     PolicyEscalationAdmissionClassified,
     ConfirmationAdmissionClassified,
     WorkItemReadinessClassified,
+    ChildJoinClassified,
 }
 
 #[allow(non_camel_case_types)]
@@ -1374,6 +1592,8 @@ pub enum TransitionId {
     ClaimOpen,
     ClaimExpiredInProgress,
     ReleaseInProgress,
+    ObserveLeaseExpiryInProgress,
+    ObserveReadinessOpen,
     BlockOpen,
     BlockInProgress,
     BlockBlocked,
@@ -1452,6 +1672,13 @@ pub enum TransitionId {
     ClassifyReadinessNotClaimableCompleted,
     ClassifyReadinessNotClaimableCancelled,
     ClassifyReadinessNotClaimableFailed,
+    ClassifyChildJoinAbsent,
+    ClassifyChildJoinOpen,
+    ClassifyChildJoinInProgress,
+    ClassifyChildJoinBlocked,
+    ClassifyChildJoinCompleted,
+    ClassifyChildJoinCancelled,
+    ClassifyChildJoinFailed,
     ClassifyBlockerSatisfactionAbsent,
     ClassifyBlockerSatisfactionOpen,
     ClassifyBlockerSatisfactionInProgress,
@@ -1776,5 +2003,7 @@ pub fn initial_state() -> State {
         principal_confirmation_count: 0,
         supervisor_confirmation_owner_keys: Default::default(),
         reviewer_confirmation_owner_keys: Default::default(),
+        failed_child_join_policy: FailedChildJoinPolicy::RequireSuccess,
+        cancelled_child_join_policy: CancelledChildJoinPolicy::RequireSuccess,
     }
 }

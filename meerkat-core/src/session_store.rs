@@ -111,6 +111,18 @@ pub enum SessionStoreError {
     #[error("session {id} rewrite rejected: {reason}")]
     InvalidTranscriptRewrite { id: SessionId, reason: String },
 
+    /// A read would otherwise be served from a derived representation already
+    /// known to disagree with, or lag behind, its canonical authority.
+    #[error(
+        "refusing {operation}: projection '{representation}' is known degraded relative to canonical authority '{authority}' ({reason})"
+    )]
+    ProjectionReadRefused {
+        operation: String,
+        authority: String,
+        representation: String,
+        reason: String,
+    },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -3192,6 +3204,24 @@ pub enum HeadCanonicalAuthorityCrossing {
     AlreadyCurrent(VerifiedHeadCanonicalAuthority),
 }
 
+/// Store-wide result of the HeadCanonical format-door crossing.
+///
+/// The backend owns both the complete physical identity census and every
+/// per-session crossing in one storage snapshot. `Activated([])` therefore
+/// means a HeadCanonical-capable store with no physical sessions, while
+/// [`Self::NotApplicable`] means this store does not own HeadCanonical
+/// physical authority.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub enum HeadCanonicalStoreActivation {
+    /// This store's durable profile is not HeadCanonical.
+    NotApplicable,
+    /// Complete per-session crossing results from one backend-owned snapshot.
+    /// Every entry must be `Converted` or `AlreadyCurrent`, with each physical
+    /// session identity occurring exactly once.
+    Activated(Vec<HeadCanonicalAuthorityCrossing>),
+}
+
 impl HeadCanonicalAuthorityCrossing {
     /// Build the trusted backend's successfully converted authority assertion.
     #[doc(hidden)]
@@ -4996,6 +5026,18 @@ fn validate_store_issued_head_identity_pair(
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait IncrementalSessionStore: SessionStore {
+    /// Activate every physical HeadCanonical session in one backend snapshot.
+    ///
+    /// This operation is required and deliberately has no default. A durable
+    /// HeadCanonical backend must enumerate its physical session identities,
+    /// cross and verify each identity, and return the complete result from one
+    /// write transaction or equivalent snapshot. It must not derive the census
+    /// from [`SessionStore::list`], which may be a filtered or derived metadata
+    /// projection. Failure rolls back the entire activation snapshot.
+    async fn activate_head_canonical_store(
+        &self,
+    ) -> Result<HeadCanonicalStoreActivation, SessionStoreError>;
+
     /// Cross one physical HeadCanonical session into current store authority.
     ///
     /// This operation is required and deliberately has no default. It is the
@@ -6158,6 +6200,12 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl IncrementalSessionStore for DefaultVerbIncrementalStore {
+        async fn activate_head_canonical_store(
+            &self,
+        ) -> Result<HeadCanonicalStoreActivation, SessionStoreError> {
+            Ok(HeadCanonicalStoreActivation::NotApplicable)
+        }
+
         async fn cross_head_canonical_authority(
             &self,
             _id: &SessionId,

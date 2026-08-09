@@ -49,6 +49,7 @@ RPC_PUBLIC_WRAPPERS: dict[str, tuple[type, str]] = {
     "session/fork_at": (MeerkatClient, "fork_session_at"),
     "session/fork_replace": (MeerkatClient, "fork_session_replace"),
     "session/rewrite_transcript": (MeerkatClient, "rewrite_session_transcript"),
+    "session/update_system_prompt": (MeerkatClient, "update_system_prompt"),
     "session/transcript_revision": (MeerkatClient, "read_session_transcript_revision"),
     "session/transcript_revisions": (
         MeerkatClient,

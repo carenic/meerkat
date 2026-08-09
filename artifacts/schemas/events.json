@@ -801,6 +801,10 @@
         ],
         "description": "Input content that can be either a plain text string or multimodal content blocks.\n\nDeserializes from either `\"text\"` or `[{type: \"text\", text: \"...\"}, ...]`.\nProvides `From<String>` and `From<&str>` for ergonomic construction."
       },
+      "CumulativeUsage": {
+        "$ref": "#/$defs/Usage",
+        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific."
+      },
       "DeferredCatalogDelta": {
         "description": "Additive hidden-catalog delta metadata for runtime notices.",
         "properties": {
@@ -1277,6 +1281,36 @@
         ],
         "type": "object"
       },
+      "PresentedTokenConvention": {
+        "description": "Provider-native convention used to normalize tokens presented to a model.",
+        "oneOf": [
+          {
+            "const": "anthropic_disjoint_input_components",
+            "description": "Anthropic reports uncached, cache-write, and cache-read input as\ndisjoint components. The normalized total is their saturating sum.",
+            "type": "string"
+          },
+          {
+            "const": "open_ai_input_includes_cached_subset",
+            "description": "OpenAI prompt/input tokens already include the cached-token subset.",
+            "type": "string"
+          },
+          {
+            "const": "gemini_prompt_includes_cached_subset",
+            "description": "Gemini prompt tokens already include the cached-content subset.",
+            "type": "string"
+          },
+          {
+            "const": "open_ai_compatible_prompt_includes_cache_details",
+            "description": "OpenAI-compatible prompt tokens are treated as the provider's inclusive\nprompt total; cache detail fields are observational subsets only.",
+            "type": "string"
+          },
+          {
+            "const": "host_declared_inclusive_input_total",
+            "description": "A custom/embedded client explicitly declares its `input_tokens` field\nas an inclusive presented-input total. This is never inferred from\ncache detail fields.",
+            "type": "string"
+          }
+        ]
+      },
       "PromptText": {
         "properties": {
           "content": {
@@ -1340,6 +1374,38 @@
             "type": "object"
           }
         ]
+      },
+      "ProviderTokenAccounting": {
+        "additionalProperties": false,
+        "description": "One provider adapter's normalized accounting for a single model turn.",
+        "properties": {
+          "aggregation": {
+            "$ref": "#/$defs/TokenAggregationProvenance"
+          },
+          "convention": {
+            "$ref": "#/$defs/PresentedTokenConvention"
+          },
+          "model": {
+            "type": "string"
+          },
+          "presented_tokens": {
+            "description": "Tokens presented to the model for this request. Output tokens are not\nincluded.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "presented_tokens",
+          "convention",
+          "aggregation"
+        ],
+        "type": "object"
       },
       "RevisedPromptDisposition": {
         "oneOf": [
@@ -1954,6 +2020,21 @@
         ],
         "type": "object"
       },
+      "TokenAggregationProvenance": {
+        "description": "How the provider adapter obtained the normalized presented-token total.",
+        "oneOf": [
+          {
+            "const": "sum_disjoint_provider_components",
+            "description": "Sum of provider-documented disjoint input components.",
+            "type": "string"
+          },
+          {
+            "const": "provider_inclusive_input_total",
+            "description": "Provider-issued inclusive prompt/input total copied without adding\ncache detail fields.",
+            "type": "string"
+          }
+        ]
+      },
       "ToolCallArguments": {
         "additionalProperties": true,
         "type": "object"
@@ -2426,6 +2507,57 @@
         ],
         "type": "string"
       },
+      "TurnUsage": {
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "properties": {
+          "accounting": {
+            "$ref": "#/$defs/ProviderTokenAccounting"
+          },
+          "cache_creation_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cache_read_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider_accounting": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProviderTokenAccounting"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider-authored normalized input accounting for one model turn.\n\nCumulative usage intentionally leaves this `None`: an aggregate may\nspan providers and models and therefore cannot truthfully carry one\nper-turn convention. Shared policy reads [`Usage::presented_tokens`]\non turn usage and never interprets cache detail fields directly."
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "accounting"
+        ],
+        "type": "object"
+      },
       "Usage": {
         "description": "Token usage statistics",
         "properties": {
@@ -2454,6 +2586,17 @@
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          },
+          "provider_accounting": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProviderTokenAccounting"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider-authored normalized input accounting for one model turn.\n\nCumulative usage intentionally leaves this `None`: an aggregate may\nspan providers and models and therefore cannot truthfully carry one\nper-turn convention. Shared policy reads [`Usage::presented_tokens`]\non turn usage and never interprets cache detail fields directly."
           }
         },
         "required": [
@@ -2520,7 +2663,7 @@
             "type": "string"
           },
           "usage": {
-            "$ref": "#/$defs/Usage"
+            "$ref": "#/$defs/CumulativeUsage"
           }
         },
         "required": [
@@ -2924,7 +3067,7 @@
             "type": "string"
           },
           "usage": {
-            "$ref": "#/$defs/Usage"
+            "$ref": "#/$defs/TurnUsage"
           }
         },
         "required": [
@@ -3885,7 +4028,7 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/$defs/Usage"
+                "$ref": "#/$defs/CumulativeUsage"
               }
             },
             "required": [
@@ -4289,7 +4432,7 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/$defs/Usage"
+                "$ref": "#/$defs/TurnUsage"
               }
             },
             "required": [
@@ -5236,6 +5379,10 @@
         ],
         "description": "Input content that can be either a plain text string or multimodal content blocks.\n\nDeserializes from either `\"text\"` or `[{type: \"text\", text: \"...\"}, ...]`.\nProvides `From<String>` and `From<&str>` for ergonomic construction."
       },
+      "CumulativeUsage": {
+        "$ref": "#/$defs/Usage",
+        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific."
+      },
       "DeferredCatalogDelta": {
         "description": "Additive hidden-catalog delta metadata for runtime notices.",
         "properties": {
@@ -5712,6 +5859,36 @@
         ],
         "type": "object"
       },
+      "PresentedTokenConvention": {
+        "description": "Provider-native convention used to normalize tokens presented to a model.",
+        "oneOf": [
+          {
+            "const": "anthropic_disjoint_input_components",
+            "description": "Anthropic reports uncached, cache-write, and cache-read input as\ndisjoint components. The normalized total is their saturating sum.",
+            "type": "string"
+          },
+          {
+            "const": "open_ai_input_includes_cached_subset",
+            "description": "OpenAI prompt/input tokens already include the cached-token subset.",
+            "type": "string"
+          },
+          {
+            "const": "gemini_prompt_includes_cached_subset",
+            "description": "Gemini prompt tokens already include the cached-content subset.",
+            "type": "string"
+          },
+          {
+            "const": "open_ai_compatible_prompt_includes_cache_details",
+            "description": "OpenAI-compatible prompt tokens are treated as the provider's inclusive\nprompt total; cache detail fields are observational subsets only.",
+            "type": "string"
+          },
+          {
+            "const": "host_declared_inclusive_input_total",
+            "description": "A custom/embedded client explicitly declares its `input_tokens` field\nas an inclusive presented-input total. This is never inferred from\ncache detail fields.",
+            "type": "string"
+          }
+        ]
+      },
       "PromptText": {
         "properties": {
           "content": {
@@ -5775,6 +5952,38 @@
             "type": "object"
           }
         ]
+      },
+      "ProviderTokenAccounting": {
+        "additionalProperties": false,
+        "description": "One provider adapter's normalized accounting for a single model turn.",
+        "properties": {
+          "aggregation": {
+            "$ref": "#/$defs/TokenAggregationProvenance"
+          },
+          "convention": {
+            "$ref": "#/$defs/PresentedTokenConvention"
+          },
+          "model": {
+            "type": "string"
+          },
+          "presented_tokens": {
+            "description": "Tokens presented to the model for this request. Output tokens are not\nincluded.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "presented_tokens",
+          "convention",
+          "aggregation"
+        ],
+        "type": "object"
       },
       "RevisedPromptDisposition": {
         "oneOf": [
@@ -6432,6 +6641,21 @@
         ],
         "type": "object"
       },
+      "TokenAggregationProvenance": {
+        "description": "How the provider adapter obtained the normalized presented-token total.",
+        "oneOf": [
+          {
+            "const": "sum_disjoint_provider_components",
+            "description": "Sum of provider-documented disjoint input components.",
+            "type": "string"
+          },
+          {
+            "const": "provider_inclusive_input_total",
+            "description": "Provider-issued inclusive prompt/input total copied without adding\ncache detail fields.",
+            "type": "string"
+          }
+        ]
+      },
       "ToolCallArguments": {
         "additionalProperties": true,
         "type": "object"
@@ -6904,6 +7128,57 @@
         ],
         "type": "string"
       },
+      "TurnUsage": {
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "properties": {
+          "accounting": {
+            "$ref": "#/$defs/ProviderTokenAccounting"
+          },
+          "cache_creation_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cache_read_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider_accounting": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProviderTokenAccounting"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider-authored normalized input accounting for one model turn.\n\nCumulative usage intentionally leaves this `None`: an aggregate may\nspan providers and models and therefore cannot truthfully carry one\nper-turn convention. Shared policy reads [`Usage::presented_tokens`]\non turn usage and never interprets cache detail fields directly."
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "accounting"
+        ],
+        "type": "object"
+      },
       "Usage": {
         "description": "Token usage statistics",
         "properties": {
@@ -6932,6 +7207,17 @@
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          },
+          "provider_accounting": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProviderTokenAccounting"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider-authored normalized input accounting for one model turn.\n\nCumulative usage intentionally leaves this `None`: an aggregate may\nspan providers and models and therefore cannot truthfully carry one\nper-turn convention. Shared policy reads [`Usage::presented_tokens`]\non turn usage and never interprets cache detail fields directly."
           }
         },
         "required": [

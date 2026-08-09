@@ -1501,7 +1501,17 @@ pub trait CoreExecutorBoundaryHandle: Send + Sync {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait CoreExecutorInterruptHandle: Send + Sync {
-    async fn hard_cancel_current_run(&self, reason: String) -> Result<(), CoreExecutorError>;
+    /// Hard-cancel one exact active run.
+    ///
+    /// Implementations must compare `expected_run_id` at the same actor-local
+    /// serialization boundary that publishes the interrupt. `false` means the
+    /// run already became non-current; an implementation must never widen a
+    /// stale request to the ambient successor run.
+    async fn hard_cancel_run_if_current(
+        &self,
+        expected_run_id: &RunId,
+        reason: String,
+    ) -> Result<bool, CoreExecutorError>;
 }
 
 /// Cloneable capability for exact durable interaction-terminal publication.

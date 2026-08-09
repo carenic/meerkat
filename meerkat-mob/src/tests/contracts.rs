@@ -589,7 +589,13 @@ async fn contract_mob_002_peer_request_response_round_trip() {
     );
 
     // Sender drains inbox and sees the response
-    let sender_interactions = CoreCommsRuntime::drain_inbox_interactions(sender.as_ref()).await;
+    let sender_interactions =
+        CoreCommsRuntime::handoff_volatile_peer_input_candidates(sender.as_ref())
+            .await
+            .expect("exact volatile response handoff")
+            .into_iter()
+            .map(|candidate| candidate.interaction)
+            .collect::<Vec<_>>();
     assert_eq!(
         sender_interactions.len(),
         1,
@@ -1345,7 +1351,7 @@ async fn contract_mob_006_generated_trust_gates_peer_discovery() {
     let peer_pubkey = _peer.public_key();
     meerkat_comms::InprocRegistry::global().unregister(&peer_pubkey);
 
-    let (_, inbox_sender) = meerkat_comms::Inbox::new();
+    let (_, inbox_sender) = meerkat_comms::Inbox::new_transport_only();
     meerkat_comms::InprocRegistry::global().register_with_meta_in_namespace(
         &ns,
         &peer_name,

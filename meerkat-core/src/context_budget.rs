@@ -87,6 +87,11 @@ pub struct ContextBudgetFact {
     /// synchronously before dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_issued_input_tokens: Option<u64>,
+    /// Explicit identity of the fully lowered body whose pressure was
+    /// observed. This remains observational unless accompanied by an exact
+    /// provider-issued token count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lowered_request_provenance: Option<crate::LoweredRequestProvenance>,
 }
 
 impl ContextBudgetFact {
@@ -135,7 +140,7 @@ pub fn context_budget_fact_for_session(
     active_model_profile: &ModelProfileWitness,
 ) -> Result<ContextBudgetFact, ContextBudgetFactError> {
     context_budget_fact_for_messages(
-        session.messages(),
+        &session.messages_for_model_boundary(),
         visible_tools,
         reserved_output_tokens,
         active_model_profile,
@@ -256,6 +261,8 @@ fn context_budget_fact_for_messages_with_pressure(
         provider_lowered_encoded_bytes: provider_request_pressure
             .map(|pressure| pressure.encoded_bytes),
         provider_issued_input_tokens,
+        lowered_request_provenance: provider_request_pressure
+            .and_then(|pressure| pressure.lowered_request_provenance),
     })
 }
 

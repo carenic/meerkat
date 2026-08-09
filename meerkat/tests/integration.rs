@@ -1002,6 +1002,7 @@ mod combined {
             output_tokens: 50,
             cache_creation_tokens: None,
             cache_read_tokens: None,
+            provider_accounting: None,
         };
         session.push(Message::BlockAssistant(BlockAssistantMessage {
             blocks: vec![AssistantBlock::ToolUse {
@@ -1017,7 +1018,7 @@ mod combined {
             identity: TranscriptMessageIdentity::default(),
             created_at: meerkat_core::types::message_timestamp_now(),
         }));
-        session.record_usage(first_usage);
+        session.record_cumulative_usage(first_usage);
 
         session.push(Message::tool_results(vec![ToolResult::new(
             "tc_1".to_string(),
@@ -1030,6 +1031,7 @@ mod combined {
             output_tokens: 75,
             cache_creation_tokens: None,
             cache_read_tokens: None,
+            provider_accounting: None,
         };
         session.push(Message::BlockAssistant(BlockAssistantMessage {
             blocks: vec![AssistantBlock::Text {
@@ -1040,7 +1042,7 @@ mod combined {
             identity: TranscriptMessageIdentity::default(),
             created_at: meerkat_core::types::message_timestamp_now(),
         }));
-        session.record_usage(second_usage);
+        session.record_cumulative_usage(second_usage);
 
         // Verify session state
         assert_eq!(session.messages().len(), 4);
@@ -1058,9 +1060,14 @@ mod combined {
             output_tokens: 100,
             cache_creation_tokens: None,
             cache_read_tokens: None,
+            provider_accounting: None,
         };
 
-        budget.record_usage(&usage);
+        budget.record_turn_usage(&meerkat_core::TurnUsage::host_declared(
+            meerkat_core::Provider::Other,
+            "integration-test",
+            usage,
+        ));
         assert_eq!(budget.token_usage(), Some((300, 1000)));
         assert_eq!(budget.remaining_tokens(), Some(700));
     }

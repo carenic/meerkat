@@ -996,7 +996,7 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/$defs/Usage"
+                "$ref": "#/$defs/CumulativeUsage"
               }
             },
             "required": [
@@ -1400,7 +1400,7 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/$defs/Usage"
+                "$ref": "#/$defs/TurnUsage"
               }
             },
             "required": [
@@ -6090,6 +6090,10 @@
         ],
         "description": "Input content that can be either a plain text string or multimodal content blocks.\n\nDeserializes from either `\"text\"` or `[{type: \"text\", text: \"...\"}, ...]`.\nProvides `From<String>` and `From<&str>` for ergonomic construction."
       },
+      "CumulativeUsage": {
+        "$ref": "#/$defs/Usage",
+        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific."
+      },
       "CustomModelConfig": {
         "additionalProperties": false,
         "description": "User-defined model registry entry (`[models.<id>]` in `config.toml` or a\nmob definition).\n\nDeclares an uncatalogued model that an API provider serves so a single\ndefinition feeds provider inference, compaction scaling, capability gates,\nand call timeouts through the effective [`crate::ModelRegistry`].\n\nCapability flags are conservative when omitted: an undeclared capability is\ntreated as absent rather than guessed from the model name.",
@@ -8049,6 +8053,36 @@
         },
         "type": "object"
       },
+      "PresentedTokenConvention": {
+        "description": "Provider-native convention used to normalize tokens presented to a model.",
+        "oneOf": [
+          {
+            "const": "anthropic_disjoint_input_components",
+            "description": "Anthropic reports uncached, cache-write, and cache-read input as\ndisjoint components. The normalized total is their saturating sum.",
+            "type": "string"
+          },
+          {
+            "const": "open_ai_input_includes_cached_subset",
+            "description": "OpenAI prompt/input tokens already include the cached-token subset.",
+            "type": "string"
+          },
+          {
+            "const": "gemini_prompt_includes_cached_subset",
+            "description": "Gemini prompt tokens already include the cached-content subset.",
+            "type": "string"
+          },
+          {
+            "const": "open_ai_compatible_prompt_includes_cache_details",
+            "description": "OpenAI-compatible prompt tokens are treated as the provider's inclusive\nprompt total; cache detail fields are observational subsets only.",
+            "type": "string"
+          },
+          {
+            "const": "host_declared_inclusive_input_total",
+            "description": "A custom/embedded client explicitly declares its `input_tokens` field\nas an inclusive presented-input total. This is never inferred from\ncache detail fields.",
+            "type": "string"
+          }
+        ]
+      },
       "ProfileId": {
         "description": "Opaque slug identifying an auth profile override on a connection.",
         "type": "string"
@@ -8116,6 +8150,38 @@
             "type": "object"
           }
         ]
+      },
+      "ProviderTokenAccounting": {
+        "additionalProperties": false,
+        "description": "One provider adapter's normalized accounting for a single model turn.",
+        "properties": {
+          "aggregation": {
+            "$ref": "#/$defs/TokenAggregationProvenance"
+          },
+          "convention": {
+            "$ref": "#/$defs/PresentedTokenConvention"
+          },
+          "model": {
+            "type": "string"
+          },
+          "presented_tokens": {
+            "description": "Tokens presented to the model for this request. Output tokens are not\nincluded.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "presented_tokens",
+          "convention",
+          "aggregation"
+        ],
+        "type": "object"
       },
       "PublicTurnToolOverlay": {
         "additionalProperties": false,
@@ -9165,6 +9231,33 @@
         ],
         "type": "object"
       },
+      "SystemPromptKey": {
+        "description": "Stable host-chosen identity for one replaceable system-prompt slot.\n\nThe key is domain identity, not an idempotency token. Every explicit\nupdate for the same key advances its [`SystemPromptVersion`], while\nunrelated ordinary System messages remain unkeyed ordered transcript\nevents.",
+        "type": "string"
+      },
+      "SystemPromptVersion": {
+        "description": "Monotonic version of one keyed system-prompt slot.\n\nVersion zero is unrepresentable. A host's first explicit adoption or\nreplacement mints version one; later explicit updates increment it.",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "SystemPromptVersionIdentity": {
+        "additionalProperties": false,
+        "description": "Typed identity carried by one durable versioned System row.",
+        "properties": {
+          "key": {
+            "$ref": "#/$defs/SystemPromptKey"
+          },
+          "version": {
+            "$ref": "#/$defs/SystemPromptVersion"
+          }
+        },
+        "required": [
+          "key",
+          "version"
+        ],
+        "type": "object"
+      },
       "SystemTime": {
         "properties": {
           "nanos_since_epoch": {
@@ -9183,6 +9276,21 @@
           "nanos_since_epoch"
         ],
         "type": "object"
+      },
+      "TokenAggregationProvenance": {
+        "description": "How the provider adapter obtained the normalized presented-token total.",
+        "oneOf": [
+          {
+            "const": "sum_disjoint_provider_components",
+            "description": "Sum of provider-documented disjoint input components.",
+            "type": "string"
+          },
+          {
+            "const": "provider_inclusive_input_total",
+            "description": "Provider-issued inclusive prompt/input total copied without adding\ncache detail fields.",
+            "type": "string"
+          }
+        ]
       },
       "ToolCallArguments": {
         "additionalProperties": true,
@@ -9681,6 +9789,57 @@
         ],
         "type": "string"
       },
+      "TurnUsage": {
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "properties": {
+          "accounting": {
+            "$ref": "#/$defs/ProviderTokenAccounting"
+          },
+          "cache_creation_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cache_read_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider_accounting": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProviderTokenAccounting"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider-authored normalized input accounting for one model turn.\n\nCumulative usage intentionally leaves this `None`: an aggregate may\nspan providers and models and therefore cannot truthfully carry one\nper-turn convention. Shared policy reads [`Usage::presented_tokens`]\non turn usage and never interprets cache detail fields directly."
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "accounting"
+        ],
+        "type": "object"
+      },
       "Usage": {
         "description": "Token usage statistics",
         "properties": {
@@ -9709,6 +9868,17 @@
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          },
+          "provider_accounting": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProviderTokenAccounting"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider-authored normalized input accounting for one model turn.\n\nCumulative usage intentionally leaves this `None`: an aggregate may\nspan providers and models and therefore cannot truthfully carry one\nper-turn convention. Shared policy reads [`Usage::presented_tokens`]\non turn usage and never interprets cache detail fields directly."
           }
         },
         "required": [
@@ -9721,7 +9891,15 @@
         "enum": [
           "disabled",
           "automatic",
-          "system_prefix"
+          "system_prefix",
+          "system_and_conversation"
+        ],
+        "type": "string"
+      },
+      "WireAnthropicCacheTtl": {
+        "enum": [
+          "5m",
+          "1h"
         ],
         "type": "string"
       },
@@ -11367,6 +11545,16 @@
                   }
                 ]
               },
+              "cache_ttl": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/WireAnthropicCacheTtl"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
               "compaction": {
                 "anyOf": [
                   {
@@ -11842,6 +12030,17 @@
                   }
                 ],
                 "description": "Optional exact control-ingress identity carried by this durable\ntranscript message. Provider adapters ignore it."
+              },
+              "prompt_version": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SystemPromptVersionIdentity"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Typed replacement-slot identity. Historical versions remain\nvisible on history/revision reads even though model materialization\nselects only the latest version for each key."
               },
               "role": {
                 "const": "system",
@@ -12638,6 +12837,26 @@
           {
             "const": "system_prefix",
             "description": "Mark the stable top-level system prompt as an ephemeral cache prefix.",
+            "type": "string"
+          },
+          {
+            "const": "system_and_conversation",
+            "description": "Mark the stable system/profile prefix and up to three recent\nconversation boundaries. This is explicit provider authoring, not a\nprocess-wide cache default.",
+            "type": "string"
+          }
+        ]
+      },
+      "AnthropicCacheTtl": {
+        "description": "Anthropic prompt-cache TTL selected per agent/profile.",
+        "oneOf": [
+          {
+            "const": "5m",
+            "description": "Provider-default five-minute cache lifetime.",
+            "type": "string"
+          },
+          {
+            "const": "1h",
+            "description": "One-hour cache lifetime for sufficiently frequent profiles.",
             "type": "string"
           }
         ]
@@ -13669,6 +13888,17 @@
                   }
                 ],
                 "description": "Prompt-cache breakpoint policy."
+              },
+              "cache_ttl": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AnthropicCacheTtl"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Prompt-cache lifetime. Effective only when this profile explicitly\nenables a cache-control policy."
               },
               "compaction": {
                 "anyOf": [
@@ -15928,6 +16158,33 @@
         ],
         "type": "object"
       },
+      "SystemPromptKey": {
+        "description": "Stable host-chosen identity for one replaceable system-prompt slot.\n\nThe key is domain identity, not an idempotency token. Every explicit\nupdate for the same key advances its [`SystemPromptVersion`], while\nunrelated ordinary System messages remain unkeyed ordered transcript\nevents.",
+        "type": "string"
+      },
+      "SystemPromptVersion": {
+        "description": "Monotonic version of one keyed system-prompt slot.\n\nVersion zero is unrepresentable. A host's first explicit adoption or\nreplacement mints version one; later explicit updates increment it.",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "SystemPromptVersionIdentity": {
+        "additionalProperties": false,
+        "description": "Typed identity carried by one durable versioned System row.",
+        "properties": {
+          "key": {
+            "$ref": "#/$defs/SystemPromptKey"
+          },
+          "version": {
+            "$ref": "#/$defs/SystemPromptVersion"
+          }
+        },
+        "required": [
+          "key",
+          "version"
+        ],
+        "type": "object"
+      },
       "ToolConfigChangeDomain": {
         "description": "Optional typed domain for tool-configuration change payloads.",
         "enum": [
@@ -16123,6 +16380,17 @@
                   "string",
                   "null"
                 ]
+              },
+              "prompt_version": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SystemPromptVersionIdentity"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Existing typed prompt-version identity for exact-row reuse.\n\nThe core generic-rewrite authority accepts this only when the full\nSystem row already exists in the current or retained lineage. New\nversions remain mintable only through `update_system_prompt`."
               },
               "role": {
                 "const": "system",
@@ -19920,7 +20188,15 @@
         "enum": [
           "disabled",
           "automatic",
-          "system_prefix"
+          "system_prefix",
+          "system_and_conversation"
+        ],
+        "type": "string"
+      },
+      "WireAnthropicCacheTtl": {
+        "enum": [
+          "5m",
+          "1h"
         ],
         "type": "string"
       },
@@ -20412,6 +20688,16 @@
                 "anyOf": [
                   {
                     "$ref": "#/$defs/WireAnthropicCacheControlPolicy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "cache_ttl": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/WireAnthropicCacheTtl"
                   },
                   {
                     "type": "null"
@@ -22805,7 +23091,15 @@
         "enum": [
           "disabled",
           "automatic",
-          "system_prefix"
+          "system_prefix",
+          "system_and_conversation"
+        ],
+        "type": "string"
+      },
+      "WireAnthropicCacheTtl": {
+        "enum": [
+          "5m",
+          "1h"
         ],
         "type": "string"
       },
@@ -23128,6 +23422,16 @@
                 "anyOf": [
                   {
                     "$ref": "#/$defs/WireAnthropicCacheControlPolicy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "cache_ttl": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/WireAnthropicCacheTtl"
                   },
                   {
                     "type": "null"
@@ -23801,7 +24105,15 @@
         "enum": [
           "disabled",
           "automatic",
-          "system_prefix"
+          "system_prefix",
+          "system_and_conversation"
+        ],
+        "type": "string"
+      },
+      "WireAnthropicCacheTtl": {
+        "enum": [
+          "5m",
+          "1h"
         ],
         "type": "string"
       },
@@ -24124,6 +24436,16 @@
                 "anyOf": [
                   {
                     "$ref": "#/$defs/WireAnthropicCacheControlPolicy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "cache_ttl": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/WireAnthropicCacheTtl"
                   },
                   {
                     "type": "null"
@@ -25778,7 +26100,15 @@
         "enum": [
           "disabled",
           "automatic",
-          "system_prefix"
+          "system_prefix",
+          "system_and_conversation"
+        ],
+        "type": "string"
+      },
+      "WireAnthropicCacheTtl": {
+        "enum": [
+          "5m",
+          "1h"
         ],
         "type": "string"
       },
@@ -26551,6 +26881,16 @@
                 "anyOf": [
                   {
                     "$ref": "#/$defs/WireAnthropicCacheControlPolicy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "cache_ttl": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/WireAnthropicCacheTtl"
                   },
                   {
                     "type": "null"
@@ -27692,7 +28032,15 @@
         "enum": [
           "disabled",
           "automatic",
-          "system_prefix"
+          "system_prefix",
+          "system_and_conversation"
+        ],
+        "type": "string"
+      },
+      "WireAnthropicCacheTtl": {
+        "enum": [
+          "5m",
+          "1h"
         ],
         "type": "string"
       },
@@ -28187,6 +28535,16 @@
                 "anyOf": [
                   {
                     "$ref": "#/$defs/WireAnthropicCacheControlPolicy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "cache_ttl": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/WireAnthropicCacheTtl"
                   },
                   {
                     "type": "null"
@@ -30024,6 +30382,33 @@
         ],
         "type": "object"
       },
+      "SystemPromptKey": {
+        "description": "Stable host-chosen identity for one replaceable system-prompt slot.\n\nThe key is domain identity, not an idempotency token. Every explicit\nupdate for the same key advances its [`SystemPromptVersion`], while\nunrelated ordinary System messages remain unkeyed ordered transcript\nevents.",
+        "type": "string"
+      },
+      "SystemPromptVersion": {
+        "description": "Monotonic version of one keyed system-prompt slot.\n\nVersion zero is unrepresentable. A host's first explicit adoption or\nreplacement mints version one; later explicit updates increment it.",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "SystemPromptVersionIdentity": {
+        "additionalProperties": false,
+        "description": "Typed identity carried by one durable versioned System row.",
+        "properties": {
+          "key": {
+            "$ref": "#/$defs/SystemPromptKey"
+          },
+          "version": {
+            "$ref": "#/$defs/SystemPromptVersion"
+          }
+        },
+        "required": [
+          "key",
+          "version"
+        ],
+        "type": "object"
+      },
       "ToolConfigChangeDomain": {
         "description": "Optional typed domain for tool-configuration change payloads.",
         "enum": [
@@ -30240,6 +30625,17 @@
                   "string",
                   "null"
                 ]
+              },
+              "prompt_version": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SystemPromptVersionIdentity"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Existing typed prompt-version identity for exact-row reuse.\n\nThe core generic-rewrite authority accepts this only when the full\nSystem row already exists in the current or retained lineage. New\nversions remain mintable only through `update_system_prompt`."
               },
               "role": {
                 "const": "system",
@@ -31831,6 +32227,289 @@
     "title": "SkillsParams",
     "type": "object"
   },
+  "SystemPromptUpdateResult": {
+    "$defs": {
+      "CompactionRewriteRange": {
+        "additionalProperties": false,
+        "description": "Opaque range carried by the typed compaction rewrite semantic.",
+        "properties": {
+          "end": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "start",
+          "end"
+        ],
+        "type": "object"
+      },
+      "SessionId": {
+        "description": "Unique identifier for a session (UUID v7 for time-ordering)",
+        "type": "string"
+      },
+      "SystemPromptKey": {
+        "description": "Stable host-chosen identity for one replaceable system-prompt slot.\n\nThe key is domain identity, not an idempotency token. Every explicit\nupdate for the same key advances its [`SystemPromptVersion`], while\nunrelated ordinary System messages remain unkeyed ordered transcript\nevents.",
+        "type": "string"
+      },
+      "SystemPromptUpdateStatus": {
+        "description": "Whether an explicit prompt-update call minted a new version.",
+        "enum": [
+          "applied",
+          "duplicate"
+        ],
+        "type": "string"
+      },
+      "SystemPromptVersion": {
+        "description": "Monotonic version of one keyed system-prompt slot.\n\nVersion zero is unrepresentable. A host's first explicit adoption or\nreplacement mints version one; later explicit updates increment it.",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "SystemTime": {
+        "properties": {
+          "nanos_since_epoch": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "secs_since_epoch": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "secs_since_epoch",
+          "nanos_since_epoch"
+        ],
+        "type": "object"
+      },
+      "TranscriptEditRewriteRange": {
+        "additionalProperties": false,
+        "description": "Opaque current-format range carried by an ordinary transcript edit.",
+        "properties": {
+          "end": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "start",
+          "end"
+        ],
+        "type": "object"
+      },
+      "TranscriptRewriteCommit": {
+        "additionalProperties": false,
+        "description": "Immutable rewrite commit that advances a session transcript head.",
+        "properties": {
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "committed_at": {
+            "$ref": "#/$defs/SystemTime"
+          },
+          "messages_after": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "messages_before": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "original_span_digest": {
+            "description": "Audit label for the removed semantic span. Exact selection coordinates\nand row lineage are structural authority; this digest is checked on\ntargeted/final semantic materialization.",
+            "type": "string"
+          },
+          "parent_revision": {
+            "description": "Content-addressed audit label for the occurrence parent.\n\nStructural continuity is owned by the occurrence generation, compact\nparent advance, exact row lineage, and graph prefix. This semantic\nlabel is re-proved when the targeted parent is materialized; ordinary\nappend/commit validation never re-hashes every historical body.",
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/$defs/TranscriptRewriteReason"
+          },
+          "replacement_digest": {
+            "type": "string"
+          },
+          "revision": {
+            "description": "Content-addressed audit label for the occurrence result, with the same\nlazy semantic-replay contract as [`Self::parent_revision`].",
+            "type": "string"
+          },
+          "rewrite_generation": {
+            "description": "Serialized occurrence identity within one session's rewrite lineage.\n\nRevision strings identify content, not occurrences: a legitimate\nrewrite can return to earlier content, and two occurrences can even\ncarry byte-identical facts under a fixed/coarse clock. Current writers\ntherefore mint a strict contiguous `1..=n` generation. `0` exists only\nas the decode marker for 0.8.10 audit rows/graphs, which are normalized\nas an ordered set before they can enter current authority.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "selection": {
+            "$ref": "#/$defs/TranscriptRewriteSelection"
+          }
+        },
+        "required": [
+          "parent_revision",
+          "revision",
+          "selection",
+          "original_span_digest",
+          "replacement_digest",
+          "messages_before",
+          "messages_after",
+          "reason",
+          "committed_at"
+        ],
+        "type": "object"
+      },
+      "TranscriptRewriteReason": {
+        "additionalProperties": false,
+        "description": "Audit annotation carried with a transcript rewrite commit.\n\nThe free-form kind is for review, debugging, and provenance only. It never\nclassifies a rewrite as compaction; [`TranscriptRewriteSelection`] owns that\nsemantic through its opaque typed compaction range.",
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "TranscriptRewriteSelection": {
+        "description": "A concrete transcript span selected for same-session rewrite.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "Pre-semantic-marker range retained for source/API compatibility and\ndecoding prior durable records. New commits canonicalize this input to\n[`TranscriptRewriteSelection::EditMessageRange`] before persistence.",
+            "properties": {
+              "end": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "start": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": {
+                "const": "message_range",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "start",
+              "end"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Current typed ordinary-edit semantic.",
+            "properties": {
+              "range": {
+                "$ref": "#/$defs/TranscriptEditRewriteRange"
+              },
+              "type": {
+                "const": "edit_message_range",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "range"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Replace a full transcript from a core-validated compaction rebuild.\n\nThe range payload has no public constructor. New values are minted only\nby the validated compaction path; deserialization exists solely for the\ndurable transcript graph and is revalidated against its retained bodies.",
+            "properties": {
+              "range": {
+                "$ref": "#/$defs/CompactionRewriteRange"
+              },
+              "type": {
+                "const": "compaction_message_range",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "range"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Durable result of a keyed prompt update.",
+    "properties": {
+      "commit": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/TranscriptRewriteCommit"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "key": {
+        "$ref": "#/$defs/SystemPromptKey"
+      },
+      "message_index": {
+        "format": "uint",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "session_id": {
+        "$ref": "#/$defs/SessionId"
+      },
+      "status": {
+        "$ref": "#/$defs/SystemPromptUpdateStatus"
+      },
+      "transcript_revision": {
+        "description": "Current transcript revision after the operation. An exact duplicate\nreports the already-current revision without minting another commit.",
+        "type": "string"
+      },
+      "version": {
+        "$ref": "#/$defs/SystemPromptVersion"
+      }
+    },
+    "required": [
+      "session_id",
+      "key",
+      "version",
+      "message_index",
+      "status",
+      "transcript_revision"
+    ],
+    "title": "SystemPromptUpdateResult",
+    "type": "object"
+  },
   "ToolsRegisterParams": {
     "$defs": {
       "CallbackToolDefinition": {
@@ -31986,6 +32665,26 @@
           {
             "const": "system_prefix",
             "description": "Mark the stable top-level system prompt as an ephemeral cache prefix.",
+            "type": "string"
+          },
+          {
+            "const": "system_and_conversation",
+            "description": "Mark the stable system/profile prefix and up to three recent\nconversation boundaries. This is explicit provider authoring, not a\nprocess-wide cache default.",
+            "type": "string"
+          }
+        ]
+      },
+      "AnthropicCacheTtl": {
+        "description": "Anthropic prompt-cache TTL selected per agent/profile.",
+        "oneOf": [
+          {
+            "const": "5m",
+            "description": "Provider-default five-minute cache lifetime.",
+            "type": "string"
+          },
+          {
+            "const": "1h",
+            "description": "One-hour cache lifetime for sufficiently frequent profiles.",
             "type": "string"
           }
         ]
@@ -33017,6 +33716,17 @@
                   }
                 ],
                 "description": "Prompt-cache breakpoint policy."
+              },
+              "cache_ttl": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AnthropicCacheTtl"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Prompt-cache lifetime. Effective only when this profile explicitly\nenables a cache-control policy."
               },
               "compaction": {
                 "anyOf": [
@@ -34219,6 +34929,26 @@
             "const": "system_prefix",
             "description": "Mark the stable top-level system prompt as an ephemeral cache prefix.",
             "type": "string"
+          },
+          {
+            "const": "system_and_conversation",
+            "description": "Mark the stable system/profile prefix and up to three recent\nconversation boundaries. This is explicit provider authoring, not a\nprocess-wide cache default.",
+            "type": "string"
+          }
+        ]
+      },
+      "AnthropicCacheTtl": {
+        "description": "Anthropic prompt-cache TTL selected per agent/profile.",
+        "oneOf": [
+          {
+            "const": "5m",
+            "description": "Provider-default five-minute cache lifetime.",
+            "type": "string"
+          },
+          {
+            "const": "1h",
+            "description": "One-hour cache lifetime for sufficiently frequent profiles.",
+            "type": "string"
           }
         ]
       },
@@ -35249,6 +35979,17 @@
                   }
                 ],
                 "description": "Prompt-cache breakpoint policy."
+              },
+              "cache_ttl": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AnthropicCacheTtl"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Prompt-cache lifetime. Effective only when this profile explicitly\nenables a cache-control policy."
               },
               "compaction": {
                 "anyOf": [
@@ -36424,6 +37165,71 @@
       }
     },
     "title": "UpdateScheduleRequest",
+    "type": "object"
+  },
+  "UpdateSystemPromptParams": {
+    "$defs": {
+      "SystemPromptKey": {
+        "description": "Stable host-chosen identity for one replaceable system-prompt slot.\n\nThe key is domain identity, not an idempotency token. Every explicit\nupdate for the same key advances its [`SystemPromptVersion`], while\nunrelated ordinary System messages remain unkeyed ordered transcript\nevents.",
+        "type": "string"
+      },
+      "SystemPromptVersion": {
+        "description": "Monotonic version of one keyed system-prompt slot.\n\nVersion zero is unrepresentable. A host's first explicit adoption or\nreplacement mints version one; later explicit updates increment it.",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request payload for `session/update_system_prompt`.\n\nUnlike a generic transcript rewrite, this operation can only mint the next\nversion of one typed prompt key. `target_message_index` is required only\nfor the first explicit adoption of an existing unversioned System row.",
+    "properties": {
+      "actor": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "content": {
+        "type": "string"
+      },
+      "expected_parent_revision": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "expected_version": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SystemPromptVersion"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "key": {
+        "$ref": "#/$defs/SystemPromptKey"
+      },
+      "session_id": {
+        "type": "string"
+      },
+      "target_message_index": {
+        "format": "uint",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "session_id",
+      "key",
+      "content"
+    ],
+    "title": "UpdateSystemPromptParams",
     "type": "object"
   },
   "WorkGraphEventFilter": {

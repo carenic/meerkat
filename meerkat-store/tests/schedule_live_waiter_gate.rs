@@ -91,10 +91,25 @@ async fn claim_and_dispatch(
     owner_id: &str,
     lease: Duration,
 ) -> Occurrence {
+    let executor_lease = match store
+        .acquire_executor_lease(meerkat_schedule::AcquireScheduleExecutorLeaseRequest {
+            owner_id: "live-waiter-test-executor".into(),
+            lease_duration: Duration::minutes(5),
+        })
+        .await
+        .expect("acquire executor lease")
+    {
+        meerkat_schedule::AcquireScheduleExecutorLeaseOutcome::Acquired(value) => value,
+        meerkat_schedule::AcquireScheduleExecutorLeaseOutcome::Busy { .. } => unreachable!(),
+    };
     let claimed = store
-        .claim_due_occurrences(claim_request(owner_id, lease))
+        .claim_due_occurrences(&executor_lease, claim_request(owner_id, lease))
         .await
         .expect("claim due occurrences");
+    store
+        .release_executor_lease(executor_lease)
+        .await
+        .expect("release executor lease after claim");
     let claim_commit = claimed
         .transitions
         .into_iter()
@@ -212,8 +227,22 @@ async fn sqlite_lease_renewal_is_multi_host_and_exact_claim_authoritative() {
     // Past the original expiry but before the renewed expiry, another host's
     // claim scan must observe the durable extension and leave attempt 1 live.
     tokio::time::sleep(std::time::Duration::from_millis(240)).await;
+    let executor_lease = match host_a
+        .acquire_executor_lease(meerkat_schedule::AcquireScheduleExecutorLeaseRequest {
+            owner_id: "live-waiter-test-executor".into(),
+            lease_duration: Duration::minutes(5),
+        })
+        .await
+        .expect("reacquire executor lease")
+    {
+        meerkat_schedule::AcquireScheduleExecutorLeaseOutcome::Acquired(lease) => lease,
+        meerkat_schedule::AcquireScheduleExecutorLeaseOutcome::Busy { .. } => unreachable!(),
+    };
     let before_renewed_expiry = host_a
-        .claim_due_occurrences(claim_request("host-a", Duration::milliseconds(200)))
+        .claim_due_occurrences(
+            &executor_lease,
+            claim_request("host-a", Duration::milliseconds(200)),
+        )
         .await
         .expect("claim scan before renewed expiry");
     assert!(
@@ -236,7 +265,10 @@ async fn sqlite_lease_renewal_is_multi_host_and_exact_claim_authoritative() {
         tokio::time::sleep(remaining + std::time::Duration::from_millis(25)).await;
     }
     let reclaimed = host_b
-        .claim_due_occurrences(claim_request("host-b", Duration::seconds(2)))
+        .claim_due_occurrences(
+            &executor_lease,
+            claim_request("host-b", Duration::seconds(2)),
+        )
         .await
         .expect("claim after renewed lease expiry");
     assert_eq!(reclaimed.transitions.len(), 1);

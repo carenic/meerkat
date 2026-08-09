@@ -157,6 +157,7 @@ export interface MobRunResult {
 
 export interface MobHelperResult {
   agent_identity: string;
+  bounded_result?: Record<string, unknown> | null;
   member_ref: WireMemberRef;
   output?: string | null;
   tokens_used: number;

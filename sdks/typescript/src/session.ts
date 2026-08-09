@@ -35,6 +35,8 @@ import type {
   SessionTranscriptRevision,
   SessionTranscriptRevisionList,
   SessionTranscriptRewriteResult,
+  SystemPromptUpdateOptions,
+  SystemPromptUpdateResult,
   SkillRef,
   TranscriptForkOptions,
   TranscriptReplacement,
@@ -167,6 +169,14 @@ export class Session {
       reason,
       options,
     );
+  }
+
+  async updateSystemPrompt(
+    key: string,
+    content: string,
+    options?: SystemPromptUpdateOptions,
+  ): Promise<SystemPromptUpdateResult> {
+    return this._client.updateSystemPrompt(this._id, key, content, options);
   }
 
   async restoreTranscriptRevision(
@@ -366,6 +376,14 @@ export class DeferredSession {
       reason,
       options,
     );
+  }
+
+  async updateSystemPrompt(
+    key: string,
+    content: string,
+    options?: SystemPromptUpdateOptions,
+  ): Promise<SystemPromptUpdateResult> {
+    return this._client.updateSystemPrompt(this._id, key, content, options);
   }
 
   async restoreTranscriptRevision(

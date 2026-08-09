@@ -56,12 +56,12 @@ pub use meerkat_core::provider_matrix::anthropic::{AnthropicAuthMethod, Anthropi
 
 #[cfg(not(target_arch = "wasm32"))]
 fn default_cache_control_for_backend(backend: AnthropicBackendKind) -> AnthropicCacheControlPolicy {
-    match backend {
-        AnthropicBackendKind::Bedrock => AnthropicCacheControlPolicy::Disabled,
-        AnthropicBackendKind::AnthropicApi
-        | AnthropicBackendKind::Vertex
-        | AnthropicBackendKind::Foundry => AnthropicCacheControlPolicy::Automatic,
-    }
+    let _ = backend;
+    // Prompt caching is an agent/profile economic decision. A process-wide
+    // default makes low-frequency profiles pay cache-write cost without a
+    // realistic reuse window, so every backend starts disabled. Profiles opt
+    // into Automatic, SystemPrefix, or SystemAndConversation explicitly.
+    AnthropicCacheControlPolicy::Disabled
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -727,18 +727,18 @@ mod tests {
     }
 
     #[test]
-    fn cache_control_defaults_follow_backend_capabilities() {
+    fn cache_control_is_profile_opt_in_on_every_backend() {
         assert_eq!(
             default_cache_control_for_backend(AnthropicBackendKind::AnthropicApi),
-            AnthropicCacheControlPolicy::Automatic
+            AnthropicCacheControlPolicy::Disabled
         );
         assert_eq!(
             default_cache_control_for_backend(AnthropicBackendKind::Vertex),
-            AnthropicCacheControlPolicy::Automatic
+            AnthropicCacheControlPolicy::Disabled
         );
         assert_eq!(
             default_cache_control_for_backend(AnthropicBackendKind::Foundry),
-            AnthropicCacheControlPolicy::Automatic
+            AnthropicCacheControlPolicy::Disabled
         );
         assert_eq!(
             default_cache_control_for_backend(AnthropicBackendKind::Bedrock),

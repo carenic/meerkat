@@ -2374,16 +2374,21 @@ struct McpSessionRuntimeInterruptHandle {
 
 #[async_trait]
 impl CoreExecutorInterruptHandle for McpSessionRuntimeInterruptHandle {
-    async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
+    async fn hard_cancel_run_if_current(
+        &self,
+        expected_run_id: &meerkat_core::lifecycle::RunId,
+        _reason: String,
+    ) -> Result<bool, CoreExecutorError> {
         self.context
             .service
-            .interrupt_with_machine_authority(
+            .interrupt_run_with_machine_authority(
                 &self.session_id,
+                expected_run_id,
                 self.context.runtime_adapter.session_control_authority(),
             )
             .await
             .or_else(|err| match err {
-                SessionError::NotRunning { .. } => Ok(()),
+                SessionError::NotRunning { .. } => Ok(false),
                 err => Err(err),
             })
             .map_err(|error| CoreExecutorError::control_failed_runtime(error.to_string()))
@@ -2547,10 +2552,13 @@ impl CoreExecutor for McpSessionRuntimeExecutor {
     }
 
     fn publication_handle(&self) -> Option<Arc<dyn CoreExecutorPublicationHandle>> {
-        Some(meerkat::surface::persistent_runtime_publication_handle(
-            Arc::clone(&self.context.service),
-            self.session_id.clone(),
-        ))
+        self.actor_witness_slot.as_ref().map(|actor_witness_slot| {
+            meerkat::surface::persistent_runtime_publication_handle_for_actor_slot(
+                Arc::clone(&self.context.service),
+                self.session_id.clone(),
+                actor_witness_slot.clone(),
+            )
+        })
     }
 
     fn machine_managed_post_stop_unregister(&self) -> bool {
@@ -2674,9 +2682,19 @@ impl CoreExecutor for McpSessionRuntimeExecutor {
         Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
         CoreExecutorError,
     > {
+        let actor_witness = self
+            .actor_witness_slot
+            .as_ref()
+            .and_then(meerkat::LiveSessionActorWitnessSlot::witness)
+            .ok_or_else(|| {
+                CoreExecutorError::Internal(format!(
+                    "MCP runtime {} has no exact service actor publication authority",
+                    self.session_id
+                ))
+            })?;
         self.context
             .service
-            .publish_interaction_terminals_exact_batch(&self.session_id, events)
+            .publish_interaction_terminals_exact_batch_for_actor(&actor_witness, events)
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
@@ -2781,7 +2799,9 @@ mod tests {
 
         let factory = AgentFactory::new(temp.path().join("sessions"));
         let mut builder = FactoryAgentBuilder::new(factory, Config::default());
-        builder.default_llm_client = Some(Arc::new(TestClient::default()));
+        builder.default_llm_client = Some(Arc::new(TestClient::for_provider(
+            meerkat_core::Provider::Anthropic,
+        )));
         let (service, runtime_adapter) =
             build_runtime_backed_service(builder, active_session_capacity, persistence);
         let config_store = Arc::new(MemoryConfigStore::new(

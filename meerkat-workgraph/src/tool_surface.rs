@@ -6,19 +6,24 @@ use meerkat_core::error::ToolError;
 use meerkat_core::lifecycle::run_primitive::{
     ConversationAppend, ConversationAppendRole, CoreRenderable,
 };
+use meerkat_core::service::TURN_DEFERRED_TOOL_AUTHORITIES_CONTEXT_KEY;
 use meerkat_core::service::TurnToolOverlay;
 use meerkat_core::types::{
     SystemNoticeBlock, SystemNoticeKind, ToolCallView, ToolDef, ToolProvenance, ToolResult,
     ToolSourceKind,
 };
-use meerkat_core::{AgentToolDispatcher, ToolCallArguments, ToolDispatchContext};
+use meerkat_core::{
+    AgentToolDispatcher, DeferredToolLoadAuthority, ToolCallArguments, ToolCatalogCapabilities,
+    ToolCatalogEntry, ToolDispatchContext, ToolVisibilityWitness,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::tools::handle_workgraph_tools_call;
 use crate::{
     AttentionContextProjection, AttentionProjectionRequest, CloseWorkItemRequest,
     GoalRequestCloseRequest, ProjectedAttentionAuthority, WorkEdgeKind, WorkGraphService,
-    handle_workgraph_tools_call, workgraph_tools_list,
+    workgraph_tools_list,
 };
 
 pub const WORKGRAPH_ATTENTION_DISPATCH_CONTEXT_KEY: &str = "workgraph.attention_projection";
@@ -187,6 +192,32 @@ impl WorkGraphToolSurface {
         })?;
         let mut dispatch_context = BTreeMap::new();
         dispatch_context.insert(WORKGRAPH_ATTENTION_DISPATCH_CONTEXT_KEY.to_string(), value);
+        let activated_deferred_tools: Vec<DeferredToolLoadAuthority> = build_tool_defs()
+            .iter()
+            .filter(|tool| allowed.contains(tool.name.as_str()))
+            .filter(|tool| {
+                matches!(
+                    tool.name.as_str(),
+                    "workgraph_attention_reassign" | "workgraph_policy_escalate"
+                )
+            })
+            .filter_map(|tool| {
+                Some(DeferredToolLoadAuthority::new(
+                    tool.name.clone(),
+                    ToolVisibilityWitness {
+                        last_seen_provenance: Some(tool.provenance.clone()?),
+                    },
+                ))
+            })
+            .collect();
+        dispatch_context.insert(
+            TURN_DEFERRED_TOOL_AUTHORITIES_CONTEXT_KEY.to_string(),
+            serde_json::to_value(&activated_deferred_tools).map_err(|error| {
+                crate::WorkGraphError::InvalidInput(format!(
+                    "WorkGraph deferred tool authorities failed to serialize: {error}"
+                ))
+            })?,
+        );
         Ok(TurnToolOverlay {
             allowed_tools: Some(
                 allowed
@@ -207,6 +238,37 @@ impl AgentToolDispatcher for WorkGraphToolSurface {
         Arc::clone(&self.tool_defs)
     }
 
+    fn tool_catalog_capabilities(&self) -> ToolCatalogCapabilities {
+        ToolCatalogCapabilities {
+            exact_catalog: true,
+            may_require_catalog_control_plane: true,
+        }
+    }
+
+    fn tool_catalog(&self) -> Arc<[ToolCatalogEntry]> {
+        self.tool_defs
+            .iter()
+            .map(|tool| {
+                if matches!(
+                    tool.name.as_str(),
+                    "workgraph_attention_reassign" | "workgraph_policy_escalate"
+                ) {
+                    ToolCatalogEntry::session_deferred(
+                        Arc::clone(tool),
+                        true,
+                        tool.provenance.clone().unwrap_or_else(|| ToolProvenance {
+                            kind: ToolSourceKind::WorkGraph,
+                            source_id: "workgraph".into(),
+                        }),
+                    )
+                } else {
+                    ToolCatalogEntry::session_inline(Arc::clone(tool), true)
+                }
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
+
     async fn dispatch(
         &self,
         call: ToolCallView<'_>,
@@ -220,7 +282,13 @@ impl AgentToolDispatcher for WorkGraphToolSurface {
         call: ToolCallView<'_>,
         context: &ToolDispatchContext,
     ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
-        if !self.tool_defs.iter().any(|tool| tool.name == call.name) {
+        let attention_context_present = context
+            .turn_metadata(WORKGRAPH_ATTENTION_DISPATCH_CONTEXT_KEY)
+            .is_some();
+        let attention_only =
+            call.name == "workgraph_attention_reassign" || call.name == "workgraph_policy_escalate";
+        let definition_available = self.tool_defs.iter().any(|tool| tool.name == call.name);
+        if !(definition_available || attention_context_present && attention_only) {
             return Err(ToolError::NotFound {
                 name: call.name.into(),
             });
@@ -620,6 +688,16 @@ mod tests {
                 .expect("valid session id");
             let goal = service
                 .create_goal(GoalCreateRequest {
+                    failed_child_join_policy: Default::default(),
+                    cancelled_child_join_policy: Default::default(),
+                    priority: Default::default(),
+                    labels: Default::default(),
+                    due_at: None,
+                    not_before: None,
+                    snoozed_until: None,
+                    external_refs: Vec::new(),
+                    evidence_refs: Vec::new(),
+                    status: None,
                     realm_id: None,
                     namespace: None,
                     title: "Parity item".to_string(),
@@ -745,6 +823,16 @@ mod tests {
                 .expect("valid session id");
             let goal = service
                 .create_goal(GoalCreateRequest {
+                    failed_child_join_policy: Default::default(),
+                    cancelled_child_join_policy: Default::default(),
+                    priority: Default::default(),
+                    labels: Default::default(),
+                    due_at: None,
+                    not_before: None,
+                    snoozed_until: None,
+                    external_refs: Vec::new(),
+                    evidence_refs: Vec::new(),
+                    status: None,
                     realm_id: None,
                     namespace: None,
                     title: "Link admission item".to_string(),
@@ -958,6 +1046,16 @@ mod tests {
             .expect("valid session id");
         let goal = service
             .create_goal(GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "Review target".to_string(),
@@ -1012,6 +1110,16 @@ mod tests {
             .expect("valid session id");
         let goal = service
             .create_goal(GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "Review child".to_string(),
@@ -1058,6 +1166,16 @@ mod tests {
             .expect("valid session id");
         let goal = service
             .create_goal(GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "Scoped item".to_string(),
@@ -1123,6 +1241,16 @@ mod tests {
                 .expect("valid session id");
         let goal = service
             .create_goal(GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "Coordinate reassignment".to_string(),
@@ -1159,7 +1287,7 @@ mod tests {
                 .tools()
                 .iter()
                 .any(|tool| tool.name == "workgraph_attention_reassign"),
-            "base dispatcher catalog must include attention-only tools so turn overlays can expose them"
+            "dispatcher base catalog retains deferred attention definitions for witnessed turn activation"
         );
         let args = serde_json::value::RawValue::from_string(
             json!({
@@ -1208,12 +1336,26 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_coordinate_create_is_forced_into_attention_scope() {
-        let service = WorkGraphService::new(Arc::new(MemoryWorkGraphStore::new()));
+        let namespace = WorkNamespace::new("scoped-ns").expect("namespace");
+        let service = WorkGraphService::with_scope(
+            Arc::new(MemoryWorkGraphStore::new()),
+            "realm-a",
+            namespace.clone(),
+        );
         let session_id = meerkat_core::SessionId::parse("019e63c2-0000-7000-8000-000000000023")
             .expect("valid session id");
-        let namespace = WorkNamespace::new("scoped-ns").expect("namespace");
         let goal = service
             .create_goal(GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: Some("realm-a".to_string()),
                 namespace: Some(namespace.clone()),
                 title: "Coordinate item".to_string(),
@@ -1263,6 +1405,16 @@ mod tests {
             .expect("valid session id");
         let goal = service
             .create_goal(GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "Scoped item".to_string(),
@@ -1313,6 +1465,16 @@ mod tests {
             .expect("valid session id");
         let goal = service
             .create_goal(GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "Review item".to_string(),
@@ -1386,6 +1548,16 @@ mod tests {
             .expect("valid session id");
         let goal = service
             .create_goal(GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "Host-confirmed item".to_string(),
@@ -1435,6 +1607,16 @@ mod tests {
             .expect("valid session id");
         let goal = service
             .create_goal(GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "Host-confirmed stale item".to_string(),

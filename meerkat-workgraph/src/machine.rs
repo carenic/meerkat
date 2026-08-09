@@ -6,11 +6,13 @@ use serde_json::json;
 use crate::WorkGraphError;
 use crate::machines::{work_attention_lifecycle as attention_dsl, workgraph_lifecycle as wg_dsl};
 use crate::types::{
-    AddEvidenceRequest, AttentionDelegatedAuthority, ClaimWorkItemRequest, CloseWorkItemRequest,
-    CreateWorkItemRequest, PolicyEscalateRequest, ProjectedAttentionAuthority,
-    ReleaseWorkItemRequest, UpdateWorkItemRequest, WorkAttentionBinding, WorkAttentionMode,
-    WorkAttentionStatus, WorkClaim, WorkCompletionPolicy, WorkEdge, WorkEdgeKind, WorkGraphEvent,
-    WorkGraphEventKind, WorkGraphMachineState, WorkItem, WorkItemId, WorkNamespace, WorkStatus,
+    AddEvidenceRequest, AttentionDelegatedAuthority, CancelledChildJoinPolicy,
+    ClaimWorkItemRequest, CloseWorkItemRequest, CreateWorkItemRequest, FailedChildJoinPolicy,
+    ObserveLeaseExpiryRequest, ObserveReadinessRequest, PolicyEscalateRequest,
+    ProjectedAttentionAuthority, ReleaseWorkItemRequest, UpdateWorkItemRequest,
+    WorkAttentionBinding, WorkAttentionMode, WorkAttentionStatus, WorkClaim, WorkCompletionPolicy,
+    WorkEdge, WorkEdgeKind, WorkGraphEvent, WorkGraphEventKind, WorkGraphMachineState, WorkItem,
+    WorkItemId, WorkNamespace, WorkStatus,
 };
 
 /// Machine-owned public error classification surfaced to REST/RPC callers.
@@ -39,6 +41,14 @@ pub use wg_dsl::WorkPublicConfirmationAdmissionKind;
 /// mirrors the emitted verdict.
 pub use wg_dsl::WorkCompletionPolicyMutationAdmissionKind;
 pub use wg_dsl::WorkPolicyEscalationAdmissionKind;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildJoinDisposition {
+    Waiting,
+    Satisfied,
+    PropagateFailure,
+    PropagateCancellation,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WorkAttentionMachine;
@@ -701,6 +711,12 @@ impl WorkGraphMachine {
                         .completion_policy
                         .reviewer_quorum_threshold(),
                     unresolved_blocker_count: 0,
+                    failed_child_join_policy: failed_child_join_policy_to_dsl(
+                        request.failed_child_join_policy,
+                    ),
+                    cancelled_child_join_policy: cancelled_child_join_policy_to_dsl(
+                        request.cancelled_child_join_policy,
+                    ),
                 }
             }
             wg_dsl::WorkCreateStatusAdmissionKind::AdmittedBlocked => {
@@ -716,6 +732,12 @@ impl WorkGraphMachine {
                         .completion_policy
                         .reviewer_quorum_threshold(),
                     unresolved_blocker_count: 0,
+                    failed_child_join_policy: failed_child_join_policy_to_dsl(
+                        request.failed_child_join_policy,
+                    ),
+                    cancelled_child_join_policy: cancelled_child_join_policy_to_dsl(
+                        request.cancelled_child_join_policy,
+                    ),
                 }
             }
             wg_dsl::WorkCreateStatusAdmissionKind::Denied => {
@@ -733,6 +755,8 @@ impl WorkGraphMachine {
             description: request.description,
             status: work_status_from_dsl(dsl_state.lifecycle_phase)?,
             completion_policy: request.completion_policy,
+            failed_child_join_policy: request.failed_child_join_policy,
+            cancelled_child_join_policy: request.cancelled_child_join_policy,
             priority: request.priority,
             labels: normalize_labels(request.labels)?,
             owner: None,
@@ -887,6 +911,7 @@ impl WorkGraphMachine {
         Self::claim_item_with_unresolved_blockers(
             item.clone(),
             item.machine_state.unresolved_blocker_count,
+            true,
             request,
             now,
         )
@@ -918,14 +943,11 @@ impl WorkGraphMachine {
     pub(crate) fn claim_item_with_unresolved_blockers(
         mut item: WorkItem,
         unresolved_blocker_count: u64,
+        child_join_satisfied: bool,
         request: ClaimWorkItemRequest,
         now: DateTime<Utc>,
     ) -> Result<(WorkItem, WorkGraphEvent), WorkGraphError> {
-        let lease_expires_at = request.lease_expires_at.or_else(|| {
-            request
-                .lease_seconds
-                .map(|seconds| now + seconds_to_duration(seconds))
-        });
+        let lease_expires_at = normalize_claim_lease(&request, &now)?;
         let owner_key = work_owner_key(&request.owner)?;
         let dsl_state = apply_item_dsl(
             &item,
@@ -935,6 +957,7 @@ impl WorkGraphMachine {
                 owner_key,
                 now_utc_ms: datetime_to_millis(now),
                 lease_expires_at_utc_ms: lease_expires_at.map(datetime_to_millis),
+                child_join_satisfied,
             },
             Some(request.expected_revision),
         )?;
@@ -943,12 +966,25 @@ impl WorkGraphMachine {
             owner: request.owner,
             claimed_at: now,
             lease_expires_at,
+            expiry_observed_at: None,
         });
         item.machine_state = dsl_state;
         sync_item_from_machine_state(&mut item)?;
         item.updated_at = now;
         let event = item_event(&item, WorkGraphEventKind::Claimed, now)?;
         Ok((item, event))
+    }
+
+    /// Validate request-carried claim authority before any alternate durable
+    /// outcome (such as child-failure propagation) is selected. The Claim DSL
+    /// transition remains final authority when a claim is actually admitted.
+    pub(crate) fn validate_claim_request(
+        request: &ClaimWorkItemRequest,
+        now: &DateTime<Utc>,
+    ) -> Result<(), WorkGraphError> {
+        normalize_claim_lease(request, now)?;
+        work_owner_key(&request.owner)?;
+        Ok(())
     }
 
     pub fn release_item(
@@ -970,6 +1006,55 @@ impl WorkGraphMachine {
         sync_item_from_machine_state(&mut item)?;
         item.updated_at = now;
         let event = item_event(&item, WorkGraphEventKind::Released, now)?;
+        Ok((item, event))
+    }
+
+    pub fn observe_lease_expiry(
+        mut item: WorkItem,
+        request: ObserveLeaseExpiryRequest,
+    ) -> Result<(WorkItem, WorkGraphEvent), WorkGraphError> {
+        let state = apply_item_dsl(
+            &item,
+            item.machine_state.unresolved_blocker_count,
+            wg_dsl::WorkGraphLifecycleInput::ObserveLeaseExpiry {
+                expected_revision: request.expected_revision,
+                observed_at_utc_ms: datetime_to_millis(request.observed_at),
+            },
+            Some(request.expected_revision),
+        )?;
+        item.claim = None;
+        item.owner = None;
+        item.machine_state = state;
+        sync_item_from_machine_state(&mut item)?;
+        item.updated_at = request.observed_at;
+        let event = item_event(&item, WorkGraphEventKind::Released, request.observed_at)?;
+        Ok((item, event))
+    }
+
+    pub fn observe_readiness(
+        mut item: WorkItem,
+        request: ObserveReadinessRequest,
+        unresolved_blocker_count: u64,
+        child_join_satisfied: bool,
+    ) -> Result<(WorkItem, WorkGraphEvent), WorkGraphError> {
+        let state = apply_item_dsl(
+            &item,
+            unresolved_blocker_count,
+            wg_dsl::WorkGraphLifecycleInput::ObserveReadiness {
+                expected_revision: request.expected_revision,
+                observed_at_utc_ms: datetime_to_millis(request.observed_at),
+                child_join_satisfied,
+            },
+            Some(request.expected_revision),
+        )?;
+        item.machine_state = state;
+        sync_item_from_machine_state(&mut item)?;
+        item.updated_at = request.observed_at;
+        let event = item_event(
+            &item,
+            WorkGraphEventKind::ReadinessObserved,
+            request.observed_at,
+        )?;
         Ok((item, event))
     }
 
@@ -1088,15 +1173,42 @@ impl WorkGraphMachine {
     /// function mirrors the emitted `WorkItemReadinessClassified.ready`, failing
     /// closed if the machine refuses or emits no verdict. It decides nothing.
     pub fn classify_readiness(item: &WorkItem, now: DateTime<Utc>) -> Result<bool, WorkGraphError> {
-        validate_item_machine_projection(item)?;
-        let mut dsl_auth = wg_dsl::WorkGraphLifecycleMachineAuthority::recover_from_state(
-            item.machine_state.clone(),
+        Self::classify_readiness_with_child_join(item, now, true)
+    }
+
+    pub fn classify_readiness_with_child_join(
+        item: &WorkItem,
+        now: DateTime<Utc>,
+        child_join_satisfied: bool,
+    ) -> Result<bool, WorkGraphError> {
+        Self::classify_readiness_from_observation(
+            item,
+            now,
+            item.machine_state.unresolved_blocker_count,
+            child_join_satisfied,
         )
-        .map_err(|error| WorkGraphError::InvalidTransition(format!("{error:?}")))?;
+    }
+
+    /// Classify readiness from one graph observation without persisting a
+    /// cached blocker count. Admission callers must make the observation and
+    /// mutation under one store transaction.
+    pub fn classify_readiness_from_observation(
+        item: &WorkItem,
+        now: DateTime<Utc>,
+        unresolved_blocker_count: u64,
+        child_join_satisfied: bool,
+    ) -> Result<bool, WorkGraphError> {
+        validate_item_machine_projection(item)?;
+        let mut observed_state = item.machine_state.clone();
+        observed_state.unresolved_blocker_count = unresolved_blocker_count;
+        let mut dsl_auth =
+            wg_dsl::WorkGraphLifecycleMachineAuthority::recover_from_state(observed_state)
+                .map_err(|error| WorkGraphError::InvalidTransition(format!("{error:?}")))?;
         let transition = wg_dsl::WorkGraphLifecycleMachineMutator::apply(
             &mut dsl_auth,
             wg_dsl::WorkGraphLifecycleInput::ClassifyReadiness {
                 now_utc_ms: datetime_to_millis(now),
+                child_join_satisfied,
             },
         )
         .map_err(|error| {
@@ -1121,6 +1233,63 @@ impl WorkGraphMachine {
         classified.ok_or_else(|| {
             WorkGraphError::Store(format!(
                 "work item {} emitted no readiness verdict",
+                item.id
+            ))
+        })
+    }
+
+    pub fn classify_child_join(
+        item: &WorkItem,
+        active_child_count: u64,
+        failed_child_count: u64,
+        cancelled_child_count: u64,
+    ) -> Result<ChildJoinDisposition, WorkGraphError> {
+        validate_item_machine_projection(item)?;
+        let mut authority = wg_dsl::WorkGraphLifecycleMachineAuthority::recover_from_state(
+            item.machine_state.clone(),
+        )
+        .map_err(|error| WorkGraphError::InvalidTransition(format!("{error:?}")))?;
+        let transition = wg_dsl::WorkGraphLifecycleMachineMutator::apply(
+            &mut authority,
+            wg_dsl::WorkGraphLifecycleInput::ClassifyChildJoin {
+                active_child_count,
+                failed_child_count,
+                cancelled_child_count,
+            },
+        )
+        .map_err(|error| {
+            WorkGraphError::InvalidTransition(format!(
+                "work item {} refused child-join classification: {error:?}",
+                item.id
+            ))
+        })?;
+        let mut disposition = None;
+        for effect in transition.effects() {
+            if let wg_dsl::WorkGraphLifecycleEffect::ChildJoinClassified {
+                disposition: emitted,
+            } = effect
+            {
+                let mapped = match emitted {
+                    wg_dsl::ChildJoinDisposition::Waiting => ChildJoinDisposition::Waiting,
+                    wg_dsl::ChildJoinDisposition::Satisfied => ChildJoinDisposition::Satisfied,
+                    wg_dsl::ChildJoinDisposition::PropagateFailure => {
+                        ChildJoinDisposition::PropagateFailure
+                    }
+                    wg_dsl::ChildJoinDisposition::PropagateCancellation => {
+                        ChildJoinDisposition::PropagateCancellation
+                    }
+                };
+                if disposition.replace(mapped).is_some() {
+                    return Err(WorkGraphError::Store(format!(
+                        "work item {} emitted multiple child-join verdicts",
+                        item.id
+                    )));
+                }
+            }
+        }
+        disposition.ok_or_else(|| {
+            WorkGraphError::Store(format!(
+                "work item {} emitted no child-join verdict",
                 item.id
             ))
         })
@@ -1181,6 +1350,9 @@ fn work_graph_error_kind(error: &WorkGraphError) -> wg_dsl::WorkGraphErrorKind {
             wg_dsl::WorkGraphErrorKind::InvalidTimestampMillis
         }
         WorkGraphError::Store(_) => wg_dsl::WorkGraphErrorKind::Store,
+        WorkGraphError::NamespaceAssignmentRequired { .. } => {
+            wg_dsl::WorkGraphErrorKind::NamespaceAssignmentRequired
+        }
         WorkGraphError::UnsupportedBackend(_) => wg_dsl::WorkGraphErrorKind::UnsupportedBackend,
     }
 }
@@ -1437,6 +1609,10 @@ fn sync_item_from_machine_state(item: &mut WorkItem) -> Result<(), WorkGraphErro
         item.machine_state.completion_supervisor_owner_key.clone(),
         item.machine_state.completion_reviewer_quorum_threshold,
     );
+    item.failed_child_join_policy =
+        failed_child_join_policy_from_dsl(item.machine_state.failed_child_join_policy);
+    item.cancelled_child_join_policy =
+        cancelled_child_join_policy_from_dsl(item.machine_state.cancelled_child_join_policy);
     item.terminal_at = item
         .machine_state
         .terminal_at_utc_ms
@@ -1485,6 +1661,22 @@ fn validate_item_machine_projection(item: &WorkItem) -> Result<(), WorkGraphErro
     {
         return Err(WorkGraphError::Store(format!(
             "work item {} completion_policy projection does not match machine state",
+            item.id
+        )));
+    }
+    if item.failed_child_join_policy
+        != failed_child_join_policy_from_dsl(item.machine_state.failed_child_join_policy)
+    {
+        return Err(WorkGraphError::Store(format!(
+            "work item {} failed_child_join_policy projection does not match machine state",
+            item.id
+        )));
+    }
+    if item.cancelled_child_join_policy
+        != cancelled_child_join_policy_from_dsl(item.machine_state.cancelled_child_join_policy)
+    {
+        return Err(WorkGraphError::Store(format!(
+            "work item {} cancelled_child_join_policy projection does not match machine state",
             item.id
         )));
     }
@@ -1540,6 +1732,48 @@ fn work_owner_key(owner: &crate::types::WorkOwner) -> Result<wg_dsl::WorkOwnerKe
         kind,
         id: owner.key.id.clone(),
     })
+}
+
+fn failed_child_join_policy_to_dsl(policy: FailedChildJoinPolicy) -> wg_dsl::FailedChildJoinPolicy {
+    match policy {
+        FailedChildJoinPolicy::RequireSuccess => wg_dsl::FailedChildJoinPolicy::RequireSuccess,
+        FailedChildJoinPolicy::Propagate => wg_dsl::FailedChildJoinPolicy::Propagate,
+        FailedChildJoinPolicy::Accept => wg_dsl::FailedChildJoinPolicy::Accept,
+    }
+}
+
+fn failed_child_join_policy_from_dsl(
+    policy: wg_dsl::FailedChildJoinPolicy,
+) -> FailedChildJoinPolicy {
+    match policy {
+        wg_dsl::FailedChildJoinPolicy::RequireSuccess => FailedChildJoinPolicy::RequireSuccess,
+        wg_dsl::FailedChildJoinPolicy::Propagate => FailedChildJoinPolicy::Propagate,
+        wg_dsl::FailedChildJoinPolicy::Accept => FailedChildJoinPolicy::Accept,
+    }
+}
+
+fn cancelled_child_join_policy_to_dsl(
+    policy: CancelledChildJoinPolicy,
+) -> wg_dsl::CancelledChildJoinPolicy {
+    match policy {
+        CancelledChildJoinPolicy::RequireSuccess => {
+            wg_dsl::CancelledChildJoinPolicy::RequireSuccess
+        }
+        CancelledChildJoinPolicy::Propagate => wg_dsl::CancelledChildJoinPolicy::Propagate,
+        CancelledChildJoinPolicy::Accept => wg_dsl::CancelledChildJoinPolicy::Accept,
+    }
+}
+
+fn cancelled_child_join_policy_from_dsl(
+    policy: wg_dsl::CancelledChildJoinPolicy,
+) -> CancelledChildJoinPolicy {
+    match policy {
+        wg_dsl::CancelledChildJoinPolicy::RequireSuccess => {
+            CancelledChildJoinPolicy::RequireSuccess
+        }
+        wg_dsl::CancelledChildJoinPolicy::Propagate => CancelledChildJoinPolicy::Propagate,
+        wg_dsl::CancelledChildJoinPolicy::Accept => CancelledChildJoinPolicy::Accept,
+    }
 }
 
 fn topology_state(
@@ -1667,9 +1901,40 @@ fn item_event(
     ))
 }
 
-fn seconds_to_duration(seconds: u64) -> Duration {
-    let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
-    Duration::seconds(seconds)
+fn normalize_claim_lease(
+    request: &ClaimWorkItemRequest,
+    now: &DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, WorkGraphError> {
+    match (request.lease_seconds, request.lease_expires_at) {
+        (Some(_), Some(_)) => Err(WorkGraphError::InvalidInput(
+            "claim lease_seconds and lease_expires_at are mutually exclusive".to_string(),
+        )),
+        (Some(seconds), None) => {
+            if seconds == 0 || seconds > crate::types::MAX_WORK_CLAIM_LEASE_SECONDS {
+                return Err(WorkGraphError::InvalidInput(format!(
+                    "claim lease_seconds must be between 1 and {}",
+                    crate::types::MAX_WORK_CLAIM_LEASE_SECONDS
+                )));
+            }
+            let seconds = i64::try_from(seconds).map_err(|_| {
+                WorkGraphError::InvalidInput(
+                    "claim lease_seconds exceeds the representable duration range".to_string(),
+                )
+            })?;
+            now.checked_add_signed(Duration::seconds(seconds))
+                .map(Some)
+                .ok_or_else(|| {
+                    WorkGraphError::InvalidInput(
+                        "claim lease_seconds exceeds the representable timestamp range".to_string(),
+                    )
+                })
+        }
+        (None, Some(expires_at)) if expires_at <= *now => Err(WorkGraphError::InvalidInput(
+            "claim lease_expires_at must be strictly later than the claim observation time"
+                .to_string(),
+        )),
+        (None, lease_expires_at) => Ok(lease_expires_at),
+    }
 }
 
 #[cfg(test)]
@@ -1703,6 +1968,8 @@ mod tests {
                 description: None,
                 priority: Default::default(),
                 completion_policy,
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
                 labels: BTreeSet::new(),
                 due_at: None,
                 not_before: None,
@@ -1735,6 +2002,8 @@ mod tests {
                 description: None,
                 priority: Default::default(),
                 completion_policy: WorkCompletionPolicy::SelfAttest,
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
                 labels: BTreeSet::new(),
                 due_at: None,
                 not_before: None,
@@ -2048,6 +2317,42 @@ mod tests {
     }
 
     #[test]
+    fn claim_lease_inputs_are_bounded_unambiguous_and_future() {
+        let now = Utc::now();
+        let request = |lease_seconds, lease_expires_at| ClaimWorkItemRequest {
+            id: WorkItemId::generated(),
+            realm_id: None,
+            namespace: None,
+            expected_revision: 1,
+            owner: owner("worker"),
+            lease_seconds,
+            lease_expires_at,
+        };
+
+        assert!(
+            normalize_claim_lease(&request(Some(60), Some(now + Duration::minutes(1))), &now)
+                .is_err(),
+            "relative and absolute lease representations must be mutually exclusive"
+        );
+        assert!(
+            normalize_claim_lease(&request(None, Some(now)), &now).is_err(),
+            "an absolute lease must be strictly later than its observation"
+        );
+        assert!(
+            normalize_claim_lease(
+                &request(Some(crate::types::MAX_WORK_CLAIM_LEASE_SECONDS + 1), None),
+                &now,
+            )
+            .is_err(),
+            "relative leases must remain within the public bound"
+        );
+        assert_eq!(
+            normalize_claim_lease(&request(Some(60), None), &now).unwrap(),
+            Some(now + Duration::minutes(1))
+        );
+    }
+
+    #[test]
     fn terminal_items_cannot_be_claimed() {
         let now = Utc::now();
         let item = create("done", now);
@@ -2313,6 +2618,13 @@ mod tests {
             ),
             (
                 WorkGraphError::Store("store".to_string()),
+                WorkGraphPublicErrorClass::StoreError,
+            ),
+            (
+                WorkGraphError::NamespaceAssignmentRequired {
+                    backend: "sqlite".to_string(),
+                    tables: vec!["workgraph_items".to_string()],
+                },
                 WorkGraphPublicErrorClass::StoreError,
             ),
             (

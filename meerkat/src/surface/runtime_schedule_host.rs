@@ -5,15 +5,15 @@ use async_trait::async_trait;
 #[cfg(feature = "comms")]
 use super::configure_peer_ingress;
 use super::schedule_host::{
-    runtime_delivery_dispatch_from_admission, schedule_runtime_correlation_id,
+    accept_schedule_runtime_input_with_reconciliation, schedule_runtime_correlation_id,
     schedule_runtime_delivery_idempotency_key,
 };
 use super::{
-    NoopScheduleMobHost, ScheduledEventDispatch, ScheduledPromptDispatch,
-    SharedScheduleTargetAdapter, SurfaceScheduleMobHost, SurfaceScheduleSessionHost,
-    default_persistent_executor, default_persistent_executor_with_workgraph_service,
-    materialize_session, recover_mob_member_identity_from_session_target, schedule_host_supported,
-    spawn_schedule_host,
+    NoopScheduleMobHost, PersistentRuntimeExecutor, ScheduledEventDispatch,
+    ScheduledPromptDispatch, SharedScheduleTargetAdapter, SurfaceScheduleMobHost,
+    SurfaceScheduleSessionHost, SurfaceSessionRecoveryContext, SurfaceSessionRecoveryOverrides,
+    build_recovered_session, materialize_session_with_reserved_admission_and_actor_slot,
+    recover_mob_member_identity_from_session_target, schedule_host_supported, spawn_schedule_host,
 };
 use crate::{
     Config, CreateSessionRequest, PersistentSessionService, ScheduleDomainError, ScheduleService,
@@ -171,20 +171,33 @@ impl<B: SessionAgentBuilder + 'static> RuntimeBackedScheduleSessionHost<B> {
         }
     }
 
-    fn runtime_executor(&self, session_id: SessionId) -> Box<dyn meerkat_core::CoreExecutor> {
-        match &self.workgraph_service {
-            Some(workgraph_service) => default_persistent_executor_with_workgraph_service(
-                Arc::clone(&self.service),
-                Arc::clone(&self.runtime_adapter),
-                session_id,
-                workgraph_service.clone(),
-            ),
-            None => default_persistent_executor(
-                Arc::clone(&self.service),
-                Arc::clone(&self.runtime_adapter),
-                session_id,
-            ),
-        }
+    fn recovered_schedule_request(
+        &self,
+        session: Session,
+    ) -> Result<CreateSessionRequest, ScheduleDomainError> {
+        let recovered = build_recovered_session(
+            session,
+            &SurfaceSessionRecoveryOverrides::default(),
+            SurfaceSessionRecoveryContext {
+                llm_client_override: self.build_template.llm_client_override.clone(),
+                agent_llm_client_decorator: self.build_template.agent_llm_client_decorator.clone(),
+                external_tools: self.build_template.external_tools.clone(),
+                checkpointer: None,
+                // The materialization transaction replaces this placeholder
+                // with its exact machine-issued SessionOwned bindings.
+                runtime_build_mode: meerkat_core::RuntimeBuildMode::StandaloneEphemeral,
+                realm_id: self.build_template.realm_id.clone(),
+                instance_id: self.build_template.instance_id.clone(),
+                backend: self
+                    .build_template
+                    .backend
+                    .as_ref()
+                    .map(|backend| backend.as_str().to_string()),
+                config_generation: self.build_template.config_generation,
+            },
+        )
+        .map_err(schedule_internal)?;
+        Ok(recovered.into_deferred_create_request())
     }
 
     async fn ensure_runtime_session_registered(
@@ -238,13 +251,105 @@ impl<B: SessionAgentBuilder + 'static> RuntimeBackedScheduleSessionHost<B> {
                 expected_member: incarnation,
             }
         } else {
-            self.runtime_adapter
-                .ensure_session_with_executor(
-                    session_id.clone(),
-                    self.runtime_executor(session_id.clone()),
+            // B stabilizes the exact service actor while the machine creates
+            // or observes its M-owned attachment. A fresh actor slot is used
+            // even for an already-live actor so the executor never receives a
+            // logical SessionId publication capability.
+            let turn_boundary = self
+                .service
+                .acquire_runtime_turn_finalization_guard(session_id)
+                .await;
+            if let Some(actor_witness) = self.service.live_session_actor_witness(session_id).await {
+                let actor_witness_slot = crate::LiveSessionActorWitnessSlot::default();
+                actor_witness_slot
+                    .publish(actor_witness)
+                    .map_err(schedule_internal)?;
+                let service = Arc::clone(&self.service);
+                let runtime_adapter = Arc::clone(&self.runtime_adapter);
+                let workgraph_service = self.workgraph_service.clone();
+                match self
+                    .runtime_adapter
+                    .ensure_session_with_executor_factory_under_runtime_turn_finalization_boundary(
+                        session_id.clone(),
+                        move |attachment_witness| {
+                            Box::new(
+                                PersistentRuntimeExecutor::new_for_actor_slot_and_attachment(
+                                    service,
+                                    runtime_adapter,
+                                    attachment_witness,
+                                    actor_witness_slot,
+                                    workgraph_service,
+                                ),
+                            )
+                        },
+                    )
+                    .await
+                    .map_err(schedule_internal)?
+                {
+                    meerkat_runtime::EnsureRuntimeExecutorAttachment::Pending(mut pending) => {
+                        if let Err(commit_error) = pending
+                            .try_commit_with_under_runtime_turn_finalization_boundary(false, |_| {
+                                Ok(())
+                            })
+                            .await
+                        {
+                            let cleanup_error = pending
+                                .abort_under_runtime_turn_finalization_boundary()
+                                .await
+                                .err();
+                            return Err(schedule_internal(match cleanup_error {
+                                Some(cleanup_error) => format!(
+                                    "{commit_error}; boundary-aware schedule attachment cleanup also failed: {cleanup_error}"
+                                ),
+                                None => commit_error.to_string(),
+                            }));
+                        }
+                    }
+                    meerkat_runtime::EnsureRuntimeExecutorAttachment::Existing(witness) => {
+                        self.runtime_adapter
+                            .publication_handle_for_executor_attachment(&witness)
+                            .await
+                            .map_err(schedule_internal)?;
+                    }
+                }
+                drop(turn_boundary);
+            } else {
+                // No service actor exists. Release the sampled B and rebuild
+                // through the canonical materialization transaction, which
+                // reacquires B before M and either refreshes the existing
+                // attachment's immutable handle or attaches a slot-bound
+                // executor in a cold process.
+                drop(turn_boundary);
+                let request = self.recovered_schedule_request(session.clone())?;
+                let reserved_admission = self
+                    .service
+                    .reserve_create_session_admission()
+                    .await
+                    .map_err(schedule_internal)?;
+                let service = Arc::clone(&self.service);
+                let runtime_adapter = Arc::clone(&self.runtime_adapter);
+                let workgraph_service = self.workgraph_service.clone();
+                materialize_session_with_reserved_admission_and_actor_slot(
+                    &self.service,
+                    &self.runtime_adapter,
+                    session,
+                    request,
+                    reserved_admission,
+                    move |_session_id, attachment_witness, actor_witness_slot| {
+                        Box::new(
+                            PersistentRuntimeExecutor::new_for_actor_slot_and_attachment(
+                                service,
+                                runtime_adapter,
+                                attachment_witness,
+                                actor_witness_slot,
+                                workgraph_service,
+                            ),
+                        )
+                    },
                 )
                 .await
                 .map_err(schedule_internal)?;
+            }
             ScheduledSessionAdmission::Ordinary
         };
         self.ensure_schedule_peer_ingress_for_admission(session_id, &admission)
@@ -532,27 +637,31 @@ impl<B: SessionAgentBuilder + 'static> SurfaceScheduleSessionHost
         // that would orphan the prior session on a crash/lease-expiry/cancel
         // landing inside the materialize->bind window.
         let session = Session::with_id(occurrence.materialized_session_id());
-        let result = Box::pin(materialize_session(
+        let reserved_admission = self
+            .service
+            .reserve_create_session_admission()
+            .await
+            .map_err(schedule_internal)?;
+        let result = Box::pin(materialize_session_with_reserved_admission_and_actor_slot(
             &self.service,
             &self.runtime_adapter,
             session,
             request,
+            reserved_admission,
             {
                 let service = Arc::clone(&self.service);
                 let runtime_adapter = Arc::clone(&self.runtime_adapter);
                 let workgraph_service = self.workgraph_service.clone();
-                move |session_id| match workgraph_service.clone() {
-                    Some(workgraph_service) => default_persistent_executor_with_workgraph_service(
-                        Arc::clone(&service),
-                        Arc::clone(&runtime_adapter),
-                        session_id,
-                        workgraph_service,
-                    ),
-                    None => default_persistent_executor(
-                        Arc::clone(&service),
-                        Arc::clone(&runtime_adapter),
-                        session_id,
-                    ),
+                move |_session_id, attachment_witness, actor_witness_slot| {
+                    Box::new(
+                        PersistentRuntimeExecutor::new_for_actor_slot_and_attachment(
+                            service,
+                            runtime_adapter,
+                            attachment_witness,
+                            actor_witness_slot,
+                            workgraph_service,
+                        ),
+                    )
                 }
             },
         ))
@@ -638,19 +747,14 @@ impl<B: SessionAgentBuilder + 'static> SurfaceScheduleSessionHost
         ));
         prompt_input.header.correlation_id = Some(schedule_runtime_correlation_id(identity)?);
 
-        let input = meerkat_runtime::Input::Prompt(prompt_input);
-        let (outcome, handle) = self
-            .accept_scheduled_input(session_id, input, &admission)
-            .await?;
-
-        runtime_delivery_dispatch_from_admission(
+        accept_schedule_runtime_input_with_reconciliation(
             self.runtime_adapter.as_ref(),
             session_id,
             occurrence,
             identity,
-            outcome,
-            handle,
+            meerkat_runtime::Input::Prompt(prompt_input),
             dispatch.materialized_session_id,
+            |input| self.accept_scheduled_input(session_id, input, &admission),
         )
         .await
     }
@@ -693,18 +797,14 @@ impl<B: SessionAgentBuilder + 'static> SurfaceScheduleSessionHost
             render_metadata: dispatch.render_metadata,
         });
 
-        let (outcome, handle) = self
-            .accept_scheduled_input(session_id, input, &admission)
-            .await?;
-
-        runtime_delivery_dispatch_from_admission(
+        accept_schedule_runtime_input_with_reconciliation(
             self.runtime_adapter.as_ref(),
             session_id,
             occurrence,
             identity,
-            outcome,
-            handle,
+            input,
             dispatch.materialized_session_id,
+            |input| self.accept_scheduled_input(session_id, input, &admission),
         )
         .await
     }
@@ -717,6 +817,13 @@ fn schedule_internal(error: impl std::fmt::Display) -> ScheduleDomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(
+        feature = "session-store",
+        feature = "comms",
+        feature = "jsonl-store",
+        not(target_arch = "wasm32")
+    ))]
+    use crate::surface::{default_persistent_executor, materialize_session};
     use meerkat_core::skills::{SkillKey, SkillName, SourceUuid};
 
     fn fixture_skill_key(name: &str) -> SkillKey {
@@ -794,6 +901,110 @@ mod tests {
         .expect("sample occurrence planning should pass generated authority")
     }
 
+    fn sample_materialization_spec() -> SessionMaterializationSpec {
+        SessionMaterializationSpec {
+            model: "gpt-5.4".to_string(),
+            system_prompt: Some("scheduled exact publication".to_string()),
+            max_tokens: None,
+            provider: None,
+            output_schema: None,
+            structured_output_retries: None,
+            provider_params: None,
+            comms_name: Some("scheduled-exact-publication".to_string()),
+            peer_meta: None,
+            labels: Default::default(),
+            preload_skills: Vec::new(),
+            additional_instructions: Vec::new(),
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+            keep_alive: false,
+            app_context: None,
+        }
+    }
+
+    #[cfg(all(
+        feature = "session-store",
+        feature = "comms",
+        feature = "jsonl-store",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn schedule_actor_recovery_refreshes_exact_terminal_publication_handle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service_runtime = Arc::new(
+            crate::CommsRuntime::inproc_only("schedule-exact-publication-service")
+                .expect("service comms runtime"),
+        );
+        let (service, runtime_adapter) =
+            build_comms_test_service(&temp, Arc::clone(&service_runtime)).await;
+        let host = RuntimeBackedScheduleSessionHost::new(
+            Arc::clone(&service),
+            Arc::clone(&runtime_adapter),
+            SessionBuildOptions::default(),
+            None,
+        );
+        let occurrence = sample_occurrence();
+        let session_id = host
+            .materialize_session(&occurrence, &sample_materialization_spec())
+            .await
+            .expect("schedule materialization must bind exact actor publication authority");
+        let attachment = runtime_adapter
+            .current_executor_attachment_witness(&session_id)
+            .await
+            .expect("scheduled session must retain an exact executor attachment");
+        let actor_a_publication = runtime_adapter
+            .publication_handle_for_executor_attachment(&attachment)
+            .await
+            .expect("scheduled attachment must retain actor A publication authority");
+
+        let turn_boundary = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        service
+            .discard_live_session_under_runtime_turn_boundary(&session_id)
+            .await
+            .expect("discard actor A while preserving the scheduled attachment");
+        drop(turn_boundary);
+
+        host.ensure_runtime_session_registered(&session_id)
+            .await
+            .expect("cold scheduled target must reconstruct actor B exactly");
+        assert_eq!(
+            runtime_adapter
+                .current_executor_attachment_witness(&session_id)
+                .await,
+            Some(attachment.clone()),
+            "schedule actor recovery must preserve the exact attachment"
+        );
+        let actor_b_publication = runtime_adapter
+            .publication_handle_for_executor_attachment(&attachment)
+            .await
+            .expect("scheduled attachment must advance to actor B publication authority");
+        assert!(
+            !Arc::ptr_eq(&actor_a_publication, &actor_b_publication),
+            "machine-retained scheduled publication authority must advance from A to B"
+        );
+
+        let terminal = meerkat_core::event::AgentEvent::InteractionComplete {
+            interaction_id: meerkat_core::interaction::InteractionId(
+                meerkat_core::time_compat::new_uuid_v7(),
+            ),
+            result: "scheduled exact actor B terminal".to_string(),
+            structured_output: None,
+        };
+        actor_a_publication
+            .publish_interaction_terminals(std::slice::from_ref(&terminal))
+            .await
+            .expect_err("revoked scheduled actor A publication must fail closed");
+        let receipts = actor_b_publication
+            .publish_interaction_terminals(std::slice::from_ref(&terminal))
+            .await
+            .expect("scheduled actor B publication must converge");
+        assert_eq!(receipts.len(), 1);
+    }
+
     #[cfg(all(
         feature = "session-store",
         feature = "comms",
@@ -818,9 +1029,19 @@ mod tests {
         let factory = crate::AgentFactory::new(temp.path().join("sessions"))
             .with_comms_runtime(shared_runtime);
         let mut builder = crate::FactoryAgentBuilder::new(factory, crate::Config::default());
-        builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
+        builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::for_provider(
+            meerkat_core::Provider::OpenAI,
+        )));
         let (service, runtime_adapter) =
             crate::surface::build_runtime_backed_service(builder, 4, persistence);
+        let service = service.with_event_projection(
+            Arc::new(meerkat_session::event_store::FileEventStore::new(
+                temp.path().join("events"),
+            )),
+            Arc::new(meerkat_session::projector::SessionProjector::new(
+                temp.path().join("projection"),
+            )),
+        );
         (Arc::new(service), runtime_adapter)
     }
 

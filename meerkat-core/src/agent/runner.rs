@@ -388,7 +388,15 @@ where
     ) -> Result<(), ToolScopeStageError> {
         let handle = self.tool_scope.handle();
         if let Some(overlay) = overlay {
-            let dispatch_context = overlay.dispatch_context;
+            let mut dispatch_context = overlay.dispatch_context;
+            let deferred_authorities = dispatch_context
+                .remove(crate::service::TURN_DEFERRED_TOOL_AUTHORITIES_CONTEXT_KEY)
+                .map(serde_json::from_value::<Vec<crate::DeferredToolLoadAuthority>>)
+                .transpose()
+                .map_err(|error| ToolScopeStageError::Owner {
+                    message: format!("invalid turn-scoped deferred tool authorities: {error}"),
+                })?
+                .unwrap_or_default();
             let allow = overlay
                 .allowed_tools
                 .map(|tools| tools.into_iter().collect::<HashSet<_>>());
@@ -397,7 +405,11 @@ where
                 .unwrap_or_default()
                 .into_iter()
                 .collect::<HashSet<_>>();
-            handle.set_turn_overlay(allow, deny)?;
+            handle.set_turn_overlay_with_deferred_authorities(
+                allow,
+                deny,
+                &deferred_authorities,
+            )?;
             self.turn_tool_dispatch_metadata = dispatch_context;
         } else {
             self.turn_tool_dispatch_metadata.clear();
@@ -1406,7 +1418,7 @@ where
                 result: result.text.clone(),
                 structured_output: result.structured_output.clone(),
                 extraction_required,
-                usage: result.usage.clone(),
+                usage: result.usage.clone().into(),
                 terminal_cause_kind: result.terminal_cause_kind,
             },
         )
@@ -2328,6 +2340,10 @@ mod skill_activation_effect_tests {
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    fn normalized_test_usage(client: &dyn AgentLlmClient, usage: Usage) -> Usage {
+        crate::TurnUsage::host_declared(client.provider(), client.model(), usage).into_inner()
+    }
+
     fn fixture_skill_key(name: &str) -> SkillKey {
         SkillKey::new(
             SourceUuid::parse("dc256086-0d2f-4f61-a307-320d4148107f")
@@ -2355,7 +2371,7 @@ mod skill_activation_effect_tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_test_usage(self, Usage::default()),
             ))
         }
 

@@ -866,7 +866,7 @@ mod tests {
     }
 
     fn test_router() -> (Arc<Router>, TrustedPeersView) {
-        let (_inbox, inbox_sender) = Inbox::new();
+        let (_inbox, inbox_sender) = Inbox::new_transport_only();
         let trusted_peers = Arc::new(RwLock::new(TrustStore::default()));
         let router = Arc::new(Router::with_shared_peers(
             crate::identity::Keypair::generate(),

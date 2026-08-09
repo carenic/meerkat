@@ -26,7 +26,7 @@ mod stdio_json;
 
 pub use embedded::{
     build_embedded_service, build_embedded_service_from_builder, set_default_schedule_tools,
-    set_default_workgraph_tools,
+    set_default_workgraph_namespace_grant, set_default_workgraph_tools,
 };
 #[cfg(all(
     feature = "session-store",
@@ -61,19 +61,22 @@ pub use request_execution::{
 pub use runtime_backed::configure_peer_ingress;
 #[cfg(feature = "session-store")]
 pub use runtime_backed::{
-    PersistentRuntimeExecutor, RuntimeBackedInitialTurn, SurfaceRuntimeMaterializeError,
-    build_runtime_backed_service, build_runtime_backed_service_with_capacities,
-    default_persistent_executor, default_persistent_executor_with_workgraph_service,
-    install_prepared_runtime_interrupt_handle,
+    AttachedActorPublicationRefreshFn, PersistentRuntimeExecutor, RuntimeBackedInitialTurn,
+    SurfaceRuntimeMaterializeError, build_runtime_backed_service,
+    build_runtime_backed_service_with_capacities, default_persistent_executor,
+    default_persistent_executor_with_workgraph_service, install_prepared_runtime_interrupt_handle,
     install_prepared_runtime_interrupt_handle_for_actor_slot,
     materialize_attached_session_actor_only,
     materialize_attached_session_actor_only_with_reserved_admission, materialize_session,
     materialize_session_actor_unattached_with_reserved_admission,
     materialize_session_under_runtime_turn_boundary, materialize_session_with_reserved_admission,
+    materialize_session_with_reserved_admission_and_actor_slot,
     materialize_session_with_reserved_admission_under_runtime_turn_boundary,
+    materialize_session_with_reserved_admission_under_runtime_turn_boundary_and_publication_refresh,
     persistent_runtime_post_stop_cleanup_handle,
     persistent_runtime_post_stop_cleanup_handle_for_actor_slot,
-    persistent_runtime_publication_handle, persistent_runtime_turn_finalization_boundary_handle,
+    persistent_runtime_publication_handle, persistent_runtime_publication_handle_for_actor_slot,
+    persistent_runtime_turn_finalization_boundary_handle,
     run_runtime_backed_initial_turn_with_machine, split_runtime_backed_eager_create_request,
 };
 #[cfg(feature = "session-store")]
@@ -84,10 +87,10 @@ pub use schedule_host::{
     AcceptedScheduledInput, MobMemberCurrentSessionScheduleResolver, NoopScheduleMobHost,
     ScheduleAdmissionOutcome, ScheduleHostHandle, ScheduledEventDispatch, ScheduledPromptDispatch,
     SharedScheduleTargetAdapter, SurfaceScheduleMobHost, SurfaceScheduleSessionHost,
-    async_completion_dispatch, async_completion_dispatch_with_admission_outcome,
-    build_dispatch_from_accepted, immediate_completed_dispatch,
-    immediate_completed_dispatch_with_admission_outcome, immediate_delivery_failure,
-    mob_member_schedule_identity, parse_mob_member_schedule_identity,
+    accept_schedule_runtime_input_with_reconciliation, async_completion_dispatch,
+    async_completion_dispatch_with_admission_outcome, build_dispatch_from_accepted,
+    immediate_completed_dispatch, immediate_completed_dispatch_with_admission_outcome,
+    immediate_delivery_failure, mob_member_schedule_identity, parse_mob_member_schedule_identity,
     recover_mob_member_identity_from_session_target, runtime_delivery_dispatch_from_admission,
     schedule_delivery_idempotency_key, schedule_host_supported, schedule_runtime_correlation_id,
     schedule_runtime_delivery_idempotency_key, spawn_schedule_host,
@@ -1218,6 +1221,16 @@ mod tests {
             crate::WorkGraphService::new(std::sync::Arc::new(crate::MemoryWorkGraphStore::new()));
         service
             .create_goal(crate::GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "arbitrated goal".to_string(),
@@ -1321,6 +1334,16 @@ mod tests {
             crate::WorkGraphService::new(std::sync::Arc::new(crate::MemoryWorkGraphStore::new()));
         workgraph_service
             .create_goal(crate::GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "session-target goal".to_string(),
@@ -1337,6 +1360,16 @@ mod tests {
             .expect("session-target goal");
         workgraph_service
             .create_goal(crate::GoalCreateRequest {
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                priority: Default::default(),
+                labels: Default::default(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
                 realm_id: None,
                 namespace: None,
                 title: "owner-target goal on the same session".to_string(),

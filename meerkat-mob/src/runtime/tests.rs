@@ -1245,10 +1245,6 @@ impl CoreCommsRuntime for MockCommsRuntime {
             .collect())
     }
 
-    async fn drain_messages(&self) -> Vec<String> {
-        Vec::new()
-    }
-
     fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
         self.inbox_notify.clone()
     }
@@ -1460,6 +1456,22 @@ impl Drop for AtomicInFlightGuard<'_> {
 }
 
 /// A mock session service that creates sessions with mock comms runtimes.
+struct TestRuntimeControlBarrier {
+    boundary_calls: AtomicU64,
+    hard_calls: AtomicU64,
+    release: tokio::sync::Notify,
+}
+
+impl TestRuntimeControlBarrier {
+    fn new() -> Self {
+        Self {
+            boundary_calls: AtomicU64::new(0),
+            hard_calls: AtomicU64::new(0),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 struct MockSessionService {
     sessions: RwLock<HashMap<SessionId, Arc<MockCommsRuntime>>>,
     actor_registry: meerkat_session::LiveSessionActorRegistry,
@@ -1509,6 +1521,8 @@ struct MockSessionService {
     /// Sessions whose archive() call should fail.
     archive_fail_sessions: RwLock<HashSet<SessionId>>,
     archive_calls: RwLock<HashMap<SessionId, u64>>,
+    archive_post_commit_gate: RwLock<Option<Arc<tokio::sync::Notify>>>,
+    archive_post_commit_started: tokio::sync::Notify,
     archive_not_found_sessions: RwLock<HashSet<SessionId>>,
     /// Sessions whose durable document belongs to another host. The live
     /// actor may still be attached locally, but this mock archive authority
@@ -1574,6 +1588,11 @@ struct MockSessionService {
     injected_interaction_ids: Arc<std::sync::Mutex<Vec<InteractionId>>>,
     keep_alive_prompts: RwLock<Vec<(SessionId, String)>>,
     interrupt_calls: AtomicU64,
+    runtime_control_barrier: RwLock<Option<Arc<TestRuntimeControlBarrier>>>,
+    turn_finalization_gate: std::sync::RwLock<Option<Arc<tokio::sync::Mutex<()>>>>,
+    turn_finalization_acquire_started: AtomicU64,
+    turn_finalization_acquire_completed: AtomicU64,
+    turn_finalization_acquire_panics_remaining: AtomicU64,
     cancel_after_boundary_supported: AtomicBool,
     cancel_after_boundary_calls: AtomicU64,
     inject_calls: Arc<AtomicU64>,
@@ -1649,6 +1668,8 @@ impl MockSessionService {
             archive_precommit_fail_sessions: RwLock::new(HashSet::new()),
             archive_fail_sessions: RwLock::new(HashSet::new()),
             archive_calls: RwLock::new(HashMap::new()),
+            archive_post_commit_gate: RwLock::new(None),
+            archive_post_commit_started: tokio::sync::Notify::new(),
             archive_not_found_sessions: RwLock::new(HashSet::new()),
             archive_authority_unknown_sessions: RwLock::new(HashSet::new()),
             archive_fail_comms_names: RwLock::new(HashSet::new()),
@@ -1673,6 +1694,11 @@ impl MockSessionService {
             injected_interaction_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             keep_alive_prompts: RwLock::new(Vec::new()),
             interrupt_calls: AtomicU64::new(0),
+            runtime_control_barrier: RwLock::new(None),
+            turn_finalization_gate: std::sync::RwLock::new(None),
+            turn_finalization_acquire_started: AtomicU64::new(0),
+            turn_finalization_acquire_completed: AtomicU64::new(0),
+            turn_finalization_acquire_panics_remaining: AtomicU64::new(0),
             cancel_after_boundary_supported: AtomicBool::new(true),
             cancel_after_boundary_calls: AtomicU64::new(0),
             inject_calls: Arc::new(AtomicU64::new(0)),
@@ -2142,6 +2168,39 @@ impl MockSessionService {
             .store(enabled, Ordering::Relaxed);
     }
 
+    async fn install_runtime_control_barrier(&self) -> Arc<TestRuntimeControlBarrier> {
+        let barrier = Arc::new(TestRuntimeControlBarrier::new());
+        *self.runtime_control_barrier.write().await = Some(Arc::clone(&barrier));
+        barrier
+    }
+
+    async fn clear_runtime_control_barrier(&self) {
+        self.runtime_control_barrier.write().await.take();
+    }
+
+    fn install_non_reentrant_turn_finalization_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        *self
+            .turn_finalization_gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&gate));
+        gate
+    }
+
+    fn turn_finalization_acquire_counts(&self) -> (u64, u64) {
+        (
+            self.turn_finalization_acquire_started
+                .load(Ordering::Acquire),
+            self.turn_finalization_acquire_completed
+                .load(Ordering::Acquire),
+        )
+    }
+
+    fn panic_next_turn_finalization_acquire(&self) {
+        self.turn_finalization_acquire_panics_remaining
+            .store(1, Ordering::Release);
+    }
+
     fn inject_call_count(&self) -> u64 {
         self.inject_calls.load(Ordering::Relaxed)
     }
@@ -2184,6 +2243,20 @@ impl MockSessionService {
 
     fn set_archive_delay_ms(&self, delay_ms: u64) {
         self.archive_delay_ms.store(delay_ms, Ordering::Relaxed);
+    }
+
+    async fn install_archive_post_commit_gate(&self) -> Arc<tokio::sync::Notify> {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *self.archive_post_commit_gate.write().await = Some(Arc::clone(&gate));
+        gate
+    }
+
+    async fn wait_for_archive_post_commit(&self) {
+        self.archive_post_commit_started.notified().await;
+    }
+
+    async fn clear_archive_post_commit_gate(&self) {
+        *self.archive_post_commit_gate.write().await = None;
     }
 
     fn fail_next_exact_actor_discard(&self) {
@@ -2908,7 +2981,7 @@ impl SessionService for MockSessionService {
                                 result: completed_result,
                                 structured_output: None,
                                 extraction_required: false,
-                                usage: Usage::default(),
+                                usage: Usage::default().into(),
                                 terminal_cause_kind: None,
                             },
                         ))
@@ -3039,6 +3112,11 @@ impl SessionService for MockSessionService {
         self.archived_session_ids.write().await.insert(id.clone());
         if self.persisted_sessions.read().await.contains_key(id) {
             self.issue_persisted_session_revision(id).await;
+        }
+        let archive_post_commit_gate = self.archive_post_commit_gate.read().await.clone();
+        if let Some(gate) = archive_post_commit_gate {
+            self.archive_post_commit_started.notify_waiters();
+            gate.notified().await;
         }
         drop(_authority_guard);
         let runtime = {
@@ -3384,7 +3462,10 @@ impl SessionServiceControlExt for MockSessionService {
 
 #[async_trait]
 impl MobSessionService for MockSessionService {
-    async fn prepare_session_for_resume(&self, session_id: &SessionId) -> Result<(), SessionError> {
+    async fn materialize_session_resume_verdict(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<super::session_service::SessionResumeVerdict, SessionError> {
         self.resume_prepare_calls.fetch_add(1, Ordering::Relaxed);
         if let Some(prepared) = self
             .prepared_resume_sessions
@@ -3399,7 +3480,8 @@ impl MobSessionService for MockSessionService {
                 .insert(session_id.clone(), prepared);
             self.issue_persisted_session_revision(session_id).await;
         }
-        Ok(())
+        super::session_service::materialize_nonpersistent_session_resume_verdict(self, session_id)
+            .await
     }
 
     async fn observe_session_resume_authority(
@@ -3448,6 +3530,7 @@ impl MobSessionService for MockSessionService {
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         req: CreateSessionRequest,
+        _resume_preparation: Option<super::session_service::SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<RunResult, SessionError> {
         self.create_session_with_actor_witness_slot(req, Some(actor_witness_slot))
@@ -3459,6 +3542,15 @@ impl MobSessionService for MockSessionService {
         session_id: &SessionId,
     ) -> Result<(), SessionError> {
         self.archive_with_mob_lifecycle_authority(session_id).await
+    }
+
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+        &self,
+        session_id: &SessionId,
+        _deadline: Instant,
+    ) -> Result<(), SessionError> {
+        self.archive_with_mob_lifecycle_authority_under_runtime_turn_boundary(session_id)
+            .await
     }
 
     async fn discard_live_session_under_runtime_turn_boundary(
@@ -3500,6 +3592,38 @@ impl MobSessionService for MockSessionService {
         true
     }
 
+    #[allow(clippy::panic)]
+    async fn acquire_runtime_turn_finalization_guard(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Box<dyn meerkat_core::lifecycle::CoreExecutorTurnFinalizationGuard>, SessionError>
+    {
+        self.turn_finalization_acquire_started
+            .fetch_add(1, Ordering::Release);
+        if self
+            .turn_finalization_acquire_panics_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            panic!("simulated turn-finalization boundary acquisition panic");
+        }
+        let gate = self
+            .turn_finalization_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let guard: Box<dyn meerkat_core::lifecycle::CoreExecutorTurnFinalizationGuard> = match gate
+        {
+            Some(gate) => Box::new(gate.lock_owned().await),
+            None => Box::new(()),
+        };
+        self.turn_finalization_acquire_completed
+            .fetch_add(1, Ordering::Release);
+        Ok(guard)
+    }
+
     async fn live_session_actor_registered(
         &self,
         session_id: &SessionId,
@@ -3522,12 +3646,33 @@ impl MobSessionService for MockSessionService {
         SessionService::interrupt(self, session_id).await
     }
 
+    async fn interrupt_run_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        _expected_run_id: &meerkat_core::RunId,
+        _authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, SessionError> {
+        if let Some(barrier) = self.runtime_control_barrier.read().await.clone() {
+            barrier.hard_calls.fetch_add(1, Ordering::Relaxed);
+            barrier.release.notified().await;
+        }
+        match SessionService::interrupt(self, session_id).await {
+            Ok(()) => Ok(true),
+            Err(SessionError::NotRunning { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn cancel_after_boundary_with_machine_authority(
         &self,
         session_id: &SessionId,
         _expected_run_id: &meerkat_core::RunId,
         _authority: meerkat_runtime::MachineSessionControlAuthority,
     ) -> Result<(), SessionError> {
+        if let Some(barrier) = self.runtime_control_barrier.read().await.clone() {
+            barrier.boundary_calls.fetch_add(1, Ordering::Relaxed);
+            barrier.release.notified().await;
+        }
         SessionService::cancel_after_boundary(self, session_id).await
     }
 
@@ -4590,7 +4735,7 @@ struct FaultInjectedRuntimeMetadataStore {
     conflict_compare_supervisor_countdown: AtomicUsize,
     fail_put_host_authority: AtomicBool,
     fail_list_overlays: AtomicBool,
-    fail_upsert_overlay: AtomicBool,
+    fail_upsert_overlay_countdown: AtomicUsize,
     fail_delete_overlay: AtomicBool,
 }
 
@@ -4606,7 +4751,7 @@ impl FaultInjectedRuntimeMetadataStore {
             conflict_compare_supervisor_countdown: AtomicUsize::new(0),
             fail_put_host_authority: AtomicBool::new(false),
             fail_list_overlays: AtomicBool::new(false),
-            fail_upsert_overlay: AtomicBool::new(false),
+            fail_upsert_overlay_countdown: AtomicUsize::new(0),
             fail_delete_overlay: AtomicBool::new(false),
         }
     }
@@ -4655,7 +4800,16 @@ impl FaultInjectedRuntimeMetadataStore {
     }
 
     fn fail_next_upsert_overlay(&self) {
-        self.fail_upsert_overlay.store(true, Ordering::Relaxed);
+        self.fail_nth_upsert_overlay(1);
+    }
+
+    fn fail_nth_upsert_overlay(&self, n: usize) {
+        assert!(
+            n > 0,
+            "overlay failure countdown must target a future write"
+        );
+        self.fail_upsert_overlay_countdown
+            .store(n, Ordering::Relaxed);
     }
 
     fn fail_next_delete_overlay(&self) {
@@ -4683,6 +4837,27 @@ impl FaultInjectedRuntimeMetadataStore {
                     }
                     break;
                 }
+                Err(actual) => remaining = actual,
+            }
+        }
+        Ok(())
+    }
+
+    fn maybe_fail_overlay_write(&self) -> Result<(), MobStoreError> {
+        let mut remaining = self.fail_upsert_overlay_countdown.load(Ordering::Relaxed);
+        while remaining > 0 {
+            match self.fail_upsert_overlay_countdown.compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) if remaining == 1 => {
+                    return Err(MobStoreError::WriteFailed(
+                        "fault-injected runtime direct-bind overlay write failure".to_string(),
+                    ));
+                }
+                Ok(_) => break,
                 Err(actual) => remaining = actual,
             }
         }
@@ -5119,13 +5294,36 @@ impl MobRuntimeMetadataStore for FaultInjectedRuntimeMetadataStore {
         mob_id: &MobId,
         record: &ExternalBindingOverlayRecord,
     ) -> Result<(), MobStoreError> {
-        if self.fail_upsert_overlay.swap(false, Ordering::Relaxed) {
+        self.maybe_fail_overlay_write()?;
+        self.inner
+            .upsert_external_binding_overlay(mob_id, record)
+            .await
+    }
+
+    async fn compare_and_set_external_direct_bind(
+        &self,
+        mob_id: &MobId,
+        expected: &ExternalBindingOverlayRecord,
+        desired: &ExternalBindingOverlayRecord,
+    ) -> Result<bool, MobStoreError> {
+        self.maybe_fail_overlay_write()?;
+        self.inner
+            .compare_and_set_external_direct_bind(mob_id, expected, desired)
+            .await
+    }
+
+    async fn compare_and_delete_external_direct_bind(
+        &self,
+        mob_id: &MobId,
+        expected: &ExternalBindingOverlayRecord,
+    ) -> Result<bool, MobStoreError> {
+        if self.fail_delete_overlay.swap(false, Ordering::Relaxed) {
             return Err(MobStoreError::WriteFailed(
-                "fault-injected runtime overlay upsert failure".to_string(),
+                "fault-injected runtime direct-bind compare-delete failure".to_string(),
             ));
         }
         self.inner
-            .upsert_external_binding_overlay(mob_id, record)
+            .compare_and_delete_external_direct_bind(mob_id, expected)
             .await
     }
 
@@ -5835,6 +6033,7 @@ struct LiveExternalPeerHarness {
     drop_next_authorize_response: Arc<AtomicBool>,
     reject_next_rotation: Arc<AtomicBool>,
     supervisor_state: Arc<RwLock<Option<HarnessSupervisorState>>>,
+    direct_member_fence: Arc<RwLock<Option<super::bridge_protocol::BridgeDirectMemberFence>>>,
     bind_peer_id_override: Arc<RwLock<Option<String>>>,
     fail_authorize_countdown: Arc<AtomicUsize>,
     fail_next_bind: Arc<AtomicBool>,
@@ -6009,6 +6208,14 @@ impl LiveExternalPeerHarness {
 
     async fn forget_supervisor(&self) {
         let _ = self.supervisor_state.write().await.take();
+    }
+
+    async fn forget_direct_member_fence(&self) {
+        let _ = self.direct_member_fence.write().await.take();
+    }
+
+    async fn direct_member_fence(&self) -> Option<super::bridge_protocol::BridgeDirectMemberFence> {
+        self.direct_member_fence.read().await.clone()
     }
 
     fn fail_next_authorize(&self) {
@@ -6222,6 +6429,9 @@ async fn spawn_live_external_peer_with_transport(
     let responder_reject_next_rotation = reject_next_rotation.clone();
     let supervisor_state: Arc<RwLock<Option<HarnessSupervisorState>>> = Arc::new(RwLock::new(None));
     let responder_supervisor_state = supervisor_state.clone();
+    let direct_member_fence: Arc<RwLock<Option<super::bridge_protocol::BridgeDirectMemberFence>>> =
+        Arc::new(RwLock::new(None));
+    let responder_direct_member_fence = direct_member_fence.clone();
     let rotation_operations: Arc<
         RwLock<
             HashMap<
@@ -6265,9 +6475,6 @@ async fn spawn_live_external_peer_with_transport(
                     .await
                     .expect("live external peer must expose classified claim authority");
             let Some(claim) = claim else {
-                if responder_runtime.dismiss_received() {
-                    break;
-                }
                 if reply_tasks.is_empty() {
                     (&mut notified).await;
                 } else {
@@ -6608,6 +6815,30 @@ async fn spawn_live_external_peer_with_transport(
                                             )
                                             .expect("bind rejection"),
                                             Ok(mutate) => {
+                                                let member_fence = {
+                                                    let mut current =
+                                                        responder_direct_member_fence.write().await;
+                                                    match current.as_ref() {
+                                                        Some(fence)
+                                                            if fence.incarnation()
+                                                                == payload.member =>
+                                                        {
+                                                            fence.clone()
+                                                        }
+                                                        _ => {
+                                                            let fence = super::bridge_protocol::BridgeDirectMemberFence {
+                                                                mob_id: payload.member.mob_id.clone(),
+                                                                agent_identity: payload.member.agent_identity.clone(),
+                                                                generation: payload.member.generation,
+                                                                fence_token: payload.member.fence_token,
+                                                                member_session_id: responder_runtime_address.clone(),
+                                                                runtime_session_token: super::bridge_protocol::BridgeDirectRuntimeSessionToken::new(),
+                                                            };
+                                                            *current = Some(fence.clone());
+                                                            fence
+                                                        }
+                                                    }
+                                                };
                                                 if mutate {
                                                     responder_bind_count
                                                         .fetch_add(1, Ordering::Relaxed);
@@ -6672,6 +6903,7 @@ async fn spawn_live_external_peer_with_transport(
                                                                     unwire_member: true,
                                                                     ..super::bridge_protocol::BridgeCapabilities::default()
                                                             },
+                                                            member_fence,
                                                             },
                                                         ),
                                                     )
@@ -7006,7 +7238,7 @@ async fn spawn_live_external_peer_with_transport(
                                         .expect("unwire ack")
                                     }
                                 }
-                                super::bridge_protocol::BridgeCommand::RetireMember(_) => {
+                                super::bridge_protocol::BridgeCommand::RetireMember(payload) => {
                                     responder_retire_count.fetch_add(1, Ordering::Relaxed);
                                     if responder_fail_next_retire.swap(false, Ordering::Relaxed) {
                                         serde_json::to_value(
@@ -7017,12 +7249,29 @@ async fn spawn_live_external_peer_with_transport(
                                         )
                                         .expect("retire rejection")
                                     } else {
-                                        state = super::bridge_protocol::BridgeMemberRuntimeState::Retired;
+                                        let mut current = responder_direct_member_fence.write().await;
+                                        let outcome = match current.as_ref() {
+                                            Some(fence) if fence == &payload.member_fence => {
+                                                *current = None;
+                                                state = super::bridge_protocol::BridgeMemberRuntimeState::Retired;
+                                                super::bridge_protocol::BridgeRetireOutcome::Retired {
+                                                    inputs_abandoned: 0,
+                                                    inputs_pending_drain: 0,
+                                                }
+                                            }
+                                            Some(fence) => super::bridge_protocol::BridgeRetireOutcome::Stale {
+                                                presented: payload.member_fence.evidence(),
+                                                current: Some(fence.evidence()),
+                                            },
+                                            None => super::bridge_protocol::BridgeRetireOutcome::Stale {
+                                                presented: payload.member_fence.evidence(),
+                                                current: None,
+                                            },
+                                        };
                                         serde_json::to_value(
                                             super::bridge_protocol::BridgeReply::Retire(
                                                 super::bridge_protocol::BridgeRetireResponse {
-                                                inputs_abandoned: 0,
-                                                inputs_pending_drain: 0,
+                                                    outcome,
                                                 },
                                             ),
                                         )
@@ -7320,6 +7569,7 @@ async fn spawn_live_external_peer_with_transport(
         drop_next_authorize_response,
         reject_next_rotation,
         supervisor_state,
+        direct_member_fence,
         bind_peer_id_override,
         fail_authorize_countdown,
         fail_next_bind,
@@ -7337,7 +7587,7 @@ async fn create_test_mob(definition: MobDefinition) -> (MobHandle, Arc<MockSessi
     let service = Arc::new(MockSessionService::new());
     let adapter = service.enable_runtime_adapter();
     let storage = MobStorage::in_memory();
-    let handle = MobBuilder::new(definition, storage)
+    let handle = MobBuilder::new(definition, storage.clone())
         .with_session_service(service.clone())
         .create()
         .await
@@ -7374,7 +7624,7 @@ async fn actor_startup_prunes_crash_recovered_stale_member_operator_rows() {
         Arc::new(InMemoryMobEventStore::new()),
         runtime_metadata.clone(),
     );
-    let handle = MobBuilder::new(definition, storage)
+    let handle = MobBuilder::new(definition, storage.clone())
         .with_session_service(service)
         .create()
         .await
@@ -9412,8 +9662,13 @@ impl SessionServiceControlExt for PersistedListingSessionService {
 
 #[async_trait]
 impl MobSessionService for PersistedListingSessionService {
-    async fn prepare_session_for_resume(&self, session_id: &SessionId) -> Result<(), SessionError> {
-        self.inner.prepare_session_for_resume(session_id).await
+    async fn materialize_session_resume_verdict(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<super::session_service::SessionResumeVerdict, SessionError> {
+        self.inner
+            .materialize_session_resume_verdict(session_id)
+            .await
     }
 
     async fn observe_session_resume_authority(
@@ -9464,10 +9719,15 @@ impl MobSessionService for PersistedListingSessionService {
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         req: CreateSessionRequest,
+        resume_preparation: Option<super::session_service::SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<RunResult, SessionError> {
         self.inner
-            .create_session_with_actor_witness_under_runtime_turn_boundary(req, actor_witness_slot)
+            .create_session_with_actor_witness_under_runtime_turn_boundary(
+                req,
+                resume_preparation,
+                actor_witness_slot,
+            )
             .await
     }
 
@@ -9476,12 +9736,14 @@ impl MobSessionService for PersistedListingSessionService {
         &self,
         req: CreateSessionRequest,
         authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
+        resume_preparation: super::session_service::SessionResumePreparationReceipt,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<RunResult, SessionError> {
         self.inner
             .create_session_with_machine_archived_resume_authority_and_actor_witness_under_runtime_turn_boundary(
                 req,
                 authorization,
+                resume_preparation,
                 actor_witness_slot,
             )
             .await
@@ -9493,6 +9755,18 @@ impl MobSessionService for PersistedListingSessionService {
     ) -> Result<(), SessionError> {
         self.inner
             .archive_with_mob_lifecycle_authority_under_runtime_turn_boundary(session_id)
+            .await
+    }
+
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<(), SessionError> {
+        self.inner
+            .archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+                session_id, deadline,
+            )
             .await
     }
 
@@ -9734,8 +10008,13 @@ impl SessionServiceControlExt for InactiveReadSessionService {
 
 #[async_trait]
 impl MobSessionService for InactiveReadSessionService {
-    async fn prepare_session_for_resume(&self, session_id: &SessionId) -> Result<(), SessionError> {
-        self.inner.prepare_session_for_resume(session_id).await
+    async fn materialize_session_resume_verdict(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<super::session_service::SessionResumeVerdict, SessionError> {
+        self.inner
+            .materialize_session_resume_verdict(session_id)
+            .await
     }
 
     async fn observe_session_resume_authority(
@@ -9786,10 +10065,15 @@ impl MobSessionService for InactiveReadSessionService {
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         req: CreateSessionRequest,
+        resume_preparation: Option<super::session_service::SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<RunResult, SessionError> {
         self.inner
-            .create_session_with_actor_witness_under_runtime_turn_boundary(req, actor_witness_slot)
+            .create_session_with_actor_witness_under_runtime_turn_boundary(
+                req,
+                resume_preparation,
+                actor_witness_slot,
+            )
             .await
     }
 
@@ -9798,12 +10082,14 @@ impl MobSessionService for InactiveReadSessionService {
         &self,
         req: CreateSessionRequest,
         authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
+        resume_preparation: super::session_service::SessionResumePreparationReceipt,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<RunResult, SessionError> {
         self.inner
             .create_session_with_machine_archived_resume_authority_and_actor_witness_under_runtime_turn_boundary(
                 req,
                 authorization,
+                resume_preparation,
                 actor_witness_slot,
             )
             .await
@@ -10065,6 +10351,7 @@ async fn archived_document_without_runtime_record_is_revivable() {
     let receipt = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
             authorized_resume: None,
+            direct_member_incarnation: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -10198,7 +10485,7 @@ impl SessionAgent for OverlayProbeSessionAgent {
                 result: result.text.clone(),
                 structured_output: result.structured_output.clone(),
                 extraction_required: false,
-                usage: result.usage.clone(),
+                usage: result.usage.clone().into(),
                 terminal_cause_kind: None,
             })
             .await;
@@ -12067,6 +12354,9 @@ async fn test_destroy_event_clear_failure_restores_runtime_metadata_for_retry() 
             &ExternalBindingOverlayRecord {
                 agent_identity: AgentIdentity::from("overlay-retry-anchor"),
                 generation: crate::ids::Generation::INITIAL,
+                fence_token: None,
+                direct_member_incarnation: None,
+                direct_member_fence: None,
                 normalized_member_ref: None,
                 bootstrap_token: Some("restore-me".to_string().into()),
                 status: ExternalBindingOverlayStatus::Failed {
@@ -13654,6 +13944,9 @@ async fn test_destroy_scrubs_runtime_metadata() {
             &ExternalBindingOverlayRecord {
                 agent_identity: AgentIdentity::from("worker-overlay"),
                 generation: crate::ids::Generation::INITIAL,
+                fence_token: None,
+                direct_member_incarnation: None,
+                direct_member_fence: None,
                 normalized_member_ref: None,
                 bootstrap_token: None,
                 status: ExternalBindingOverlayStatus::Failed {
@@ -15132,7 +15425,7 @@ async fn test_rotate_supervisor_does_not_attempt_old_bind_fallback() {
 }
 
 #[tokio::test]
-async fn test_rotate_supervisor_does_not_persist_old_rebind_metadata() {
+async fn test_rotate_supervisor_post_commit_adoption_failure_retries_same_v5_epoch() {
     let _serial = lock_real_comms_tests();
     let definition = with_unique_mob_id(
         sample_definition_with_external_backend(),
@@ -15146,7 +15439,7 @@ async fn test_rotate_supervisor_does_not_persist_old_rebind_metadata() {
     );
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
-    let handle = MobBuilder::new(definition, storage)
+    let handle = MobBuilder::new(definition, storage.clone())
         .with_session_service(service)
         .create()
         .await
@@ -15168,15 +15461,16 @@ async fn test_rotate_supervisor_does_not_persist_old_rebind_metadata() {
         .expect("load original authority")
         .expect("original authority record");
     external.forget_supervisor().await;
-    runtime_metadata.fail_next_upsert_overlay();
+    external.forget_direct_member_fence().await;
+    runtime_metadata.fail_nth_upsert_overlay(2);
 
-    let report = handle
+    let error = handle
         .rotate_supervisor()
         .await
-        .expect("rotation should not persist an old-authority rebound");
+        .expect_err("post-commit direct-member adoption failure must stay retryable");
     assert!(
-        runtime_metadata.fail_upsert_overlay.load(Ordering::Relaxed),
-        "rotation must not consume the injected old-rebind overlay failure"
+        matches!(&error, MobError::DirectMemberAdoptionPending { .. }),
+        "committed V5 authority must not be misreported as an incomplete supervisor rotation: {error}"
     );
 
     let current = runtime_metadata
@@ -15185,16 +15479,47 @@ async fn test_rotate_supervisor_does_not_persist_old_rebind_metadata() {
         .expect("load authority after rotation")
         .expect("authority after rotation");
     assert_eq!(current.epoch, original.epoch + 1);
-    assert_eq!(current.public_peer_id, report.public_peer_id);
     assert!(
         current.pending_rotation.is_none(),
-        "successful rotation should clear its durable operation anchor"
+        "V5 authority already committed, so no pending rotation anchor may be claimed"
     );
     assert_eq!(
         external.authorized_supervisor_peer_id().await.as_deref(),
         Some(current.public_peer_id.as_str()),
         "member must stay on the committed next authority, never an old rebound"
     );
+    let pending = runtime_metadata
+        .list_external_binding_overlays(&mob_id)
+        .await
+        .expect("load durable adoption intent");
+    assert!(pending.iter().any(|record| {
+        record.agent_identity == AgentIdentity::from("w-ext")
+            && record.status == crate::store::ExternalBindingOverlayStatus::DirectBindPending
+    }));
+    handle
+        .shutdown()
+        .await
+        .expect("stop actor after lost Bound persistence");
+
+    let resumed_service = Arc::new(MockSessionService::new());
+    let _ = resumed_service.enable_runtime_adapter();
+    let resumed = MobBuilder::for_resume(storage)
+        .with_session_service(resumed_service)
+        .resume()
+        .await
+        .expect("cold resume must drain exact pending adoption");
+    let retry = resumed
+        .rotate_supervisor()
+        .await
+        .expect("first post-recovery retry must report the already committed epoch");
+    assert_eq!(retry.previous_epoch, current.epoch);
+    assert_eq!(retry.current_epoch, current.epoch);
+    let after_retry = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after adoption retry")
+        .expect("authority after adoption retry");
+    assert_eq!(after_retry.epoch, current.epoch, "retry must not mint V6");
 }
 
 #[tokio::test]
@@ -16796,6 +17121,217 @@ async fn test_restarted_peer_only_member_rebinds_when_supervisor_state_is_lost()
 }
 
 #[tokio::test]
+async fn test_v4_resume_is_effect_free_until_explicit_rotation_then_adopts_direct_member() {
+    let _serial = lock_real_comms_tests();
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "v4-resume-explicit-v5-adoption",
+    );
+    let mob_id = definition.id.clone();
+    let storage = MobStorage::in_memory();
+    let (handle, _service) =
+        create_test_mob_with_real_comms_and_storage(definition.clone(), storage.clone()).await;
+    let external =
+        spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-v4-adopt")).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-v4-adopt"),
+            None,
+            external.binding(),
+        )
+        .await
+        .expect("seed peer-only member under current authority");
+    handle.shutdown().await.expect("stop original actor");
+
+    // Reconstruct the exact structural/identity store under a released V4
+    // supervisor record. The receiver has also lost its supervisor state, so
+    // an incorrectly ordered resume would visibly send Authorize or Bind.
+    let legacy_metadata = Arc::new(InMemoryMobRuntimeMetadataStore::new());
+    let legacy =
+        SupervisorAuthorityRecord::generate(super::bridge_protocol::BridgeProtocolVersion::V4);
+    persist_supervisor_authority_for_test(legacy_metadata.as_ref(), &mob_id, &legacy).await;
+    let original_supervisor = external
+        .authorized_supervisor_spec()
+        .await
+        .expect("seeded receiver supervisor authority");
+    external
+        .install_legacy_rotated_supervisor(
+            super::bridge_protocol::BridgePeerSpec {
+                name: original_supervisor.name,
+                peer_id: legacy.public_peer_id.clone(),
+                address: original_supervisor.address,
+                pubkey: legacy.public_signing_key(),
+            },
+            legacy.epoch,
+        )
+        .await;
+    let mut resumed_storage = storage.clone();
+    resumed_storage.runtime_metadata = legacy_metadata.clone();
+    external.forget_supervisor().await;
+    external.forget_direct_member_fence().await;
+    let binds_before_resume = external.bind_protocol_versions().await;
+    let created_before_resume = storage
+        .events
+        .replay_all()
+        .await
+        .expect("replay original events")
+        .into_iter()
+        .filter(|event| matches!(event.kind, MobEventKind::MobCreated { .. }))
+        .count();
+
+    let (resumed, _resumed_service) = resume_test_mob_with_real_comms(resumed_storage).await;
+    assert_eq!(
+        external.bind_protocol_versions().await,
+        binds_before_resume,
+        "V4 materialization must not send V5 BindMember before explicit rotation"
+    );
+    assert_eq!(
+        external.authorized_supervisor_peer_id().await,
+        None,
+        "V4 materialization must not send AuthorizeSupervisor after remote authority loss"
+    );
+    assert!(
+        external.direct_member_fence().await.is_none(),
+        "V4 materialization must not recreate the receiver bearer"
+    );
+    let created_after_resume = storage
+        .events
+        .replay_all()
+        .await
+        .expect("replay resumed events")
+        .into_iter()
+        .filter(|event| matches!(event.kind, MobEventKind::MobCreated { .. }))
+        .count();
+    assert_eq!(
+        created_after_resume, created_before_resume,
+        "cold resume must not append another MobCreated"
+    );
+    assert!(
+        legacy_metadata
+            .list_external_binding_overlays(&mob_id)
+            .await
+            .expect("list legacy overlays")
+            .is_empty(),
+        "V4 materialization must not reserve DirectBind authority"
+    );
+
+    let rotation_deadline = Instant::now() + Duration::from_secs(5);
+    let report = loop {
+        match resumed.rotate_supervisor().await {
+            Ok(report) => break report,
+            Err(MobError::SupervisorRotationIncomplete {
+                pending_authority_recorded: true,
+                ..
+            }) if Instant::now() < rotation_deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => panic!(
+                "explicit rotation should commit V5 and adopt legacy peer-only members: {error:?}"
+            ),
+        }
+    };
+    let committed = legacy_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load committed authority")
+        .expect("committed authority");
+    assert_eq!(committed.epoch, report.current_epoch);
+    assert_eq!(
+        committed.protocol_version,
+        super::bridge_protocol::BridgeProtocolVersion::V5
+    );
+    assert!(external.direct_member_fence().await.is_some());
+    resumed
+        .retire(AgentIdentity::from("w-v4-adopt"))
+        .await
+        .expect("adopted legacy peer must support exact retirement");
+}
+
+#[tokio::test]
+async fn test_v5_cold_resume_refreshes_bound_fence_and_stale_none_rebinds_before_retire() {
+    let _serial = lock_real_comms_tests();
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "v5-cold-bound-refresh-stale-none-retire",
+    );
+    let mob_id = definition.id.clone();
+    let storage = MobStorage::in_memory();
+    let (handle, _service) =
+        create_test_mob_with_real_comms_and_storage(definition.clone(), storage.clone()).await;
+    let external =
+        spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-cold-bound")).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-cold-bound"),
+            None,
+            external.binding(),
+        )
+        .await
+        .expect("spawn peer-only member");
+    let first_fence = external
+        .direct_member_fence()
+        .await
+        .expect("initial exact fence");
+    handle.shutdown().await.expect("stop original actor");
+
+    // Receiver restart preserves the live runtime but loses its process-local
+    // direct-member slot. V5 resume must reissue the byte-identical semantic
+    // Bind, CAS the rotated bearer, and project it before lifecycle use.
+    external.forget_direct_member_fence().await;
+    let binds_before_resume = external.bind_protocol_versions().await.len();
+    let created_before_resume = storage
+        .events
+        .replay_all()
+        .await
+        .expect("replay original events")
+        .into_iter()
+        .filter(|event| matches!(event.kind, MobEventKind::MobCreated { .. }))
+        .count();
+    let (resumed, _resumed_service) = resume_test_mob_with_real_comms(storage.clone()).await;
+    let refreshed_fence = external
+        .direct_member_fence()
+        .await
+        .expect("cold resume must recover an exact fence");
+    assert_eq!(refreshed_fence.incarnation(), first_fence.incarnation());
+    assert_ne!(
+        refreshed_fence.runtime_session_token, first_fence.runtime_session_token,
+        "receiver restart must rotate the opaque bearer without changing semantic incarnation"
+    );
+    assert_eq!(
+        external.bind_protocol_versions().await.len(),
+        binds_before_resume + 1,
+        "Bound cold replay must still issue one exact semantic Bind"
+    );
+    let created_after_resume = storage
+        .events
+        .replay_all()
+        .await
+        .expect("replay resumed events")
+        .into_iter()
+        .filter(|event| matches!(event.kind, MobEventKind::MobCreated { .. }))
+        .count();
+    assert_eq!(created_after_resume, created_before_resume);
+
+    // Lose the process-local slot once more immediately before retirement.
+    // The first Retire returns Stale current=None; controller ownership must
+    // re-Bind and exact-Retire, never treat None as runtime absence.
+    external.forget_direct_member_fence().await;
+    let retires_before = external.retire_count();
+    resumed
+        .retire(AgentIdentity::from("w-cold-bound"))
+        .await
+        .expect("Stale None must converge through rebind plus exact retire");
+    assert_eq!(
+        external.retire_count(),
+        retires_before + 2,
+        "retirement must observe Stale None then confirm exact Retired"
+    );
+    assert!(external.direct_member_fence().await.is_none());
+}
+
+#[tokio::test]
 async fn test_resume_rebind_ambiguity_retains_outer_trust_for_exact_retry() {
     let _serial = lock_real_comms_tests();
     let definition = with_unique_mob_id(
@@ -16841,6 +17377,12 @@ async fn test_resume_rebind_ambiguity_retains_outer_trust_for_exact_retry() {
     let rebind_authority = super::provisioner::PeerOnlyRebindAuthority {
         peer: peer.clone(),
         bootstrap_token,
+        direct_member_incarnation: super::bridge_protocol::BridgeDirectMemberIncarnation {
+            mob_id: mob_id.to_string(),
+            agent_identity: "w-rebind-ambiguous".to_string(),
+            generation: 1,
+            fence_token: 1,
+        },
     };
     let provisioner = super::provisioner::MultiBackendProvisioner::new(
         service,
@@ -18393,12 +18935,45 @@ async fn test_spawn_helper_contract_aligns_with_retired_terminal_state() {
 
     assert_eq!(result.agent_identity, helper_id);
     assert!(
+        result.bounded_result.is_none(),
+        "non-blocking helper registration must not claim a certified terminal projection"
+    );
+    assert!(
         handle
             .get_member(&result.agent_identity)
             .await
             .unwrap()
             .is_none(),
         "spawn_helper must remove the helper from the active roster once it returns"
+    );
+}
+
+#[tokio::test]
+async fn test_bounded_terminal_result_preserves_deferred_member_for_retry() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let member_id = AgentIdentity::from("bounded-deferred");
+    handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            member_id.clone(),
+            Some("do deferred work".into()),
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn deferred worker");
+
+    let error = handle
+        .bounded_terminal_member_result(&member_id, "deferred-result", 256)
+        .await
+        .expect_err("deferred worker must not project an unauthored terminal result");
+    assert!(
+        matches!(error, MobError::BoundedHelperResultUnavailable { .. }),
+        "projection must fail through the typed retryable carrier: {error}"
+    );
+    assert!(
+        handle.get_member(&member_id).await.unwrap().is_some(),
+        "unavailable bounded projection must preserve the member for retry"
     );
 }
 
@@ -18438,6 +19013,10 @@ async fn test_fork_helper_contract_aligns_with_retired_terminal_state() {
     .expect("fork_helper succeeds");
 
     assert_eq!(result.agent_identity, helper_id);
+    assert!(
+        result.bounded_result.is_none(),
+        "non-blocking fork registration must not claim a certified terminal projection"
+    );
     assert!(
         handle
             .get_member(&result.agent_identity)
@@ -19944,6 +20523,16 @@ async fn test_workgraph_owner_attention_survives_respawn_and_scopes_member_turn(
     );
     let goal = workgraph_service
         .create_goal(meerkat::GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
             realm_id: None,
             namespace: None,
             title: "Keep reviewer focused after respawn".to_string(),
@@ -23507,6 +24096,9 @@ async fn test_resume_treats_normalized_external_binding_overlay_as_projection_on
             &ExternalBindingOverlayRecord {
                 agent_identity: AgentIdentity::from("w-ext"),
                 generation,
+                fence_token: None,
+                direct_member_incarnation: None,
+                direct_member_fence: None,
                 normalized_member_ref: Some(MemberRef::BackendPeer {
                     peer_id: old_peer_id.clone(),
                     address: old_address.clone(),
@@ -23663,6 +24255,9 @@ async fn test_resume_treats_failed_external_binding_overlay_as_projection_only()
             &ExternalBindingOverlayRecord {
                 agent_identity: AgentIdentity::from("w-ext"),
                 generation,
+                fence_token: None,
+                direct_member_incarnation: None,
+                direct_member_fence: None,
                 normalized_member_ref: None,
                 bootstrap_token: None,
                 status: ExternalBindingOverlayStatus::Failed {
@@ -23783,6 +24378,9 @@ async fn resume_with_stale_external_binding_overlay(
             &ExternalBindingOverlayRecord {
                 agent_identity: AgentIdentity::from("w-ext"),
                 generation,
+                fence_token: None,
+                direct_member_incarnation: None,
+                direct_member_fence: None,
                 normalized_member_ref: overlay_member_ref,
                 bootstrap_token: None,
                 status,
@@ -23921,6 +24519,9 @@ async fn test_reconcile_spawns_member_despite_stale_overlay_only_record() {
             &ExternalBindingOverlayRecord {
                 agent_identity: AgentIdentity::from("ghost"),
                 generation: crate::ids::Generation::INITIAL,
+                fence_token: None,
+                direct_member_incarnation: None,
+                direct_member_fence: None,
                 normalized_member_ref: Some(MemberRef::BackendPeer {
                     peer_id: "ed25519:test-key:ghost".to_string(),
                     address: "tcp://test.invalid/ghost".to_string(),
@@ -24042,6 +24643,9 @@ async fn test_peer_only_members_reject_agent_event_subscriptions_explicitly() {
             &ExternalBindingOverlayRecord {
                 agent_identity: AgentIdentity::from("w-ext"),
                 generation,
+                fence_token: None,
+                direct_member_incarnation: None,
+                direct_member_fence: None,
                 normalized_member_ref: Some(MemberRef::BackendPeer {
                     peer_id,
                     address,
@@ -24185,6 +24789,9 @@ async fn test_peer_only_members_accept_direct_turn_delivery_without_bridge_sessi
             &ExternalBindingOverlayRecord {
                 agent_identity: AgentIdentity::from("w-ext"),
                 generation,
+                fence_token: None,
+                direct_member_incarnation: None,
+                direct_member_fence: None,
                 normalized_member_ref: Some(MemberRef::BackendPeer {
                     peer_id,
                     address,
@@ -32238,6 +32845,7 @@ async fn provision_runtime_backed_disposal_fixture(
     provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
             authorized_resume: None,
+            direct_member_incarnation: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::Fresh,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -33218,6 +33826,961 @@ async fn test_retire_member_waits_for_active_runtime_turn_before_unregister() {
     );
 }
 
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn test_retire_member_cancels_visible_retired_drain_run_before_archive() {
+    struct RetiredDrainBoundaryHandle {
+        cancel_requested: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutorBoundaryHandle
+        for RetiredDrainBoundaryHandle
+    {
+        async fn cancel_after_boundary(
+            &self,
+            _expected_run_id: &meerkat_core::RunId,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            self.cancel_requested.notify_waiters();
+            Ok(())
+        }
+    }
+
+    struct RetiredDrainExecutor {
+        apply_started: Arc<tokio::sync::Notify>,
+        cancel_requested: Arc<tokio::sync::Notify>,
+        allow_finish: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutor for RetiredDrainExecutor {
+        fn boundary_handle(
+            &self,
+        ) -> Option<Arc<dyn meerkat_core::lifecycle::core_executor::CoreExecutorBoundaryHandle>>
+        {
+            Some(Arc::new(RetiredDrainBoundaryHandle {
+                cancel_requested: Arc::clone(&self.cancel_requested),
+            }))
+        }
+
+        async fn apply(
+            &mut self,
+            run_id: meerkat_core::RunId,
+            primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+        ) -> Result<
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+            meerkat_core::lifecycle::core_executor::CoreExecutorError,
+        > {
+            self.apply_started.notify_waiters();
+            self.allow_finish.notified().await;
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                    meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
+                        run_id,
+                        boundary:
+                            meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                        contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                        conversation_digest: None,
+                        message_count: 0,
+                    },
+                    None,
+                    None,
+                ),
+            )
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            self.cancel_requested.notify_waiters();
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let service = Arc::new(MockSessionService::new());
+    let adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+    service.set_runtime_adapter(adapter.clone());
+    let provisioner =
+        super::provisioner::SessionBackend::new(service.clone(), Some(adapter.clone()), None);
+    let session = Session::new();
+    let session_id = session.id().clone();
+    let apply_started = Arc::new(tokio::sync::Notify::new());
+    let cancel_requested = Arc::new(tokio::sync::Notify::new());
+    let allow_finish = Arc::new(tokio::sync::Notify::new());
+
+    service
+        .create_session(CreateSessionRequest {
+            injected_context: Vec::new(),
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "retire visible-retired drain turn".to_string().into(),
+            system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+            max_tokens: None,
+            event_tx: None,
+            build: Some(meerkat_core::service::SessionBuildOptions {
+                resume_session: Some(session),
+                comms_name: Some("test-mob/worker/retire-visible-retired-drain".to_string()),
+                keep_alive: true,
+                ..Default::default()
+            }),
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            labels: None,
+        })
+        .await
+        .expect("create runtime-backed retired-drain session");
+    adapter
+        .ensure_session_with_executor(
+            session_id.clone(),
+            Box::new(RetiredDrainExecutor {
+                apply_started: Arc::clone(&apply_started),
+                cancel_requested: Arc::clone(&cancel_requested),
+                allow_finish: Arc::clone(&allow_finish),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+
+    let member_ref = MemberRef::from_bridge_session_id(session_id.clone());
+    let bindings = adapter
+        .prepare_local_session_bindings(session_id.clone())
+        .await
+        .expect("prepare generated runtime bindings for retired-drain test");
+    provisioner
+        .bind_member_owner_context(
+            &member_ref,
+            session_id.clone(),
+            Arc::clone(bindings.ops_lifecycle()),
+        )
+        .await
+        .expect("bind generated owner context for retired-drain test");
+
+    let input = meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+        "queued turn drained after retire",
+        Some(
+            meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                handling_mode: Some(HandlingMode::Queue),
+                ..Default::default()
+            },
+        ),
+    ));
+    adapter
+        .accept_input_without_wake(&session_id, input)
+        .await
+        .expect("queued drain turn should be accepted before runtime retire");
+    let apply_started_wait = apply_started.notified();
+    tokio::pin!(apply_started_wait);
+    apply_started_wait.as_mut().enable();
+    adapter
+        .retire_runtime_control_plane(&meerkat_runtime::LogicalRuntimeId::for_session(&session_id))
+        .await
+        .expect("runtime retire should wake its preserved queue drain");
+    tokio::time::timeout(Duration::from_secs(1), &mut apply_started_wait)
+        .await
+        .expect("retired runtime should begin the preserved drain run");
+
+    let draining = adapter
+        .meerkat_machine_archive_snapshot(&session_id)
+        .await
+        .expect("retired drain snapshot");
+    assert_eq!(
+        draining.control.phase,
+        meerkat_runtime::RuntimeState::Retired
+    );
+    assert!(
+        draining.control.current_run_id.is_some(),
+        "fixture must reproduce visible Retired with a generated active run"
+    );
+
+    let cancel_wait = cancel_requested.notified();
+    tokio::pin!(cancel_wait);
+    cancel_wait.as_mut().enable();
+    let retire_task = tokio::spawn(async move { provisioner.retire_member(&member_ref).await });
+    tokio::time::timeout(Duration::from_secs(1), &mut cancel_wait)
+        .await
+        .expect("mob retire must cancel a bound run even when lifecycle projects Retired");
+    allow_finish.notify_waiters();
+
+    tokio::time::timeout(Duration::from_secs(5), retire_task)
+        .await
+        .expect("mob retire RPC owner must not strand after retired-drain cancellation")
+        .expect("retire task should not panic")
+        .expect("retire should archive after the exact drain run terminalizes");
+    assert!(
+        !adapter.contains_session(&session_id).await,
+        "retire should unregister only after the generated drain run terminalizes"
+    );
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn test_retire_member_bounds_finalization_boundary_and_retry_keeps_authority() {
+    struct IdleRetireExecutor;
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutor for IdleRetireExecutor {
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn apply(
+            &mut self,
+            run_id: meerkat_core::RunId,
+            primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+        ) -> Result<
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+            meerkat_core::lifecycle::core_executor::CoreExecutorError,
+        > {
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                    meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
+                        run_id,
+                        boundary:
+                            meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                        contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                        conversation_digest: None,
+                        message_count: 0,
+                    },
+                    None,
+                    None,
+                ),
+            )
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let service = Arc::new(MockSessionService::new());
+    let adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+    service.set_runtime_adapter(adapter.clone());
+    let provisioner =
+        super::provisioner::SessionBackend::new(service.clone(), Some(adapter.clone()), None);
+    let session = Session::new();
+    let session_id = session.id().clone();
+
+    service
+        .create_session(CreateSessionRequest {
+            injected_context: Vec::new(),
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "bounded retirement boundary".to_string().into(),
+            system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+            max_tokens: None,
+            event_tx: None,
+            build: Some(meerkat_core::service::SessionBuildOptions {
+                resume_session: Some(session),
+                comms_name: Some("test-mob/worker/bounded-retire-boundary".to_string()),
+                keep_alive: true,
+                ..Default::default()
+            }),
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            labels: None,
+        })
+        .await
+        .expect("create runtime-backed bounded-retire session");
+    adapter
+        .ensure_session_with_executor(session_id.clone(), Box::new(IdleRetireExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+
+    let member_ref = MemberRef::from_bridge_session_id(session_id.clone());
+    let bindings = adapter
+        .prepare_local_session_bindings(session_id.clone())
+        .await
+        .expect("prepare generated runtime bindings for bounded-retire test");
+    provisioner
+        .bind_member_owner_context(
+            &member_ref,
+            session_id.clone(),
+            Arc::clone(bindings.ops_lifecycle()),
+        )
+        .await
+        .expect("bind generated owner context for bounded-retire test");
+
+    service.panic_next_turn_finalization_acquire();
+    let panic_error = provisioner
+        .retire_member_until(
+            &member_ref,
+            &AgentIdentity::from("retiring"),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect_err("panicked custom boundary acquisition must return an owned error");
+    assert!(matches!(
+        panic_error,
+        MobError::SessionError(SessionError::Agent(_))
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if service.turn_finalization_acquire_counts() == (1, 0)
+                && provisioner
+                    .pending_turn_finalization_boundary_followers(&session_id)
+                    .await
+                    .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("panicked acquire must clear its process-owned election slot");
+
+    let gate = service.install_non_reentrant_turn_finalization_gate();
+    let held_gate = Arc::clone(&gate).lock_owned().await;
+    let started = Instant::now();
+    let error = provisioner
+        .retire_member_until(
+            &member_ref,
+            &AgentIdentity::from("retiring"),
+            Instant::now() + super::provisioner::MEMBER_RETIRE_TOTAL_TIMEOUT,
+        )
+        .await
+        .expect_err("wedged B acquisition must return a typed retry outcome");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "retire must return within its one test budget"
+    );
+    assert!(matches!(
+        &error,
+        MobError::RetirementInProgress { stage, .. }
+            if stage == "turn_finalization_boundary"
+    ));
+    assert_eq!(
+        error.failure_class(),
+        crate::error::MobFailureClass::RuntimeRejected
+    );
+    let data = error
+        .structured_data()
+        .expect("retirement-in-progress must carry stable structured data");
+    assert_eq!(data["kind"], "mob_retirement_in_progress");
+    assert_eq!(data["retryable"], true);
+    assert_eq!(data["authority_retained"], true);
+    assert!(
+        adapter.contains_session(&session_id).await,
+        "deadline must retain exact runtime registration for retry"
+    );
+    assert!(
+        service
+            .has_live_session(&session_id)
+            .await
+            .expect("read live service state"),
+        "deadline must not archive or discard the retained live session"
+    );
+    assert_eq!(
+        service.turn_finalization_acquire_counts(),
+        (2, 0),
+        "deadline must leave the custom boundary acquire running process-owned"
+    );
+    for retry in 1..=3 {
+        let retry_error = provisioner
+            .retire_member_until(
+                &member_ref,
+                &AgentIdentity::from("retiring"),
+                Instant::now() + Duration::from_millis(100),
+            )
+            .await
+            .expect_err("same-process retry must join the pending boundary acquisition");
+        assert!(matches!(
+            retry_error,
+            MobError::RetirementInProgress { ref stage, .. }
+                if stage == "turn_finalization_boundary"
+        ));
+        assert_eq!(
+            service.turn_finalization_acquire_counts(),
+            (2, 0),
+            "retry {retry} must not queue another custom boundary acquisition"
+        );
+    }
+    let replacement_provisioner =
+        super::provisioner::SessionBackend::new(service.clone(), Some(adapter.clone()), None);
+    let replacement_error = replacement_provisioner
+        .retire_member_until(
+            &member_ref,
+            &AgentIdentity::from("retiring"),
+            Instant::now() + Duration::from_millis(100),
+        )
+        .await
+        .expect_err("replacement provisioner must join the process-wide boundary acquisition");
+    assert!(matches!(
+        replacement_error,
+        MobError::RetirementInProgress { ref stage, .. }
+            if stage == "turn_finalization_boundary"
+    ));
+    assert_eq!(
+        service.turn_finalization_acquire_counts(),
+        (2, 0),
+        "in-process provisioner handover must not queue another custom boundary acquisition"
+    );
+
+    let completion_retry_provisioner = provisioner.clone();
+    let completion_retry_member = member_ref.clone();
+    let completion_retry = tokio::spawn(async move {
+        completion_retry_provisioner
+            .retire_member_until(
+                &completion_retry_member,
+                &AgentIdentity::from("retiring"),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if provisioner
+                .pending_turn_finalization_boundary_followers(&session_id)
+                .await
+                == Some(5)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completion retry must register its notification before election release");
+
+    drop(held_gate);
+    let disposal = tokio::time::timeout(Duration::from_secs(5), completion_retry)
+        .await
+        .expect("notified retry must not miss boundary-election completion")
+        .expect("completion retry task should not panic")
+        .expect("retry should converge from retained exact authority");
+    assert_eq!(
+        disposal,
+        crate::machines::mob_machine::MemberSessionDisposal::Archived
+    );
+    assert_eq!(
+        service.turn_finalization_acquire_counts(),
+        (3, 2),
+        "one late acquire and one elected retry must complete without stale waiters"
+    );
+    let late_guard_released =
+        tokio::time::timeout(Duration::from_secs(1), Arc::clone(&gate).lock_owned())
+            .await
+            .expect("all process-owned boundary leases must release after retirement");
+    drop(late_guard_released);
+    assert!(!adapter.contains_session(&session_id).await);
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn test_retire_member_bounds_wedged_exact_control_and_retry_converges() {
+    struct WedgedControl {
+        boundary_runs: std::sync::Mutex<Vec<meerkat_core::RunId>>,
+        hard_runs: std::sync::Mutex<Vec<meerkat_core::RunId>>,
+        release: tokio::sync::Notify,
+    }
+
+    struct WedgedBoundaryHandle(Arc<WedgedControl>);
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutorBoundaryHandle for WedgedBoundaryHandle {
+        async fn cancel_after_boundary(
+            &self,
+            expected_run_id: &meerkat_core::RunId,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            self.0
+                .boundary_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(expected_run_id.clone());
+            self.0.release.notified().await;
+            Ok(())
+        }
+    }
+
+    struct WedgedInterruptHandle(Arc<WedgedControl>);
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutorInterruptHandle for WedgedInterruptHandle {
+        async fn hard_cancel_run_if_current(
+            &self,
+            expected_run_id: &meerkat_core::RunId,
+            _reason: String,
+        ) -> Result<bool, meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            self.0
+                .hard_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(expected_run_id.clone());
+            self.0.release.notified().await;
+            Ok(true)
+        }
+    }
+
+    struct WedgedControlExecutor {
+        control: Arc<WedgedControl>,
+        apply_started: Arc<tokio::sync::Notify>,
+        allow_finish: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutor for WedgedControlExecutor {
+        fn boundary_handle(
+            &self,
+        ) -> Option<Arc<dyn meerkat_core::lifecycle::core_executor::CoreExecutorBoundaryHandle>>
+        {
+            Some(Arc::new(WedgedBoundaryHandle(Arc::clone(&self.control))))
+        }
+
+        fn interrupt_handle(
+            &self,
+        ) -> Option<Arc<dyn meerkat_core::lifecycle::core_executor::CoreExecutorInterruptHandle>>
+        {
+            Some(Arc::new(WedgedInterruptHandle(Arc::clone(&self.control))))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn apply(
+            &mut self,
+            run_id: meerkat_core::RunId,
+            primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+        ) -> Result<
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+            meerkat_core::lifecycle::core_executor::CoreExecutorError,
+        > {
+            self.apply_started.notify_waiters();
+            self.allow_finish.notified().await;
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                    meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
+                        run_id,
+                        boundary:
+                            meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                        contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                        conversation_digest: None,
+                        message_count: 0,
+                    },
+                    None,
+                    None,
+                ),
+            )
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let service = Arc::new(MockSessionService::new());
+    let adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+    service.set_runtime_adapter(adapter.clone());
+    let provisioner =
+        super::provisioner::SessionBackend::new(service.clone(), Some(adapter.clone()), None);
+    let session = Session::new();
+    let session_id = session.id().clone();
+    let apply_started = Arc::new(tokio::sync::Notify::new());
+    let allow_finish = Arc::new(tokio::sync::Notify::new());
+    let control = Arc::new(WedgedControl {
+        boundary_runs: std::sync::Mutex::new(Vec::new()),
+        hard_runs: std::sync::Mutex::new(Vec::new()),
+        release: tokio::sync::Notify::new(),
+    });
+
+    service
+        .create_session(CreateSessionRequest {
+            injected_context: Vec::new(),
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "wedged exact retirement control".to_string().into(),
+            system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+            max_tokens: None,
+            event_tx: None,
+            build: Some(meerkat_core::service::SessionBuildOptions {
+                resume_session: Some(session),
+                comms_name: Some("test-mob/worker/wedged-retire-control".to_string()),
+                keep_alive: true,
+                ..Default::default()
+            }),
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            labels: None,
+        })
+        .await
+        .expect("create runtime-backed wedged-control session");
+    adapter
+        .ensure_session_with_executor(
+            session_id.clone(),
+            Box::new(WedgedControlExecutor {
+                control: Arc::clone(&control),
+                apply_started: Arc::clone(&apply_started),
+                allow_finish: Arc::clone(&allow_finish),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+
+    let member_ref = MemberRef::from_bridge_session_id(session_id.clone());
+    let bindings = adapter
+        .prepare_local_session_bindings(session_id.clone())
+        .await
+        .expect("prepare generated runtime bindings for wedged-control test");
+    provisioner
+        .bind_member_owner_context(
+            &member_ref,
+            session_id.clone(),
+            Arc::clone(bindings.ops_lifecycle()),
+        )
+        .await
+        .expect("bind generated owner context for wedged-control test");
+
+    adapter
+        .accept_input_without_wake(
+            &session_id,
+            meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                "run held across bounded retirement control",
+                Some(
+                    meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                        handling_mode: Some(HandlingMode::Queue),
+                        ..Default::default()
+                    },
+                ),
+            )),
+        )
+        .await
+        .expect("queue exact run before runtime retire");
+    let apply_started_wait = apply_started.notified();
+    tokio::pin!(apply_started_wait);
+    apply_started_wait.as_mut().enable();
+    adapter
+        .retire_runtime_control_plane(&meerkat_runtime::LogicalRuntimeId::for_session(&session_id))
+        .await
+        .expect("runtime retire should start preserved queue drain");
+    tokio::time::timeout(Duration::from_secs(1), &mut apply_started_wait)
+        .await
+        .expect("retired runtime should begin exact drain run");
+    let exact_run_id = adapter
+        .meerkat_machine_archive_snapshot(&session_id)
+        .await
+        .and_then(|snapshot| snapshot.control.current_run_id)
+        .expect("fixture must expose exact active run");
+
+    let error = provisioner
+        .retire_member_until(
+            &member_ref,
+            &AgentIdentity::from("retiring"),
+            Instant::now() + super::provisioner::MEMBER_RETIRE_TOTAL_TIMEOUT,
+        )
+        .await
+        .expect_err("wedged exact control must return retirement-in-progress");
+    assert!(matches!(
+        error,
+        MobError::RetirementInProgress { ref stage, .. }
+            if stage == "active_runtime_turn"
+    ));
+    let boundary_runs = control
+        .boundary_runs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let hard_runs = control
+        .hard_runs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(boundary_runs, vec![exact_run_id.clone()]);
+    assert_eq!(hard_runs, vec![exact_run_id]);
+    assert!(adapter.contains_session(&session_id).await);
+    assert!(
+        service
+            .has_live_session(&session_id)
+            .await
+            .expect("read live service state")
+    );
+
+    control.release.notify_waiters();
+    allow_finish.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let run_bound = adapter
+                .meerkat_machine_archive_snapshot(&session_id)
+                .await
+                .is_some_and(|snapshot| snapshot.control.current_run_id.is_some());
+            if !run_bound {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("released exact control tasks should converge the retained run");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        provisioner.retire_member(&member_ref),
+    )
+    .await
+    .expect("retry should not strand after exact callbacks release")
+    .expect("retry should converge retained retirement authority");
+    assert!(!adapter.contains_session(&session_id).await);
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn test_retire_exact_cooperative_rejection_escalates_to_hard_cancel() {
+    use meerkat_runtime::SessionServiceRuntimeExt as _;
+
+    struct RejectingControl {
+        boundary_runs: std::sync::Mutex<Vec<meerkat_core::RunId>>,
+        hard_runs: std::sync::Mutex<Vec<meerkat_core::RunId>>,
+        reject_first_hard_cancel: std::sync::atomic::AtomicBool,
+        apply_started: tokio::sync::Notify,
+        finish_apply: tokio::sync::Notify,
+    }
+
+    struct RejectingBoundaryHandle(Arc<RejectingControl>);
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutorBoundaryHandle
+        for RejectingBoundaryHandle
+    {
+        async fn cancel_after_boundary(
+            &self,
+            expected_run_id: &meerkat_core::RunId,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            self.0
+                .boundary_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(expected_run_id.clone());
+            Err(
+                meerkat_core::lifecycle::core_executor::CoreExecutorError::control_failed_runtime(
+                    "Runtime not ready: running",
+                ),
+            )
+        }
+    }
+
+    struct CompletingInterruptHandle(Arc<RejectingControl>);
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutorInterruptHandle
+        for CompletingInterruptHandle
+    {
+        async fn hard_cancel_run_if_current(
+            &self,
+            expected_run_id: &meerkat_core::RunId,
+            _reason: String,
+        ) -> Result<bool, meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            self.0
+                .hard_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(expected_run_id.clone());
+            if self
+                .0
+                .reject_first_hard_cancel
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(false);
+            }
+            self.0.finish_apply.notify_waiters();
+            Ok(true)
+        }
+    }
+
+    struct RejectingControlExecutor(Arc<RejectingControl>);
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutor for RejectingControlExecutor {
+        fn boundary_handle(
+            &self,
+        ) -> Option<Arc<dyn meerkat_core::lifecycle::core_executor::CoreExecutorBoundaryHandle>>
+        {
+            Some(Arc::new(RejectingBoundaryHandle(Arc::clone(&self.0))))
+        }
+
+        fn interrupt_handle(
+            &self,
+        ) -> Option<Arc<dyn meerkat_core::lifecycle::core_executor::CoreExecutorInterruptHandle>>
+        {
+            Some(Arc::new(CompletingInterruptHandle(Arc::clone(&self.0))))
+        }
+
+        async fn apply(
+            &mut self,
+            run_id: meerkat_core::RunId,
+            primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+        ) -> Result<
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+            meerkat_core::lifecycle::core_executor::CoreExecutorError,
+        > {
+            self.0.apply_started.notify_waiters();
+            self.0.finish_apply.notified().await;
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                    meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
+                        run_id,
+                        boundary:
+                            meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                        contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                        conversation_digest: None,
+                        message_count: 0,
+                    },
+                    None,
+                    None,
+                ),
+            )
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let service = Arc::new(MockSessionService::new());
+    let adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+    service.set_runtime_adapter(Arc::clone(&adapter));
+    let provisioner =
+        super::provisioner::SessionBackend::new(service.clone(), Some(adapter.clone()), None);
+    let session = Session::new();
+    let session_id = session.id().clone();
+    let control = Arc::new(RejectingControl {
+        boundary_runs: std::sync::Mutex::new(Vec::new()),
+        hard_runs: std::sync::Mutex::new(Vec::new()),
+        reject_first_hard_cancel: std::sync::atomic::AtomicBool::new(true),
+        apply_started: tokio::sync::Notify::new(),
+        finish_apply: tokio::sync::Notify::new(),
+    });
+    service
+        .create_session(CreateSessionRequest {
+            injected_context: Vec::new(),
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "cooperative rejection retirement escalation"
+                .to_string()
+                .into(),
+            system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+            max_tokens: None,
+            event_tx: None,
+            build: Some(meerkat_core::service::SessionBuildOptions {
+                resume_session: Some(session),
+                comms_name: Some("test-mob/worker/rejecting-retire-control".to_string()),
+                keep_alive: true,
+                ..Default::default()
+            }),
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            labels: None,
+        })
+        .await
+        .expect("create runtime-backed rejecting-control session");
+    adapter
+        .ensure_session_with_executor(
+            session_id.clone(),
+            Box::new(RejectingControlExecutor(Arc::clone(&control))),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+    let member_ref = MemberRef::from_bridge_session_id(session_id.clone());
+    let bindings = adapter
+        .prepare_local_session_bindings(session_id.clone())
+        .await
+        .expect("prepare generated runtime bindings for rejecting-control retire test");
+    provisioner
+        .bind_member_owner_context(
+            &member_ref,
+            session_id.clone(),
+            Arc::clone(bindings.ops_lifecycle()),
+        )
+        .await
+        .expect("bind generated owner context for rejecting-control retire test");
+
+    let apply_started = control.apply_started.notified();
+    tokio::pin!(apply_started);
+    apply_started.as_mut().enable();
+    adapter
+        .accept_input(
+            &session_id,
+            meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                "cooperative rejection before retirement escalation",
+                None,
+            )),
+        )
+        .await
+        .expect("retirement race input should be accepted");
+    tokio::time::timeout(Duration::from_secs(1), &mut apply_started)
+        .await
+        .expect("fixture run should become current");
+    let exact_run_id = adapter
+        .meerkat_machine_archive_snapshot(&session_id)
+        .await
+        .and_then(|snapshot| snapshot.control.current_run_id)
+        .expect("fixture should expose its exact current run");
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        provisioner.retire_member(&member_ref),
+    )
+    .await
+    .expect("retirement should remain bounded after cooperative rejection")
+    .expect("hard-cancel escalation should converge retirement");
+
+    assert_eq!(
+        control
+            .boundary_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        &[exact_run_id.clone()],
+        "cooperative cancellation must target the exact run once"
+    );
+    assert_eq!(
+        control
+            .hard_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        &[exact_run_id.clone(), exact_run_id],
+        "a stale hard-cancel result must retry only the same exact run"
+    );
+    assert!(
+        !adapter.contains_session(&session_id).await,
+        "exact hard cancellation must let retirement archive and unregister"
+    );
+    assert!(
+        !service
+            .has_live_session(&session_id)
+            .await
+            .expect("read live session after retirement"),
+        "retirement must archive the exact live session after escalation"
+    );
+}
+
 #[tokio::test]
 async fn test_builder_rejects_runtime_adapter_with_mismatched_persistence_authority() {
     let service = Arc::new(MockSessionService::new());
@@ -33700,6 +35263,225 @@ async fn test_retire_quiesces_mid_provider_call_before_ingress_detach() {
 }
 
 #[tokio::test]
+async fn test_retire_publishes_retiring_before_wedged_control_and_retry_is_bounded() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let member_id = AgentIdentity::from("retire-control-wedged");
+    let member_ref = handle
+        .spawn_with_options(
+            ProfileName::from("lead"),
+            member_id.clone(),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn retirement target");
+    let session_id = member_ref
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed retirement target");
+    let entry = handle
+        .get_member(&member_id)
+        .await
+        .expect("read member before retire")
+        .expect("member should exist before retire");
+
+    service.set_start_turn_delay_ms(600_000);
+    let baseline_start_turn = service.start_turn_call_count();
+    handle
+        .member(&member_id)
+        .await
+        .expect("member handle")
+        .send("wedge exact callbacks before retire", HandlingMode::Queue)
+        .await
+        .expect("active turn admission");
+    wait_for_start_turn_call_count(
+        service.as_ref(),
+        baseline_start_turn + 1,
+        "retirement target should reach the provider call",
+    )
+    .await;
+    let control = service.install_runtime_control_barrier().await;
+
+    let first_handle = handle.clone();
+    let first_member_id = member_id.clone();
+    let first_retire = tokio::spawn(async move { first_handle.retire(first_member_id).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if control.boundary_calls.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retire should reach the wedged exact boundary callback");
+
+    let retiring = handle.list_members_including_retiring().await;
+    let retiring_entry = retiring
+        .iter()
+        .find(|member| member.agent_identity == member_id)
+        .expect("durable Retiring roster anchor must remain visible");
+    assert_eq!(
+        retiring_entry.status,
+        crate::runtime::handle::MobMemberStatus::Retiring,
+        "MobMachine must publish Retiring before awaiting executor control"
+    );
+    let rejected = handle
+        .submit_work(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            WorkRef::new(),
+            WorkSpec::new(
+                "must not enter retiring member".to_string(),
+                WorkOrigin::Internal,
+            ),
+        )
+        .await;
+    assert!(
+        rejected.is_err(),
+        "Retiring must fence new member work while control callback is wedged"
+    );
+
+    let first_error = tokio::time::timeout(Duration::from_secs(3), first_retire)
+        .await
+        .expect("first retire must honor the test owner deadline")
+        .expect("retire task should not panic")
+        .expect_err("wedged control must return retirement-in-progress");
+    assert!(matches!(first_error, MobError::RetirementInProgress { .. }));
+    assert_eq!(
+        first_error
+            .structured_data()
+            .expect("typed retirement data")["deadline_reached"],
+        true
+    );
+    assert_eq!(service.archive_call_count(&session_id).await, 0);
+
+    let retry_error = tokio::time::timeout(
+        Duration::from_secs(3),
+        handle.retire(AgentIdentity::from(member_id.as_str())),
+    )
+    .await
+    .expect("immediate retry must remain bounded behind the same wedged run")
+    .expect_err("immediate retry must retain retirement-in-progress");
+    assert!(matches!(retry_error, MobError::RetirementInProgress { .. }));
+    assert_eq!(service.archive_call_count(&session_id).await, 0);
+    assert!(
+        handle
+            .get_member(&member_id)
+            .await
+            .expect("read retained member after retry")
+            .is_some(),
+        "bounded retries must retain the exact roster/session anchor"
+    );
+
+    control.release.notify_waiters();
+    service.clear_runtime_control_barrier().await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.retire(AgentIdentity::from(member_id.as_str())),
+    )
+    .await
+    .expect("retry should not strand after exact callbacks release")
+    .expect("retry should converge retained Retiring authority");
+    assert!(
+        handle
+            .get_member(&member_id)
+            .await
+            .expect("read roster after retirement convergence")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_retire_deadline_after_archive_commit_retains_anchor_and_retry_converges() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let member_id = AgentIdentity::from("retire-archive-post-commit");
+    let member_ref = handle
+        .spawn_with_options(
+            ProfileName::from("lead"),
+            member_id.clone(),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn post-commit retirement target");
+    let session_id = member_ref
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed retirement target");
+    let archive_release = service.install_archive_post_commit_gate().await;
+    let archive_started = service.archive_post_commit_started.notified();
+    tokio::pin!(archive_started);
+    archive_started.as_mut().enable();
+
+    let first_handle = handle.clone();
+    let first_member = member_id.clone();
+    let first = tokio::spawn(async move { first_handle.retire(first_member).await });
+    tokio::time::timeout(Duration::from_secs(3), &mut archive_started)
+        .await
+        .expect("archive must reach its durable commit before the callback wedge");
+    assert_eq!(service.archive_call_count(&session_id).await, 1);
+    assert!(
+        service
+            .archived_session_ids
+            .read()
+            .await
+            .contains(&session_id),
+        "durable archive must already hold before the injected callback wedge"
+    );
+
+    let first_error = tokio::time::timeout(Duration::from_secs(3), first)
+        .await
+        .expect("retire must return within its owner deadline")
+        .expect("retire task should not panic")
+        .expect_err("post-commit callback wedge must return retirement-in-progress");
+    assert!(matches!(first_error, MobError::RetirementInProgress { .. }));
+    let retained = handle
+        .list_members_including_retiring()
+        .await
+        .into_iter()
+        .find(|entry| entry.agent_identity == member_id)
+        .expect("durable Retiring roster anchor must remain after timeout");
+    assert_eq!(
+        retained.status,
+        crate::runtime::handle::MobMemberStatus::Retiring
+    );
+
+    let retry_error = tokio::time::timeout(
+        Duration::from_secs(3),
+        handle.retire(AgentIdentity::from(member_id.as_str())),
+    )
+    .await
+    .expect("retry must remain bounded behind the retained exact B lease")
+    .expect_err("retry must report retirement-in-progress while callback is wedged");
+    assert!(matches!(retry_error, MobError::RetirementInProgress { .. }));
+    assert_eq!(
+        service.archive_call_count(&session_id).await,
+        1,
+        "retry must join the exact in-flight archive transaction"
+    );
+
+    service.clear_archive_post_commit_gate().await;
+    archive_release.notify_waiters();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.retire(AgentIdentity::from(member_id.as_str())),
+    )
+    .await
+    .expect("retry must converge after the owned callback releases")
+    .expect("retry should finalize the retained retirement anchor");
+    assert!(
+        handle
+            .get_member(&member_id)
+            .await
+            .expect("read roster after convergence")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn test_runtime_adapter_cancel_all_work_rejects_unsupported_boundary_cancel() {
     let (handle, service) = create_test_mob(sample_definition()).await;
     let member_id = AgentIdentity::from("runtime-unsupported-boundary");
@@ -33835,6 +35617,7 @@ async fn test_provision_member_uses_local_bindings_before_routed_runtime_bound()
     provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
             authorized_resume: None,
+            direct_member_incarnation: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::Fresh,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -33929,6 +35712,7 @@ async fn test_multi_backend_session_provision_forwards_injected_authorized_resum
     let stale_error = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
             authorized_resume: Some(authorized_resume),
+            direct_member_incarnation: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -33995,6 +35779,7 @@ async fn test_multi_backend_session_provision_forwards_injected_authorized_resum
     let receipt = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
             authorized_resume: Some(authorized_resume),
+            direct_member_incarnation: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -34278,6 +36063,7 @@ async fn test_fresh_provision_failure_preserves_resumable_document_and_quiesces_
     let error = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
             authorized_resume: None,
+            direct_member_incarnation: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::Fresh,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -34353,6 +36139,7 @@ async fn test_fresh_provision_failure_preserves_resumable_document_and_quiesces_
     let resumed = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
             authorized_resume: None,
+            direct_member_incarnation: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -34427,6 +36214,7 @@ async fn test_retired_session_revival_failure_preserves_resumable_document() {
     let receipt = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
             authorized_resume: None,
+            direct_member_incarnation: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::Fresh,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -34499,6 +36287,7 @@ async fn test_retired_session_revival_failure_preserves_resumable_document() {
     let error = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
             authorized_resume: None,
+            direct_member_incarnation: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -34582,6 +36371,7 @@ async fn test_retired_session_revival_failure_preserves_resumable_document() {
     let resumed = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
             authorized_resume: None,
+            direct_member_incarnation: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -40987,9 +42777,6 @@ impl RealCommsSessionService {
                     .await
                     .expect("real-comms fixture must expose classified claim authority");
                 let Some(claim) = claim else {
-                    if runtime.dismiss_received() {
-                        return;
-                    }
                     (&mut notified).await;
                     continue;
                 };
@@ -41399,13 +43186,6 @@ impl SessionServiceControlExt for RealCommsSessionService {
 
 #[async_trait]
 impl MobSessionService for RealCommsSessionService {
-    async fn prepare_session_for_resume(
-        &self,
-        _session_id: &SessionId,
-    ) -> Result<(), SessionError> {
-        Ok(())
-    }
-
     async fn observe_session_resume_authority(
         &self,
         session_id: &SessionId,
@@ -41462,6 +43242,7 @@ impl MobSessionService for RealCommsSessionService {
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         req: CreateSessionRequest,
+        _resume_preparation: Option<super::session_service::SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<RunResult, SessionError> {
         self.create_session_with_actor_witness_slot(req, Some(actor_witness_slot))
@@ -41674,7 +43455,14 @@ impl Drop for RealCommsSessionService {
 /// that need autonomous ingress should use
 /// `create_test_mob_with_runtime_backed_real_comms(...)` instead.
 async fn create_test_mob_with_real_comms(
+    definition: MobDefinition,
+) -> (MobHandle, Arc<RealCommsSessionService>) {
+    create_test_mob_with_real_comms_and_storage(definition, MobStorage::in_memory()).await
+}
+
+async fn create_test_mob_with_real_comms_and_storage(
     mut definition: MobDefinition,
+    storage: MobStorage,
 ) -> (MobHandle, Arc<RealCommsSessionService>) {
     for profile in definition
         .profiles
@@ -41684,13 +43472,24 @@ async fn create_test_mob_with_real_comms(
         profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
     }
     let service = Arc::new(RealCommsSessionService::new());
-    let storage = MobStorage::in_memory();
     let handle = MobBuilder::new(definition, storage)
         .with_session_service(service.clone())
         .create()
         .await
         .expect("create mob");
 
+    (handle, service)
+}
+
+async fn resume_test_mob_with_real_comms(
+    storage: MobStorage,
+) -> (MobHandle, Arc<RealCommsSessionService>) {
+    let service = Arc::new(RealCommsSessionService::new());
+    let handle = MobBuilder::for_resume(storage)
+        .with_session_service(service.clone())
+        .resume()
+        .await
+        .expect("resume mob with real comms");
     (handle, service)
 }
 
@@ -42579,13 +44378,6 @@ impl SessionServiceControlExt for RuntimeBackedRealCommsSessionService {
 
 #[async_trait]
 impl MobSessionService for RuntimeBackedRealCommsSessionService {
-    async fn prepare_session_for_resume(
-        &self,
-        _session_id: &SessionId,
-    ) -> Result<(), SessionError> {
-        Ok(())
-    }
-
     async fn observe_session_resume_authority(
         &self,
         _session_id: &SessionId,
@@ -42637,6 +44429,7 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         req: CreateSessionRequest,
+        _resume_preparation: Option<super::session_service::SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<RunResult, SessionError> {
         self.create_session_with_actor_witness_slot(req, Some(actor_witness_slot))
@@ -42874,7 +44667,7 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
                     result: "runtime terminal before commit".to_string(),
                     structured_output: None,
                     extraction_required: false,
-                    usage: Usage::default(),
+                    usage: Usage::default().into(),
                     terminal_cause_kind: None,
                 }
             };
@@ -43075,6 +44868,53 @@ async fn create_test_mob_with_persistent_runtime_backed_real_comms(
         .expect("create mob");
 
     (handle, service)
+}
+
+#[tokio::test]
+async fn test_turn_driven_role_wiring_starts_durable_ingress_before_peer_lifecycle_send() {
+    let _serial = lock_real_comms_tests();
+    let mut definition = sample_definition_with_cross_role_wiring();
+    for binding in definition.profiles.values_mut() {
+        if let crate::profile::ProfileBinding::Inline(profile) = binding {
+            profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
+            profile.tools.comms = true;
+        }
+    }
+    let (handle, _service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+
+    handle
+        .spawn(
+            ProfileName::from("lead"),
+            AgentIdentity::from("lead-1"),
+            None,
+        )
+        .await
+        .expect("spawn first turn-driven member");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        handle.spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("reviewer-1"),
+            None,
+        ),
+    )
+    .await
+    .expect("second spawn must not wait for its own later comms-drain kickoff")
+    .expect("spawn role-wired turn-driven member");
+
+    let lead = handle
+        .get_member(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("read lead")
+        .expect("lead roster entry");
+    let reviewer = handle
+        .get_member(&AgentIdentity::from("reviewer-1"))
+        .await
+        .expect("read reviewer")
+        .expect("reviewer roster entry");
+    assert!(lead.wired_to.contains(&AgentIdentity::from("reviewer-1")));
+    assert!(reviewer.wired_to.contains(&AgentIdentity::from("lead-1")));
 }
 
 fn mcp_tool_context_for(comms: &Arc<meerkat_comms::CommsRuntime>) -> meerkat_comms::ToolContext {
@@ -45880,10 +47720,22 @@ async fn test_member_reads_bypass_saturated_actor_command_queue() {
 
     let (blocked_tx, _blocked_rx) = tokio::sync::mpsc::channel(1);
     let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+    let queued_identity = AgentIdentity::from("queued-command");
+    let queued_generation = Generation::INITIAL;
+    let (admission_tx, _admission_rx) = tokio::sync::watch::channel(false);
     blocked_tx
         .try_send(super::scope_gate::RoutedMobCommand::internal(
             super::state::MobCommand::Retire {
-                agent_identity: AgentIdentity::from("queued-command"),
+                agent_identity: queued_identity.clone(),
+                expected_incarnation: super::state::RetireMemberIncarnation {
+                    agent_identity: queued_identity.clone(),
+                    agent_runtime_id: AgentRuntimeId::new(queued_identity, queued_generation),
+                    generation: queued_generation,
+                    fence_token: FenceToken::new(1),
+                    member_ref: MemberRef::from_bridge_session_id(SessionId::new()),
+                },
+                deadline: Instant::now(),
+                admission_tx,
                 reply_tx,
             },
         ))
@@ -45973,6 +47825,101 @@ async fn test_member_reads_bypass_saturated_actor_command_queue() {
                 if reason.contains("actor-owned external event pump")
         ),
         "placed observation helper must not treat a host-resident session id as local"
+    );
+}
+
+#[tokio::test]
+async fn test_retire_saturated_actor_queue_reports_not_admitted_without_authority_claim() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("w-retire-admission");
+    handle
+        .spawn(ProfileName::from("worker"), identity.clone(), None)
+        .await
+        .expect("spawn retirement-admission worker");
+
+    let (blocked_tx, blocked_rx) = tokio::sync::mpsc::channel(1);
+    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+    let queued_identity = AgentIdentity::from("queued-command");
+    let queued_generation = Generation::INITIAL;
+    let (admission_tx, _admission_rx) = tokio::sync::watch::channel(false);
+    blocked_tx
+        .try_send(super::scope_gate::RoutedMobCommand::internal(
+            super::state::MobCommand::Retire {
+                agent_identity: queued_identity.clone(),
+                expected_incarnation: super::state::RetireMemberIncarnation {
+                    agent_identity: queued_identity.clone(),
+                    agent_runtime_id: AgentRuntimeId::new(queued_identity, queued_generation),
+                    generation: queued_generation,
+                    fence_token: FenceToken::new(1),
+                    member_ref: MemberRef::from_bridge_session_id(SessionId::new()),
+                },
+                deadline: Instant::now(),
+                admission_tx,
+                reply_tx,
+            },
+        ))
+        .expect("saturate the replacement command channel");
+    let blocked_handle = MobHandle {
+        command_tx: blocked_tx,
+        ..handle.clone()
+    };
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(3),
+        blocked_handle.retire(identity.clone()),
+    )
+    .await
+    .expect("retire observation must be bounded")
+    .expect_err("saturated actor queue cannot durably admit retirement");
+    assert!(matches!(
+        &error,
+        MobError::MemberRetirementAdmissionPending { member_id, stage }
+            if member_id == &identity && stage == "actor_command_admission"
+    ));
+    let data = error
+        .structured_data()
+        .expect("not-admitted retirement has typed retry data");
+    assert_eq!(data["retryable"], true);
+    assert_eq!(data["authority_retained"], false);
+    let member = handle
+        .list_members_observation_snapshot()
+        .await
+        .into_iter()
+        .find(|member| member.agent_identity == identity)
+        .expect("member must remain observable");
+    assert_eq!(
+        member.status,
+        MobMemberStatus::Active,
+        "a queued process task is not durable Retiring authority"
+    );
+
+    drop(blocked_rx);
+}
+
+#[tokio::test]
+async fn test_retirement_singleflight_scopes_identical_semantic_keys_to_exact_mob_store() {
+    let (first, _first_service) = create_test_mob(sample_definition()).await;
+    let (second, _second_service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("same-member");
+    let generation = Generation::INITIAL;
+    let expected = super::state::RetireMemberIncarnation {
+        agent_identity: identity.clone(),
+        agent_runtime_id: AgentRuntimeId::new(identity, generation),
+        generation,
+        fence_token: FenceToken::new(7),
+        member_ref: MemberRef::from_bridge_session_id(SessionId::new()),
+    };
+
+    let first_key = first.retirement_operation_key(&expected);
+    let reconstructed_same_store_key = first.clone().retirement_operation_key(&expected);
+    let independent_store_key = second.retirement_operation_key(&expected);
+    assert_eq!(
+        first_key, reconstructed_same_store_key,
+        "handles over one MobStorage allocation must join the exact task"
+    );
+    assert_ne!(
+        first_key, independent_store_key,
+        "independent MobStorage allocations may reuse every semantic id without sharing a task"
     );
 }
 
@@ -46683,8 +48630,12 @@ async fn test_wire_enables_peer_request_delivery() {
         "wire should expose lead in worker peers()"
     );
 
-    let _ = CoreCommsRuntime::drain_inbox_interactions(&*comms_a).await;
-    let _ = CoreCommsRuntime::drain_inbox_interactions(&*comms_b).await;
+    CoreCommsRuntime::handoff_volatile_peer_input_candidates(&*comms_a)
+        .await
+        .expect("exact lead volatile handoff");
+    CoreCommsRuntime::handoff_volatile_peer_input_candidates(&*comms_b)
+        .await
+        .expect("exact worker volatile handoff");
     let ingress_before = CoreCommsRuntime::peer_ingress_queue_snapshot(&*comms_b)
         .await
         .expect("worker peer ingress snapshot before request");
@@ -46763,8 +48714,12 @@ async fn test_unwire_updates_peers_and_sends_retired_notifications() {
 
     let comms_a = service.real_comms(&sid_a).await.expect("comms for l-1");
     let comms_b = service.real_comms(&sid_b).await.expect("comms for w-1");
-    let _ = CoreCommsRuntime::drain_inbox_interactions(&*comms_a).await;
-    let _ = CoreCommsRuntime::drain_inbox_interactions(&*comms_b).await;
+    CoreCommsRuntime::handoff_volatile_peer_input_candidates(&*comms_a)
+        .await
+        .expect("exact lead volatile handoff");
+    CoreCommsRuntime::handoff_volatile_peer_input_candidates(&*comms_b)
+        .await
+        .expect("exact worker volatile handoff");
 
     handle
         .unwire(AgentIdentity::from("l-1"), AgentIdentity::from("w-1"))
@@ -47243,8 +49198,12 @@ async fn test_retire_updates_peers_and_sends_retired_notifications() {
 
     let comms_a = service.real_comms(&sid_a).await.expect("comms for w-1");
     let comms_b = service.real_comms(&sid_b).await.expect("comms for w-2");
-    let _ = CoreCommsRuntime::drain_inbox_interactions(&*comms_a).await;
-    let _ = CoreCommsRuntime::drain_inbox_interactions(&*comms_b).await;
+    CoreCommsRuntime::handoff_volatile_peer_input_candidates(&*comms_a)
+        .await
+        .expect("exact first-worker volatile handoff");
+    CoreCommsRuntime::handoff_volatile_peer_input_candidates(&*comms_b)
+        .await
+        .expect("exact second-worker volatile handoff");
 
     handle
         .retire(AgentIdentity::from("w-1"))
@@ -57863,8 +59822,24 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "external_member_cleanup_uncertain".to_string()
         }
         MobError::RetirementTopologyIncomplete(_) => "retirement_topology_incomplete".to_string(),
+        MobError::RetirementInProgress { stage, .. } => {
+            format!("retirement_in_progress:{stage}")
+        }
+        MobError::MemberRetirementInProgress { stage, .. } => {
+            format!("member_retirement_in_progress:{stage}")
+        }
+        MobError::MemberRetirementAdmissionPending { stage, .. } => {
+            format!("member_retirement_admission_pending:{stage}")
+        }
+        MobError::SharedRetirementFailure(error) => summarize_mob_runtime_error(error.as_ref()),
         MobError::SupervisorRotationIncomplete { .. } => {
             "supervisor_rotation_incomplete".to_string()
+        }
+        MobError::SupervisorProtocolUpgradeRequired { .. } => {
+            "supervisor_protocol_upgrade_required".to_string()
+        }
+        MobError::DirectMemberAdoptionPending { .. } => {
+            "direct_member_adoption_pending".to_string()
         }
         MobError::SupervisorEpochExhausted { .. } => "supervisor_epoch_exhausted".to_string(),
         MobError::BridgeCommandRejected { cause, .. } => {
@@ -57872,6 +59847,14 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         }
         MobError::MemberProvisionFailed { cause } => {
             format!("member_provision_failed:{cause:?}")
+        }
+        MobError::ForkMemberProvisionFailed { .. } => "fork_member_provision_failed".to_string(),
+        MobError::InvalidBoundedHelperResult { .. } => "invalid_bounded_helper_result".to_string(),
+        MobError::BoundedHelperResultUnavailable { .. } => {
+            "bounded_helper_result_unavailable".to_string()
+        }
+        MobError::BoundedHelperRetirementFailed { .. } => {
+            "bounded_helper_retirement_failed".to_string()
         }
         MobError::MemberRestoreFailed { .. } => "member_restore_failed".to_string(),
         MobError::SpawnMemberAdmissionDenied { .. } => "spawn_member_admission_denied".to_string(),
@@ -61141,11 +63124,11 @@ async fn spawn_host_daemon_stub(label: &str, live_endpoint: Option<String>) -> H
             let notified = inbox_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let candidates = responder_runtime.drain_peer_input_candidates().await;
+            let candidates = responder_runtime
+                .handoff_volatile_peer_input_candidates()
+                .await
+                .expect("volatile peer-input handoff");
             if candidates.is_empty() {
-                if responder_runtime.dismiss_received() {
-                    break;
-                }
                 (&mut notified).await;
                 continue;
             }
@@ -63079,7 +65062,7 @@ impl meerkat_client::LlmClient for HeadCanonicalQueueGateClient {
 
     fn stream<'a>(
         &'a self,
-        _request: &'a meerkat_client::LlmRequest,
+        request: &'a meerkat_client::LlmRequest,
     ) -> meerkat_client::types::LlmStream<'a> {
         self.state.request_count.fetch_add(1, Ordering::SeqCst);
         let mut release = self.state.release.subscribe();
@@ -63096,6 +65079,13 @@ impl meerkat_client::LlmClient for HeadCanonicalQueueGateClient {
                 delta: "ok".to_string(),
                 meta: None,
             };
+            yield meerkat_client::LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    Provider::OpenAI,
+                    &request.model,
+                    meerkat_core::Usage::default(),
+                ),
+            };
             yield meerkat_client::LlmEvent::Done {
                 outcome: meerkat_client::LlmDoneOutcome::Success {
                     stop_reason: meerkat_core::StopReason::EndTurn,
@@ -63105,7 +65095,7 @@ impl meerkat_client::LlmClient for HeadCanonicalQueueGateClient {
     }
 
     fn provider(&self) -> Provider {
-        Provider::Other
+        Provider::OpenAI
     }
 
     async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {

@@ -816,9 +816,6 @@ impl PeerInputCandidate {
     }
 }
 
-/// Back-compat alias for older runtime and diagnostic seams.
-pub type ClassifiedInboxInteraction = PeerInputCandidate;
-
 /// Coarse source kind for a queued peer-ingress item.
 ///
 /// This is a diagnostic shape for MeerkatMachine mapping work. It records the
@@ -940,11 +937,13 @@ pub enum PeerIngressDeliveryContract {
 
 /// Non-destructive snapshot of the queued peer-ingress surface.
 ///
-/// This is intentionally queue-shaped rather than a full PeerComms model. It
-/// is the current honest owner-visible slice of peer ingress while the broader
-/// MeerkatMachine refactor proceeds.
+/// This is intentionally queue-shaped rather than a second PeerComms model.
+/// It projects the canonical FIFO and exact claim commits without providing a
+/// mutation path.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PeerIngressQueueSnapshot {
+    /// Current number of queued peer-ingress entries. This is a read-only
+    /// projection of the canonical FIFO, not admission or dequeue authority.
     pub total_count: usize,
     pub actionable_count: usize,
     pub response_count: usize,
@@ -954,18 +953,68 @@ pub struct PeerIngressQueueSnapshot {
     pub plain_event_count: usize,
     /// Current FIFO-head claim, if the runtime handover task owns one.
     pub outstanding_claim: Option<PeerIngressClaimSnapshot>,
-    /// Number of queue heads claimed for durable runtime admission or handed
-    /// to a volatile control consumer.
+    /// Number of FIFO-head claim acquisitions. Cancellation and reacquisition
+    /// intentionally count as another acquisition.
+    pub claim_acquired_count: u64,
+    /// Number of exact queue heads successfully handed to either the volatile
+    /// control consumer or the durable runtime admission consumer.
     pub handed_off_count: u64,
-    /// Number of runtime handovers that reached Accepted or Deduplicated.
+    /// Number of exact machine receipts that reached Accepted or Deduplicated.
     pub durably_admitted_count: u64,
-    /// Number of runtime handovers that reached a typed terminal outcome.
+    /// Number of exact machine receipts that reached any typed terminal
+    /// outcome, including Rejected.
     pub runtime_handover_count: u64,
     /// Typed terminal outcomes observed at exact queue-claim commit.
     pub terminal_outcomes: PeerIngressTerminalOutcomeCounts,
-    /// Most recent stable raw/runtime correlation committed by the queue.
+    /// Most recent stable raw/runtime correlation committed by the queue. This
+    /// is diagnostic evidence, not an idempotency or dequeue capability.
     pub last_delivery_correlation: Option<PeerIngressDeliveryCorrelation>,
     pub queued_entries: Vec<PeerIngressEntrySnapshot>,
+}
+
+impl PeerIngressQueueSnapshot {
+    /// Current queue depth, derived from the canonical FIFO snapshot.
+    pub const fn queue_depth(&self) -> usize {
+        self.total_count
+    }
+
+    /// Age of the currently outstanding head claim, when one exists.
+    pub fn oldest_claim_age(&self) -> Option<Duration> {
+        self.outstanding_claim.map(|claim| claim.age)
+    }
+
+    /// Completed handoffs to the volatile control consumer, derived from
+    /// total completed handoffs minus machine-terminal runtime handovers.
+    pub const fn volatile_handed_off_count(&self) -> u64 {
+        self.handed_off_count
+            .saturating_sub(self.runtime_handover_count)
+    }
+
+    /// Current runtime handover state derived from the outstanding claim.
+    pub const fn handover_state(&self) -> PeerIngressHandoverState {
+        match self.outstanding_claim {
+            None => PeerIngressHandoverState::Idle,
+            Some(claim) => PeerIngressHandoverState::Claimed {
+                claim_id: claim.claim_id,
+                raw_item_id: claim.raw_item_id,
+                delivery_contract: claim.delivery_contract,
+            },
+        }
+    }
+}
+
+/// Read-only projection of the peer-ingress handover state.
+///
+/// Claim identities here are diagnostic correlation facts. They cannot commit,
+/// release, or otherwise authorize mutation of the canonical FIFO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerIngressHandoverState {
+    Idle,
+    Claimed {
+        claim_id: PeerIngressClaimId,
+        raw_item_id: InteractionId,
+        delivery_contract: PeerIngressDeliveryContract,
+    },
 }
 
 /// Read-only projection of the one outstanding FIFO-head claim.
@@ -1079,7 +1128,7 @@ pub struct PeerIngressQueueClaim {
     raw_item_id: InteractionId,
     class: PeerInputClass,
     delivery_contract: PeerIngressDeliveryContract,
-    candidate: Option<ClassifiedInboxInteraction>,
+    candidate: Option<PeerInputCandidate>,
     lease: Option<Arc<dyn PeerIngressClaimLease>>,
 }
 
@@ -1102,7 +1151,7 @@ impl PeerIngressQueueClaim {
         raw_item_id: InteractionId,
         class: PeerInputClass,
         delivery_contract: PeerIngressDeliveryContract,
-        candidate: Option<ClassifiedInboxInteraction>,
+        candidate: Option<PeerInputCandidate>,
         lease: Arc<dyn PeerIngressClaimLease>,
     ) -> Self {
         Self {
@@ -1131,7 +1180,7 @@ impl PeerIngressQueueClaim {
         self.delivery_contract
     }
 
-    pub fn candidate(&self) -> Option<&ClassifiedInboxInteraction> {
+    pub fn candidate(&self) -> Option<&PeerInputCandidate> {
         self.candidate.as_ref()
     }
 
@@ -1161,7 +1210,7 @@ impl PeerIngressQueueClaim {
     #[doc(hidden)]
     pub fn __handoff_volatile(
         mut self,
-    ) -> Result<Option<ClassifiedInboxInteraction>, PeerIngressClaimCommitError> {
+    ) -> Result<Option<PeerInputCandidate>, PeerIngressClaimCommitError> {
         let Some(lease) = self.lease.as_ref() else {
             return Err(PeerIngressClaimCommitError::NoOutstandingClaim);
         };
@@ -1194,8 +1243,9 @@ pub enum PeerIngressAuthorityPhase {
 
 /// Runtime-owned peer snapshot for the current Meerkat session.
 ///
-/// This wraps the queued ingress surface with the trust membership that governs
-/// which peer identities are admitted into that queue.
+/// This wraps the queued ingress surface with the trust membership observed by
+/// the runtime. It is a read-only projection: consumers must not use it to
+/// reconstruct trust, admission, claim, or dequeue authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerIngressRuntimeSnapshot {
     /// This runtime's public peer identity.
@@ -1206,8 +1256,6 @@ pub struct PeerIngressRuntimeSnapshot {
     pub authority_phase: PeerIngressAuthorityPhase,
     /// Current trusted peer set visible to this runtime.
     pub trusted_peers: Vec<TrustedPeerDescriptor>,
-    /// Current length of the authority-owned typed peer submission queue.
-    pub submission_queue_len: usize,
     /// Non-destructive snapshot of the queued ingress surface.
     pub queue: PeerIngressQueueSnapshot,
 }

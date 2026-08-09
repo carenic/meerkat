@@ -518,6 +518,9 @@ pub(super) enum MobCommand {
     },
     Retire {
         agent_identity: AgentIdentity,
+        expected_incarnation: RetireMemberIncarnation,
+        deadline: meerkat_core::time_compat::Instant,
+        admission_tx: tokio::sync::watch::Sender<bool>,
         reply_tx: oneshot::Sender<Result<(), MobError>>,
     },
     Respawn {
@@ -1088,6 +1091,19 @@ pub(super) enum MobCommand {
     QueryPhase {
         reply_tx: oneshot::Sender<Result<MobState, MobError>>,
     },
+}
+
+/// Exact roster and MobMachine incarnation authorized by one public retire
+/// admission. The actor revalidates every field before it may touch pending
+/// spawn cleanup or publish Retiring, so a delayed command for incarnation A
+/// can never retire a successor B that reused the stable identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RetireMemberIncarnation {
+    pub agent_identity: AgentIdentity,
+    pub agent_runtime_id: AgentRuntimeId,
+    pub generation: Generation,
+    pub fence_token: FenceToken,
+    pub member_ref: MemberRef,
 }
 
 impl MobCommand {

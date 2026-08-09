@@ -388,7 +388,7 @@ pub enum LiveAdapterObservation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response_id: Option<String>,
         stop_reason: StopReason,
-        usage: Usage,
+        usage: crate::types::TurnUsage,
     },
     StatusChanged {
         status: LiveAdapterStatus,
@@ -1393,12 +1393,15 @@ mod tests {
         let obs = LiveAdapterObservation::TurnCompleted {
             response_id: None,
             stop_reason: StopReason::EndTurn,
-            usage: Usage {
-                input_tokens: 100,
-                output_tokens: 50,
-                cache_creation_tokens: None,
-                cache_read_tokens: None,
-            },
+            usage: crate::TurnUsage::host_declared(
+                crate::Provider::Other,
+                "live-test",
+                Usage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Usage::default()
+                },
+            ),
         };
         let json = serde_json::to_string(&obs).unwrap();
         // R6: absent response_id is skipped on the wire.
@@ -1415,12 +1418,15 @@ mod tests {
         let obs = LiveAdapterObservation::TurnCompleted {
             response_id: Some("resp_42".into()),
             stop_reason: StopReason::EndTurn,
-            usage: Usage {
-                input_tokens: 12,
-                output_tokens: 7,
-                cache_creation_tokens: None,
-                cache_read_tokens: None,
-            },
+            usage: crate::TurnUsage::host_declared(
+                crate::Provider::Other,
+                "live-test",
+                Usage {
+                    input_tokens: 12,
+                    output_tokens: 7,
+                    ..Usage::default()
+                },
+            ),
         };
         let json = serde_json::to_string(&obs).unwrap();
         assert!(json.contains("\"response_id\":\"resp_42\""));
@@ -1608,6 +1614,7 @@ mod tests {
                 output_tokens: 5,
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
+                provider_accounting: None,
             },
         };
         let json = serde_json::to_string(&obs).unwrap();
@@ -1631,6 +1638,7 @@ mod tests {
                 output_tokens: 1,
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
+                provider_accounting: None,
             },
         };
         let json = serde_json::to_string(&obs).unwrap();

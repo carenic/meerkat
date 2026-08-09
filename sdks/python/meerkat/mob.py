@@ -209,6 +209,26 @@ MobKickoffMemberSnapshot = TypedDict(
 
 MobReadyMemberSnapshot = MobKickoffMemberSnapshot
 
+MobBoundedHelperResultStatus = Literal[
+    "completed",
+    "completed_truncated",
+    "failed",
+    "failed_truncated",
+    "in_progress",
+    "in_progress_truncated",
+    "unavailable",
+    "unavailable_truncated",
+]
+
+MobBoundedHelperResult = TypedDict(
+    "MobBoundedHelperResult",
+    {
+        "label": str,
+        "status": MobBoundedHelperResultStatus,
+        "text": str,
+    },
+)
+
 MobHelperResult = TypedDict(
     "MobHelperResult",
     {
@@ -216,6 +236,7 @@ MobHelperResult = TypedDict(
         "tokens_used": int,
         "agent_identity": str,
         "member_ref": MobMemberRef,
+        "bounded_result": NotRequired[MobBoundedHelperResult],
     },
 )
 

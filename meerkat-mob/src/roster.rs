@@ -16,6 +16,7 @@
 use crate::event::{MemberRef, MemberWireEdge, MobEvent, MobEventKind};
 use crate::ids::{AgentIdentity, AgentRuntimeId, FenceToken, Generation, ProfileName};
 use crate::runtime_mode::MobRuntimeMode;
+use meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence;
 use meerkat_core::comms::{PeerId, TrustedPeerDescriptor};
 use meerkat_core::time_compat::SystemTime;
 use meerkat_core::types::SessionId;
@@ -102,6 +103,10 @@ pub struct RosterEntry {
     /// Transport/auth signing public key for this member's comms runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) transport_public_key: Option<String>,
+    /// Opaque receiving-runtime fence authorizing retirement of this exact
+    /// peer-only incarnation.
+    #[serde(skip, default)]
+    pub(crate) direct_member_fence: Option<BridgeDirectMemberFence>,
     /// Trusted specs for external peers keyed by their projected peer name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) external_peer_specs: BTreeMap<AgentIdentity, TrustedPeerDescriptor>,
@@ -132,6 +137,7 @@ pub(crate) struct RosterAddEntry {
     pub(crate) member_ref: MemberRef,
     pub(crate) peer_id: Option<PeerId>,
     pub(crate) transport_public_key: Option<String>,
+    pub(crate) direct_member_fence: Option<BridgeDirectMemberFence>,
     pub(crate) labels: BTreeMap<String, String>,
     pub(crate) effective_profile_override: Option<crate::profile::Profile>,
     pub(crate) effective_model_override: Option<String>,
@@ -193,6 +199,7 @@ impl Roster {
                     member_ref,
                     peer_id: None,
                     transport_public_key: None,
+                    direct_member_fence: member_spawned.direct_member_fence.clone(),
                     labels: member_spawned.labels.clone(),
                     // Durable single owner: replay repopulates the per-spawn
                     // override so restarts without a SpawnMemberCustomizer
@@ -346,6 +353,7 @@ impl Roster {
                     runtime_mode: entry.runtime_mode,
                     peer_id: entry.peer_id,
                     transport_public_key: entry.transport_public_key,
+                    direct_member_fence: entry.direct_member_fence,
                     wired_to: BTreeSet::new(),
                     external_peer_specs: BTreeMap::new(),
                     labels: entry.labels,
@@ -539,6 +547,7 @@ impl Roster {
         next_peer_id: &str,
         next_address: &str,
         bootstrap_token: Option<meerkat_contracts::wire::supervisor_bridge::BridgeBootstrapToken>,
+        direct_member_fence: Option<BridgeDirectMemberFence>,
     ) -> Vec<(AgentIdentity, Generation, [u8; 32])> {
         let mut updated = Vec::new();
         for identity in identities {
@@ -559,6 +568,9 @@ impl Roster {
                     bootstrap_token: bootstrap_token.clone(),
                     session_id: None,
                 };
+                if let Some(direct_member_fence) = direct_member_fence.as_ref() {
+                    entry.direct_member_fence = Some(direct_member_fence.clone());
+                }
                 updated.push((entry.agent_identity.clone(), entry.generation, pubkey));
             }
         }
@@ -680,6 +692,7 @@ mod tests {
             member_ref,
             peer_id: None,
             transport_public_key: None,
+            direct_member_fence: None,
             labels,
             effective_profile_override: None,
             effective_model_override: None,
@@ -1261,6 +1274,7 @@ mod tests {
             kickoff: None,
             effective_profile_override: None,
             effective_model_override: None,
+            direct_member_fence: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: RosterEntry = serde_json::from_str(&json).unwrap();

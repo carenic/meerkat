@@ -498,77 +498,70 @@ pub async fn build_comms_runtime_from_config_scoped_with_silent_intents(
         })
         .transpose()?;
 
-    let runtime =
-        match config.comms.mode {
-            CommsRuntimeMode::Inproc => CommsRuntime::inproc_only_with_silent_intents(
-                comms_name,
-                inproc_namespace.clone(),
-                silent_intents.clone(),
-            )
-            .map_err(|e| format!("Failed to create inproc comms runtime: {e}"))?,
-            CommsRuntimeMode::Tcp => {
-                let address =
-                    config.comms.address.as_ref().ok_or_else(|| {
-                        "comms.address is required when comms.mode = tcp".to_string()
-                    })?;
-                let listen_tcp = address
-                    .parse()
-                    .map_err(|e| format!("Invalid comms TCP address '{address}': {e}"))?;
-                let comms = CoreCommsConfig {
-                    enabled: true,
-                    name: comms_name.to_string(),
-                    inproc_namespace: inproc_namespace.clone(),
-                    listen_tcp: Some(listen_tcp),
-                    advertise_address: config.comms.advertise_address.clone(),
-                    auth: config.comms.auth,
-                    require_peer_auth: config.comms.require_peer_auth,
-                    event_listen_tcp,
-                    pairing_password: config.comms.pairing_password.clone(),
-                    ..Default::default()
-                };
-                let resolved = comms.resolve_paths(base_dir.as_ref());
-                let mut rt = CommsRuntime::new_machine_authority_required_with_silent_intents(
-                    resolved,
-                    silent_intents.clone(),
-                )
+    let runtime = match config.comms.mode {
+        CommsRuntimeMode::Inproc => CommsRuntime::inproc_only_with_silent_intents(
+            comms_name,
+            inproc_namespace.clone(),
+            silent_intents.clone(),
+        )
+        .map_err(|e| format!("Failed to create inproc comms runtime: {e}"))?,
+        CommsRuntimeMode::Tcp => {
+            let address = config
+                .comms
+                .address
+                .as_ref()
+                .ok_or_else(|| "comms.address is required when comms.mode = tcp".to_string())?;
+            let listen_tcp = address
+                .parse()
+                .map_err(|e| format!("Invalid comms TCP address '{address}': {e}"))?;
+            let comms = CoreCommsConfig {
+                enabled: true,
+                name: comms_name.to_string(),
+                inproc_namespace: inproc_namespace.clone(),
+                listen_tcp: Some(listen_tcp),
+                advertise_address: config.comms.advertise_address.clone(),
+                auth: config.comms.auth,
+                require_peer_auth: config.comms.require_peer_auth,
+                event_listen_tcp,
+                pairing_password: config.comms.pairing_password.clone(),
+                ..Default::default()
+            };
+            let resolved = comms.resolve_paths(base_dir.as_ref());
+            let mut rt = CommsRuntime::new_with_silent_intents(resolved, silent_intents.clone())
                 .await
                 .map_err(|e| format!("Failed to create comms runtime: {e}"))?;
-                rt.start_listeners()
-                    .await
-                    .map_err(|e| format!("Failed to start comms listeners: {e}"))?;
-                rt
-            }
-            CommsRuntimeMode::Uds => {
-                let address =
-                    config.comms.address.as_ref().ok_or_else(|| {
-                        "comms.address is required when comms.mode = uds".to_string()
-                    })?;
-                let comms = CoreCommsConfig {
-                    enabled: true,
-                    name: comms_name.to_string(),
-                    inproc_namespace: inproc_namespace.clone(),
-                    listen_uds: Some(std::path::PathBuf::from(address)),
-                    auth: config.comms.auth,
-                    require_peer_auth: config.comms.require_peer_auth,
-                    event_listen_tcp,
-                    pairing_password: config.comms.pairing_password.clone(),
-                    ..Default::default()
-                };
-                let resolved = comms.resolve_paths(base_dir.as_ref());
-                let mut rt = CommsRuntime::new_machine_authority_required_with_silent_intents(
-                    resolved,
-                    silent_intents.clone(),
-                )
+            rt.start_listeners()
+                .await
+                .map_err(|e| format!("Failed to start comms listeners: {e}"))?;
+            rt
+        }
+        CommsRuntimeMode::Uds => {
+            let address = config
+                .comms
+                .address
+                .as_ref()
+                .ok_or_else(|| "comms.address is required when comms.mode = uds".to_string())?;
+            let comms = CoreCommsConfig {
+                enabled: true,
+                name: comms_name.to_string(),
+                inproc_namespace: inproc_namespace.clone(),
+                listen_uds: Some(std::path::PathBuf::from(address)),
+                auth: config.comms.auth,
+                require_peer_auth: config.comms.require_peer_auth,
+                event_listen_tcp,
+                pairing_password: config.comms.pairing_password.clone(),
+                ..Default::default()
+            };
+            let resolved = comms.resolve_paths(base_dir.as_ref());
+            let mut rt = CommsRuntime::new_with_silent_intents(resolved, silent_intents.clone())
                 .await
                 .map_err(|e| format!("Failed to create comms runtime: {e}"))?;
-                rt.start_listeners()
-                    .await
-                    .map_err(|e| format!("Failed to start comms listeners: {e}"))?;
-                rt
-            }
-        };
-
-    runtime.require_peer_comms_machine_authority();
+            rt.start_listeners()
+                .await
+                .map_err(|e| format!("Failed to start comms listeners: {e}"))?;
+            rt
+        }
+    };
 
     if let Some(meta) = peer_meta {
         runtime.set_peer_meta(meta);
@@ -680,12 +673,11 @@ pub(crate) async fn build_session_scoped_comms_runtime_from_config_scoped_with_s
                 ..Default::default()
             };
             let resolved = comms.resolve_paths(base_dir.as_ref());
-            let mut rt = CommsRuntime::new_machine_authority_required_with_silent_intents(
-                resolved,
-                silent_intents.clone(),
-            )
-            .await
-            .map_err(|error| session_scoped_comms_error("Failed to create comms runtime", error))?;
+            let mut rt = CommsRuntime::new_with_silent_intents(resolved, silent_intents.clone())
+                .await
+                .map_err(|error| {
+                    session_scoped_comms_error("Failed to create comms runtime", error)
+                })?;
             rt.start_listeners().await.map_err(|error| {
                 session_scoped_comms_error("Failed to start comms listeners", error)
             })?;
@@ -708,20 +700,17 @@ pub(crate) async fn build_session_scoped_comms_runtime_from_config_scoped_with_s
                 ..Default::default()
             };
             let resolved = comms.resolve_paths(base_dir.as_ref());
-            let mut rt = CommsRuntime::new_machine_authority_required_with_silent_intents(
-                resolved,
-                silent_intents.clone(),
-            )
-            .await
-            .map_err(|error| session_scoped_comms_error("Failed to create comms runtime", error))?;
+            let mut rt = CommsRuntime::new_with_silent_intents(resolved, silent_intents.clone())
+                .await
+                .map_err(|error| {
+                    session_scoped_comms_error("Failed to create comms runtime", error)
+                })?;
             rt.start_listeners().await.map_err(|error| {
                 session_scoped_comms_error("Failed to start comms listeners", error)
             })?;
             rt
         }
     };
-
-    runtime.require_peer_comms_machine_authority();
 
     if let Some(meta) = peer_meta {
         runtime.set_peer_meta(meta);
@@ -848,10 +837,6 @@ mod tests {
             .expect("sdk tcp runtime");
 
         assert!(
-            receiver.peer_comms_machine_authority_required(),
-            "public SDK listener runtimes must fail closed before a session-owned build installs machine authority"
-        );
-        assert!(
             receiver.peer_comms_handle().is_none(),
             "fixture must prove the pre-handle ingress path is closed"
         );
@@ -890,8 +875,9 @@ mod tests {
             })
         ));
         assert!(
-            CoreCommsRuntime::drain_inbox_interactions(&receiver)
+            CoreCommsRuntime::handoff_volatile_peer_input_candidates(&receiver)
                 .await
+                .expect("exact volatile SDK handoff")
                 .is_empty(),
             "pre-handle SDK-built runtime must not enqueue peer ingress"
         );

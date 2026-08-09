@@ -418,12 +418,13 @@ pub enum RealtimeSessionOpenProjectionError {
 }
 
 fn realtime_projection_messages_full(session: &Session) -> Result<Vec<Message>, SessionError> {
-    Ok(session.messages().to_vec())
+    Ok(session.messages_for_model_boundary())
 }
 
 /// Project replayable dialogue/tool history for realtime delivery.
 ///
-/// Every System row remains in its authored transcript position.
+/// Every active System row remains in its authored transcript position. For a
+/// versioned prompt key, only the latest durable version reaches the provider.
 pub fn realtime_projection_messages(session: &Session) -> Result<Vec<Message>, SessionError> {
     realtime_projection_messages_full(session)
 }
@@ -3050,9 +3051,11 @@ mod prompt_truth_tests {
     };
     use meerkat_core::types::{
         AssistantBlock, BlockAssistantMessage, Message, SessionId, StopReason, SystemMessage,
-        SystemNoticeKind, SystemNoticeMessage, UserMessage,
+        SystemNoticeKind, SystemNoticeMessage, SystemPromptKey, SystemPromptVersion, UserMessage,
     };
-    use meerkat_core::{Provider, Session, SessionLlmIdentity};
+    use meerkat_core::{
+        Provider, Session, SessionLlmIdentity, SystemPromptUpdateRequest, SystemPromptUpdateStatus,
+    };
     use meerkat_llm_core::realtime_session::RealtimeSessionOpenConfig;
 
     fn test_identity() -> SessionLlmIdentity {
@@ -3103,6 +3106,58 @@ mod prompt_truth_tests {
             RealtimeSessionOpenConfig::canonical_system_messages(session.messages()),
             vec!["transcript fallback"]
         );
+    }
+
+    #[test]
+    fn live_projection_selects_latest_versioned_system_prompt() {
+        let mut session = Session::new();
+        session.append_system_message("ordinary prompt");
+        session
+            .update_system_prompt(SystemPromptUpdateRequest {
+                key: SystemPromptKey::new("primary").expect("prompt key"),
+                expected_version: None,
+                target_message_index: Some(0),
+                content: "version one".to_string(),
+                actor: Some("host-test".to_string()),
+                expected_parent_revision: None,
+            })
+            .expect("version one");
+        session
+            .update_system_prompt(SystemPromptUpdateRequest {
+                key: SystemPromptKey::new("primary").expect("prompt key"),
+                expected_version: Some(SystemPromptVersion::INITIAL),
+                target_message_index: None,
+                content: "version two".to_string(),
+                actor: Some("host-test".to_string()),
+                expected_parent_revision: None,
+            })
+            .expect("version two");
+
+        let projected = realtime_projection_messages(&session).expect("full projection");
+        assert_eq!(projected.len(), 1);
+        assert!(matches!(
+            &projected[0],
+            Message::System(system) if system.content == "version two"
+        ));
+        let windowed = realtime_projection_messages_with_window(
+            &session,
+            LiveSeedWindow::new(10_000).expect("non-zero window"),
+        )
+        .expect("windowed projection");
+        assert_eq!(windowed.messages, projected);
+        assert_eq!(windowed.status, LiveSeedProjectionStatus::Complete);
+
+        let retry = session
+            .update_system_prompt(SystemPromptUpdateRequest {
+                key: SystemPromptKey::new("primary").expect("prompt key"),
+                expected_version: Some(SystemPromptVersion::INITIAL),
+                target_message_index: None,
+                content: "version two".to_string(),
+                actor: Some("host-test".to_string()),
+                expected_parent_revision: None,
+            })
+            .expect("exact retry");
+        assert_eq!(retry.status, SystemPromptUpdateStatus::Duplicate);
     }
 
     #[test]

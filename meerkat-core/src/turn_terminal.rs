@@ -220,7 +220,7 @@ mod tests {
             result: result.to_string(),
             structured_output: structured,
             extraction_required: extraction,
-            usage: crate::Usage::default(),
+            usage: crate::Usage::default().into(),
             terminal_cause_kind: None,
         }
     }

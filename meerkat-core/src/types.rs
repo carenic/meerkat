@@ -1231,6 +1231,189 @@ pub enum Message {
     },
 }
 
+/// Stable host-chosen identity for one replaceable system-prompt slot.
+///
+/// The key is domain identity, not an idempotency token. Every explicit
+/// update for the same key advances its [`SystemPromptVersion`], while
+/// unrelated ordinary System messages remain unkeyed ordered transcript
+/// events.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(transparent)]
+pub struct SystemPromptKey(String);
+
+impl SystemPromptKey {
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidSystemPromptKey> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(InvalidSystemPromptKey);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SystemPromptKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<'de> Deserialize<'de> for SystemPromptKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("system prompt key must not be empty")]
+pub struct InvalidSystemPromptKey;
+
+/// Monotonic version of one keyed system-prompt slot.
+///
+/// Version zero is unrepresentable. A host's first explicit adoption or
+/// replacement mints version one; later explicit updates increment it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(transparent)]
+pub struct SystemPromptVersion(u64);
+
+impl SystemPromptVersion {
+    pub const INITIAL: Self = Self(1);
+
+    pub fn new(value: u64) -> Result<Self, InvalidSystemPromptVersion> {
+        if value == 0 {
+            return Err(InvalidSystemPromptVersion);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
+impl<'de> Deserialize<'de> for SystemPromptVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("system prompt version must be greater than zero")]
+pub struct InvalidSystemPromptVersion;
+
+/// Typed identity carried by one durable versioned System row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct SystemPromptVersionIdentity {
+    pub key: SystemPromptKey,
+    pub version: SystemPromptVersion,
+}
+
+/// Return the offsets of versioned System rows superseded by a later version
+/// of the same key.
+///
+/// Unkeyed System rows are never superseded. Current session materialization
+/// and compaction both consume this one selector, so the two boundaries cannot
+/// disagree about which prompt version is active.
+#[must_use]
+pub fn superseded_system_prompt_offsets(messages: &[Message]) -> std::collections::BTreeSet<usize> {
+    let mut latest =
+        std::collections::BTreeMap::<&SystemPromptKey, (SystemPromptVersion, usize)>::new();
+    for (offset, message) in messages.iter().enumerate() {
+        let Message::System(system) = message else {
+            continue;
+        };
+        let Some(identity) = system.prompt_version.as_ref() else {
+            continue;
+        };
+        match latest.get(&identity.key) {
+            Some((version, _)) if *version >= identity.version => {}
+            _ => {
+                latest.insert(&identity.key, (identity.version, offset));
+            }
+        }
+    }
+
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, message)| {
+            let Message::System(system) = message else {
+                return None;
+            };
+            let identity = system.prompt_version.as_ref()?;
+            (latest
+                .get(&identity.key)
+                .is_some_and(|(_, latest_offset)| *latest_offset != offset))
+            .then_some(offset)
+        })
+        .collect()
+}
+
+/// Materialize the transcript view presented to a model or summarizer.
+///
+/// Historical prompt versions remain durable transcript rows and therefore
+/// remain reachable through transcript revision history. Only their latest
+/// keyed version is projected at an active model boundary.
+#[must_use]
+pub fn materialize_latest_system_prompt_versions(messages: &[Message]) -> Vec<Message> {
+    let superseded = superseded_system_prompt_offsets(messages);
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(offset, _)| !superseded.contains(offset))
+        .map(|(_, message)| message.clone())
+        .collect()
+}
+
+/// Validate the per-key ordering carried by durable versioned System rows.
+///
+/// Compaction may remove historical versions, so the first retained version
+/// need not be one. Versions that remain in one materialized transcript must
+/// nevertheless be strictly increasing in transcript order for each key.
+pub fn validate_system_prompt_version_order(messages: &[Message]) -> Result<(), String> {
+    let mut latest = std::collections::BTreeMap::<&SystemPromptKey, SystemPromptVersion>::new();
+    for message in messages {
+        let Message::System(system) = message else {
+            continue;
+        };
+        let Some(identity) = system.prompt_version.as_ref() else {
+            continue;
+        };
+        if let Some(previous) = latest.insert(&identity.key, identity.version)
+            && previous >= identity.version
+        {
+            return Err(format!(
+                "system prompt key '{}' has non-increasing durable versions {} then {}",
+                identity.key,
+                previous.get(),
+                identity.version.get()
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Message {
     pub fn tool_results(results: Vec<ToolResult>) -> Self {
         Self::ToolResults {
@@ -1425,6 +1608,13 @@ pub struct SystemMessage {
     /// Ordinary System messages omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<SystemMessageIdentity>,
+    /// Typed version identity for an explicitly replaceable prompt slot.
+    ///
+    /// This field is minted only by the explicit system-prompt update
+    /// operation. Creation, boot, resume, and ordinary materialization never
+    /// infer or add it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_version: Option<SystemPromptVersionIdentity>,
 }
 
 impl SystemMessage {
@@ -1433,6 +1623,7 @@ impl SystemMessage {
             content: content.into(),
             created_at: message_timestamp_now(),
             identity: None,
+            prompt_version: None,
         }
     }
 
@@ -1462,6 +1653,7 @@ impl SystemMessage {
                 source,
                 idempotency_key,
             }),
+            prompt_version: None,
         }
     }
 }
@@ -2593,24 +2785,171 @@ pub struct Usage {
     pub output_tokens: u64,
     pub cache_creation_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
+    /// Provider-authored normalized input accounting for one model turn.
+    ///
+    /// Cumulative usage intentionally leaves this `None`: an aggregate may
+    /// span providers and models and therefore cannot truthfully carry one
+    /// per-turn convention. Shared policy reads [`Usage::presented_tokens`]
+    /// on turn usage and never interprets cache detail fields directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_accounting: Option<crate::ProviderTokenAccounting>,
 }
 
 impl Usage {
-    /// Get total tokens used
+    /// Raw provider counters plus output. Shared provider policy must use a
+    /// validated [`TurnUsage`] instead.
     pub fn total_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens
+        self.input_tokens.saturating_add(self.output_tokens)
     }
 
-    /// Accumulate usage from another
+    /// Provider-normalized tokens presented to the model for this turn.
+    pub fn presented_tokens(&self) -> Option<u64> {
+        self.provider_accounting
+            .as_ref()
+            .map(|accounting| accounting.presented_tokens)
+    }
+
+    /// Accumulate already-normalized cumulative usage.
+    ///
+    /// Provider turn usage must first pass through [`TurnUsage`] and
+    /// [`CumulativeUsage::add_turn`]. Raw cache counters are deliberately not
+    /// aggregated here because their relationship to `input_tokens` differs
+    /// by provider.
     pub fn add(&mut self, other: &Usage) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        if let Some(c) = other.cache_creation_tokens {
-            *self.cache_creation_tokens.get_or_insert(0) += c;
-        }
-        if let Some(c) = other.cache_read_tokens {
-            *self.cache_read_tokens.get_or_insert(0) += c;
-        }
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_creation_tokens = None;
+        self.cache_read_tokens = None;
+        // Per-turn provider/model/convention evidence cannot be promoted to a
+        // potentially cross-provider cumulative aggregate.
+        self.provider_accounting = None;
+    }
+}
+
+/// Usage for one provider turn.
+///
+/// This is deliberately distinct from cumulative [`Usage`] on event
+/// boundaries, while retaining the existing flat wire shape.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct TurnUsage {
+    #[serde(flatten)]
+    usage: Usage,
+    accounting: crate::ProviderTokenAccounting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("provider turn usage is missing normalized accounting evidence")]
+pub struct TurnUsageAccountingMissing;
+
+impl TurnUsage {
+    pub fn new(mut usage: Usage, accounting: crate::ProviderTokenAccounting) -> Self {
+        usage.provider_accounting = None;
+        Self { usage, accounting }
+    }
+
+    pub fn try_from_usage(usage: Usage) -> Result<Self, TurnUsageAccountingMissing> {
+        let accounting = usage
+            .provider_accounting
+            .clone()
+            .ok_or(TurnUsageAccountingMissing)?;
+        let mut usage = usage;
+        usage.provider_accounting = None;
+        Ok(Self { usage, accounting })
+    }
+
+    pub fn host_declared(
+        provider: crate::Provider,
+        model: impl Into<String>,
+        usage: Usage,
+    ) -> Self {
+        let accounting =
+            crate::ProviderTokenAccounting::host_declared(provider, model, usage.input_tokens);
+        Self::new(usage, accounting)
+    }
+
+    pub fn into_inner(self) -> Usage {
+        let mut usage = self.usage;
+        usage.provider_accounting = Some(self.accounting);
+        usage
+    }
+
+    pub fn as_usage(&self) -> &Usage {
+        &self.usage
+    }
+
+    pub fn accounting(&self) -> &crate::ProviderTokenAccounting {
+        &self.accounting
+    }
+
+    pub fn presented_tokens(&self) -> u64 {
+        self.accounting.presented_tokens
+    }
+
+    pub fn normalized_total_tokens(&self) -> u64 {
+        self.presented_tokens()
+            .saturating_add(self.usage.output_tokens)
+    }
+}
+
+impl std::ops::Deref for TurnUsage {
+    type Target = Usage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.usage
+    }
+}
+
+/// Cumulative usage across committed turns. Cache detail counters are not
+/// aggregated because their relationship to input totals is provider-specific.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(transparent)]
+pub struct CumulativeUsage(Usage);
+
+impl CumulativeUsage {
+    pub fn from_usage(mut usage: Usage) -> Self {
+        usage.cache_creation_tokens = None;
+        usage.cache_read_tokens = None;
+        usage.provider_accounting = None;
+        Self(usage)
+    }
+
+    pub fn add_turn(&mut self, turn: &TurnUsage) {
+        self.0.input_tokens = self.0.input_tokens.saturating_add(turn.presented_tokens());
+        self.0.output_tokens = self.0.output_tokens.saturating_add(turn.output_tokens);
+        self.0.cache_creation_tokens = None;
+        self.0.cache_read_tokens = None;
+        self.0.provider_accounting = None;
+    }
+
+    pub fn as_usage(&self) -> &Usage {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> Usage {
+        self.0
+    }
+}
+
+impl From<Usage> for CumulativeUsage {
+    fn from(value: Usage) -> Self {
+        Self::from_usage(value)
+    }
+}
+
+impl From<CumulativeUsage> for Usage {
+    fn from(value: CumulativeUsage) -> Self {
+        value.into_inner()
+    }
+}
+
+impl std::ops::Deref for CumulativeUsage {
+    type Target = Usage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 

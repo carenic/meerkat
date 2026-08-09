@@ -22,6 +22,10 @@ use tokio::sync::{Mutex, mpsc};
 type DynAgent =
     meerkat_core::Agent<dyn AgentLlmClient, dyn AgentToolDispatcher, dyn AgentSessionStore>;
 
+fn normalized_test_usage(client: &dyn AgentLlmClient, usage: Usage) -> Usage {
+    meerkat_core::TurnUsage::host_declared(client.provider(), client.model(), usage).into_inner()
+}
+
 fn empty_test_tool_schema() -> Value {
     let mut schema = serde_json::Map::new();
     schema.insert("type".to_string(), Value::String("object".to_string()));
@@ -72,7 +76,7 @@ impl AgentLlmClient for ScenarioClient {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_test_usage(self, Usage::default()),
             )),
             ClientMode::ToolThenText | ClientMode::ToolThenTextMalformedArgs => {
                 if index == 0 {
@@ -94,7 +98,7 @@ impl AgentLlmClient for ScenarioClient {
                             meta: None,
                         }],
                         StopReason::ToolUse,
-                        Usage::default(),
+                        normalized_test_usage(self, Usage::default()),
                     ))
                 } else {
                     Ok(LlmStreamResult::new(
@@ -103,7 +107,7 @@ impl AgentLlmClient for ScenarioClient {
                             meta: None,
                         }],
                         StopReason::EndTurn,
-                        Usage::default(),
+                        normalized_test_usage(self, Usage::default()),
                     ))
                 }
             }

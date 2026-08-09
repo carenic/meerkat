@@ -614,6 +614,10 @@ impl LiveSessionActorWitness {
             && Arc::ptr_eq(&self.incarnation, &handle.actor_witness.incarnation)
     }
 
+    fn same_incarnation(&self, other: &Self) -> bool {
+        self.session_id == other.session_id && Arc::ptr_eq(&self.incarnation, &other.incarnation)
+    }
+
     /// Whether this exact actor incarnation has not been revoked.
     ///
     /// Session registries revoke a witness before removing or replacing its
@@ -979,6 +983,7 @@ enum SessionCommand {
     },
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     PublishInteractionTerminalsExactBatch {
+        expected_actor: Option<LiveSessionActorWitness>,
         events: Vec<AgentEvent>,
         event_store: Arc<dyn crate::event_store::EventStore>,
         reply_tx: oneshot::Sender<
@@ -1312,6 +1317,7 @@ impl RuntimeContextAdmissionGuard {
 }
 
 struct SessionTaskControl {
+    actor_witness: LiveSessionActorWitness,
     state_tx: watch::Sender<SessionState>,
     summary_tx: watch::Sender<SessionSummaryCache>,
     llm_identity_tx: watch::Sender<SessionLlmIdentity>,
@@ -1936,6 +1942,38 @@ pub struct EphemeralSessionService<B: SessionAgentBuilder> {
 }
 
 impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
+    /// Deliver a hard interrupt to one exact live run.
+    ///
+    /// The turn-admission slot serializes this comparison with turn
+    /// completion and successor admission. A stale request therefore resolves
+    /// as `false` and can never set the ambient successor's interrupt bit.
+    pub async fn interrupt_run_if_current(
+        &self,
+        id: &SessionId,
+        expected_run_id: &RunId,
+    ) -> Result<bool, SessionError> {
+        let sessions = self.sessions.read().await;
+        let handle = sessions
+            .get(id)
+            .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
+        let woke = {
+            let mut slot = lock_turn_admission(&handle.turn_admission);
+            let active_run_id = handle
+                .turn_state_handle
+                .as_deref()
+                .and_then(|turn_state| turn_state.snapshot().active_run_id);
+            if active_run_id.as_ref() != Some(expected_run_id) {
+                return Ok(false);
+            }
+            slot.request_interrupt()
+                .map_err(|_| SessionError::NotRunning { id: id.clone() })?
+        };
+        if woke {
+            wake_interrupt_notify(&handle.interrupt_notify);
+        }
+        Ok(true)
+    }
+
     /// Deliver cooperative cancellation to one exact live run.
     ///
     /// Machine-owned boundary handles must use this run-scoped seam. The
@@ -3018,14 +3056,17 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
         SessionError,
     > {
-        let sessions = self.sessions.read().await;
-        let handle = sessions
+        let command_tx = self
+            .sessions
+            .read()
+            .await
             .get(id)
+            .map(|handle| handle.command_tx.clone())
             .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        handle
-            .command_tx
+        command_tx
             .send(SessionCommand::PublishInteractionTerminalsExactBatch {
+                expected_actor: None,
                 events,
                 event_store,
                 reply_tx,
@@ -3039,6 +3080,57 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         reply_rx.await.map_err(|_| {
             SessionError::Agent(meerkat_core::error::AgentError::InternalError(
                 "Session task dropped the reply channel".to_string(),
+            ))
+        })?
+    }
+
+    /// Publish an exact interaction-terminal batch only to the actor named by
+    /// `witness`.
+    ///
+    /// The registry read lock is held only long enough to compare the sealed
+    /// incarnation and clone that actor's command sender. An arbitrarily slow
+    /// actor callback therefore cannot block removal or replacement, while a
+    /// late predecessor callback can never resolve the logical SessionId to a
+    /// successor actor.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    pub(crate) async fn publish_interaction_terminals_exact_batch_for_actor(
+        &self,
+        witness: &LiveSessionActorWitness,
+        events: Vec<AgentEvent>,
+        event_store: Arc<dyn crate::event_store::EventStore>,
+    ) -> Result<
+        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
+        SessionError,
+    > {
+        let command_tx = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(witness.session_id())
+                .filter(|handle| {
+                    witness.is_handle(handle) && witness.is_live() && !handle.command_tx.is_closed()
+                })
+                .map(|handle| handle.command_tx.clone())
+                .ok_or_else(|| SessionError::NotFound {
+                    id: witness.session_id().clone(),
+                })?
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        command_tx
+            .send(SessionCommand::PublishInteractionTerminalsExactBatch {
+                expected_actor: Some(witness.clone()),
+                events,
+                event_store,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    "Exact session actor has exited".to_string(),
+                ))
+            })?;
+        reply_rx.await.map_err(|_| {
+            SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                "Exact session actor dropped interaction-terminal reply channel".to_string(),
             ))
         })?
     }
@@ -4065,6 +4157,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             command_rx,
             Arc::clone(&deferred_turn_state),
             SessionTaskControl {
+                actor_witness: actor_witness.clone(),
                 state_tx,
                 summary_tx,
                 llm_identity_tx,
@@ -4084,6 +4177,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             command_rx,
             Arc::clone(&deferred_turn_state),
             SessionTaskControl {
+                actor_witness: actor_witness.clone(),
                 state_tx,
                 summary_tx,
                 llm_identity_tx,
@@ -4445,6 +4539,14 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
             wake_interrupt_notify(&handle.interrupt_notify);
         }
         Ok(())
+    }
+
+    async fn interrupt_run_if_current(
+        &self,
+        id: &SessionId,
+        expected_run_id: &RunId,
+    ) -> Result<bool, SessionError> {
+        EphemeralSessionService::interrupt_run_if_current(self, id, expected_run_id).await
     }
 
     async fn cancel_after_boundary(&self, id: &SessionId) -> Result<(), SessionError> {
@@ -4810,11 +4912,19 @@ async fn publish_interaction_terminal_batch(
     next_seq: &mut u64,
     control: &SessionTaskControl,
     event_store: &dyn crate::event_store::EventStore,
+    expected_actor: Option<&LiveSessionActorWitness>,
     events: Vec<AgentEvent>,
 ) -> Result<
     Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
     SessionError,
 > {
+    if let Some(expected_actor) = expected_actor
+        && (!expected_actor.same_incarnation(&control.actor_witness) || !expected_actor.is_live())
+    {
+        return Err(SessionError::NotFound {
+            id: expected_actor.session_id().clone(),
+        });
+    }
     if events.len() > crate::event_store::MAX_EXACT_INTERACTION_TERMINAL_BATCH {
         return Err(SessionError::Store(Box::new(
             crate::event_store::EventStoreError::InvalidExactInteractionTerminalBatch {
@@ -4973,9 +5083,14 @@ async fn publish_interaction_terminal_batch(
     }
 
     inserted.sort_unstable_by_key(|(stream_seq, _)| *stream_seq);
-    *next_seq = canonical_tail;
-    for (_, envelope) in inserted {
-        let _ = control.session_event_tx.send(envelope);
+    let actor_still_exact = expected_actor.is_none_or(|expected_actor| {
+        expected_actor.same_incarnation(&control.actor_witness) && expected_actor.is_live()
+    });
+    if actor_still_exact {
+        *next_seq = canonical_tail;
+        for (_, envelope) in inserted {
+            let _ = control.session_event_tx.send(envelope);
+        }
     }
     Ok(receipts)
 }
@@ -6162,6 +6277,7 @@ async fn session_task<A: SessionAgent>(
             }
             #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
             SessionCommand::PublishInteractionTerminalsExactBatch {
+                expected_actor,
                 events,
                 event_store,
                 reply_tx,
@@ -6171,6 +6287,7 @@ async fn session_task<A: SessionAgent>(
                     &mut next_seq,
                     &control,
                     event_store.as_ref(),
+                    expected_actor.as_ref(),
                     events,
                 )
                 .await;
@@ -6240,7 +6357,7 @@ async fn session_task<A: SessionAgent>(
                         _ => None,
                     })
                     .collect::<String>();
-                let usage_for_event = usage.clone();
+                let usage_for_event = meerkat_core::TurnUsage::try_from_usage(usage.clone()).ok();
                 let result = agent.append_external_assistant_output(blocks, stop_reason, usage);
                 if result.is_ok() {
                     let snap = agent.snapshot();
@@ -6261,15 +6378,14 @@ async fn session_task<A: SessionAgent>(
                         );
                         let _ = control.session_event_tx.send(envelope);
                     }
-                    let envelope = stamp_event_envelope(
-                        &mut next_seq,
-                        &source,
-                        AgentEvent::TurnCompleted {
-                            stop_reason,
-                            usage: usage_for_event,
-                        },
-                    );
-                    let _ = control.session_event_tx.send(envelope);
+                    if let Some(usage) = usage_for_event {
+                        let envelope = stamp_event_envelope(
+                            &mut next_seq,
+                            &source,
+                            AgentEvent::TurnCompleted { stop_reason, usage },
+                        );
+                        let _ = control.session_event_tx.send(envelope);
+                    }
                 }
                 let _ = reply_tx.send(result);
             }
@@ -6302,15 +6418,17 @@ async fn session_task<A: SessionAgent>(
                                 );
                                 let _ = control.session_event_tx.send(envelope);
                             }
-                            let envelope = stamp_event_envelope(
-                                &mut next_seq,
-                                &source,
-                                AgentEvent::TurnCompleted {
-                                    stop_reason: *stop_reason,
-                                    usage: usage.clone(),
-                                },
-                            );
-                            let _ = control.session_event_tx.send(envelope);
+                            if let Some(usage) = usage.clone() {
+                                let envelope = stamp_event_envelope(
+                                    &mut next_seq,
+                                    &source,
+                                    AgentEvent::TurnCompleted {
+                                        stop_reason: *stop_reason,
+                                        usage,
+                                    },
+                                );
+                                let _ = control.session_event_tx.send(envelope);
+                            }
                         }
                     }
                 }

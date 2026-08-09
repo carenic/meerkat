@@ -28,16 +28,21 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `principal_confirmation_count`: `u64`
 - `supervisor_confirmation_owner_keys`: `Set<WorkOwnerKey>`
 - `reviewer_confirmation_owner_keys`: `Set<WorkOwnerKey>`
+- `failed_child_join_policy`: `FailedChildJoinPolicy`
+- `cancelled_child_join_policy`: `CancelledChildJoinPolicy`
 
 ## Inputs
-- `CreateOpen`(due_at_utc_ms: Option<u64>, not_before_utc_ms: Option<u64>, snoozed_until_utc_ms: Option<u64>, completion_policy: WorkCompletionPolicy, completion_supervisor_owner_key: Option<WorkOwnerKey>, completion_reviewer_quorum_threshold: Option<u64>, unresolved_blocker_count: u64)
-- `CreateBlocked`(due_at_utc_ms: Option<u64>, not_before_utc_ms: Option<u64>, snoozed_until_utc_ms: Option<u64>, completion_policy: WorkCompletionPolicy, completion_supervisor_owner_key: Option<WorkOwnerKey>, completion_reviewer_quorum_threshold: Option<u64>, unresolved_blocker_count: u64)
+- `CreateOpen`(due_at_utc_ms: Option<u64>, not_before_utc_ms: Option<u64>, snoozed_until_utc_ms: Option<u64>, completion_policy: WorkCompletionPolicy, completion_supervisor_owner_key: Option<WorkOwnerKey>, completion_reviewer_quorum_threshold: Option<u64>, unresolved_blocker_count: u64, failed_child_join_policy: FailedChildJoinPolicy, cancelled_child_join_policy: CancelledChildJoinPolicy)
+- `CreateBlocked`(due_at_utc_ms: Option<u64>, not_before_utc_ms: Option<u64>, snoozed_until_utc_ms: Option<u64>, completion_policy: WorkCompletionPolicy, completion_supervisor_owner_key: Option<WorkOwnerKey>, completion_reviewer_quorum_threshold: Option<u64>, unresolved_blocker_count: u64, failed_child_join_policy: FailedChildJoinPolicy, cancelled_child_join_policy: CancelledChildJoinPolicy)
 - `Update`(expected_revision: u64, due_at_utc_ms: Option<u64>, not_before_utc_ms: Option<u64>, snoozed_until_utc_ms: Option<u64>, completion_policy: WorkCompletionPolicy, completion_supervisor_owner_key: Option<WorkOwnerKey>, completion_reviewer_quorum_threshold: Option<u64>, unresolved_blocker_count: u64)
 - `PolicyEscalate`(expected_revision: u64, requested_completion_policy: WorkCompletionPolicy, requested_completion_supervisor_owner_key: Option<WorkOwnerKey>, requested_completion_reviewer_quorum_threshold: Option<u64>)
-- `Claim`(expected_revision: u64, owner_key: WorkOwnerKey, now_utc_ms: u64, lease_expires_at_utc_ms: Option<u64>)
+- `Claim`(expected_revision: u64, owner_key: WorkOwnerKey, now_utc_ms: u64, lease_expires_at_utc_ms: Option<u64>, child_join_satisfied: Bool)
 - `Release`(expected_revision: u64)
+- `ObserveLeaseExpiry`(expected_revision: u64, observed_at_utc_ms: u64)
+- `ObserveReadiness`(expected_revision: u64, observed_at_utc_ms: u64, child_join_satisfied: Bool)
 - `Block`(expected_revision: u64)
 - `RefreshEligibility`(unresolved_blocker_count: u64)
+- `ClassifyChildJoin`(active_child_count: u64, failed_child_count: u64, cancelled_child_count: u64)
 - `ValidateLink`(kind: WorkEdgeKind, from_item_key: WorkItemKey, to_item_key: WorkItemKey, edge_key: WorkEdgeKey, reverse_path_key: WorkDependencyPathKey)
 - `CloseCompleted`(expected_revision: u64, at_utc_ms: u64)
 - `CloseCancelled`(expected_revision: u64, at_utc_ms: u64)
@@ -52,7 +57,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ClassifyPublicConfirmationAdmission`(completion_policy: WorkCompletionPolicy)
 - `ClassifyCompletionPolicyMutationAdmission`(requested_completion_policy: WorkCompletionPolicy, requested_completion_supervisor_owner_key: Option<WorkOwnerKey>, requested_completion_reviewer_quorum_threshold: Option<u64>)
 - `ClassifyConfirmationAdmission`(completion_policy: WorkCompletionPolicy, completion_supervisor_owner_key: Option<WorkOwnerKey>, requested_principal_owner_key: Option<WorkOwnerKey>, requested_principal_kind: Option<WorkOwnerKind>, supplied_evidence_kind: WorkConfirmationEvidenceObservation)
-- `ClassifyReadiness`(now_utc_ms: u64)
+- `ClassifyReadiness`(now_utc_ms: u64, child_join_satisfied: Bool)
 
 ## Signals
 
@@ -61,6 +66,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `Updated`
 - `Claimed`(owner_key: WorkOwnerKey)
 - `Released`
+- `LeaseExpiryObserved`
+- `ReadinessObserved`
 - `Blocked`
 - `LinkValidated`
 - `Closed`(terminal_state: WorkLifecycleState, at_utc_ms: u64)
@@ -76,6 +83,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `PolicyEscalationAdmissionClassified`(admission: WorkPolicyEscalationAdmissionKind)
 - `ConfirmationAdmissionClassified`(admission: WorkConfirmationAdmissionKind)
 - `WorkItemReadinessClassified`(ready: Bool)
+- `ChildJoinClassified`(disposition: ChildJoinDisposition)
 
 ## Helpers
 - `completion_policy_payload_valid`(policy: WorkCompletionPolicy, supervisor_owner_key: Option<WorkOwnerKey>, reviewer_quorum_threshold: Option<u64>) -> `Bool`
@@ -106,7 +114,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ## Transitions
 ### `CreateOpen`
 - From: `Absent`
-- On: `CreateOpen`(due_at_utc_ms, not_before_utc_ms, snoozed_until_utc_ms, completion_policy, completion_supervisor_owner_key, completion_reviewer_quorum_threshold, unresolved_blocker_count)
+- On: `CreateOpen`(due_at_utc_ms, not_before_utc_ms, snoozed_until_utc_ms, completion_policy, completion_supervisor_owner_key, completion_reviewer_quorum_threshold, unresolved_blocker_count, failed_child_join_policy, cancelled_child_join_policy)
 - Guards:
   - `completion_policy_payload_valid`
 - Emits: `Created`
@@ -114,7 +122,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CreateBlocked`
 - From: `Absent`
-- On: `CreateBlocked`(due_at_utc_ms, not_before_utc_ms, snoozed_until_utc_ms, completion_policy, completion_supervisor_owner_key, completion_reviewer_quorum_threshold, unresolved_blocker_count)
+- On: `CreateBlocked`(due_at_utc_ms, not_before_utc_ms, snoozed_until_utc_ms, completion_policy, completion_supervisor_owner_key, completion_reviewer_quorum_threshold, unresolved_blocker_count, failed_child_join_policy, cancelled_child_join_policy)
 - Guards:
   - `completion_policy_payload_valid`
 - Emits: `Created`
@@ -206,10 +214,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClaimOpen`
 - From: `Open`
-- On: `Claim`(expected_revision, owner_key, now_utc_ms, lease_expires_at_utc_ms)
+- On: `Claim`(expected_revision, owner_key, now_utc_ms, lease_expires_at_utc_ms, child_join_satisfied)
 - Guards:
   - `revision_matches`
   - `dependencies_satisfied`
+  - `child_join_satisfied`
+  - `new_lease_valid`
   - `due_eligible`
   - `not_before_eligible`
   - `snooze_eligible`
@@ -218,13 +228,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClaimExpiredInProgress`
 - From: `InProgress`
-- On: `Claim`(expected_revision, owner_key, now_utc_ms, lease_expires_at_utc_ms)
+- On: `Claim`(expected_revision, owner_key, now_utc_ms, lease_expires_at_utc_ms, child_join_satisfied)
 - Guards:
   - `revision_matches`
   - `prior_claim_present`
   - `prior_claim_has_lease`
   - `prior_claim_expired`
   - `dependencies_satisfied`
+  - `child_join_satisfied`
+  - `new_lease_valid`
   - `due_eligible`
   - `not_before_eligible`
   - `snooze_eligible`
@@ -237,6 +249,30 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - ``
 - Emits: `Released`
+- To: `Open`
+
+### `ObserveLeaseExpiryInProgress`
+- From: `InProgress`
+- On: `ObserveLeaseExpiry`(expected_revision, observed_at_utc_ms)
+- Guards:
+  - `revision_matches`
+  - `claim_present`
+  - `lease_present`
+  - `lease_expired`
+- Emits: `LeaseExpiryObserved`, `Released`
+- To: `Open`
+
+### `ObserveReadinessOpen`
+- From: `Open`
+- On: `ObserveReadiness`(expected_revision, observed_at_utc_ms, child_join_satisfied)
+- Guards:
+  - `revision_matches`
+  - `dependencies_satisfied`
+  - `child_join_satisfied`
+  - `due_eligible`
+  - `not_before_eligible`
+  - `snooze_eligible`
+- Emits: `ReadinessObserved`
 - To: `Open`
 
 ### `BlockOpen`
@@ -800,44 +836,86 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClassifyReadinessOpenOpen`
 - From: `Open`
-- On: `ClassifyReadiness`(now_utc_ms)
+- On: `ClassifyReadiness`(now_utc_ms, child_join_satisfied)
 - Emits: `WorkItemReadinessClassified`
 - To: `Open`
 
 ### `ClassifyReadinessInProgressInProgress`
 - From: `InProgress`
-- On: `ClassifyReadiness`(now_utc_ms)
+- On: `ClassifyReadiness`(now_utc_ms, child_join_satisfied)
 - Emits: `WorkItemReadinessClassified`
 - To: `InProgress`
 
 ### `ClassifyReadinessNotClaimableAbsent`
 - From: `Absent`
-- On: `ClassifyReadiness`(now_utc_ms)
+- On: `ClassifyReadiness`(now_utc_ms, child_join_satisfied)
 - Emits: `WorkItemReadinessClassified`
 - To: `Absent`
 
 ### `ClassifyReadinessNotClaimableBlocked`
 - From: `Blocked`
-- On: `ClassifyReadiness`(now_utc_ms)
+- On: `ClassifyReadiness`(now_utc_ms, child_join_satisfied)
 - Emits: `WorkItemReadinessClassified`
 - To: `Blocked`
 
 ### `ClassifyReadinessNotClaimableCompleted`
 - From: `Completed`
-- On: `ClassifyReadiness`(now_utc_ms)
+- On: `ClassifyReadiness`(now_utc_ms, child_join_satisfied)
 - Emits: `WorkItemReadinessClassified`
 - To: `Completed`
 
 ### `ClassifyReadinessNotClaimableCancelled`
 - From: `Cancelled`
-- On: `ClassifyReadiness`(now_utc_ms)
+- On: `ClassifyReadiness`(now_utc_ms, child_join_satisfied)
 - Emits: `WorkItemReadinessClassified`
 - To: `Cancelled`
 
 ### `ClassifyReadinessNotClaimableFailed`
 - From: `Failed`
-- On: `ClassifyReadiness`(now_utc_ms)
+- On: `ClassifyReadiness`(now_utc_ms, child_join_satisfied)
 - Emits: `WorkItemReadinessClassified`
+- To: `Failed`
+
+### `ClassifyChildJoinAbsent`
+- From: `Absent`
+- On: `ClassifyChildJoin`(active_child_count, failed_child_count, cancelled_child_count)
+- Emits: `ChildJoinClassified`
+- To: `Absent`
+
+### `ClassifyChildJoinOpen`
+- From: `Open`
+- On: `ClassifyChildJoin`(active_child_count, failed_child_count, cancelled_child_count)
+- Emits: `ChildJoinClassified`
+- To: `Open`
+
+### `ClassifyChildJoinInProgress`
+- From: `InProgress`
+- On: `ClassifyChildJoin`(active_child_count, failed_child_count, cancelled_child_count)
+- Emits: `ChildJoinClassified`
+- To: `InProgress`
+
+### `ClassifyChildJoinBlocked`
+- From: `Blocked`
+- On: `ClassifyChildJoin`(active_child_count, failed_child_count, cancelled_child_count)
+- Emits: `ChildJoinClassified`
+- To: `Blocked`
+
+### `ClassifyChildJoinCompleted`
+- From: `Completed`
+- On: `ClassifyChildJoin`(active_child_count, failed_child_count, cancelled_child_count)
+- Emits: `ChildJoinClassified`
+- To: `Completed`
+
+### `ClassifyChildJoinCancelled`
+- From: `Cancelled`
+- On: `ClassifyChildJoin`(active_child_count, failed_child_count, cancelled_child_count)
+- Emits: `ChildJoinClassified`
+- To: `Cancelled`
+
+### `ClassifyChildJoinFailed`
+- From: `Failed`
+- On: `ClassifyChildJoin`(active_child_count, failed_child_count, cancelled_child_count)
+- Emits: `ChildJoinClassified`
 - To: `Failed`
 
 ### `ClassifyBlockerSatisfactionAbsent`

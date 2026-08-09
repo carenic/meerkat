@@ -1007,6 +1007,20 @@ pub fn resolve_realm_binding_target_for_provider(
     preferred_realm: Option<&RealmId>,
     allow_env_default: bool,
 ) -> Result<ResolvedConnectionTarget, ConnectionTargetError> {
+    // `env_default` is a typed selection, not an absent realm hint. Honor it
+    // before walking the configured realm chain so a configured `global`
+    // binding cannot silently replace an explicitly selected process-env
+    // credential. The synthetic target remains minted only by
+    // `env_default_target`; durable `AuthBindingRef` inputs with this identity
+    // are still rejected by `resolve_auth_binding_or_default_for_provider`.
+    if allow_env_default
+        && explicit_realm.is_none()
+        && explicit_binding.is_none()
+        && preferred_realm.is_some_and(RealmId::is_env_default)
+    {
+        return env_default_target(provider, explicit_profile.cloned());
+    }
+
     // Head of the chain: an explicit realm names it (and must exist); else the
     // preferred realm; else the reserved `global` root. Resolution walks
     // head -> parents -> global; an unrelated sibling realm is NOT a candidate
@@ -1181,6 +1195,14 @@ pub fn resolve_auth_binding_candidates_for_provider(
             allow_env_default,
         )
         .map(|target| vec![target]);
+    }
+
+    // An explicitly selected synthetic env realm is singular authority. It
+    // must not be weakened into "configured realms first, env last", which
+    // would make a global managed binding override the caller's env-default
+    // selection for primary or cross-provider tool executors.
+    if allow_env_default && preferred_realm.is_some_and(RealmId::is_env_default) {
+        return env_default_target(provider, None).map(|target| vec![target]);
     }
 
     // Head defaults to the reserved `global` root when no realm is preferred,
@@ -2909,6 +2931,59 @@ auth_profile = "openai_oauth"
             "unrelated sibling 'dev' must not be discovered via a flat scan"
         );
         // Only the synthetic env-var fallback remains.
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].auth_binding.is_env_default());
+        assert_eq!(
+            candidates[0].auth_binding.origin,
+            BindingOrigin::SyntheticEnvDefault
+        );
+    }
+
+    #[test]
+    fn preferred_env_default_excludes_configured_global_binding() {
+        let config = config_with_realms(
+            r#"
+[global]
+default_binding = "google_oauth"
+
+[global.backend.google_code_assist]
+provider = "gemini"
+backend_kind = "google_code_assist"
+
+[global.auth.google_oauth]
+provider = "gemini"
+auth_method = "google_oauth"
+source = { kind = "managed_store" }
+
+[global.binding.google_oauth]
+backend_profile = "google_code_assist"
+auth_profile = "google_oauth"
+"#,
+        );
+        let env_default = RealmId::parse(ENV_DEFAULT_REALM_SLUG).unwrap();
+
+        let target = resolve_auth_binding_or_default_for_provider(
+            &config,
+            Provider::Gemini,
+            None,
+            Some(&env_default),
+            true,
+        )
+        .expect("selected env_default resolves through the synthetic target");
+        assert!(target.auth_binding.is_env_default());
+        assert_eq!(
+            target.auth_binding.origin,
+            BindingOrigin::SyntheticEnvDefault
+        );
+
+        let candidates = resolve_auth_binding_candidates_for_provider(
+            &config,
+            Provider::Gemini,
+            None,
+            Some(&env_default),
+            true,
+        )
+        .expect("selected env_default is the only candidate");
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].auth_binding.is_env_default());
         assert_eq!(

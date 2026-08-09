@@ -62,6 +62,7 @@ pub mod pending_continuation;
 pub mod placement;
 pub mod prompt;
 pub mod provider;
+pub mod provider_evidence;
 pub mod provider_matrix;
 pub mod realtime_transcript;
 pub mod realtime_transcript_revision;
@@ -215,13 +216,13 @@ pub use image_content::{
 };
 pub use image_generation::*;
 pub use interaction::{
-    ClassifiedInboxInteraction, InboxInteraction, InteractionContent, InteractionId, ObjectiveId,
-    PeerIngressAdmission, PeerIngressAdmissionDiagnostic, PeerIngressAuthDecision,
-    PeerIngressAuthExemption, PeerIngressAuthorityPhase, PeerIngressClaimId,
-    PeerIngressClaimSnapshot, PeerIngressClassification, PeerIngressConvention,
-    PeerIngressDeliveryContract, PeerIngressDeliveryCorrelation, PeerIngressDequeueAuthority,
-    PeerIngressDequeueFacts, PeerIngressDiagnosticDisplay, PeerIngressEntrySnapshot,
-    PeerIngressEnvelopeFacts, PeerIngressEnvelopeKind, PeerIngressFact, PeerIngressIdentity,
+    InboxInteraction, InteractionContent, InteractionId, ObjectiveId, PeerIngressAdmission,
+    PeerIngressAdmissionDiagnostic, PeerIngressAuthDecision, PeerIngressAuthExemption,
+    PeerIngressAuthorityPhase, PeerIngressClaimId, PeerIngressClaimSnapshot,
+    PeerIngressClassification, PeerIngressConvention, PeerIngressDeliveryContract,
+    PeerIngressDeliveryCorrelation, PeerIngressDequeueAuthority, PeerIngressDequeueFacts,
+    PeerIngressDiagnosticDisplay, PeerIngressEntrySnapshot, PeerIngressEnvelopeFacts,
+    PeerIngressEnvelopeKind, PeerIngressFact, PeerIngressHandoverState, PeerIngressIdentity,
     PeerIngressKind, PeerIngressPlainEventFacts, PeerIngressQueueClaim, PeerIngressQueueSnapshot,
     PeerIngressReceiveAuthority, PeerIngressReceiveFacts, PeerIngressReceiveOutcome,
     PeerIngressRuntimeSnapshot, PeerIngressTerminalOutcomeCounts, PeerIngressTerminalOutcomeKind,
@@ -285,6 +286,14 @@ pub use persistence_contract::{
 pub use placement::{ExecutionPlacement, ExecutionPlacementIdentity, PlacementError};
 pub use prompt::{AGENTS_MD_MAX_BYTES, DEFAULT_SYSTEM_PROMPT, SystemPromptConfig};
 pub use provider::Provider;
+pub use provider_evidence::{
+    AuthoredCacheBreakpoint, CacheBreakpointBoundary, CacheBreakpointEvidenceError,
+    LoweredRequestEncoding, LoweredRequestProvenance, PresentedTokenConvention,
+    ProviderCacheBreakpointClaim, ProviderCacheBreakpointClaimRequest, ProviderCacheTtl,
+    ProviderTokenAccounting, TargetCacheLoweringCapability, TargetCacheLoweringIssuer,
+    TokenAggregationProvenance, ValidatedSourceCacheBreakpoint, canonical_cache_prefix_identity,
+    provider_cache_breakpoint_claim,
+};
 pub use realtime_transcript::{
     PendingRealtimeUserContentBlob, RealtimeTranscriptApplyOutcome, RealtimeTranscriptEvent,
     RealtimeTranscriptMaterializedMessage, RealtimeTranscriptRole, RealtimeUserContentApplyOutcome,
@@ -313,18 +322,21 @@ pub use schema::{
 };
 pub use service::{
     AppendSystemContextRequest, AppendSystemContextResult, AppendSystemContextStatus,
-    CreateSessionRequest, DeferredPromptPolicy, MobToolsBuildArgs, MobToolsFactory,
-    PublicTurnToolOverlay, SessionBuildOptions, SessionControlError, SessionError,
-    SessionForkAtRequest, SessionForkReplaceRequest, SessionForkResult, SessionHistoryPage,
-    SessionHistoryQuery, SessionInfo, SessionQuery, SessionService, SessionServiceCommsExt,
-    SessionServiceControlExt, SessionServiceHistoryExt, SessionServiceTranscriptEditExt,
-    SessionSummary, SessionTranscriptRestoreRevisionRequest, SessionTranscriptRevisionList,
-    SessionTranscriptRevisionListEntry, SessionTranscriptRevisionListQuery,
-    SessionTranscriptRevisionPage, SessionTranscriptRevisionQuery, SessionTranscriptRewriteRequest,
+    CreateSessionRequest, DeferredPromptPolicy, DurableSessionForkTarget, ForkCacheInheritance,
+    ForkCacheInheritanceInstall, ForkCacheInheritanceUnavailableReason, ForkPoint, ForkPointError,
+    MobToolsBuildArgs, MobToolsFactory, PublicTurnToolOverlay, SessionBuildOptions,
+    SessionControlError, SessionError, SessionForkAtRequest, SessionForkReplaceRequest,
+    SessionForkResult, SessionHistoryPage, SessionHistoryQuery, SessionInfo, SessionQuery,
+    SessionService, SessionServiceCommsExt, SessionServiceControlExt, SessionServiceHistoryExt,
+    SessionServiceTranscriptEditExt, SessionSummary, SessionTranscriptRestoreRevisionRequest,
+    SessionTranscriptRevisionList, SessionTranscriptRevisionListEntry,
+    SessionTranscriptRevisionListQuery, SessionTranscriptRevisionPage,
+    SessionTranscriptRevisionQuery, SessionTranscriptRewriteRequest,
     SessionTranscriptRewriteResult, SessionUsage, SessionView, StageToolResultsDisposition,
     StageToolResultsRequest, StageToolResultsResult, StartTurnRequest, TranscriptEditError,
     TranscriptEditRunningBehavior, TranscriptReplacement, TranscriptRewriteReason,
     TranscriptRewriteSelection, TranscriptRewriteSemantic, TurnToolOverlay,
+    WorkGraphNamespaceGrant,
 };
 pub use session::{
     AuthorizedSessionToolVisibilityState, ConsumedDeferredTurnInputs, DeferredFirstTurnPhase,
@@ -342,16 +354,18 @@ pub use session::{
     SessionLineageId, SessionLlmIdentity, SessionLlmIdentityOverride,
     SessionLlmIdentityOverrideError, SessionLlmRequestPolicy, SessionMeta, SessionMetadata,
     SessionMetadataDocument, SessionToolVisibilityState, SessionTooling, SystemMessageAppendError,
-    ToolCategoryOverride, ToolVisibilityWitness, TranscriptEndpointWitness,
-    TranscriptGraphPrefixAccumulator, TranscriptHistoryState, TranscriptParentAdvance,
-    TranscriptRevisionBody, TranscriptRevisionEdge, TranscriptRewriteAuditReceiptBatch,
-    TranscriptRewriteCommit, TranscriptRewriteParentTransition, TranscriptRewritePatch,
-    TranscriptRewritePrefixAccumulator, TranscriptRewriteRecord, TransientTurnContextStateHandle,
-    VIEW_IMAGE_TOOL_NAME, ValidatedTranscriptHistory, ValidatedTranscriptRewriteSuffix,
-    WitnessedToolFilter, capability_base_filter_for_image_tool_results,
-    extend_transcript_rewrite_prefix_accumulator, import_released_0810_session,
-    released_0810_transcript_serialized_rows_digest, resolve_session_llm_identity_override,
-    session_metadata_document_from_slice, session_metadata_schema_version, session_version,
+    SystemPromptUpdateError, SystemPromptUpdateRequest, SystemPromptUpdateResult,
+    SystemPromptUpdateStatus, ToolCategoryOverride, ToolVisibilityWitness,
+    TranscriptEndpointWitness, TranscriptGraphPrefixAccumulator, TranscriptHistoryState,
+    TranscriptParentAdvance, TranscriptRevisionBody, TranscriptRevisionEdge,
+    TranscriptRewriteAuditReceiptBatch, TranscriptRewriteCommit, TranscriptRewriteParentTransition,
+    TranscriptRewritePatch, TranscriptRewritePrefixAccumulator, TranscriptRewriteRecord,
+    TransientTurnContextStateHandle, VIEW_IMAGE_TOOL_NAME, ValidatedTranscriptHistory,
+    ValidatedTranscriptRewriteSuffix, WitnessedToolFilter,
+    capability_base_filter_for_image_tool_results, extend_transcript_rewrite_prefix_accumulator,
+    import_released_0810_session, released_0810_transcript_serialized_rows_digest,
+    resolve_session_llm_identity_override, session_metadata_document_from_slice,
+    session_metadata_schema_version, session_version,
     transcript_history_full_body_materializations, transcript_messages_digest,
     transcript_rewrite_prefix_digest, try_lifecycle_terminal_from_map,
     try_session_metadata_from_map, validate_current_persisted_transcript_history_slice,
@@ -368,12 +382,12 @@ pub use session_recovery::{
     session_allows_first_turn_build_overrides,
 };
 pub use session_store::{
-    HeadCanonicalAuthorityCrossing, IncrementalSessionStore, PreparedHeadCanonicalMutationRoute,
-    PreparedHeadCanonicalRewritePreflight, SessionFilter, SessionHead, SessionHeadCas,
-    SessionMessageRowPrefixAccumulator, SessionStore, SessionStoreError, StrandLayout,
-    StrandRewriteLayout, TranscriptStrandId, VerifiedHeadCanonicalAuthority,
-    VerifiedSessionHeadMaterialization, head_canonical_plain_save_guard, session_head_cas_token,
-    strand_layout_for_history,
+    HeadCanonicalAuthorityCrossing, HeadCanonicalStoreActivation, IncrementalSessionStore,
+    PreparedHeadCanonicalMutationRoute, PreparedHeadCanonicalRewritePreflight, SessionFilter,
+    SessionHead, SessionHeadCas, SessionMessageRowPrefixAccumulator, SessionStore,
+    SessionStoreError, StrandLayout, StrandRewriteLayout, TranscriptStrandId,
+    VerifiedHeadCanonicalAuthority, VerifiedSessionHeadMaterialization,
+    head_canonical_plain_save_guard, session_head_cas_token, strand_layout_for_history,
 };
 pub use state::LoopState;
 pub use storage_diagnostics::{
@@ -433,15 +447,19 @@ pub use turn_execution_authority::{
 pub use turn_terminal::{ClassifiedTurnTerminal, TurnTerminalClassifier, TurnTerminalKind};
 pub use types::{
     ArtifactRef, AssistantBlock, BlockAssistantMessage, CommsNoticeKind, ContentBlock,
-    ContentInput, ExtractionError, HandlingMode, ImageData, MemoryIndexExclusion,
+    ContentInput, CumulativeUsage, ExtractionError, HandlingMode, ImageData, MemoryIndexExclusion,
     MemoryIndexableContent, Message, OutputSchema, ProviderMeta, RunInput, RunResult,
     SUPPORTED_VIDEO_MEDIA_TYPES, SecurityMode, ServerToolKind, SessionId, StopReason,
     SystemMessage, SystemMessageIdentity, SystemNoticeBlock, SystemNoticeDirection,
-    SystemNoticeKind, SystemNoticeMessage, SystemNoticePeer, ToolCall, ToolCallIter, ToolCallView,
-    ToolDef, ToolIdentity, ToolName, ToolNameSet, ToolProvenance, ToolResult, ToolSourceId,
-    ToolSourceKind, TranscriptMessageIdentity, TranscriptSource, TranscriptUserRole, Usage,
-    UserMessage, VideoData, assistant_blocks_have_visible_or_actionable_output, has_images,
-    has_non_text_content, has_video, is_supported_video_media_type, validate_inline_video_blocks,
+    SystemNoticeKind, SystemNoticeMessage, SystemNoticePeer, SystemPromptKey, SystemPromptVersion,
+    SystemPromptVersionIdentity, ToolCall, ToolCallIter, ToolCallView, ToolDef, ToolIdentity,
+    ToolName, ToolNameSet, ToolProvenance, ToolResult, ToolSourceId, ToolSourceKind,
+    TranscriptMessageIdentity, TranscriptSource, TranscriptUserRole, TurnUsage,
+    TurnUsageAccountingMissing, Usage, UserMessage, VideoData,
+    assistant_blocks_have_visible_or_actionable_output, has_images, has_non_text_content,
+    has_video, is_supported_video_media_type, materialize_latest_system_prompt_versions,
+    superseded_system_prompt_offsets, validate_inline_video_blocks,
+    validate_system_prompt_version_order,
 };
 pub use web_search::*;
 

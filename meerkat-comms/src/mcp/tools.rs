@@ -1130,10 +1130,6 @@ mod tests {
             Ok(receipt)
         }
 
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<Notify> {
             Arc::clone(&self.notify)
         }
@@ -2350,7 +2346,7 @@ mod tests {
         let sender_keypair = Keypair::generate();
         let receiver_id = PeerId::new();
 
-        let (_, router_inbox_sender) = crate::Inbox::new();
+        let (_, router_inbox_sender) = crate::Inbox::new_transport_only();
         let router = Arc::new(Router::new(
             sender_keypair,
             CommsConfig::default(),
@@ -2386,7 +2382,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_message_invalid_handling_mode_fails_at_serde_boundary() {
         let keypair = Keypair::generate();
-        let (_, inbox_sender) = crate::Inbox::new();
+        let (_, inbox_sender) = crate::Inbox::new_transport_only();
         let router = Arc::new(Router::new(
             keypair,
             CommsConfig::default(),
@@ -2424,7 +2420,7 @@ mod tests {
     #[tokio::test]
     async fn test_unknown_tool_returns_error() {
         let keypair = Keypair::generate();
-        let (_, inbox_sender) = crate::Inbox::new();
+        let (_, inbox_sender) = crate::Inbox::new_transport_only();
         let router = Arc::new(Router::new(
             keypair,
             CommsConfig::default(),

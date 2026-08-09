@@ -224,6 +224,8 @@ import type {
   SessionForkResult as RpcSessionForkResult,
   SessionPeerResponseTerminalParams as RpcSessionPeerResponseTerminalParams,
   SessionTranscriptRewriteResult as RpcSessionTranscriptRewriteResult,
+  SystemPromptUpdateResult as RpcSystemPromptUpdateResult,
+  UpdateSystemPromptParams as RpcUpdateSystemPromptParams,
   WireDeviceCompleteResult as RpcWireDeviceCompleteResult,
   WireProvisionApiKeyResult as RpcWireProvisionApiKeyResult,
   WireRunResult as RpcWireRunResult,
@@ -235,6 +237,7 @@ import {
   Mob,
   type MemberDeliveryReceipt,
   type MemberSendOptions,
+  type MobBoundedHelperResult,
   type MobHandlingMode,
   type MobHelperResult,
   type MobKickoffMemberSnapshot,
@@ -260,6 +263,15 @@ import type {
   ContentInput,
   ContentBlock,
   CreateScheduleRequest,
+  ForkAuthoredCacheBreakpoint,
+  ForkCacheBreakpointBoundary,
+  ForkCacheInheritance,
+  ForkCacheInheritanceUnavailableReason,
+  ForkCacheLoweredRequestEncoding,
+  ForkCacheLoweredRequestProvenance,
+  ForkCacheProvider,
+  ForkCacheTtl,
+  ForkPoint,
   HelpOptions,
   ModelProfile,
   ModelsCatalog,
@@ -308,6 +320,9 @@ import type {
   SessionTranscriptRevisionEntry,
   SessionTranscriptRevisionList,
   SessionTranscriptRewriteResult,
+  SystemPromptUpdateOptions,
+  SystemPromptUpdateResult,
+  SystemPromptVersionIdentity,
   SessionToolResult,
   SkillKey,
   SkillRef,
@@ -1234,7 +1249,7 @@ export class MeerkatClient {
     if (options?.toolAccessPolicy !== undefined) {
       params.tool_access_policy = options.toolAccessPolicy;
     }
-    const raw = await this.request("session/fork_at", params);
+    const raw = await this.request<RpcSessionForkResult>("session/fork_at", params);
     return MeerkatClient.parseSessionForkResult(raw);
   }
 
@@ -1256,7 +1271,7 @@ export class MeerkatClient {
     if (options?.toolAccessPolicy !== undefined) {
       params.tool_access_policy = options.toolAccessPolicy;
     }
-    const raw = await this.request("session/fork_replace", params);
+    const raw = await this.request<RpcSessionForkResult>("session/fork_replace", params);
     return MeerkatClient.parseSessionForkResult(raw);
   }
 
@@ -1287,6 +1302,36 @@ export class MeerkatClient {
     }
     const raw = await this.request("session/rewrite_transcript", params);
     return MeerkatClient.parseSessionTranscriptRewriteResult(raw);
+  }
+
+  async updateSystemPrompt(
+    sessionId: string,
+    key: string,
+    content: string,
+    options?: SystemPromptUpdateOptions,
+  ): Promise<SystemPromptUpdateResult> {
+    const params: RpcUpdateSystemPromptParams = {
+      session_id: sessionId,
+      key,
+      content,
+    };
+    if (options?.expectedVersion !== undefined) {
+      params.expected_version = options.expectedVersion;
+    }
+    if (options?.targetMessageIndex !== undefined) {
+      params.target_message_index = options.targetMessageIndex;
+    }
+    if (options?.actor !== undefined) {
+      params.actor = options.actor;
+    }
+    if (options?.expectedParentRevision !== undefined) {
+      params.expected_parent_revision = options.expectedParentRevision;
+    }
+    const raw = await this.request<RpcSystemPromptUpdateResult>(
+      "session/update_system_prompt",
+      params,
+    );
+    return MeerkatClient.parseSystemPromptUpdateResult(raw);
   }
 
   async restoreSessionTranscriptRevision(
@@ -3000,6 +3045,10 @@ export class MeerkatClient {
       ),
       agentIdentity: resultIdentity,
       memberRef,
+      boundedResult: MeerkatClient.parseBoundedHelperResult(
+        result.bounded_result,
+        "Invalid mob/spawn_helper response",
+      ),
     };
   }
 
@@ -3054,6 +3103,10 @@ export class MeerkatClient {
       ),
       agentIdentity: resultIdentity,
       memberRef,
+      boundedResult: MeerkatClient.parseBoundedHelperResult(
+        result.bounded_result,
+        "Invalid mob/fork_helper response",
+      ),
     };
   }
 
@@ -3319,6 +3372,38 @@ export class MeerkatClient {
       return raw;
     }
     throw new MeerkatError("INVALID_RESPONSE", context);
+  }
+
+  private static parseBoundedHelperResult(
+    raw: unknown,
+    context: string,
+  ): MobBoundedHelperResult | undefined {
+    if (raw == null) {
+      return undefined;
+    }
+    const record = MeerkatClient.requireRecord(raw, "bounded_result", context);
+    const status = MeerkatClient.requireStringField(record, "status", context);
+    const allowedStatuses = new Set([
+      "completed",
+      "completed_truncated",
+      "failed",
+      "failed_truncated",
+      "in_progress",
+      "in_progress_truncated",
+      "unavailable",
+      "unavailable_truncated",
+    ]);
+    if (!allowedStatuses.has(status)) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        `${context}: unsupported bounded_result status ${status}`,
+      );
+    }
+    return {
+      label: MeerkatClient.requireStringField(record, "label", context),
+      status: status as MobBoundedHelperResult["status"],
+      text: MeerkatClient.requirePresentStringField(record, "text", context),
+    };
   }
 
   private static parseAttributedMobEvent(raw: Record<string, unknown>): AttributedMobEvent {
@@ -6309,13 +6394,186 @@ export class MeerkatClient {
     };
   }
 
-  static parseSessionForkResult(data: Record<string, unknown>): SessionForkResult {
-    const context = "Invalid session fork response";
+  private static parseForkCacheLoweredRequestProvenance(
+    raw: unknown,
+    context: string,
+  ): ForkCacheLoweredRequestProvenance {
+    const data = MeerkatClient.requireRecord(raw, "lowered_request_provenance", context);
+    const provider = MeerkatClient.requireClosedStringField(
+      data,
+      "provider",
+      ["anthropic", "openai", "gemini", "self_hosted", "other"],
+      context,
+    ) as ForkCacheProvider;
+    const encoding = MeerkatClient.requireClosedStringField(
+      data,
+      "encoding",
+      [
+        "anthropic_messages_json",
+        "open_ai_responses_json",
+        "open_ai_chat_completions_json",
+        "gemini_generate_content_json",
+      ],
+      context,
+    ) as ForkCacheLoweredRequestEncoding;
+    const rawBodySha256 = MeerkatClient.requireOwnField(data, "body_sha256", context);
+    if (
+      !Array.isArray(rawBodySha256) ||
+      rawBodySha256.length !== 32 ||
+      rawBodySha256.some(
+        (byte) => !Number.isInteger(byte) || Number(byte) < 0 || Number(byte) > 255,
+      )
+    ) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        `${context}: body_sha256 must contain exactly 32 bytes`,
+      );
+    }
     return {
-      sourceSessionId: MeerkatClient.requireStringField(data, "source_session_id", context),
-      sessionId: MeerkatClient.requireStringField(data, "session_id", context),
-      sessionRef: data.session_ref != null ? String(data.session_ref) : undefined,
-      messageCount: MeerkatClient.requireNumberField(data, "message_count", context),
+      provider,
+      encoding,
+      bodySha256: rawBodySha256 as number[],
+    };
+  }
+
+  private static parseForkAuthoredCacheBreakpoint(
+    raw: unknown,
+    context: string,
+  ): ForkAuthoredCacheBreakpoint {
+    const data = MeerkatClient.requireRecord(raw, "authored_cache_breakpoint", context);
+    const boundaryData = MeerkatClient.requireRecord(data.boundary, "boundary", context);
+    const boundary: ForkCacheBreakpointBoundary = {
+      kind: MeerkatClient.requireClosedStringField(
+        boundaryData,
+        "kind",
+        ["system_profile_prefix", "transcript_after"],
+        context,
+      ) as ForkCacheBreakpointBoundary["kind"],
+      messageCount: MeerkatClient.requireNonNegativeIntegerField(
+        boundaryData,
+        "message_count",
+        context,
+      ),
+    };
+    return {
+      provider: MeerkatClient.requireClosedStringField(
+        data,
+        "provider",
+        ["anthropic", "openai", "gemini", "self_hosted", "other"],
+        context,
+      ) as ForkCacheProvider,
+      model: MeerkatClient.requireStringField(data, "model", context),
+      boundary,
+      canonicalPrefixSha256: MeerkatClient.requireStringField(
+        data,
+        "canonical_prefix_sha256",
+        context,
+      ),
+      canonicalPrefixBytes: MeerkatClient.requireNonNegativeIntegerField(
+        data,
+        "canonical_prefix_bytes",
+        context,
+      ),
+      renderedPrefixSha256: MeerkatClient.requireStringField(
+        data,
+        "rendered_prefix_sha256",
+        context,
+      ),
+      renderedPrefixBytes: MeerkatClient.requireNonNegativeIntegerField(
+        data,
+        "rendered_prefix_bytes",
+        context,
+      ),
+      loweredRequestProvenance: MeerkatClient.parseForkCacheLoweredRequestProvenance(
+        data.lowered_request_provenance,
+        context,
+      ),
+      ttl: MeerkatClient.requireClosedStringField(
+        data,
+        "ttl",
+        [
+          "five_minutes",
+          "one_hour",
+          "thirty_minutes",
+          "twenty_four_hours",
+          "provider_default",
+        ],
+        context,
+      ) as ForkCacheTtl,
+    };
+  }
+
+  private static parseForkPoint(raw: unknown, context: string): ForkPoint {
+    const data = MeerkatClient.requireRecord(raw, "fork_point", context);
+    return {
+      messageCount: MeerkatClient.requireNonNegativeIntegerField(
+        data,
+        "message_count",
+        context,
+      ),
+      authoredCacheBreakpoint: MeerkatClient.parseForkAuthoredCacheBreakpoint(
+        data.authored_cache_breakpoint,
+        context,
+      ),
+    };
+  }
+
+  private static parseForkCacheInheritance(
+    raw: unknown,
+    context: string,
+  ): ForkCacheInheritance {
+    const data = MeerkatClient.requireRecord(raw, "cache_inheritance", context);
+    const status = MeerkatClient.requireClosedStringField(
+      data,
+      "status",
+      ["available", "unavailable"],
+      context,
+    );
+    if (status === "available") {
+      return {
+        status,
+        forkPoint: MeerkatClient.parseForkPoint(data.fork_point, context),
+      };
+    }
+    return {
+      status: "unavailable",
+      messageCount: MeerkatClient.requireNonNegativeIntegerField(
+        data,
+        "message_count",
+        context,
+      ),
+      reason: MeerkatClient.requireClosedStringField(
+        data,
+        "reason",
+        [
+          "no_authored_breakpoint_at_boundary",
+          "provider_model_mismatch",
+          "target_identity_unresolved",
+          "target_lowering_unavailable",
+          "rendered_prefix_projection_unavailable",
+          "authored_evidence_invalid",
+        ],
+        context,
+      ) as ForkCacheInheritanceUnavailableReason,
+    };
+  }
+
+  static parseSessionForkResult(data: RpcSessionForkResult): SessionForkResult {
+    const context = "Invalid session fork response";
+    const wire = data as unknown as Record<string, unknown>;
+    return {
+      sourceSessionId: MeerkatClient.requireStringField(wire, "source_session_id", context),
+      sessionId: MeerkatClient.requireStringField(wire, "session_id", context),
+      sessionRef: wire.session_ref != null ? String(wire.session_ref) : undefined,
+      messageCount: MeerkatClient.requireNonNegativeIntegerField(
+        wire,
+        "message_count",
+        context,
+      ),
+      cacheInheritance: MeerkatClient.parseForkCacheInheritance(
+        wire.cache_inheritance,
+        context,
+      ),
     };
   }
 
@@ -6333,6 +6591,57 @@ export class MeerkatClient {
       revision: MeerkatClient.requireStringField(data, "revision", context),
       messageCount: MeerkatClient.requireNumberField(data, "message_count", context),
       commit: commit as Record<string, unknown>,
+    };
+  }
+
+  static parseSystemPromptUpdateResult(
+    data: RpcSystemPromptUpdateResult,
+  ): SystemPromptUpdateResult {
+    const context = "Invalid system prompt update response";
+    const wire = data as unknown as Record<string, unknown>;
+    const version = MeerkatClient.requireNumberField(wire, "version", context);
+    if (!Number.isInteger(version) || version <= 0) {
+      throw new MeerkatError("INVALID_RESPONSE", `${context}: version must be a positive integer`);
+    }
+    const messageIndex = MeerkatClient.requireNumberField(wire, "message_index", context);
+    if (!Number.isInteger(messageIndex) || messageIndex < 0) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        `${context}: message_index must be a non-negative integer`,
+      );
+    }
+    const status = MeerkatClient.requireStringField(wire, "status", context);
+    if (status !== "applied" && status !== "duplicate") {
+      throw new MeerkatError("INVALID_RESPONSE", `${context}: unsupported status ${status}`);
+    }
+    const rawCommit = wire.commit;
+    if (status === "applied" && rawCommit === undefined) {
+      throw new MeerkatError("INVALID_RESPONSE", `${context}: applied result must carry a commit`);
+    }
+    if (status === "duplicate" && rawCommit !== undefined) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        `${context}: duplicate result must not carry a commit`,
+      );
+    }
+    if (
+      rawCommit !== undefined &&
+      (typeof rawCommit !== "object" || rawCommit === null || Array.isArray(rawCommit))
+    ) {
+      throw new MeerkatError("INVALID_RESPONSE", `${context}: commit must be an object`);
+    }
+    return {
+      sessionId: MeerkatClient.requireStringField(wire, "session_id", context),
+      key: MeerkatClient.requireStringField(wire, "key", context),
+      version,
+      messageIndex,
+      status,
+      transcriptRevision: MeerkatClient.requireStringField(
+        wire,
+        "transcript_revision",
+        context,
+      ),
+      commit: rawCommit as Record<string, unknown> | undefined,
     };
   }
 
@@ -6389,6 +6698,38 @@ export class MeerkatClient {
     }
     const rawBlocks = (data.blocks as Array<Record<string, unknown>> | undefined) ?? [];
     const rawResults = (data.results as Array<Record<string, unknown>> | undefined) ?? [];
+    let promptVersion: SystemPromptVersionIdentity | undefined;
+    if (data.prompt_version !== undefined && data.prompt_version !== null) {
+      if (
+        typeof data.prompt_version !== "object" ||
+        Array.isArray(data.prompt_version)
+      ) {
+        throw new MeerkatError(
+          "INVALID_RESPONSE",
+          `${context}: prompt_version must be an object`,
+        );
+      }
+      const rawPromptVersion = data.prompt_version as Record<string, unknown>;
+      const version = MeerkatClient.requireNumberField(
+        rawPromptVersion,
+        "version",
+        `${context}: prompt_version`,
+      );
+      if (!Number.isInteger(version) || version <= 0) {
+        throw new MeerkatError(
+          "INVALID_RESPONSE",
+          `${context}: prompt_version.version must be a positive integer`,
+        );
+      }
+      promptVersion = {
+        key: MeerkatClient.requireStringField(
+          rawPromptVersion,
+          "key",
+          `${context}: prompt_version`,
+        ),
+        version,
+      };
+    }
     return {
       role,
       createdAt,
@@ -6399,6 +6740,7 @@ export class MeerkatClient {
       stopReason: data.stop_reason != null ? String(data.stop_reason) : undefined,
       interactionId: data.interaction_id != null ? String(data.interaction_id) : undefined,
       runId: data.run_id != null ? String(data.run_id) : undefined,
+      promptVersion,
       // System-notice blocks have their own generated union and remain
       // available in `raw`; only block-assistant rows project through the
       // public assistant-block view.

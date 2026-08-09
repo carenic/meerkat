@@ -38,6 +38,7 @@ from .types import (
     SessionTranscriptRevision,
     SessionTranscriptRevisionList,
     SessionTranscriptRewriteResult,
+    SystemPromptUpdateResult,
     SkillKey,
     SkillRef,
     TranscriptEditRunningBehavior,
@@ -379,6 +380,27 @@ class Session:
             running_behavior=running_behavior,
         )
 
+    async def update_system_prompt(
+        self,
+        key: str,
+        content: str,
+        *,
+        expected_version: int | None = None,
+        target_message_index: int | None = None,
+        actor: str | None = None,
+        expected_parent_revision: str | None = None,
+    ) -> SystemPromptUpdateResult:
+        """Explicitly replace one durable versioned system-prompt key."""
+        return await self._client.update_system_prompt(  # noqa: SLF001
+            self._id,
+            key,
+            content,
+            expected_version=expected_version,
+            target_message_index=target_message_index,
+            actor=actor,
+            expected_parent_revision=expected_parent_revision,
+        )
+
     async def subscribe_events(self) -> EventSubscription:
         """Open a standalone session-wide event subscription."""
         return await self._client.subscribe_session_events(self._id)  # noqa: SLF001
@@ -670,6 +692,27 @@ class DeferredSession:
             actor=actor,
             expected_parent_revision=expected_parent_revision,
             running_behavior=running_behavior,
+        )
+
+    async def update_system_prompt(
+        self,
+        key: str,
+        content: str,
+        *,
+        expected_version: int | None = None,
+        target_message_index: int | None = None,
+        actor: str | None = None,
+        expected_parent_revision: str | None = None,
+    ) -> SystemPromptUpdateResult:
+        """Explicitly replace one durable versioned system-prompt key."""
+        return await self._client.update_system_prompt(  # noqa: SLF001
+            self._id,
+            key,
+            content,
+            expected_version=expected_version,
+            target_message_index=target_message_index,
+            actor=actor,
+            expected_parent_revision=expected_parent_revision,
         )
 
     async def restore_transcript_revision(

@@ -53,6 +53,31 @@ run_head_canonical_kill_window() {
     -E 'test(mob_cold_restart_resume_after_kill_between_commit_points)'
 }
 
+prebuild_e2e_system_rkat_tests() {
+  # System scenarios enforce behavior timeouts around their nested commands.
+  # Compile every exact rkat feature graph used by the canonical system lane
+  # before those timers start, so a cold output root cannot spend the behavior
+  # allowance compiling and then kill shared artifact progress at the deadline.
+  "${cargo_bin}" test \
+    -p rkat \
+    --features integration-real-tests \
+    --test system_cli_init \
+    --test live_smoke_cli \
+    --test cli_mobpack_live_smoke \
+    --no-run
+  "${cargo_bin}" test \
+    -p rkat \
+    --features integration-real-tests,mob,comms \
+    --test system_mob_host_daemon \
+    --test system_mob_cli_verbs \
+    --no-run
+  "${cargo_bin}" test \
+    -p rkat \
+    --features integration-real-tests,memory-store-session \
+    --test system_cli_resume \
+    --no-run
+}
+
 case "${lane}" in
   build)
     if meerkat_buildbuddy_enabled; then
@@ -115,6 +140,7 @@ case "${lane}" in
     if meerkat_buildbuddy_enabled; then
       exec "${root}/scripts/buildbuddy-dev" e2e-system
     fi
+    prebuild_e2e_system_rkat_tests
     exec "${cargo_bin}" e2e-system
     ;;
   e2e-live)

@@ -20,6 +20,7 @@ use tokio::task::spawn_blocking;
 
 const SESSION_WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_WRITE_LOCK_POLL: Duration = Duration::from_millis(10);
+const PROJECTION_READ_VERIFICATION_ATTEMPTS: usize = 3;
 
 struct SessionWriteLock {
     file: std::fs::File,
@@ -30,6 +31,7 @@ enum IndexProjectionDegradationReason {
     PostCommitIndexUpdateFailed,
     PostCommitIndexDeleteFailed,
     StartupReconciliationDiverged,
+    ReadVerificationDiverged,
 }
 
 impl IndexProjectionDegradationReason {
@@ -38,21 +40,15 @@ impl IndexProjectionDegradationReason {
             Self::PostCommitIndexUpdateFailed => "post_commit_index_update_failed",
             Self::PostCommitIndexDeleteFailed => "post_commit_index_delete_failed",
             Self::StartupReconciliationDiverged => "startup_reconciliation_diverged",
+            Self::ReadVerificationDiverged => "read_verification_diverged",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct IndexProjectionWarning {
-    epoch: u64,
-    reason: IndexProjectionDegradationReason,
 }
 
 #[derive(Debug, Default)]
 struct IndexProjectionHealth {
     epoch: u64,
     degraded: Option<IndexProjectionDegradationReason>,
-    warned_epoch: Option<u64>,
 }
 
 impl IndexProjectionHealth {
@@ -61,16 +57,14 @@ impl IndexProjectionHealth {
         self.degraded = Some(reason);
     }
 
-    fn take_warning(&mut self) -> Option<IndexProjectionWarning> {
-        let reason = self.degraded?;
-        if self.warned_epoch == Some(self.epoch) {
-            return None;
+    fn degradation(&self) -> Option<(u64, IndexProjectionDegradationReason)> {
+        self.degraded.map(|reason| (self.epoch, reason))
+    }
+
+    fn clear_if_epoch(&mut self, epoch: u64) {
+        if self.epoch == epoch {
+            self.degraded = None;
         }
-        self.warned_epoch = Some(self.epoch);
-        Some(IndexProjectionWarning {
-            epoch: self.epoch,
-            reason,
-        })
     }
 }
 
@@ -197,25 +191,21 @@ impl JsonlStore {
         );
     }
 
-    fn warn_if_serving_known_degraded_index(&self) {
-        let warning = self.with_index_projection_health(IndexProjectionHealth::take_warning);
-        let Some(warning) = warning else {
-            return;
+    fn refuse_known_degraded_index(&self) -> Result<(), SessionStoreError> {
+        let degradation = self.with_index_projection_health(|health| health.degradation());
+        let Some((epoch, reason)) = degradation else {
+            return Ok(());
         };
-        tracing::warn!(
-            event = "projection_read",
-            code = "demoted-projection-read",
-            authority = "jsonl-session-file",
-            representation = "jsonl-session-index",
-            operation = "session.list",
-            served = true,
-            health = "known_degraded",
-            lag = "unknown",
-            rebuildable = true,
-            degraded_epoch = warning.epoch,
-            reason = warning.reason.as_str(),
-            "session listing served from a known-degraded JSONL index projection"
-        );
+        Err(SessionStoreError::ProjectionReadRefused {
+            operation: "session.list".to_string(),
+            authority: "jsonl-session-file".to_string(),
+            representation: "jsonl-session-index".to_string(),
+            reason: format!("{} at degradation epoch {epoch}", reason.as_str()),
+        })
+    }
+
+    fn clear_verified_index_degradation(&self, epoch: u64) {
+        self.with_index_projection_health(|health| health.clear_if_epoch(epoch));
     }
 
     /// Derive `SessionMeta` for every durable session file.
@@ -237,6 +227,11 @@ impl JsonlStore {
 
             let contents = match fs::read_to_string(&path).await {
                 Ok(contents) => contents,
+                // A concurrent canonical delete may remove a file after the
+                // directory iterator yielded it. Treat that as a changed
+                // snapshot; the before/after list bracket decides whether a
+                // stable projection can be served.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(StoreError::Io(err)),
             };
 
@@ -346,10 +341,8 @@ impl JsonlStore {
 
         // Upsert reconciliation repairs missing and stale metadata but cannot
         // remove an orphan left by a canonical delete whose index removal
-        // failed. Compare the reconciled index with the exact canonical
-        // snapshot before exposing it to `list`. A concurrent canonical write
-        // may conservatively arm this warning; serving silently is worse than
-        // a false-positive WARN during that narrow race.
+        // failed. Compare the reconciled index with an exact canonical
+        // snapshot before exposing it to `list`.
         let projected_metas = {
             let index = Arc::clone(&index);
             spawn_blocking(move || index.list_meta(SessionFilter::default())).await
@@ -359,7 +352,17 @@ impl JsonlStore {
             Ok(Err(err)) => return Err(err),
             Err(err) => return Err(StoreError::Join(err)),
         };
-        if session_meta_sets_diverge(&canonical_metas, &projected_metas) {
+        // A warning could conservatively tolerate a false positive during a
+        // concurrent canonical write; a typed refusal cannot. Re-read the
+        // canonical files after the projection snapshot and arm refusal only
+        // when the canonical metadata view stayed stable across the
+        // verification window and the projection still disagrees with it.
+        let verified_canonical_metas = self.read_all_session_metas().await?;
+        if projection_diverges_from_stable_canonical(
+            &canonical_metas,
+            &verified_canonical_metas,
+            &projected_metas,
+        ) {
             self.mark_index_projection_degraded(
                 IndexProjectionDegradationReason::StartupReconciliationDiverged,
             );
@@ -460,8 +463,45 @@ fn session_meta_sets_diverge(canonical: &[SessionMeta], projected: &[SessionMeta
     })
 }
 
-// Private methods return StoreError (preserves internal ? chains).
-// Trait methods convert at the boundary via into_session_store_error().
+fn projection_diverges_from_stable_canonical(
+    canonical_before: &[SessionMeta],
+    canonical_after: &[SessionMeta],
+    projected: &[SessionMeta],
+) -> bool {
+    !session_meta_sets_diverge(canonical_before, canonical_after)
+        && session_meta_sets_diverge(canonical_after, projected)
+}
+
+fn apply_session_filter(mut sessions: Vec<SessionMeta>, filter: SessionFilter) -> Vec<SessionMeta> {
+    sessions.retain(|meta| {
+        if let Some(created_after) = filter.created_after
+            && meta.created_at < created_after
+        {
+            return false;
+        }
+        if let Some(updated_after) = filter.updated_after
+            && meta.updated_at < updated_after
+        {
+            return false;
+        }
+        true
+    });
+    sessions.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.id.0.cmp(&right.id.0))
+    });
+    sessions
+        .into_iter()
+        .skip(filter.offset.unwrap_or(0))
+        .take(filter.limit.unwrap_or(usize::MAX))
+        .collect()
+}
+
+// Canonical write/load helpers return StoreError (preserving internal ?
+// chains). The projection-backed list helper returns SessionStoreError so its
+// typed degraded-read refusal survives the public trait boundary.
 impl JsonlStore {
     /// Take the realm write-admission guard for one write operation, when
     /// this store sits inside a realm directory. Fails typed
@@ -570,18 +610,74 @@ impl JsonlStore {
     /// the session files, so a crash that lands the session rename but not the
     /// index insert self-heals on next open: the canonical truth is intact and
     /// the projection is rematerialized from it. A live post-commit index
-    /// failure instead latches the projection as known-degraded, and the first
-    /// successful listing in each degradation epoch emits a structured warning.
-    async fn list_impl(&self, filter: SessionFilter) -> Result<Vec<SessionMeta>, StoreError> {
-        let index = self.index().await?;
-        let result = spawn_blocking(move || index.list_meta(filter)).await;
-        let sessions = match result {
-            Ok(Ok(sessions)) => sessions,
-            Ok(Err(err)) => return Err(err),
-            Err(err) => return Err(StoreError::Join(err)),
-        };
-        self.warn_if_serving_known_degraded_index();
-        Ok(sessions)
+    /// failure instead latches the projection as known-degraded. Listing then
+    /// refuses with a typed error until the index has been rebuilt and
+    /// verified from canonical files. The checks bracket the index
+    /// query so a concurrent post-commit projection failure cannot leak a
+    /// stale result through a read that began while the projection was healthy.
+    async fn list_impl(
+        &self,
+        filter: SessionFilter,
+    ) -> Result<Vec<SessionMeta>, SessionStoreError> {
+        let index = self.index().await.map_err(into_session_store_error)?;
+        for attempt in 0..PROJECTION_READ_VERIFICATION_ATTEMPTS {
+            let health_before = self.with_index_projection_health(|health| health.degradation());
+            let canonical_before = self
+                .read_all_session_metas()
+                .await
+                .map_err(into_session_store_error)?;
+            let projected = {
+                let index = Arc::clone(&index);
+                let result =
+                    spawn_blocking(move || index.list_meta(SessionFilter::default())).await;
+                match result {
+                    Ok(Ok(sessions)) => sessions,
+                    Ok(Err(err)) => return Err(into_session_store_error(err)),
+                    Err(err) => return Err(into_session_store_error(StoreError::Join(err))),
+                }
+            };
+            let canonical_after = self
+                .read_all_session_metas()
+                .await
+                .map_err(into_session_store_error)?;
+            let health_after = self.with_index_projection_health(|health| health.degradation());
+
+            let canonical_changed = session_meta_sets_diverge(&canonical_before, &canonical_after);
+            let health_changed = health_before != health_after;
+            if canonical_changed || health_changed {
+                if attempt + 1 < PROJECTION_READ_VERIFICATION_ATTEMPTS {
+                    continue;
+                }
+                if health_changed && health_after.is_some() {
+                    self.refuse_known_degraded_index()?;
+                }
+                return Err(SessionStoreError::ProjectionReadRefused {
+                    operation: "session.list".to_string(),
+                    authority: "jsonl-session-file".to_string(),
+                    representation: "jsonl-session-index".to_string(),
+                    reason: format!(
+                        "canonical authority changed during all \
+                         {PROJECTION_READ_VERIFICATION_ATTEMPTS} bounded verification attempts"
+                    ),
+                });
+            }
+
+            if session_meta_sets_diverge(&canonical_after, &projected) {
+                if health_after.is_none() {
+                    self.mark_index_projection_degraded(
+                        IndexProjectionDegradationReason::ReadVerificationDiverged,
+                    );
+                }
+                self.refuse_known_degraded_index()?;
+                unreachable!("known degraded projection refusal must return an error");
+            }
+
+            if let Some((epoch, _reason)) = health_after {
+                self.clear_verified_index_degradation(epoch);
+            }
+            return Ok(apply_session_filter(projected, filter));
+        }
+        unreachable!("projection verification loop returns or retries every attempt")
     }
 
     /// Callers (the trait methods) hold the realm write-admission guard
@@ -726,9 +822,7 @@ impl SessionStore for JsonlStore {
     }
 
     async fn list(&self, filter: SessionFilter) -> Result<Vec<SessionMeta>, SessionStoreError> {
-        self.list_impl(filter)
-            .await
-            .map_err(into_session_store_error)
+        self.list_impl(filter).await
     }
 
     async fn delete(&self, id: &SessionId) -> Result<(), SessionStoreError> {
@@ -774,27 +868,45 @@ mod tests {
     };
 
     #[test]
-    fn degraded_index_warning_is_once_per_epoch() {
+    fn degraded_index_refusal_reports_stable_typed_context() {
         let mut health = IndexProjectionHealth::default();
         health.mark_degraded(IndexProjectionDegradationReason::PostCommitIndexUpdateFailed);
         assert_eq!(
-            health.take_warning(),
-            Some(IndexProjectionWarning {
-                epoch: 1,
-                reason: IndexProjectionDegradationReason::PostCommitIndexUpdateFailed,
-            })
+            health.degradation(),
+            Some((
+                1,
+                IndexProjectionDegradationReason::PostCommitIndexUpdateFailed
+            ))
         );
-        assert_eq!(health.take_warning(), None);
 
         health.mark_degraded(IndexProjectionDegradationReason::PostCommitIndexDeleteFailed);
         assert_eq!(
-            health.take_warning(),
-            Some(IndexProjectionWarning {
-                epoch: 2,
-                reason: IndexProjectionDegradationReason::PostCommitIndexDeleteFailed,
-            })
+            health.degradation(),
+            Some((
+                2,
+                IndexProjectionDegradationReason::PostCommitIndexDeleteFailed
+            ))
         );
-        assert_eq!(health.take_warning(), None);
+    }
+
+    #[test]
+    fn startup_refusal_requires_a_stable_canonical_verification_window() {
+        let canonical = SessionMeta::from(&Session::new());
+        let mut changed_canonical = canonical.clone();
+        changed_canonical.message_count = 1;
+        let mut stale_projection = canonical.clone();
+        stale_projection.total_tokens = 1;
+
+        assert!(!projection_diverges_from_stable_canonical(
+            std::slice::from_ref(&canonical),
+            std::slice::from_ref(&changed_canonical),
+            std::slice::from_ref(&canonical),
+        ));
+        assert!(projection_diverges_from_stable_canonical(
+            std::slice::from_ref(&canonical),
+            std::slice::from_ref(&canonical),
+            std::slice::from_ref(&stale_projection),
+        ));
     }
 
     fn obstruct_cached_index(store: &JsonlStore) -> PathBuf {
@@ -811,13 +923,24 @@ mod tests {
         std::fs::rename(backup_path, index_path).unwrap();
     }
 
-    fn assert_warning_consumed(store: &JsonlStore, reason: IndexProjectionDegradationReason) {
-        let health = store
-            .index_projection_health
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(health.degraded, Some(reason));
-        assert_eq!(health.warned_epoch, Some(health.epoch));
+    fn assert_projection_read_refused(
+        error: SessionStoreError,
+        reason: IndexProjectionDegradationReason,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let SessionStoreError::ProjectionReadRefused {
+            operation,
+            authority,
+            representation,
+            reason: detail,
+        } = error
+        else {
+            return Err(format!("expected typed projection-read refusal, got {error:?}").into());
+        };
+        assert_eq!(operation, "session.list");
+        assert_eq!(authority, "jsonl-session-file");
+        assert_eq!(representation, "jsonl-session-index");
+        assert!(detail.starts_with(reason.as_str()));
+        Ok(())
     }
 
     #[tokio::test]
@@ -841,15 +964,81 @@ mod tests {
         assert_eq!(loaded.messages().len(), 1);
 
         restore_cached_index(&store, &backup_path);
-        let listed = store.list(SessionFilter::default()).await?;
-        assert_eq!(listed.len(), 1);
-        assert_eq!(
-            listed[0].message_count, 0,
-            "index remains a stale projection"
-        );
-        assert_warning_consumed(
-            &store,
+        let error = store
+            .list(SessionFilter::default())
+            .await
+            .expect_err("known-degraded projection must refuse listing");
+        assert_projection_read_refused(
+            error,
             IndexProjectionDegradationReason::PostCommitIndexUpdateFailed,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn second_process_refuses_projection_degraded_by_first_process()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let store_path = temp_dir.path().to_path_buf();
+        let writer = JsonlStore::new(store_path.clone());
+        let reader = JsonlStore::new(store_path);
+        let mut session = Session::new();
+        writer.save(&session).await?;
+        reader
+            .list(SessionFilter::default())
+            .await
+            .expect("second process primes an independently healthy projection handle");
+
+        let backup_path = obstruct_cached_index(&writer);
+        session.push(Message::User(UserMessage::text("canonical update")));
+        writer
+            .save(&session)
+            .await
+            .expect("canonical commit remains independent of projection failure");
+        restore_cached_index(&writer, &backup_path);
+
+        let error = reader
+            .list(SessionFilter::default())
+            .await
+            .expect_err("a process-local healthy latch must not serve cross-process stale state");
+        assert_projection_read_refused(
+            error,
+            IndexProjectionDegradationReason::ReadVerificationDiverged,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verified_cross_process_rebuild_clears_process_local_refusal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let store_path = temp_dir.path().to_path_buf();
+        let writer = JsonlStore::new(store_path.clone());
+        let mut session = Session::new();
+        writer.save(&session).await?;
+        let backup_path = obstruct_cached_index(&writer);
+
+        session.push(Message::User(UserMessage::text("canonical update")));
+        writer
+            .save(&session)
+            .await
+            .expect("canonical commit remains independent of projection failure");
+        restore_cached_index(&writer, &backup_path);
+        let rebuilder = JsonlStore::new(store_path);
+        rebuilder
+            .list(SessionFilter::default())
+            .await
+            .expect("fresh process rebuilds and verifies the shared projection");
+
+        let listed = writer
+            .list(SessionFilter::default())
+            .await
+            .expect("full canonical verification admits the healed projection");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_count, 1);
+        assert_eq!(
+            writer.with_index_projection_health(|health| health.degradation()),
+            None
         );
         Ok(())
     }
@@ -871,21 +1060,19 @@ mod tests {
         assert!(store.load(&id).await?.is_none());
 
         restore_cached_index(&store, &backup_path);
-        let listed = store.list(SessionFilter::default()).await?;
-        assert_eq!(
-            listed.len(),
-            1,
-            "WARN-first leaves stale projection for repair"
-        );
-        assert_warning_consumed(
-            &store,
+        let error = store
+            .list(SessionFilter::default())
+            .await
+            .expect_err("known-degraded projection must refuse listing");
+        assert_projection_read_refused(
+            error,
             IndexProjectionDegradationReason::PostCommitIndexDeleteFailed,
-        );
+        )?;
         Ok(())
     }
 
     #[tokio::test]
-    async fn restart_with_canonical_empty_and_stale_index_arms_warning()
+    async fn restart_with_canonical_empty_and_stale_index_refuses_projection_read()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempfile::tempdir()?;
         let store_path = temp_dir.path().to_path_buf();
@@ -899,25 +1086,14 @@ mod tests {
         drop(store);
 
         let reopened = JsonlStore::new(store_path);
-        let listed = reopened.list(SessionFilter::default()).await?;
-        assert_eq!(
-            listed.len(),
-            1,
-            "WARN-first does not silently repair the index"
-        );
-        let health = reopened
-            .index_projection_health
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(
-            health.degraded,
-            Some(IndexProjectionDegradationReason::StartupReconciliationDiverged)
-        );
-        assert_eq!(
-            health.warned_epoch,
-            Some(health.epoch),
-            "the successful restart listing must consume the armed warning epoch"
-        );
+        let error = reopened
+            .list(SessionFilter::default())
+            .await
+            .expect_err("divergent startup projection must refuse listing");
+        assert_projection_read_refused(
+            error,
+            IndexProjectionDegradationReason::StartupReconciliationDiverged,
+        )?;
         Ok(())
     }
 

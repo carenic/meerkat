@@ -22,6 +22,10 @@ pub enum ScheduleStoreError {
     Transient(String),
     #[error("concurrency error: {0}")]
     Concurrency(String),
+    #[error("invalid schedule executor lease: {0}")]
+    InvalidExecutorLease(String),
+    #[error("schedule executor lease is stale or expired")]
+    ExecutorLeaseStale,
     #[error("internal error: {0}")]
     Internal(String),
 }

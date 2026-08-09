@@ -16,7 +16,7 @@ use meerkat_core::{
     RealtimeUserContentIdentity, RealtimeUserContentTombstone, ToolCallId, ToolDef, ToolName,
     ToolResult,
 };
-use meerkat_core::{StopReason, types::Usage};
+use meerkat_core::{StopReason, TurnUsage, types::Usage};
 use meerkat_llm_core::LlmError;
 use meerkat_llm_core::realtime_session::{
     RealtimeExternalSessionTarget, RealtimeSession, RealtimeSessionEvent, RealtimeSessionFactory,
@@ -2084,7 +2084,7 @@ impl OpenAiRealtimeSession {
     fn normalize_cancelled_response_terminal(
         &mut self,
         response: &oai_rt_rs::protocol::models::Response,
-    ) -> RealtimeSessionEvent {
+    ) -> Result<RealtimeSessionEvent, LlmError> {
         debug_assert!(matches!(
             response.status,
             oai_rt_rs::protocol::models::ResponseStatus::Cancelled
@@ -2093,17 +2093,22 @@ impl OpenAiRealtimeSession {
         let turn_completed = RealtimeSessionEvent::TurnCompleted {
             response_id: response_id.clone(),
             stop_reason: StopReason::Cancelled,
-            usage: openai_response_usage(response.usage.as_ref()),
+            usage: openai_response_usage(
+                response.usage.as_ref(),
+                self.current_model_id
+                    .as_deref()
+                    .unwrap_or(OPENAI_CANONICAL_REALTIME_MODEL),
+            )?,
         };
         if std::mem::replace(&mut self.response_interrupt_emitted, false) {
-            turn_completed
+            Ok(turn_completed)
         } else {
             self.response_interrupt_emitted = true;
             self.remember_interrupted_response_cancel_target(Some(&response_id));
             self.push_pending_event(turn_completed);
-            RealtimeSessionEvent::Interrupted {
+            Ok(RealtimeSessionEvent::Interrupted {
                 response_id: Some(response_id),
-            }
+            })
         }
     }
 
@@ -2725,13 +2730,18 @@ impl OpenAiRealtimeSession {
                 let turn_completed = RealtimeSessionEvent::TurnCompleted {
                     response_id,
                     stop_reason,
-                    usage: openai_response_usage(response.usage.as_ref()),
+                    usage: openai_response_usage(
+                        response.usage.as_ref(),
+                        self.current_model_id
+                            .as_deref()
+                            .unwrap_or(OPENAI_CANONICAL_REALTIME_MODEL),
+                    )?,
                 };
                 if matches!(
                     response.status,
                     oai_rt_rs::protocol::models::ResponseStatus::Cancelled
                 ) {
-                    Some(self.normalize_cancelled_response_terminal(&response))
+                    Some(self.normalize_cancelled_response_terminal(&response)?)
                 } else {
                     self.response_interrupt_emitted = false;
                     Some(turn_completed)
@@ -2756,7 +2766,7 @@ impl OpenAiRealtimeSession {
                 self.clear_response_output_active();
                 self.response_tool_call_observed = false;
                 trace_openai_realtime_lifecycle("response.cancelled surfaced");
-                Some(self.normalize_cancelled_response_terminal(&response))
+                Some(self.normalize_cancelled_response_terminal(&response)?)
             }
             ServerEvent::ResponseOutputItemAdded {
                 response_id, item, ..
@@ -3954,13 +3964,24 @@ fn openai_response_stop_reason(
     }
 }
 
-fn openai_response_usage(usage: Option<&oai_rt_rs::protocol::models::Usage>) -> Usage {
-    usage.map_or_else(Usage::default, |usage| Usage {
+fn openai_response_usage(
+    usage: Option<&oai_rt_rs::protocol::models::Usage>,
+    model: &str,
+) -> Result<TurnUsage, LlmError> {
+    let usage = usage.ok_or_else(|| LlmError::IncompleteResponse {
+        message: "openai realtime terminal response omitted usage accounting".to_string(),
+    })?;
+    let raw = Usage {
         input_tokens: u64::from(usage.input_tokens),
         output_tokens: u64::from(usage.output_tokens),
         cache_creation_tokens: None,
         cache_read_tokens: usage.cached_tokens.map(u64::from),
-    })
+        provider_accounting: None,
+    };
+    Ok(TurnUsage::new(
+        raw,
+        meerkat_core::ProviderTokenAccounting::openai(model, u64::from(usage.input_tokens)),
+    ))
 }
 
 /// Provider-neutral realtime session factory backed by OpenAI sideband sessions.
@@ -4335,6 +4356,17 @@ fn map_openai_live_server_error(error: OpenAiServerError) -> LlmError {
             retry_after_ms: None,
         },
         ApiErrorType::AuthenticationError => LlmError::AuthenticationFailed { message },
+        ApiErrorType::InvalidRequestError
+            if matches!(
+                error.code.as_deref(),
+                Some("context_length_exceeded" | "context_window_exceeded")
+            ) =>
+        {
+            LlmError::ContextLengthExceeded {
+                max: 0,
+                requested: 1,
+            }
+        }
         ApiErrorType::InvalidRequestError => LlmError::InvalidRequest { message },
         ApiErrorType::ServerError => LlmError::ServerError {
             status: 500,
@@ -6440,6 +6472,39 @@ mod tests {
     }
 
     #[test]
+    fn realtime_context_limit_uses_structured_code() {
+        for code in ["context_length_exceeded", "context_window_exceeded"] {
+            let mapped = map_openai_live_server_error(OpenAiServerError {
+                error_type: ApiErrorType::InvalidRequestError,
+                code: Some(code.to_string()),
+                message: "the request exceeds the model context".to_string(),
+                param: None,
+                event_id: None,
+            });
+
+            assert!(matches!(mapped, LlmError::ContextLengthExceeded { .. }));
+        }
+    }
+
+    #[test]
+    fn realtime_context_words_without_structured_code_stay_invalid_request() {
+        let message = "free-form context_window_exceeded text is not provider evidence".to_string();
+        let mapped = map_openai_live_server_error(OpenAiServerError {
+            error_type: ApiErrorType::InvalidRequestError,
+            code: Some("invalid_request_error".to_string()),
+            message: message.clone(),
+            param: None,
+            event_id: None,
+        });
+
+        assert!(matches!(
+            mapped,
+            LlmError::InvalidRequest { message: mapped_message }
+                if mapped_message == message
+        ));
+    }
+
+    #[test]
     fn realtime_image_error_redaction_is_ascii_case_insensitive() {
         let secret = "mixed-case-secret-image-payload";
         for data_uri in [
@@ -6855,7 +6920,15 @@ mod tests {
             max_output_tokens: None,
             audio: None,
             metadata: None,
-            usage: None,
+            usage: Some(oai_rt_rs::protocol::models::Usage {
+                total_tokens: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                input_token_details: None,
+                output_token_details: None,
+                cached_tokens: None,
+                cached_tokens_details: None,
+            }),
         }
     }
 
@@ -10239,13 +10312,20 @@ mod tests {
             })
             .expect("response.done should map after response.created");
 
-        assert!(matches!(
-            done,
-            Some(RealtimeSessionEvent::TurnCompleted {
-                stop_reason: StopReason::EndTurn,
-                ..
-            })
-        ));
+        let Some(RealtimeSessionEvent::TurnCompleted {
+            stop_reason, usage, ..
+        }) = done
+        else {
+            panic!("response.done must surface one typed completed turn");
+        };
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(usage.accounting().provider, Provider::OpenAI);
+        assert_eq!(usage.accounting().model, OPENAI_CANONICAL_REALTIME_MODEL);
+        assert_eq!(usage.presented_tokens(), 0);
+        assert_eq!(
+            usage.accounting().convention,
+            meerkat_core::PresentedTokenConvention::OpenAiInputIncludesCachedSubset
+        );
     }
 
     #[tokio::test]
@@ -13452,7 +13532,11 @@ mod tests {
         let critical = LiveAdapterObservation::TurnCompleted {
             response_id: None,
             stop_reason: meerkat_core::types::StopReason::EndTurn,
-            usage: meerkat_core::types::Usage::default(),
+            usage: meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Other,
+                "live-control-test",
+                meerkat_core::types::Usage::default(),
+            ),
         };
         control_tx
             .send(critical.clone().into())
@@ -13526,7 +13610,11 @@ mod tests {
                 LiveAdapterObservation::TurnCompleted {
                     response_id: None,
                     stop_reason: meerkat_core::types::StopReason::EndTurn,
-                    usage: meerkat_core::types::Usage::default(),
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::Other,
+                        "live-control-test",
+                        meerkat_core::types::Usage::default(),
+                    ),
                 }
                 .into(),
             )

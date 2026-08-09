@@ -4,8 +4,8 @@ use crate::lifecycle::{
     ScheduleLifecycleInput, ScheduleLifecycleMutator, ScheduleTransitionCommit,
 };
 use crate::store::{
-    OccurrenceFilter, ScheduleFilter, ScheduleMutationCommit, ScheduleRefillCandidate,
-    ScheduleStore,
+    OccurrenceFilter, ScheduleExecutorLeaseObservation, ScheduleFilter, ScheduleMutationCommit,
+    ScheduleRefillCandidate, ScheduleStore,
 };
 use crate::trigger::{next_due_after, occurrences_for_horizon};
 use crate::types::{
@@ -205,6 +205,19 @@ impl ScheduleService {
 
     pub fn store(&self) -> Arc<dyn ScheduleStore> {
         self.store.clone()
+    }
+
+    /// Observe the durable, store-clock schedule firing-host lease.
+    ///
+    /// This replaces process-local "host started" gates. The result carries
+    /// no bearer token and therefore cannot authorize occurrence claims.
+    pub async fn firing_host_status(
+        &self,
+    ) -> Result<ScheduleExecutorLeaseObservation, ScheduleDomainError> {
+        self.store
+            .observe_executor_lease()
+            .await
+            .map_err(ScheduleDomainError::from)
     }
 
     /// Subscribe to successful schedule mutations made through this service.
@@ -897,9 +910,10 @@ mod tests {
 
         async fn claim_due_occurrences(
             &self,
+            lease: &crate::ScheduleExecutorLease,
             request: crate::ClaimDueRequest,
         ) -> Result<crate::ClaimDueResult, ScheduleStoreError> {
-            self.inner.claim_due_occurrences(request).await
+            self.inner.claim_due_occurrences(lease, request).await
         }
 
         async fn renew_occurrence_lease_if_current(
@@ -1424,13 +1438,29 @@ mod tests {
             })
             .await?;
 
-        let claimed = store
-            .claim_due_occurrences(crate::ClaimDueRequest {
-                owner_id: "driver-owner".into(),
-                limit: 1,
-                lease_duration: Duration::seconds(30),
+        let executor_lease = match store
+            .acquire_executor_lease(crate::AcquireScheduleExecutorLeaseRequest {
+                owner_id: "test-executor".into(),
+                lease_duration: Duration::minutes(5),
             })
+            .await?
+        {
+            crate::AcquireScheduleExecutorLeaseOutcome::Acquired(lease) => lease,
+            crate::AcquireScheduleExecutorLeaseOutcome::Busy { .. } => {
+                return Err(ScheduleDomainError::Internal("test executor busy".into()));
+            }
+        };
+        let claimed = store
+            .claim_due_occurrences(
+                &executor_lease,
+                crate::ClaimDueRequest {
+                    owner_id: "driver-owner".into(),
+                    limit: 1,
+                    lease_duration: Duration::seconds(30),
+                },
+            )
             .await?;
+        store.release_executor_lease(executor_lease).await?;
         let in_flight = claimed
             .transitions
             .into_iter()

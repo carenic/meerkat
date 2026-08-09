@@ -1,16 +1,22 @@
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
+use async_trait::async_trait;
 use meerkat_core::SessionId;
 use meerkat_jobs::{
     AttemptClaim, AttemptWriteAuthority, CanonicalArgumentsHash, DetachedJobService,
-    ExecutionIntentId, InteractionLineageId, JobNotification, JobOutboxPayload, JobSpec,
-    JobSubmissionKey, JobTerminalResult, MemoryDetachedJobStore, PredicateComparison,
+    DetachedJobStore, ExecutionIntentId, InsertJobOutcome, InteractionLineageId, JobId,
+    JobNotification, JobOutboxEntry, JobOutboxPayload, JobSpec, JobSubmissionKey,
+    JobTerminalResult, MemoryDetachedJobStore, PredicateComparison,
+    PredicateDeliveryIdempotencyKey, PredicateDeliveryIdentity, PredicateDeliveryOutcome,
     PredicateEvaluation, PredicateObservation, PredicatePollingPolicy, PredicateSource,
     PredicateWatch, PredicateWatchId, RestartClass, RunnerHandleRef, RunnerIdentity, ScheduleIdRef,
-    ToolIdentity, WorkerId,
+    StoredJob, ToolIdentity, WorkerId,
 };
+use tokio::sync::Notify;
 
 fn monitor_spec(key: &str) -> JobSpec {
     JobSpec::new(
@@ -24,6 +30,287 @@ fn monitor_spec(key: &str) -> JobSpec {
         CanonicalArgumentsHash::new(format!("sha256:{key}")).expect("hash"),
         JobSubmissionKey::new(key).expect("key"),
     )
+}
+
+#[derive(Debug)]
+struct PausingDeliveryAckStore {
+    inner: Arc<MemoryDetachedJobStore>,
+    pause_once: AtomicBool,
+    ack_cas_entered: Notify,
+    release_ack_cas: Notify,
+}
+
+impl PausingDeliveryAckStore {
+    fn new(inner: Arc<MemoryDetachedJobStore>) -> Self {
+        Self {
+            inner,
+            pause_once: AtomicBool::new(true),
+            ack_cas_entered: Notify::new(),
+            release_ack_cas: Notify::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl DetachedJobStore for PausingDeliveryAckStore {
+    async fn insert_deduplicated(
+        &self,
+        job: StoredJob,
+    ) -> Result<InsertJobOutcome, meerkat_jobs::DetachedJobError> {
+        self.inner.insert_deduplicated(job).await
+    }
+
+    async fn get(
+        &self,
+        job_id: &JobId,
+    ) -> Result<Option<StoredJob>, meerkat_jobs::DetachedJobError> {
+        self.inner.get(job_id).await
+    }
+
+    async fn compare_and_swap(
+        &self,
+        expected_revision: u64,
+        replacement: StoredJob,
+    ) -> Result<StoredJob, meerkat_jobs::DetachedJobError> {
+        if replacement.outbox.iter().any(|entry| entry.applied)
+            && self.pause_once.swap(false, Ordering::AcqRel)
+        {
+            self.ack_cas_entered.notify_one();
+            self.release_ack_cas.notified().await;
+        }
+        self.inner
+            .compare_and_swap(expected_revision, replacement)
+            .await
+    }
+
+    async fn list_pending_outbox(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<JobOutboxEntry>, meerkat_jobs::DetachedJobError> {
+        self.inner.list_pending_outbox(limit).await
+    }
+
+    async fn list_for_origin(
+        &self,
+        realm_id: &str,
+        origin_session_id: &SessionId,
+        limit: usize,
+    ) -> Result<Vec<StoredJob>, meerkat_jobs::DetachedJobError> {
+        self.inner
+            .list_for_origin(realm_id, origin_session_id, limit)
+            .await
+    }
+
+    async fn list_all(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredJob>, meerkat_jobs::DetachedJobError> {
+        self.inner.list_all(limit).await
+    }
+
+    fn is_persistent(&self) -> bool {
+        self.inner.is_persistent()
+    }
+}
+
+#[tokio::test]
+async fn concurrent_delivery_acknowledgements_converge_on_machine_authorized_state() {
+    let memory = Arc::new(MemoryDetachedJobStore::new());
+    let store = Arc::new(PausingDeliveryAckStore::new(memory));
+    let service = DetachedJobService::new(store.clone());
+    let job_id = service
+        .submit(monitor_spec("concurrent-delivery-ack"))
+        .await
+        .expect("submit")
+        .job_id;
+    let claim = service
+        .claim_attempt(
+            &job_id,
+            AttemptClaim::new(
+                WorkerId::new("delivery-worker").expect("worker"),
+                100,
+                10_000,
+                RunnerHandleRef::new("delivery-handle").expect("handle"),
+            ),
+        )
+        .await
+        .expect("claim");
+    let emitted = service
+        .emit_notification(
+            &job_id,
+            (&claim).into(),
+            200,
+            JobNotification::new(
+                "concurrent-delivery",
+                "concurrent:delivery",
+                "Concurrent delivery",
+                "Concurrent delivery acknowledgement",
+            )
+            .expect("notification"),
+        )
+        .await
+        .expect("emit notification");
+
+    let first_service = service.clone();
+    let first_job_id = job_id.clone();
+    let first = tokio::spawn(async move {
+        first_service
+            .mark_delivery_applied(&first_job_id, emitted.delivery_sequence)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), store.ack_cas_entered.notified())
+        .await
+        .expect("first acknowledgement should enter the deterministic CAS gate");
+
+    let winner = service
+        .mark_delivery_applied(&job_id, emitted.delivery_sequence)
+        .await
+        .expect("racing delivery acknowledgement");
+    store.release_ack_cas.notify_one();
+    let reloaded = first
+        .await
+        .expect("first acknowledgement task")
+        .expect("stale acknowledgement reloads generated-machine state");
+
+    assert_eq!(reloaded.revision, winner.revision);
+    assert_eq!(reloaded.outbox, winner.outbox);
+    assert!(winner.outbox[0].applied);
+}
+
+#[tokio::test]
+async fn predicate_delivery_key_atomically_deduplicates_the_entire_job_mutation_bundle()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(MemoryDetachedJobStore::new());
+    let service = DetachedJobService::new(store.clone());
+    let job_id = service
+        .submit(monitor_spec("predicate-delivery-idempotency"))
+        .await
+        .expect("submit")
+        .job_id;
+    let claim = service
+        .claim_attempt(
+            &job_id,
+            AttemptClaim::new(
+                WorkerId::new("predicate-worker").expect("worker"),
+                100,
+                10_000,
+                RunnerHandleRef::new("predicate-handle").expect("handle"),
+            ),
+        )
+        .await
+        .expect("claim");
+    let write = AttemptWriteAuthority::from(&claim);
+    let watch = PredicateWatch::scheduled(
+        PredicateWatchId::new("delivery-watch").expect("watch id"),
+        ScheduleIdRef::new("schedule-delivery-watch").expect("schedule id"),
+        PredicateSource::StableHttp {
+            url: "https://example.invalid/delivery".into(),
+            conditional_requests: true,
+        },
+        PredicateComparison::Changed,
+        PredicatePollingPolicy::new(60, 1, 0, 1, 300).expect("policy"),
+    )
+    .expect("watch");
+    let first_identity = PredicateDeliveryIdentity::new(
+        PredicateDeliveryIdempotencyKey::new("schedule:schedule-delivery-watch:occurrence:first")
+            .expect("delivery key"),
+        "occurrence:first",
+        "meerkat.predicate.evaluate.v1",
+    )
+    .expect("delivery identity");
+
+    let first = service
+        .evaluate_predicate_idempotent(
+            &job_id,
+            write.clone(),
+            first_identity.clone(),
+            &watch,
+            PredicateObservation::available("v1", "Version v1").expect("observation"),
+            200,
+        )
+        .await
+        .expect("first evaluation");
+    let PredicateDeliveryOutcome::Applied {
+        receipt: first_receipt,
+        snapshot: first_snapshot,
+    } = first
+    else {
+        return Err(std::io::Error::other("first delivery must apply").into());
+    };
+    assert!(first_snapshot.outbox.is_empty());
+    assert_eq!(first_receipt.committed_revision, first_snapshot.revision);
+    let first_revision = first_snapshot.revision;
+    let first_checkpoint = first_snapshot.checkpoint_ref.clone();
+    let first_progress = first_snapshot.progress.clone();
+
+    let duplicate = service
+        .evaluate_predicate_idempotent(
+            &job_id,
+            write.clone(),
+            first_identity.clone(),
+            &watch,
+            PredicateObservation::available("v2", "Version v2").expect("observation"),
+            300,
+        )
+        .await
+        .expect("duplicate evaluation");
+    let PredicateDeliveryOutcome::Deduplicated { receipt, snapshot } = duplicate else {
+        return Err(std::io::Error::other("same delivery identity must deduplicate").into());
+    };
+    assert_eq!(receipt, first_receipt);
+    assert_eq!(snapshot.revision, first_revision);
+    assert_eq!(snapshot.checkpoint_ref, first_checkpoint);
+    assert_eq!(snapshot.progress, first_progress);
+    assert!(snapshot.outbox.is_empty());
+
+    let rebound_identity = PredicateDeliveryIdentity::new(
+        first_identity.idempotency_key().clone(),
+        "occurrence:tampered",
+        "meerkat.predicate.evaluate.v1",
+    )
+    .expect("rebound identity");
+    let rebound_error = service
+        .predicate_delivery_applied(&job_id, &rebound_identity)
+        .await
+        .expect_err("one stable key cannot be rebound to another occurrence");
+    assert!(rebound_error.to_string().contains("already bound"));
+
+    let reopened = DetachedJobService::new(Arc::new(
+        MemoryDetachedJobStore::from_snapshot(store.snapshot().await).expect("reopen"),
+    ));
+    assert!(
+        reopened
+            .predicate_delivery_applied(&job_id, &first_identity)
+            .await
+            .expect("read delivery fact")
+    );
+    let second_identity = PredicateDeliveryIdentity::new(
+        PredicateDeliveryIdempotencyKey::new("schedule:schedule-delivery-watch:occurrence:second")
+            .expect("delivery key"),
+        "occurrence:second",
+        "meerkat.predicate.evaluate.v1",
+    )
+    .expect("delivery identity");
+    let second = reopened
+        .evaluate_predicate_idempotent(
+            &job_id,
+            write,
+            second_identity,
+            &watch,
+            PredicateObservation::available("v2", "Version v2").expect("observation"),
+            400,
+        )
+        .await
+        .expect("second occurrence");
+    let PredicateDeliveryOutcome::Applied {
+        receipt: _,
+        snapshot,
+    } = second
+    else {
+        return Err(std::io::Error::other("different delivery identity must apply").into());
+    };
+    assert_eq!(snapshot.outbox.len(), 1);
+    Ok(())
 }
 
 #[tokio::test]

@@ -772,7 +772,7 @@ pub trait LiveProjectionSink: Send + Sync {
         &self,
         session_id: &SessionId,
         stop_reason: StopReason,
-        usage: Usage,
+        usage: meerkat_core::TurnUsage,
         response_id: Option<&str>,
     ) -> Result<(), LiveProjectionError>;
 
@@ -988,7 +988,7 @@ impl LiveProjectionSink for NoOpProjectionSink {
         &self,
         _session_id: &SessionId,
         _stop_reason: StopReason,
-        _usage: Usage,
+        _usage: meerkat_core::TurnUsage,
         _response_id: Option<&str>,
     ) -> Result<(), LiveProjectionError> {
         Ok(())
@@ -3802,12 +3802,15 @@ mod tests {
         let obs = LiveAdapterObservation::TurnCompleted {
             response_id: None,
             stop_reason: StopReason::EndTurn,
-            usage: Usage {
-                input_tokens: 10,
-                output_tokens: 5,
-                cache_creation_tokens: None,
-                cache_read_tokens: None,
-            },
+            usage: meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Other,
+                "live-host-test",
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Usage::default()
+                },
+            ),
         };
         assert_eq!(
             LiveAdapterHost::classify_observation(&obs),
@@ -4440,7 +4443,11 @@ mod tests {
         let obs = LiveAdapterObservation::TurnCompleted {
             response_id: None,
             stop_reason: StopReason::EndTurn,
-            usage: Usage::default(),
+            usage: meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Other,
+                "live-host-test",
+                Usage::default(),
+            ),
         };
         host.apply_observation(&ch, &obs).await.unwrap();
         let turns = sink.turn_completed.lock().unwrap();
@@ -4603,7 +4610,11 @@ mod tests {
         let event = RealtimeTranscriptEvent::AssistantTurnCompleted {
             response_id: "resp_complete".into(),
             stop_reason: StopReason::EndTurn,
-            usage: Usage::default(),
+            usage: meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Other,
+                "live-host-test",
+                Usage::default(),
+            ),
         };
         let obs = LiveAdapterObservation::RealtimeTranscript {
             event: event.clone(),
@@ -5578,7 +5589,14 @@ mod tests {
         >,
         interrupts: StdMutex<Vec<(SessionId, Option<String>)>>,
         output_audio_degraded: StdMutex<Vec<(SessionId, u64)>>,
-        turn_completed: StdMutex<Vec<(SessionId, StopReason, Usage, Option<String>)>>,
+        turn_completed: StdMutex<
+            Vec<(
+                SessionId,
+                StopReason,
+                meerkat_core::TurnUsage,
+                Option<String>,
+            )>,
+        >,
         terminal_errors: StdMutex<Vec<(SessionId, LiveAdapterErrorCode, String)>>,
         realtime_events: StdMutex<Vec<(SessionId, RealtimeTranscriptEvent)>>,
     }
@@ -5715,7 +5733,7 @@ mod tests {
             &self,
             session_id: &SessionId,
             stop_reason: StopReason,
-            usage: Usage,
+            usage: meerkat_core::TurnUsage,
             response_id: Option<&str>,
         ) -> Result<(), LiveProjectionError> {
             self.turn_completed.lock().unwrap().push((

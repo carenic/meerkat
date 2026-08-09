@@ -1821,7 +1821,7 @@ mod tests {
             &self,
             _session_id: &SessionId,
             _stop_reason: meerkat_core::types::StopReason,
-            _usage: meerkat_core::types::Usage,
+            _usage: meerkat_core::TurnUsage,
             _response_id: Option<&str>,
         ) -> Result<(), LiveProjectionError> {
             Ok(())
@@ -3741,7 +3741,11 @@ mod tests {
                 LiveAdapterObservation::TurnCompleted {
                     response_id: Some("resp_1".into()),
                     stop_reason: StopReason::EndTurn,
-                    usage: Usage::default(),
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::Other,
+                        "live-transport-test",
+                        Usage::default(),
+                    ),
                 },
                 Duration::from_millis(50),
             )),

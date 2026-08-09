@@ -5,14 +5,14 @@ use crate::json_column::JsonColumnBytes;
 use crate::{SessionFilter, SessionStore, SessionStoreError, StoreError};
 use async_trait::async_trait;
 use meerkat_core::session_store::{
-    HeadCanonicalAuthorityCrossing, IncrementalSessionStore, PreparedHeadCanonicalMutation,
-    PreparedHeadCanonicalParentSplice, PreparedHeadCanonicalParentTransition,
-    PreparedHeadCanonicalRewriteMutation, SESSION_ROW_LINEAGE_REBASE_INTERVAL, SaveGuardWitness,
-    SessionHead, SessionHeadCas, SessionMessageRowPrefixAccumulator, StrandLayout,
-    StrandRewriteLayout, StrandSegment, StrandSplice, TranscriptStrandId,
-    VerifiedHeadCanonicalTranscriptHistory, head_canonical_plain_save_guard_with_prefix_witness,
-    reconstruct_rewrite_record, session_head_cas_token, strand_layout_for_history,
-    validate_save_head_transition,
+    HeadCanonicalAuthorityCrossing, HeadCanonicalStoreActivation, IncrementalSessionStore,
+    PreparedHeadCanonicalMutation, PreparedHeadCanonicalParentSplice,
+    PreparedHeadCanonicalParentTransition, PreparedHeadCanonicalRewriteMutation,
+    SESSION_ROW_LINEAGE_REBASE_INTERVAL, SaveGuardWitness, SessionHead, SessionHeadCas,
+    SessionMessageRowPrefixAccumulator, StrandLayout, StrandRewriteLayout, StrandSegment,
+    StrandSplice, TranscriptStrandId, VerifiedHeadCanonicalTranscriptHistory,
+    head_canonical_plain_save_guard_with_prefix_witness, reconstruct_rewrite_record,
+    session_head_cas_token, strand_layout_for_history, validate_save_head_transition,
 };
 use meerkat_core::time_compat::SystemTime;
 use meerkat_core::transcript_messages_digest;
@@ -1507,6 +1507,98 @@ mod schema_floor_tests {
             converted_token.as_str()
         );
         tx.commit().expect("commit typed retry");
+    }
+
+    #[test]
+    fn store_activation_crosses_sparse_legacy_blob_and_pre_exact_head_atomically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut conn, head_id, _source_head_bytes, _source_token) = pre_exact_head_canonical_v3();
+        let blob_id = SessionId::parse("ffffffff-ffff-ffff-ffff-ffffffffffff")?;
+        assert!(head_id.to_string() < blob_id.to_string());
+        let mut blob_session = Session::with_id(blob_id.clone());
+        blob_session.push(Message::User(meerkat_core::types::UserMessage::text(
+            "legacy blob row".to_string(),
+        )));
+        let tx = conn.transaction()?;
+        write_session_snapshot_in_txn(&tx, &blob_session)?;
+        tx.commit()?;
+
+        let tx = conn.transaction()?;
+        let activation = activate_head_canonical_store_in_txn(&tx)?;
+        let HeadCanonicalStoreActivation::Activated(crossings) = activation else {
+            return Err("SQLite HeadCanonical activation must be applicable".into());
+        };
+        assert_eq!(crossings.len(), 2);
+        assert!(
+            crossings
+                .iter()
+                .all(|crossing| matches!(crossing, HeadCanonicalAuthorityCrossing::Converted(_)))
+        );
+        assert_eq!(
+            crossings[0]
+                .authority()
+                .ok_or("first crossing must carry verified authority")?
+                .head()
+                .id,
+            head_id
+        );
+        assert_eq!(
+            crossings[1]
+                .authority()
+                .ok_or("second crossing must carry verified authority")?
+                .head()
+                .id,
+            blob_id
+        );
+        tx.commit()?;
+
+        let tx = conn.transaction()?;
+        let (blob_head, blob_token) =
+            head_row_in_txn(&tx, &blob_id)?.ok_or("sparse blob must now have a physical head")?;
+        assert_eq!(session_head_cas_token(&blob_head)?, blob_token);
+        verify_physical_head_canonical_in_txn(&tx, &blob_head)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn store_activation_rolls_back_earlier_crossing_when_later_identity_is_invalid() {
+        let (mut conn, head_id, source_head_bytes, source_token) = pre_exact_head_canonical_v3();
+        let blob_id = SessionId::parse("ffffffff-ffff-ffff-ffff-ffffffffffff")
+            .expect("fixed legacy blob identity");
+        let blob_session = Session::with_id(blob_id.clone());
+        let tx = conn.transaction().expect("legacy blob transaction");
+        write_session_snapshot_in_txn(&tx, &blob_session).expect("insert legacy blob row");
+        tx.execute(
+            "UPDATE sessions SET session_id = 'zzzz-invalid' WHERE session_id = ?1",
+            params![blob_id.to_string()],
+        )
+        .expect("corrupt later physical identity");
+        tx.commit()
+            .expect("commit invalid physical identity fixture");
+
+        let tx = conn.transaction().expect("bulk activation transaction");
+        activate_head_canonical_store_in_txn(&tx)
+            .expect_err("invalid later census identity must abort the full activation");
+        drop(tx);
+
+        let (head_bytes, token) = conn
+            .query_row(
+                "SELECT head_json, cas_token FROM session_heads WHERE session_id = ?1",
+                params![head_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, JsonColumnBytes>(0)?.into_bytes(),
+                        row.get::<_, String>(1)?,
+                    ))
+                },
+            )
+            .expect("read rolled-back source head");
+        assert_eq!(token, source_token);
+        assert_eq!(
+            head_bytes, source_head_bytes,
+            "a later census failure must roll back every earlier crossing"
+        );
     }
 
     #[test]
@@ -3018,10 +3110,11 @@ fn prune_converged_metadata_history_in_txn(
 
 /// Move the retained RuntimeStore boundary reference to `head`.
 ///
-/// The runtime authority row and this reference update share one co-tenant
-/// transaction. Ordinary equal-state boundaries are a literal no-write path.
-/// The exceptional 0.8.10 activation may seed a second verified root snapshot
-/// when the retained runtime boundary predates a newer physical projection.
+/// The runtime authority row and this reference update share one transaction.
+/// Ordinary equal-state boundaries are a literal no-write path. Co-tenant
+/// stores prune converged physical/runtime metadata history. An externally
+/// paired RuntimeStore instead retains only its store-verified runtime snapshot
+/// and must not require or invent a local physical-owner reference.
 #[doc(hidden)]
 pub fn retain_runtime_boundary_head_metadata_in_txn(
     tx: &Transaction<'_>,
@@ -3061,6 +3154,10 @@ pub fn retain_runtime_boundary_head_metadata_in_txn(
         &head_token,
         &state_id,
     )?;
+    if metadata_owner_ref_in_txn(tx, &head.id, HeadMetadataProjectionOwner::PhysicalHead)?.is_none()
+    {
+        return Ok(());
+    }
     prune_converged_metadata_history_in_txn(tx, &head.id, retired_runtime_state)
 }
 
@@ -5970,30 +6067,37 @@ fn cross_head_canonical_authority_in_txn(
     tx: &Transaction<'_>,
     id: &SessionId,
 ) -> Result<HeadCanonicalAuthorityCrossing, SessionStoreError> {
-    let Some((source_head, source_token)) = head_row_in_txn(tx, id)? else {
+    let source_was_current = match head_row_in_txn(tx, id)? {
+        Some((source_head, source_token)) => {
+            if source_head.id != *id || session_head_cas_token(&source_head)? != source_token {
+                return Err(SessionStoreError::Corrupted(id.clone()));
+            }
+            let replay_start = source_head
+                .row_lineage_anchor
+                .as_ref()
+                .map_or(0, |anchor| anchor.rewrite_count());
+            let missing_graph_edge = post_anchor_rewrite_graph_edge_is_missing_in_txn(
+                tx,
+                id,
+                replay_start,
+                source_head.rewrite_count,
+            )?;
+            source_head.message_row_prefix.is_some()
+                && source_head.row_lineage_anchor.is_some()
+                && source_head.realtime_event_prefix.is_some()
+                && source_head.metadata_identity().is_some()
+                && !missing_graph_edge
+        }
+        // A structurally current database may still contain a sparse legacy
+        // blob row because v2 DDL did not backfill physical heads. Enter the
+        // existing exact blob-to-head conversion seam before classifying the
+        // identity as absent/not-applicable.
+        None => false,
+    };
+
+    let Some((head, stored_token)) = ensure_head_canonical_for_runtime_in_txn(tx, id)? else {
         return Ok(HeadCanonicalAuthorityCrossing::NotApplicable);
     };
-    if source_head.id != *id || session_head_cas_token(&source_head)? != source_token {
-        return Err(SessionStoreError::Corrupted(id.clone()));
-    }
-    let replay_start = source_head
-        .row_lineage_anchor
-        .as_ref()
-        .map_or(0, |anchor| anchor.rewrite_count());
-    let missing_graph_edge = post_anchor_rewrite_graph_edge_is_missing_in_txn(
-        tx,
-        id,
-        replay_start,
-        source_head.rewrite_count,
-    )?;
-    let source_was_current = source_head.message_row_prefix.is_some()
-        && source_head.row_lineage_anchor.is_some()
-        && source_head.realtime_event_prefix.is_some()
-        && source_head.metadata_identity().is_some()
-        && !missing_graph_edge;
-
-    let (head, stored_token) = ensure_head_canonical_for_runtime_in_txn(tx, id)?
-        .ok_or_else(|| SessionStoreError::NotFound(id.clone()))?;
     let (published_head, published_token) =
         head_row_in_txn(tx, id)?.ok_or_else(|| SessionStoreError::NotFound(id.clone()))?;
     if head.id != *id
@@ -6010,6 +6114,44 @@ fn cross_head_canonical_authority_in_txn(
     } else {
         HeadCanonicalAuthorityCrossing::converted(verified, published_token)
     }
+}
+
+fn activate_head_canonical_store_in_txn(
+    tx: &Transaction<'_>,
+) -> Result<HeadCanonicalStoreActivation, SessionStoreError> {
+    let raw_ids = {
+        let mut statement = tx
+            .prepare(
+                r"
+                SELECT session_id FROM session_heads
+                UNION
+                SELECT session_id FROM sessions
+                ORDER BY session_id ASC
+                ",
+            )
+            .map_err(StoreError::from)
+            .map_err(into_session_store_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(StoreError::from)
+            .map_err(into_session_store_error)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+            .map_err(into_session_store_error)?
+    };
+    let mut crossings = Vec::with_capacity(raw_ids.len());
+    for raw_id in raw_ids {
+        let id = parse_session_id(raw_id).map_err(into_session_store_error)?;
+        let crossing = cross_head_canonical_authority_in_txn(tx, &id)?;
+        if matches!(crossing, HeadCanonicalAuthorityCrossing::NotApplicable) {
+            return Err(SessionStoreError::InvalidTranscriptRewrite {
+                id,
+                reason: "physical session cannot cross into HeadCanonical authority".to_string(),
+            });
+        }
+        crossings.push(crossing);
+    }
+    Ok(HeadCanonicalStoreActivation::Activated(crossings))
 }
 
 /// Result of applying one sealed ordinary head-canonical mutation.
@@ -8333,6 +8475,13 @@ fn legacy_head_canonical_rewrite_error(id: &SessionId) -> SessionStoreError {
 
 #[async_trait]
 impl IncrementalSessionStore for SqliteSessionStore {
+    async fn activate_head_canonical_store(
+        &self,
+    ) -> Result<HeadCanonicalStoreActivation, SessionStoreError> {
+        self.in_write_txn(activate_head_canonical_store_in_txn)
+            .await
+    }
+
     async fn cross_head_canonical_authority(
         &self,
         id: &SessionId,

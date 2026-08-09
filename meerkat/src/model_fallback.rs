@@ -99,6 +99,27 @@ impl AgentLlmClient for ModelFallbackClient {
             .request_pressure(messages, tools, max_tokens, temperature, provider_params)
     }
 
+    fn target_cache_lowering_capabilities(
+        &self,
+        issuer: &meerkat_core::TargetCacheLoweringIssuer,
+        messages: &[meerkat_core::Message],
+        tools: &[Arc<ToolDef>],
+        max_tokens: u32,
+        temperature: Option<f32>,
+        provider_params: Option<&ProviderParamsOverride>,
+    ) -> Result<Vec<meerkat_core::TargetCacheLoweringCapability>, AgentError> {
+        self.candidates[self.active_index()]
+            .client
+            .target_cache_lowering_capabilities(
+                issuer,
+                messages,
+                tools,
+                max_tokens,
+                temperature,
+                provider_params,
+            )
+    }
+
     fn provider(&self) -> Provider {
         self.candidates[self.active_index()].identity.provider
     }

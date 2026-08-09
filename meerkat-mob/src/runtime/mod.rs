@@ -17,8 +17,8 @@ use crate::definition::MobDefinition;
 use crate::error::MobError;
 use crate::event::{MemberRef, MobEventKind, NewMobEvent};
 use crate::ids::{
-    AgentIdentity, AgentRuntimeId, FenceToken, FlowId, MobId, ProfileName, RunId, WorkOrigin,
-    WorkRef, WorkSpec,
+    AgentIdentity, AgentRuntimeId, FenceToken, FlowId, Generation, MobId, ProfileName, RunId,
+    WorkOrigin, WorkRef, WorkSpec,
 };
 use crate::roster::{Roster, RosterEntry};
 use crate::run::{FlowRunConfig, MobRun};
@@ -311,21 +311,23 @@ pub use handle::{
     AdaptiveLayerResultDigest, AdaptiveLayerRetention, AdaptiveLayerRunStart,
     AdaptiveLayerSetupFault, AdaptiveLayerSetupFaultObservation, AdaptiveLayerSnapshot,
     AdaptivePlanningDecisionKind, AdaptiveRunLimits, AdaptiveRunPhaseView, AdaptiveRunSnapshot,
-    AdaptiveStopReasonView, CurrentMobAdmission, ExternalMemberBindingMode,
+    AdaptiveStopReasonView, BoundedHelperResult, BoundedHelperResultStatus, CurrentMobAdmission,
+    DEFAULT_BOUNDED_HELPER_RESULT_BYTES, ExternalMemberBindingMode,
     ExternalMemberForwardingHookRef, ExternalMemberForwardingHooks, ExternalMemberForwardingStatus,
     ExternalMemberObservationSnapshot, ExternalMemberOwnerRef, ExternalMemberReachability,
-    ExternalMemberRebindStatus, ExternalPeerBindingSpec, FlowTargetProvisioner, HelperOptions,
-    HelperResult, HostBindReport, HostBindRequest, HostCapabilityReport, HostRevokeReport,
-    InitializeAdaptiveRunRequest, MemberDeliveryReceipt, MemberHandle, MemberRespawnReceipt,
-    MemberTurnEventSender, MemberTurnHandle, MemberTurnOptions, MobDestroyError, MobDestroyReport,
-    MobEventsSubscription, MobEventsSubscriptionConfig, MobEventsView, MobHandle,
-    MobMachineStateChanges, MobMemberListEntry, MobMemberSnapshot, MobMemberStatus,
-    MobPeerConnectivitySnapshot, MobRespawnError, MobSpawnManyFailure, MobUnreachablePeer,
-    MobWireMembersBatchReport, PeerMessageReceipt, PeerTarget, PreviousMemberCleanupReport,
-    SpawnContinuityIntent, SpawnCustomizationContext, SpawnMemberAdmission,
-    SpawnMemberAdmissionObservations, SpawnMemberCustomizer, SpawnMemberSpec, SpawnResult,
-    SpawnSource, SpawnSystemPromptOverride, SpawnToolAdmission, SupervisorRotationReport,
-    WorkDeliveryReceipt, mob_error_wire_code, profile_to_wire, stored_realm_profile_to_wire,
+    ExternalMemberRebindStatus, ExternalPeerBindingSpec, FlowTargetProvisioner, ForkMemberResult,
+    HELPER_RESULT_TRUNCATION_MARKER, HelperOptions, HelperResult, HostBindReport, HostBindRequest,
+    HostCapabilityReport, HostRevokeReport, InitializeAdaptiveRunRequest, MemberDeliveryReceipt,
+    MemberHandle, MemberRespawnReceipt, MemberTurnEventSender, MemberTurnHandle, MemberTurnOptions,
+    MobDestroyError, MobDestroyReport, MobEventsSubscription, MobEventsSubscriptionConfig,
+    MobEventsView, MobHandle, MobMachineStateChanges, MobMemberListEntry, MobMemberSnapshot,
+    MobMemberStatus, MobPeerConnectivitySnapshot, MobRespawnError, MobSpawnManyFailure,
+    MobUnreachablePeer, MobWireMembersBatchReport, PeerMessageReceipt, PeerTarget,
+    PreviousMemberCleanupReport, SpawnContinuityIntent, SpawnCustomizationContext,
+    SpawnMemberAdmission, SpawnMemberAdmissionObservations, SpawnMemberCustomizer, SpawnMemberSpec,
+    SpawnResult, SpawnSource, SpawnSystemPromptOverride, SpawnToolAdmission,
+    SupervisorRotationReport, WorkDeliveryReceipt, mob_error_wire_code, profile_to_wire,
+    stored_realm_profile_to_wire,
 };
 pub(crate) use handle::{CanonicalOpsOwnerContext, MemberSpawnReceipt};
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
@@ -349,8 +351,8 @@ use roster_authority::{RosterAuthority, RosterMutator};
 pub use session_service::{
     AuthorizedSessionResume, MobSessionService, PersistedSessionAuthorityReadCost,
     ResumeRejectionKind, ResumeSessionLoad, ResumeVerdictTerminality, SessionResumeAuthority,
-    SessionResumeLifecycle, SessionResumeMaterialization, SessionResumeRejection,
-    SessionResumeVerdict,
+    SessionResumeLifecycle, SessionResumeMaterialization, SessionResumePreparationReceipt,
+    SessionResumeRejection, SessionResumeVerdict,
 };
 pub use spawn_policy::{SpawnPolicy, SpawnSpec};
 use spawn_profile_authority::{

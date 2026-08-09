@@ -733,14 +733,15 @@ impl MeerkatMachine {
         >,
         reason: String,
     ) -> Result<bool, RuntimeDriverError> {
-        let _member_lease = match expected_member {
+        let run_fenced = expected_run_id.is_some();
+        let member_lease = match expected_member {
             Some(expected_member) => Some(
                 self.acquire_member_effect_authority_lease(session_id, Some(expected_member))
                     .await?,
             ),
             None => None,
         };
-        let _gate_guard = if let Some(lease) = &_member_lease {
+        let gate_guard = if let Some(lease) = &member_lease {
             let guard = Arc::clone(&lease.session_mutation_gate).lock_owned().await;
             let sessions = self.sessions.read().await;
             let Some(entry) = sessions.get(session_id) else {
@@ -753,7 +754,7 @@ impl MeerkatMachine {
                     reason: "user interrupt runtime session was replaced".to_string(),
                 });
             }
-            Some(guard)
+            guard
         } else {
             match expected_run_id {
                 // The run-fenced bridge path must compare and stage under the SAME
@@ -761,51 +762,112 @@ impl MeerkatMachine {
                 // is already no longer current, which is the level-triggered
                 // terminal condition rather than a cancellation error.
                 Some(_) => match self.lock_current_session_mutation_gate(session_id).await {
-                    Some(guard) => Some(guard),
+                    Some(guard) => guard,
                     None => return Ok(false),
                 },
                 None => {
                     let gate = self.session_mutation_gate(session_id).await;
                     match gate {
                         Some(g) => match Arc::clone(&g).try_lock_owned() {
-                            Ok(guard) => Some(guard),
-                            Err(_) if self.generated_stop_deferred(session_id).await => None,
-                            Err(_) => Some(g.lock_owned().await),
+                            Ok(guard) => guard,
+                            Err(_) if self.generated_stop_deferred(session_id).await => {
+                                return Ok(false);
+                            }
+                            Err(_) => g.lock_owned().await,
                         },
-                        None => None,
+                        None => return Ok(false),
                     }
                 }
             }
         };
 
+        let Ok(authority) = self.session_dsl_authority(session_id).await else {
+            return Ok(false);
+        };
+        let (phase, current_run_id) = {
+            let authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                crate::meerkat_machine::dsl_authority::runtime_phase_from_authority(&authority),
+                crate::meerkat_machine::dsl_authority::current_run_id_from_authority(&authority),
+            )
+        };
         if let Some(expected_run_id) = expected_run_id {
-            let Ok(authority) = self.session_dsl_authority(session_id).await else {
-                return Ok(false);
-            };
-            let (phase, current_run_id) = {
-                let authority = authority
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (
-                    crate::meerkat_machine::dsl_authority::runtime_phase_from_authority(&authority),
-                    crate::meerkat_machine::dsl_authority::current_run_id_from_authority(
-                        &authority,
-                    ),
-                )
-            };
-            if phase != RuntimeState::Running || current_run_id.as_ref() != Some(expected_run_id) {
+            if !matches!(phase, RuntimeState::Running | RuntimeState::Retired)
+                || current_run_id.as_ref() != Some(expected_run_id)
+            {
                 return Ok(false);
             }
+        } else {
+            let visible_state = self
+                .existing_session_runtime_state(session_id)
+                .await
+                .unwrap_or(phase);
+            self.reject_unregistration_drain_ingress(session_id, visible_state)
+                .await?;
+        }
+        let Some(expected_run_id) = current_run_id else {
+            return Ok(false);
+        };
+
+        let expected_member = expected_member.cloned();
+        let (captured_gate, captured_authority, attachment_id, provisional_claim_id, handle) = {
+            let sessions = self.sessions.read().await;
+            let Some(entry) = sessions.get(session_id) else {
+                return Ok(false);
+            };
+            let Some(handle) = entry.interrupt_handle() else {
+                return Err(RuntimeDriverError::NotReady { state: phase });
+            };
+            (
+                Arc::clone(&entry.mutation_gate),
+                Arc::clone(&entry.dsl_authority),
+                entry.live_attachment_id(),
+                entry.provisional_materialization_claim_id,
+                handle,
+            )
+        };
+
+        let joined_result = {
+            let sessions = self.sessions.read().await;
+            sessions.get(session_id).and_then(|entry| {
+                entry
+                    .pending_user_interrupt_dispatch
+                    .as_ref()
+                    .and_then(|pending| {
+                        (pending.expected_run_id == expected_run_id
+                            && pending.attachment_id == attachment_id
+                            && pending.provisional_materialization_claim_id == provisional_claim_id
+                            && pending.expected_member == expected_member
+                            && Arc::ptr_eq(&pending.interrupt_handle, &handle))
+                        .then(|| pending.result_rx.clone())
+                    })
+            })
+        };
+        if let Some(result_rx) = joined_result {
+            drop(gate_guard);
+            drop(member_lease);
+            return Self::await_user_interrupt_dispatch(result_rx, &expected_run_id).await;
         }
 
-        let staged_interrupt = match self
-            .stage_session_runtime_internal_dsl_transition(
+        let staged_interrupt = if run_fenced {
+            Self::stage_dsl_transition_on_authority(
+                &captured_authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::InterruptCurrentRunForRun {
+                    run_id: crate::meerkat_machine::dsl::RunId::from_domain(&expected_run_id),
+                },
+                "InterruptCurrentRunForRun",
+            )
+        } else {
+            self.stage_session_runtime_internal_dsl_transition(
                 session_id,
                 crate::meerkat_machine_types::MeerkatMachineFieldlessRuntimeInternalInput::InterruptCurrentRun,
             )
             .await
-        {
-            Ok(state) => state,
+        };
+        match staged_interrupt {
+            Ok(_) => {}
             Err(_) => {
                 // The generated machine rejected `InterruptCurrentRun` for the
                 // current phase. Surface the terminal `Destroyed` truth as its
@@ -821,22 +883,80 @@ impl MeerkatMachine {
                 }
                 return Err(RuntimeDriverError::NotReady { state });
             }
-        };
-
-        if let Err(err) = self
-            .apply_user_interrupt_live_cancel(session_id, reason)
-            .await
-        {
-            self.restore_session_dsl_state_if_current(
-                session_id,
-                staged_interrupt.committed_snapshot,
-                staged_interrupt.previous_snapshot,
-            )
-            .await;
-            return Err(err);
         }
 
-        Ok(true)
+        // Acquire process-owned execution before publishing the joinable slot.
+        // If runtime acquisition fails, no receiver can be left installed with
+        // no task capable of publishing or clearing its result.
+        let cleanup_spawner = MachineCleanupTaskSpawner::acquire()?;
+        let dispatch_id = uuid::Uuid::new_v4();
+        let (result_tx, result_rx) = crate::tokio::sync::watch::channel(None);
+        {
+            let mut sessions = self.sessions.write().await;
+            let Some(entry) = sessions.get_mut(session_id) else {
+                return Ok(false);
+            };
+            if !Arc::ptr_eq(&entry.mutation_gate, &captured_gate)
+                || !Arc::ptr_eq(&entry.dsl_authority, &captured_authority)
+                || entry.live_attachment_id() != attachment_id
+                || entry.provisional_materialization_claim_id != provisional_claim_id
+                || entry
+                    .interrupt_handle()
+                    .is_none_or(|current| !Arc::ptr_eq(&current, &handle))
+            {
+                return Ok(false);
+            }
+            entry.pending_user_interrupt_dispatch = Some(PendingUserInterruptDispatch {
+                dispatch_id,
+                expected_run_id: expected_run_id.clone(),
+                attachment_id,
+                provisional_materialization_claim_id: provisional_claim_id,
+                interrupt_handle: Arc::clone(&handle),
+                expected_member: expected_member.clone(),
+                result_rx: result_rx.clone(),
+            });
+        }
+
+        let machine = self.clone();
+        let owned_session_id = session_id.clone();
+        let owned_run_id = expected_run_id.clone();
+        drop(gate_guard);
+        drop(member_lease);
+        cleanup_spawner.spawn(async move {
+            let callback_result = match std::panic::AssertUnwindSafe(
+                handle.hard_cancel_run_if_current(&owned_run_id, reason),
+            )
+            .catch_unwind()
+            .await
+            {
+                Ok(Ok(delivered)) => Ok(delivered),
+                Ok(Err(error)) => Err(RuntimeDriverError::Internal(format!(
+                    "failed to hard cancel exact run {owned_run_id}: {error}"
+                ))),
+                Err(payload) => Err(RuntimeDriverError::InterruptDispatchPanicked {
+                    run_id: owned_run_id.clone(),
+                    reason: meerkat_core::panic_payload::panic_payload_detail(payload.as_ref()),
+                }),
+            };
+            let result = machine
+                .reconcile_user_interrupt_dispatch(
+                    &owned_session_id,
+                    dispatch_id,
+                    &owned_run_id,
+                    &captured_gate,
+                    &captured_authority,
+                    attachment_id,
+                    provisional_claim_id,
+                    &handle,
+                    &result_tx,
+                    expected_member.as_ref(),
+                    callback_result,
+                )
+                .await;
+            let _ = result;
+        });
+
+        Self::await_user_interrupt_dispatch(result_rx, &expected_run_id).await
     }
 
     /// Classify a generated-machine rejection of a session lifecycle input.
@@ -1136,6 +1256,34 @@ impl MeerkatMachine {
                 && state.phase == crate::RuntimeActorMaterializationClaimPhase::Vacant)
                 .then_some(state.legacy_capability_generation)
         };
+        // A committed terminal outbox is process-owned predecessor authority.
+        // It is also the durable actor-exclusion fence for cold/stored-only
+        // publication: no same-SessionId actor incarnation may materialize
+        // until the exact publication receipt has converged. This closes the
+        // gap after a stored-only publisher's brief R absence check without
+        // retaining M or R across arbitrary EventStore IO.
+        if self.runless_terminal_publication_dispatch_pending(&driver_handle)
+            || crate::control_plane::has_committed_runless_recovery_carrier(&driver_handle)
+                .await
+                .map_err(|error| RuntimeDriverError::Internal(error.to_string()))?
+        {
+            release_failed_materialization_claim(
+                &materialization_claim_state,
+                materialization_claim_id,
+            );
+            drop(mutation_guard);
+            self.cleanup_failed_materialization_claim(
+                &session_id,
+                inserted_by_call,
+                &epoch_id,
+                materialization_claim_id,
+                &materialization_claim_state,
+            )
+            .await;
+            return Err(RuntimeDriverError::RuntimeTerminalPublicationInProgress {
+                runtime_id: LogicalRuntimeId::for_session(&session_id),
+            });
+        }
         if materialization_claim_id.is_some()
             && let Some(claim_state_sink) = claim_state_sink
         {

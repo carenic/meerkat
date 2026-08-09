@@ -262,6 +262,12 @@ export interface SessionAssistantBlock {
   readonly raw?: Record<string, unknown>;
 }
 
+/** Durable key and version carried by one system-prompt history row. */
+export interface SystemPromptVersionIdentity {
+  readonly key: string;
+  readonly version: number;
+}
+
 export interface SessionMessage {
   readonly role: string;
   readonly createdAt: string;
@@ -271,6 +277,7 @@ export interface SessionMessage {
   readonly stopReason?: string;
   readonly interactionId?: string;
   readonly runId?: string;
+  readonly promptVersion?: SystemPromptVersionIdentity;
   readonly blocks: readonly SessionAssistantBlock[];
   readonly results: readonly SessionToolResult[];
   readonly raw?: Record<string, unknown>;
@@ -426,12 +433,109 @@ export interface SessionTranscriptRewriteResult {
   readonly commit: Record<string, unknown>;
 }
 
+/** Options for explicitly replacing one durable system-prompt key. */
+export interface SystemPromptUpdateOptions {
+  readonly expectedVersion?: number;
+  readonly targetMessageIndex?: number;
+  readonly actor?: string;
+  readonly expectedParentRevision?: string;
+}
+
+/** Result of explicitly replacing one durable system-prompt key. */
+export interface SystemPromptUpdateResult {
+  readonly sessionId: string;
+  readonly key: string;
+  readonly version: number;
+  readonly messageIndex: number;
+  readonly status: "applied" | "duplicate";
+  readonly transcriptRevision: string;
+  readonly commit?: Record<string, unknown>;
+}
+
+/** Provider identity carried by authored fork-cache evidence. */
+export type ForkCacheProvider = Provider;
+
+/** Exact lowered request encoding that authored a cache breakpoint. */
+export type ForkCacheLoweredRequestEncoding =
+  | "anthropic_messages_json"
+  | "open_ai_responses_json"
+  | "open_ai_chat_completions_json"
+  | "gemini_generate_content_json";
+
+/** Provider cache lifetime selected for an authored breakpoint. */
+export type ForkCacheTtl =
+  | "five_minutes"
+  | "one_hour"
+  | "thirty_minutes"
+  | "twenty_four_hours"
+  | "provider_default";
+
+/** Why a durable fork could not inherit provider cache state. */
+export type ForkCacheInheritanceUnavailableReason =
+  | "no_authored_breakpoint_at_boundary"
+  | "provider_model_mismatch"
+  | "target_identity_unresolved"
+  | "target_lowering_unavailable"
+  | "rendered_prefix_projection_unavailable"
+  | "authored_evidence_invalid";
+
+/** Canonical transcript boundary at which a provider authored a breakpoint. */
+export interface ForkCacheBreakpointBoundary {
+  readonly kind: "system_profile_prefix" | "transcript_after";
+  readonly messageCount: number;
+}
+
+/** Provenance of the fully lowered provider request body. */
+export interface ForkCacheLoweredRequestProvenance {
+  readonly provider: ForkCacheProvider;
+  readonly encoding: ForkCacheLoweredRequestEncoding;
+  readonly bodySha256: readonly number[];
+}
+
+/** Provider-authored evidence for one cache-compatible transcript boundary. */
+export interface ForkAuthoredCacheBreakpoint {
+  readonly provider: ForkCacheProvider;
+  readonly model: string;
+  readonly boundary: ForkCacheBreakpointBoundary;
+  readonly canonicalPrefixSha256: string;
+  readonly canonicalPrefixBytes: number;
+  readonly renderedPrefixSha256: string;
+  readonly renderedPrefixBytes: number;
+  readonly loweredRequestProvenance: ForkCacheLoweredRequestProvenance;
+  readonly ttl: ForkCacheTtl;
+}
+
+/** Verified provider-cache-compatible durable transcript fork point. */
+export interface ForkPoint {
+  readonly messageCount: number;
+  readonly authoredCacheBreakpoint: ForkAuthoredCacheBreakpoint;
+}
+
+/** A fork inherited cache evidence at an actually authored breakpoint. */
+export interface ForkCacheInheritanceAvailable {
+  readonly status: "available";
+  readonly forkPoint: ForkPoint;
+}
+
+/** A valid durable fork could not inherit provider cache evidence. */
+export interface ForkCacheInheritanceUnavailable {
+  readonly status: "unavailable";
+  readonly messageCount: number;
+  readonly reason: ForkCacheInheritanceUnavailableReason;
+}
+
+/** Exact provider cache inheritance disposition for a durable fork. */
+export type ForkCacheInheritance =
+  | ForkCacheInheritanceAvailable
+  | ForkCacheInheritanceUnavailable;
+
 /** Result of creating a forked transcript branch. */
 export interface SessionForkResult {
   readonly sourceSessionId: string;
   readonly sessionId: string;
   readonly sessionRef?: string;
   readonly messageCount: number;
+  readonly cacheInheritance: ForkCacheInheritance;
 }
 
 /** Session listing filters for `session/list`. */

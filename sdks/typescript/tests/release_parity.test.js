@@ -28,6 +28,7 @@ describe("Phase 1 release parity targets", () => {
       "readSessionHistory",
       "readSessionTranscriptRevision",
       "rewriteSessionTranscript",
+      "updateSystemPrompt",
       "restoreSessionTranscriptRevision",
       "sendExternalEvent",
       "injectContext",
@@ -78,6 +79,7 @@ describe("Phase 1 release parity targets", () => {
       "injectContext",
       "transcriptRevision",
       "rewriteTranscript",
+      "updateSystemPrompt",
       "restoreTranscriptRevision",
     ]) {
       assert.ok(sessionMethods.includes(method), `missing Session.${method}`);

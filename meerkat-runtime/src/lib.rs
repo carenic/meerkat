@@ -1048,8 +1048,9 @@ pub use service_ext::SessionServiceRuntimeExt;
 pub use store::SqliteRuntimeStore;
 pub use store::{
     CommittedRecoveryBoundary, CommittedWholeBlobProvisionalTail, CommittedWholeBlobSnapshot,
-    HeadCanonicalProvisionalTailAuthority, HeadCanonicalStoreAuthority, InMemoryRuntimeStore,
-    InputStateRow, PreparedDurableTailRecoverySource, PreparedHeadCanonicalProvisionalPromotion,
+    HeadCanonicalProvisionalTailAuthority, HeadCanonicalRuntimeAuthorityActivation,
+    HeadCanonicalStoreAuthority, InMemoryRuntimeStore, InputStateRow,
+    PreparedDurableTailRecoverySource, PreparedHeadCanonicalProvisionalPromotion,
     PreparedHeadCanonicalProvisionalTail, PreparedRecoveryEvidence,
     PreparedRecoveryReceiptDigestEnrichment, PreparedRecoveryReceiptSource,
     PreparedRuntimeSessionCommit, PreparedRuntimeSessionCommitKind,

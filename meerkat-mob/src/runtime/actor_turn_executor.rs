@@ -792,7 +792,7 @@ mod tests {
                 result: "{\"answer\":42}".to_string(),
                 structured_output: Some(serde_json::json!({"answer": 42})),
                 extraction_required: false,
-                usage: meerkat_core::Usage::default(),
+                usage: meerkat_core::Usage::default().into(),
                 terminal_cause_kind: None,
             })
             .await
@@ -859,7 +859,7 @@ mod tests {
                 result: "main answer".to_string(),
                 structured_output: None,
                 extraction_required: true,
-                usage: meerkat_core::Usage::default(),
+                usage: meerkat_core::Usage::default().into(),
                 terminal_cause_kind: None,
             })
             .await
@@ -900,7 +900,7 @@ mod tests {
                 result: "main answer".to_string(),
                 structured_output: None,
                 extraction_required: true,
-                usage: meerkat_core::Usage::default(),
+                usage: meerkat_core::Usage::default().into(),
                 terminal_cause_kind: None,
             })
             .await

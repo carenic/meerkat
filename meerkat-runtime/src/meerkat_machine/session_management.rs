@@ -1579,6 +1579,7 @@ impl MeerkatMachine {
             post_stop_cleanup_complete: false,
             post_stop_cleanup_gate: Arc::new(Mutex::new(())),
             provisional_interrupt_handle: None,
+            pending_user_interrupt_dispatch: None,
             provisional_materialization_claim_id: None,
             dsl_authority,
             drain_slot: CommsDrainSlot::new(),
@@ -1749,6 +1750,7 @@ impl MeerkatMachine {
             post_stop_cleanup_complete: false,
             post_stop_cleanup_gate: Arc::new(Mutex::new(())),
             provisional_interrupt_handle: None,
+            pending_user_interrupt_dispatch: None,
             provisional_materialization_claim_id: None,
             dsl_authority,
             drain_slot: CommsDrainSlot::new(),
@@ -1957,6 +1959,7 @@ impl MeerkatMachine {
             post_stop_cleanup_complete: false,
             post_stop_cleanup_gate: Arc::new(Mutex::new(())),
             provisional_interrupt_handle: None,
+            pending_user_interrupt_dispatch: None,
             provisional_materialization_claim_id: None,
             dsl_authority,
             drain_slot: CommsDrainSlot::new(),
@@ -2194,6 +2197,44 @@ impl MeerkatMachine {
             .map_err(|error| {
                 RuntimeDriverError::Internal(format!(
                     "owned exact executor attachment saga ended without a result: {error}"
+                ))
+            })?
+    }
+
+    /// Boundary-owned variant of [`Self::ensure_session_with_executor_factory`].
+    ///
+    /// The caller already owns the service turn-finalization boundary and
+    /// must finish a returned pending lease through the matching
+    /// boundary-aware commit/abort methods before releasing that boundary.
+    pub async fn ensure_session_with_executor_factory_under_runtime_turn_finalization_boundary<F>(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        executor_factory: F,
+    ) -> Result<EnsureRuntimeExecutorAttachment, RuntimeDriverError>
+    where
+        F: FnOnce(
+                RuntimeExecutorAttachmentWitness,
+            ) -> Box<dyn meerkat_core::lifecycle::CoreExecutor>
+            + Send
+            + 'static,
+    {
+        let cleanup_spawner = super::MachineCleanupTaskSpawner::acquire()?;
+        let machine = Arc::clone(self);
+        cleanup_spawner
+            .spawn(async move {
+                machine
+                    .ensure_session_with_executor_factory_inner(
+                        session_id,
+                        None,
+                        true,
+                        executor_factory,
+                    )
+                    .await
+            })
+            .await
+            .map_err(|error| {
+                RuntimeDriverError::Internal(format!(
+                    "owned boundary-aware exact executor attachment saga ended without a result: {error}"
                 ))
             })?
     }
@@ -3451,6 +3492,7 @@ impl MeerkatMachine {
                         post_stop_cleanup_complete: false,
                         post_stop_cleanup_gate: Arc::new(Mutex::new(())),
                         provisional_interrupt_handle: None,
+                        pending_user_interrupt_dispatch: None,
                         provisional_materialization_claim_id: None,
                         dsl_authority: Arc::clone(&dsl_authority),
                         drain_slot: CommsDrainSlot::new(),
@@ -3923,9 +3965,11 @@ impl MeerkatMachine {
     /// Retire a candidate that exited before its serving gate opened.
     ///
     /// The runtime-loop watcher deliberately leaves `UnservedAttachment` to
-    /// this exact startup owner. When B is already held, complete the
-    /// attachment-local actor cleanup non-reentrantly before canonical
-    /// unregister; the ordinary path would otherwise wait on the same B.
+    /// this exact startup owner. When B is already held, transfer the exact
+    /// witness into the process-owned retirement coordinator and return. The
+    /// coordinator may reacquire B only after the caller releases it, so an
+    /// arbitrary or wedged surface cleanup callback cannot retain the caller's
+    /// boundary or block startup failure reporting.
     async fn cleanup_unserved_executor_attachment(
         self: &Arc<Self>,
         witness: &RuntimeExecutorAttachmentWitness,
@@ -3936,16 +3980,22 @@ impl MeerkatMachine {
                 .unregister_executor_attachment_if_current(witness)
                 .await;
         }
-        self.complete_executor_attachment_cleanup_under_runtime_turn_boundary(witness)
-            .await?;
-        let Some(guard) = self
-            .lock_current_session_mutation_gate(witness.session_id())
-            .await
-        else {
-            return Ok(false);
-        };
-        self.unregister_executor_attachment_if_current_with_guard(witness.clone(), guard)
-            .await
+        let cleanup_spawner = super::MachineCleanupTaskSpawner::acquire()?;
+        let machine = Arc::clone(self);
+        let witness = witness.clone();
+        cleanup_spawner.spawn(async move {
+            if let Err(error) = machine
+                .unregister_executor_attachment_if_current(&witness)
+                .await
+            {
+                tracing::warn!(
+                    session_id = %witness.session_id(),
+                    %error,
+                    "process-owned unserved attachment retirement failed"
+                );
+            }
+        });
+        Ok(true)
     }
 
     /// Return the exact committed attachment currently serving this session.
@@ -3971,6 +4021,48 @@ impl MeerkatMachine {
             entry.epoch_id.clone(),
             attachment.id,
         ))
+    }
+
+    /// Snapshot the terminal-publication capability retained by one exact
+    /// serving executor attachment.
+    ///
+    /// Mutable executors use this after actor-only recovery: the machine
+    /// replaces its retained immutable A handle with B while holding the
+    /// prepared attachment's M, and the still-serving executor can then sample
+    /// B without resolving through logical SessionId. A stale attachment can
+    /// never observe a successor's capability.
+    pub async fn publication_handle_for_executor_attachment(
+        self: &Arc<Self>,
+        witness: &RuntimeExecutorAttachmentWitness,
+    ) -> Result<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>, RuntimeDriverError>
+    {
+        if !witness.belongs_to(self) {
+            return Err(RuntimeDriverError::StaleAuthority {
+                reason: "publication witness belongs to another machine".to_string(),
+            });
+        }
+        let sessions = self.sessions.read().await;
+        let entry = sessions
+            .get(witness.session_id())
+            .filter(|entry| {
+                entry.epoch_id == witness.epoch_id
+                    && entry.generated_executor_registration_active()
+                    && entry.owns_runtime_loop_attachment(witness.attachment_id)
+            })
+            .ok_or_else(|| RuntimeDriverError::StaleAuthority {
+                reason: format!(
+                    "executor attachment for session {} changed before terminal publication",
+                    witness.session_id()
+                ),
+            })?;
+        entry
+            .publication_handle()
+            .ok_or_else(|| RuntimeDriverError::ValidationFailed {
+                reason: format!(
+                    "executor attachment for session {} has no exact actor publication capability",
+                    witness.session_id()
+                ),
+            })
     }
 
     /// Return whether `witness` still names attachment-local cleanup authority
@@ -6621,6 +6713,7 @@ impl MeerkatMachine {
         let (
             loop_handle,
             loop_interrupt_handle,
+            loop_interrupt_run_id,
             teardown_slot,
             drain_handle,
             rotation_slot,
@@ -6634,10 +6727,19 @@ impl MeerkatMachine {
                         .as_ref()
                         .and_then(|attachment| attachment.interrupt_handle.clone())
                         .or_else(|| entry.interrupt_handle());
+                    let interrupt_run_id = entry
+                        .dsl_authority
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .state()
+                        .current_run_id
+                        .as_ref()
+                        .and_then(crate::meerkat_machine::dsl_authority::current_run_id_from_dsl);
                     let loop_handle = attachment.map(|attachment| attachment.loop_handle);
                     (
                         loop_handle,
                         interrupt_handle,
+                        interrupt_run_id,
                         entry.runtime_loop_teardown.clone(),
                         entry.drain_slot.abort_keeping_handle(),
                         Some(Arc::clone(&entry.supervisor_rotation_task)),
@@ -6674,15 +6776,19 @@ impl MeerkatMachine {
             // (mid `start_turn`) never observes the closed channel. Hard-cancel
             // the in-flight run so a well-behaved executor unwinds `apply` and
             // the loop reaches its clean stop/terminal-handoff exit promptly.
-            if let Some(interrupt_handle) = loop_interrupt_handle {
+            if let (Some(interrupt_handle), Some(expected_run_id)) =
+                (loop_interrupt_handle, loop_interrupt_run_id)
+            {
                 match crate::tokio::time::timeout(
                     UNREGISTER_INTERRUPT_DELIVERY_GRACE,
-                    interrupt_handle
-                        .hard_cancel_current_run("runtime session unregistered".to_string()),
+                    interrupt_handle.hard_cancel_run_if_current(
+                        &expected_run_id,
+                        "runtime session unregistered".to_string(),
+                    ),
                 )
                 .await
                 {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(_)) => {}
                     Ok(Err(error)) => {
                         tracing::debug!(
                             %session_id,
@@ -8112,8 +8218,14 @@ impl MeerkatMachine {
         session_id: &SessionId,
         expected_member: &meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation,
     ) -> Result<(), RuntimeDriverError> {
-        self.cancel_after_boundary_inner_for_incarnation(session_id, Some(expected_member), true)
-            .await
+        self.cancel_after_boundary_inner_for_incarnation(
+            session_id,
+            Some(expected_member),
+            true,
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Bridge cooperative cancel whose `None` target is an exact peer-only
@@ -8127,8 +8239,27 @@ impl MeerkatMachine {
             &meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation,
         >,
     ) -> Result<(), RuntimeDriverError> {
-        self.cancel_after_boundary_inner_for_incarnation(session_id, expected_member, true)
+        self.cancel_after_boundary_inner_for_incarnation(session_id, expected_member, true, None)
             .await
+            .map(|_| ())
+    }
+
+    /// Cooperative cancel admitted only while `expected_run_id` remains the
+    /// machine-owned current run. The compare, generated stage, and exact
+    /// attachment capture share M; the callback then follows the existing
+    /// process-owned boundary dispatch path.
+    pub async fn cancel_after_boundary_run_if_current(
+        &self,
+        session_id: &SessionId,
+        expected_run_id: &meerkat_core::RunId,
+    ) -> Result<bool, RuntimeDriverError> {
+        self.cancel_after_boundary_inner_for_incarnation(
+            session_id,
+            None,
+            false,
+            Some(expected_run_id),
+        )
+        .await
     }
 
     /// Realize pending-input abandonment after the machine has already entered
@@ -8138,7 +8269,30 @@ impl MeerkatMachine {
         session_id: &SessionId,
         reason: impl Into<String>,
     ) -> Result<usize, RuntimeDriverError> {
-        let reason = reason.into();
+        self.abandon_retired_pending_inputs_inner(session_id, reason.into(), None)
+            .await
+    }
+
+    /// Deadline-aware retirement cleanup. The absolute deadline bounds only
+    /// this caller's acknowledgement wait; a publication callback that
+    /// outlives it remains owned by the process dispatch and exact durable
+    /// outbox.
+    pub async fn abandon_retired_pending_inputs_before(
+        &self,
+        session_id: &SessionId,
+        reason: impl Into<String>,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<usize, RuntimeDriverError> {
+        self.abandon_retired_pending_inputs_inner(session_id, reason.into(), Some(deadline))
+            .await
+    }
+
+    async fn abandon_retired_pending_inputs_inner(
+        &self,
+        session_id: &SessionId,
+        reason: String,
+        deadline: Option<meerkat_core::time_compat::Instant>,
+    ) -> Result<usize, RuntimeDriverError> {
         let state = self
             .existing_session_runtime_state(session_id)
             .await
@@ -8147,11 +8301,11 @@ impl MeerkatMachine {
             return Err(RuntimeDriverError::NotReady { state });
         }
 
-        let _gate_guard = self
+        let gate_guard = self
             .lock_current_durability_ready_session_mutation_gate(session_id)
             .await?;
 
-        let (driver, completions, publication_handle) = {
+        let (runtime_id, driver, completions, mutation_gate, publication_handle) = {
             let sessions = self.sessions.read().await;
             let entry = sessions
                 .get(session_id)
@@ -8159,8 +8313,10 @@ impl MeerkatMachine {
                     state: RuntimeState::Destroyed,
                 })?;
             (
+                entry.runtime_id.clone(),
                 entry.driver.clone(),
                 entry.completions.clone(),
+                Arc::clone(&entry.mutation_gate),
                 entry.publication_handle(),
             )
         };
@@ -8186,15 +8342,49 @@ impl MeerkatMachine {
                 crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
             (abandoned, completion_input_ids, candidate_owner_input_id)
         };
-        crate::control_plane::publish_and_resolve_runless_runtime_termination(
-            &driver,
-            Some(&completions),
-            publication_handle.as_deref(),
-            &completion_input_ids,
-            candidate_owner_input_id.as_ref(),
-            &reason,
-        )
-        .await?;
+
+        let dispatch = match publication_handle {
+            Some(publication_handle) => {
+                let (result_rx, start_tx) = self.prepare_runless_terminal_publication_dispatch(
+                    &driver,
+                    &completions,
+                    &mutation_gate,
+                    publication_handle,
+                )?;
+                Some((result_rx, start_tx))
+            }
+            None => None,
+        };
+        drop(gate_guard);
+
+        if let Some((result_rx, start_tx)) = dispatch {
+            if let Some(start_tx) = start_tx {
+                let _ = start_tx.send(());
+            }
+            self.await_runless_terminal_publication_dispatch(&runtime_id, result_rx, deadline)
+                .await?;
+        } else {
+            crate::control_plane::converge_known_committed_runless_runtime_terminations_before(
+                &driver,
+                Some(&completions),
+                None,
+                deadline,
+            )
+            .await?;
+        }
+
+        if candidate_owner_input_id.is_none() && !completion_input_ids.is_empty() {
+            crate::control_plane::publish_and_resolve_runless_runtime_termination_before(
+                &driver,
+                Some(&completions),
+                None,
+                &completion_input_ids,
+                None,
+                &reason,
+                deadline,
+            )
+            .await?;
+        }
         Ok(abandoned)
     }
 

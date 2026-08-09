@@ -5,9 +5,9 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use meerkat_core::lifecycle::run_primitive::{
-    AnthropicCacheControlPolicy, AnthropicCompactionConfig, AnthropicContextWindow,
-    AnthropicEffort, AnthropicInferenceGeo, AnthropicProviderTag, AnthropicThinkingConfig,
-    ProviderTag,
+    AnthropicCacheControlPolicy, AnthropicCacheTtl, AnthropicCompactionConfig,
+    AnthropicContextWindow, AnthropicEffort, AnthropicInferenceGeo, AnthropicProviderTag,
+    AnthropicThinkingConfig, ProviderTag,
 };
 use meerkat_core::schema::{CompiledSchema, SchemaError};
 use meerkat_core::{
@@ -44,9 +44,8 @@ pub struct AnthropicClient {
     connect_timeout: Duration,
     request_timeout: Duration,
     pool_idle_timeout: Duration,
-    /// Backend-owned cache default. Native Anthropic, Vertex, and Foundry use
-    /// automatic moving breakpoints; Amazon Bedrock disables this because its
-    /// Messages surface does not support Anthropic automatic caching.
+    /// Backend-owned fallback. This remains disabled unless an embedding host
+    /// deliberately overrides it; ordinary cache policy is profile-owned.
     default_cache_control: AnthropicCacheControlPolicy,
     /// Whether this backend accepts Anthropic's request-wide automatic cache
     /// policy. Amazon Bedrock supports manual breakpoints but not this mode.
@@ -78,7 +77,7 @@ impl AnthropicClientBuilder {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             pool_idle_timeout: DEFAULT_POOL_IDLE_TIMEOUT,
-            default_cache_control: AnthropicCacheControlPolicy::Automatic,
+            default_cache_control: AnthropicCacheControlPolicy::Disabled,
             automatic_cache_control_supported: true,
             authorizer: None,
         }
@@ -802,6 +801,19 @@ impl AnthropicClient {
         let cache_control = anthropic_tag(request)
             .and_then(|tag| tag.cache_control)
             .unwrap_or(self.default_cache_control);
+        let cache_ttl = anthropic_tag(request)
+            .and_then(|tag| tag.cache_ttl)
+            .unwrap_or(AnthropicCacheTtl::FiveMinutes);
+
+        if anthropic_tag(request).is_some_and(|tag| tag.cache_ttl.is_some())
+            && matches!(cache_control, AnthropicCacheControlPolicy::Disabled)
+        {
+            return Err(LlmError::InvalidRequest {
+                message:
+                    "Anthropic cache_ttl requires an explicit non-disabled cache_control policy"
+                        .to_string(),
+            });
+        }
 
         if matches!(cache_control, AnthropicCacheControlPolicy::Automatic)
             && !self.automatic_cache_control_supported
@@ -814,11 +826,23 @@ impl AnthropicClient {
         }
 
         if !system_messages.is_empty() {
-            body["system"] = Self::anthropic_ordered_system_value(&system_messages, cache_control);
+            body["system"] =
+                Self::anthropic_ordered_system_value(&system_messages, cache_control, cache_ttl);
         }
 
         if matches!(cache_control, AnthropicCacheControlPolicy::Automatic) {
-            body["cache_control"] = serde_json::json!({"type": "ephemeral"});
+            body["cache_control"] = Self::anthropic_cache_control_value(cache_ttl);
+        }
+
+        if matches!(
+            cache_control,
+            AnthropicCacheControlPolicy::SystemAndConversation
+        ) && let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut)
+        {
+            for message in messages.iter_mut().rev().take(3) {
+                let _ =
+                    Self::author_anthropic_content_breakpoint(&mut message["content"], cache_ttl);
+            }
         }
 
         if Self::request_supports_temperature(request)
@@ -943,8 +967,14 @@ impl AnthropicClient {
     fn anthropic_ordered_system_value(
         system_messages: &[String],
         cache_control: AnthropicCacheControlPolicy,
+        cache_ttl: AnthropicCacheTtl,
     ) -> Value {
-        if system_messages.len() == 1 && cache_control != AnthropicCacheControlPolicy::SystemPrefix
+        if system_messages.len() == 1
+            && !matches!(
+                cache_control,
+                AnthropicCacheControlPolicy::SystemPrefix
+                    | AnthropicCacheControlPolicy::SystemAndConversation
+            )
         {
             return Value::String(system_messages[0].clone());
         }
@@ -957,15 +987,64 @@ impl AnthropicClient {
                         "type": "text",
                         "text": system,
                     });
-                    if cache_control == AnthropicCacheControlPolicy::SystemPrefix
-                        && index + 1 == system_messages.len()
+                    if matches!(
+                        cache_control,
+                        AnthropicCacheControlPolicy::SystemPrefix
+                            | AnthropicCacheControlPolicy::SystemAndConversation
+                    ) && index + 1 == system_messages.len()
                     {
-                        block["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                        block["cache_control"] = Self::anthropic_cache_control_value(cache_ttl);
                     }
                     block
                 })
                 .collect(),
         )
+    }
+
+    fn anthropic_cache_control_value(cache_ttl: AnthropicCacheTtl) -> Value {
+        match cache_ttl {
+            AnthropicCacheTtl::FiveMinutes => serde_json::json!({"type": "ephemeral"}),
+            AnthropicCacheTtl::OneHour => {
+                serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+            }
+        }
+    }
+
+    fn author_anthropic_content_breakpoint(
+        content: &mut Value,
+        cache_ttl: AnthropicCacheTtl,
+    ) -> bool {
+        if let Some(blocks) = content.as_array_mut() {
+            let Some(block) = blocks.last_mut() else {
+                return false;
+            };
+            block["cache_control"] = Self::anthropic_cache_control_value(cache_ttl);
+            return true;
+        }
+        if let Some(text) = content
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+        {
+            *content = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": Self::anthropic_cache_control_value(cache_ttl),
+            }]);
+            return true;
+        }
+        false
+    }
+
+    fn contains_cache_control(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                object.contains_key("cache_control")
+                    || object.values().any(Self::contains_cache_control)
+            }
+            Value::Array(values) => values.iter().any(Self::contains_cache_control),
+            _ => false,
+        }
     }
 
     fn ensure_claude_ai_oauth_system_marker(body: &mut Value) {
@@ -1100,6 +1179,15 @@ fn merge_usage(target: &mut Usage, update: &AnthropicUsage) {
     }
 }
 
+fn attach_normalized_usage(model: &str, usage: &mut Usage) {
+    usage.provider_accounting = Some(meerkat_core::ProviderTokenAccounting::anthropic(
+        model,
+        usage.input_tokens,
+        usage.cache_creation_tokens.unwrap_or(0),
+        usage.cache_read_tokens.unwrap_or(0),
+    ));
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl LlmClient for AnthropicClient {
@@ -1117,15 +1205,151 @@ impl LlmClient for AnthropicClient {
         if self.authorizer_needs_claude_ai_oauth_system_marker() {
             Self::ensure_claude_ai_oauth_system_marker(&mut body);
         }
-        let encoded_bytes = serde_json::to_vec(&body)
-            .map_err(|error| LlmError::InvalidRequest {
-                message: format!("failed to serialize Anthropic request body: {error}"),
-            })?
-            .len() as u64;
-        Ok(Some(meerkat_core::ProviderRequestPressure::new(
-            encoded_bytes,
-            meerkat_models::approximate_request_byte_cap(self.provider()),
-        )))
+        let encoded_body = serde_json::to_vec(&body).map_err(|error| LlmError::InvalidRequest {
+            message: format!("failed to serialize Anthropic request body: {error}"),
+        })?;
+        Ok(Some(
+            meerkat_core::ProviderRequestPressure::new(
+                encoded_body.len() as u64,
+                meerkat_models::approximate_request_byte_cap(self.provider()),
+            )
+            .with_lowered_request_provenance(
+                meerkat_core::LoweredRequestProvenance::from_body(
+                    Provider::Anthropic,
+                    meerkat_core::LoweredRequestEncoding::AnthropicMessagesJson,
+                    &encoded_body,
+                ),
+            ),
+        ))
+    }
+
+    fn authored_cache_breakpoints(
+        &self,
+        request: &LlmRequest,
+        canonical_messages: &[Message],
+    ) -> Result<Vec<meerkat_core::ProviderCacheBreakpointClaim>, LlmError> {
+        if request.messages.len() != canonical_messages.len() {
+            return Ok(Vec::new());
+        }
+        let policy = anthropic_tag(request)
+            .and_then(|tag| tag.cache_control)
+            .unwrap_or(self.default_cache_control);
+        if !matches!(
+            policy,
+            AnthropicCacheControlPolicy::SystemPrefix
+                | AnthropicCacheControlPolicy::SystemAndConversation
+        ) {
+            return Ok(Vec::new());
+        }
+        let mut body = self.build_request_body(request)?;
+        if self.authorizer_needs_claude_ai_oauth_system_marker() {
+            Self::ensure_claude_ai_oauth_system_marker(&mut body);
+        }
+        let encoded_body = serde_json::to_vec(&body).map_err(|error| LlmError::InvalidRequest {
+            message: format!("failed to serialize Anthropic cache evidence body: {error}"),
+        })?;
+        let ttl = match anthropic_tag(request)
+            .and_then(|tag| tag.cache_ttl)
+            .unwrap_or(AnthropicCacheTtl::FiveMinutes)
+        {
+            AnthropicCacheTtl::FiveMinutes => meerkat_core::ProviderCacheTtl::FiveMinutes,
+            AnthropicCacheTtl::OneHour => meerkat_core::ProviderCacheTtl::OneHour,
+        };
+        let mut boundaries = Vec::new();
+        let leading_system_count = request
+            .messages
+            .iter()
+            .take_while(|message| matches!(message, Message::System(_)))
+            .count();
+        if leading_system_count > 0 && body.get("system").is_some_and(Self::contains_cache_control)
+        {
+            boundaries.push(meerkat_core::CacheBreakpointBoundary::SystemProfilePrefix {
+                message_count: leading_system_count as u64,
+            });
+        }
+
+        if matches!(policy, AnthropicCacheControlPolicy::SystemAndConversation) {
+            let source_indices: Vec<usize> = request
+                .messages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, message)| {
+                    (!(index < leading_system_count && matches!(message, Message::System(_))))
+                        .then_some(index)
+                })
+                .collect();
+            if let Some(lowered_messages) = body.get("messages").and_then(Value::as_array) {
+                for (source_index, lowered) in source_indices.into_iter().zip(lowered_messages) {
+                    if lowered
+                        .get("content")
+                        .is_some_and(Self::contains_cache_control)
+                    {
+                        boundaries.push(meerkat_core::CacheBreakpointBoundary::TranscriptAfter {
+                            message_count: (source_index + 1) as u64,
+                        });
+                    }
+                }
+            }
+        }
+
+        boundaries
+            .into_iter()
+            .map(|boundary| {
+                let lowered_message_count = match boundary {
+                    meerkat_core::CacheBreakpointBoundary::SystemProfilePrefix { .. } => 0,
+                    meerkat_core::CacheBreakpointBoundary::TranscriptAfter { message_count } => {
+                        request
+                            .messages
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, message)| {
+                                !(*index < leading_system_count
+                                    && matches!(message, Message::System(_)))
+                            })
+                            .take_while(|(index, _)| (*index as u64) < message_count)
+                            .count()
+                    }
+                };
+                let lowered_messages = body
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .and_then(|messages| messages.get(..lowered_message_count))
+                    .ok_or_else(|| LlmError::InvalidRequest {
+                        message: "Anthropic cache breakpoint did not map to lowered messages"
+                            .to_string(),
+                    })?;
+                let rendered_prefix = serde_json::to_vec(&serde_json::json!({
+                    "renderer_mode": "anthropic_messages_cache_prefix_v1",
+                    "model": body.get("model"),
+                    "tools": body.get("tools"),
+                    "tool_choice": body.get("tool_choice"),
+                    "cache_control": body.get("cache_control"),
+                    "system": body.get("system"),
+                    "messages": lowered_messages,
+                }))
+                .map_err(|error| LlmError::InvalidRequest {
+                    message: format!(
+                        "failed to serialize Anthropic rendered cache prefix: {error}"
+                    ),
+                })?;
+                meerkat_core::provider_cache_breakpoint_claim(
+                    meerkat_core::ProviderCacheBreakpointClaimRequest {
+                        provider: Provider::Anthropic,
+                        model: &request.model,
+                        messages: canonical_messages,
+                        boundary,
+                        ttl,
+                        rendered_prefix: &rendered_prefix,
+                        lowered_request_encoding:
+                            meerkat_core::LoweredRequestEncoding::AnthropicMessagesJson,
+                        lowered_request_body: &encoded_body,
+                    },
+                )
+                .map_err(|error| LlmError::InvalidRequest {
+                    message: format!("invalid Anthropic cache-breakpoint evidence: {error}"),
+                })
+            })
+            .collect()
     }
 
     fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
@@ -1466,8 +1690,12 @@ impl LlmClient for AnthropicClient {
                         "message_delta" => {
                             if let Some(usage_update) = $event.usage {
                                 merge_usage(&mut usage, &usage_update);
+                                attach_normalized_usage(&request.model, &mut usage);
                                 yield LlmEvent::UsageUpdate {
-                                    usage: usage.clone(),
+                                    usage: meerkat_core::TurnUsage::try_from_usage(usage.clone())
+                                        .map_err(|error| LlmError::Unknown {
+                                            message: error.to_string(),
+                                        })?,
                                 };
                             }
                             if let Some(finish_reason) = $event.delta.and_then(|d| d.stop_reason) {
@@ -1484,8 +1712,12 @@ impl LlmClient for AnthropicClient {
                         "message_start" => {
                             if let Some(usage_update) = $event.message.and_then(|m| m.usage) {
                                 merge_usage(&mut usage, &usage_update);
+                                attach_normalized_usage(&request.model, &mut usage);
                                 yield LlmEvent::UsageUpdate {
-                                    usage: usage.clone(),
+                                    usage: meerkat_core::TurnUsage::try_from_usage(usage.clone())
+                                        .map_err(|error| LlmError::Unknown {
+                                            message: error.to_string(),
+                                        })?,
                                 };
                             }
                         }
@@ -1537,6 +1769,17 @@ impl LlmClient for AnthropicClient {
                                     status: 500,
                                     message: error_msg.to_string(),
                                 },
+                                "context_length_exceeded" | "context_window_exceeded" => {
+                                    LlmError::ContextLengthExceeded {
+                                        max: 0,
+                                        requested: 1,
+                                    }
+                                }
+                                "invalid_request_error" => LlmError::from_http_status(
+                                    400,
+                                    error_msg.to_string(),
+                                    None,
+                                ),
                                 _ => LlmError::Unknown {
                                     message: format!("{error_type}: {error_msg}"),
                                 },
@@ -2613,10 +2856,13 @@ mod tests {
         assert!(body.get("thinking").is_none());
         assert!(body.get("top_k").is_none());
         assert_eq!(body["model"], "claude-sonnet-4-20250514");
-        assert_eq!(
-            body["cache_control"],
-            serde_json::json!({"type": "ephemeral"}),
-            "native Anthropic requests should automatically cache the growing conversation prefix"
+        assert!(
+            body.get("cache_control").is_none(),
+            "cache policy must remain disabled unless the profile or request opts in"
+        );
+        assert!(
+            body["messages"].to_string().find("cache_control").is_none(),
+            "disabled cache policy must not author conversation breakpoints"
         );
         Ok(())
     }

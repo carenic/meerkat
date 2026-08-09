@@ -2994,6 +2994,18 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
     use tokio::net::TcpStream;
 
+    fn provider_for_successful_rpc_test_model(model: &str) -> meerkat_core::Provider {
+        if model.starts_with("claude-") {
+            meerkat_core::Provider::Anthropic
+        } else if model.starts_with("gpt-") || model.starts_with("o1-") {
+            meerkat_core::Provider::OpenAI
+        } else if model.starts_with("gemini-") {
+            meerkat_core::Provider::Gemini
+        } else {
+            meerkat_core::Provider::Other
+        }
+    }
+
     /// Mock LLM that immediately returns "Hello from mock" and ends the turn.
     struct MockLlmClient;
 
@@ -3008,7 +3020,7 @@ mod tests {
 
         fn stream<'a>(
             &'a self,
-            _request: &'a meerkat_client::LlmRequest,
+            request: &'a meerkat_client::LlmRequest,
         ) -> Pin<
             Box<dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>> + Send + 'a>,
         > {
@@ -3016,6 +3028,13 @@ mod tests {
                 Ok(meerkat_client::LlmEvent::TextDelta {
                     delta: "Hello from mock".to_string(),
                     meta: None,
+                }),
+                Ok(meerkat_client::LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider_for_successful_rpc_test_model(&request.model),
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
                     outcome: meerkat_client::LlmDoneOutcome::Success {

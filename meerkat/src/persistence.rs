@@ -46,6 +46,8 @@ pub enum PersistenceError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
+    Session(#[from] meerkat_core::SessionStoreError),
+    #[error(transparent)]
     Runtime(#[from] RuntimeStoreError),
     #[error(transparent)]
     WorkGraph(#[from] meerkat_workgraph::WorkGraphError),
@@ -93,6 +95,80 @@ pub enum PersistenceError {
         profile: RuntimeSessionPersistenceProfile,
         detail: String,
     },
+}
+
+/// Activate one externally injected HeadCanonical store before its stores are
+/// allowed to enter a [`PersistenceBundle`].
+///
+/// The provider boundary is the only asynchronous construction seam before a
+/// runtime-backed session service is built. Consume the backend's one bulk
+/// activation result here so no service can observe a pre-current physical
+/// head. Each store-issued proof is then consumed exactly once by the paired
+/// RuntimeStore. A crash between those commits is retry-safe because the
+/// physical store reissues `AlreadyCurrent` and the runtime consumer accepts
+/// either the exact installed token or the same semantic pre-activation
+/// boundary.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+async fn activate_external_head_canonical_store(
+    session_store: &Arc<dyn SessionStore>,
+    runtime_store: &Arc<dyn RuntimeStore>,
+    profile: RuntimeSessionPersistenceProfile,
+) -> Result<(), PersistenceError> {
+    if profile != RuntimeSessionPersistenceProfile::HeadCanonicalV1 {
+        return Ok(());
+    }
+    let incremental = Arc::clone(session_store).as_incremental().ok_or_else(|| {
+        PersistenceError::SessionPersistenceProfileMismatch {
+            profile,
+            detail: "HeadCanonical requires an IncrementalSessionStore pairing".to_string(),
+        }
+    })?;
+    let crossings = match incremental.activate_head_canonical_store().await? {
+        meerkat_core::HeadCanonicalStoreActivation::NotApplicable => {
+            return Err(PersistenceError::SessionPersistenceProfileMismatch {
+                profile,
+                detail: "HeadCanonical activation returned NotApplicable".to_string(),
+            });
+        }
+        meerkat_core::HeadCanonicalStoreActivation::Activated(crossings) => crossings,
+    };
+    let mut seen = std::collections::HashSet::with_capacity(crossings.len());
+    for crossing in crossings {
+        let authority = match crossing {
+            meerkat_core::HeadCanonicalAuthorityCrossing::Converted(authority)
+            | meerkat_core::HeadCanonicalAuthorityCrossing::AlreadyCurrent(authority) => authority,
+            meerkat_core::HeadCanonicalAuthorityCrossing::NotApplicable => {
+                return Err(PersistenceError::SessionPersistenceProfileMismatch {
+                    profile,
+                    detail: "HeadCanonical bulk activation contained NotApplicable".to_string(),
+                });
+            }
+        };
+        let session_id = authority.head().id.clone();
+        let head_token = authority.head_token().to_string();
+        if !seen.insert(session_id.clone()) {
+            return Err(PersistenceError::SessionPersistenceProfileMismatch {
+                profile,
+                detail: format!(
+                    "HeadCanonical bulk activation returned session {session_id} more than once"
+                ),
+            });
+        }
+        let aligned = runtime_store
+            .activate_head_canonical_runtime_authority(authority)
+            .await?;
+        if aligned.authority().session_id() != &session_id
+            || aligned.authority().committed_head_token() != head_token
+        {
+            return Err(PersistenceError::SessionPersistenceProfileMismatch {
+                profile,
+                detail: format!(
+                    "HeadCanonical runtime activation returned authority different from verified physical session {session_id}"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
@@ -831,6 +907,10 @@ pub async fn open_realm_persistence_with_provider(
             detail: "HeadCanonical requires an IncrementalSessionStore pairing".to_string(),
         });
     }
+    if manifest.provider_name().is_some() {
+        activate_external_head_canonical_store(&set.session_store, &set.runtime_store, profile)
+            .await?;
+    }
 
     let builtin_manifest = manifest.as_builtin().cloned();
     let mut bundle = if let (Some(projection_root), Some(builtin)) =
@@ -1139,9 +1219,9 @@ mod tests {
         let mut expected = vec![
             ("session-store", 1, 4),
             ("runtime-store", 1, 2),
-            ("schedule-store", 1, 2),
+            ("schedule-store", 1, 3),
             ("workgraph", 1, 3),
-            ("jobs", 1, 2),
+            ("jobs", 1, 3),
         ];
         #[cfg(feature = "memory-store-session")]
         expected.push(("memory", 1, 2));
@@ -1855,6 +1935,161 @@ mod tests {
         let err = PersistenceError::from(RuntimeStoreError::WriteFailed("boom".to_string()));
 
         assert!(matches!(err, PersistenceError::Runtime(_)));
+    }
+
+    #[tokio::test]
+    async fn external_head_canonical_activation_consumes_current_store_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let store = Arc::new(SqliteSessionStore::open(
+            temp.path().join("sessions.sqlite3"),
+        )?);
+        let runtime_store = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(
+                temp.path().join("runtime.sqlite3"),
+            )?,
+        );
+        let mut session = Session::new();
+        session.push(meerkat_core::Message::User(
+            meerkat_core::types::UserMessage::text("sparse legacy row"),
+        ));
+        store.save(&session).await?;
+        let erased: Arc<dyn SessionStore> = store.clone();
+        let erased_runtime: Arc<dyn RuntimeStore> = runtime_store.clone();
+
+        // Simulate process death after the physical bulk crossing commits but
+        // before the runtime authority consumes its proof.
+        let first = Arc::clone(&store)
+            .as_incremental()
+            .expect("SQLite exposes HeadCanonical capability")
+            .activate_head_canonical_store()
+            .await?;
+        assert!(matches!(
+            first,
+            meerkat_core::HeadCanonicalStoreActivation::Activated(ref crossings)
+                if matches!(crossings.as_slice(), [meerkat_core::HeadCanonicalAuthorityCrossing::Converted(_)])
+        ));
+
+        activate_external_head_canonical_store(
+            &erased,
+            &erased_runtime,
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1,
+        )
+        .await?;
+
+        let head = Arc::clone(&erased)
+            .as_incremental()
+            .expect("activated store remains incremental")
+            .load_head(session.id())
+            .await?
+            .expect("activated authority keeps the physical head");
+        assert!(head.message_row_prefix.is_some());
+        assert!(head.row_lineage_anchor.is_some());
+        assert!(head.realtime_event_prefix.is_some());
+        assert!(head.metadata_identity().is_some());
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(session.id());
+        let aligned = runtime_store
+            .load_session_boundary_authority(&runtime_id)
+            .await?
+            .expect("retry aligns runtime authority from AlreadyCurrent proof");
+        let aligned = aligned
+            .head_canonical()
+            .expect("aligned authority is HeadCanonical");
+        assert_eq!(aligned.boundary_head(), &head);
+        let revision = aligned.store_revision();
+
+        activate_external_head_canonical_store(
+            &erased,
+            &erased_runtime,
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1,
+        )
+        .await?;
+        assert_eq!(
+            runtime_store
+                .load_session_boundary_authority(&runtime_id)
+                .await?
+                .and_then(|authority| authority.head_canonical().cloned())
+                .expect("idempotent retry retains runtime authority")
+                .store_revision(),
+            revision,
+            "an exact retry must not allocate another runtime revision"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn external_head_canonical_activation_refuses_semantic_boundary_drift()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let runtime_store = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(
+                temp.path().join("runtime.sqlite3"),
+            )?,
+        );
+        let session = Session::new();
+        let first_store = Arc::new(SqliteSessionStore::open(temp.path().join("first.sqlite3"))?);
+        let first =
+            meerkat_core::session_store::PreparedHeadCanonicalMutation::prepare_root(&session)?;
+        Arc::clone(&first_store)
+            .as_incremental()
+            .expect("SQLite is incremental")
+            .apply_prepared_head_canonical_mutation(&first)
+            .await?;
+        let first_erased: Arc<dyn SessionStore> = first_store;
+        let runtime_erased: Arc<dyn RuntimeStore> = runtime_store;
+        activate_external_head_canonical_store(
+            &first_erased,
+            &runtime_erased,
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1,
+        )
+        .await?;
+
+        let mut drifted = Session::with_id(session.id().clone());
+        drifted.push(meerkat_core::Message::User(
+            meerkat_core::types::UserMessage::text("different semantic boundary"),
+        ));
+        let second_store = Arc::new(SqliteSessionStore::open(
+            temp.path().join("second.sqlite3"),
+        )?);
+        let second =
+            meerkat_core::session_store::PreparedHeadCanonicalMutation::prepare_root(&drifted)?;
+        Arc::clone(&second_store)
+            .as_incremental()
+            .expect("SQLite is incremental")
+            .apply_prepared_head_canonical_mutation(&second)
+            .await?;
+        let second_erased: Arc<dyn SessionStore> = second_store;
+        let error = activate_external_head_canonical_store(
+            &second_erased,
+            &runtime_erased,
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1,
+        )
+        .await
+        .expect_err("semantic content drift cannot be called representation activation");
+        assert!(matches!(error, PersistenceError::Runtime(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn external_head_canonical_activation_refuses_non_head_canonical_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let runtime_store: Arc<dyn RuntimeStore> =
+            Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new());
+        let error = activate_external_head_canonical_store(
+            &store,
+            &runtime_store,
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1,
+        )
+        .await
+        .expect_err("HeadCanonical runtime profile requires store-wide physical activation");
+
+        assert!(matches!(
+            error,
+            PersistenceError::SessionPersistenceProfileMismatch { detail, .. }
+                if detail.contains("returned NotApplicable")
+        ));
+        Ok(())
     }
 
     #[cfg(not(target_arch = "wasm32"))]

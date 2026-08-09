@@ -13,7 +13,9 @@ use crate::session::{TranscriptRewriteAuditReceiptBatch, TranscriptRewriteRecord
 use crate::skills::{CapabilityId, SkillError, SkillKey};
 use crate::time_compat::SystemTime;
 use crate::turn_execution_authority::{TurnTerminalCauseKind, TurnTerminalOutcome};
-use crate::types::{ContentBlock, RunInput, ServerToolKind, SessionId, StopReason, Usage};
+use crate::types::{
+    ContentBlock, CumulativeUsage, RunInput, ServerToolKind, SessionId, StopReason,
+};
 use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -1829,7 +1831,7 @@ pub enum AgentEvent {
         /// completed main run.
         #[serde(default)]
         extraction_required: bool,
-        usage: Usage,
+        usage: CumulativeUsage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_cause_kind: Option<TurnTerminalCauseKind>,
     },
@@ -1941,7 +1943,7 @@ pub enum AgentEvent {
     /// Turn completed
     TurnCompleted {
         stop_reason: StopReason,
-        usage: Usage,
+        usage: crate::types::TurnUsage,
     },
 
     // === Tool Execution ===
@@ -2400,7 +2402,7 @@ mod tests {
     use super::*;
     use crate::retry::{LlmRetryFailure, LlmRetryFailureKind, LlmRetryPlan, LlmRetrySchedule};
     use crate::skills::SkillName;
-    use crate::types::ContentBlock;
+    use crate::types::{ContentBlock, Usage};
 
     mod peer_content_ingested_projection {
         use super::super::{AgentEvent, peer_content_ingested_events};
@@ -2956,7 +2958,11 @@ mod tests {
             AgentEvent::TurnStarted { turn_number: 1 },
             AgentEvent::TurnCompleted {
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: crate::types::TurnUsage::host_declared(
+                    crate::Provider::Other,
+                    "event-test",
+                    Usage::default(),
+                ),
             },
             AgentEvent::ToolCallRequested {
                 id: "tc_1".to_string(),
@@ -3005,7 +3011,9 @@ mod tests {
                     output_tokens: 50,
                     cache_creation_tokens: None,
                     cache_read_tokens: None,
-                },
+                    provider_accounting: None,
+                }
+                .into(),
                 terminal_cause_kind: None,
             },
             AgentEvent::RunFailed {
@@ -3509,7 +3517,7 @@ mod tests {
                 result: "Done".to_string(),
                 structured_output: None,
                 extraction_required: false,
-                usage: Usage::default(),
+                usage: Usage::default().into(),
                 terminal_cause_kind: None,
             },
             AgentEvent::RunFailed {
@@ -3582,7 +3590,11 @@ mod tests {
             },
             AgentEvent::TurnCompleted {
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: crate::types::TurnUsage::host_declared(
+                    crate::Provider::Other,
+                    "event-test",
+                    Usage::default(),
+                ),
             },
             AgentEvent::ToolExecutionStarted {
                 id: "tool-1".to_string(),

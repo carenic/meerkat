@@ -27,9 +27,9 @@ use meerkat_core::comms::{
     CommsCommand, CommsTrustMutation, InputStreamMode, PeerAddress, PeerName, PeerRoute,
     PeerTransport, SendReceipt, TrustedPeerDescriptor,
 };
+use meerkat_core::interaction::PeerInputCandidate;
 use meerkat_core::{
-    ClassifiedInboxInteraction, HandlingMode, InteractionContent, InteractionId, PeerCorrelationId,
-    ResponseStatus,
+    HandlingMode, InteractionContent, InteractionId, PeerCorrelationId, ResponseStatus,
 };
 use meerkat_runtime::handles::{
     HandleDslAuthority, RuntimeInteractionStreamHandle, RuntimePeerCommsHandle,
@@ -329,11 +329,11 @@ async fn drain_until_nonempty(
     runtime: &CommsRuntime,
     poll_ms: u64,
     attempts: u32,
-) -> Vec<ClassifiedInboxInteraction> {
+) -> Vec<PeerInputCandidate> {
     for _ in 0..attempts {
-        let batch = CoreCommsRuntime::drain_classified_inbox_interactions(runtime)
+        let batch = CoreCommsRuntime::handoff_volatile_peer_input_candidates(runtime)
             .await
-            .unwrap_or_default();
+            .expect("exact volatile handoff");
         if !batch.is_empty() {
             return batch;
         }

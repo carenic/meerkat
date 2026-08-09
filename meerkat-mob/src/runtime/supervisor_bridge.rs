@@ -12,8 +12,8 @@ use meerkat_core::interaction::{InteractionContent, PeerInputCandidate, Terminal
 use meerkat_core::time_compat::{Duration, Instant};
 use meerkat_core::types::HandlingMode;
 use meerkat_runtime::meerkat_machine::dsl as mm_dsl;
-use std::collections::{HashSet, VecDeque};
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use tokio::sync::{Mutex, RwLock};
 
 #[cfg(test)]
@@ -76,6 +76,15 @@ pub(crate) enum BridgeRequestFailure {
     AfterSend(MobError),
 }
 
+const SUPERVISOR_REQUEST_TOMBSTONE_TTL: Duration = Duration::from_secs(300);
+const SUPERVISOR_REQUEST_CORRELATION_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+enum SupervisorRequestCorrelationState {
+    Active,
+    TimedOut(Instant),
+}
+
 impl BridgeRequestFailure {
     fn into_error(self) -> MobError {
         match self {
@@ -91,6 +100,12 @@ pub(crate) struct MobSupervisorBridge {
     runtime: RwLock<Arc<meerkat_comms::CommsRuntime>>,
     dsl: RwLock<Arc<meerkat_runtime::HandleDslAuthority>>,
     buffered_candidates: Mutex<VecDeque<PeerInputCandidate>>,
+    /// Correlation ids whose dispatch or response deadline elapsed after the
+    /// peer-request lifecycle entered `request_sent`. A late response is
+    /// consumed here rather than becoming ordinary session input or an
+    /// immortal shared-buffer candidate. Entries are consumed on arrival and
+    /// lazily expired under the same bounded horizon as comms reply tombstones.
+    request_correlations: StdMutex<HashMap<uuid::Uuid, SupervisorRequestCorrelationState>>,
     /// Shared-intake coordination with the mob upcall responder (DEC-U3):
     /// fired whenever foreign candidates are pushed into the shared buffer
     /// or `buffer_and_extract` retains request-class candidates, so neither
@@ -132,6 +147,44 @@ pub(crate) struct MobSupervisorBridge {
     /// matching identity lease has been installed on the shared acceptor.
     #[cfg(not(target_arch = "wasm32"))]
     controlling_reply_endpoint: StdRwLock<Option<PeerAddress>>,
+}
+
+/// Linear owner for one bridge request correlation.
+///
+/// Dropping the caller at any await point conservatively leaves a timed-out
+/// tombstone and attempts the peer-machine timeout transition. A handled
+/// pre-admission failure or confirmed terminal response explicitly removes the
+/// row. This makes cancellation and panic unable to strand an immortal Active
+/// correlation or launder an admitted request into a no-effect failure.
+struct SupervisorRequestCorrelationGuard<'a> {
+    bridge: &'a MobSupervisorBridge,
+    runtime: Arc<meerkat_comms::CommsRuntime>,
+    envelope_id: uuid::Uuid,
+    armed: bool,
+}
+
+impl SupervisorRequestCorrelationGuard<'_> {
+    fn finish(mut self) {
+        self.bridge.finish_request_correlation(self.envelope_id);
+        self.armed = false;
+    }
+
+    fn terminalize(mut self) -> Result<(), MobError> {
+        let result = self
+            .bridge
+            .terminalize_ambiguous_request(&self.runtime, self.envelope_id);
+        self.armed = false;
+        result
+    }
+}
+
+impl Drop for SupervisorRequestCorrelationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.bridge.tombstone_request_correlation(self.envelope_id);
+            let _ = MobSupervisorBridge::record_request_timed_out(&self.runtime, self.envelope_id);
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -458,6 +511,7 @@ impl MobSupervisorBridge {
             runtime: RwLock::new(runtime),
             dsl: RwLock::new(dsl),
             buffered_candidates: Mutex::new(VecDeque::new()),
+            request_correlations: StdMutex::new(HashMap::new()),
             intake_notify: Arc::new(tokio::sync::Notify::new()),
             authority_gate: RwLock::new(()),
             alternate_authority_probe_gate: Arc::new(Mutex::new(())),
@@ -1000,7 +1054,6 @@ impl MobSupervisorBridge {
                 "failed to install supervisor bridge peer-comms authority '{participant_name}': {error}"
             ))
         })?;
-        runtime.require_peer_comms_machine_authority();
         let request_response_authority = meerkat_comms::PeerRequestResponseAuthority::new(
             Arc::new(meerkat_runtime::RuntimePeerInteractionHandle::new(
                 Arc::clone(&dsl),
@@ -2427,25 +2480,83 @@ impl MobSupervisorBridge {
         payload: &T,
         timeout: Duration,
     ) -> Result<(serde_json::Value, uuid::Uuid), BridgeRequestFailure> {
+        let deadline = BridgeRequestDeadline::start(timeout);
         // The shared response buffer is part of the callback path even for a
         // private TCP listener, so retain the gate through terminality.
-        let _authority_guard = self.authority_gate.read().await;
-        let runtime = self.runtime_with_gate_held().await;
-        let envelope_id = self
-            .send_supervisor_request(
+        let _authority_guard = deadline
+            .run(self.authority_gate.read())
+            .await
+            .map_err(|_| {
+                BridgeRequestFailure::BeforeSend(Self::bridge_request_timeout(
+                    "authority-gate-not-acquired",
+                    timeout,
+                ))
+            })?;
+        let runtime = deadline
+            .run(self.runtime.read())
+            .await
+            .map_err(|_| {
+                BridgeRequestFailure::BeforeSend(Self::bridge_request_timeout(
+                    "runtime-not-observed",
+                    timeout,
+                ))
+            })?
+            .clone();
+        let envelope_id = uuid::Uuid::new_v4();
+        let correlation = self
+            .reserve_request_correlation(Arc::clone(&runtime), envelope_id)
+            .map_err(BridgeRequestFailure::BeforeSend)?;
+        let send = self
+            .send_supervisor_request_with_id(
                 &runtime,
                 recipient,
                 intent,
                 payload,
                 SupervisorRequestReplyEndpoint::Live,
+                envelope_id,
+                Some(deadline.expires_at),
             )
-            .await
-            .map_err(BridgeRequestFailure::BeforeSend)?;
-        let value = self
-            .wait_for_response(&runtime, envelope_id, recipient.peer_id, timeout)
-            .await
-            .map_err(BridgeRequestFailure::AfterSend)?;
-        Ok((value, envelope_id))
+            .await;
+        match send {
+            Ok(receipt_id) => {
+                debug_assert_eq!(receipt_id, envelope_id);
+            }
+            Err(
+                error @ MobError::CommsError(meerkat_core::comms::SendError::AmbiguousDelivery {
+                    ..
+                }),
+            ) => {
+                correlation
+                    .terminalize()
+                    .map_err(BridgeRequestFailure::AfterSend)?;
+                return Err(BridgeRequestFailure::AfterSend(error));
+            }
+            Err(error) => {
+                correlation.finish();
+                return Err(BridgeRequestFailure::BeforeSend(error));
+            }
+        }
+        let response = self
+            .wait_for_response_before(&runtime, envelope_id, recipient.peer_id, &deadline)
+            .await;
+        match response {
+            Ok(value) => {
+                correlation.finish();
+                Ok((value, envelope_id))
+            }
+            Err(error @ MobError::BridgeRequestTimedOut { .. }) => {
+                correlation
+                    .terminalize()
+                    .map_err(BridgeRequestFailure::AfterSend)?;
+                Err(BridgeRequestFailure::AfterSend(error))
+            }
+            Err(error) => {
+                correlation
+                    .terminalize()
+                    .map_err(BridgeRequestFailure::AfterSend)?;
+                Err(BridgeRequestFailure::AfterSend(error))
+            }
+        }
     }
 
     async fn request_json_with_runtime_classified<T: serde::Serialize>(
@@ -2479,6 +2590,28 @@ impl MobSupervisorBridge {
         payload: &T,
         reply_endpoint: SupervisorRequestReplyEndpoint,
     ) -> Result<uuid::Uuid, MobError> {
+        self.send_supervisor_request_with_id(
+            runtime,
+            recipient,
+            intent,
+            payload,
+            reply_endpoint,
+            uuid::Uuid::new_v4(),
+            None,
+        )
+        .await
+    }
+
+    async fn send_supervisor_request_with_id<T: serde::Serialize>(
+        &self,
+        runtime: &Arc<meerkat_comms::CommsRuntime>,
+        recipient: &TrustedPeerDescriptor,
+        intent: &str,
+        payload: &T,
+        reply_endpoint: SupervisorRequestReplyEndpoint,
+        envelope_id: uuid::Uuid,
+        send_deadline: Option<Instant>,
+    ) -> Result<uuid::Uuid, MobError> {
         #[cfg(not(target_arch = "wasm32"))]
         if recipient.address.transport() == PeerTransport::Uds {
             return Err(MobError::WiringError(
@@ -2493,46 +2626,78 @@ impl MobSupervisorBridge {
         #[cfg(not(target_arch = "wasm32"))]
         let receipt = match reply_endpoint {
             SupervisorRequestReplyEndpoint::InProcessProbe => {
-                runtime
-                    .send(CommsCommand::PeerRequest {
-                        objective_id: None,
-                        to,
-                        intent: intent.to_string(),
-                        params,
-                        blocks: None,
-                        content_taint: None,
-                        handling_mode: HandlingMode::Queue,
-                        stream: InputStreamMode::None,
-                    })
-                    .await?
+                if let Some(deadline) = send_deadline {
+                    runtime
+                        .send_peer_request_with_id_before(envelope_id, to, intent, params, deadline)
+                        .await?
+                } else {
+                    runtime
+                        .send_peer_request_with_id(envelope_id, to, intent, params)
+                        .await?
+                }
             }
             SupervisorRequestReplyEndpoint::Live => {
                 let reply_endpoint = self.live_runtime_reply_endpoint(runtime)?;
-                runtime
-                    .send_peer_request_at_endpoint(to, intent, params, reply_endpoint)
-                    .await?
+                if let Some(deadline) = send_deadline {
+                    runtime
+                        .send_peer_request_at_endpoint_with_id_before(
+                            envelope_id,
+                            to,
+                            intent,
+                            params,
+                            reply_endpoint,
+                            deadline,
+                        )
+                        .await?
+                } else {
+                    runtime
+                        .send_peer_request_at_endpoint_with_id(
+                            envelope_id,
+                            to,
+                            intent,
+                            params,
+                            reply_endpoint,
+                        )
+                        .await?
+                }
             }
             SupervisorRequestReplyEndpoint::EphemeralProbe(reply_endpoint) => {
-                runtime
-                    .send_peer_request_at_endpoint(to, intent, params, reply_endpoint)
-                    .await?
+                if let Some(deadline) = send_deadline {
+                    runtime
+                        .send_peer_request_at_endpoint_with_id_before(
+                            envelope_id,
+                            to,
+                            intent,
+                            params,
+                            reply_endpoint,
+                            deadline,
+                        )
+                        .await?
+                } else {
+                    runtime
+                        .send_peer_request_at_endpoint_with_id(
+                            envelope_id,
+                            to,
+                            intent,
+                            params,
+                            reply_endpoint,
+                        )
+                        .await?
+                }
             }
         };
         #[cfg(target_arch = "wasm32")]
         let receipt = {
             let SupervisorRequestReplyEndpoint::Live = reply_endpoint;
-            runtime
-                .send(CommsCommand::PeerRequest {
-                    objective_id: None,
-                    to,
-                    intent: intent.to_string(),
-                    params,
-                    blocks: None,
-                    content_taint: None,
-                    handling_mode: HandlingMode::Queue,
-                    stream: InputStreamMode::None,
-                })
-                .await?
+            if let Some(deadline) = send_deadline {
+                runtime
+                    .send_peer_request_with_id_before(envelope_id, to, intent, params, deadline)
+                    .await?
+            } else {
+                runtime
+                    .send_peer_request_with_id(envelope_id, to, intent, params)
+                    .await?
+            }
         };
         let SendReceipt::PeerRequestSent { envelope_id, .. } = receipt else {
             return Err(MobError::Internal(
@@ -2581,6 +2746,92 @@ impl MobSupervisorBridge {
         Arc::clone(&self.intake_notify)
     }
 
+    fn bridge_request_timeout(request_envelope_id: &str, timeout: Duration) -> MobError {
+        MobError::BridgeRequestTimedOut {
+            request_envelope_id: request_envelope_id.to_string(),
+            timeout_ms: timeout.as_millis() as u64,
+        }
+    }
+
+    fn request_correlations(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<uuid::Uuid, SupervisorRequestCorrelationState>> {
+        self.request_correlations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn reserve_request_correlation(
+        &self,
+        runtime: Arc<meerkat_comms::CommsRuntime>,
+        envelope_id: uuid::Uuid,
+    ) -> Result<SupervisorRequestCorrelationGuard<'_>, MobError> {
+        let now = Instant::now();
+        let mut correlations = self.request_correlations();
+        correlations.retain(|_, state| match state {
+            SupervisorRequestCorrelationState::Active => true,
+            SupervisorRequestCorrelationState::TimedOut(at) => {
+                now.duration_since(*at) < SUPERVISOR_REQUEST_TOMBSTONE_TTL
+            }
+        });
+        if correlations.len() >= SUPERVISOR_REQUEST_CORRELATION_CAPACITY {
+            return Err(MobError::CommsError(
+                meerkat_core::comms::SendError::Validation(format!(
+                    "supervisor request correlation registry at capacity ({SUPERVISOR_REQUEST_CORRELATION_CAPACITY})"
+                )),
+            ));
+        }
+        correlations.insert(envelope_id, SupervisorRequestCorrelationState::Active);
+        drop(correlations);
+        Ok(SupervisorRequestCorrelationGuard {
+            bridge: self,
+            runtime,
+            envelope_id,
+            armed: true,
+        })
+    }
+
+    fn finish_request_correlation(&self, envelope_id: uuid::Uuid) {
+        self.request_correlations().remove(&envelope_id);
+    }
+
+    fn tombstone_request_correlation(&self, envelope_id: uuid::Uuid) {
+        self.request_correlations().insert(
+            envelope_id,
+            SupervisorRequestCorrelationState::TimedOut(Instant::now()),
+        );
+    }
+
+    fn consume_tombstoned_response(&self, candidate: &PeerInputCandidate) -> bool {
+        let InteractionContent::Response { in_reply_to, .. } = &candidate.interaction.content
+        else {
+            return false;
+        };
+        let mut correlations = self.request_correlations();
+        if matches!(
+            correlations.get(&in_reply_to.0),
+            Some(SupervisorRequestCorrelationState::TimedOut(_))
+        ) {
+            correlations.remove(&in_reply_to.0);
+            tracing::debug!(
+                corr_id = %in_reply_to.0,
+                "supervisor bridge discarded a late response for a timed-out request"
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    fn terminalize_ambiguous_request(
+        &self,
+        runtime: &Arc<meerkat_comms::CommsRuntime>,
+        envelope_id: uuid::Uuid,
+    ) -> Result<(), MobError> {
+        self.tombstone_request_correlation(envelope_id);
+        Self::record_request_timed_out(runtime, envelope_id)
+    }
+
     async fn wait_for_response(
         &self,
         runtime: &Arc<meerkat_comms::CommsRuntime>,
@@ -2589,6 +2840,22 @@ impl MobSupervisorBridge {
         timeout: Duration,
     ) -> Result<serde_json::Value, MobError> {
         let deadline = BridgeRequestDeadline::start(timeout);
+        let result = self
+            .wait_for_response_before(runtime, request_envelope_id, expected_responder, &deadline)
+            .await;
+        if matches!(result, Err(MobError::BridgeRequestTimedOut { .. })) {
+            self.terminalize_ambiguous_request(runtime, request_envelope_id)?;
+        }
+        result
+    }
+
+    async fn wait_for_response_before(
+        &self,
+        runtime: &Arc<meerkat_comms::CommsRuntime>,
+        request_envelope_id: uuid::Uuid,
+        expected_responder: PeerId,
+        deadline: &BridgeRequestDeadline,
+    ) -> Result<serde_json::Value, MobError> {
         let inbox_notify = runtime.inbox_notify();
         loop {
             // Register both waiters BEFORE checking the buffer and draining:
@@ -2597,7 +2864,7 @@ impl MobSupervisorBridge {
             // response the upcall responder pushes via
             // `buffer_foreign_candidates` between the drain below and the
             // trailing select would otherwise be a lost wake (the comms
-            // `recv_message` discipline).
+            // exact volatile-control receive discipline).
             let mut inbox_notified = std::pin::pin!(inbox_notify.notified());
             inbox_notified.as_mut().enable();
             let mut intake_notified = std::pin::pin!(self.intake_notify.notified());
@@ -2606,47 +2873,63 @@ impl MobSupervisorBridge {
             // Re-check the shared buffer at EVERY loop head: a responder-
             // drained Response lands here via `buffer_foreign_candidates`
             // (DEC-U3), not on the inbox.
-            if let Some(result) = self
-                .take_buffered_response(runtime, request_envelope_id, expected_responder)
-                .await?
+            if let Some(result) = deadline
+                .run(self.take_buffered_response(runtime, request_envelope_id, expected_responder))
+                .await
+                .map_err(|_| {
+                    Self::bridge_request_timeout(&request_envelope_id.to_string(), deadline.timeout)
+                })??
             {
                 return Ok(result);
             }
-            let drained = runtime.drain_peer_input_candidates().await;
-            if let Some(result) = self
-                .buffer_and_extract(runtime, drained, request_envelope_id, expected_responder)
-                .await?
+            let drained = deadline
+                .run(runtime.handoff_volatile_peer_input_candidates())
+                .await
+                .map_err(|_| {
+                    Self::bridge_request_timeout(&request_envelope_id.to_string(), deadline.timeout)
+                })?
+                .map_err(|error| MobError::Internal(error.to_string()))?;
+            if let Some(result) = deadline
+                .run(self.buffer_and_extract(
+                    runtime,
+                    drained,
+                    request_envelope_id,
+                    expected_responder,
+                ))
+                .await
+                .map_err(|_| {
+                    Self::bridge_request_timeout(&request_envelope_id.to_string(), deadline.timeout)
+                })??
             {
                 return Ok(result);
             }
 
             let remaining = deadline.remaining();
             if remaining.is_zero() {
-                Self::record_request_timed_out(runtime, request_envelope_id)?;
                 // Typed timeout (not an `Internal` string): the multi-host
                 // materialize dispatcher's ADJ-4 resend classification keys
                 // on this class, so it must be a variant, never a substring.
                 return Err(MobError::BridgeRequestTimedOut {
                     request_envelope_id: request_envelope_id.to_string(),
-                    timeout_ms: timeout.as_millis() as u64,
+                    timeout_ms: deadline.timeout.as_millis() as u64,
                 });
             }
 
-            let woke = tokio::time::timeout(remaining, async {
-                tokio::select! {
-                    () = inbox_notified.as_mut() => {}
-                    () = intake_notified.as_mut() => {}
-                }
-            })
-            .await;
+            let woke = deadline
+                .run(async {
+                    tokio::select! {
+                        () = inbox_notified.as_mut() => {}
+                        () = intake_notified.as_mut() => {}
+                    }
+                })
+                .await;
             if woke.is_err() {
-                Self::record_request_timed_out(runtime, request_envelope_id)?;
                 // Typed timeout (not an `Internal` string): the multi-host
                 // materialize dispatcher's ADJ-4 resend classification keys
                 // on this class, so it must be a variant, never a substring.
                 return Err(MobError::BridgeRequestTimedOut {
                     request_envelope_id: request_envelope_id.to_string(),
-                    timeout_ms: timeout.as_millis() as u64,
+                    timeout_ms: deadline.timeout.as_millis() as u64,
                 });
             }
         }
@@ -2663,6 +2946,9 @@ impl MobSupervisorBridge {
         let mut matched = None;
 
         while let Some(candidate) = buffered.pop_front() {
+            if self.consume_tombstoned_response(&candidate) {
+                continue;
+            }
             let outcome = Self::response_outcome(&candidate, request_envelope_id)?;
             if outcome.is_some()
                 && !Self::responder_identity_matches(&candidate, expected_responder)
@@ -2704,6 +2990,9 @@ impl MobSupervisorBridge {
         let mut retained_any = false;
 
         for candidate in drained {
+            if self.consume_tombstoned_response(&candidate) {
+                continue;
+            }
             let outcome = Self::response_outcome(&candidate, request_envelope_id)?;
             if outcome.is_some()
                 && !Self::responder_identity_matches(&candidate, expected_responder)
@@ -2890,13 +3179,18 @@ enum SupervisorResponseOutcome {
 #[derive(Debug)]
 struct BridgeRequestDeadline {
     started: Instant,
+    expires_at: Instant,
     timeout: Duration,
 }
 
 impl BridgeRequestDeadline {
     fn start(timeout: Duration) -> Self {
+        let started = Instant::now();
         Self {
-            started: Instant::now(),
+            started,
+            // Overflow is not a usable operation budget. Fail closed at the
+            // already-observed instant instead of panicking in production.
+            expires_at: started.checked_add(timeout).unwrap_or(started),
             timeout,
         }
     }
@@ -2907,6 +3201,24 @@ impl BridgeRequestDeadline {
 
     fn remaining_after(timeout: Duration, elapsed: Duration) -> Duration {
         timeout.saturating_sub(elapsed)
+    }
+
+    async fn run<F>(&self, future: F) -> Result<F::Output, ()>
+    where
+        F: std::future::Future,
+    {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(self.expires_at), future)
+                .await
+                .map_err(|_| ())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            tokio::time::timeout(self.remaining(), future)
+                .await
+                .map_err(|_| ())
+        }
     }
 }
 
@@ -3165,7 +3477,12 @@ mod tests {
     ) -> PeerInputCandidate {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(candidate) = runtime.drain_peer_input_candidates().await.pop() {
+                if let Some(candidate) = runtime
+                    .handoff_volatile_peer_input_candidates()
+                    .await
+                    .expect("volatile peer-input handoff")
+                    .pop()
+                {
                     break candidate;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3398,10 +3715,6 @@ mod tests {
         .await
         .expect("supervisor runtime should build");
 
-        assert!(
-            runtime.peer_comms_machine_authority_required(),
-            "supervisor bridge ingress must fail closed without generated peer-comms authority"
-        );
         assert!(
             runtime.peer_comms_handle().is_some(),
             "supervisor bridge ingress terminality must come from generated peer-comms authority"
@@ -5184,6 +5497,256 @@ mod tests {
         );
 
         bridge.shutdown().await;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn supervisor_request_deadline_bounds_ack_wedge_and_cancel_releases_authority() {
+        let suffix = uuid::Uuid::new_v4();
+        let authority = SupervisorAuthorityRecord::generate(
+            super::super::bridge_protocol::SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
+        );
+        let config = super::super::builder::ControllingAcceptorConfig::new(
+            "127.0.0.1:0".parse().expect("loopback address"),
+            None,
+            Arc::new(NoLocalAcceptorMaterial),
+        );
+        let bridge = Arc::new(
+            MobSupervisorBridge::new_with_controlling_acceptor(
+                &crate::MobId::from(format!("mob/bridge-send-deadline-{suffix}")),
+                authority,
+                None,
+                Some(config),
+            )
+            .await
+            .expect("supervisor bridge should build"),
+        );
+        let remote_authority = SupervisorAuthorityRecord::generate(
+            super::super::bridge_protocol::SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind deterministic ACK wedge");
+        let blackhole_address = listener.local_addr().expect("read ACK wedge address");
+        let blackhole = TrustedPeerDescriptor::unsigned_with_pubkey(
+            format!("ack-wedge-{suffix}"),
+            remote_authority.public_peer_id.clone(),
+            *remote_authority.keypair().public_key().as_bytes(),
+            format!("tcp://{blackhole_address}"),
+        )
+        .expect("blackhole peer descriptor");
+        bridge
+            .trust_recipient(&blackhole)
+            .await
+            .expect("trust deterministic ACK wedge");
+
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let blackhole_task = tokio::spawn(async move {
+            let mut held_streams = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held_streams.push(stream);
+                let _ = accepted_tx.send(());
+            }
+        });
+
+        // Cancellation after TCP acceptance must drop the exact correlation
+        // guard, terminalize the admitted peer interaction, and release the
+        // bridge read gate. It must not leave an immortal Active row.
+        let cancelled_bridge = Arc::clone(&bridge);
+        let cancelled_recipient = blackhole.clone();
+        let cancelled = tokio::spawn(async move {
+            cancelled_bridge
+                .request_json(
+                    &cancelled_recipient,
+                    super::super::bridge_protocol::SUPERVISOR_BRIDGE_INTENT,
+                    &serde_json::json!({"probe": "cancel-after-write"}),
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx.recv())
+            .await
+            .expect("cancelled request should connect")
+            .expect("ACK wedge should remain alive");
+        cancelled.abort();
+        assert!(
+            cancelled
+                .await
+                .expect_err("request task should be cancelled")
+                .is_cancelled()
+        );
+        let cancelled_gate =
+            tokio::time::timeout(Duration::from_millis(250), bridge.authority_gate.write())
+                .await
+                .expect("cancellation must release bridge authority serialization");
+        drop(cancelled_gate);
+        assert!(
+            bridge
+                .request_correlations()
+                .values()
+                .all(|state| matches!(state, SupervisorRequestCorrelationState::TimedOut(_))),
+            "cancellation must not leak an Active correlation"
+        );
+
+        // The same absolute request deadline bounds the transport ACK wait,
+        // not only the later response wait. The transport result is ambiguous
+        // because the framed request may have reached the receiver.
+        let started = Instant::now();
+        let error = bridge
+            .request_json(
+                &blackhole,
+                super::super::bridge_protocol::SUPERVISOR_BRIDGE_INTENT,
+                &serde_json::json!({"probe": "deadline-after-write"}),
+                Duration::from_millis(80),
+            )
+            .await
+            .expect_err("ACK wedge must terminate at the one request deadline");
+        assert!(
+            matches!(
+                error,
+                MobError::CommsError(meerkat_core::comms::SendError::AmbiguousDelivery { .. })
+            ),
+            "post-write deadline must remain an ambiguous send"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "ACK wedge must not outlive the request deadline"
+        );
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx.recv())
+            .await
+            .expect("deadline request should connect")
+            .expect("ACK wedge should remain alive");
+        let deadline_gate =
+            tokio::time::timeout(Duration::from_millis(250), bridge.authority_gate.write())
+                .await
+                .expect("deadline expiry must release bridge authority serialization");
+        drop(deadline_gate);
+
+        // Rebuild the same peer identity on a healthy runtime, update only its
+        // endpoint projection, and prove the exact retry can converge. Stale
+        // timeout rows remain tombstones, never Active routing authority.
+        blackhole_task.abort();
+        let (remote_runtime, remote_dsl) = MobSupervisorBridge::build_runtime(
+            &format!("ack-wedge-{suffix}"),
+            &remote_authority,
+            &SupervisorBridgeEndpointConfig::default(),
+        )
+        .await
+        .expect("healthy replacement runtime should build");
+        let remote = TrustedPeerDescriptor::unsigned_with_pubkey(
+            format!("ack-wedge-{suffix}"),
+            remote_authority.public_peer_id.clone(),
+            *remote_authority.keypair().public_key().as_bytes(),
+            remote_runtime.advertised_address(),
+        )
+        .expect("healthy replacement descriptor");
+        bridge
+            .untrust_recipient(&blackhole)
+            .await
+            .expect("remove the stale ACK-wedge endpoint projection");
+        bridge
+            .trust_recipient(&remote)
+            .await
+            .expect("replace the exact peer endpoint projection");
+        let supervisor = bridge
+            .supervisor_spec_for_recipient(&remote)
+            .await
+            .expect("healthy runtime supervisor descriptor");
+        MobSupervisorBridge::apply_bridge_trust(
+            &bridge.trust_reconcile_gate,
+            &remote_runtime,
+            &remote_dsl,
+            supervisor,
+        )
+        .await
+        .expect("healthy runtime should trust the supervisor");
+
+        let retry_bridge = Arc::clone(&bridge);
+        let retry_recipient = remote.clone();
+        let retry = tokio::spawn(async move {
+            retry_bridge
+                .request_json(
+                    &retry_recipient,
+                    super::super::bridge_protocol::SUPERVISOR_BRIDGE_INTENT,
+                    &serde_json::json!({"probe": "retry-after-ambiguous-send"}),
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let candidate = next_remote_candidate(&remote_runtime).await;
+        reply_to_remote_candidate(
+            &remote_runtime,
+            candidate,
+            serde_json::json!({"retried": true}),
+        )
+        .await;
+        assert_eq!(
+            retry
+                .await
+                .expect("retry task should not panic")
+                .expect("exact retry should converge"),
+            serde_json::json!({"retried": true})
+        );
+        assert!(
+            bridge
+                .request_correlations()
+                .values()
+                .all(|state| matches!(state, SupervisorRequestCorrelationState::TimedOut(_))),
+            "successful retry must remove its Active correlation"
+        );
+
+        bridge.shutdown().await;
+        remote_runtime.stop_listeners_for_rebind().await;
+    }
+
+    #[tokio::test]
+    async fn expired_transport_deadline_is_admitted_before_ambiguous_timeout() {
+        let authority = SupervisorAuthorityRecord::generate(
+            super::super::bridge_protocol::SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
+        );
+        let (runtime, _dsl) = MobSupervisorBridge::build_runtime(
+            "mob/__mob_supervisor__/expired-send-deadline",
+            &authority,
+            &SupervisorBridgeEndpointConfig::default(),
+        )
+        .await
+        .expect("supervisor runtime should build");
+        let remote_authority = SupervisorAuthorityRecord::generate(
+            super::super::bridge_protocol::SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
+        );
+        let envelope_id = uuid::Uuid::new_v4();
+        let corr_id = meerkat_core::PeerCorrelationId::from_uuid(envelope_id);
+        let error = runtime
+            .send_peer_request_with_id_before(
+                envelope_id,
+                PeerRoute::with_display_name(
+                    remote_authority.keypair().public_key().to_peer_id(),
+                    meerkat_core::comms::PeerName::new("expired-deadline-peer")
+                        .expect("valid peer name"),
+                ),
+                super::super::bridge_protocol::SUPERVISOR_BRIDGE_INTENT,
+                serde_json::json!({"probe": "already-expired"}),
+                Instant::now(),
+            )
+            .await
+            .expect_err("already-expired I/O deadline must be ambiguous after admission");
+        assert!(matches!(
+            error,
+            meerkat_core::comms::SendError::AmbiguousDelivery {
+                envelope_id: observed,
+                ..
+            } if observed == envelope_id
+        ));
+        let handle = runtime
+            .peer_interaction_handle()
+            .expect("supervisor runtime installs peer interaction authority");
+        assert!(
+            handle.outbound_state(corr_id).is_some(),
+            "request_sent must precede observation of the expired I/O deadline"
+        );
+        MobSupervisorBridge::record_request_timed_out(&runtime, envelope_id)
+            .expect("ambiguous expired send remains exactly terminalizable");
+        assert_eq!(handle.outbound_state(corr_id), None);
     }
 
     #[tokio::test]

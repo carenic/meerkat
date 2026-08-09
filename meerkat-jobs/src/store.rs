@@ -11,7 +11,8 @@ use meerkat_core::SessionId;
 use crate::machines::detached_job::{DetachedJobMachineAuthority, DetachedJobMachineState};
 use crate::{
     DetachedJobError, JobId, JobOutboxEntry, JobOutboxPayload, JobProgress, JobSpec,
-    JobSubmissionKey, JobTerminalResult,
+    JobSubmissionKey, JobTerminalResult, PredicateDeliveryCommit, PredicateDeliveryIdempotencyKey,
+    PredicateDeliveryIdentity, PredicateDeliveryReceipt,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +34,19 @@ pub enum InsertJobOutcome {
     Existing(StoredJob),
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum PredicateDeliveryCommitOutcome {
+    Committed {
+        job: StoredJob,
+        receipt: PredicateDeliveryReceipt,
+    },
+    Deduplicated {
+        job: StoredJob,
+        receipt: PredicateDeliveryReceipt,
+    },
+}
+
 #[async_trait]
 pub trait DetachedJobStore: Send + Sync {
     async fn insert_deduplicated(
@@ -47,6 +61,36 @@ pub trait DetachedJobStore: Send + Sync {
         expected_revision: u64,
         replacement: StoredJob,
     ) -> Result<StoredJob, DetachedJobError>;
+
+    /// Read the immutable result for one exact predicate delivery identity.
+    ///
+    /// The default fails closed. Stores that host scheduled predicates must
+    /// implement this together with [`Self::commit_predicate_delivery`].
+    async fn predicate_delivery_receipt(
+        &self,
+        _job_id: &JobId,
+        _identity: &PredicateDeliveryIdentity,
+    ) -> Result<Option<PredicateDeliveryReceipt>, DetachedJobError> {
+        Err(DetachedJobError::Store(
+            "detached-job store does not support predicate delivery idempotency".into(),
+        ))
+    }
+
+    /// Atomically replace a job and insert its stable predicate result.
+    ///
+    /// Implementations must commit both halves or neither. Exact retries
+    /// return the original receipt. Reusing the key with another occurrence
+    /// or runnable must fail closed.
+    async fn commit_predicate_delivery(
+        &self,
+        _expected_revision: u64,
+        _replacement: StoredJob,
+        _commit: PredicateDeliveryCommit,
+    ) -> Result<PredicateDeliveryCommitOutcome, DetachedJobError> {
+        Err(DetachedJobError::Store(
+            "detached-job store does not support atomic predicate delivery commits".into(),
+        ))
+    }
 
     async fn list_pending_outbox(
         &self,
@@ -71,12 +115,16 @@ pub trait DetachedJobStore: Send + Sync {
 pub struct MemoryDetachedJobStoreSnapshot {
     jobs: BTreeMap<JobId, StoredJob>,
     submission_index: BTreeMap<(String, JobSubmissionKey), JobId>,
+    predicate_deliveries:
+        BTreeMap<(JobId, PredicateDeliveryIdempotencyKey), PredicateDeliveryReceipt>,
 }
 
 #[derive(Debug, Default)]
 struct MemoryDetachedJobStoreState {
     jobs: BTreeMap<JobId, StoredJob>,
     submission_index: BTreeMap<(String, JobSubmissionKey), JobId>,
+    predicate_deliveries:
+        BTreeMap<(JobId, PredicateDeliveryIdempotencyKey), PredicateDeliveryReceipt>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -115,10 +163,19 @@ impl MemoryDetachedJobStore {
                 )));
             }
         }
+        for ((job_id, idempotency_key), receipt) in &snapshot.predicate_deliveries {
+            let job = snapshot.jobs.get(job_id).ok_or_else(|| {
+                DetachedJobError::Store(format!(
+                    "predicate delivery index points to missing job {job_id}"
+                ))
+            })?;
+            validate_predicate_delivery_receipt(job, idempotency_key, receipt)?;
+        }
         Ok(Self {
             inner: Arc::new(RwLock::new(MemoryDetachedJobStoreState {
                 jobs: snapshot.jobs,
                 submission_index: snapshot.submission_index,
+                predicate_deliveries: snapshot.predicate_deliveries,
             })),
         })
     }
@@ -128,6 +185,7 @@ impl MemoryDetachedJobStore {
         MemoryDetachedJobStoreSnapshot {
             jobs: guard.jobs.clone(),
             submission_index: guard.submission_index.clone(),
+            predicate_deliveries: guard.predicate_deliveries.clone(),
         }
     }
 
@@ -202,26 +260,88 @@ impl DetachedJobStore for MemoryDetachedJobStore {
             .jobs
             .get(&replacement.job_id)
             .ok_or_else(|| DetachedJobError::NotFound(replacement.job_id.clone()))?;
-        if current.revision != expected_revision {
-            return Err(DetachedJobError::StaleRevision {
-                job_id: replacement.job_id.clone(),
-                expected: expected_revision,
-                actual: current.revision,
-            });
-        }
-        if current.spec.submission_key != replacement.spec.submission_key
-            || !current.spec.equivalent_submission(&replacement.spec)
-        {
-            return Err(DetachedJobError::Store(
-                "compare-and-swap cannot change the submitted job specification".into(),
-            ));
-        }
-        validate_stored_job(&replacement)?;
+        validate_job_replacement(current, expected_revision, &replacement)?;
         replacement.revision = next_revision(expected_revision)?;
         guard
             .jobs
             .insert(replacement.job_id.clone(), replacement.clone());
         Ok(replacement)
+    }
+
+    async fn predicate_delivery_receipt(
+        &self,
+        job_id: &JobId,
+        identity: &PredicateDeliveryIdentity,
+    ) -> Result<Option<PredicateDeliveryReceipt>, DetachedJobError> {
+        let guard = self.inner.read().await;
+        if !guard.jobs.contains_key(job_id) {
+            return Err(DetachedJobError::NotFound(job_id.clone()));
+        }
+        let Some(receipt) = guard
+            .predicate_deliveries
+            .get(&(job_id.clone(), identity.idempotency_key().clone()))
+        else {
+            return Ok(None);
+        };
+        ensure_same_predicate_delivery_identity(job_id, &receipt.identity, identity)?;
+        Ok(Some(receipt.clone()))
+    }
+
+    async fn commit_predicate_delivery(
+        &self,
+        expected_revision: u64,
+        mut replacement: StoredJob,
+        commit: PredicateDeliveryCommit,
+    ) -> Result<PredicateDeliveryCommitOutcome, DetachedJobError> {
+        let mut guard = self.inner.write().await;
+        let ledger_key = (
+            replacement.job_id.clone(),
+            commit.identity.idempotency_key().clone(),
+        );
+        if let Some(receipt) = guard.predicate_deliveries.get(&ledger_key) {
+            ensure_same_predicate_delivery_identity(
+                &replacement.job_id,
+                &receipt.identity,
+                &commit.identity,
+            )?;
+            let job = guard
+                .jobs
+                .get(&replacement.job_id)
+                .ok_or_else(|| DetachedJobError::NotFound(replacement.job_id.clone()))?
+                .clone();
+            return Ok(PredicateDeliveryCommitOutcome::Deduplicated {
+                job,
+                receipt: receipt.clone(),
+            });
+        }
+        let current = guard
+            .jobs
+            .get(&replacement.job_id)
+            .ok_or_else(|| DetachedJobError::NotFound(replacement.job_id.clone()))?;
+        validate_job_replacement(current, expected_revision, &replacement)?;
+        replacement.revision = next_revision(expected_revision)?;
+        let receipt = PredicateDeliveryReceipt {
+            job_id: replacement.job_id.clone(),
+            identity: commit.identity,
+            committed_revision: replacement.revision,
+            evaluation: commit.evaluation,
+            notification: commit.notification,
+        };
+        validate_predicate_delivery_receipt(
+            &replacement,
+            receipt.identity.idempotency_key(),
+            &receipt,
+        )?;
+        guard
+            .jobs
+            .insert(replacement.job_id.clone(), replacement.clone());
+        guard
+            .predicate_deliveries
+            .insert(ledger_key, receipt.clone());
+        Ok(PredicateDeliveryCommitOutcome::Committed {
+            job: replacement,
+            receipt,
+        })
     }
 
     async fn list_pending_outbox(
@@ -289,6 +409,91 @@ pub(crate) fn next_revision(current: u64) -> Result<u64, DetachedJobError> {
     current.checked_add(1).ok_or_else(|| {
         DetachedJobError::Store("detached job revision exhausted u64 authority".into())
     })
+}
+
+pub(crate) fn validate_job_replacement(
+    current: &StoredJob,
+    expected_revision: u64,
+    replacement: &StoredJob,
+) -> Result<(), DetachedJobError> {
+    if current.revision != expected_revision {
+        return Err(DetachedJobError::StaleRevision {
+            job_id: replacement.job_id.clone(),
+            expected: expected_revision,
+            actual: current.revision,
+        });
+    }
+    if current.spec.submission_key != replacement.spec.submission_key
+        || !current.spec.equivalent_submission(&replacement.spec)
+    {
+        return Err(DetachedJobError::Store(
+            "compare-and-swap cannot change the submitted job specification".into(),
+        ));
+    }
+    validate_stored_job(replacement)
+}
+
+pub(crate) fn ensure_same_predicate_delivery_identity(
+    job_id: &JobId,
+    committed: &PredicateDeliveryIdentity,
+    requested: &PredicateDeliveryIdentity,
+) -> Result<(), DetachedJobError> {
+    if committed == requested {
+        return Ok(());
+    }
+    Err(DetachedJobError::Store(format!(
+        "predicate delivery key {} for job {job_id} is already bound to occurrence {} and runnable {}, not occurrence {} and runnable {}",
+        requested.idempotency_key(),
+        committed.occurrence_id(),
+        committed.runnable(),
+        requested.occurrence_id(),
+        requested.runnable(),
+    )))
+}
+
+pub(crate) fn validate_predicate_delivery_receipt(
+    job: &StoredJob,
+    idempotency_key: &PredicateDeliveryIdempotencyKey,
+    receipt: &PredicateDeliveryReceipt,
+) -> Result<(), DetachedJobError> {
+    if receipt.job_id != job.job_id {
+        return Err(DetachedJobError::Store(format!(
+            "predicate delivery receipt job {} disagrees with ledger job {}",
+            receipt.job_id, job.job_id
+        )));
+    }
+    if receipt.identity.idempotency_key() != idempotency_key {
+        return Err(DetachedJobError::Store(format!(
+            "predicate delivery ledger key disagrees with receipt for job {}",
+            job.job_id
+        )));
+    }
+    if receipt.committed_revision == 0 || receipt.committed_revision > job.revision {
+        return Err(DetachedJobError::Store(format!(
+            "predicate delivery receipt revision {} is invalid for job {} at revision {}",
+            receipt.committed_revision, job.job_id, job.revision
+        )));
+    }
+    let validated_key =
+        PredicateDeliveryIdempotencyKey::new(receipt.identity.idempotency_key().as_str())?;
+    if &validated_key != receipt.identity.idempotency_key() {
+        return Err(DetachedJobError::Store(format!(
+            "predicate delivery receipt key is non-canonical for job {}",
+            job.job_id
+        )));
+    }
+    let validated = PredicateDeliveryIdentity::new(
+        validated_key,
+        receipt.identity.occurrence_id(),
+        receipt.identity.runnable(),
+    )?;
+    if validated != receipt.identity {
+        return Err(DetachedJobError::Store(format!(
+            "predicate delivery receipt identity is non-canonical for job {}",
+            job.job_id
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_stored_job(job: &StoredJob) -> Result<(), DetachedJobError> {

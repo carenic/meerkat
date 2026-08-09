@@ -554,7 +554,7 @@ impl LiveProjectionSink for ServiceLiveProjection {
         &self,
         session_id: &SessionId,
         stop_reason: StopReason,
-        usage: Usage,
+        usage: meerkat_core::TurnUsage,
         response_id: Option<&str>,
     ) -> Result<(), LiveProjectionError> {
         // CC2: synthesize AssistantTurnCompleted so the staging materializer
@@ -589,9 +589,14 @@ impl LiveProjectionSink for ServiceLiveProjection {
             return Ok(());
         }
         let usage_for_drain = if realtime_materialized {
-            Usage::default()
+            meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Other,
+                "realtime-usage-already-recorded",
+                Usage::default(),
+            )
+            .into_inner()
         } else {
-            usage
+            usage.into_inner()
         };
         self.service
             .append_external_assistant_output(session_id, blocks, stop_reason, usage_for_drain)

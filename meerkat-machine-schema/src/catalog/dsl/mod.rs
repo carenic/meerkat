@@ -2404,6 +2404,7 @@ runtime_internal_inputs!(
         AbandonInput,
         AbandonLiveOpenAdmission,
         AbortCancelAfterBoundaryDispatch,
+        CancelAfterBoundaryForRun,
         AbortOp,
         AcknowledgeTerminal,
         AddDirectPeerEndpoint,
@@ -2464,6 +2465,7 @@ runtime_internal_inputs!(
         ForceCancelNoRun,
         IncrementAttemptCount,
         InterruptCurrentRun,
+        InterruptCurrentRunForRun,
         InteractionStreamAbandoned,
         InteractionStreamAttached,
         InteractionStreamClosedEarly,
@@ -4231,6 +4233,23 @@ pub fn workgraph_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                 ],
             ),
             NamedTypeBinding::string_enum(
+                "FailedChildJoinPolicy",
+                &["RequireSuccess", "Propagate", "Accept"],
+            ),
+            NamedTypeBinding::string_enum(
+                "CancelledChildJoinPolicy",
+                &["RequireSuccess", "Propagate", "Accept"],
+            ),
+            NamedTypeBinding::string_enum(
+                "ChildJoinDisposition",
+                &[
+                    "Waiting",
+                    "Satisfied",
+                    "PropagateFailure",
+                    "PropagateCancellation",
+                ],
+            ),
+            NamedTypeBinding::string_enum(
                 "WorkOwnerKind",
                 &["Principal", "Agent", "Session", "Mob", "Label"],
             ),
@@ -4254,6 +4273,7 @@ pub fn workgraph_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                     "InvalidTransition",
                     "InvalidInput",
                     "InvalidTimestampMillis",
+                    "NamespaceAssignmentRequired",
                     "Store",
                     "UnsupportedBackend",
                 ],

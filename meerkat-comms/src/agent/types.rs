@@ -3,8 +3,9 @@
 //! These types project classified inbox entries into the format needed for
 //! injection into an agent's session.
 
-use crate::inproc::InprocRegistry;
-use crate::{InboxItem, MessageKind, PubKey};
+#[cfg(test)]
+use crate::MessageKind;
+use crate::PubKey;
 use meerkat_core::comms::PeerLifecycleKind;
 use meerkat_core::types::ContentBlock;
 use serde::{Deserialize, Serialize};
@@ -191,6 +192,7 @@ pub struct CommsMessage {
 }
 
 impl CommsMessage {
+    #[cfg(test)]
     pub(crate) fn from_external_with_resolved_peer(
         envelope: &crate::Envelope,
         from_peer: String,
@@ -203,9 +205,9 @@ impl CommsMessage {
             // This public projection is explicitly session-injectable and has
             // no access to the runtime's member-residency authority. A fenced
             // envelope must therefore stay on the structured interaction
-            // drain, where MeerkatMachine checks `expected_recipient` before
-            // admitting any work. Flattening it into `Message` here would turn
-            // the legacy drain/recv APIs into an authority bypass.
+            // candidate, where MeerkatMachine checks `expected_recipient`
+            // before admitting any work. Flattening it into `Message` here
+            // would create an authority bypass.
             MessageKind::IncarnationFencedMessage { .. } => return None,
             MessageKind::Request {
                 intent,
@@ -243,33 +245,6 @@ impl CommsMessage {
             from_pubkey: envelope.from,
             content,
         })
-    }
-
-    /// Create a `CommsMessage` from a classified inbox entry.
-    ///
-    /// Uses the ingress-stored `from_peer` identity instead of re-resolving
-    /// against live trust state, preserving snapshot semantics: a message
-    /// accepted at ingress cannot disappear or change identity if the peer
-    /// is removed/renamed before drain.
-    ///
-    /// Returns `None` for non-External items, PlainEvent, Ack messages, and
-    /// incarnation-fenced messages. Fenced messages are authority-bearing and
-    /// may only be consumed through the structured runtime interaction drain.
-    pub(crate) fn from_classified_entry(
-        entry: &crate::inbox::ClassifiedInboxEntry,
-    ) -> Option<Self> {
-        let envelope = match &entry.item {
-            InboxItem::External { envelope } => envelope,
-            InboxItem::PlainEvent { .. } => return None,
-        };
-
-        let from_peer = entry.from_peer.clone().unwrap_or_else(|| {
-            InprocRegistry::global()
-                .get_name_by_pubkey(&envelope.from)
-                .unwrap_or_else(|| envelope.from.to_pubkey_string())
-        });
-
-        Self::from_external_with_resolved_peer(envelope, from_peer)
     }
 
     /// Format this message as text suitable for injection into an LLM session.

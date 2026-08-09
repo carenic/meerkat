@@ -24,7 +24,7 @@ fn make_keypair() -> Keypair {
 #[ignore = "integration-real: socket integration + timing behavior"]
 async fn integration_real_router_unknown_peer_fails_closed() {
     let keypair = make_keypair();
-    let (_, inbox_sender) = meerkat_comms::Inbox::new();
+    let (_, inbox_sender) = meerkat_comms::Inbox::new_transport_only();
     let router = Router::new(keypair, CommsConfig::default(), inbox_sender, true);
 
     let unknown_pubkey = make_keypair().public_key();
@@ -59,11 +59,11 @@ async fn integration_real_router_inproc_peer_not_found() {
     // registration is transport presence, trust is the routing authority.
     let receiver_keypair = make_keypair();
     let receiver_pubkey = receiver_keypair.public_key();
-    let (_inbox, receiver_sender) = Inbox::new();
+    let (_inbox, receiver_sender) = Inbox::new_transport_only();
     InprocRegistry::global().register("untrusted-receiver", receiver_pubkey, receiver_sender);
 
     let sender_keypair = make_keypair();
-    let (_, inbox_sender) = meerkat_comms::Inbox::new();
+    let (_, inbox_sender) = meerkat_comms::Inbox::new_transport_only();
     let router = Router::new(sender_keypair, CommsConfig::default(), inbox_sender, true);
 
     let result = router

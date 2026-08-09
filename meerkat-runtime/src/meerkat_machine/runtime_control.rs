@@ -1301,8 +1301,9 @@ impl MeerkatMachine {
         &self,
         session_id: &SessionId,
     ) -> Result<(), RuntimeDriverError> {
-        self.cancel_after_boundary_inner_for_incarnation(session_id, None, false)
+        self.cancel_after_boundary_inner_for_incarnation(session_id, None, false, None)
             .await
+            .map(|_| ())
     }
 
     pub(super) async fn cancel_after_boundary_inner_for_incarnation(
@@ -1312,7 +1313,8 @@ impl MeerkatMachine {
             &meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation,
         >,
         fence_member_residency: bool,
-    ) -> Result<(), RuntimeDriverError> {
+        requested_run_id: Option<&meerkat_core::RunId>,
+    ) -> Result<bool, RuntimeDriverError> {
         let expected_member = expected_member.cloned();
         let (
             member_lease,
@@ -1398,10 +1400,54 @@ impl MeerkatMachine {
                 .existing_session_runtime_state(session_id)
                 .await
                 .unwrap_or(RuntimeState::Destroyed);
-            self.reject_unregistration_drain_ingress(session_id, state)
-                .await?;
-            let staged = match self
-                .stage_session_dsl_transition(
+            // An exact-run request is teardown control, not new ingress. An
+            // unregister/archive drain can begin after a queued input was
+            // admitted but before that input binds its run. Retirement must
+            // still be able to cancel that exact run once it becomes current.
+            // Ordinary and member-routed cancellation retain the Draining
+            // admission fence.
+            if requested_run_id.is_none() {
+                self.reject_unregistration_drain_ingress(session_id, state)
+                    .await?;
+            }
+            if let Some(requested_run_id) = requested_run_id {
+                let (raw_phase, current_run_id) = {
+                    let authority = captured_dsl_authority
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    (
+                        crate::meerkat_machine::dsl_authority::runtime_phase_from_authority(
+                            &authority,
+                        ),
+                        crate::meerkat_machine::dsl_authority::current_run_id_from_authority(
+                            &authority,
+                        ),
+                    )
+                };
+                if !matches!(raw_phase, RuntimeState::Running | RuntimeState::Retired)
+                    || current_run_id.as_ref() != Some(requested_run_id)
+                {
+                    return Ok(false);
+                }
+            }
+            let staged_result = if let Some(requested_run_id) = requested_run_id {
+                // The exact teardown caller already proved the current run,
+                // session gate, and DSL authority under M above. Stage on
+                // that captured authority so an unregister-owned closed
+                // handle gate cannot misclassify teardown control as a new
+                // lifecycle mutation. Its distinct generated input also owns
+                // the Retired-with-a-draining-run case without opening the
+                // ambient CancelAfterBoundary input in Retired.
+                Self::stage_dsl_transition_on_authority(
+                    &captured_dsl_authority,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::CancelAfterBoundaryForRun {
+                        run_id: crate::meerkat_machine::dsl::RunId::from_domain(requested_run_id),
+                        reason: "boundary cancel".to_string(),
+                    },
+                    "CancelAfterBoundaryForRun",
+                )
+            } else {
+                self.stage_session_dsl_transition(
                     session_id,
                     crate::meerkat_machine::dsl::MeerkatMachineInput::CancelAfterBoundary {
                         reason: "boundary cancel".to_string(),
@@ -1409,7 +1455,8 @@ impl MeerkatMachine {
                     "CancelAfterBoundary",
                 )
                 .await
-            {
+            };
+            let staged = match staged_result {
                 Ok(staged) => staged,
                 Err(_) => {
                     // Stage-first classification (dispatch_user_interrupt
@@ -1462,7 +1509,7 @@ impl MeerkatMachine {
                             .to_string(),
                     ));
                 }
-                return Ok(());
+                return Ok(true);
             };
             let expected_run_id = staged
                 .committed_snapshot
@@ -1562,11 +1609,12 @@ impl MeerkatMachine {
                 projected_effect,
                 dispatch_generation,
                 dispatch_lifecycle_phase,
+                requested_run_id.is_some(),
                 "CancelAfterBoundary",
             )
             .await?;
         drop(gate_guard);
-        Ok(())
+        Ok(true)
     }
 
     /// Stop the attached runtime executor through the out-of-band control
@@ -1854,6 +1902,7 @@ impl MeerkatMachine {
                 PublishQueued {
                     driver: crate::meerkat_machine::driver::SharedDriver,
                     completions: crate::meerkat_machine::driver::SharedCompletionRegistry,
+                    mutation_gate: Arc<crate::tokio::sync::Mutex<()>>,
                     publication_handle: Option<
                         std::sync::Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
                     >,
@@ -1867,7 +1916,7 @@ impl MeerkatMachine {
             let authority = self
                 .lock_member_effect_authority(session_id, expected_member)
                 .await?;
-            let (driver, completions, publication_handle) = {
+            let (driver, completions, mutation_gate, publication_handle) = {
                 let sessions = self.sessions.read().await;
                 let entry =
                     sessions
@@ -1879,6 +1928,7 @@ impl MeerkatMachine {
                 (
                     entry.driver.clone(),
                     entry.completions.clone(),
+                    Arc::clone(&entry.mutation_gate),
                     entry.publication_handle(),
                 )
             };
@@ -1915,6 +1965,7 @@ impl MeerkatMachine {
                                 Action::PublishQueued {
                                     driver: driver.clone(),
                                     completions: completions.clone(),
+                                    mutation_gate: Arc::clone(&mutation_gate),
                                     publication_handle: publication_handle.clone(),
                                     input_id,
                                     candidate_owner_input_id,
@@ -1933,24 +1984,65 @@ impl MeerkatMachine {
                 Action::PublishQueued {
                     driver,
                     completions,
+                    mutation_gate,
                     publication_handle,
                     input_id,
                     candidate_owner_input_id,
                 } => {
-                    // Retain `authority` across durable publication/waiter
-                    // handoff so replacement cannot overtake the exact queued
-                    // terminalization interval.
-                    crate::control_plane::publish_and_resolve_runless_runtime_termination_before(
-                        &driver,
-                        Some(&completions),
-                        publication_handle.as_deref(),
-                        &[input_id],
+                    let dispatch = match (
                         candidate_owner_input_id.as_ref(),
-                        "tracked input cancelled before run",
-                        Some(deadline),
-                    )
-                    .await?;
+                        publication_handle.clone(),
+                    ) {
+                        (Some(_), Some(publication_handle)) => {
+                            Some(self.prepare_runless_terminal_publication_dispatch(
+                                &driver,
+                                &completions,
+                                &mutation_gate,
+                                publication_handle,
+                            )?)
+                        }
+                        _ => None,
+                    };
+                    // The terminal carrier is durable and any issued
+                    // publication handle is actor-exact. Release both M and
+                    // the member-residency slot before polling arbitrary
+                    // publication IO so replacement is never pinned behind a
+                    // wedged callback.
                     drop(authority);
+                    let publication = if let Some((result_rx, start_tx)) = dispatch {
+                        if let Some(start_tx) = start_tx {
+                            let _ = start_tx.send(());
+                        }
+                        self.await_runless_terminal_publication_dispatch(
+                            &LogicalRuntimeId::for_session(session_id),
+                            result_rx,
+                            Some(deadline),
+                        )
+                        .await
+                    } else {
+                        crate::control_plane::publish_and_resolve_runless_runtime_termination_before(
+                            &driver,
+                            Some(&completions),
+                            publication_handle.as_deref(),
+                            std::slice::from_ref(&input_id),
+                            candidate_owner_input_id.as_ref(),
+                            "tracked input cancelled before run",
+                            Some(deadline),
+                        )
+                        .await
+                    };
+                    if let Err(error) = publication {
+                        if candidate_owner_input_id.is_none() {
+                            return Err(error);
+                        }
+                        crate::control_plane::converge_known_committed_runless_runtime_terminations_before(
+                            &driver,
+                            Some(&completions),
+                            publication_handle.as_deref(),
+                            Some(deadline),
+                        )
+                        .await?;
+                    }
                     return Ok(());
                 }
                 Action::CancelRun(run_id) => {
@@ -2079,7 +2171,7 @@ impl MeerkatMachine {
                 ) => return Ok(false),
                 Err(error) => return Err(error),
             };
-            let (completions, publication_handle) = {
+            let (completions, publication_handle, mutation_gate) = {
                 let sessions = self.sessions.read().await;
                 let Some(entry) = sessions.get(session_id) else {
                     return Ok(false);
@@ -2087,7 +2179,11 @@ impl MeerkatMachine {
                 if !std::sync::Arc::ptr_eq(&entry.driver, &driver) {
                     return Ok(false);
                 }
-                (entry.completions.clone(), entry.publication_handle())
+                (
+                    entry.completions.clone(),
+                    entry.publication_handle(),
+                    Arc::clone(&entry.mutation_gate),
+                )
             };
             let action = {
                 let mut driver_guard = driver.lock().await;
@@ -2137,14 +2233,40 @@ impl MeerkatMachine {
                     // carrier and then lost publication. Terminal observation
                     // is not success until canonical recovery has published
                     // that carrier and resolved its waiter.
-                    crate::control_plane::converge_known_committed_runless_runtime_terminations_before(
-                        &driver,
-                        Some(&completions),
-                        publication_handle.as_deref(),
-                        Some(deadline),
-                    )
-                    .await?;
+                    let dispatch =
+                        match self.existing_runless_terminal_publication_dispatch(&driver) {
+                            Some(result_rx) => Some((result_rx, None)),
+                            None => publication_handle
+                                .map(|publication_handle| {
+                                    self.prepare_runless_terminal_publication_dispatch(
+                                        &driver,
+                                        &completions,
+                                        &mutation_gate,
+                                        publication_handle,
+                                    )
+                                })
+                                .transpose()?,
+                        };
                     drop(authority);
+                    if let Some((result_rx, start_tx)) = dispatch {
+                        if let Some(start_tx) = start_tx {
+                            let _ = start_tx.send(());
+                        }
+                        self.await_runless_terminal_publication_dispatch(
+                            &LogicalRuntimeId::for_session(session_id),
+                            result_rx,
+                            Some(deadline),
+                        )
+                        .await?;
+                    } else {
+                        crate::control_plane::converge_known_committed_runless_runtime_terminations_before(
+                            &driver,
+                            Some(&completions),
+                            None,
+                            Some(deadline),
+                        )
+                        .await?;
+                    }
                     return Ok(true);
                 }
                 Action::PublishQueued {
@@ -2152,16 +2274,43 @@ impl MeerkatMachine {
                     publication_handle,
                     candidate_owner_input_id,
                 } => {
-                    let publication = crate::control_plane::publish_and_resolve_runless_runtime_termination_before(
-                        &driver,
-                        Some(&completions),
-                        publication_handle.as_deref(),
-                        std::slice::from_ref(input_id),
+                    let dispatch = match (
                         candidate_owner_input_id.as_ref(),
-                        &reason,
-                        Some(deadline),
-                    )
-                    .await;
+                        publication_handle.clone(),
+                    ) {
+                        (Some(_), Some(publication_handle)) => {
+                            Some(self.prepare_runless_terminal_publication_dispatch(
+                                &driver,
+                                &completions,
+                                &mutation_gate,
+                                publication_handle,
+                            )?)
+                        }
+                        _ => None,
+                    };
+                    drop(authority);
+                    let publication = if let Some((result_rx, start_tx)) = dispatch {
+                        if let Some(start_tx) = start_tx {
+                            let _ = start_tx.send(());
+                        }
+                        self.await_runless_terminal_publication_dispatch(
+                            &LogicalRuntimeId::for_session(session_id),
+                            result_rx,
+                            Some(deadline),
+                        )
+                        .await
+                    } else {
+                        crate::control_plane::publish_and_resolve_runless_runtime_termination_before(
+                            &driver,
+                            Some(&completions),
+                            None,
+                            std::slice::from_ref(input_id),
+                            candidate_owner_input_id.as_ref(),
+                            &reason,
+                            Some(deadline),
+                        )
+                        .await
+                    };
                     if let Err(error) = publication {
                         if candidate_owner_input_id.is_none() {
                             // Nondirected completion has no durable outbox to
@@ -2184,7 +2333,6 @@ impl MeerkatMachine {
                         )
                         .await?;
                     }
-                    drop(authority);
                     return Ok(true);
                 }
                 Action::CancelRun(run_id) => {

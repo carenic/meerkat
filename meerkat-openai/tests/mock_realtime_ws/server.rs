@@ -72,7 +72,11 @@ impl ScriptedEvent {
                 Some(Ok(Some(RealtimeSessionEvent::TurnCompleted {
                     response_id: "mock_response".to_string(),
                     stop_reason,
-                    usage: Default::default(),
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::Other,
+                        "mock-realtime",
+                        meerkat_core::Usage::default(),
+                    ),
                 })))
             }
             ScriptedEvent::Interrupted => Some(Ok(Some(RealtimeSessionEvent::Interrupted {

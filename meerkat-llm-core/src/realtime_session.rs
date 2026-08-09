@@ -14,7 +14,7 @@ use meerkat_core::{
 };
 use meerkat_core::{
     RealtimeOpenProjectionLease, RealtimeOpenProjectionLeaseSlot, SessionLlmIdentity, StopReason,
-    ToolDef, types::Message, types::Usage,
+    ToolDef, TurnUsage, types::Message, types::Usage,
 };
 use serde_json::Value;
 
@@ -61,7 +61,7 @@ pub enum RealtimeSessionEvent {
     TurnCompleted {
         response_id: String,
         stop_reason: StopReason,
-        usage: Usage,
+        usage: TurnUsage,
     },
     OutputTextDelta {
         delta: String,
@@ -236,7 +236,7 @@ pub struct RealtimeSessionOpenConfig {
     /// reusing or concurrently opening from another clone must acquire fresh
     /// custody instead of reusing the original reservation.
     open_projection_lease: RealtimeOpenProjectionLeaseSlot,
-    /// Exact canonical System payload sequence at projection time.
+    /// Exact provider-visible System payload sequence at projection time.
     ///
     /// This is a refresh drift witness, not a provider instruction field.
     /// Provider adapters replay the actual `Message::System` rows from
@@ -271,12 +271,17 @@ pub struct RealtimeSessionOpenConfig {
 }
 
 impl RealtimeSessionOpenConfig {
-    /// Collect exact System payloads in authored System-message order.
+    /// Collect provider-visible System payloads in authored message order.
+    /// Superseded versions of a keyed prompt remain durable but are excluded
+    /// from both provider replay and the refresh drift witness.
     #[must_use]
     pub fn canonical_system_messages(messages: &[Message]) -> Vec<String> {
+        let superseded = meerkat_core::types::superseded_system_prompt_offsets(messages);
         messages
             .iter()
-            .filter_map(|message| match message {
+            .enumerate()
+            .filter(|(offset, _)| !superseded.contains(offset))
+            .filter_map(|(_, message)| match message {
                 Message::System(system) => Some(system.content.clone()),
                 _ => None,
             })
@@ -289,6 +294,8 @@ impl RealtimeSessionOpenConfig {
         visible_tools: Vec<ToolDef>,
         seed_messages: Vec<Message>,
     ) -> Result<Self, LlmError> {
+        let seed_messages =
+            meerkat_core::types::materialize_latest_system_prompt_versions(&seed_messages);
         let canonical_system_messages = Self::canonical_system_messages(&seed_messages);
         Ok(Self::new_with_projection(
             turning_mode,
@@ -311,6 +318,8 @@ impl RealtimeSessionOpenConfig {
         seed_messages: Vec<Message>,
         canonical_messages: &[Message],
     ) -> Result<Self, LlmError> {
+        let seed_messages =
+            meerkat_core::types::materialize_latest_system_prompt_versions(&seed_messages);
         let canonical_system_messages = Self::canonical_system_messages(canonical_messages);
         Ok(Self::new_with_projection(
             turning_mode,
@@ -394,6 +403,8 @@ impl RealtimeSessionOpenConfig {
     /// Replace the canonical seed while atomically re-deriving its System
     /// drift witness.
     pub fn with_seed_messages(mut self, seed_messages: Vec<Message>) -> Result<Self, LlmError> {
+        let seed_messages =
+            meerkat_core::types::materialize_latest_system_prompt_versions(&seed_messages);
         self.canonical_system_messages = Self::canonical_system_messages(&seed_messages);
         self.seed_messages = seed_messages;
         Ok(self)
@@ -513,7 +524,10 @@ mod tests {
     use super::*;
 
     use meerkat_core::Provider;
-    use meerkat_core::types::{SystemMessage, SystemNoticeKind, SystemNoticeMessage, UserMessage};
+    use meerkat_core::types::{
+        SystemMessage, SystemNoticeKind, SystemNoticeMessage, SystemPromptKey, SystemPromptVersion,
+        SystemPromptVersionIdentity, UserMessage,
+    };
 
     fn sample_identity() -> SessionLlmIdentity {
         SessionLlmIdentity {
@@ -554,6 +568,38 @@ mod tests {
             config.canonical_system_messages_ref(),
             &["first", "", " \t ", "later"]
         );
+    }
+
+    #[test]
+    fn realtime_seed_and_drift_witness_select_latest_prompt_version() {
+        let key = SystemPromptKey::new("primary").expect("prompt key");
+        let mut first = SystemMessage::new("version one");
+        first.prompt_version = Some(SystemPromptVersionIdentity {
+            key: key.clone(),
+            version: SystemPromptVersion::INITIAL,
+        });
+        let mut second = SystemMessage::new("version two");
+        second.prompt_version = Some(SystemPromptVersionIdentity {
+            key,
+            version: SystemPromptVersion::new(2).expect("version two"),
+        });
+        let raw = vec![
+            Message::System(first),
+            Message::System(second.clone()),
+            Message::User(UserMessage::text("hello")),
+        ];
+
+        let config = RealtimeSessionOpenConfig::for_open_from_messages(
+            RealtimeTurningMode::ProviderManaged,
+            sample_identity(),
+            Vec::new(),
+            raw.clone(),
+            &raw,
+        )
+        .expect("versioned prompt projection");
+        assert_eq!(config.canonical_system_messages_ref(), &["version two"]);
+        assert_eq!(config.seed_messages().len(), 2);
+        assert_eq!(config.seed_messages()[0], Message::System(second));
     }
 
     #[test]

@@ -55,7 +55,7 @@ pub use migrate::{
 // Custom storage backends depend only on meerkat-core; existing consumers
 // of meerkat-store see no change.
 pub use meerkat_core::session_store::{
-    HeadCanonicalAuthorityCrossing, VerifiedHeadCanonicalAuthority,
+    HeadCanonicalAuthorityCrossing, HeadCanonicalStoreActivation, VerifiedHeadCanonicalAuthority,
 };
 pub use meerkat_core::{
     IncrementalSessionStore, SessionFilter, SessionHead, SessionHeadCas, SessionStore,

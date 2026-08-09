@@ -217,18 +217,45 @@ impl MeerkatMachine {
         driver: &SharedDriver,
         completions: &SharedCompletionRegistry,
         publication_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>>,
+        mutation_gate: &Arc<crate::tokio::sync::Mutex<()>>,
+        held_mutation_gate: crate::tokio::sync::OwnedMutexGuard<()>,
         input_id: &InputId,
         reason: String,
     ) -> Result<(), RuntimeDriverError> {
         let candidate_owner_input_id = self
             .commit_failed_accepted_input_terminal(driver, input_id, &reason)
             .await?;
+        let dispatch = match (
+            candidate_owner_input_id.as_ref(),
+            publication_handle.clone(),
+        ) {
+            (Some(_), Some(publication_handle)) => {
+                Some(self.prepare_runless_terminal_publication_dispatch(
+                    driver,
+                    completions,
+                    mutation_gate,
+                    publication_handle,
+                )?)
+            }
+            _ => None,
+        };
+        drop(held_mutation_gate);
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
-        let result = if candidate_owner_input_id.is_some() {
+        let result = if let Some((result_rx, start_tx)) = dispatch {
+            if let Some(start_tx) = start_tx {
+                let _ = start_tx.send(());
+            }
+            self.await_runless_terminal_publication_dispatch(
+                &LogicalRuntimeId::for_session(session_id),
+                result_rx,
+                Some(deadline),
+            )
+            .await
+        } else if candidate_owner_input_id.is_some() {
             crate::control_plane::converge_known_committed_runless_runtime_terminations_before(
                 driver,
                 Some(completions),
-                publication_handle.as_deref(),
+                None,
                 Some(deadline),
             )
             .await
@@ -264,6 +291,7 @@ impl MeerkatMachine {
         witness: &RuntimeLiveBoundaryAttachmentWitness,
         completions: &SharedCompletionRegistry,
         publication_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>>,
+        held_mutation_gate: crate::tokio::sync::OwnedMutexGuard<()>,
         input_id: &InputId,
         primary: RuntimeDriverError,
         fallback_wake: &mut AcceptedIngressFallbackWakeGuard,
@@ -275,6 +303,8 @@ impl MeerkatMachine {
                 &witness.driver,
                 completions,
                 publication_handle,
+                &witness.mutation_gate,
+                held_mutation_gate,
                 input_id,
                 reason.clone(),
             )
@@ -309,9 +339,10 @@ impl MeerkatMachine {
         witness: &RuntimeLiveBoundaryAttachmentWitness,
         completions: &SharedCompletionRegistry,
         publication_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>>,
+        held_mutation_gate: crate::tokio::sync::OwnedMutexGuard<()>,
         input_id: &InputId,
         fallback_wake: &mut AcceptedIngressFallbackWakeGuard,
-    ) -> Result<(), RuntimeDriverError> {
+    ) -> Result<crate::tokio::sync::OwnedMutexGuard<()>, RuntimeDriverError> {
         if let Err(error) = witness
             .driver
             .lock()
@@ -325,13 +356,14 @@ impl MeerkatMachine {
                     witness,
                     completions,
                     publication_handle,
+                    held_mutation_gate,
                     input_id,
                     error,
                     fallback_wake,
                 )
                 .await);
         }
-        Ok(())
+        Ok(held_mutation_gate)
     }
 
     /// Attempt one exact active-turn context injection.
@@ -400,7 +432,7 @@ impl MeerkatMachine {
         &self,
         session_id: &SessionId,
         witness: &RuntimeLiveBoundaryAttachmentWitness,
-        held_mutation_gate: crate::tokio::sync::OwnedMutexGuard<()>,
+        mut held_mutation_gate: crate::tokio::sync::OwnedMutexGuard<()>,
         input_id: &InputId,
         completions: &SharedCompletionRegistry,
         publication_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>>,
@@ -433,15 +465,17 @@ impl MeerkatMachine {
                 && steer_queue.first() != Some(input_id)
             {
                 drop(driver);
-                self.normalize_live_boundary_queued_fallback(
-                    session_id,
-                    witness,
-                    completions,
-                    publication_handle.clone(),
-                    input_id,
-                    fallback_wake,
-                )
-                .await?;
+                held_mutation_gate = self
+                    .normalize_live_boundary_queued_fallback(
+                        session_id,
+                        witness,
+                        completions,
+                        publication_handle.clone(),
+                        held_mutation_gate,
+                        input_id,
+                        fallback_wake,
+                    )
+                    .await?;
                 tracing::debug!(
                     session_id = %session_id,
                     input_id = %input_id,
@@ -463,6 +497,7 @@ impl MeerkatMachine {
                         witness,
                         completions,
                         publication_handle,
+                        held_mutation_gate,
                         input_id,
                         error,
                         fallback_wake,
@@ -481,6 +516,7 @@ impl MeerkatMachine {
                         witness,
                         completions,
                         publication_handle,
+                        held_mutation_gate,
                         input_id,
                         error,
                         fallback_wake,
@@ -520,7 +556,7 @@ impl MeerkatMachine {
             .boundary_handle
             .prepare_transient_turn_context_at_boundary(&run_id, contexts)
             .await;
-        let held_mutation_gate = Arc::clone(&witness.mutation_gate).lock_owned().await;
+        let mut held_mutation_gate = Arc::clone(&witness.mutation_gate).lock_owned().await;
 
         let revalidation = match self
             .revalidate_live_boundary_attachment(session_id, witness, &run_id, input_id)
@@ -535,6 +571,7 @@ impl MeerkatMachine {
                         witness,
                         completions,
                         publication_handle,
+                        held_mutation_gate,
                         input_id,
                         error,
                         fallback_wake,
@@ -547,15 +584,17 @@ impl MeerkatMachine {
         match revalidation {
             LiveBoundaryAttachmentRevalidation::RunAdvancedQueued => {
                 drop(prepared);
-                self.normalize_live_boundary_queued_fallback(
-                    session_id,
-                    witness,
-                    completions,
-                    publication_handle.clone(),
-                    input_id,
-                    fallback_wake,
-                )
-                .await?;
+                held_mutation_gate = self
+                    .normalize_live_boundary_queued_fallback(
+                        session_id,
+                        witness,
+                        completions,
+                        publication_handle.clone(),
+                        held_mutation_gate,
+                        input_id,
+                        fallback_wake,
+                    )
+                    .await?;
                 tracing::debug!(
                     session_id = %session_id,
                     run_id = %run_id,
@@ -616,6 +655,7 @@ impl MeerkatMachine {
                         witness,
                         completions,
                         publication_handle,
+                        held_mutation_gate,
                         input_id,
                         error,
                         fallback_wake,
@@ -628,15 +668,17 @@ impl MeerkatMachine {
         let prepared = match prepared {
             RetryableLiveBoundaryPreparation::Prepared(prepared) => prepared,
             RetryableLiveBoundaryPreparation::Unavailable { reason } => {
-                self.normalize_live_boundary_queued_fallback(
-                    session_id,
-                    witness,
-                    completions,
-                    publication_handle.clone(),
-                    input_id,
-                    fallback_wake,
-                )
-                .await?;
+                held_mutation_gate = self
+                    .normalize_live_boundary_queued_fallback(
+                        session_id,
+                        witness,
+                        completions,
+                        publication_handle.clone(),
+                        held_mutation_gate,
+                        input_id,
+                        fallback_wake,
+                    )
+                    .await?;
                 tracing::debug!(
                     session_id = %session_id,
                     run_id = %run_id,
@@ -650,15 +692,17 @@ impl MeerkatMachine {
                 ));
             }
             RetryableLiveBoundaryPreparation::Stale { reason } => {
-                self.normalize_live_boundary_queued_fallback(
-                    session_id,
-                    witness,
-                    completions,
-                    publication_handle.clone(),
-                    input_id,
-                    fallback_wake,
-                )
-                .await?;
+                held_mutation_gate = self
+                    .normalize_live_boundary_queued_fallback(
+                        session_id,
+                        witness,
+                        completions,
+                        publication_handle.clone(),
+                        held_mutation_gate,
+                        input_id,
+                        fallback_wake,
+                    )
+                    .await?;
                 tracing::debug!(
                     session_id = %session_id,
                     run_id = %run_id,
@@ -699,6 +743,7 @@ impl MeerkatMachine {
                     witness,
                     completions,
                     publication_handle,
+                    held_mutation_gate,
                     input_id,
                     error,
                     fallback_wake,
@@ -1440,7 +1485,7 @@ impl MeerkatMachine {
                 })
             }
             MeerkatMachineCommand::AcceptWithoutWake { session_id, input } => {
-                let (driver, completions, publication_handle) = {
+                let (driver, completions, mutation_gate, publication_handle) = {
                     let sessions = self.sessions.read().await;
                     let entry = sessions
                         .get(&session_id)
@@ -1450,6 +1495,7 @@ impl MeerkatMachine {
                     (
                         entry.driver.clone(),
                         entry.completions.clone(),
+                        Arc::clone(&entry.mutation_gate),
                         entry.publication_handle(),
                     )
                 };
@@ -1470,8 +1516,6 @@ impl MeerkatMachine {
                     .await?;
                 self.require_directed_terminal_publication_capability(&session_id, &input)
                     .await?;
-                let _gate_guard = gate_guard;
-
                 let (outcome, accepted_input_id) = {
                     let mut driver = driver.lock().await;
                     let resolved = driver
@@ -1532,6 +1576,8 @@ impl MeerkatMachine {
                                     &driver,
                                     &completions,
                                     publication_handle,
+                                    &mutation_gate,
+                                    gate_guard,
                                     &input_id,
                                     primary_reason.clone(),
                                 )

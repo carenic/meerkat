@@ -3744,12 +3744,14 @@ macro_rules! meerkat_catalog_machine_dsl {
             },
             NotifyDrainExited { reason: Enum<DrainExitReason> },
             InterruptCurrentRun,
+            InterruptCurrentRunForRun { run_id: RunId },
             ResolveUserInterruptPublicResult {
                 observation: Enum<UserInterruptObservationKind>,
                 target_present: bool,
                 staged_promotion_busy: bool,
             },
             CancelAfterBoundary { reason: String },
+            CancelAfterBoundaryForRun { run_id: RunId, reason: String },
             AbortCancelAfterBoundaryDispatch { dispatch_generation: u64 },
             StagePersistentFilter { filter: ToolFilter, witnesses: Map<ToolName, ToolVisibilityWitness> },
             PublishCommittedVisibleSet {
@@ -9443,8 +9445,33 @@ macro_rules! meerkat_catalog_machine_dsl {
         transition InterruptCurrentRun {
             on input InterruptCurrentRun
             guard { self.lifecycle_phase == Phase::Running }
+            guard "not_retiring" { self.pre_run_phase != Some(PreRunPhase::Retired) }
             update {}
             to Running
+            emit WakeInterrupt
+            emit RequestCancellationAtBoundary
+        }
+
+        // Exact-run hard interrupt remains available to teardown after Retire
+        // closes ambient admission while a run remains raw Running. The
+        // Retired arm is narrowly fenced recovery tolerance for legacy or
+        // partially persisted Retired+current-run states; normal Retire never
+        // creates that shape. Ambient interruption never gains a Retired arm.
+        transition InterruptCurrentRunForRunRunning {
+            on input InterruptCurrentRunForRun { run_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "run_matches_current" { self.current_run_id == Some(run_id) }
+            update {}
+            to Running
+            emit WakeInterrupt
+            emit RequestCancellationAtBoundary
+        }
+        transition InterruptCurrentRunForRunRetired {
+            on input InterruptCurrentRunForRun { run_id }
+            guard { self.lifecycle_phase == Phase::Retired }
+            guard "run_matches_current" { self.current_run_id == Some(run_id) }
+            update {}
+            to Retired
             emit WakeInterrupt
             emit RequestCancellationAtBoundary
         }
@@ -9570,6 +9597,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         transition CancelAfterBoundary {
             on input CancelAfterBoundary { reason }
             guard { self.lifecycle_phase == Phase::Running }
+            guard "not_retiring" { self.pre_run_phase != Some(PreRunPhase::Retired) }
             guard "no_dispatch_outstanding" { self.boundary_cancel_dispatch_pending == false }
             update {
                 self.boundary_cancel_dispatch_pending = true;
@@ -9590,9 +9618,61 @@ macro_rules! meerkat_catalog_machine_dsl {
         transition CancelAfterBoundaryAlreadyPending {
             on input CancelAfterBoundary { reason }
             guard { self.lifecycle_phase == Phase::Running }
+            guard "not_retiring" { self.pre_run_phase != Some(PreRunPhase::Retired) }
             guard "dispatch_outstanding" { self.boundary_cancel_dispatch_pending == true }
             update {}
             to Running
+            emit BoundaryCancelAlreadyPending
+        }
+
+        // Exact-run teardown control remains valid after Retire has closed
+        // ordinary admission while a run remains raw Running. The Retired
+        // arms are narrowly fenced recovery tolerance for legacy or partially
+        // persisted Retired+current-run states; normal Retire never creates
+        // that shape. Ambient cancellation never gains a Retired arm, and the
+        // run-id guard prevents redirecting a delayed request to a successor.
+        transition CancelAfterBoundaryForRunRunning {
+            on input CancelAfterBoundaryForRun { run_id, reason }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "run_matches_current" { self.current_run_id == Some(run_id) }
+            guard "no_dispatch_outstanding" { self.boundary_cancel_dispatch_pending == false }
+            update {
+                self.boundary_cancel_dispatch_pending = true;
+                self.boundary_cancel_dispatch_generation = self.boundary_cancel_dispatch_generation + 1;
+            }
+            to Running
+            emit RequestCancellationAtBoundary
+            emit RuntimeEffectFact { kind: RuntimeEffectKind::CancelAfterBoundary, reason: reason }
+        }
+        transition CancelAfterBoundaryForRunRetired {
+            on input CancelAfterBoundaryForRun { run_id, reason }
+            guard { self.lifecycle_phase == Phase::Retired }
+            guard "run_matches_current" { self.current_run_id == Some(run_id) }
+            guard "no_dispatch_outstanding" { self.boundary_cancel_dispatch_pending == false }
+            update {
+                self.boundary_cancel_dispatch_pending = true;
+                self.boundary_cancel_dispatch_generation = self.boundary_cancel_dispatch_generation + 1;
+            }
+            to Retired
+            emit RequestCancellationAtBoundary
+            emit RuntimeEffectFact { kind: RuntimeEffectKind::CancelAfterBoundary, reason: reason }
+        }
+        transition CancelAfterBoundaryForRunRunningAlreadyPending {
+            on input CancelAfterBoundaryForRun { run_id, reason }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "run_matches_current" { self.current_run_id == Some(run_id) }
+            guard "dispatch_outstanding" { self.boundary_cancel_dispatch_pending == true }
+            update {}
+            to Running
+            emit BoundaryCancelAlreadyPending
+        }
+        transition CancelAfterBoundaryForRunRetiredAlreadyPending {
+            on input CancelAfterBoundaryForRun { run_id, reason }
+            guard { self.lifecycle_phase == Phase::Retired }
+            guard "run_matches_current" { self.current_run_id == Some(run_id) }
+            guard "dispatch_outstanding" { self.boundary_cancel_dispatch_pending == true }
+            update {}
+            to Retired
             emit BoundaryCancelAlreadyPending
         }
 
@@ -9872,7 +9952,9 @@ macro_rules! meerkat_catalog_machine_dsl {
             emit CommittedVisibleSetPublished { revision: active_visibility_revision }
         }
 
-        // 14. Retire: from [Idle, Attached, Running, Stopped] → Retired.
+        // 14. Retire: quiescent phases move directly to Retired. A live run
+        // remains Running with a Retired pre-run phase so its existing turn
+        // terminal transitions retain authority to converge to Retired.
         // Stopped is admitted so disposal of an executor-stopped session
         // (mob archive completion, durable retire) is a machine transition
         // instead of a shell phase probe: a stopped runtime being retired is
@@ -9882,7 +9964,6 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard {
                 self.lifecycle_phase == Phase::Idle
                 || self.lifecycle_phase == Phase::Attached
-                || self.lifecycle_phase == Phase::Running
                 || self.lifecycle_phase == Phase::Stopped
             }
             guard "runtime_binding_present" {
@@ -9899,7 +9980,6 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard {
                 self.lifecycle_phase == Phase::Idle
                 || self.lifecycle_phase == Phase::Attached
-                || self.lifecycle_phase == Phase::Running
                 || self.lifecycle_phase == Phase::Stopped
             }
             guard "runtime_binding_absent" {
@@ -9909,6 +9989,33 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.runtime_stop_deferred = false;
             }
             to Retired
+        }
+        transition RetireRequestedWhileRunBound {
+            on input Retire { session_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "current_run_present" { self.current_run_id != None }
+            guard "runtime_binding_present" {
+                self.active_runtime_id != None && self.active_fence_token != None
+            }
+            update {
+                self.pre_run_phase = Some(PreRunPhase::Retired);
+                self.runtime_stop_deferred = false;
+            }
+            to Running
+            emit RuntimeRetired { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value") }
+        }
+        transition RetireRequestedWhileRunUnbound {
+            on input Retire { session_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "current_run_present" { self.current_run_id != None }
+            guard "runtime_binding_absent" {
+                self.active_runtime_id == None || self.active_fence_token == None
+            }
+            update {
+                self.pre_run_phase = Some(PreRunPhase::Retired);
+                self.runtime_stop_deferred = false;
+            }
+            to Running
         }
         transition RetireAlreadyRetired {
             on input Retire { session_id }
@@ -12201,10 +12308,9 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
         }
 
-        // Retire is admitted directly from Running and intentionally does not
-        // erase the live run witness before the durable terminal fact commits.
-        // Every closed PreRunPhase value therefore remains compatible with a
-        // durable Retired projection; lifecycle V3 persists no run witness.
+        // Retired is a quiescent raw lifecycle phase. Retirement requested
+        // during a live run remains raw Running with pre_run_phase Retired, so
+        // every direct Retired state is already a durable Retired projection.
         transition ClassifyRuntimeDurabilityRetired {
             per_phase [Idle]
             on input ClassifyRuntimeLifecycleDurability { state, pre_run_phase }
@@ -21162,6 +21268,15 @@ macro_rules! meerkat_catalog_machine_dsl {
             update {
                 self.active_filter = filter;
                 self.active_visibility_revision = revision;
+                // Witnesses authorize named filters only. Once the staged
+                // default becomes active, retaining witnesses from the
+                // predecessor filter would falsely preserve that filter's
+                // authority and can pin a resumed session to obsolete tool
+                // visibility. Capability and inherited-base filters have
+                // separate state and are intentionally untouched here.
+                if filter == ToolFilter::All {
+                    self.filter_visibility_witnesses = EmptyMap;
+                }
             }
             to Idle
             emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }

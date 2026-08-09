@@ -304,6 +304,12 @@ impl SessionStore for DefaultRangeVerbIncrementalStore {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl IncrementalSessionStore for DefaultRangeVerbIncrementalStore {
+    async fn activate_head_canonical_store(
+        &self,
+    ) -> Result<meerkat_core::HeadCanonicalStoreActivation, SessionStoreError> {
+        self.inner_inc.activate_head_canonical_store().await
+    }
+
     async fn cross_head_canonical_authority(
         &self,
         id: &SessionId,

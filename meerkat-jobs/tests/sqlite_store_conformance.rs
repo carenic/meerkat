@@ -6,8 +6,11 @@ use meerkat_core::{SessionId, ToolCredentialContextRef};
 use meerkat_jobs::{
     AttemptClaim, AttemptWriteAuthority, CanonicalArgumentsHash, DetachedJobService,
     DetachedJobStore, ExecutionIntentId, InteractionLineageId, JobProgress, JobSpec,
-    JobSubmissionKey, JobTerminalResult, MemoryDetachedJobStore, RestartClass, RunnerHandleRef,
-    RunnerIdentity, RunnerSpecificationRef, SqliteDetachedJobStore, ToolIdentity, WorkerId,
+    JobSubmissionKey, JobTerminalResult, MemoryDetachedJobStore, PredicateComparison,
+    PredicateDeliveryIdempotencyKey, PredicateDeliveryIdentity, PredicateObservation,
+    PredicatePollingPolicy, PredicateSource, PredicateWatch, PredicateWatchId, RestartClass,
+    RunnerHandleRef, RunnerIdentity, RunnerSpecificationRef, ScheduleIdRef, SqliteDetachedJobStore,
+    ToolIdentity, WorkerId,
 };
 
 fn spec(key: &str, restart_class: RestartClass) -> JobSpec {
@@ -111,6 +114,112 @@ async fn sqlite_reopen_preserves_committed_writer_authority_without_advancing_it
         )
         .await
         .expect("reopen alone must not fence the latest committed writer");
+}
+
+#[tokio::test]
+async fn sqlite_predicate_delivery_rolls_back_job_and_receipt_when_receipt_insert_fails() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("jobs.sqlite3");
+    let store = Arc::new(SqliteDetachedJobStore::open(&path).expect("open"));
+    let service = DetachedJobService::new(store);
+    let job_id = service
+        .submit(spec(
+            "sqlite-predicate-atomicity",
+            RestartClass::CheckpointResumable,
+        ))
+        .await
+        .expect("submit")
+        .job_id;
+    let claim = service
+        .claim_attempt(
+            &job_id,
+            AttemptClaim::new(
+                WorkerId::new("predicate-worker").expect("worker"),
+                100,
+                10_000,
+                RunnerHandleRef::new("predicate-runner").expect("runner handle"),
+            ),
+        )
+        .await
+        .expect("claim");
+    let write = AttemptWriteAuthority::from(&claim);
+    let watch = PredicateWatch::scheduled(
+        PredicateWatchId::new("sqlite-atomic-watch").expect("watch id"),
+        ScheduleIdRef::new("sqlite-atomic-schedule").expect("schedule id"),
+        PredicateSource::StableHttp {
+            url: "https://example.invalid/sqlite-atomic".into(),
+            conditional_requests: true,
+        },
+        PredicateComparison::Changed,
+        PredicatePollingPolicy::new(60, 1, 0, 1, 300).expect("policy"),
+    )
+    .expect("watch");
+    let identity = PredicateDeliveryIdentity::new(
+        PredicateDeliveryIdempotencyKey::new("schedule:sqlite-atomic-schedule:occurrence:first")
+            .expect("delivery key"),
+        "occurrence:first",
+        "meerkat.predicate.evaluate.v1",
+    )
+    .expect("delivery identity");
+    let before = service
+        .get(&job_id)
+        .await
+        .expect("get before")
+        .expect("job before");
+
+    let conn = rusqlite::Connection::open(&path).expect("raw open");
+    conn.execute_batch(
+        "CREATE TRIGGER fail_predicate_receipt_insert
+         BEFORE INSERT ON detached_job_predicate_deliveries
+         BEGIN
+             SELECT RAISE(ABORT, 'forced predicate receipt failure');
+         END;",
+    )
+    .expect("failure trigger");
+    drop(conn);
+
+    service
+        .evaluate_predicate_idempotent(
+            &job_id,
+            write.clone(),
+            identity.clone(),
+            &watch,
+            PredicateObservation::available("v1", "Version v1").expect("observation"),
+            200,
+        )
+        .await
+        .expect_err("receipt insertion failure must abort the whole transaction");
+    let after_failure = service
+        .get(&job_id)
+        .await
+        .expect("get after failure")
+        .expect("job after failure");
+    assert_eq!(after_failure.revision, before.revision);
+    assert_eq!(after_failure.checkpoint_ref, before.checkpoint_ref);
+    assert_eq!(after_failure.progress, before.progress);
+    assert_eq!(after_failure.outbox, before.outbox);
+    assert!(
+        !service
+            .predicate_delivery_applied(&job_id, &identity)
+            .await
+            .expect("no receipt after rollback")
+    );
+
+    let conn = rusqlite::Connection::open(&path).expect("raw reopen");
+    conn.execute_batch("DROP TRIGGER fail_predicate_receipt_insert;")
+        .expect("drop failure trigger");
+    drop(conn);
+    service
+        .evaluate_predicate_idempotent(
+            &job_id,
+            write,
+            identity,
+            &watch,
+            PredicateObservation::available("v1", "Version v1").expect("observation"),
+            300,
+        )
+        .await
+        .expect("retry after rollback");
 }
 
 #[tokio::test]
@@ -294,10 +403,10 @@ fn sqlite_open_refuses_a_jobs_schema_below_the_0_8_10_floor() {
             meerkat_sqlite::SqliteStoreError::UnsupportedSchemaPredecessor {
                 ref domain,
                 found: 1,
-                supported: 2,
+                supported: 3,
                 ref allowed,
             }
-        ) if domain == "jobs" && allowed == &[2]
+        ) if domain == "jobs" && allowed == &[2, 3]
     ));
     let version = meerkat_sqlite::domain_version(
         &meerkat_sqlite::open(&path, meerkat_sqlite::ConnectionProfile::ReadOnly)
@@ -306,6 +415,47 @@ fn sqlite_open_refuses_a_jobs_schema_below_the_0_8_10_floor() {
     )
     .expect("domain version");
     assert_eq!(version, Some(1), "refusal must not mutate the ledger");
+}
+
+#[test]
+fn sqlite_open_migrates_the_released_v2_jobs_schema_to_the_predicate_ledger() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("jobs.sqlite3");
+    let conn = rusqlite::Connection::open(&path).expect("raw open");
+    conn.execute_batch(
+        "CREATE TABLE meerkat_schema (
+             domain TEXT PRIMARY KEY,
+             version INTEGER NOT NULL
+         );
+         INSERT INTO meerkat_schema (domain, version) VALUES ('jobs', 2);
+         CREATE TABLE detached_jobs (
+             job_id TEXT PRIMARY KEY,
+             realm_id TEXT NOT NULL,
+             submission_key TEXT NOT NULL,
+             revision BLOB NOT NULL CHECK (length(revision) = 8),
+             has_pending_outbox INTEGER NOT NULL CHECK (has_pending_outbox IN (0, 1)),
+             job_json BLOB NOT NULL,
+             UNIQUE (realm_id, submission_key)
+         );
+         CREATE INDEX idx_detached_jobs_pending_outbox
+             ON detached_jobs (has_pending_outbox, job_id);",
+    )
+    .expect("released v2 schema");
+    drop(conn);
+
+    SqliteDetachedJobStore::open(&path).expect("v2 migration");
+    let conn = rusqlite::Connection::open(&path).expect("raw reopen");
+    let ledger_table: String = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            ["detached_job_predicate_deliveries"],
+            |row| row.get(0),
+        )
+        .expect("predicate ledger table");
+    assert_eq!(ledger_table, "detached_job_predicate_deliveries");
+    let version = meerkat_sqlite::domain_version(&conn, meerkat_jobs::JOBS_DOMAIN.name)
+        .expect("domain version");
+    assert_eq!(version, Some(3));
 }
 
 #[test]
@@ -331,7 +481,7 @@ fn sqlite_open_refuses_a_future_jobs_schema() {
             meerkat_sqlite::SqliteStoreError::SchemaFromTheFuture {
                 ref domain,
                 found: 999,
-                supported: 2
+                supported: 3
             }
         ) if domain == "jobs"
     ));

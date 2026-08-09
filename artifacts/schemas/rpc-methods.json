@@ -155,6 +155,12 @@
       "result_type": "SessionTranscriptRewriteResult"
     },
     {
+      "description": "Explicitly replace one durable versioned system-prompt key",
+      "name": "session/update_system_prompt",
+      "params_type": "UpdateSystemPromptParams",
+      "result_type": "SystemPromptUpdateResult"
+    },
+    {
       "description": "Read a retained immutable transcript revision body",
       "name": "session/transcript_revision",
       "params_type": "ReadSessionTranscriptRevisionParams",

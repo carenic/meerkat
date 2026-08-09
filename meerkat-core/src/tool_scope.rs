@@ -1294,6 +1294,11 @@ struct ToolScopeState {
     deferred_tool_names: ToolNameSet,
     active_turn_allow: Option<ToolNameSet>,
     active_turn_deny: ToolNameSet,
+    // Observational intersection only: generated authority owns the accepted
+    // turn allow/deny set, the immutable catalog owns exact definition
+    // identity, and the dispatcher owns execution authority. This projection
+    // cannot add a definition or authorize dispatch.
+    active_turn_deferred_names: ToolNameSet,
 }
 
 /// Projection payload accepted by the generated turn-overlay authority.
@@ -1441,6 +1446,7 @@ impl ToolScope {
                 deferred_tool_names,
                 active_turn_allow: None,
                 active_turn_deny: ToolNameSet::new(),
+                active_turn_deferred_names: ToolNameSet::new(),
             })),
             visibility_owner,
             visibility_authority,
@@ -1914,13 +1920,16 @@ impl ToolScope {
         if !state.deferred_tool_names.contains(tool.name.as_str()) {
             return true;
         }
-        visibility_state
+        (visibility_state
             .active_requested_deferred_names
             .contains(tool.name.as_str())
             && Self::requested_witness_matches_tool(
                 visibility_state.requested_witnesses.get(tool.name.as_str()),
                 tool,
-            )
+            ))
+            || state
+                .active_turn_deferred_names
+                .contains(tool.name.as_str())
     }
 
     /// Set the base filter for this scope.
@@ -2164,6 +2173,7 @@ impl ToolScope {
         state.deferred_tool_names.clear();
         state.active_turn_allow = Some(ToolNameSet::new());
         state.active_turn_deny.clear();
+        state.active_turn_deferred_names.clear();
         Ok(Arc::<[Arc<ToolDef>]>::from([]))
     }
 
@@ -2323,13 +2333,62 @@ impl ToolScopeHandle {
         allow: Option<HashSet<ToolName>>,
         deny: HashSet<ToolName>,
     ) -> Result<(), ToolScopeStageError> {
+        self.set_turn_overlay_with_deferred_authorities(allow, deny, &[])
+    }
+
+    /// Set an ephemeral overlay and project catalog-witnessed deferred tools
+    /// into provider visibility for this turn only. Generated authority first
+    /// admits the turn allow/deny set; this layer intersects that result with
+    /// the immutable base catalog. It cannot add definitions or authorize
+    /// dispatch, which remains the dispatcher's responsibility.
+    pub fn set_turn_overlay_with_deferred_authorities(
+        &self,
+        allow: Option<HashSet<ToolName>>,
+        deny: HashSet<ToolName>,
+        authorities: &[DeferredToolLoadAuthority],
+    ) -> Result<(), ToolScopeStageError> {
         self.ensure_generated_authority_for_stage("setting turn tool overlay")?;
         let allow: Option<ToolNameSet> = allow.map(|names| names.into_iter().collect());
         let deny: ToolNameSet = deny.into_iter().collect();
+        let mut activated = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| ToolScopeStageError::LockPoisoned)?;
+            let catalog = deferred_authority_catalog_for_base_tools(
+                &state.base_tools,
+                &state.deferred_tool_names,
+            );
+            let mut activated = ToolNameSet::new();
+            let mut invalid = Vec::new();
+            for authority in authorities {
+                let allowed = allow
+                    .as_ref()
+                    .is_some_and(|names| names.contains(authority.name.as_str()));
+                if !allowed || catalog.get(authority.name.as_str()) != Some(&authority.witness) {
+                    invalid.push(authority.name.clone());
+                } else {
+                    activated.insert(authority.name.clone());
+                }
+            }
+            if !invalid.is_empty() {
+                invalid.sort_unstable();
+                invalid.dedup();
+                return Err(ToolScopeStageError::InvalidWitnesses { names: invalid });
+            }
+            activated
+        };
         let accepted = self.visibility_owner.set_turn_overlay(
             allow.as_ref().map(tool_name_set_to_btree),
             tool_name_set_to_btree(&deny),
         )?;
+        activated.retain(|name| {
+            accepted
+                .allow
+                .as_ref()
+                .is_some_and(|allow| allow.contains(name))
+                && !accepted.deny.contains(name)
+        });
         let mut state = self
             .state
             .write()
@@ -2337,6 +2396,7 @@ impl ToolScopeHandle {
 
         state.active_turn_allow = accepted.allow;
         state.active_turn_deny = accepted.deny;
+        state.active_turn_deferred_names = activated;
         Ok(())
     }
 
@@ -2350,6 +2410,7 @@ impl ToolScopeHandle {
             .map_err(|_| ToolScopeStageError::LockPoisoned)?;
         state.active_turn_allow = accepted.allow;
         state.active_turn_deny = accepted.deny;
+        state.active_turn_deferred_names.clear();
         Ok(())
     }
 }
@@ -3053,6 +3114,43 @@ mod tests {
             applied.visible_names,
             vec!["visible".to_string(), "deferred".to_string()],
             "the next boundary should promote requested deferred tools into the visible set"
+        );
+    }
+
+    #[test]
+    fn catalog_witnessed_deferred_tool_activation_is_turn_scoped() {
+        let visible = tools(&["visible"])[0].clone();
+        let deferred = tool_with_provenance("deferred", "attention-binding-a");
+        let scope = scope_with_generated_projection_names(
+            vec![Arc::clone(&visible), Arc::clone(&deferred)].into(),
+            raw_set(&["deferred"]),
+        );
+        let handle = scope.handle();
+        let authority = crate::DeferredToolLoadAuthority::new(
+            "deferred",
+            crate::ToolVisibilityWitness {
+                last_seen_provenance: deferred.provenance.clone(),
+            },
+        );
+
+        handle
+            .set_turn_overlay_with_deferred_authorities(
+                Some(raw_set(&["deferred"])),
+                raw_set(&[]),
+                &[authority],
+            )
+            .expect("generated allow plus exact catalog witness should activate the definition");
+        assert_eq!(
+            scope.visible_tool_names().unwrap(),
+            ["deferred".into()].into_iter().collect(),
+            "turn activation should expose only the machine-allowed deferred definition"
+        );
+
+        handle.clear_turn_overlay().unwrap();
+        assert_eq!(
+            scope.visible_tool_names().unwrap(),
+            ["visible".into()].into_iter().collect(),
+            "clearing the turn overlay must remove ephemeral activation"
         );
     }
 

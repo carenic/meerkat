@@ -48,13 +48,22 @@ impl LlmClient for FirstTurnOnlyClient {
         Ok(messages.to_vec())
     }
 
-    fn stream<'a>(&'a self, _request: &'a LlmRequest) -> LlmStream<'a> {
+    fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
         let call = self.calls.fetch_add(1, Ordering::AcqRel);
         if call == 0 {
+            let provider = meerkat_models::infer_provider(&request.model)
+                .unwrap_or(meerkat_core::Provider::Other);
             Box::pin(stream::iter(vec![
                 Ok(LlmEvent::TextDelta {
                     delta: "ok".to_string(),
                     meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider,
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
                 }),
                 Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {

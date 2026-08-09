@@ -9,20 +9,31 @@ use serde::{Deserialize, Serialize};
 use crate::machines::detached_job::{
     DetachedJobMachineState, DetachedJobPhase, DetachedJobRestartClass, DetachedJobTerminalKind,
 };
-use crate::store::{next_revision, validate_stored_job};
+use crate::store::{
+    PredicateDeliveryCommitOutcome, ensure_same_predicate_delivery_identity, next_revision,
+    validate_job_replacement, validate_predicate_delivery_receipt, validate_stored_job,
+};
 use crate::{
     CanonicalArgumentsHash, DetachedJobError, DetachedJobStore, ExecutionIntentId,
     InsertJobOutcome, InteractionLineageId, JobId, JobOutboxEntry, JobOutboxPayload, JobProgress,
-    JobSpec, JobSubmissionKey, JobSubscription, JobTerminalResult, OriginMemberId, RunnerIdentity,
+    JobSpec, JobSubmissionKey, JobSubscription, JobTerminalResult, OriginMemberId,
+    PredicateDeliveryCommit, PredicateDeliveryIdentity, PredicateDeliveryReceipt, RunnerIdentity,
     RunnerSpecificationRef, StoredJob, ToolIdentity,
 };
 
 const STORED_JOB_FORMAT_VERSION: u32 = 1;
+const PREDICATE_DELIVERY_RECEIPT_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredJobEnvelope {
     format_version: u32,
     job: PersistedStoredJob,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PredicateDeliveryReceiptEnvelope {
+    format_version: u32,
+    receipt: PredicateDeliveryReceipt,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -169,10 +180,18 @@ pub const JOBS_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDoma
             name: "notification-outbox-and-subscriptions",
             apply: migration_0002_notification_outbox_and_subscriptions,
         },
+        meerkat_sqlite::Migration {
+            version: 3,
+            name: "predicate-delivery-ledger",
+            apply: migration_0003_predicate_delivery_ledger,
+        },
     ],
     initialize_current: initialize_current_jobs_schema,
-    allowed_existing_versions: &[2],
-    released_predecessors: &[],
+    allowed_existing_versions: &[2, 3],
+    released_predecessors: &[meerkat_sqlite::SchemaPredecessor {
+        version: 2,
+        verify: verify_released_jobs_v2_schema,
+    }],
     owned_objects: &[
         meerkat_sqlite::SchemaObject {
             kind: meerkat_sqlite::SchemaObjectKind::Table,
@@ -182,13 +201,18 @@ pub const JOBS_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDoma
             kind: meerkat_sqlite::SchemaObjectKind::Index,
             name: "idx_detached_jobs_pending_outbox",
         },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "detached_job_predicate_deliveries",
+        },
     ],
     retired_objects: &[],
 };
 
 fn initialize_current_jobs_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     migration_0001_jobs_schema(tx)?;
-    migration_0002_notification_outbox_and_subscriptions(tx)
+    migration_0002_notification_outbox_and_subscriptions(tx)?;
+    migration_0003_predicate_delivery_ledger(tx)
 }
 
 fn migration_0001_jobs_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
@@ -217,6 +241,42 @@ fn migration_0002_notification_outbox_and_subscriptions(
     // fields. Older binaries therefore refuse the database before attempting
     // to decode a row they cannot understand.
     Ok(())
+}
+
+const RELEASED_JOBS_V2_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "detached_jobs",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "idx_detached_jobs_pending_outbox",
+    },
+];
+
+fn verify_released_jobs_v2_schema(conn: &Connection) -> Result<(), String> {
+    meerkat_sqlite::verify_released_schema_fingerprint(
+        conn,
+        &JOBS_DOMAIN,
+        RELEASED_JOBS_V2_OBJECTS,
+        migration_0001_jobs_schema,
+    )
+}
+
+fn migration_0003_predicate_delivery_ledger(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    tx.execute_batch(
+        r"
+        CREATE TABLE detached_job_predicate_deliveries (
+            job_id TEXT NOT NULL,
+            delivery_idempotency_key TEXT NOT NULL,
+            occurrence_id TEXT NOT NULL,
+            runnable TEXT NOT NULL,
+            committed_revision BLOB NOT NULL CHECK (length(committed_revision) = 8),
+            receipt_json BLOB NOT NULL,
+            PRIMARY KEY (job_id, delivery_idempotency_key)
+        );
+        ",
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +428,126 @@ impl DetachedJobStore for SqliteDetachedJobStore {
         })
     }
 
+    async fn predicate_delivery_receipt(
+        &self,
+        job_id: &JobId,
+        identity: &PredicateDeliveryIdentity,
+    ) -> Result<Option<PredicateDeliveryReceipt>, DetachedJobError> {
+        self.with_connection(|conn| {
+            let tx = conn.transaction().map_err(raw_sqlite_error)?;
+            let Some(job) = select_by_id(&tx, job_id)? else {
+                return Err(DetachedJobError::NotFound(job_id.clone()));
+            };
+            let receipt = select_predicate_delivery_receipt(
+                &tx,
+                job_id,
+                identity.idempotency_key().as_str(),
+            )?;
+            if let Some(receipt) = &receipt {
+                ensure_same_predicate_delivery_identity(job_id, &receipt.identity, identity)?;
+                validate_predicate_delivery_receipt(&job, identity.idempotency_key(), receipt)?;
+            }
+            tx.commit().map_err(raw_sqlite_error)?;
+            Ok(receipt)
+        })
+    }
+
+    async fn commit_predicate_delivery(
+        &self,
+        expected_revision: u64,
+        mut replacement: StoredJob,
+        commit: PredicateDeliveryCommit,
+    ) -> Result<PredicateDeliveryCommitOutcome, DetachedJobError> {
+        self.with_connection(|conn| {
+            let tx = meerkat_sqlite::begin_immediate(conn).map_err(sqlite_store_error)?;
+            let current = select_by_id(&tx, &replacement.job_id)?
+                .ok_or_else(|| DetachedJobError::NotFound(replacement.job_id.clone()))?;
+            if let Some(receipt) = select_predicate_delivery_receipt(
+                &tx,
+                &replacement.job_id,
+                commit.identity.idempotency_key().as_str(),
+            )? {
+                ensure_same_predicate_delivery_identity(
+                    &replacement.job_id,
+                    &receipt.identity,
+                    &commit.identity,
+                )?;
+                validate_predicate_delivery_receipt(
+                    &current,
+                    commit.identity.idempotency_key(),
+                    &receipt,
+                )?;
+                tx.commit().map_err(raw_sqlite_error)?;
+                return Ok(PredicateDeliveryCommitOutcome::Deduplicated {
+                    job: current,
+                    receipt,
+                });
+            }
+            validate_job_replacement(&current, expected_revision, &replacement)?;
+            replacement.revision = next_revision(expected_revision)?;
+            let receipt = PredicateDeliveryReceipt {
+                job_id: replacement.job_id.clone(),
+                identity: commit.identity,
+                committed_revision: replacement.revision,
+                evaluation: commit.evaluation,
+                notification: commit.notification,
+            };
+            validate_predicate_delivery_receipt(
+                &replacement,
+                receipt.identity.idempotency_key(),
+                &receipt,
+            )?;
+
+            let encoded_job = encode_job(&replacement)?;
+            let pending = has_pending_outbox(&replacement);
+            let replacement_revision = revision_bytes(replacement.revision);
+            let expected_revision_bytes = revision_bytes(expected_revision);
+            let changed = tx
+                .execute(
+                    "UPDATE detached_jobs
+                        SET revision = ?2, has_pending_outbox = ?3, job_json = ?4
+                      WHERE job_id = ?1 AND revision = ?5",
+                    params![
+                        replacement.job_id.as_str(),
+                        replacement_revision.as_slice(),
+                        pending,
+                        encoded_job,
+                        expected_revision_bytes.as_slice(),
+                    ],
+                )
+                .map_err(raw_sqlite_error)?;
+            if changed != 1 {
+                let actual = current_revision(&tx, &replacement.job_id)?.unwrap_or_default();
+                return Err(DetachedJobError::StaleRevision {
+                    job_id: replacement.job_id.clone(),
+                    expected: expected_revision,
+                    actual,
+                });
+            }
+            let encoded_receipt = encode_predicate_delivery_receipt(&receipt)?;
+            tx.execute(
+                "INSERT INTO detached_job_predicate_deliveries
+                    (job_id, delivery_idempotency_key, occurrence_id, runnable,
+                     committed_revision, receipt_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    replacement.job_id.as_str(),
+                    receipt.identity.idempotency_key().as_str(),
+                    receipt.identity.occurrence_id(),
+                    receipt.identity.runnable(),
+                    replacement_revision.as_slice(),
+                    encoded_receipt,
+                ],
+            )
+            .map_err(raw_sqlite_error)?;
+            tx.commit().map_err(raw_sqlite_error)?;
+            Ok(PredicateDeliveryCommitOutcome::Committed {
+                job: replacement,
+                receipt,
+            })
+        })
+    }
+
     async fn list_pending_outbox(
         &self,
         limit: usize,
@@ -500,6 +680,64 @@ fn select_by_submission(
     .transpose()
 }
 
+fn select_predicate_delivery_receipt(
+    conn: &Connection,
+    job_id: &JobId,
+    idempotency_key: &str,
+) -> Result<Option<PredicateDeliveryReceipt>, DetachedJobError> {
+    let encoded = conn
+        .query_row(
+            "SELECT job_id, delivery_idempotency_key, occurrence_id, runnable,
+                    committed_revision, receipt_json
+               FROM detached_job_predicate_deliveries
+              WHERE job_id = ?1 AND delivery_idempotency_key = ?2",
+            params![job_id.as_str(), idempotency_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, meerkat_sqlite::JsonColumnBytes>(5)?
+                        .into_bytes(),
+                ))
+            },
+        )
+        .optional()
+        .map_err(raw_sqlite_error)?;
+    let Some((stored_job_id, stored_key, occurrence_id, runnable, revision, encoded)) = encoded
+    else {
+        return Ok(None);
+    };
+    let envelope: PredicateDeliveryReceiptEnvelope =
+        serde_json::from_slice(&encoded).map_err(|error| {
+            DetachedJobError::Store(format!(
+                "stored predicate delivery receipt JSON is invalid: {error}"
+            ))
+        })?;
+    if envelope.format_version != PREDICATE_DELIVERY_RECEIPT_FORMAT_VERSION {
+        return Err(DetachedJobError::Store(format!(
+            "stored predicate delivery receipt format version {} is unsupported; this binary supports {}",
+            envelope.format_version, PREDICATE_DELIVERY_RECEIPT_FORMAT_VERSION
+        )));
+    }
+    let receipt = envelope.receipt;
+    if stored_job_id != job_id.as_str()
+        || &receipt.job_id != job_id
+        || stored_key != idempotency_key
+        || occurrence_id != receipt.identity.occurrence_id()
+        || runnable != receipt.identity.runnable()
+        || revision_from_bytes(&revision)? != receipt.committed_revision
+        || receipt.identity.idempotency_key().as_str() != idempotency_key
+    {
+        return Err(DetachedJobError::Store(format!(
+            "predicate delivery row columns disagree with encoded receipt for job {job_id}"
+        )));
+    }
+    Ok(Some(receipt))
+}
+
 type EncodedJobRow = (String, String, String, Vec<u8>, bool, Vec<u8>);
 
 fn decode_job_row_sql(row: &rusqlite::Row<'_>) -> Result<EncodedJobRow, rusqlite::Error> {
@@ -563,6 +801,18 @@ fn encode_job(job: &StoredJob) -> Result<Vec<u8>, DetachedJobError> {
         job: PersistedStoredJob::from(job),
     })
     .map_err(|error| DetachedJobError::Store(format!("cannot encode stored job: {error}")))
+}
+
+fn encode_predicate_delivery_receipt(
+    receipt: &PredicateDeliveryReceipt,
+) -> Result<Vec<u8>, DetachedJobError> {
+    serde_json::to_vec(&PredicateDeliveryReceiptEnvelope {
+        format_version: PREDICATE_DELIVERY_RECEIPT_FORMAT_VERSION,
+        receipt: receipt.clone(),
+    })
+    .map_err(|error| {
+        DetachedJobError::Store(format!("cannot encode predicate delivery receipt: {error}"))
+    })
 }
 
 fn has_pending_outbox(job: &StoredJob) -> bool {

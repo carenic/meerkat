@@ -801,6 +801,7 @@ meerkat_machine_runtime_internal_inputs!(
     ],
     CancellationLifecycle => [
         AbortCancelAfterBoundaryDispatch,
+        CancelAfterBoundaryForRun,
         CancelNow,
         CancelRun,
         CancellationObserved,
@@ -980,6 +981,7 @@ meerkat_machine_runtime_internal_inputs!(
         ResolveVisibleRuntimePhase,
     ],
     UserInterruptDispatch => [
+        InterruptCurrentRunForRun,
         InterruptCurrentRun,
         ResolveUserInterruptPublicResult,
     ],

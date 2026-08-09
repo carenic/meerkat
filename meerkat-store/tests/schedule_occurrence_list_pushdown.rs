@@ -142,12 +142,26 @@ async fn seed_store(store: &SqliteScheduleStore) -> (Schedule, Schedule) {
     // call below through the machine-owned due classification.
     commit_occurrence(store, &schedule_a, 0, Utc::now() - Duration::seconds(1)).await;
     commit_occurrence(store, &schedule_a, 1, Utc::now() - Duration::hours(2)).await;
-    let claimed = store
-        .claim_due_occurrences(ClaimDueRequest {
-            owner_id: "pushdown-test".to_string(),
-            limit: 16,
-            lease_duration: Duration::seconds(60),
+    let executor_lease = match store
+        .acquire_executor_lease(meerkat_schedule::AcquireScheduleExecutorLeaseRequest {
+            owner_id: "pushdown-test-executor".into(),
+            lease_duration: Duration::minutes(5),
         })
+        .await
+        .expect("acquire executor lease")
+    {
+        meerkat_schedule::AcquireScheduleExecutorLeaseOutcome::Acquired(lease) => lease,
+        meerkat_schedule::AcquireScheduleExecutorLeaseOutcome::Busy { .. } => unreachable!(),
+    };
+    let claimed = store
+        .claim_due_occurrences(
+            &executor_lease,
+            ClaimDueRequest {
+                owner_id: "pushdown-test".to_string(),
+                limit: 16,
+                lease_duration: Duration::seconds(60),
+            },
+        )
         .await
         .expect("claim");
     assert_eq!(

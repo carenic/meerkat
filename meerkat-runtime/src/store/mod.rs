@@ -1458,6 +1458,93 @@ impl HeadCanonicalStoreAuthority {
     }
 }
 
+/// Result of consuming one store-verified HeadCanonical activation proof.
+///
+/// The runtime backend owns the monotonic runtime revision. The physical
+/// backend owns the verified head/token pair. This result records how the
+/// runtime side aligned itself without inventing a second physical authority.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub enum HeadCanonicalRuntimeAuthorityActivation {
+    /// No runtime authority existed, so revision one was installed.
+    Installed(HeadCanonicalStoreAuthority),
+    /// The exact verified head/token was already installed.
+    AlreadyAligned(HeadCanonicalStoreAuthority),
+    /// A semantically identical pre-activation boundary was advanced to the
+    /// verified representation-side successor.
+    RepresentationAdvanced(HeadCanonicalStoreAuthority),
+}
+
+impl HeadCanonicalRuntimeAuthorityActivation {
+    #[must_use]
+    pub const fn authority(&self) -> &HeadCanonicalStoreAuthority {
+        match self {
+            Self::Installed(authority)
+            | Self::AlreadyAligned(authority)
+            | Self::RepresentationAdvanced(authority) => authority,
+        }
+    }
+}
+
+fn head_canonical_activation_predecessor_matches(
+    predecessor: &meerkat_core::session_store::SessionHead,
+    successor: &meerkat_core::session_store::SessionHead,
+) -> Result<bool, RuntimeStoreError> {
+    if predecessor.id != successor.id
+        || predecessor.version != successor.version
+        || predecessor.strand != successor.strand
+        || predecessor.head_revision != successor.head_revision
+        || predecessor.message_count != successor.message_count
+        || predecessor.rewrite_count != successor.rewrite_count
+        || predecessor.created_at != successor.created_at
+        || predecessor.updated_at != successor.updated_at
+        || predecessor.usage != successor.usage
+    {
+        return Ok(false);
+    }
+    if predecessor
+        .message_row_prefix
+        .as_ref()
+        .is_some_and(|prefix| Some(prefix) != successor.message_row_prefix.as_ref())
+        || predecessor
+            .row_lineage_anchor
+            .as_ref()
+            .is_some_and(|anchor| Some(anchor) != successor.row_lineage_anchor.as_ref())
+        || (predecessor.rewrite_prefix.occurrence_count() != 0
+            && predecessor.rewrite_prefix != successor.rewrite_prefix)
+        || predecessor
+            .graph_prefix
+            .as_ref()
+            .is_some_and(|prefix| Some(prefix) != successor.graph_prefix.as_ref())
+        || predecessor
+            .realtime_event_prefix
+            .as_ref()
+            .is_some_and(|prefix| Some(prefix) != successor.realtime_event_prefix.as_ref())
+    {
+        return Ok(false);
+    }
+    match predecessor.metadata_identity() {
+        Some(identity) => Ok(successor.metadata_identity() == Some(identity)
+            && predecessor.metadata == successor.metadata),
+        None => {
+            let mut predecessor_metadata = predecessor.metadata.clone();
+            predecessor_metadata.remove(meerkat_core::SESSION_TRANSCRIPT_HISTORY_STATE_KEY);
+            predecessor_metadata
+                .remove(meerkat_core::SESSION_TRANSCRIPT_REWRITE_PREFIX_AUTHORITY_KEY);
+            predecessor_metadata.remove(meerkat_core::SESSION_REALTIME_TRANSCRIPT_STATE_KEY);
+            successor
+                .materialized_metadata()
+                .map(|metadata| metadata == predecessor_metadata)
+                .map_err(|error| RuntimeStoreError::SessionPersistenceAuthorityConflict {
+                    runtime_id: predecessor.id.to_string(),
+                    detail: format!(
+                        "verified HeadCanonical activation metadata cannot be materialized: {error}"
+                    ),
+                })
+        }
+    }
+}
+
 /// Opaque intent written before a HeadCanonical physical-head CAS.
 ///
 /// The carrier binds the exact committed parent, explicit run identity, and
@@ -2227,6 +2314,9 @@ pub enum RuntimeStoreError {
     /// Operation is not supported by this store implementation.
     #[error("Unsupported store operation: {0}")]
     Unsupported(String),
+    /// Direct-member semantic authority is malformed before durable admission.
+    #[error("Invalid direct-member incarnation: {reason}")]
+    InvalidDirectMemberIncarnation { reason: String },
     /// A non-whole-blob store declared a profile but did not implement the
     /// prepared boundary method required to commit that representation.
     #[error("runtime store profile '{profile}' must override commit_prepared_session_boundary")]
@@ -2354,6 +2444,40 @@ pub enum RuntimeStoreError {
     /// Internal error.
     #[error("Internal error: {0}")]
     Internal(String),
+}
+
+/// Classify whether `candidate` may become the durable direct-member semantic
+/// high-water for one member session.
+///
+/// The record deliberately contains no runtime bearer token. Equal semantic
+/// authority may be rebound after a runtime epoch replacement; only a newer
+/// generation/fence pair for the same Mob member identity may supersede it.
+pub(crate) fn direct_member_high_water_accepts(
+    current: &meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+    candidate: &meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+) -> bool {
+    current == candidate
+        || (current.mob_id == candidate.mob_id
+            && current.agent_identity == candidate.agent_identity
+            && (candidate.generation, candidate.fence_token)
+                > (current.generation, current.fence_token))
+}
+
+pub(crate) fn validate_direct_member_high_water_candidate(
+    member_session_id: &str,
+    candidate: &meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+) -> Result<(), RuntimeStoreError> {
+    if member_session_id.is_empty()
+        || candidate.mob_id.is_empty()
+        || candidate.agent_identity.is_empty()
+        || candidate.fence_token == 0
+    {
+        return Err(RuntimeStoreError::InvalidDirectMemberIncarnation {
+            reason: "member session, mob, and agent identities must be non-empty and fence token must be nonzero"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Transactional updater for the runtime-owned OAuth login-flow payload snapshot.
@@ -7282,6 +7406,13 @@ pub trait RuntimeSessionAuthorityOps: Send + Sync {
 
     fn session_boundary_authority_read_cost(&self) -> RuntimeSessionAuthorityReadCost;
 
+    /// Consume one exact store-verified physical activation proof and align
+    /// the matching runtime HeadCanonical authority atomically.
+    async fn activate_head_canonical_runtime_authority(
+        &self,
+        authority: meerkat_core::VerifiedHeadCanonicalAuthority,
+    ) -> Result<HeadCanonicalRuntimeAuthorityActivation, RuntimeStoreError>;
+
     async fn commit_prepared_session_boundary(
         &self,
         runtime_id: &LogicalRuntimeId,
@@ -7414,6 +7545,17 @@ pub trait RuntimeStore: Send + Sync {
     fn session_boundary_authority_read_cost(&self) -> RuntimeSessionAuthorityReadCost {
         self.session_authority_ops()
             .session_boundary_authority_read_cost()
+    }
+
+    /// Consume one exact physical HeadCanonical activation proof at the
+    /// backend construction boundary.
+    async fn activate_head_canonical_runtime_authority(
+        &self,
+        authority: meerkat_core::VerifiedHeadCanonicalAuthority,
+    ) -> Result<HeadCanonicalRuntimeAuthorityActivation, RuntimeStoreError> {
+        self.session_authority_ops()
+            .activate_head_canonical_runtime_authority(authority)
+            .await
     }
 
     /// Commit one valid-by-construction prepared session boundary.
@@ -8447,6 +8589,30 @@ pub trait RuntimeStore: Send + Sync {
         let _ = runtime_id;
         Err(RuntimeStoreError::Unsupported(
             "delete_ops_lifecycle".into(),
+        ))
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct peer-member semantic high-water
+    // -----------------------------------------------------------------------
+
+    /// Atomically admit one semantic incarnation or return the current durable
+    /// high-water for this exact member session.
+    ///
+    /// Implementations must compare and update inside one transaction. The
+    /// returned value is always the canonical durable high-water after the
+    /// operation. No runtime/session bearer token is stored at this boundary.
+    async fn admit_direct_member_incarnation_high_water(
+        &self,
+        member_session_id: &str,
+        candidate: &meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+    ) -> Result<
+        meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+        RuntimeStoreError,
+    > {
+        let _ = (member_session_id, candidate);
+        Err(RuntimeStoreError::Unsupported(
+            "admit_direct_member_incarnation_high_water".into(),
         ))
     }
 

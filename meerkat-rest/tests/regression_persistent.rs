@@ -5,14 +5,17 @@
     clippy::expect_used
 )]
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use futures::stream;
 use http_body_util::BodyExt;
 use meerkat::{
     AgentFactory, Config, FactoryAgentBuilder, MemoryStore, PersistenceBundle,
     PersistentSessionService, SessionId, SessionStore,
 };
-use meerkat_client::TestClient;
+use meerkat_client::types::LlmStream;
+use meerkat_client::{LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest};
 use meerkat_core::MemoryConfigStore;
 #[cfg(feature = "mob")]
 use meerkat_mob_mcp::wire_mob_tools;
@@ -23,6 +26,53 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::time::{Duration, timeout};
 use tower::ServiceExt;
+
+/// Successful synthetic turns must carry accounting for the exact dispatched
+/// request. These resume regressions intentionally reconstruct the host with a
+/// different default provider, so a fixture pinned to the host default would
+/// falsely certify the wrong provider/model pair.
+struct RequestBoundTestClient;
+
+#[async_trait]
+impl LlmClient for RequestBoundTestClient {
+    fn project_replay_messages(
+        &self,
+        messages: &[meerkat_core::Message],
+    ) -> Result<Vec<meerkat_core::Message>, LlmError> {
+        Ok(messages.to_vec())
+    }
+
+    fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
+        let provider =
+            meerkat_models::infer_provider(&request.model).unwrap_or(meerkat_core::Provider::Other);
+        Box::pin(stream::iter(vec![
+            Ok(LlmEvent::TextDelta {
+                delta: "ok".to_string(),
+                meta: None,
+            }),
+            Ok(LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    provider,
+                    &request.model,
+                    meerkat_core::Usage::default(),
+                ),
+            }),
+            Ok(LlmEvent::Done {
+                outcome: LlmDoneOutcome::Success {
+                    stop_reason: meerkat_core::StopReason::EndTurn,
+                },
+            }),
+        ]))
+    }
+
+    fn provider(&self) -> meerkat_core::Provider {
+        meerkat_core::Provider::Other
+    }
+
+    async fn health_check(&self) -> Result<(), LlmError> {
+        Ok(())
+    }
+}
 
 /// An empty filesystem realm-config source rooted at a non-existent path, so
 /// every realm (including `global`) resolves to `None` and the composed config
@@ -62,7 +112,7 @@ fn build_state(
         .project_root(project_root.to_path_buf());
     let provider_registry = factory.provider_runtime_registry();
     let mut builder = FactoryAgentBuilder::new(factory, config.clone());
-    builder.default_llm_client = Some(Arc::new(TestClient::default()));
+    builder.default_llm_client = Some(Arc::new(RequestBoundTestClient));
     let persistence = PersistenceBundle::new_with_subsystem_stores(
         store,
         runtime_store,
@@ -83,6 +133,10 @@ fn build_state(
         Some(Arc::new(meerkat::WorkGraphToolSurface::new(
             workgraph_service.clone(),
         ))),
+    );
+    meerkat::surface::set_default_workgraph_namespace_grant(
+        &builder,
+        Some(workgraph_service.namespace_grant().clone()),
     );
     #[cfg(feature = "mob")]
     let builder_mob_tools_slot = Arc::clone(&builder.default_mob_tools);
@@ -119,7 +173,7 @@ fn build_state(
         project_root: Some(project_root.to_path_buf()),
         context_root: None,
         user_config_root: None,
-        llm_client_override: Some(Arc::new(TestClient::default())),
+        llm_client_override: Some(Arc::new(RequestBoundTestClient)),
         config_store,
         event_tx,
         session_service,

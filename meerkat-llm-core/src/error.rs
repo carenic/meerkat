@@ -130,6 +130,56 @@ impl LlmError {
         body.contains("request_too_large")
     }
 
+    /// Provider context-window rejection classification at the provider
+    /// boundary. Exact structured codes are preferred; the phrase checks cover
+    /// providers that expose only a message inside an `INVALID_ARGUMENT`
+    /// envelope. Shared agent policy never parses this prose.
+    fn body_signals_context_exceeded(body: &str) -> bool {
+        let lower = body.to_ascii_lowercase();
+        [
+            "context_length_exceeded",
+            "context_window_exceeded",
+            "maximum context length",
+            "prompt is too long",
+            "exceeds the maximum number of tokens",
+        ]
+        .iter()
+        .any(|signal| lower.contains(signal))
+    }
+
+    fn context_counts(body: &str) -> (usize, usize) {
+        fn find_named(value: &serde_json::Value, names: &[&str]) -> Option<u64> {
+            match value {
+                serde_json::Value::Object(object) => names
+                    .iter()
+                    .find_map(|name| object.get(*name).and_then(serde_json::Value::as_u64))
+                    .or_else(|| object.values().find_map(|value| find_named(value, names))),
+                serde_json::Value::Array(values) => {
+                    values.iter().find_map(|value| find_named(value, names))
+                }
+                _ => None,
+            }
+        }
+
+        let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+        let max = parsed
+            .as_ref()
+            .and_then(|value| find_named(value, &["max", "context_window", "max_tokens"]))
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0);
+        let requested = parsed
+            .as_ref()
+            .and_then(|value| {
+                find_named(
+                    value,
+                    &["requested", "input_tokens", "prompt_tokens", "total_tokens"],
+                )
+            })
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or_else(|| max.saturating_add(1));
+        (max, requested)
+    }
+
     /// Whether this error should trigger a retry
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -166,6 +216,9 @@ impl LlmError {
             s if s >= 400 => {
                 if Self::body_signals_request_too_large(&message) {
                     Self::request_too_large(message)
+                } else if Self::body_signals_context_exceeded(&message) {
+                    let (max, requested) = Self::context_counts(&message);
+                    Self::ContextLengthExceeded { max, requested }
                 } else {
                     Self::InvalidRequest { message }
                 }

@@ -93,7 +93,7 @@ impl<C: LlmClient + 'static> AgentLlmClient for LlmClientAdapter<C> {
                         tool_calls.push(ToolCall::new(id, name, args));
                     }
                     LlmEvent::UsageUpdate { usage: u } => {
-                        usage = u;
+                        usage = u.into_inner();
                     }
                     LlmEvent::Done { outcome } => match outcome {
                         LlmDoneOutcome::Success { stop_reason: sr } => {

@@ -50,6 +50,9 @@ fn invalid_params(id: Option<RpcId>, message: impl Into<String>) -> RpcResponse 
 /// `invalid_params` string rendering byte-identical.
 trait MobWireErrorSource: std::fmt::Display {
     fn wire_detail(&self) -> Option<meerkat_contracts::wire::WireMobErrorDetail>;
+    fn wire_error_code(&self) -> Option<meerkat_contracts::ErrorCode> {
+        self.wire_detail().map(|detail| detail.code())
+    }
     fn structured_data(&self) -> Option<serde_json::Value> {
         None
     }
@@ -63,6 +66,10 @@ impl MobWireErrorSource for MobError {
     fn structured_data(&self) -> Option<serde_json::Value> {
         MobError::structured_data(self)
     }
+
+    fn wire_error_code(&self) -> Option<meerkat_contracts::ErrorCode> {
+        MobError::wire_error_code(self)
+    }
 }
 
 impl MobWireErrorSource for MobRespawnError {
@@ -73,17 +80,29 @@ impl MobWireErrorSource for MobRespawnError {
     fn structured_data(&self) -> Option<serde_json::Value> {
         MobRespawnError::structured_data(self)
     }
+
+    fn wire_error_code(&self) -> Option<meerkat_contracts::ErrorCode> {
+        MobRespawnError::wire_error_code(self)
+    }
 }
 
 impl MobWireErrorSource for MobMcpDestroyError {
     fn wire_detail(&self) -> Option<meerkat_contracts::wire::WireMobErrorDetail> {
         MobMcpDestroyError::wire_detail(self)
     }
+
+    fn wire_error_code(&self) -> Option<meerkat_contracts::ErrorCode> {
+        MobMcpDestroyError::wire_error_code(self)
+    }
 }
 
 impl MobWireErrorSource for MobAppendSystemContextError {
     fn wire_detail(&self) -> Option<meerkat_contracts::wire::WireMobErrorDetail> {
         MobAppendSystemContextError::wire_detail(self)
+    }
+
+    fn wire_error_code(&self) -> Option<meerkat_contracts::ErrorCode> {
+        MobAppendSystemContextError::wire_error_code(self)
     }
 }
 
@@ -104,10 +123,19 @@ fn mob_call_error<E: MobWireErrorSource>(id: Option<RpcId>, err: &E) -> RpcRespo
             ),
         },
         None => match err.structured_data() {
-            Some(data) => {
-                RpcResponse::error_with_data(id, error::INVALID_PARAMS, err.to_string(), data)
-            }
-            None => invalid_params(id, err.to_string()),
+            Some(data) => RpcResponse::error_with_data(
+                id,
+                err.wire_error_code().map_or(
+                    error::INVALID_PARAMS,
+                    meerkat_contracts::ErrorCode::jsonrpc_code,
+                ),
+                err.to_string(),
+                data,
+            ),
+            None => match err.wire_error_code() {
+                Some(code) => RpcResponse::error(id, code.jsonrpc_code(), err.to_string()),
+                None => invalid_params(id, err.to_string()),
+            },
         },
     }
 }
@@ -1516,6 +1544,10 @@ pub async fn handle_spawn_helper(
     {
         Ok(result) => {
             let identity_str = result.agent_identity.to_string();
+            let bounded_result = result
+                .bounded_result
+                .as_ref()
+                .map(meerkat_mob::BoundedHelperResult::to_wire);
             RpcResponse::success(
                 id,
                 MobHelperResult {
@@ -1526,6 +1558,7 @@ pub async fn handle_spawn_helper(
                         mob_id.as_str(),
                         &identity_str,
                     ),
+                    bounded_result,
                 },
             )
         }
@@ -1609,6 +1642,10 @@ pub async fn handle_fork_helper(
     {
         Ok(result) => {
             let identity_str = result.agent_identity.to_string();
+            let bounded_result = result
+                .bounded_result
+                .as_ref()
+                .map(meerkat_mob::BoundedHelperResult::to_wire);
             RpcResponse::success(
                 id,
                 MobHelperResult {
@@ -1619,6 +1656,7 @@ pub async fn handle_fork_helper(
                         mob_id.as_str(),
                         &identity_str,
                     ),
+                    bounded_result,
                 },
             )
         }
@@ -4454,6 +4492,36 @@ mod tests {
         assert_eq!(error.code, ErrorCode::HostUnavailable.jsonrpc_code());
         let data = error.data.expect("typed host-unavailable data");
         assert_eq!(data["timeout_ms"], serde_json::json!(15_000));
+
+        let err = MobError::RetirementInProgress {
+            session_id: meerkat_core::SessionId::new(),
+            stage: "runtime_binding_unregister".to_string(),
+        };
+        let response = mob_call_error(Some(RpcId::Num(4)), &err);
+        let error = response.error.expect("retirement in progress is an error");
+        assert_eq!(error.code, ErrorCode::SessionBusy.jsonrpc_code());
+        let data = error.data.expect("typed retirement retry data");
+        assert_eq!(
+            data["kind"],
+            serde_json::json!("mob_retirement_in_progress")
+        );
+        assert_eq!(data["retryable"], serde_json::json!(true));
+        assert_eq!(data["authority_retained"], serde_json::json!(true));
+
+        let err = MobError::MemberRetirementInProgress {
+            member_id: AgentIdentity::from("peer-worker"),
+            stage: "peer_retirement_reply".to_string(),
+        };
+        let response = mob_call_error(Some(RpcId::Num(5)), &err);
+        let error = response
+            .error
+            .expect("peer retirement in progress is an error");
+        assert_eq!(error.code, ErrorCode::SessionBusy.jsonrpc_code());
+        let data = error.data.expect("typed peer retirement retry data");
+        assert_eq!(data["member_id"], serde_json::json!("peer-worker"));
+        assert_eq!(data["stage"], serde_json::json!("peer_retirement_reply"));
+        assert_eq!(data["retryable"], serde_json::json!(true));
+        assert_eq!(data["authority_retained"], serde_json::json!(true));
     }
 
     /// T-A5 regression pin: an unclassified error renders byte-identical

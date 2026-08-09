@@ -227,6 +227,8 @@ from .generated.types import (
     SessionForkResult as RpcSessionForkResult,
     SessionPeerResponseTerminalParams as RpcSessionPeerResponseTerminalParams,
     SessionTranscriptRewriteResult as RpcSessionTranscriptRewriteResult,
+    SystemPromptUpdateResult as RpcSystemPromptUpdateResult,
+    UpdateSystemPromptParams as RpcUpdateSystemPromptParams,
     WireDeviceCompleteResult as RpcWireDeviceCompleteResult,
     WireProvisionApiKeyResult as RpcWireProvisionApiKeyResult,
     WireRunResult as RpcWireRunResult,
@@ -235,6 +237,7 @@ from .generated.types import (
 )
 from .mob import (
     Mob,
+    MobBoundedHelperResult,
     MobHelperResult,
     MobKickoffMemberSnapshot,
     MobLifecycleAction,
@@ -286,6 +289,17 @@ from .types import (
     ScheduleToolCall,
     EventEnvelope,
     McpLiveOpResponse,
+    ForkAuthoredCacheBreakpoint,
+    ForkCacheBreakpointBoundary,
+    ForkCacheInheritance,
+    ForkCacheInheritanceAvailable,
+    ForkCacheInheritanceUnavailable,
+    ForkCacheInheritanceUnavailableReason,
+    ForkCacheLoweredRequestEncoding,
+    ForkCacheLoweredRequestProvenance,
+    ForkCacheProvider,
+    ForkCacheTtl,
+    ForkPoint,
     ResolvedModelCapabilities,
     RunResult,
     SchemaWarning,
@@ -299,6 +313,8 @@ from .types import (
     SessionTranscriptRevisionEntry,
     SessionTranscriptRevisionList,
     SessionTranscriptRewriteResult,
+    SystemPromptUpdateResult,
+    SystemPromptVersionIdentity,
     SessionSummary,
     SessionMessage,
     SessionToolResult,
@@ -1482,7 +1498,9 @@ class MeerkatClient:
             params["running_behavior"] = running_behavior
         if tool_access_policy is not None:
             params["tool_access_policy"] = _wire_value(tool_access_policy)
-        raw = await self._request("session/fork_at", params)
+        raw: RpcSessionForkResult | dict[str, Any] = await self._request(
+            "session/fork_at", params
+        )
         return self._parse_session_fork_result(raw)
 
     async def fork_session_replace(
@@ -1505,7 +1523,9 @@ class MeerkatClient:
             params["running_behavior"] = running_behavior
         if tool_access_policy is not None:
             params["tool_access_policy"] = _wire_value(tool_access_policy)
-        raw = await self._request("session/fork_replace", params)
+        raw: RpcSessionForkResult | dict[str, Any] = await self._request(
+            "session/fork_replace", params
+        )
         return self._parse_session_fork_result(raw)
 
     async def rewrite_session_transcript(
@@ -1540,6 +1560,34 @@ class MeerkatClient:
             params["running_behavior"] = running_behavior
         raw = await self._request("session/rewrite_transcript", params)
         return self._parse_session_transcript_rewrite_result(raw)
+
+    async def update_system_prompt(
+        self,
+        session_id: str,
+        key: str,
+        content: str,
+        *,
+        expected_version: int | None = None,
+        target_message_index: int | None = None,
+        actor: str | None = None,
+        expected_parent_revision: str | None = None,
+    ) -> SystemPromptUpdateResult:
+        """Explicitly replace one durable versioned system-prompt key."""
+        _rpc_signature: RpcUpdateSystemPromptParams | RpcSystemPromptUpdateResult
+        params = RpcUpdateSystemPromptParams(
+            session_id=session_id,
+            key=key,
+            content=content,
+            expected_version=expected_version,
+            target_message_index=target_message_index,
+            actor=actor,
+            expected_parent_revision=expected_parent_revision,
+        )
+        raw: RpcSystemPromptUpdateResult | dict[str, Any] = await self._request(
+            "session/update_system_prompt",
+            _wire_params(params),
+        )
+        return self._parse_system_prompt_update_result(_wire_value(raw))
 
     async def restore_session_transcript_revision(
         self,
@@ -3393,6 +3441,10 @@ class MeerkatClient:
                 "INVALID_RESPONSE",
                 "Invalid mob/spawn_helper response: missing agent_identity",
             )
+        bounded_result = self._parse_bounded_helper_result(
+            result.get("bounded_result"),
+            "Invalid mob/spawn_helper response",
+        )
         return {
             "output": str(result["output"])
             if result.get("output") is not None
@@ -3404,6 +3456,11 @@ class MeerkatClient:
             ),
             "agent_identity": resolved_identity,
             "member_ref": member_ref,
+            **(
+                {"bounded_result": bounded_result}
+                if bounded_result is not None
+                else {}
+            ),
         }
 
     async def fork_mob_helper(
@@ -3447,6 +3504,10 @@ class MeerkatClient:
                 "INVALID_RESPONSE",
                 "Invalid mob/fork_helper response: missing agent_identity",
             )
+        bounded_result = self._parse_bounded_helper_result(
+            result.get("bounded_result"),
+            "Invalid mob/fork_helper response",
+        )
         return {
             "output": str(result["output"])
             if result.get("output") is not None
@@ -3458,6 +3519,11 @@ class MeerkatClient:
             ),
             "agent_identity": resolved_identity,
             "member_ref": member_ref,
+            **(
+                {"bounded_result": bounded_result}
+                if bounded_result is not None
+                else {}
+            ),
         }
 
     async def create_mob_profile(
@@ -6515,6 +6581,37 @@ class MeerkatClient:
         return raw
 
     @staticmethod
+    def _parse_bounded_helper_result(
+        raw: Any,
+        context: str,
+    ) -> MobBoundedHelperResult | None:
+        if raw is None:
+            return None
+        value = MeerkatClient._require_dict(raw, "bounded_result", context)
+        label = MeerkatClient._require_string_field(value, "label", context)
+        status = MeerkatClient._require_string_field(value, "status", context)
+        text = MeerkatClient._require_present_string_field(value, "text", context)
+        allowed = {
+            "completed",
+            "completed_truncated",
+            "failed",
+            "failed_truncated",
+            "in_progress",
+            "in_progress_truncated",
+            "unavailable",
+            "unavailable_truncated",
+        }
+        if status not in allowed:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: unsupported bounded_result status {status!r}",
+            )
+        return cast(
+            MobBoundedHelperResult,
+            {"label": label, "status": status, "text": text},
+        )
+
+    @staticmethod
     def _require_string_field(raw: dict[str, Any], field: str, context: str) -> str:
         value = raw.get(field)
         if not isinstance(value, str) or not value:
@@ -7096,9 +7193,197 @@ class MeerkatClient:
         )
 
     @staticmethod
-    def _parse_session_fork_result(data: Any) -> SessionForkResult:
+    def _parse_fork_cache_lowered_request_provenance(
+        raw: Any,
+        context: str,
+    ) -> ForkCacheLoweredRequestProvenance:
+        data = MeerkatClient._require_dict(
+            raw,
+            "lowered_request_provenance",
+            context,
+        )
+        provider = MeerkatClient._require_string_field(data, "provider", context)
+        if provider not in {"anthropic", "openai", "gemini", "self_hosted", "other"}:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: unsupported provider {provider!r}",
+            )
+        encoding = MeerkatClient._require_string_field(data, "encoding", context)
+        if encoding not in {
+            "anthropic_messages_json",
+            "open_ai_responses_json",
+            "open_ai_chat_completions_json",
+            "gemini_generate_content_json",
+        }:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: unsupported encoding {encoding!r}",
+            )
+        body_sha256 = data.get("body_sha256")
+        if (
+            not isinstance(body_sha256, list)
+            or len(body_sha256) != 32
+            or any(
+                not isinstance(byte, int)
+                or isinstance(byte, bool)
+                or byte < 0
+                or byte > 255
+                for byte in body_sha256
+            )
+        ):
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: body_sha256 must contain exactly 32 bytes",
+            )
+        return ForkCacheLoweredRequestProvenance(
+            provider=cast(ForkCacheProvider, provider),
+            encoding=cast(ForkCacheLoweredRequestEncoding, encoding),
+            body_sha256=tuple(body_sha256),
+        )
+
+    @staticmethod
+    def _parse_fork_authored_cache_breakpoint(
+        raw: Any,
+        context: str,
+    ) -> ForkAuthoredCacheBreakpoint:
+        data = MeerkatClient._require_dict(raw, "authored_cache_breakpoint", context)
+        provider = MeerkatClient._require_string_field(data, "provider", context)
+        if provider not in {"anthropic", "openai", "gemini", "self_hosted", "other"}:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: unsupported provider {provider!r}",
+            )
+        boundary_data = MeerkatClient._require_dict(
+            data.get("boundary"),
+            "boundary",
+            context,
+        )
+        boundary_kind = MeerkatClient._require_string_field(
+            boundary_data,
+            "kind",
+            context,
+        )
+        if boundary_kind not in {"system_profile_prefix", "transcript_after"}:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: unsupported boundary kind {boundary_kind!r}",
+            )
+        ttl = MeerkatClient._require_string_field(data, "ttl", context)
+        if ttl not in {
+            "five_minutes",
+            "one_hour",
+            "thirty_minutes",
+            "twenty_four_hours",
+            "provider_default",
+        }:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: unsupported ttl {ttl!r}",
+            )
+        return ForkAuthoredCacheBreakpoint(
+            provider=cast(ForkCacheProvider, provider),
+            model=MeerkatClient._require_string_field(data, "model", context),
+            boundary=ForkCacheBreakpointBoundary(
+                kind=cast(
+                    Literal["system_profile_prefix", "transcript_after"],
+                    boundary_kind,
+                ),
+                message_count=MeerkatClient._require_non_negative_integer_field(
+                    boundary_data,
+                    "message_count",
+                    context,
+                ),
+            ),
+            canonical_prefix_sha256=MeerkatClient._require_string_field(
+                data,
+                "canonical_prefix_sha256",
+                context,
+            ),
+            canonical_prefix_bytes=MeerkatClient._require_non_negative_integer_field(
+                data,
+                "canonical_prefix_bytes",
+                context,
+            ),
+            rendered_prefix_sha256=MeerkatClient._require_string_field(
+                data,
+                "rendered_prefix_sha256",
+                context,
+            ),
+            rendered_prefix_bytes=MeerkatClient._require_non_negative_integer_field(
+                data,
+                "rendered_prefix_bytes",
+                context,
+            ),
+            lowered_request_provenance=(
+                MeerkatClient._parse_fork_cache_lowered_request_provenance(
+                    data.get("lowered_request_provenance"),
+                    context,
+                )
+            ),
+            ttl=cast(ForkCacheTtl, ttl),
+        )
+
+    @staticmethod
+    def _parse_fork_point(raw: Any, context: str) -> ForkPoint:
+        data = MeerkatClient._require_dict(raw, "fork_point", context)
+        return ForkPoint(
+            message_count=MeerkatClient._require_non_negative_integer_field(
+                data,
+                "message_count",
+                context,
+            ),
+            authored_cache_breakpoint=(
+                MeerkatClient._parse_fork_authored_cache_breakpoint(
+                    data.get("authored_cache_breakpoint"),
+                    context,
+                )
+            ),
+        )
+
+    @staticmethod
+    def _parse_fork_cache_inheritance(raw: Any, context: str) -> ForkCacheInheritance:
+        data = MeerkatClient._require_dict(raw, "cache_inheritance", context)
+        status = MeerkatClient._require_string_field(data, "status", context)
+        if status == "available":
+            return ForkCacheInheritanceAvailable(
+                fork_point=MeerkatClient._parse_fork_point(
+                    data.get("fork_point"),
+                    context,
+                )
+            )
+        if status != "unavailable":
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: unsupported cache inheritance status {status!r}",
+            )
+        reason = MeerkatClient._require_string_field(data, "reason", context)
+        if reason not in {
+            "no_authored_breakpoint_at_boundary",
+            "provider_model_mismatch",
+            "target_identity_unresolved",
+            "target_lowering_unavailable",
+            "rendered_prefix_projection_unavailable",
+            "authored_evidence_invalid",
+        }:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: unsupported cache inheritance reason {reason!r}",
+            )
+        return ForkCacheInheritanceUnavailable(
+            message_count=MeerkatClient._require_non_negative_integer_field(
+                data,
+                "message_count",
+                context,
+            ),
+            reason=cast(ForkCacheInheritanceUnavailableReason, reason),
+        )
+
+    @staticmethod
+    def _parse_session_fork_result(
+        data: RpcSessionForkResult | dict[str, Any],
+    ) -> SessionForkResult:
         context = "Invalid session/fork response"
-        data = MeerkatClient._require_dict(data, "result", context)
+        data = MeerkatClient._require_dict(_wire_value(data), "result", context)
         return SessionForkResult(
             source_session_id=MeerkatClient._require_string_field(
                 data, "source_session_id", context
@@ -7111,6 +7396,10 @@ class MeerkatClient:
             ),
             message_count=MeerkatClient._require_non_negative_integer_field(
                 data, "message_count", context
+            ),
+            cache_inheritance=MeerkatClient._parse_fork_cache_inheritance(
+                data.get("cache_inheritance"),
+                context,
             ),
         )
 
@@ -7236,6 +7525,63 @@ class MeerkatClient:
         )
 
     @staticmethod
+    def _parse_system_prompt_update_result(data: Any) -> SystemPromptUpdateResult:
+        context = "Invalid system prompt update response"
+        data = MeerkatClient._require_dict(data, "result", context)
+        version = MeerkatClient._require_non_negative_integer_field(
+            data,
+            "version",
+            context,
+        )
+        if version == 0:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: version must be greater than zero",
+            )
+        status = MeerkatClient._require_string_field(data, "status", context)
+        if status not in {"applied", "duplicate"}:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: unsupported status {status!r}",
+            )
+        raw_commit = data.get("commit")
+        if status == "applied" and raw_commit is None:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: applied result must carry a commit",
+            )
+        if status == "duplicate" and raw_commit is not None:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: duplicate result must not carry a commit",
+            )
+        commit = None
+        if raw_commit is not None:
+            commit = dict(
+                MeerkatClient._validate_transcript_rewrite_commit(
+                    raw_commit,
+                    f"{context}: commit",
+                )
+            )
+        return SystemPromptUpdateResult(
+            session_id=MeerkatClient._require_string_field(data, "session_id", context),
+            key=MeerkatClient._require_string_field(data, "key", context),
+            version=version,
+            message_index=MeerkatClient._require_non_negative_integer_field(
+                data,
+                "message_index",
+                context,
+            ),
+            status=cast(Any, status),
+            transcript_revision=MeerkatClient._require_string_field(
+                data,
+                "transcript_revision",
+                context,
+            ),
+            commit=commit,
+        )
+
+    @staticmethod
     def _parse_session_message(data: dict[str, Any]) -> SessionMessage:
         # Transcript truth fails closed: a message without its identity facts
         # (role, created_at) or with malformed collections is a wire-contract
@@ -7250,6 +7596,31 @@ class MeerkatClient:
             else data.get("content")
         )
         transcript_role = data.get("transcript_role")
+        prompt_version = None
+        if data.get("prompt_version") is not None:
+            raw_prompt_version = MeerkatClient._require_dict(
+                data.get("prompt_version"),
+                "prompt_version",
+                context,
+            )
+            version = MeerkatClient._require_non_negative_integer_field(
+                raw_prompt_version,
+                "version",
+                f"{context}: prompt_version",
+            )
+            if version == 0:
+                raise MeerkatError(
+                    "INVALID_RESPONSE",
+                    f"{context}: prompt_version.version must be greater than zero",
+                )
+            prompt_version = SystemPromptVersionIdentity(
+                key=MeerkatClient._require_string_field(
+                    raw_prompt_version,
+                    "key",
+                    f"{context}: prompt_version",
+                ),
+                version=version,
+            )
         return SessionMessage(
             role=role,
             created_at=created_at,
@@ -7265,6 +7636,7 @@ class MeerkatClient:
             stop_reason=data.get("stop_reason"),
             interaction_id=data.get("interaction_id"),
             run_id=data.get("run_id"),
+            prompt_version=prompt_version,
             blocks=[
                 MeerkatClient._parse_session_assistant_block(block)
                 for block in MeerkatClient._require_list_field(data, "blocks", context)

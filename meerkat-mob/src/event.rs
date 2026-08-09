@@ -11,7 +11,7 @@ use crate::ids::{
 use crate::roster::MobMemberKickoffSnapshot;
 use crate::runtime_mode::MobRuntimeMode;
 use chrono::{DateTime, Utc};
-use meerkat_contracts::wire::supervisor_bridge::BridgeBootstrapToken;
+use meerkat_contracts::wire::supervisor_bridge::{BridgeBootstrapToken, BridgeDirectMemberFence};
 use meerkat_core::comms::{PeerName, TrustedPeerDescriptor};
 use meerkat_core::event::{AgentEvent, EventEnvelope};
 use meerkat_core::service::{MobToolCallerProvenance, OpaquePrincipalToken};
@@ -940,6 +940,11 @@ pub struct MemberSpawnedEvent {
     /// optional so journals written before endpoint persistence stay readable.
     #[serde(skip, default)]
     pub(crate) member_peer_endpoint: Option<TrustedPeerDescriptor>,
+    /// Exact V5 peer-only runtime/session fence returned by `BindMember`.
+    /// This is replay-only effect authority and never appears on public mob
+    /// event surfaces.
+    #[serde(skip, default)]
+    pub(crate) direct_member_fence: Option<BridgeDirectMemberFence>,
 }
 
 impl MemberSpawnedEvent {
@@ -965,6 +970,7 @@ impl MemberSpawnedEvent {
             identity_intent_authority_digest: None,
             placed_spawn_id: None,
             member_peer_endpoint: None,
+            direct_member_fence: None,
         }
     }
 
@@ -1011,6 +1017,18 @@ impl MemberSpawnedEvent {
 
     pub(crate) fn member_peer_endpoint(&self) -> Option<&TrustedPeerDescriptor> {
         self.member_peer_endpoint.as_ref()
+    }
+
+    pub(crate) fn with_direct_member_fence(
+        mut self,
+        direct_member_fence: Option<BridgeDirectMemberFence>,
+    ) -> Self {
+        self.direct_member_fence = direct_member_fence;
+        self
+    }
+
+    pub(crate) fn direct_member_fence(&self) -> Option<&BridgeDirectMemberFence> {
+        self.direct_member_fence.as_ref()
     }
 }
 
@@ -1259,6 +1277,15 @@ pub(crate) fn encode_stored_mob_event(event: &MobEvent) -> Result<Vec<u8>, serde
             serde_json::to_value(member_peer_endpoint)?,
         );
     }
+    if let Some(member_spawned) = event.kind.member_spawned()
+        && let Some(direct_member_fence) = member_spawned.direct_member_fence()
+        && let Some(kind) = value.get_mut("kind").and_then(Value::as_object_mut)
+    {
+        kind.insert(
+            "direct_member_fence".to_string(),
+            serde_json::to_value(direct_member_fence)?,
+        );
+    }
     if let Some(recovered) = event.kind.member_session_binding_recovered()
         && let Some(bridge_session_id) = recovered.bridge_session_id()
         && let Some(kind) = value.get_mut("kind").and_then(Value::as_object_mut)
@@ -1395,6 +1422,18 @@ pub(crate) fn decode_stored_mob_event(bytes: &[u8]) -> Result<MobEvent, serde_js
         })
         .map(serde_json::from_value)
         .transpose()?;
+    let spawned_direct_member_fence = value
+        .get_mut("kind")
+        .and_then(Value::as_object_mut)
+        .and_then(|kind| {
+            if kind.get("type").and_then(Value::as_str) == Some("member_spawned") {
+                kind.remove("direct_member_fence")
+            } else {
+                None
+            }
+        })
+        .map(serde_json::from_value)
+        .transpose()?;
     let recovered_bridge_session_id = value
         .get_mut("kind")
         .and_then(Value::as_object_mut)
@@ -1501,6 +1540,11 @@ pub(crate) fn decode_stored_mob_event(bytes: &[u8]) -> Result<MobEvent, serde_js
         && let Some(member_spawned) = event.kind.member_spawned_mut()
     {
         member_spawned.member_peer_endpoint = Some(member_peer_endpoint);
+    }
+    if let Some(direct_member_fence) = spawned_direct_member_fence
+        && let Some(member_spawned) = event.kind.member_spawned_mut()
+    {
+        member_spawned.direct_member_fence = Some(direct_member_fence);
     }
     if let Some(bridge_session_id) = recovered_bridge_session_id
         && let Some(recovered) = event.kind.member_session_binding_recovered_mut()

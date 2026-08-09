@@ -47,7 +47,7 @@ mod tests {
     #[test]
     fn test_comms_tool_set_creation() {
         let keypair = Keypair::generate();
-        let (_, inbox_sender) = meerkat_comms::Inbox::new();
+        let (_, inbox_sender) = meerkat_comms::Inbox::new_transport_only();
         let router = Arc::new(Router::new(
             keypair,
             CommsConfig::default(),

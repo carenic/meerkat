@@ -7,7 +7,62 @@ struct MutationGuardedControlEntry {
     publication_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>>,
 }
 
+struct MutationGuardedResetCommit {
+    report: ResetReport,
+    completion_input_ids: Vec<InputId>,
+    candidate_owner_input_id: Option<InputId>,
+}
+
 impl MeerkatMachine {
+    async fn converge_pending_runless_terminals_before_control_mutation(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        session_id: &SessionId,
+    ) -> Result<(), RuntimeControlPlaneError> {
+        loop {
+            let mutation_guard = self
+                .lock_current_control_durability_ready_session_mutation_gate(session_id)
+                .await?;
+            let entry = self
+                .capture_current_control_entry_under_mutation_guard(
+                    runtime_id,
+                    session_id,
+                    &mutation_guard,
+                )
+                .await?;
+            if !crate::control_plane::has_committed_runless_recovery_carrier(&entry.driver)
+                .await
+                .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?
+            {
+                return Ok(());
+            }
+            let publication_handle = entry.publication_handle.ok_or_else(|| {
+                RuntimeControlPlaneError::Internal(format!(
+                    "runtime {runtime_id} has a committed directed terminal without an exact publication capability"
+                ))
+            })?;
+            let mutation_gate = self
+                .session_mutation_gate(session_id)
+                .await
+                .ok_or_else(|| RuntimeControlPlaneError::NotFound(runtime_id.clone()))?;
+            let (result_rx, start_tx) = self
+                .prepare_runless_terminal_publication_dispatch(
+                    &entry.driver,
+                    &entry.completions,
+                    &mutation_gate,
+                    publication_handle,
+                )
+                .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+            drop(mutation_guard);
+            if let Some(start_tx) = start_tx {
+                let _ = start_tx.send(());
+            }
+            self.await_runless_terminal_publication_dispatch(runtime_id, result_rx, None)
+                .await
+                .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+        }
+    }
+
     async fn lock_current_control_durability_ready_session_mutation_gate(
         &self,
         session_id: &SessionId,
@@ -49,22 +104,7 @@ impl MeerkatMachine {
         &self,
         session_id: &SessionId,
         driver: &SharedDriver,
-        completions: &SharedCompletionRegistry,
-    ) -> Result<ResetReport, RuntimeControlPlaneError> {
-        let publication_handle = self
-            .sessions
-            .read()
-            .await
-            .get(session_id)
-            .and_then(RuntimeSessionEntry::publication_handle);
-        crate::control_plane::drain_recovered_runless_runtime_terminations(
-            driver,
-            Some(completions),
-            publication_handle.as_deref(),
-        )
-        .await
-        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-
+    ) -> Result<MutationGuardedResetCommit, RuntimeControlPlaneError> {
         let reason = "runtime reset";
         let (completion_input_ids, prepared_terminals) = {
             let mut drv = driver.lock().await;
@@ -106,17 +146,11 @@ impl MeerkatMachine {
             crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared_terminals);
         drop(drv);
 
-        crate::control_plane::publish_and_resolve_runless_runtime_termination(
-            driver,
-            Some(completions),
-            publication_handle.as_deref(),
-            &completion_input_ids,
-            candidate_owner_input_id.as_ref(),
-            reason,
-        )
-        .await
-        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-        Ok(report)
+        Ok(MutationGuardedResetCommit {
+            report,
+            completion_input_ids,
+            candidate_owner_input_id,
+        })
     }
 
     pub(super) async fn reset_runtime_for_authorized_archived_resume(
@@ -162,9 +196,28 @@ impl MeerkatMachine {
             }
             (Arc::clone(&entry.driver), Arc::clone(&entry.completions))
         };
-        self.realize_reset_under_mutation_guard(&lease.session_id, &driver, &completions)
+        if crate::control_plane::has_committed_runless_recovery_carrier(&driver)
             .await
-            .map_err(|error| RuntimeDriverError::Internal(error.to_string()))
+            .map_err(|error| RuntimeDriverError::Internal(error.to_string()))?
+            || !driver
+                .lock()
+                .await
+                .as_driver()
+                .active_input_ids()
+                .is_empty()
+        {
+            return Err(RuntimeDriverError::RuntimeTerminalPublicationInProgress {
+                runtime_id: LogicalRuntimeId::for_session(&lease.session_id),
+            });
+        }
+        let committed = self
+            .realize_reset_under_mutation_guard(&lease.session_id, &driver)
+            .await
+            .map_err(|error| RuntimeDriverError::Internal(error.to_string()))?;
+        debug_assert!(committed.completion_input_ids.is_empty());
+        debug_assert!(committed.candidate_owner_input_id.is_none());
+        let _ = completions;
+        Ok(committed.report)
     }
 
     fn accept_outcome_matches_preview(preview: &AcceptOutcome, committed: &AcceptOutcome) -> bool {
@@ -742,43 +795,131 @@ impl MeerkatMachine {
                 // replacement while waiting can reset A's driver while
                 // applying B's DSL transition.
                 let (session_id, _, _, _) = self.lookup_entry(&runtime_id).await?;
-                let _gate_guard = self
-                    .lock_current_durability_ready_session_mutation_gate(&session_id)
-                    .await
-                    .map_err(|error| match error {
-                        RuntimeDriverError::NotReady {
-                            state: RuntimeState::Destroyed,
-                        } => RuntimeControlPlaneError::NotFound(runtime_id.clone()),
-                        error => RuntimeControlPlaneError::StoreError(error.to_string()),
-                    })?;
-                let (locked_session_id, driver, completions, _wake_tx) =
-                    self.lookup_entry(&runtime_id).await?;
-                if locked_session_id != session_id {
-                    return Err(RuntimeControlPlaneError::Internal(format!(
-                        "runtime reset lookup changed logical session from {session_id} to {locked_session_id} while holding the current mutation gate"
-                    )));
+                loop {
+                    let gate_guard = self
+                        .lock_current_durability_ready_session_mutation_gate(&session_id)
+                        .await
+                        .map_err(|error| match error {
+                            RuntimeDriverError::NotReady {
+                                state: RuntimeState::Destroyed,
+                            } => RuntimeControlPlaneError::NotFound(runtime_id.clone()),
+                            error => RuntimeControlPlaneError::StoreError(error.to_string()),
+                        })?;
+                    let (locked_session_id, driver, completions, _wake_tx) =
+                        self.lookup_entry(&runtime_id).await?;
+                    if locked_session_id != session_id {
+                        return Err(RuntimeControlPlaneError::Internal(format!(
+                            "runtime reset lookup changed logical session from {session_id} to {locked_session_id} while holding the current mutation gate"
+                        )));
+                    }
+                    let (claim_outstanding, mutation_gate, publication_handle) = {
+                        let sessions = self.sessions.read().await;
+                        let entry = sessions.get(&session_id).ok_or_else(|| {
+                            RuntimeControlPlaneError::NotFound(runtime_id.clone())
+                        })?;
+                        (
+                            entry
+                                .materialization_claim_state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .current
+                                .is_some(),
+                            Arc::clone(&entry.mutation_gate),
+                            entry.publication_handle(),
+                        )
+                    };
+                    if claim_outstanding {
+                        return Err(RuntimeControlPlaneError::Internal(format!(
+                            "runtime reset for session {session_id} requires the exact prepared materialization lease while an actor/attachment claim is outstanding"
+                        )));
+                    }
+
+                    if crate::control_plane::has_committed_runless_recovery_carrier(&driver)
+                        .await
+                        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?
+                    {
+                        let publication_handle = publication_handle.ok_or_else(|| {
+                            RuntimeControlPlaneError::Internal(
+                                "runtime reset recovery has no exact terminal publication capability"
+                                    .to_string(),
+                            )
+                        })?;
+                        let (result_rx, start_tx) = self
+                            .prepare_runless_terminal_publication_dispatch(
+                                &driver,
+                                &completions,
+                                &mutation_gate,
+                                publication_handle,
+                            )
+                            .map_err(|error| {
+                                RuntimeControlPlaneError::Internal(error.to_string())
+                            })?;
+                        drop(gate_guard);
+                        if let Some(start_tx) = start_tx {
+                            let _ = start_tx.send(());
+                        }
+                        self.await_runless_terminal_publication_dispatch(
+                            &runtime_id,
+                            result_rx,
+                            None,
+                        )
+                        .await
+                        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+                        continue;
+                    }
+
+                    let committed = self
+                        .realize_reset_under_mutation_guard(&session_id, &driver)
+                        .await?;
+                    let dispatch = match (
+                        committed.candidate_owner_input_id.as_ref(),
+                        publication_handle,
+                    ) {
+                        (Some(_), Some(publication_handle)) => Some(
+                            self.prepare_runless_terminal_publication_dispatch(
+                                &driver,
+                                &completions,
+                                &mutation_gate,
+                                publication_handle,
+                            )
+                            .map_err(|error| {
+                                RuntimeControlPlaneError::Internal(error.to_string())
+                            })?,
+                        ),
+                        (Some(_), None) => {
+                            return Err(RuntimeControlPlaneError::Internal(
+                                "runtime reset committed directed terminals without an exact publication capability"
+                                    .to_string(),
+                            ));
+                        }
+                        (None, _) => None,
+                    };
+                    drop(gate_guard);
+                    if let Some((result_rx, start_tx)) = dispatch {
+                        if let Some(start_tx) = start_tx {
+                            let _ = start_tx.send(());
+                        }
+                        self.await_runless_terminal_publication_dispatch(
+                            &runtime_id,
+                            result_rx,
+                            None,
+                        )
+                        .await
+                        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+                    } else if !committed.completion_input_ids.is_empty() {
+                        crate::control_plane::publish_and_resolve_runless_runtime_termination(
+                            &driver,
+                            Some(&completions),
+                            None,
+                            &committed.completion_input_ids,
+                            None,
+                            "runtime reset",
+                        )
+                        .await
+                        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+                    }
+                    break Ok(MeerkatMachineCommandResult::ResetReport(committed.report));
                 }
-                let claim_outstanding = {
-                    let sessions = self.sessions.read().await;
-                    let entry = sessions
-                        .get(&session_id)
-                        .ok_or_else(|| RuntimeControlPlaneError::NotFound(runtime_id.clone()))?;
-                    entry
-                        .materialization_claim_state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .current
-                        .is_some()
-                };
-                if claim_outstanding {
-                    return Err(RuntimeControlPlaneError::Internal(format!(
-                        "runtime reset for session {session_id} requires the exact prepared materialization lease while an actor/attachment claim is outstanding"
-                    )));
-                }
-                let report = self
-                    .realize_reset_under_mutation_guard(&session_id, &driver, &completions)
-                    .await?;
-                Ok(MeerkatMachineCommandResult::ResetReport(report))
             }
             MeerkatMachineCommand::Recover { runtime_id } => {
                 let session_id = self.resolve_session_id(&runtime_id).await?;
@@ -852,6 +993,11 @@ impl MeerkatMachine {
                     &session_id,
                 )
                 .await;
+                self.converge_pending_runless_terminals_before_control_mutation(
+                    &runtime_id,
+                    &session_id,
+                )
+                .await?;
                 #[cfg(feature = "live")]
                 let live_lifecycle_lease = self
                     .acquire_member_live_disposal_lease(&session_id)
@@ -886,6 +1032,10 @@ impl MeerkatMachine {
                         &mutation_guard,
                     )
                     .await?;
+                let mutation_gate = self
+                    .session_mutation_gate(&session_id)
+                    .await
+                    .ok_or_else(|| RuntimeControlPlaneError::NotFound(runtime_id.clone()))?;
                 let mutation_blocked = {
                     let sessions = self.sessions.read().await;
                     sessions
@@ -895,13 +1045,15 @@ impl MeerkatMachine {
                 if let Some(error) = mutation_blocked {
                     return Err(RuntimeControlPlaneError::Internal(error.to_string()));
                 }
-                crate::control_plane::drain_recovered_runless_runtime_terminations(
-                    &driver,
-                    Some(&completions),
-                    publication_handle.as_deref(),
-                )
-                .await
-                .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+                if crate::control_plane::has_committed_runless_recovery_carrier(&driver)
+                    .await
+                    .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?
+                {
+                    return Err(RuntimeControlPlaneError::RetirementInProgress {
+                        runtime_id,
+                        stage: "pre_destroy_terminal_publication".to_string(),
+                    });
+                }
 
                 let destroy_input = crate::meerkat_machine::dsl::MeerkatMachineInput::Destroy {
                     session_id: crate::meerkat_machine::dsl::SessionId::from_domain(&session_id),
@@ -981,16 +1133,47 @@ impl MeerkatMachine {
                     .lock()
                     .await
                     .sync_control_projection_from_dsl_authority();
-                let publication_result =
+                let publication_dispatch = match (
+                    candidate_owner_input_id.as_ref(),
+                    publication_handle,
+                ) {
+                    (Some(_), Some(publication_handle)) => Some(
+                        self.prepare_runless_terminal_publication_dispatch(
+                            &driver,
+                            &completions,
+                            &mutation_gate,
+                            publication_handle,
+                        )
+                        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?,
+                    ),
+                    (Some(_), None) => {
+                        return Err(RuntimeControlPlaneError::Internal(
+                            "runtime destroy committed directed terminals without an exact publication capability"
+                                .to_string(),
+                        ));
+                    }
+                    (None, _) => None,
+                };
+                drop(mutation_guard);
+                #[cfg(feature = "live")]
+                drop(live_lifecycle_lease);
+                let publication_result = if let Some((result_rx, start_tx)) = publication_dispatch {
+                    if let Some(start_tx) = start_tx {
+                        let _ = start_tx.send(());
+                    }
+                    self.await_runless_terminal_publication_dispatch(&runtime_id, result_rx, None)
+                        .await
+                } else {
                     crate::control_plane::publish_and_resolve_runless_runtime_termination(
                         &driver,
                         Some(&completions),
-                        publication_handle.as_deref(),
+                        None,
                         &completion_input_ids,
-                        candidate_owner_input_id.as_ref(),
+                        None,
                         reason,
                     )
-                    .await;
+                    .await
+                };
                 if let Err(reason) = apply_result {
                     return Err(RuntimeControlPlaneError::Internal(reason));
                 }

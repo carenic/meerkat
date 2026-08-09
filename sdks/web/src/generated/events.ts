@@ -149,6 +149,8 @@ export type ContentBlock = {
 
 export type ContentInput = string | ContentBlock[];
 
+export type CumulativeUsage = Usage;
+
 export interface DeferredCatalogDelta {
   added_hidden_names?: ToolName[];
   pending_sources?: string[];
@@ -247,6 +249,8 @@ export interface PendingCallbackToolCall {
   tool_use_id: string;
 }
 
+export type PresentedTokenConvention = "anthropic_disjoint_input_components" | "open_ai_input_includes_cached_subset" | "gemini_prompt_includes_cached_subset" | "open_ai_compatible_prompt_includes_cache_details" | "host_declared_inclusive_input_total";
+
 export interface PromptText {
   content: string;
 }
@@ -256,6 +260,14 @@ export type Provider = "anthropic" | "openai" | "gemini" | "self_hosted" | "othe
 export type ProviderImageMetadata = {
   provider: "not_emitted";
 } | OpenAiImageMetadata | GeminiImageMetadata;
+
+export interface ProviderTokenAccounting {
+  aggregation: TokenAggregationProvenance;
+  convention: PresentedTokenConvention;
+  model: string;
+  presented_tokens: number;
+  provider: Provider;
+}
 
 export type RevisedPromptDisposition = {
   disposition: "not_requested";
@@ -381,6 +393,8 @@ export interface SystemTime {
   secs_since_epoch: number;
 }
 
+export type TokenAggregationProvenance = "sum_disjoint_provider_components" | "provider_inclusive_input_total";
+
 export type ToolCallArguments = Record<string, unknown>;
 
 export type ToolConfigChangeDomain = "tool_scope" | "deferred_catalog";
@@ -483,11 +497,21 @@ export type TurnTerminalCauseKind = "unknown" | "hook_denied" | "hook_failure" |
 
 export type TurnTerminalOutcome = "none" | "completed" | "failed" | "cancelled" | "budget_exhausted" | "time_budget_exceeded" | "structured_output_validation_failed";
 
+export type TurnUsage = {
+  accounting: ProviderTokenAccounting;
+  cache_creation_tokens?: number | null;
+  cache_read_tokens?: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  provider_accounting?: ProviderTokenAccounting | null;
+};
+
 export type Usage = {
   cache_creation_tokens?: number | null;
   cache_read_tokens?: number | null;
   input_tokens: number;
   output_tokens: number;
+  provider_accounting?: ProviderTokenAccounting | null;
 };
 
 export interface RunStartedEvent {
@@ -503,7 +527,7 @@ export interface RunCompletedEvent {
   structured_output?: unknown;
   terminal_cause_kind?: TurnTerminalCauseKind | null;
   type: "run_completed";
-  usage: Usage;
+  usage: CumulativeUsage;
 }
 
 export interface ExtractionSucceededEvent {
@@ -612,7 +636,7 @@ export interface ToolResultReceivedEvent {
 export interface TurnCompletedEvent {
   stop_reason: StopReason;
   type: "turn_completed";
-  usage: Usage;
+  usage: TurnUsage;
 }
 
 export interface ToolExecutionStartedEvent {

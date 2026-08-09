@@ -2118,12 +2118,12 @@ async fn runtime_comms_terminal_response_wake_drains_requester_queue() {
 
     async fn drain_until_nonempty(
         runtime: &InprocCommsRuntime,
-    ) -> Vec<meerkat_core::ClassifiedInboxInteraction> {
+    ) -> Vec<meerkat_core::interaction::PeerInputCandidate> {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let batch = CoreCommsRuntime::drain_classified_inbox_interactions(runtime)
+                let batch = CoreCommsRuntime::handoff_volatile_peer_input_candidates(runtime)
                     .await
-                    .unwrap_or_default();
+                    .expect("exact volatile handoff");
                 if !batch.is_empty() {
                     return batch;
                 }
@@ -3099,9 +3099,13 @@ async fn stop_runtime_executor_keeps_attachment_live_until_stop_completes() {
 
     #[async_trait::async_trait]
     impl CoreExecutorInterruptHandle for BlockingStopInterruptHandle {
-        async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
+        async fn hard_cancel_run_if_current(
+            &self,
+            _expected_run_id: &RunId,
+            _reason: String,
+        ) -> Result<bool, CoreExecutorError> {
             self.interrupt_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(true)
         }
     }
 
@@ -4227,16 +4231,8 @@ async fn unregister_session_aborts_spawned_drain_and_clears_suppression() {
 
     #[async_trait::async_trait]
     impl CommsRuntime for IdleDrainRuntime {
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<Notify> {
             Arc::clone(&self.notify)
-        }
-
-        fn dismiss_received(&self) -> bool {
-            false
         }
 
         async fn claim_classified_inbox_interaction(
@@ -4304,16 +4300,8 @@ async fn idle_non_host_sessions_do_not_spawn_background_comms_drains() {
 
     #[async_trait::async_trait]
     impl CommsRuntime for IdleDrainRuntime {
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<Notify> {
             Arc::clone(&self.notify)
-        }
-
-        fn dismiss_received(&self) -> bool {
-            false
         }
 
         async fn claim_classified_inbox_interaction(
@@ -4368,16 +4356,8 @@ async fn attached_sessions_do_not_spawn_comms_drains_without_keep_alive() {
 
     #[async_trait::async_trait]
     impl CommsRuntime for IdleDrainRuntime {
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<Notify> {
             Arc::clone(&self.notify)
-        }
-
-        fn dismiss_received(&self) -> bool {
-            false
         }
 
         async fn claim_classified_inbox_interaction(

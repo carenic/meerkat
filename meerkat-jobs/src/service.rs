@@ -1,17 +1,21 @@
 use std::sync::Arc;
 
 use crate::machines::detached_job as dsl;
-use crate::store::{InsertJobOutcome, StoredJob};
+use crate::store::{InsertJobOutcome, PredicateDeliveryCommitOutcome, StoredJob};
 use crate::{
     AttemptClaim, AttemptClaimReceipt, AttemptId, AttemptWriteAuthority, CheckpointRef,
     DetachedJobError, DetachedJobStore, FenceToken, JobDescription, JobFailureCode,
     JobHealthCondition, JobHealthSnapshot, JobId, JobNotification, JobNotificationReceipt,
     JobOutboxEntry, JobOutboxPayload, JobProgress, JobReceipt, JobReference, JobResultRef,
     JobSnapshot, JobSubscription, JobSubscriptionId, JobTerminalResult, NotificationId,
-    PredicateEvaluation, PredicateEvaluationReceipt, PredicateObservation, PredicateWatch,
+    PredicateDeliveryCommit, PredicateDeliveryIdentity, PredicateDeliveryNotificationReceipt,
+    PredicateDeliveryOutcome, PredicateEvaluation, PredicateEvaluationReceipt,
+    PredicateObservation, PredicateWatch,
 };
 
 const REQUEST_CANCEL_CONFLICT_BUDGET: usize = 8;
+const DELIVERY_ACK_CONFLICT_BUDGET: usize = 8;
+const PREDICATE_EVALUATION_CONFLICT_BUDGET: usize = 8;
 
 #[derive(Clone)]
 pub struct DetachedJobService {
@@ -536,6 +540,216 @@ impl DetachedJobService {
         })
     }
 
+    /// Whether one Schedule-owned predicate delivery already committed.
+    ///
+    /// This read intentionally precedes active-attempt validation at the host
+    /// seam: a replay remains successful after the job moved on or became
+    /// terminal because the exact earlier delivery is already durable.
+    pub async fn predicate_delivery_applied(
+        &self,
+        job_id: &JobId,
+        identity: &PredicateDeliveryIdentity,
+    ) -> Result<bool, DetachedJobError> {
+        Ok(self
+            .store
+            .predicate_delivery_receipt(job_id, identity)
+            .await?
+            .is_some())
+    }
+
+    /// Atomically apply one repeatable predicate observation under the stable
+    /// Schedule occurrence delivery identity.
+    ///
+    /// Notification outbox insertion, checkpoint replacement, and health
+    /// progress are projected through the generated job authority. The store
+    /// commits that one replacement together with a narrow immutable delivery
+    /// receipt. A crash before the transaction leaves neither half; a crash
+    /// after it makes every exact retry return the original receipt.
+    pub async fn evaluate_predicate_idempotent(
+        &self,
+        job_id: &JobId,
+        write: AttemptWriteAuthority,
+        identity: PredicateDeliveryIdentity,
+        watch: &PredicateWatch,
+        observation: PredicateObservation,
+        observed_at_ms: u64,
+    ) -> Result<PredicateDeliveryOutcome, DetachedJobError> {
+        let mut conflicts = 0usize;
+        loop {
+            if let Some(receipt) = self
+                .store
+                .predicate_delivery_receipt(job_id, &identity)
+                .await?
+            {
+                let current = self.required(job_id).await?;
+                return Ok(PredicateDeliveryOutcome::Deduplicated {
+                    receipt,
+                    snapshot: job_snapshot(current)?,
+                });
+            }
+            let current = self.required(job_id).await?;
+            ensure_current_writer(job_id, &current, &write)?;
+
+            let checkpoint = current
+                .machine_state
+                .checkpoint_ref
+                .as_deref()
+                .map(decode_predicate_checkpoint)
+                .transpose()?;
+            let evaluation = watch
+                .evaluate(checkpoint.as_ref(), observation.clone())
+                .map_err(|error| DetachedJobError::InvalidInput(error.to_string()))?;
+
+            let mut authority =
+                dsl::DetachedJobMachineAuthority::recover_from_state(current.machine_state.clone())
+                    .map_err(|error| DetachedJobError::InvalidTransition {
+                        job_id: job_id.clone(),
+                        detail: format!("machine recovery rejected persisted state: {error:?}"),
+                    })?;
+            let mut replacement = current.clone();
+
+            let mut notification_projection = None;
+            if let Some(notification) = evaluation.notification().cloned() {
+                let runtime_delivery_id =
+                    format!("{}:notification:{}", job_id, notification.notification_id());
+                let effects = apply_predicate_bundle_step(
+                    job_id,
+                    &mut authority,
+                    &mut replacement,
+                    dsl::DetachedJobInput::EmitNotification {
+                        attempt_id: write.attempt_id.as_str().to_string(),
+                        fence: write.fence.get(),
+                        notification_id: notification.notification_id().as_str().to_string(),
+                        idempotency_key: notification.idempotency_key().to_string(),
+                        runtime_delivery_id,
+                        observed_at_ms,
+                    },
+                )?;
+                project_notification(&mut replacement, &effects, &notification)?;
+                notification_projection = Some(notification_disposition(&effects)?);
+            }
+
+            if let Some(checkpoint) = evaluation.checkpoint() {
+                let encoded = serde_json::to_string(checkpoint).map_err(|error| {
+                    DetachedJobError::InvalidInput(format!(
+                        "cannot encode predicate checkpoint: {error}"
+                    ))
+                })?;
+                let checkpoint_ref = CheckpointRef::new(format!("predicate:{encoded}"))?;
+                let effects = apply_predicate_bundle_step(
+                    job_id,
+                    &mut authority,
+                    &mut replacement,
+                    dsl::DetachedJobInput::RecordCheckpoint {
+                        attempt_id: write.attempt_id.as_str().to_string(),
+                        fence: write.fence.get(),
+                        checkpoint_ref: checkpoint_ref.as_str().to_string(),
+                        observed_at_ms,
+                    },
+                )?;
+                if effects.as_slice()
+                    != [dsl::DetachedJobEffect::CheckpointAccepted {
+                        checkpoint_ref: checkpoint_ref.as_str().to_string(),
+                    }]
+                {
+                    return Err(DetachedJobError::Store(
+                        "predicate checkpoint step emitted an unexpected effect set".into(),
+                    ));
+                }
+            }
+
+            let health_cursor = replacement.progress.as_ref().map_or(Ok(1), |progress| {
+                progress.cursor.checked_add(1).ok_or_else(|| {
+                    DetachedJobError::InvalidInput("predicate health cursor exhausted u64".into())
+                })
+            })?;
+            let (condition, detail) = match &evaluation {
+                PredicateEvaluation::SourceUnavailable {
+                    reason,
+                    retry_after_secs,
+                    ..
+                } => (
+                    JobHealthCondition::PredicateSourceUnavailable {
+                        retry_after_secs: *retry_after_secs,
+                    },
+                    format!("predicate_source_unavailable:{reason}"),
+                ),
+                PredicateEvaluation::Baseline { .. }
+                | PredicateEvaluation::Unchanged { .. }
+                | PredicateEvaluation::Crossed { .. } => (
+                    JobHealthCondition::Healthy,
+                    "predicate_source_healthy".to_string(),
+                ),
+            };
+            let progress = JobProgress::health(health_cursor, condition, detail)?;
+            let effects = apply_predicate_bundle_step(
+                job_id,
+                &mut authority,
+                &mut replacement,
+                dsl::DetachedJobInput::ReportProgress {
+                    attempt_id: write.attempt_id.as_str().to_string(),
+                    fence: write.fence.get(),
+                    cursor: progress.cursor,
+                    observed_at_ms,
+                },
+            )?;
+            if effects.as_slice()
+                != [dsl::DetachedJobEffect::ProgressAccepted {
+                    cursor: progress.cursor,
+                }]
+            {
+                return Err(DetachedJobError::Store(
+                    "predicate progress step emitted an unexpected effect set".into(),
+                ));
+            }
+            replacement.progress = Some(progress);
+
+            let expected_revision = replacement.revision;
+            let notification_receipt = notification_projection.as_ref().map(
+                |(notification_id, delivery_sequence, deduplicated)| {
+                    PredicateDeliveryNotificationReceipt {
+                        notification_id: notification_id.clone(),
+                        delivery_sequence: *delivery_sequence,
+                        deduplicated: *deduplicated,
+                    }
+                },
+            );
+            let commit = PredicateDeliveryCommit {
+                identity: identity.clone(),
+                evaluation: evaluation.clone(),
+                notification: notification_receipt,
+            };
+            let outcome = match self
+                .store
+                .commit_predicate_delivery(expected_revision, replacement, commit)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(DetachedJobError::StaleRevision { .. })
+                    if conflicts < PREDICATE_EVALUATION_CONFLICT_BUDGET =>
+                {
+                    conflicts += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            return match outcome {
+                PredicateDeliveryCommitOutcome::Committed { job, receipt } => {
+                    Ok(PredicateDeliveryOutcome::Applied {
+                        receipt,
+                        snapshot: job_snapshot(job)?,
+                    })
+                }
+                PredicateDeliveryCommitOutcome::Deduplicated { job, receipt } => {
+                    Ok(PredicateDeliveryOutcome::Deduplicated {
+                        receipt,
+                        snapshot: job_snapshot(job)?,
+                    })
+                }
+            };
+        }
+    }
+
     pub async fn wait_external(
         &self,
         job_id: &JobId,
@@ -755,58 +969,70 @@ impl DetachedJobService {
         job_id: &JobId,
         delivery_sequence: u64,
     ) -> Result<JobSnapshot, DetachedJobError> {
-        let current = self.required(job_id).await?;
-        let entry = current
-            .outbox
-            .iter()
-            .find(|entry| entry.delivery_sequence == delivery_sequence)
-            .ok_or_else(|| {
-                DetachedJobError::Store(format!(
-                    "delivery {delivery_sequence} has no committed outbox entry"
-                ))
-            })?;
-        let delivery_id = entry.delivery_id.clone();
-        let machine_delivery_id = delivery_id.clone();
-        let (stored, _) = self
-            .apply_from(
-                current,
-                dsl::DetachedJobInput::MarkDeliveryApplied {
-                    delivery_id: machine_delivery_id,
-                    delivery_sequence,
-                },
-                move |job, effects| {
-                    let emitted = effects.iter().filter(|effect| {
-                        matches!(
-                            effect,
-                            dsl::DetachedJobEffect::DeliveryApplied {
-                                delivery_id: emitted_id,
-                                delivery_sequence: emitted
-                            } if emitted_id == &delivery_id && *emitted == delivery_sequence
-                        )
-                    });
-                    if emitted.count() != 1 {
-                        return Err(DetachedJobError::Store(
-                            "machine did not authorize exactly one delivery acknowledgement".into(),
-                        ));
-                    }
-                    let entry = job
-                        .outbox
-                        .iter_mut()
-                        .find(|entry| entry.delivery_sequence == delivery_sequence)
-                        .ok_or_else(|| {
-                            DetachedJobError::Store(format!(
-                                "delivery {delivery_sequence} has no committed outbox entry"
-                            ))
-                        })?;
-                    if entry.applied {
-                        return Ok(());
-                    }
-                    entry.applied = true;
-                    Ok(())
-                },
-            )
-            .await?;
-        job_snapshot(stored)
+        let mut conflicts = 0usize;
+        loop {
+            let current = self.required(job_id).await?;
+            let entry = current
+                .outbox
+                .iter()
+                .find(|entry| entry.delivery_sequence == delivery_sequence)
+                .ok_or_else(|| {
+                    DetachedJobError::Store(format!(
+                        "delivery {delivery_sequence} has no committed outbox entry"
+                    ))
+                })?;
+            let delivery_id = entry.delivery_id.clone();
+            let machine_delivery_id = delivery_id.clone();
+            let outcome = self
+                .apply_from(
+                    current,
+                    dsl::DetachedJobInput::MarkDeliveryApplied {
+                        delivery_id: machine_delivery_id,
+                        delivery_sequence,
+                    },
+                    move |job, effects| {
+                        let emitted = effects.iter().filter(|effect| {
+                            matches!(
+                                effect,
+                                dsl::DetachedJobEffect::DeliveryApplied {
+                                    delivery_id: emitted_id,
+                                    delivery_sequence: emitted
+                                } if emitted_id == &delivery_id && *emitted == delivery_sequence
+                            )
+                        });
+                        if emitted.count() != 1 {
+                            return Err(DetachedJobError::Store(
+                                "machine did not authorize exactly one delivery acknowledgement"
+                                    .into(),
+                            ));
+                        }
+                        let entry = job
+                            .outbox
+                            .iter_mut()
+                            .find(|entry| entry.delivery_sequence == delivery_sequence)
+                            .ok_or_else(|| {
+                                DetachedJobError::Store(format!(
+                                    "delivery {delivery_sequence} has no committed outbox entry"
+                                ))
+                            })?;
+                        if entry.applied {
+                            return Ok(());
+                        }
+                        entry.applied = true;
+                        Ok(())
+                    },
+                )
+                .await;
+            match outcome {
+                Ok((stored, _)) => return job_snapshot(stored),
+                Err(DetachedJobError::StaleRevision { .. })
+                    if conflicts < DELIVERY_ACK_CONFLICT_BUDGET =>
+                {
+                    conflicts = conflicts.saturating_add(1);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn apply_terminal(
@@ -883,6 +1109,56 @@ impl DetachedJobService {
             .await?;
         Ok((committed, effects))
     }
+}
+
+fn apply_predicate_bundle_step(
+    job_id: &JobId,
+    authority: &mut dsl::DetachedJobMachineAuthority,
+    replacement: &mut StoredJob,
+    input: dsl::DetachedJobInput,
+) -> Result<Vec<dsl::DetachedJobEffect>, DetachedJobError> {
+    let transition = dsl::DetachedJobMachineMutator::apply(authority, input).map_err(|error| {
+        DetachedJobError::InvalidTransition {
+            job_id: job_id.clone(),
+            detail: format!("{error:?}"),
+        }
+    })?;
+    let effects = transition.effects().to_vec();
+    replacement.machine_state = authority.state().clone();
+    Ok(effects)
+}
+
+fn notification_disposition(
+    effects: &[dsl::DetachedJobEffect],
+) -> Result<(NotificationId, u64, bool), DetachedJobError> {
+    let mut dispositions = effects.iter().filter_map(|effect| match effect {
+        dsl::DetachedJobEffect::NotificationCommitted {
+            notification_id,
+            delivery_sequence,
+            ..
+        } => Some((notification_id.as_str(), *delivery_sequence, false)),
+        dsl::DetachedJobEffect::NotificationSuppressed {
+            notification_id,
+            delivery_sequence,
+            ..
+        } => Some((notification_id.as_str(), *delivery_sequence, true)),
+        _ => None,
+    });
+    let Some((notification_id, delivery_sequence, deduplicated)) = dispositions.next() else {
+        return Err(DetachedJobError::Store(
+            "predicate notification step emitted no notification disposition".into(),
+        ));
+    };
+    if dispositions.next().is_some() {
+        return Err(DetachedJobError::Store(
+            "predicate notification step emitted multiple notification dispositions".into(),
+        ));
+    }
+    Ok((
+        NotificationId::new(notification_id)?,
+        delivery_sequence,
+        deduplicated,
+    ))
 }
 
 fn ensure_current_writer(

@@ -318,7 +318,12 @@ impl PeerCommsEndpoint {
             let notified = inbox_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            for candidate in self.runtime.drain_peer_input_candidates().await {
+            for candidate in self
+                .runtime
+                .handoff_volatile_peer_input_candidates()
+                .await
+                .map_err(|error| error.to_string())?
+            {
                 if let InteractionContent::Response { result, .. } = &candidate.interaction.content
                 {
                     return serde_json::from_value::<BridgeReply>(result.clone())
@@ -337,8 +342,7 @@ impl PeerCommsEndpoint {
 
     /// Drain plain peer-message bodies delivered to this endpoint's inbox.
     pub async fn drain_message_bodies(&self) -> Vec<String> {
-        let mut bodies = self
-            .observed_runtime_inputs
+        self.observed_runtime_inputs
             .lock()
             .await
             .drain(..)
@@ -346,18 +350,7 @@ impl PeerCommsEndpoint {
                 InteractionContent::Message { body, .. } => Some(body),
                 _ => None,
             })
-            .collect::<Vec<_>>();
-        bodies.extend(
-            self.runtime
-                .drain_peer_input_candidates()
-                .await
-                .into_iter()
-                .filter_map(|candidate| match candidate.interaction.content {
-                    InteractionContent::Message { body, .. } => Some(body),
-                    _ => None,
-                }),
-        );
-        bodies
+            .collect()
     }
 
     /// Wait (notify-driven) until `predicate` matches a drained message body.

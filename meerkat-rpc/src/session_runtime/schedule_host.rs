@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use meerkat::surface::{
     NoopScheduleMobHost, ScheduledEventDispatch, ScheduledPromptDispatch,
     SharedScheduleTargetAdapter, SurfaceScheduleMobHost, SurfaceScheduleSessionHost,
-    recover_mob_member_identity_from_session_target, runtime_delivery_dispatch_from_admission,
-    schedule_host_supported, schedule_runtime_correlation_id,
-    schedule_runtime_delivery_idempotency_key, spawn_schedule_host,
+    accept_schedule_runtime_input_with_reconciliation,
+    recover_mob_member_identity_from_session_target, schedule_host_supported,
+    schedule_runtime_correlation_id, schedule_runtime_delivery_idempotency_key,
+    spawn_schedule_host,
 };
 use meerkat::{
     AgentBuildConfig, DeliveryDispatch, IdentityTargetBinding, Occurrence,
@@ -400,20 +401,17 @@ impl SessionRuntime {
         ));
         prompt_input.header.correlation_id = Some(schedule_runtime_correlation_id(identity)?);
 
-        let (outcome, handle) = self
-            .runtime_adapter
-            .accept_input_with_completion(session_id, meerkat_runtime::Input::Prompt(prompt_input))
-            .await
-            .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
-
-        runtime_delivery_dispatch_from_admission(
+        accept_schedule_runtime_input_with_reconciliation(
             self.runtime_adapter.as_ref(),
             session_id,
             occurrence,
             identity,
-            outcome,
-            handle,
+            meerkat_runtime::Input::Prompt(prompt_input),
             dispatch.materialized_session_id,
+            |input| {
+                self.runtime_adapter
+                    .accept_input_with_completion(session_id, input)
+            },
         )
         .await
     }
@@ -478,20 +476,17 @@ impl SessionRuntime {
             render_metadata: dispatch.render_metadata,
         });
 
-        let (outcome, handle) = self
-            .runtime_adapter
-            .accept_input_with_completion(session_id, input)
-            .await
-            .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
-
-        runtime_delivery_dispatch_from_admission(
+        accept_schedule_runtime_input_with_reconciliation(
             self.runtime_adapter.as_ref(),
             session_id,
             occurrence,
             identity,
-            outcome,
-            handle,
+            input,
             dispatch.materialized_session_id,
+            |input| {
+                self.runtime_adapter
+                    .accept_input_with_completion(session_id, input)
+            },
         )
         .await
     }

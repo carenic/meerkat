@@ -304,6 +304,10 @@ pub trait SurfaceScheduleSessionHost: Send + Sync {
         create: &SessionMaterializationSpec,
     ) -> Result<SessionId, ScheduleDomainError>;
 
+    /// Admit the prompt under `identity.idempotency_key` before returning.
+    /// An exact replay must return the original admission result without a
+    /// second input. Ordinary errors certify that admission did not occur;
+    /// an unknown post-admission outcome uses `DeliveryRepairDeferred`.
     async fn deliver_prompt(
         &self,
         session_id: &SessionId,
@@ -312,6 +316,8 @@ pub trait SurfaceScheduleSessionHost: Send + Sync {
         dispatch: ScheduledPromptDispatch,
     ) -> Result<DeliveryDispatch, ScheduleDomainError>;
 
+    /// Admit the event under the same stable-key and ambiguous-outcome
+    /// contract as [`Self::deliver_prompt`].
     async fn deliver_event(
         &self,
         session_id: &SessionId,
@@ -328,6 +334,9 @@ pub trait SurfaceScheduleMobHost: Send + Sync {
         binding: &MobTargetBinding,
     ) -> Result<TargetProbeOutcome, ScheduleDomainError>;
 
+    /// Admit the mob action under `identity.idempotency_key`. Exact replays
+    /// must deduplicate, and an ambiguous post-admission outcome must surface
+    /// as `DeliveryRepairDeferred` rather than an ordinary terminal error.
     async fn deliver_mob_target(
         &self,
         occurrence: &Occurrence,
@@ -355,6 +364,8 @@ pub trait SurfaceScheduleMobHost: Send + Sync {
         Ok(None)
     }
 
+    /// When this host owns the identity, delivery follows the same stable-key
+    /// admission contract as [`Self::deliver_mob_target`].
     async fn deliver_identity_target(
         &self,
         occurrence: &Occurrence,
@@ -1373,7 +1384,8 @@ async fn run_schedule_host_worker(
         log_schedule_host_health(
             health.observe(incident, meerkat_core::time_compat::Instant::now()),
         );
-        delay = next_delay;
+        let heartbeat = driver.executor_heartbeat_interval();
+        delay = Some(next_delay.map_or(heartbeat, |delay| delay.min(heartbeat)));
     }
 }
 
@@ -1410,6 +1422,9 @@ async fn supervise_schedule_host(
                         let _ = shutdown_tx.send(());
                     }
                     let _ = worker.await;
+                    if let Err(error) = driver.release_executor_lease().await {
+                        tracing::warn!(%error, "failed to release schedule executor lease during shutdown");
+                    }
                     return;
                 }
                 result = &mut worker => break result,
@@ -1440,7 +1455,12 @@ async fn supervise_schedule_host(
 
         let restart_delay = restart_backoff.after_failure();
         schedule_host_tokio::select! {
-            _ = &mut shutdown_rx => return,
+            _ = &mut shutdown_rx => {
+                if let Err(error) = driver.release_executor_lease().await {
+                    tracing::warn!(%error, "failed to release schedule executor lease during shutdown");
+                }
+                return;
+            },
             () = schedule_host_tokio::time::sleep(restart_delay) => {}
         }
     }
@@ -1843,6 +1863,184 @@ pub async fn runtime_delivery_dispatch_from_admission(
     ))
 }
 
+/// Admit one scheduled runtime input and reconcile the ambiguous error seam.
+///
+/// Persistent runtime admission can fail after the idempotency binding and
+/// input row committed (for example while archiving terminal in-memory
+/// carriers). An ordinary adapter error would falsely certify that no target
+/// effect was admitted and make the Schedule driver terminalize the durable
+/// `DispatchStarted` intent. This helper first re-drives the exact same input,
+/// then consults the store-owned idempotency index. Only an authoritative miss
+/// may return an ordinary pre-admission error; a committed binding or an
+/// unavailable reconciliation read remains reclaimable as
+/// `DeliveryRepairDeferred`.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub async fn accept_schedule_runtime_input_with_reconciliation<F, Fut, E>(
+    runtime_adapter: &MeerkatMachine,
+    session_id: &SessionId,
+    occurrence: &Occurrence,
+    identity: &ScheduleDeliveryIdentity,
+    input: meerkat_runtime::Input,
+    materialized_session_id: Option<SessionId>,
+    mut accept: F,
+) -> Result<DeliveryDispatch, ScheduleDomainError>
+where
+    F: FnMut(meerkat_runtime::Input) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                (
+                    meerkat_runtime::AcceptOutcome,
+                    Option<meerkat_runtime::CompletionHandle>,
+                ),
+                E,
+            >,
+        >,
+    E: std::fmt::Display,
+{
+    let idempotency_key = input
+        .header()
+        .idempotency_key
+        .as_ref()
+        .map(|key| key.0.clone())
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| {
+            ScheduleDomainError::Internal(
+                "scheduled runtime input omitted its stable idempotency key".to_string(),
+            )
+        })?;
+    let redrive = input.clone();
+    let redrive_input_id = redrive.id().clone();
+    match accept(input).await {
+        Ok((outcome, handle)) => {
+            return runtime_delivery_dispatch_from_admission(
+                runtime_adapter,
+                session_id,
+                occurrence,
+                identity,
+                outcome,
+                handle,
+                materialized_session_id,
+            )
+            .await;
+        }
+        Err(first_error) => match accept(redrive).await {
+            Ok((
+                outcome @ (meerkat_runtime::AcceptOutcome::Accepted { .. }
+                | meerkat_runtime::AcceptOutcome::Deduplicated { .. }),
+                handle,
+            )) => {
+                runtime_delivery_dispatch_from_admission(
+                    runtime_adapter,
+                    session_id,
+                    occurrence,
+                    identity,
+                    outcome,
+                    handle,
+                    materialized_session_id,
+                )
+                .await
+            }
+            Ok((outcome, _)) => {
+                let redrive_detail = format!("runtime returned {outcome:?} on exact redrive");
+                reconcile_schedule_runtime_admission_binding(
+                    runtime_adapter,
+                    session_id,
+                    occurrence,
+                    identity,
+                    redrive_input_id,
+                    &idempotency_key,
+                    materialized_session_id,
+                    first_error.to_string(),
+                    redrive_detail,
+                    Some(outcome),
+                )
+                .await
+            }
+            Err(redrive_error) => {
+                reconcile_schedule_runtime_admission_binding(
+                    runtime_adapter,
+                    session_id,
+                    occurrence,
+                    identity,
+                    redrive_input_id,
+                    &idempotency_key,
+                    materialized_session_id,
+                    first_error.to_string(),
+                    redrive_error.to_string(),
+                    None,
+                )
+                .await
+            }
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_schedule_runtime_admission_binding(
+    runtime_adapter: &MeerkatMachine,
+    session_id: &SessionId,
+    occurrence: &Occurrence,
+    identity: &ScheduleDeliveryIdentity,
+    redrive_input_id: meerkat_core::lifecycle::InputId,
+    idempotency_key: &str,
+    materialized_session_id: Option<SessionId>,
+    first_error: String,
+    redrive_detail: String,
+    no_binding_outcome: Option<meerkat_runtime::AcceptOutcome>,
+) -> Result<DeliveryDispatch, ScheduleDomainError> {
+    match runtime_adapter
+        .input_state_by_idempotency_key(session_id, idempotency_key)
+        .await
+    {
+        Ok(Some(stored)) => {
+            let existing_id = stored.state.input_id.clone();
+            tracing::warn!(
+                %idempotency_key,
+                %existing_id,
+                %first_error,
+                %redrive_detail,
+                "recovered scheduled runtime admission from durable idempotency binding"
+            );
+            runtime_delivery_dispatch_from_admission(
+                runtime_adapter,
+                session_id,
+                occurrence,
+                identity,
+                meerkat_runtime::AcceptOutcome::Deduplicated {
+                    input_id: redrive_input_id,
+                    existing_id,
+                    existing_seed: stored.seed,
+                },
+                None,
+                materialized_session_id,
+            )
+            .await
+        }
+        Ok(None) => match no_binding_outcome {
+            Some(outcome) => {
+                runtime_delivery_dispatch_from_admission(
+                    runtime_adapter,
+                    session_id,
+                    occurrence,
+                    identity,
+                    outcome,
+                    None,
+                    materialized_session_id,
+                )
+                .await
+            }
+            None => Err(ScheduleDomainError::Internal(format!(
+                "runtime admission failed before any durable binding for stable key {idempotency_key} ({first_error}; redrive: {redrive_detail})"
+            ))),
+        },
+        Err(reconciliation_error) => Err(ScheduleDomainError::DeliveryRepairDeferred {
+            detail: format!(
+                "runtime admission outcome for stable key {idempotency_key} is unknown after errors ({first_error}; redrive: {redrive_detail}); durable reconciliation failed: {reconciliation_error}"
+            ),
+        }),
+    }
+}
+
 /// Runtime-facing delivery identity for a scheduled occurrence: schedule +
 /// occurrence ONLY.
 ///
@@ -2185,6 +2383,27 @@ mod tests {
                 ))
             }
 
+            async fn acquire_executor_lease(
+                &self,
+                request: meerkat_schedule::AcquireScheduleExecutorLeaseRequest,
+            ) -> Result<
+                meerkat_schedule::AcquireScheduleExecutorLeaseOutcome,
+                meerkat_schedule::ScheduleStoreError,
+            > {
+                let now = chrono::Utc::now();
+                Ok(
+                    meerkat_schedule::AcquireScheduleExecutorLeaseOutcome::Acquired(
+                        meerkat_schedule::ScheduleExecutorLease::from_store_commit(
+                            request.owner_id,
+                            uuid::Uuid::now_v7(),
+                            1,
+                            now,
+                            now + request.lease_duration,
+                        ),
+                    ),
+                )
+            }
+
             async fn get_store_time_utc(
                 &self,
             ) -> Result<chrono::DateTime<chrono::Utc>, meerkat_schedule::ScheduleStoreError>
@@ -2340,6 +2559,7 @@ mod tests {
 
             async fn claim_due_occurrences(
                 &self,
+                _lease: &meerkat_schedule::ScheduleExecutorLease,
                 _request: meerkat_schedule::ClaimDueRequest,
             ) -> Result<meerkat_schedule::ClaimDueResult, meerkat_schedule::ScheduleStoreError>
             {

@@ -573,7 +573,7 @@ fn recursive_rpc_interrupt_handle_fails() {
         "meerkat-rpc/src/session_executor.rs",
         r"
 impl CoreExecutorInterruptHandle for SessionRuntimeInterruptHandle {
-    async fn hard_cancel_current_run(&self) {
+    async fn hard_cancel_run_if_current(&self, _expected_run_id: &RunId) {
         let _ = self.runtime.interrupt(&self.session_id).await;
     }
 }
@@ -794,9 +794,13 @@ struct Handle {
 }
 
 impl CoreExecutorInterruptHandle for Handle {
-    async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
+    async fn hard_cancel_run_if_current(
+        &self,
+        expected_run_id: &RunId,
+        _reason: String,
+    ) -> Result<bool, CoreExecutorError> {
         self.service
-            .interrupt(&self.session_id)
+            .interrupt_run_with_machine_authority(&self.session_id, expected_run_id, authority)
             .await
     }
 }

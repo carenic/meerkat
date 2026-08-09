@@ -435,7 +435,7 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/components/schemas/Usage"
+                "$ref": "#/components/schemas/CumulativeUsage"
               }
             },
             "required": [
@@ -839,7 +839,7 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/components/schemas/Usage"
+                "$ref": "#/components/schemas/TurnUsage"
               }
             },
             "required": [
@@ -1379,6 +1379,26 @@
           {
             "const": "system_prefix",
             "description": "Mark the stable top-level system prompt as an ephemeral cache prefix.",
+            "type": "string"
+          },
+          {
+            "const": "system_and_conversation",
+            "description": "Mark the stable system/profile prefix and up to three recent\nconversation boundaries. This is explicit provider authoring, not a\nprocess-wide cache default.",
+            "type": "string"
+          }
+        ]
+      },
+      "AnthropicCacheTtl": {
+        "description": "Anthropic prompt-cache TTL selected per agent/profile.",
+        "oneOf": [
+          {
+            "const": "5m",
+            "description": "Provider-default five-minute cache lifetime.",
+            "type": "string"
+          },
+          {
+            "const": "1h",
+            "description": "One-hour cache lifetime for sufficiently frequent profiles.",
             "type": "string"
           }
         ]
@@ -6116,6 +6136,9 @@
           {
             "additionalProperties": false,
             "properties": {
+              "delivery": {
+                "$ref": "#/components/schemas/PeerDeliveryOutcome"
+              },
               "envelope_id": {
                 "type": "string"
               },
@@ -6126,13 +6149,17 @@
             },
             "required": [
               "kind",
-              "envelope_id"
+              "envelope_id",
+              "delivery"
             ],
             "type": "object"
           },
           {
             "additionalProperties": false,
             "properties": {
+              "delivery": {
+                "$ref": "#/components/schemas/PeerDeliveryOutcome"
+              },
               "envelope_id": {
                 "type": "string"
               },
@@ -6155,13 +6182,17 @@
               "envelope_id",
               "interaction_id",
               "request_id",
-              "stream_reserved"
+              "stream_reserved",
+              "delivery"
             ],
             "type": "object"
           },
           {
             "additionalProperties": false,
             "properties": {
+              "delivery": {
+                "$ref": "#/components/schemas/PeerDeliveryOutcome"
+              },
               "envelope_id": {
                 "type": "string"
               },
@@ -6176,7 +6207,8 @@
             "required": [
               "kind",
               "envelope_id",
-              "in_reply_to"
+              "in_reply_to",
+              "delivery"
             ],
             "type": "object"
           }
@@ -6838,6 +6870,10 @@
         ],
         "title": "CreateScheduleRequest",
         "type": "object"
+      },
+      "CumulativeUsage": {
+        "$ref": "#/components/schemas/Usage",
+        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific."
       },
       "CustomModelConfig": {
         "additionalProperties": false,
@@ -10060,13 +10096,34 @@
         "description": "Strongest successful peer-delivery fact proved by the selected transport.",
         "oneOf": [
           {
+            "additionalProperties": false,
+            "description": "The receiver durably terminalized peer ingress for this exact\nenvelope before acknowledging it.",
+            "properties": {
+              "durably_resolved": {
+                "properties": {
+                  "outcome": {
+                    "$ref": "#/components/schemas/PeerIngressTerminalOutcomeKind"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "durably_resolved"
+            ],
+            "type": "object"
+          },
+          {
             "const": "acked",
-            "description": "A peer acknowledgement was received and verified.",
+            "description": "A byte-compatible transport acknowledgement was received and verified.\n\nThe ACK proves that the receiver completed the delivery contract for\nthis message kind, but the legacy signed wire shape cannot distinguish\ndurable Accepted from Deduplicated, or durable runtime admission from\nvolatile control handoff. Exact outcomes are available only on inproc\ndelivery, where no rolling-upgrade wire claim is involved.",
             "type": "string"
           },
           {
-            "const": "handed_off",
-            "description": "The receiver's local inbox admitted the envelope directly.",
+            "const": "volatile_handed_off",
+            "description": "The receiver's volatile control consumer accepted ownership of the\nenvelope. This is explicitly weaker than durable runtime admission.",
             "type": "string"
           },
           {
@@ -10129,6 +10186,14 @@
       },
       "PeerId": {
         "description": "Canonical runtime identity for a peer.\n\n`PeerId` is the routing key: the router and trust store key by `PeerId`,\nnever by `PeerName`. Two peers may legitimately share a display `PeerName`\n(per the Wave-B V5 dogma note), but their `PeerId`s never collide — the\nunderlying UUID is globally unique.\n\nConstructed freshly (`PeerId::new`) for a peer minted locally, parsed\nfrom a hyphenated UUID (`PeerId::parse`) when we've been given an identity\nover the wire, or derived from a 32-byte Ed25519 public key when a transport\nstill authenticates by raw signing key.",
+        "type": "string"
+      },
+      "PeerIngressTerminalOutcomeKind": {
+        "enum": [
+          "accepted",
+          "deduplicated",
+          "rejected"
+        ],
         "type": "string"
       },
       "PeerLifecycleKind": {
@@ -10707,6 +10772,36 @@
         },
         "type": "object"
       },
+      "PresentedTokenConvention": {
+        "description": "Provider-native convention used to normalize tokens presented to a model.",
+        "oneOf": [
+          {
+            "const": "anthropic_disjoint_input_components",
+            "description": "Anthropic reports uncached, cache-write, and cache-read input as\ndisjoint components. The normalized total is their saturating sum.",
+            "type": "string"
+          },
+          {
+            "const": "open_ai_input_includes_cached_subset",
+            "description": "OpenAI prompt/input tokens already include the cached-token subset.",
+            "type": "string"
+          },
+          {
+            "const": "gemini_prompt_includes_cached_subset",
+            "description": "Gemini prompt tokens already include the cached-content subset.",
+            "type": "string"
+          },
+          {
+            "const": "open_ai_compatible_prompt_includes_cache_details",
+            "description": "OpenAI-compatible prompt tokens are treated as the provider's inclusive\nprompt total; cache detail fields are observational subsets only.",
+            "type": "string"
+          },
+          {
+            "const": "host_declared_inclusive_input_total",
+            "description": "A custom/embedded client explicitly declares its `input_tokens` field\nas an inclusive presented-input total. This is never inferred from\ncache detail fields.",
+            "type": "string"
+          }
+        ]
+      },
       "ProfileId": {
         "description": "Opaque slug identifying an auth profile override on a connection.",
         "type": "string"
@@ -10875,6 +10970,17 @@
                   }
                 ],
                 "description": "Prompt-cache breakpoint policy."
+              },
+              "cache_ttl": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/AnthropicCacheTtl"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Prompt-cache lifetime. Effective only when this profile explicitly\nenables a cache-control policy."
               },
               "compaction": {
                 "anyOf": [
@@ -11300,6 +11406,38 @@
             "type": "object"
           }
         ]
+      },
+      "ProviderTokenAccounting": {
+        "additionalProperties": false,
+        "description": "One provider adapter's normalized accounting for a single model turn.",
+        "properties": {
+          "aggregation": {
+            "$ref": "#/components/schemas/TokenAggregationProvenance"
+          },
+          "convention": {
+            "$ref": "#/components/schemas/PresentedTokenConvention"
+          },
+          "model": {
+            "type": "string"
+          },
+          "presented_tokens": {
+            "description": "Tokens presented to the model for this request. Output tokens are not\nincluded.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "presented_tokens",
+          "convention",
+          "aggregation"
+        ],
+        "type": "object"
       },
       "PublicTurnToolOverlay": {
         "additionalProperties": false,
@@ -14426,6 +14564,10 @@
         ],
         "type": "object"
       },
+      "SystemPromptKey": {
+        "description": "Stable host-chosen identity for one replaceable system-prompt slot.\n\nThe key is domain identity, not an idempotency token. Every explicit\nupdate for the same key advances its [`SystemPromptVersion`], while\nunrelated ordinary System messages remain unkeyed ordered transcript\nevents.",
+        "type": "string"
+      },
       "SystemPromptOverride": {
         "anyOf": [
           {
@@ -14451,6 +14593,133 @@
           }
         ],
         "description": "Per-request system-prompt policy: omit/null to inherit, a string to set an explicit prompt, or {\"action\": \"disable\"} to suppress every prompt source."
+      },
+      "SystemPromptUpdateRequest": {
+        "additionalProperties": false,
+        "description": "Explicit host request to replace one keyed system-prompt slot.\n\nThe first update for a key must identify an existing unversioned System row\nwith `target_message_index` and use `expected_version = None`. Later calls\naddress the slot by key and must CAS the latest typed version. Supplying the\ntarget again is allowed only when it still names the latest row. The minted\nversion advances the whole retained session lineage, so it may skip after a\nhost restores an older transcript revision.",
+        "properties": {
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content": {
+            "type": "string"
+          },
+          "expected_parent_revision": {
+            "description": "Optional transcript-head CAS in addition to the prompt-version CAS.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_version": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SystemPromptVersion"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "key": {
+            "$ref": "#/components/schemas/SystemPromptKey"
+          },
+          "target_message_index": {
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "key",
+          "content"
+        ],
+        "title": "SystemPromptUpdateRequest",
+        "type": "object"
+      },
+      "SystemPromptUpdateResult": {
+        "additionalProperties": false,
+        "description": "Durable result of a keyed prompt update.",
+        "properties": {
+          "commit": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TranscriptRewriteCommit"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "key": {
+            "$ref": "#/components/schemas/SystemPromptKey"
+          },
+          "message_index": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/SessionId"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SystemPromptUpdateStatus"
+          },
+          "transcript_revision": {
+            "description": "Current transcript revision after the operation. An exact duplicate\nreports the already-current revision without minting another commit.",
+            "type": "string"
+          },
+          "version": {
+            "$ref": "#/components/schemas/SystemPromptVersion"
+          }
+        },
+        "required": [
+          "session_id",
+          "key",
+          "version",
+          "message_index",
+          "status",
+          "transcript_revision"
+        ],
+        "title": "SystemPromptUpdateResult",
+        "type": "object"
+      },
+      "SystemPromptUpdateStatus": {
+        "description": "Whether an explicit prompt-update call minted a new version.",
+        "enum": [
+          "applied",
+          "duplicate"
+        ],
+        "type": "string"
+      },
+      "SystemPromptVersion": {
+        "description": "Monotonic version of one keyed system-prompt slot.\n\nVersion zero is unrepresentable. A host's first explicit adoption or\nreplacement mints version one; later explicit updates increment it.",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "SystemPromptVersionIdentity": {
+        "additionalProperties": false,
+        "description": "Typed identity carried by one durable versioned System row.",
+        "properties": {
+          "key": {
+            "$ref": "#/components/schemas/SystemPromptKey"
+          },
+          "version": {
+            "$ref": "#/components/schemas/SystemPromptVersion"
+          }
+        },
+        "required": [
+          "key",
+          "version"
+        ],
+        "type": "object"
       },
       "SystemTime": {
         "properties": {
@@ -14524,6 +14793,21 @@
               "target_kind"
             ],
             "type": "object"
+          }
+        ]
+      },
+      "TokenAggregationProvenance": {
+        "description": "How the provider adapter obtained the normalized presented-token total.",
+        "oneOf": [
+          {
+            "const": "sum_disjoint_provider_components",
+            "description": "Sum of provider-documented disjoint input components.",
+            "type": "string"
+          },
+          {
+            "const": "provider_inclusive_input_total",
+            "description": "Provider-issued inclusive prompt/input total copied without adding\ncache detail fields.",
+            "type": "string"
           }
         ]
       },
@@ -15131,6 +15415,57 @@
         ],
         "type": "string"
       },
+      "TurnUsage": {
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "properties": {
+          "accounting": {
+            "$ref": "#/components/schemas/ProviderTokenAccounting"
+          },
+          "cache_creation_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cache_read_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider_accounting": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProviderTokenAccounting"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider-authored normalized input accounting for one model turn.\n\nCumulative usage intentionally leaves this `None`: an aggregate may\nspan providers and models and therefore cannot truthfully carry one\nper-turn convention. Shared policy reads [`Usage::presented_tokens`]\non turn usage and never interprets cache detail fields directly."
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "accounting"
+        ],
+        "type": "object"
+      },
       "UpdateScheduleRequest": {
         "properties": {
           "description": {
@@ -15260,6 +15595,17 @@
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          },
+          "provider_accounting": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProviderTokenAccounting"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider-authored normalized input accounting for one model turn.\n\nCumulative usage intentionally leaves this `None`: an aggregate may\nspan providers and models and therefore cannot truthfully carry one\nper-turn convention. Shared policy reads [`Usage::presented_tokens`]\non turn usage and never interprets cache detail fields directly."
           }
         },
         "required": [
@@ -15272,7 +15618,15 @@
         "enum": [
           "disabled",
           "automatic",
-          "system_prefix"
+          "system_prefix",
+          "system_and_conversation"
+        ],
+        "type": "string"
+      },
+      "WireAnthropicCacheTtl": {
+        "enum": [
+          "5m",
+          "1h"
         ],
         "type": "string"
       },
@@ -17653,6 +18007,16 @@
                   }
                 ]
               },
+              "cache_ttl": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/WireAnthropicCacheTtl"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
               "compaction": {
                 "anyOf": [
                   {
@@ -18393,6 +18757,17 @@
                 ],
                 "description": "Optional exact control-ingress identity carried by this durable\ntranscript message. Provider adapters ignore it."
               },
+              "prompt_version": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/SystemPromptVersionIdentity"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Typed replacement-slot identity. Historical versions remain\nvisible on history/revision reads even though model materialization\nselects only the latest version for each key."
+              },
               "role": {
                 "const": "system",
                 "type": "string"
@@ -19029,6 +19404,13 @@
             "format": "date-time",
             "type": "string"
           },
+          "facts": {
+            "description": "Facts atomically observed by this mutation. A fact is never appended by\na read-only query or by an observability projection after commit.",
+            "items": {
+              "$ref": "#/components/schemas/WorkGraphFact"
+            },
+            "type": "array"
+          },
           "item_id": {
             "type": [
               "string",
@@ -19065,6 +19447,7 @@
         "enum": [
           "created",
           "updated",
+          "readiness_observed",
           "claimed",
           "released",
           "blocked",
@@ -19092,6 +19475,87 @@
         ],
         "title": "WorkGraphEventsResponse",
         "type": "object"
+      },
+      "WorkGraphFact": {
+        "description": "Typed transition facts recorded by the same durable commit as the mutation\nthat first observes them. These are ledger facts, not wake instructions.\nSchedule may cause an observing mutation, but WorkGraph never owns a timer.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "item_id": {
+                "type": "string"
+              },
+              "item_revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "item_ready",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "item_id",
+              "item_revision"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "expired_owner": {
+                "$ref": "#/components/schemas/WorkOwnerKey"
+              },
+              "item_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "lease_expired",
+                "type": "string"
+              },
+              "lease_expires_at": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "observed_at": {
+                "format": "date-time",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "item_id",
+              "expired_owner",
+              "lease_expires_at",
+              "observed_at"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "namespace_terminal",
+                "type": "string"
+              },
+              "namespace": {
+                "type": "string"
+              },
+              "observed_at": {
+                "format": "date-time",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "namespace",
+              "observed_at"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "WorkGraphItemsResponse": {
         "properties": {
@@ -19172,6 +19636,14 @@
       },
       "WorkItem": {
         "properties": {
+          "cancelled_child_join_policy": {
+            "enum": [
+              "require_success",
+              "propagate",
+              "accept"
+            ],
+            "type": "string"
+          },
           "claim": {
             "anyOf": [
               {
@@ -19179,6 +19651,13 @@
                   "claimed_at": {
                     "format": "date-time",
                     "type": "string"
+                  },
+                  "expiry_observed_at": {
+                    "format": "date-time",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "lease_expires_at": {
                     "format": "date-time",
@@ -19459,6 +19938,14 @@
             },
             "type": "array"
           },
+          "failed_child_join_policy": {
+            "enum": [
+              "require_success",
+              "propagate",
+              "accept"
+            ],
+            "type": "string"
+          },
           "id": {
             "type": "string"
           },
@@ -19582,6 +20069,8 @@
           "title",
           "status",
           "completion_policy",
+          "failed_child_join_policy",
+          "cancelled_child_join_policy",
           "priority",
           "machine_state",
           "revision",
@@ -22045,6 +22534,54 @@
           }
         },
         "summary": "Append one ordinary durable ordered System message to a session"
+      }
+    },
+    "/sessions/{id}/system_prompt": {
+      "post": {
+        "operationId": "post_sessions_id_system_prompt",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SystemPromptUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemPromptUpdateResult"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WireError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "summary": "Explicitly replace one durable versioned system-prompt key"
       }
     },
     "/skills": {

@@ -753,6 +753,7 @@ pub enum WireAnthropicCacheControlPolicy {
     Disabled,
     Automatic,
     SystemPrefix,
+    SystemAndConversation,
 }
 
 impl From<meerkat_core::lifecycle::run_primitive::AnthropicCacheControlPolicy>
@@ -764,6 +765,7 @@ impl From<meerkat_core::lifecycle::run_primitive::AnthropicCacheControlPolicy>
             Core::Disabled => Self::Disabled,
             Core::Automatic => Self::Automatic,
             Core::SystemPrefix => Self::SystemPrefix,
+            Core::SystemAndConversation => Self::SystemAndConversation,
         }
     }
 }
@@ -776,6 +778,37 @@ impl From<WireAnthropicCacheControlPolicy>
             WireAnthropicCacheControlPolicy::Disabled => Self::Disabled,
             WireAnthropicCacheControlPolicy::Automatic => Self::Automatic,
             WireAnthropicCacheControlPolicy::SystemPrefix => Self::SystemPrefix,
+            WireAnthropicCacheControlPolicy::SystemAndConversation => Self::SystemAndConversation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WireAnthropicCacheTtl {
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+impl From<meerkat_core::lifecycle::run_primitive::AnthropicCacheTtl> for WireAnthropicCacheTtl {
+    fn from(value: meerkat_core::lifecycle::run_primitive::AnthropicCacheTtl) -> Self {
+        match value {
+            meerkat_core::lifecycle::run_primitive::AnthropicCacheTtl::FiveMinutes => {
+                Self::FiveMinutes
+            }
+            meerkat_core::lifecycle::run_primitive::AnthropicCacheTtl::OneHour => Self::OneHour,
+        }
+    }
+}
+
+impl From<WireAnthropicCacheTtl> for meerkat_core::lifecycle::run_primitive::AnthropicCacheTtl {
+    fn from(value: WireAnthropicCacheTtl) -> Self {
+        match value {
+            WireAnthropicCacheTtl::FiveMinutes => Self::FiveMinutes,
+            WireAnthropicCacheTtl::OneHour => Self::OneHour,
         }
     }
 }
@@ -1111,6 +1144,8 @@ pub enum WireProviderTag {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<WireAnthropicCacheControlPolicy>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_ttl: Option<WireAnthropicCacheTtl>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         supports_temperature_override: Option<bool>,
     },
     OpenAi {
@@ -1214,6 +1249,7 @@ impl From<meerkat_core::lifecycle::run_primitive::ProviderTag> for WireProviderT
                 compaction: t.compaction.map(Into::into),
                 context: t.context.map(Into::into),
                 cache_control: t.cache_control.map(Into::into),
+                cache_ttl: t.cache_ttl.map(Into::into),
                 supports_temperature_override: t.supports_temperature_override,
             },
             Core::OpenAi(t) => Self::OpenAi {
@@ -1270,6 +1306,7 @@ impl From<WireProviderTag> for meerkat_core::lifecycle::run_primitive::ProviderT
                 compaction,
                 context,
                 cache_control,
+                cache_ttl,
                 supports_temperature_override,
             } => Self::Anthropic(AnthropicProviderTag {
                 thinking: thinking.map(Into::into),
@@ -1282,6 +1319,7 @@ impl From<WireProviderTag> for meerkat_core::lifecycle::run_primitive::ProviderT
                 compaction: compaction.map(Into::into),
                 context: context.map(Into::into),
                 cache_control: cache_control.map(Into::into),
+                cache_ttl: cache_ttl.map(Into::into),
                 supports_temperature_override,
             }),
             WireProviderTag::OpenAi {

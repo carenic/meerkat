@@ -6,6 +6,7 @@ use async_trait::async_trait;
 pub struct TestClient {
     events: Vec<LlmEvent>,
     provider: meerkat_core::Provider,
+    synthesize_usage: bool,
 }
 
 impl TestClient {
@@ -13,6 +14,7 @@ impl TestClient {
         Self {
             events,
             provider: meerkat_core::Provider::Other,
+            synthesize_usage: false,
         }
     }
 
@@ -21,6 +23,7 @@ impl TestClient {
         Self {
             events: Self::default_events(),
             provider,
+            synthesize_usage: true,
         }
     }
 
@@ -41,7 +44,11 @@ impl TestClient {
 
 impl Default for TestClient {
     fn default() -> Self {
-        Self::new(Self::default_events())
+        Self {
+            events: Self::default_events(),
+            provider: meerkat_core::Provider::Other,
+            synthesize_usage: true,
+        }
     }
 }
 
@@ -55,8 +62,32 @@ impl LlmClient for TestClient {
         Ok(messages.to_vec())
     }
 
-    fn stream<'a>(&'a self, _request: &'a LlmRequest) -> LlmStream<'a> {
-        let events = self.events.clone();
+    fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
+        let mut events = self.events.clone();
+        if self.synthesize_usage
+            && !events
+                .iter()
+                .any(|event| matches!(event, LlmEvent::UsageUpdate { .. }))
+            && let Some(done_index) = events.iter().position(|event| {
+                matches!(
+                    event,
+                    LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Success { .. }
+                    }
+                )
+            })
+        {
+            events.insert(
+                done_index,
+                LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        self.provider,
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
+                },
+            );
+        }
         crate::streaming::ensure_terminal_done(Box::pin(futures::stream::iter(
             events.into_iter().map(Ok),
         )))

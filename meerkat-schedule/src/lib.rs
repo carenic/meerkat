@@ -41,12 +41,14 @@ pub use runnable::{
 };
 pub use service::ScheduleService;
 pub use store::{
-    ClaimDueRequest, ClaimDueResult, DisabledScheduleStore, MemoryScheduleStore, OccurrenceFilter,
-    PendingSupersession, RenewOccurrenceLeaseOutcome, RenewOccurrenceLeaseRequest,
-    RenewOccurrenceLeaseResult, ScheduleFilter, ScheduleMutationCommit, ScheduleRefillBatch,
-    ScheduleRefillCandidate, ScheduleStore, ScheduleStoreActionTime, ScheduleStoreKind,
-    ScheduleStoreRowFault, ScheduleStoreRowFaultKind, ScheduleStoreWakeMode,
-    apply_supersession_feedback,
+    AcquireScheduleExecutorLeaseOutcome, AcquireScheduleExecutorLeaseRequest,
+    ActiveScheduleExecutor, ClaimDueRequest, ClaimDueResult, DisabledScheduleStore,
+    MemoryScheduleStore, OccurrenceFilter, PendingSupersession, RenewOccurrenceLeaseOutcome,
+    RenewOccurrenceLeaseRequest, RenewOccurrenceLeaseResult, RenewScheduleExecutorLeaseOutcome,
+    RenewScheduleExecutorLeaseRequest, ScheduleExecutorLease, ScheduleExecutorLeaseObservation,
+    ScheduleFilter, ScheduleMutationCommit, ScheduleRefillBatch, ScheduleRefillCandidate,
+    ScheduleStore, ScheduleStoreActionTime, ScheduleStoreKind, ScheduleStoreRowFault,
+    ScheduleStoreRowFaultKind, ScheduleStoreWakeMode, apply_supersession_feedback,
 };
 pub use surface::wire_schedule_tools;
 pub use tool_surface::ScheduleToolSurface;

@@ -4,15 +4,17 @@ use crate::sqlite_store::begin_immediate_transaction;
 use async_trait::async_trait;
 use chrono::{DateTime, LocalResult, TimeZone, Utc};
 use meerkat_schedule::{
-    AuthorizedOccurrenceWrite, AuthorizedScheduleWrite, ClaimDueRequest, ClaimDueResult,
-    DeliveryReceipt, Occurrence, OccurrenceDueAction, OccurrenceFilter, OccurrenceId,
-    OccurrenceLifecycleError, OccurrenceLifecycleInput, OccurrenceLifecycleMutator,
+    AcquireScheduleExecutorLeaseOutcome, AcquireScheduleExecutorLeaseRequest,
+    ActiveScheduleExecutor, AuthorizedOccurrenceWrite, AuthorizedScheduleWrite, ClaimDueRequest,
+    ClaimDueResult, DeliveryReceipt, Occurrence, OccurrenceDueAction, OccurrenceFilter,
+    OccurrenceId, OccurrenceLifecycleError, OccurrenceLifecycleInput, OccurrenceLifecycleMutator,
     OccurrenceTransitionCommit, PendingSupersession, RenewOccurrenceLeaseOutcome,
-    RenewOccurrenceLeaseRequest, RenewOccurrenceLeaseResult, RuntimeDeliveryOutcome, Schedule,
-    ScheduleFilter, ScheduleMutationCommit, SchedulePhase, ScheduleRefillBatch,
-    ScheduleRefillCandidate, ScheduleStore, ScheduleStoreActionTime, ScheduleStoreError,
-    ScheduleStoreKind, ScheduleStoreRowFault, ScheduleStoreRowFaultKind, ScheduleStoreWakeMode,
-    ScheduleTransitionCommit, apply_supersession_feedback,
+    RenewOccurrenceLeaseRequest, RenewOccurrenceLeaseResult, RenewScheduleExecutorLeaseOutcome,
+    RenewScheduleExecutorLeaseRequest, RuntimeDeliveryOutcome, Schedule, ScheduleExecutorLease,
+    ScheduleExecutorLeaseObservation, ScheduleFilter, ScheduleMutationCommit, SchedulePhase,
+    ScheduleRefillBatch, ScheduleRefillCandidate, ScheduleStore, ScheduleStoreActionTime,
+    ScheduleStoreError, ScheduleStoreKind, ScheduleStoreRowFault, ScheduleStoreRowFaultKind,
+    ScheduleStoreWakeMode, ScheduleTransitionCommit, apply_supersession_feedback,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::{Path, PathBuf};
@@ -48,9 +50,19 @@ fn migration_0002_schedule_work_projections(tx: &Transaction<'_>) -> Result<(), 
     Ok(())
 }
 
+fn migration_0003_schedule_executor_lease(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    tx.execute_batch(CREATE_EXECUTOR_LEASE_TABLE_SQL)?;
+    tx.execute(
+        "INSERT INTO schedule_executor_lease (singleton, fencing_token) VALUES (1, 0)",
+        [],
+    )?;
+    Ok(())
+}
+
 fn initialize_current_schedule_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     migration_0001_schedule_schema(tx)?;
-    migration_0002_schedule_work_projections(tx)
+    migration_0002_schedule_work_projections(tx)?;
+    migration_0003_schedule_executor_lease(tx)
 }
 
 const RELEASED_0_8_10_SCHEDULE_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
@@ -89,6 +101,87 @@ fn verify_released_0_8_10_schedule_schema(conn: &Connection) -> Result<(), Strin
     )
 }
 
+const RELEASED_SCHEDULE_V2_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "schedule_schedules",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "schedule_occurrences",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "schedule_receipts",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "schedule_occurrences_due_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "schedule_occurrences_schedule_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "schedule_receipts_occurrence_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "schedule_schedules_refill_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "schedule_occurrences_refill_pending_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "schedule_occurrences_action_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "schedule_occurrences_action_insert",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "schedule_occurrences_action_update",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "schedule_occurrences_schedule_phase_update",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "schedule_refill_insert",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "schedule_refill_phase_revision_update",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "schedule_occurrences_refill_departure",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "schedule_occurrences_refill_delete",
+    },
+];
+
+fn build_released_schedule_v2_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    migration_0001_schedule_schema(tx)?;
+    migration_0002_schedule_work_projections(tx)
+}
+
+fn verify_released_schedule_v2_schema(conn: &Connection) -> Result<(), String> {
+    meerkat_sqlite::verify_released_schema_fingerprint(
+        conn,
+        &SCHEDULE_STORE_DOMAIN,
+        RELEASED_SCHEDULE_V2_OBJECTS,
+        build_released_schedule_v2_schema,
+    )
+}
+
 /// The schedule store's schema domain in the per-file migration ledger.
 /// (Co-tenants the sessions file in the sqlite realm backend; the ledger
 /// keys strictly by domain, so co-tenancy is safe.)
@@ -105,13 +198,24 @@ pub const SCHEDULE_STORE_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::
             name: "active-work-projections",
             apply: migration_0002_schedule_work_projections,
         },
+        meerkat_sqlite::Migration {
+            version: 3,
+            name: "schedule-executor-lease",
+            apply: migration_0003_schedule_executor_lease,
+        },
     ],
     initialize_current: initialize_current_schedule_schema,
-    allowed_existing_versions: &[1, 2],
-    released_predecessors: &[meerkat_sqlite::SchemaPredecessor {
-        version: 1,
-        verify: verify_released_0_8_10_schedule_schema,
-    }],
+    allowed_existing_versions: &[1, 2, 3],
+    released_predecessors: &[
+        meerkat_sqlite::SchemaPredecessor {
+            version: 1,
+            verify: verify_released_0_8_10_schedule_schema,
+        },
+        meerkat_sqlite::SchemaPredecessor {
+            version: 2,
+            verify: verify_released_schedule_v2_schema,
+        },
+    ],
     owned_objects: &[
         meerkat_sqlite::SchemaObject {
             kind: meerkat_sqlite::SchemaObjectKind::Table,
@@ -124,6 +228,10 @@ pub const SCHEDULE_STORE_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::
         meerkat_sqlite::SchemaObject {
             kind: meerkat_sqlite::SchemaObjectKind::Table,
             name: "schedule_receipts",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "schedule_executor_lease",
         },
         meerkat_sqlite::SchemaObject {
             kind: meerkat_sqlite::SchemaObjectKind::Index,
@@ -202,23 +310,57 @@ mod schema_floor_tests {
         conn
     }
 
+    fn released_v2() -> Connection {
+        let mut conn = Connection::open_in_memory().expect("open");
+        let tx = conn.transaction().expect("tx");
+        build_released_schedule_v2_schema(&tx).expect("released schema");
+        tx.commit().expect("commit");
+        conn.execute_batch(
+            "CREATE TABLE meerkat_schema (
+                 domain TEXT PRIMARY KEY,
+                 version INTEGER NOT NULL
+             );
+             INSERT INTO meerkat_schema VALUES ('schedule-store', 2);",
+        )
+        .expect("ledger");
+        conn
+    }
+
     #[test]
     fn exact_released_v1_upgrades_to_current() {
         let mut conn = released_v1();
         let report = meerkat_sqlite::apply_domain_migrations(&mut conn, &SCHEDULE_STORE_DOMAIN)
             .expect("upgrade");
         assert_eq!(report.from_version, 1);
-        assert_eq!(report.to_version, 2);
+        assert_eq!(report.to_version, 3);
     }
 
     #[test]
-    fn released_v1_final_column_index_and_trigger_collisions_are_refused_unmutated() {
+    fn exact_released_v2_upgrades_to_executor_lease_schema() {
+        let mut conn = released_v2();
+        let report = meerkat_sqlite::apply_domain_migrations(&mut conn, &SCHEDULE_STORE_DOMAIN)
+            .expect("upgrade");
+        assert_eq!(report.from_version, 2);
+        assert_eq!(report.to_version, 3);
+        let fencing_token: i64 = conn
+            .query_row(
+                "SELECT fencing_token FROM schedule_executor_lease WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("executor lease singleton");
+        assert_eq!(fencing_token, 0);
+    }
+
+    #[test]
+    fn released_v1_final_schema_object_collisions_are_refused_unmutated() {
         for collision in [
             "ALTER TABLE schedule_occurrences ADD COLUMN action_at_ms INTEGER",
             "CREATE INDEX schedule_occurrences_action_idx
                  ON schedule_occurrences(schedule_id)",
             "CREATE TRIGGER schedule_occurrences_action_insert
                  AFTER INSERT ON schedule_occurrences BEGIN SELECT 1; END",
+            "CREATE TABLE schedule_executor_lease (singleton INTEGER PRIMARY KEY)",
         ] {
             let mut conn = released_v1();
             conn.execute_batch(collision).expect("collision");
@@ -297,6 +439,21 @@ CREATE TABLE IF NOT EXISTS schedule_occurrences (
     lease_expires_at_ms INTEGER NULL,
     occurrence_json BLOB NOT NULL,
     FOREIGN KEY(schedule_id) REFERENCES schedule_schedules(schedule_id)
+)";
+
+const CREATE_EXECUTOR_LEASE_TABLE_SQL: &str = r"
+CREATE TABLE schedule_executor_lease (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    owner_id TEXT NULL,
+    lease_token TEXT NULL,
+    fencing_token INTEGER NOT NULL,
+    acquired_at_ms INTEGER NULL,
+    expires_at_ms INTEGER NULL,
+    CHECK ((owner_id IS NULL AND lease_token IS NULL AND acquired_at_ms IS NULL AND expires_at_ms IS NULL)
+        OR (owner_id IS NOT NULL AND length(trim(owner_id)) > 0
+            AND lease_token IS NOT NULL
+            AND acquired_at_ms IS NOT NULL AND expires_at_ms IS NOT NULL
+            AND acquired_at_ms < expires_at_ms))
 )";
 
 const CREATE_OCCURRENCES_DUE_INDEX_SQL: &str = r"
@@ -1330,6 +1487,7 @@ impl SqliteScheduleStore {
     async fn claim_due_occurrences_impl(
         &self,
         request: ClaimDueRequest,
+        executor_lease: ScheduleExecutorLease,
     ) -> Result<ClaimDueResult, StoreError> {
         let scan_after = self
             .claim_scan_cursor
@@ -1342,6 +1500,7 @@ impl SqliteScheduleStore {
                 let tx = begin_immediate_transaction(conn)?;
                 let store_now_ms = select_store_now_ms(&tx)?;
                 let store_now_utc = utc_from_millis(store_now_ms);
+                verify_executor_lease_in_txn(&tx, &executor_lease, store_now_ms)?;
 
                 let limit = request.limit;
                 if limit == 0 {
@@ -1548,6 +1707,169 @@ impl ScheduleStore for SqliteScheduleStore {
         })
     }
 
+    async fn acquire_executor_lease(
+        &self,
+        request: AcquireScheduleExecutorLeaseRequest,
+    ) -> Result<AcquireScheduleExecutorLeaseOutcome, ScheduleStoreError> {
+        if request.owner_id.trim().is_empty() || request.lease_duration.num_milliseconds() <= 0 {
+            return Err(ScheduleStoreError::InvalidExecutorLease(
+                "executor owner must be non-empty and lease duration must be at least 1ms".into(),
+            ));
+        }
+        self.with_conn(move |conn| {
+            let tx = begin_immediate_transaction(conn)?;
+            let now_ms = select_store_now_ms(&tx)?;
+            let row = read_executor_lease_row(&tx)?;
+            validate_executor_lease_row_shape(&row)?;
+            let active_owner = row.owner_id.clone();
+            if let Some(current_owner) = active_owner.as_deref()
+                && row.expires_at_ms.is_some_and(|expiry| expiry > now_ms)
+            {
+                let expires_at_utc = executor_utc_from_millis(row.expires_at_ms.ok_or_else(|| {
+                    StoreError::Internal("active executor lease omitted expiry".into())
+                })?)?;
+                let current_owner_id = current_owner.to_string();
+                tx.commit()?;
+                return Ok(AcquireScheduleExecutorLeaseOutcome::Busy {
+                    current_owner_id,
+                    expires_at_utc,
+                });
+            }
+            let fencing_token = row.fencing_token.checked_add(1).ok_or_else(|| {
+                StoreError::Internal("executor fencing token exhausted".into())
+            })?;
+            let lease_token = Uuid::now_v7();
+            let owner_id = request.owner_id;
+            let expires_at_ms = now_ms
+                .checked_add(request.lease_duration.num_milliseconds())
+                .ok_or_else(|| StoreError::Internal("executor lease expiry overflow".into()))?;
+            tx.execute(
+                "UPDATE schedule_executor_lease SET owner_id=?1, lease_token=?2, fencing_token=?3, acquired_at_ms=?4, expires_at_ms=?5 WHERE singleton=1",
+                params![&owner_id, lease_token.to_string(), fencing_token, now_ms, expires_at_ms],
+            )?;
+            let lease = ScheduleExecutorLease::from_store_commit(
+                owner_id,
+                lease_token,
+                u64::try_from(fencing_token).map_err(|_| {
+                    StoreError::Internal("negative executor fencing token".into())
+                })?,
+                executor_utc_from_millis(now_ms)?,
+                executor_utc_from_millis(expires_at_ms)?,
+            );
+            tx.commit()?;
+            Ok(AcquireScheduleExecutorLeaseOutcome::Acquired(lease))
+        })
+        .await
+        .map_err(into_schedule_store_error)
+    }
+
+    async fn renew_executor_lease(
+        &self,
+        request: RenewScheduleExecutorLeaseRequest,
+    ) -> Result<RenewScheduleExecutorLeaseOutcome, ScheduleStoreError> {
+        if request.lease_duration.num_milliseconds() <= 0 {
+            return Err(ScheduleStoreError::InvalidExecutorLease(
+                "executor lease duration must be at least 1ms".into(),
+            ));
+        }
+        self.with_conn(move |conn| {
+            let tx = begin_immediate_transaction(conn)?;
+            let now_ms = select_store_now_ms(&tx)?;
+            match verify_executor_lease_in_txn(&tx, &request.lease, now_ms) {
+                Ok(()) => {}
+                Err(StoreError::ScheduleExecutorLeaseStale) => {
+                    tx.commit()?;
+                    return Ok(RenewScheduleExecutorLeaseOutcome::Stale);
+                }
+                Err(error) => return Err(error),
+            }
+            let expires_at_ms = now_ms
+                .checked_add(request.lease_duration.num_milliseconds())
+                .ok_or_else(|| StoreError::Internal("executor lease expiry overflow".into()))?;
+            tx.execute(
+                "UPDATE schedule_executor_lease SET expires_at_ms=?1 WHERE singleton=1",
+                params![expires_at_ms],
+            )?;
+            let renewed = ScheduleExecutorLease::from_store_commit(
+                request.lease.owner_id().to_string(),
+                request.lease.lease_token(),
+                request.lease.fencing_token(),
+                request.lease.acquired_at_utc(),
+                executor_utc_from_millis(expires_at_ms)?,
+            );
+            tx.commit()?;
+            Ok(RenewScheduleExecutorLeaseOutcome::Renewed(renewed))
+        })
+        .await
+        .map_err(into_schedule_store_error)
+    }
+
+    async fn release_executor_lease(
+        &self,
+        lease: ScheduleExecutorLease,
+    ) -> Result<(), ScheduleStoreError> {
+        self.with_conn(move |conn| {
+            let Ok(fencing_token) = i64::try_from(lease.fencing_token()) else {
+                return Ok(());
+            };
+            let tx = begin_immediate_transaction(conn)?;
+            tx.execute(
+                "UPDATE schedule_executor_lease SET owner_id=NULL, lease_token=NULL, acquired_at_ms=NULL, expires_at_ms=NULL WHERE singleton=1 AND owner_id=?1 AND lease_token=?2 AND fencing_token=?3 AND acquired_at_ms=?4 AND expires_at_ms=?5",
+                params![
+                    lease.owner_id(),
+                    lease.lease_token().to_string(),
+                    fencing_token,
+                    millis(lease.acquired_at_utc()),
+                    millis(lease.expires_at_utc()),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(into_schedule_store_error)
+    }
+
+    async fn observe_executor_lease(
+        &self,
+    ) -> Result<ScheduleExecutorLeaseObservation, ScheduleStoreError> {
+        self.with_conn(move |conn| {
+            let tx = conn.transaction()?;
+            let now_ms = select_store_now_ms(&tx)?;
+            let row = read_executor_lease_row(&tx)?;
+            validate_executor_lease_row_shape(&row)?;
+            let active = if row.expires_at_ms.is_some_and(|expiry| expiry > now_ms) {
+                Some(ActiveScheduleExecutor {
+                    owner_id: row.owner_id.ok_or_else(|| {
+                        StoreError::Internal("active executor lease omitted owner".into())
+                    })?,
+                    fencing_token: u64::try_from(row.fencing_token).map_err(|_| {
+                        StoreError::Internal("negative executor fencing token".into())
+                    })?,
+                    acquired_at_utc: executor_utc_from_millis(row.acquired_at_ms.ok_or_else(
+                        || {
+                            StoreError::Internal(
+                                "active executor lease omitted acquisition time".into(),
+                            )
+                        },
+                    )?)?,
+                    expires_at_utc: executor_utc_from_millis(row.expires_at_ms.ok_or_else(
+                        || StoreError::Internal("active executor lease omitted expiry".into()),
+                    )?)?,
+                })
+            } else {
+                None
+            };
+            tx.commit()?;
+            Ok(ScheduleExecutorLeaseObservation {
+                store_now_utc: executor_utc_from_millis(now_ms)?,
+                active,
+            })
+        })
+        .await
+        .map_err(into_schedule_store_error)
+    }
+
     async fn get_store_time_utc(&self) -> Result<DateTime<Utc>, ScheduleStoreError> {
         self.with_conn(move |conn| Ok(utc_from_millis(select_store_now_ms(conn)?)))
             .await
@@ -1739,9 +2061,10 @@ impl ScheduleStore for SqliteScheduleStore {
 
     async fn claim_due_occurrences(
         &self,
+        lease: &ScheduleExecutorLease,
         request: ClaimDueRequest,
     ) -> Result<ClaimDueResult, ScheduleStoreError> {
-        self.claim_due_occurrences_impl(request)
+        self.claim_due_occurrences_impl(request, lease.clone())
             .await
             .map_err(into_schedule_store_error)
     }
@@ -1918,6 +2241,96 @@ fn read_schedule_in_txn(
     .optional()?
     .map(|bytes| serde_json::from_slice(&bytes).map_err(StoreError::Serialization))
     .transpose()
+}
+
+struct ExecutorLeaseRow {
+    owner_id: Option<String>,
+    lease_token: Option<String>,
+    fencing_token: i64,
+    acquired_at_ms: Option<i64>,
+    expires_at_ms: Option<i64>,
+}
+
+fn read_executor_lease_row(tx: &Transaction<'_>) -> Result<ExecutorLeaseRow, StoreError> {
+    tx.query_row(
+        "SELECT owner_id, lease_token, fencing_token, acquired_at_ms, expires_at_ms FROM schedule_executor_lease WHERE singleton=1",
+        [],
+        |row| {
+            Ok(ExecutorLeaseRow {
+                owner_id: row.get(0)?,
+                lease_token: row.get(1)?,
+                fencing_token: row.get(2)?,
+                acquired_at_ms: row.get(3)?,
+                expires_at_ms: row.get(4)?,
+            })
+        },
+    )
+    .map_err(StoreError::from)
+}
+
+fn validate_executor_lease_row_shape(row: &ExecutorLeaseRow) -> Result<(), StoreError> {
+    let fields = [
+        row.owner_id.is_some(),
+        row.lease_token.is_some(),
+        row.acquired_at_ms.is_some(),
+        row.expires_at_ms.is_some(),
+    ];
+    if !(fields.iter().all(|present| *present) || fields.iter().all(|present| !*present)) {
+        return Err(StoreError::Internal(
+            "schedule executor lease row is partially populated".into(),
+        ));
+    }
+    if row.fencing_token < 0 {
+        return Err(StoreError::Internal(
+            "schedule executor lease row has a negative fencing token".into(),
+        ));
+    }
+    if let Some(owner_id) = row.owner_id.as_deref() {
+        if owner_id.trim().is_empty() {
+            return Err(StoreError::Internal(
+                "schedule executor lease row has an empty owner".into(),
+            ));
+        }
+        row.lease_token
+            .as_deref()
+            .and_then(|token| Uuid::parse_str(token).ok())
+            .ok_or_else(|| {
+                StoreError::Internal("schedule executor lease row has an invalid token".into())
+            })?;
+        let acquired_at_ms = row.acquired_at_ms.ok_or_else(|| {
+            StoreError::Internal("schedule executor lease row omitted acquisition time".into())
+        })?;
+        let expires_at_ms = row.expires_at_ms.ok_or_else(|| {
+            StoreError::Internal("schedule executor lease row omitted expiry".into())
+        })?;
+        if acquired_at_ms >= expires_at_ms {
+            return Err(StoreError::Internal(
+                "schedule executor lease row has a non-positive validity interval".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_executor_lease_in_txn(
+    tx: &Transaction<'_>,
+    lease: &ScheduleExecutorLease,
+    store_now_ms: i64,
+) -> Result<(), StoreError> {
+    let row = read_executor_lease_row(tx)?;
+    validate_executor_lease_row_shape(&row)?;
+    let matches = row.owner_id.as_deref() == Some(lease.owner_id())
+        && row.lease_token.as_deref() == Some(lease.lease_token().to_string().as_str())
+        && u64::try_from(row.fencing_token).ok() == Some(lease.fencing_token())
+        && row.acquired_at_ms == Some(millis(lease.acquired_at_utc()))
+        && row.expires_at_ms == Some(millis(lease.expires_at_utc()))
+        && row
+            .expires_at_ms
+            .is_some_and(|expiry| expiry > store_now_ms);
+    if !matches {
+        return Err(StoreError::ScheduleExecutorLeaseStale);
+    }
+    Ok(())
 }
 
 fn read_occurrence_in_txn(
@@ -2659,6 +3072,14 @@ fn utc_from_millis(value: i64) -> DateTime<Utc> {
     }
 }
 
+fn executor_utc_from_millis(value: i64) -> Result<DateTime<Utc>, StoreError> {
+    Utc.timestamp_millis_opt(value).single().ok_or_else(|| {
+        StoreError::Internal(format!(
+            "schedule executor lease timestamp is outside the supported UTC range: {value}"
+        ))
+    })
+}
+
 fn into_schedule_store_error(error: StoreError) -> ScheduleStoreError {
     match error {
         StoreError::Io(err) => ScheduleStoreError::Io(err.to_string()),
@@ -2666,6 +3087,7 @@ fn into_schedule_store_error(error: StoreError) -> ScheduleStoreError {
         // Bounded busy-handler exhaustion is a mechanism-level retry class,
         // distinct from semantic concurrency (stale claim/CAS evidence).
         StoreError::Busy(err) => ScheduleStoreError::Transient(err.to_string()),
+        StoreError::ScheduleExecutorLeaseStale => ScheduleStoreError::ExecutorLeaseStale,
         other => ScheduleStoreError::Internal(other.to_string()),
     }
 }
@@ -3140,14 +3562,28 @@ mod tests {
         let path = dir.path().join("schedule.sqlite3");
         let store = SqliteScheduleStore::open(&path).expect("open store");
         assert_eq!(store.worker.connection_open_count(), 0);
+        let executor_lease = match store
+            .acquire_executor_lease(AcquireScheduleExecutorLeaseRequest {
+                owner_id: "connection-reuse-executor".into(),
+                lease_duration: chrono::Duration::minutes(5),
+            })
+            .await
+            .expect("acquire executor lease")
+        {
+            AcquireScheduleExecutorLeaseOutcome::Acquired(lease) => lease,
+            AcquireScheduleExecutorLeaseOutcome::Busy { .. } => unreachable!(),
+        };
 
         let (refill, claims, next_action) = tokio::join!(
             store.read_due_refill_candidates(16),
-            store.claim_due_occurrences(ClaimDueRequest {
-                owner_id: "connection-reuse-test".to_string(),
-                limit: 16,
-                lease_duration: chrono::Duration::seconds(30),
-            }),
+            store.claim_due_occurrences(
+                &executor_lease,
+                ClaimDueRequest {
+                    owner_id: "connection-reuse-test".to_string(),
+                    limit: 16,
+                    lease_duration: chrono::Duration::seconds(30),
+                }
+            ),
             store.next_action_time_utc(),
         );
         refill.expect("read refill candidates");

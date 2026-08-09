@@ -736,6 +736,9 @@ impl InteractionTerminalPublicationError {
             crate::RuntimeDriverError::UnregisterFinalizationOutcomeUnknown { .. }
             | crate::RuntimeDriverError::UnregisterInProgress { .. }
             | crate::RuntimeDriverError::RuntimeStopInProgress { .. }
+            | crate::RuntimeDriverError::InterruptDispatchOutcomeUnknown { .. }
+            | crate::RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. }
+            | crate::RuntimeDriverError::InterruptDispatchPanicked { .. }
             | crate::RuntimeDriverError::RecoveryBackoff { .. }
             | crate::RuntimeDriverError::Internal(_) => Self::Retryable(detail),
         }

@@ -91,10 +91,6 @@ impl CommsRuntime for RecordingCommsRuntime {
         Some("inproc://local".to_string())
     }
 
-    async fn drain_messages(&self) -> Vec<String> {
-        Vec::new()
-    }
-
     fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
         Arc::new(tokio::sync::Notify::new())
     }
@@ -161,7 +157,6 @@ impl CommsRuntime for RecordingCommsRuntime {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
-            submission_queue_len: 0,
             queue: PeerIngressQueueSnapshot::default(),
         })
     }

@@ -20,17 +20,17 @@ mod inner {
         AuthOAuthFlowSnapshotUpdate, CommittedRecoveryBoundary, CommittedWholeBlobProvisionalTail,
         CommittedWholeBlobSnapshot, ExactInputStateObservation, FencedInputStateBatchCasOutcome,
         FencedMachineLifecycleCasOutcome, HeadCanonicalProvisionalTailAuthority,
-        HeadCanonicalStoreAuthority, InputStateBatchCasImplementationProfile,
-        InputStateBatchCasOutcome, InputStateRow, MachineLifecycleCasOutcome,
-        MachineLifecycleCommit, MachineLifecycleExpectedVersion, MachineLifecycleObservation,
-        MachineLifecycleObservationVersion, MachineLifecycleSnapshot, MachineLifecycleStoreRecord,
-        PreparedDurableTailRecoverySource, PreparedHeadCanonicalProvisionalTail,
-        PreparedRecoveryInputSnapshot, PreparedRecoveryInputStateMutation,
-        PreparedRecoveryReceiptSource, PreparedRuntimeSessionCommit,
-        PreparedRuntimeSessionCommitPayload, PreparedRuntimeSessionCommitResult,
-        PreparedWholeBlobProvisionalTail, PreparedWholeBlobRewriteStoreParts,
-        PreparedWholeBlobSnapshotCas, RecoveryCommitStatus, RecoveryInputSetRevision,
-        RecoveryInputStateMutation, RuntimeDeliveryAuthorityCasOutcome,
+        HeadCanonicalRuntimeAuthorityActivation, HeadCanonicalStoreAuthority,
+        InputStateBatchCasImplementationProfile, InputStateBatchCasOutcome, InputStateRow,
+        MachineLifecycleCasOutcome, MachineLifecycleCommit, MachineLifecycleExpectedVersion,
+        MachineLifecycleObservation, MachineLifecycleObservationVersion, MachineLifecycleSnapshot,
+        MachineLifecycleStoreRecord, PreparedDurableTailRecoverySource,
+        PreparedHeadCanonicalProvisionalTail, PreparedRecoveryInputSnapshot,
+        PreparedRecoveryInputStateMutation, PreparedRecoveryReceiptSource,
+        PreparedRuntimeSessionCommit, PreparedRuntimeSessionCommitPayload,
+        PreparedRuntimeSessionCommitResult, PreparedWholeBlobProvisionalTail,
+        PreparedWholeBlobRewriteStoreParts, PreparedWholeBlobSnapshotCas, RecoveryCommitStatus,
+        RecoveryInputSetRevision, RecoveryInputStateMutation, RuntimeDeliveryAuthorityCasOutcome,
         RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord, RuntimeSessionAuthority,
         RuntimeSessionAuthorityReadCost, RuntimeSessionPersistenceProfile,
         RuntimeSessionResumeObservation, RuntimeStore, RuntimeStoreError, RuntimeStoreWriteFence,
@@ -38,9 +38,10 @@ mod inner {
         WholeBlobProvisionalTailAuthority, WholeBlobSnapshotCasOutcome, WholeBlobStoreAuthority,
         classify_machine_lifecycle_record, complete_compaction_projection_intent,
         decoded_prepared_machine_lifecycle_replacement, execute_runtime_store_write_fence,
-        parsed_whole_blob_snapshot, prepare_input_state_batch_cas,
-        prepare_machine_lifecycle_replacement, prepare_recovery_input_state_mutations,
-        validate_input_state_batch_read_ids, validate_machine_lifecycle_replacement,
+        head_canonical_activation_predecessor_matches, parsed_whole_blob_snapshot,
+        prepare_input_state_batch_cas, prepare_machine_lifecycle_replacement,
+        prepare_recovery_input_state_mutations, validate_input_state_batch_read_ids,
+        validate_machine_lifecycle_replacement,
     };
 
     const CREATE_RUNTIME_SCHEMA_SQL: &str = r"
@@ -163,6 +164,12 @@ CREATE TABLE IF NOT EXISTS runtime_mob_host_bindings (
 CREATE TABLE IF NOT EXISTS runtime_mob_host_revocations (
     mob_id TEXT PRIMARY KEY,
     receipt_json BLOB NOT NULL
+)";
+
+    const CREATE_RUNTIME_DIRECT_MEMBER_HIGH_WATER_SCHEMA_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
+    member_session_id TEXT PRIMARY KEY,
+    incarnation_json BLOB NOT NULL
 )";
 
     fn pre_0_8_10_input_import_error(
@@ -1462,14 +1469,14 @@ CREATE TABLE IF NOT EXISTS runtime_mob_host_revocations (
                     error.to_string(),
                 )
             })?;
-        if !matches!(ledger_version, None | Some(1 | 2)) {
+        if !matches!(ledger_version, None | Some(1 | 2 | 3)) {
             return Err(pre_0_8_10_input_import_error(
                 RUNTIME_STORE_DOMAIN.name,
                 "<ledger>",
                 format!("unsupported runtime-store ledger version {ledger_version:?}"),
             ));
         }
-        let target_current = ledger_version == Some(2);
+        let target_current = matches!(ledger_version, Some(2 | 3));
         let rows = {
             let mut statement = tx.prepare(
                 "SELECT inputs.runtime_id, inputs.input_id, inputs.state_json,
@@ -3012,11 +3019,38 @@ END";
         tx.execute_batch(CREATE_RUNTIME_HEAD_CANONICAL_ACTIVATION_QUEUE_SCHEMA_SQL)
     }
 
+    fn migration_0003_direct_member_high_water(
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<(), rusqlite::Error> {
+        tx.execute_batch(CREATE_RUNTIME_DIRECT_MEMBER_HIGH_WATER_SCHEMA_SQL)
+    }
+
+    fn initialize_runtime_v2_schema(tx: &rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error> {
+        migration_0001_runtime_schema(tx)?;
+        migration_0002_current_runtime_schema(tx)
+    }
+
+    fn verify_released_runtime_v2_schema(conn: &Connection) -> Result<(), String> {
+        let v2_objects = RUNTIME_STORE_DOMAIN
+            .owned_objects
+            .iter()
+            .copied()
+            .filter(|object| object.name != "runtime_direct_member_high_waters")
+            .collect::<Vec<_>>();
+        meerkat_sqlite::verify_released_schema_fingerprint(
+            conn,
+            &RUNTIME_STORE_DOMAIN,
+            &v2_objects,
+            initialize_runtime_v2_schema,
+        )
+    }
+
     fn initialize_current_runtime_schema(
         tx: &rusqlite::Transaction<'_>,
     ) -> Result<(), rusqlite::Error> {
         migration_0001_runtime_schema(tx)?;
-        migration_0002_current_runtime_schema(tx)
+        migration_0002_current_runtime_schema(tx)?;
+        migration_0003_direct_member_high_water(tx)
     }
 
     const PRE_MOB_HOST_RUNTIME_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
@@ -3149,6 +3183,10 @@ END";
     /// tables. Whole-BLOB runtimes are materialized once into the activation
     /// queue; ordinary reopen then reads only pending work and interrupted
     /// activations.
+    /// Version 3 adds the receiver-owned semantic high-water that fences
+    /// delayed direct-member binds across runtime replacement and cold
+    /// restart. It stores no runtime bearer token.
+    ///
     /// This intentionally makes older binaries refuse the file: they do not
     /// understand the authority split and must never resume writing the frozen
     /// BLOB after a head-canonical boundary has committed.
@@ -3165,13 +3203,24 @@ END";
                 name: "current-runtime-schema",
                 apply: migration_0002_current_runtime_schema,
             },
+            meerkat_sqlite::Migration {
+                version: 3,
+                name: "direct-member-high-water",
+                apply: migration_0003_direct_member_high_water,
+            },
         ],
         initialize_current: initialize_current_runtime_schema,
-        allowed_existing_versions: &[1, 2],
-        released_predecessors: &[meerkat_sqlite::SchemaPredecessor {
-            version: 1,
-            verify: verify_released_0_8_10_runtime_schema,
-        }],
+        allowed_existing_versions: &[1, 2, 3],
+        released_predecessors: &[
+            meerkat_sqlite::SchemaPredecessor {
+                version: 1,
+                verify: verify_released_0_8_10_runtime_schema,
+            },
+            meerkat_sqlite::SchemaPredecessor {
+                version: 2,
+                verify: verify_released_runtime_v2_schema,
+            },
+        ],
         owned_objects: &[
             meerkat_sqlite::SchemaObject {
                 kind: meerkat_sqlite::SchemaObjectKind::Table,
@@ -3236,6 +3285,10 @@ END";
             meerkat_sqlite::SchemaObject {
                 kind: meerkat_sqlite::SchemaObjectKind::Table,
                 name: "runtime_mob_host_revocations",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "runtime_direct_member_high_waters",
             },
             meerkat_sqlite::SchemaObject {
                 kind: meerkat_sqlite::SchemaObjectKind::Table,
@@ -3452,6 +3505,22 @@ END";
             conn
         }
 
+        fn released_v2() -> Connection {
+            let mut conn = Connection::open_in_memory().expect("open");
+            let tx = conn.transaction().expect("tx");
+            initialize_runtime_v2_schema(&tx).expect("released v2 schema");
+            tx.commit().expect("commit");
+            conn.execute_batch(
+                "CREATE TABLE meerkat_schema (
+                     domain TEXT PRIMARY KEY,
+                     version INTEGER NOT NULL
+                 );
+                 INSERT INTO meerkat_schema VALUES ('runtime-store', 2);",
+            )
+            .expect("ledger");
+            conn
+        }
+
         fn pre_mob_host_unledgered_v1() -> Connection {
             let mut conn = Connection::open_in_memory().expect("open");
             let tx = conn.transaction().expect("tx");
@@ -3478,7 +3547,17 @@ END";
             let report = meerkat_sqlite::apply_domain_migrations(&mut conn, &RUNTIME_STORE_DOMAIN)
                 .expect("upgrade");
             assert_eq!(report.from_version, 1);
-            assert_eq!(report.to_version, 2);
+            assert_eq!(report.to_version, 3);
+        }
+
+        #[test]
+        fn exact_released_v2_upgrades_to_current() {
+            let mut conn = released_v2();
+            let report = meerkat_sqlite::apply_domain_migrations(&mut conn, &RUNTIME_STORE_DOMAIN)
+                .expect("upgrade");
+            assert_eq!(report.from_version, 2);
+            assert_eq!(report.to_version, 3);
+            assert!(table_exists(&conn, "runtime_direct_member_high_waters"));
         }
 
         #[test]
@@ -3494,14 +3573,15 @@ END";
             .expect("bridge exact pre-mob-host predecessor");
 
             assert_eq!(report.from_version, 1);
-            assert_eq!(report.to_version, 2);
+            assert_eq!(report.to_version, 3);
             assert_eq!(report.prepared, 0);
             assert_eq!(
                 meerkat_sqlite::domain_version(&conn, RUNTIME_STORE_DOMAIN.name).expect("ledger"),
-                Some(2)
+                Some(3)
             );
             assert!(table_exists(&conn, "runtime_mob_host_bindings"));
             assert!(table_exists(&conn, "runtime_mob_host_revocations"));
+            assert!(table_exists(&conn, "runtime_direct_member_high_waters"));
             meerkat_sqlite::preflight_schema_eligibility(&conn, &RUNTIME_STORE_DOMAIN)
                 .expect("current catalog");
         }
@@ -4652,6 +4732,103 @@ END";
             ));
         }
         Ok(Some(RuntimeSessionAuthority::HeadCanonical(authority)))
+    }
+
+    #[derive(Debug)]
+    struct HeadCanonicalActivationPredecessor {
+        authority_version: u16,
+        session_id: meerkat_core::types::SessionId,
+        store_revision: u64,
+        boundary_head: meerkat_core::session_store::SessionHead,
+        committed_head_token: String,
+    }
+
+    fn load_head_canonical_activation_predecessor(
+        conn: &Connection,
+        runtime_id: &LogicalRuntimeId,
+    ) -> Result<Option<HeadCanonicalActivationPredecessor>, RuntimeStoreError> {
+        let row = conn
+            .query_row(
+                r"
+                SELECT authority_version, session_id, store_revision,
+                       boundary_head_json, committed_head_token
+                FROM runtime_session_authority
+                WHERE runtime_id = ?1
+                ",
+                params![runtime_id_text(runtime_id)],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, JsonColumnBytes>(3)?.into_bytes(),
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+        let Some((version, session_id, store_revision, boundary_head_json, head_token)) = row
+        else {
+            return Ok(None);
+        };
+        let authority_version = u16::try_from(version).map_err(|_| {
+            session_authority_conflict(
+                runtime_id,
+                "persisted activation predecessor has an invalid authority version",
+            )
+        })?;
+        if authority_version != HeadCanonicalStoreAuthority::VERSION {
+            return Err(session_authority_conflict(
+                runtime_id,
+                format!(
+                    "unsupported HeadCanonical activation predecessor version {authority_version}"
+                ),
+            ));
+        }
+        let store_revision = u64::try_from(store_revision)
+            .ok()
+            .filter(|revision| *revision != 0)
+            .ok_or_else(|| {
+                session_authority_conflict(
+                    runtime_id,
+                    "persisted activation predecessor revision is not positive",
+                )
+            })?;
+        let session_id = meerkat_core::types::SessionId::parse(&session_id).map_err(|error| {
+            session_authority_conflict(
+                runtime_id,
+                format!("persisted activation predecessor session id is invalid: {error}"),
+            )
+        })?;
+        let boundary_head: meerkat_core::session_store::SessionHead =
+            serde_json::from_slice(&boundary_head_json).map_err(|error| {
+                session_authority_conflict(
+                    runtime_id,
+                    format!("persisted activation predecessor head is invalid: {error}"),
+                )
+            })?;
+        if boundary_head.id != session_id
+            || &LogicalRuntimeId::for_session(&session_id) != runtime_id
+            || meerkat_core::session_head_cas_token(&boundary_head).map_err(|error| {
+                session_authority_conflict(
+                    runtime_id,
+                    format!("persisted activation predecessor token is invalid: {error}"),
+                )
+            })? != head_token
+        {
+            return Err(session_authority_conflict(
+                runtime_id,
+                "persisted activation predecessor identity or token is inconsistent",
+            ));
+        }
+        Ok(Some(HeadCanonicalActivationPredecessor {
+            authority_version,
+            session_id,
+            store_revision,
+            boundary_head,
+            committed_head_token: head_token,
+        }))
     }
 
     #[derive(Debug)]
@@ -10617,6 +10794,172 @@ ORDER BY runtime_id";
             RuntimeSessionAuthorityReadCost::Bounded
         }
 
+        async fn activate_head_canonical_runtime_authority(
+            &self,
+            verified: meerkat_core::VerifiedHeadCanonicalAuthority,
+        ) -> Result<HeadCanonicalRuntimeAuthorityActivation, RuntimeStoreError> {
+            let (verified_head, verified_token) = verified.into_parts();
+            let runtime_id = LogicalRuntimeId::for_session(&verified_head.id);
+            self.require_head_canonical_session_operation(
+                &runtime_id,
+                "HeadCanonical runtime authority activation",
+            )?;
+            let path = self.path.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut conn = open_head_canonical_runtime_connection(&path)?;
+                let tx = begin_runtime_transaction(&mut conn)?;
+                if load_head_canonical_provisional_tail_authority(&tx, &runtime_id)?.is_some() {
+                    return Err(session_authority_conflict(
+                        &runtime_id,
+                        "HeadCanonical activation cannot replace authority while a provisional tail is live",
+                    ));
+                }
+                let current = load_head_canonical_activation_predecessor(&tx, &runtime_id)?;
+                if let Some(current) = current.as_ref() {
+                    if current.boundary_head == verified_head
+                        && current.committed_head_token == verified_token
+                    {
+                        let aligned = HeadCanonicalStoreAuthority::issued(
+                            current.session_id.clone(),
+                            current.store_revision,
+                            current.boundary_head.clone(),
+                            current.committed_head_token.clone(),
+                        )?;
+                        tx.commit().map_err(|error| {
+                            RuntimeStoreError::WriteFailed(error.to_string())
+                        })?;
+                        return Ok(HeadCanonicalRuntimeAuthorityActivation::AlreadyAligned(
+                            aligned,
+                        ));
+                    }
+                    if !head_canonical_activation_predecessor_matches(
+                        &current.boundary_head,
+                        &verified_head,
+                    )? {
+                        return Err(session_authority_conflict(
+                            &runtime_id,
+                            "verified physical HeadCanonical activation changes semantic boundary content, lineage, or rewrite authority",
+                        ));
+                    }
+                }
+
+                let store_revision = current.as_ref().map_or(Ok(1), |current| {
+                    current.store_revision.checked_add(1).ok_or_else(|| {
+                        session_authority_conflict(
+                            &runtime_id,
+                            "HeadCanonical activation store revision overflow",
+                        )
+                    })
+                })?;
+                let installed_head = HeadCanonicalStoreAuthority::issued(
+                    verified_head.id.clone(),
+                    store_revision,
+                    verified_head,
+                    verified_token.clone(),
+                )?;
+                if installed_head.committed_head_token() != verified_token {
+                    return Err(session_authority_conflict(
+                        &runtime_id,
+                        "runtime activation minted a token different from the verified physical authority",
+                    ));
+                }
+                let boundary_head_json = serde_json::to_vec(installed_head.boundary_head())
+                    .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                let changed = match current.as_ref() {
+                    None => tx.execute(
+                        r"
+                        INSERT INTO runtime_session_authority (
+                            runtime_id, authority_version, session_id, store_revision,
+                            boundary_head_json, committed_head_token
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                        ",
+                        params![
+                            runtime_id_text(&runtime_id),
+                            i64::from(installed_head.authority_version()),
+                            installed_head.session_id().to_string(),
+                            i64::try_from(installed_head.store_revision()).map_err(|_| {
+                                session_authority_conflict(
+                                    &runtime_id,
+                                    "HeadCanonical activation revision exceeds SQLite INTEGER",
+                                )
+                            })?,
+                            boundary_head_json,
+                            installed_head.committed_head_token(),
+                        ],
+                    ),
+                    Some(predecessor) => tx.execute(
+                        r"
+                        UPDATE runtime_session_authority
+                        SET authority_version = ?2,
+                            session_id = ?3,
+                            store_revision = ?4,
+                            boundary_head_json = ?5,
+                            committed_head_token = ?6
+                        WHERE runtime_id = ?1
+                          AND authority_version = ?7
+                          AND store_revision = ?8
+                          AND committed_head_token = ?9
+                        ",
+                        params![
+                            runtime_id_text(&runtime_id),
+                            i64::from(installed_head.authority_version()),
+                            installed_head.session_id().to_string(),
+                            i64::try_from(installed_head.store_revision()).map_err(|_| {
+                                session_authority_conflict(
+                                    &runtime_id,
+                                    "HeadCanonical activation revision exceeds SQLite INTEGER",
+                                )
+                            })?,
+                            boundary_head_json,
+                            installed_head.committed_head_token(),
+                            i64::from(predecessor.authority_version),
+                            i64::try_from(predecessor.store_revision).map_err(|_| {
+                                session_authority_conflict(
+                                    &runtime_id,
+                                    "HeadCanonical predecessor revision exceeds SQLite INTEGER",
+                                )
+                            })?,
+                            predecessor.committed_head_token.as_str(),
+                        ],
+                    ),
+                }
+                .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                if changed != 1 {
+                    return Err(session_authority_conflict(
+                        &runtime_id,
+                        "HeadCanonical activation predecessor changed before atomic alignment",
+                    ));
+                }
+                meerkat_store::sqlite_store::retain_runtime_boundary_head_metadata_in_txn(
+                    &tx,
+                    installed_head.boundary_head(),
+                )
+                .map_err(|error| {
+                    map_head_canonical_session_store_error(&runtime_id, error)
+                })?;
+                let runtime_state = load_runtime_session_catalog_entry_in_txn(&tx, &runtime_id)?
+                    .and_then(|entry| entry.runtime_state());
+                let catalog_entry = crate::store::RuntimeSessionCatalogEntry::from_head(
+                    installed_head.boundary_head(),
+                    RuntimeSessionPersistenceProfile::HeadCanonicalV1,
+                    runtime_state,
+                )?;
+                upsert_runtime_session_catalog_entry_in_txn(&tx, &runtime_id, &catalog_entry)?;
+                let advanced = current.is_some();
+                tx.commit()
+                    .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                Ok(if advanced {
+                    HeadCanonicalRuntimeAuthorityActivation::RepresentationAdvanced(
+                        installed_head,
+                    )
+                } else {
+                    HeadCanonicalRuntimeAuthorityActivation::Installed(installed_head)
+                })
+            })
+            .await
+            .map_err(|error| RuntimeStoreError::Internal(format!("Task join failed: {error}")))?
+        }
+
         async fn commit_prepared_session_boundary(
             &self,
             runtime_id: &LogicalRuntimeId,
@@ -15244,6 +15587,68 @@ ORDER BY runtime_id";
             .map_err(|err| RuntimeStoreError::Internal(format!("Task join failed: {err}")))?
         }
 
+        async fn admit_direct_member_incarnation_high_water(
+            &self,
+            member_session_id: &str,
+            candidate: &meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+        ) -> Result<
+            meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+            RuntimeStoreError,
+        > {
+            crate::store::validate_direct_member_high_water_candidate(
+                member_session_id,
+                candidate,
+            )?;
+            let path = self.path.clone();
+            let member_session_id = member_session_id.to_string();
+            let candidate = candidate.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut conn = open_runtime_connection(&path)?;
+                let tx = begin_runtime_transaction(&mut conn)?;
+                let current = tx
+                    .query_row(
+                        "SELECT incarnation_json FROM runtime_direct_member_high_waters \
+                         WHERE member_session_id = ?1",
+                        params![&member_session_id],
+                        |row| Ok(row.get::<_, JsonColumnBytes>(0)?.into_bytes()),
+                    )
+                    .optional()
+                    .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?
+                    .map(|bytes| {
+                        serde_json::from_slice::<
+                            meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+                        >(&bytes)
+                        .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))
+                    })
+                    .transpose()?;
+
+                if let Some(current) = current.as_ref()
+                    && !crate::store::direct_member_high_water_accepts(current, &candidate)
+                {
+                    return Ok(current.clone());
+                }
+                if current.as_ref() == Some(&candidate) {
+                    return Ok(candidate);
+                }
+
+                let incarnation_json = serde_json::to_vec(&candidate)
+                    .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                tx.execute(
+                    "INSERT INTO runtime_direct_member_high_waters \
+                     (member_session_id, incarnation_json) VALUES (?1, ?2) \
+                     ON CONFLICT(member_session_id) DO UPDATE \
+                     SET incarnation_json = excluded.incarnation_json",
+                    params![member_session_id, incarnation_json],
+                )
+                .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                tx.commit()
+                    .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                Ok(candidate)
+            })
+            .await
+            .map_err(|error| RuntimeStoreError::Internal(format!("Task join failed: {error}")))?
+        }
+
         async fn load_mob_host_binding(
             &self,
             mob_id: &str,
@@ -15475,6 +15880,101 @@ ORDER BY runtime_id";
         use tempfile::TempDir;
 
         use super::*;
+
+        #[tokio::test]
+        async fn external_activation_advances_only_representation_side_predecessor() {
+            use meerkat_core::SessionStore as _;
+
+            let tempdir = TempDir::new().unwrap();
+            let session_store = Arc::new(
+                meerkat_store::SqliteSessionStore::open(tempdir.path().join("sessions.sqlite3"))
+                    .unwrap(),
+            );
+            let session = meerkat_core::Session::new();
+            let root =
+                meerkat_core::session_store::PreparedHeadCanonicalMutation::prepare_root(&session)
+                    .unwrap();
+            Arc::clone(&session_store)
+                .as_incremental()
+                .unwrap()
+                .apply_prepared_head_canonical_mutation(&root)
+                .await
+                .unwrap();
+            let activation = Arc::clone(&session_store)
+                .as_incremental()
+                .unwrap()
+                .activate_head_canonical_store()
+                .await
+                .unwrap();
+            let meerkat_core::HeadCanonicalStoreActivation::Activated(mut crossings) = activation
+            else {
+                panic!("SQLite store activation must apply");
+            };
+            let verified = match crossings.pop().unwrap() {
+                meerkat_core::HeadCanonicalAuthorityCrossing::AlreadyCurrent(authority) => {
+                    authority
+                }
+                other => panic!("expected already-current root proof, got {other:?}"),
+            };
+
+            let mut predecessor = verified.head().clone();
+            let inline_metadata = predecessor.materialized_metadata().unwrap();
+            predecessor.message_row_prefix = None;
+            predecessor.row_lineage_anchor = None;
+            predecessor.graph_prefix = None;
+            predecessor.realtime_event_prefix = None;
+            predecessor.metadata_identity = None;
+            predecessor.metadata = inline_metadata;
+            // The representation-side predecessor is a persisted legacy head.
+            // Round-tripping drops the sealed, non-serialized current metadata
+            // projection that accompanied the verified successor in memory.
+            let predecessor: meerkat_core::session_store::SessionHead =
+                serde_json::from_slice(&serde_json::to_vec(&predecessor).unwrap()).unwrap();
+            let predecessor_token = meerkat_core::session_head_cas_token(&predecessor).unwrap();
+            let runtime_id = LogicalRuntimeId::for_session(&predecessor.id);
+            let runtime_store =
+                SqliteRuntimeStore::new_head_canonical(tempdir.path().join("runtime.sqlite3"))
+                    .unwrap();
+            let mut conn = open_head_canonical_runtime_connection(runtime_store.path()).unwrap();
+            let tx = begin_runtime_transaction(&mut conn).unwrap();
+            tx.execute(
+                r"
+                INSERT INTO runtime_session_authority (
+                    runtime_id, authority_version, session_id, store_revision,
+                    boundary_head_json, committed_head_token
+                ) VALUES (?1, ?2, ?3, 7, ?4, ?5)
+                ",
+                params![
+                    runtime_id_text(&runtime_id),
+                    i64::from(HeadCanonicalStoreAuthority::VERSION),
+                    predecessor.id.to_string(),
+                    serde_json::to_vec(&predecessor).unwrap(),
+                    predecessor_token,
+                ],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+
+            let outcome = runtime_store
+                .activate_head_canonical_runtime_authority(verified.clone())
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                HeadCanonicalRuntimeAuthorityActivation::RepresentationAdvanced(ref authority)
+                    if authority.store_revision() == 8
+                        && authority.committed_head_token() == verified.head_token()
+            ));
+            let current = runtime_store
+                .load_session_boundary_authority(&runtime_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                current.head_canonical().unwrap().committed_head_token(),
+                verified.head_token()
+            );
+        }
 
         #[tokio::test]
         async fn pending_terminal_owner_index_satisfies_store_contract() {
@@ -21047,8 +21547,9 @@ ORDER BY runtime_id";
         // ── upgrade/rollback ledger contract for the delivery domain ──────
         //
         // Head-canonical runtime authority intentionally advances the released
-        // v1 runtime domain to v2: older binaries do not understand the frozen-BLOB
-        // ownership split and must refuse rather than resume writing it.
+        // v1 runtime domain through v3: older binaries do not understand the
+        // frozen-BLOB ownership split or direct-member high-water and must
+        // refuse rather than resume writing it.
         // Durable delivery remains a separate lazily provisioned domain;
         // merely opening or reading a realm never stamps that domain.
 
@@ -21058,7 +21559,7 @@ ORDER BY runtime_id";
             let conn = Connection::open(store.path()).unwrap();
             assert_eq!(
                 meerkat_sqlite::domain_version(&conn, "runtime-store").unwrap(),
-                Some(2),
+                Some(3),
                 "runtime-store must install the complete head-canonical authority contract"
             );
             assert_eq!(
@@ -21073,6 +21574,7 @@ ORDER BY runtime_id";
                 ("table", "runtime_head_canonical_profile_pin"),
                 ("table", "runtime_head_canonical_activations"),
                 ("table", "runtime_head_canonical_activation_queue"),
+                ("table", "runtime_direct_member_high_waters"),
                 ("trigger", "runtime_head_canonical_profile_pin_no_update"),
                 ("trigger", "runtime_head_canonical_profile_pin_no_delete"),
                 (
@@ -21179,6 +21681,45 @@ ORDER BY runtime_id";
         }
 
         #[tokio::test]
+        async fn direct_member_high_water_survives_sqlite_reopen() {
+            let (dir, store) = temp_store();
+            let path = store.path().to_owned();
+            let predecessor =
+                meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+                    mob_id: "mob-sqlite-high-water".to_string(),
+                    agent_identity: "worker-sqlite-high-water".to_string(),
+                    generation: 1,
+                    fence_token: 51,
+                };
+            let successor =
+                meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+                    generation: 2,
+                    fence_token: 52,
+                    ..predecessor.clone()
+                };
+            store
+                .admit_direct_member_incarnation_high_water("session-sqlite-high-water", &successor)
+                .await
+                .expect("persist successor high-water");
+            drop(store);
+
+            let reopened = SqliteRuntimeStore::new(path).expect("reopen runtime store");
+            assert_eq!(
+                reopened
+                    .admit_direct_member_incarnation_high_water(
+                        "session-sqlite-high-water",
+                        &predecessor,
+                    )
+                    .await
+                    .expect("observe durable high-water"),
+                successor,
+                "cold reopen must reject delayed predecessor before successor rebind"
+            );
+            drop(reopened);
+            drop(dir);
+        }
+
+        #[tokio::test]
         async fn delivery_reads_do_not_provision_the_delivery_domain() {
             let (_dir, store) = temp_store();
             let rid = runtime_id();
@@ -21240,7 +21781,7 @@ ORDER BY runtime_id";
             );
             assert_eq!(
                 meerkat_sqlite::domain_version(&conn, "runtime-store").unwrap(),
-                Some(2),
+                Some(3),
                 "delivery use must not move the runtime-store domain"
             );
             drop(conn);

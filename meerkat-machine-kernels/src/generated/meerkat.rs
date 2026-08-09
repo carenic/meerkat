@@ -11601,6 +11601,10 @@ pub mod inputs {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct InterruptCurrentRun {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct InterruptCurrentRunForRun {
+        pub run_id: RunId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ResolveUserInterruptPublicResult {
         pub observation: UserInterruptObservationKind,
         pub target_present: bool,
@@ -11608,6 +11612,11 @@ pub mod inputs {
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct CancelAfterBoundary {
+        pub reason: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CancelAfterBoundaryForRun {
+        pub run_id: RunId,
         pub reason: String,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -13174,8 +13183,10 @@ pub enum Input {
     ResolvePeerIngressDequeue(inputs::ResolvePeerIngressDequeue),
     NotifyDrainExited(inputs::NotifyDrainExited),
     InterruptCurrentRun(inputs::InterruptCurrentRun),
+    InterruptCurrentRunForRun(inputs::InterruptCurrentRunForRun),
     ResolveUserInterruptPublicResult(inputs::ResolveUserInterruptPublicResult),
     CancelAfterBoundary(inputs::CancelAfterBoundary),
+    CancelAfterBoundaryForRun(inputs::CancelAfterBoundaryForRun),
     AbortCancelAfterBoundaryDispatch(inputs::AbortCancelAfterBoundaryDispatch),
     StagePersistentFilter(inputs::StagePersistentFilter),
     PublishCommittedVisibleSet(inputs::PublishCommittedVisibleSet),
@@ -13489,10 +13500,12 @@ impl Input {
             Self::ResolvePeerIngressDequeue(_) => InputKind::ResolvePeerIngressDequeue,
             Self::NotifyDrainExited(_) => InputKind::NotifyDrainExited,
             Self::InterruptCurrentRun(_) => InputKind::InterruptCurrentRun,
+            Self::InterruptCurrentRunForRun(_) => InputKind::InterruptCurrentRunForRun,
             Self::ResolveUserInterruptPublicResult(_) => {
                 InputKind::ResolveUserInterruptPublicResult
             }
             Self::CancelAfterBoundary(_) => InputKind::CancelAfterBoundary,
+            Self::CancelAfterBoundaryForRun(_) => InputKind::CancelAfterBoundaryForRun,
             Self::AbortCancelAfterBoundaryDispatch(_) => {
                 InputKind::AbortCancelAfterBoundaryDispatch
             }
@@ -13873,8 +13886,10 @@ pub enum InputKind {
     ResolvePeerIngressDequeue,
     NotifyDrainExited,
     InterruptCurrentRun,
+    InterruptCurrentRunForRun,
     ResolveUserInterruptPublicResult,
     CancelAfterBoundary,
+    CancelAfterBoundaryForRun,
     AbortCancelAfterBoundaryDispatch,
     StagePersistentFilter,
     PublishCommittedVisibleSet,
@@ -16161,6 +16176,8 @@ pub enum TransitionId {
     NotifyDrainExitedTerminalSupervisorCleanup,
     InterruptCurrentRunAttached,
     InterruptCurrentRun,
+    InterruptCurrentRunForRunRunning,
+    InterruptCurrentRunForRunRetired,
     ResolveUserInterruptPublicResultAcceptedInitializing,
     ResolveUserInterruptPublicResultAcceptedIdle,
     ResolveUserInterruptPublicResultAcceptedAttached,
@@ -16208,6 +16225,10 @@ pub enum TransitionId {
     CancelAfterBoundary,
     CancelAfterBoundaryAttachedAlreadyPending,
     CancelAfterBoundaryAlreadyPending,
+    CancelAfterBoundaryForRunRunning,
+    CancelAfterBoundaryForRunRetired,
+    CancelAfterBoundaryForRunRunningAlreadyPending,
+    CancelAfterBoundaryForRunRetiredAlreadyPending,
     AbortCancelAfterBoundaryDispatchInitializing,
     AbortCancelAfterBoundaryDispatchIdle,
     AbortCancelAfterBoundaryDispatchAttached,
@@ -16222,6 +16243,8 @@ pub enum TransitionId {
     PublishCommittedVisibleSetRetired,
     RetireRequestedFromIdle,
     RetireRequestedFromIdleUnbound,
+    RetireRequestedWhileRunBound,
+    RetireRequestedWhileRunUnbound,
     RetireAlreadyRetired,
     RetireAlreadyRetiredUnbound,
     Reset,

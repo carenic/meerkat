@@ -732,12 +732,17 @@ impl SessionAgent for FactoryAgent {
         stop_reason: StopReason,
         usage: Usage,
     ) -> Result<(), meerkat_core::error::AgentError> {
+        let usage = meerkat_core::TurnUsage::try_from_usage(usage).map_err(|error| {
+            meerkat_core::error::AgentError::ConfigError(format!(
+                "external assistant usage requires normalized provider accounting: {error}"
+            ))
+        })?;
         self.agent.session_mut().append_external_assistant_blocks(
             blocks,
             stop_reason,
             usage.clone(),
         );
-        self.agent.budget().record_usage(&usage);
+        self.agent.budget().record_turn_usage(&usage);
         Ok(())
     }
 
@@ -751,10 +756,11 @@ impl SessionAgent for FactoryAgent {
             .append_realtime_transcript_event(event);
         for materialized in &outcome.materialized_messages {
             if let meerkat_core::RealtimeTranscriptMaterializedMessage::Assistant {
-                usage, ..
+                usage: Some(usage),
+                ..
             } = materialized
             {
-                self.agent.budget().record_usage(usage);
+                self.agent.budget().record_turn_usage(usage);
             }
         }
         Ok(outcome)
@@ -873,6 +879,9 @@ pub struct FactoryAgentBuilder {
     /// Default WorkGraph tools injected into all builds.
     pub default_workgraph_tools:
         Arc<std::sync::RwLock<Option<Arc<dyn meerkat_core::AgentToolDispatcher>>>>,
+    /// Namespace grant paired with `default_workgraph_tools`.
+    pub default_workgraph_namespace_grant:
+        Arc<std::sync::RwLock<Option<meerkat_core::service::WorkGraphNamespaceGrant>>>,
     /// Default blob store injected into all builds.
     pub default_blob_store: Option<Arc<dyn meerkat_core::BlobStore>>,
     /// Persistence-owned realm used when a session request does not carry an
@@ -907,6 +916,7 @@ impl FactoryAgentBuilder {
             default_mob_tools: Arc::new(std::sync::RwLock::new(None)),
             default_schedule_tools: Arc::new(std::sync::RwLock::new(None)),
             default_workgraph_tools: Arc::new(std::sync::RwLock::new(None)),
+            default_workgraph_namespace_grant: Arc::new(std::sync::RwLock::new(None)),
             default_blob_store: None,
             default_realm_id: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -941,6 +951,7 @@ impl FactoryAgentBuilder {
             default_mob_tools: Arc::new(std::sync::RwLock::new(None)),
             default_schedule_tools: Arc::new(std::sync::RwLock::new(None)),
             default_workgraph_tools: Arc::new(std::sync::RwLock::new(None)),
+            default_workgraph_namespace_grant: Arc::new(std::sync::RwLock::new(None)),
             default_blob_store: None,
             default_realm_id: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1207,6 +1218,26 @@ impl SessionAgentBuilder for FactoryAgentBuilder {
                 .clone()
         {
             build_config.workgraph_tools = Some(workgraph_dispatcher);
+            let default_grant = self
+                .default_workgraph_namespace_grant
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let (Some(requested), Some(default)) =
+                (&build_config.workgraph_namespace_grant, &default_grant)
+                && requested != default
+            {
+                return Err(SessionError::Agent(
+                    meerkat_core::error::AgentError::ConfigError(format!(
+                        "requested WorkGraph namespace grant {}/{} does not match the injected dispatcher grant {}/{}",
+                        requested.realm_id,
+                        requested.namespace,
+                        default.realm_id,
+                        default.namespace
+                    )),
+                ));
+            }
+            build_config.workgraph_namespace_grant = default_grant;
         }
 
         if build_config.blob_store_override.is_none()
@@ -1323,6 +1354,10 @@ fn set_default_workgraph_tools_from_persistence(
             persistence.workgraph_store(),
             manifest.realm.as_str().to_owned(),
             crate::WorkNamespace::default(),
+        );
+        crate::surface::set_default_workgraph_namespace_grant(
+            builder,
+            Some(service.namespace_grant().clone()),
         );
         crate::surface::set_default_workgraph_tools(
             builder,
@@ -1459,16 +1494,36 @@ mod tests {
         delta: &'static str,
     }
 
+    fn provider_for_successful_test_model(model: &str) -> Provider {
+        if model.starts_with("claude-") {
+            Provider::Anthropic
+        } else if model.starts_with("gpt-") || model.starts_with("o1-") {
+            Provider::OpenAI
+        } else if model.starts_with("gemini-") {
+            Provider::Gemini
+        } else {
+            Provider::Other
+        }
+    }
+
     impl Default for MockLlmClient {
         fn default() -> Self {
             Self { delta: "ok" }
         }
     }
 
-    #[derive(Default)]
     struct CaptureToolClient {
         inner: meerkat_client::TestClient,
         seen_tools: Mutex<Vec<String>>,
+    }
+
+    impl Default for CaptureToolClient {
+        fn default() -> Self {
+            Self {
+                inner: meerkat_client::TestClient::for_provider(Provider::Anthropic),
+                seen_tools: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     impl CaptureToolClient {
@@ -1715,7 +1770,7 @@ mod tests {
 
         fn stream<'a>(
             &'a self,
-            _request: &'a LlmRequest,
+            request: &'a LlmRequest,
         ) -> Pin<
             Box<dyn futures::Stream<Item = Result<LlmEvent, meerkat_client::LlmError>> + Send + 'a>,
         > {
@@ -1723,6 +1778,13 @@ mod tests {
                 Ok(LlmEvent::TextDelta {
                     delta: self.delta.to_string(),
                     meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider_for_successful_test_model(&request.model),
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
                 }),
                 Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {

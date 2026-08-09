@@ -75,6 +75,7 @@ impl CanonicalMemberSnapshotMaterial {
             output: self.output_preview.clone(),
             tokens_used: self.tokens_used,
             agent_identity: self.agent_identity.clone(),
+            bounded_result: None,
             agent_runtime_id,
             fence_token,
         })

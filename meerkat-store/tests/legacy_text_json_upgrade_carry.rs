@@ -13,15 +13,30 @@ use meerkat_core::{
     ContentInput, Message, Session, SessionId, SessionMeta, SessionStore, UserMessage,
 };
 use meerkat_schedule::{
-    ClaimDueRequest, CreateScheduleRequest, IntervalTriggerSpec, MisfirePolicy,
-    MissingTargetPolicy, Occurrence, OccurrenceLifecycleEffect, OccurrenceLifecycleInput,
-    OccurrenceOrdinal, OccurrencePhase, OverlapPolicy, Schedule, ScheduleLifecycleInput,
-    ScheduleStore, ScheduledSessionAction, SessionTargetBinding, TargetBinding, TriggerSpec,
+    AcquireScheduleExecutorLeaseOutcome, AcquireScheduleExecutorLeaseRequest, ClaimDueRequest,
+    CreateScheduleRequest, IntervalTriggerSpec, MisfirePolicy, MissingTargetPolicy, Occurrence,
+    OccurrenceLifecycleEffect, OccurrenceLifecycleInput, OccurrenceOrdinal, OccurrencePhase,
+    OverlapPolicy, Schedule, ScheduleLifecycleInput, ScheduleStore, ScheduledSessionAction,
+    SessionTargetBinding, TargetBinding, TriggerSpec,
 };
 use meerkat_store::{SqliteScheduleStore, SqliteSessionStore, index::SqliteSessionIndex};
 use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::path::Path;
+
+async fn executor_lease(store: &SqliteScheduleStore) -> meerkat_schedule::ScheduleExecutorLease {
+    match store
+        .acquire_executor_lease(AcquireScheduleExecutorLeaseRequest {
+            owner_id: "legacy-carry-executor".into(),
+            lease_duration: Duration::minutes(5),
+        })
+        .await
+        .expect("acquire executor lease")
+    {
+        AcquireScheduleExecutorLeaseOutcome::Acquired(lease) => lease,
+        AcquireScheduleExecutorLeaseOutcome::Busy { .. } => unreachable!(),
+    }
+}
 
 fn sample_schedule_request() -> CreateScheduleRequest {
     CreateScheduleRequest {
@@ -112,14 +127,22 @@ async fn schedule_store_reads_legacy_text_rows() {
     assert!(planned_commit.supersession_acks().is_empty());
 
     // Drive one occurrence to a terminal receipt so schedule_receipts has a row.
+    let lease = executor_lease(&store).await;
     let claim = store
-        .claim_due_occurrences(ClaimDueRequest {
-            owner_id: "legacy-carry".into(),
-            limit: 8,
-            lease_duration: Duration::minutes(5),
-        })
+        .claim_due_occurrences(
+            &lease,
+            ClaimDueRequest {
+                owner_id: "legacy-carry".into(),
+                limit: 8,
+                lease_duration: Duration::minutes(5),
+            },
+        )
         .await
         .expect("claim due occurrences");
+    store
+        .release_executor_lease(lease)
+        .await
+        .expect("release executor lease");
     assert_eq!(
         claim.transitions.len(),
         1,
@@ -248,14 +271,22 @@ async fn schedule_store_claims_and_writes_over_legacy_text_rows() {
     // The claim path joins schedule and occurrence JSON columns and rewrites
     // the claimed row; both must carry over legacy TEXT rows.
     let store = SqliteScheduleStore::open(&path).expect("re-open");
+    let lease = executor_lease(&store).await;
     let claim = store
-        .claim_due_occurrences(ClaimDueRequest {
-            owner_id: "legacy-carry".into(),
-            limit: 8,
-            lease_duration: Duration::minutes(5),
-        })
+        .claim_due_occurrences(
+            &lease,
+            ClaimDueRequest {
+                owner_id: "legacy-carry".into(),
+                limit: 8,
+                lease_duration: Duration::minutes(5),
+            },
+        )
         .await
         .expect("claim_due_occurrences over TEXT rows");
+    store
+        .release_executor_lease(lease)
+        .await
+        .expect("release executor lease");
     assert_eq!(
         claim.transitions.len(),
         1,

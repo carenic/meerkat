@@ -1086,6 +1086,7 @@ class ScheduleToolsResult:
 @dataclass
 class SessionForkResult:
     """Result of creating an edited transcript branch."""
+    cache_inheritance: dict[str, Any]
     message_count: int
     session_id: str
     source_session_id: str
@@ -1109,6 +1110,18 @@ authority over its own payload shape). Allow-listed per
 
 
 @dataclass
+class SystemPromptUpdateResult:
+    """Durable result of a keyed prompt update."""
+    key: SystemPromptKey
+    message_index: int
+    session_id: str
+    status: Literal['applied', 'duplicate']
+    transcript_revision: str
+    version: SystemPromptVersion
+    commit: Optional[dict[str, Any]] = None
+
+
+@dataclass
 class SessionTranscriptRewriteResult:
     """Result of committing a same-session transcript rewrite."""
     commit: dict[str, Any]
@@ -1116,6 +1129,22 @@ class SessionTranscriptRewriteResult:
     parent_revision: str
     revision: str
     session_id: str
+
+
+@dataclass
+class UpdateSystemPromptParams:
+    """Request payload for `session/update_system_prompt`.
+
+Unlike a generic transcript rewrite, this operation can only mint the next
+version of one typed prompt key. `target_message_index` is required only
+for the first explicit adoption of an existing unversioned System row."""
+    content: str
+    key: SystemPromptKey
+    session_id: str
+    actor: Optional[str] = None
+    expected_parent_revision: Optional[str] = None
+    expected_version: Optional[SystemPromptVersion] = None
+    target_message_index: Optional[int] = None
 
 
 @dataclass
@@ -2074,6 +2103,7 @@ class MobHelperResult:
     agent_identity: str
     member_ref: WireMemberRef
     tokens_used: int
+    bounded_result: Optional[dict[str, Any]] = None
     output: Optional[str] = None
 
 
@@ -3056,8 +3086,10 @@ class WorkGraphSnapshotFilter:
 @dataclass
 class WorkItem:
     """Wire payload for WorkItem."""
+    cancelled_child_join_policy: Literal['require_success', 'propagate', 'accept']
     completion_policy: WorkCompletionPolicy
     created_at: str
+    failed_child_join_policy: Literal['require_success', 'propagate', 'accept']
     id: str
     machine_state: dict[str, Any]
     namespace: str
@@ -3085,6 +3117,7 @@ class WorkItem:
         """
         data = _expect_wire_object(value, 'WorkItem')
         return cls(
+            cancelled_child_join_policy=_expect_wire_enum(_require_wire_field(data, 'cancelled_child_join_policy', 'WorkItem'), ('require_success', 'propagate', 'accept',), 'WorkItem.cancelled_child_join_policy'),
             claim=(WorkItemClaim.from_wire(data['claim']) if data.get('claim') is not None else None),
             completion_policy=parse_work_completion_policy(_require_wire_field(data, 'completion_policy', 'WorkItem')),
             created_at=_expect_wire_str(_require_wire_field(data, 'created_at', 'WorkItem'), 'WorkItem.created_at'),
@@ -3092,6 +3125,7 @@ class WorkItem:
             due_at=(_expect_wire_str(data['due_at'], 'WorkItem.due_at') if data.get('due_at') is not None else None),
             evidence_refs=([WorkEvidenceRef.from_wire(_item) for _item in _expect_wire_list(data['evidence_refs'], 'WorkItem.evidence_refs')] if data.get('evidence_refs') is not None else None),
             external_refs=([WorkItemExternalRef.from_wire(_item) for _item in _expect_wire_list(data['external_refs'], 'WorkItem.external_refs')] if data.get('external_refs') is not None else None),
+            failed_child_join_policy=_expect_wire_enum(_require_wire_field(data, 'failed_child_join_policy', 'WorkItem'), ('require_success', 'propagate', 'accept',), 'WorkItem.failed_child_join_policy'),
             id=_expect_wire_str(_require_wire_field(data, 'id', 'WorkItem'), 'WorkItem.id'),
             labels=([_expect_wire_str(_item, 'WorkItem.labels[]') for _item in _expect_wire_list(data['labels'], 'WorkItem.labels')] if data.get('labels') is not None else None),
             machine_state=_expect_wire_object(_require_wire_field(data, 'machine_state', 'WorkItem'), 'WorkItem.machine_state'),
@@ -3202,6 +3236,7 @@ class WorkGraphEvent:
     kind: WorkGraphEventKind
     namespace: str
     realm_id: str
+    facts: Optional[list[Any]] = None
     item_id: Optional[str] = None
     payload: Optional[Any] = None
     seq: Optional[int] = None
@@ -3214,6 +3249,7 @@ class WorkGraphEvent:
         data = _expect_wire_object(value, 'WorkGraphEvent')
         return cls(
             at=_expect_wire_str(_require_wire_field(data, 'at', 'WorkGraphEvent'), 'WorkGraphEvent.at'),
+            facts=(list(_expect_wire_list(data['facts'], 'WorkGraphEvent.facts')) if data.get('facts') is not None else None),
             item_id=(_expect_wire_str(data['item_id'], 'WorkGraphEvent.item_id') if data.get('item_id') is not None else None),
             kind=parse_work_graph_event_kind(_require_wire_field(data, 'kind', 'WorkGraphEvent')),
             namespace=_expect_wire_str(_require_wire_field(data, 'namespace', 'WorkGraphEvent'), 'WorkGraphEvent.namespace'),
@@ -3246,6 +3282,7 @@ class WorkItemClaim:
     """Promoted inline object type WorkItemClaim."""
     claimed_at: str
     owner: WorkItemOwner
+    expiry_observed_at: Optional[str] = None
     lease_expires_at: Optional[str] = None
 
     @classmethod
@@ -3256,6 +3293,7 @@ class WorkItemClaim:
         data = _expect_wire_object(value, 'WorkItemClaim')
         return cls(
             claimed_at=_expect_wire_str(_require_wire_field(data, 'claimed_at', 'WorkItemClaim'), 'WorkItemClaim.claimed_at'),
+            expiry_observed_at=(_expect_wire_str(data['expiry_observed_at'], 'WorkItemClaim.expiry_observed_at') if data.get('expiry_observed_at') is not None else None),
             lease_expires_at=(_expect_wire_str(data['lease_expires_at'], 'WorkItemClaim.lease_expires_at') if data.get('lease_expires_at') is not None else None),
             owner=WorkItemOwner.from_wire(_require_wire_field(data, 'owner', 'WorkItemClaim')),
         )
@@ -5643,7 +5681,7 @@ WorkEdgeKind = Literal['blocks', 'parent', 'related', 'supersedes', 'derived_fro
 WorkEvidenceKind = Literal['host_confirmation', 'principal_confirmation', 'supervisor_confirmation', 'reviewer_confirmation'] | Literal['self_attest']
 
 # WorkGraph RPC helper wire type for WorkGraphEventKind.
-WorkGraphEventKind = Literal['created', 'updated', 'claimed', 'released', 'blocked', 'closed', 'linked', 'evidence_added', 'attention_created', 'attention_updated', 'execution_bound', 'execution_transitioned']
+WorkGraphEventKind = Literal['created', 'updated', 'readiness_observed', 'claimed', 'released', 'blocked', 'closed', 'linked', 'evidence_added', 'attention_created', 'attention_updated', 'execution_bound', 'execution_transitioned']
 
 # WorkGraph RPC helper wire type for WorkOwnerKind.
 WorkOwnerKind = Literal['principal', 'agent', 'session', 'mob', 'label']
@@ -6084,6 +6122,27 @@ SystemNoticeBlock = SystemNoticeBlockComms | SystemNoticeBlockExternalEvent | Sy
 # Typed system notice content carried in the transcript.
 SystemNoticeKind = Literal['generic', 'comms', 'external_event', 'mcp_pending', 'mcp', 'background_job', 'tool_scope', 'tool_scope_warning'] | Literal['auth_reauth_required']
 
+# Stable host-chosen identity for one replaceable system-prompt slot.
+#
+# The key is domain identity, not an idempotency token. Every explicit
+# update for the same key advances its [`SystemPromptVersion`], while
+# unrelated ordinary System messages remain unkeyed ordered transcript
+# events.
+SystemPromptKey = str
+
+# Monotonic version of one keyed system-prompt slot.
+#
+# Version zero is unrepresentable. A host's first explicit adoption or
+# replacement mints version one; later explicit updates increment it.
+SystemPromptVersion = int
+
+@dataclass
+class SystemPromptVersionIdentity:
+    """Typed identity carried by one durable versioned System row."""
+    key: SystemPromptKey
+    version: SystemPromptVersion
+
+
 # Typed transcript role for a user-channel message.
 #
 # This is the canonical replacement for `[Context compacted]` string-prefix
@@ -6195,6 +6254,7 @@ WireServerToolKind = WireServerToolKindWebSearch | WireServerToolKindGoogleSearc
 class TranscriptRewriteMessageSystem(TypedDict, total=False):
     content: Required[str]
     created_at: NotRequired[Optional[str]]
+    prompt_version: NotRequired[Optional[SystemPromptVersionIdentity]]
     role: Required[Literal['system']]
 
 class TranscriptRewriteMessageSystemNotice(TypedDict, total=False):
@@ -7030,15 +7090,17 @@ class CommsSendResultInputAccepted(TypedDict, total=False):
     stream_reserved: Required[bool]
 
 class CommsSendResultPeerMessageSent(TypedDict, total=False):
-    delivery: Required[Literal['acked', 'handed_off', 'queued']]
+    delivery: Required[dict[str, dict[str, Any]] | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']]
     envelope_id: Required[str]
     kind: Required[Literal['peer_message_sent']]
 
 class CommsSendResultPeerLifecycleSent(TypedDict, total=False):
+    delivery: Required[dict[str, dict[str, Any]] | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']]
     envelope_id: Required[str]
     kind: Required[Literal['peer_lifecycle_sent']]
 
 class CommsSendResultPeerRequestSent(TypedDict, total=False):
+    delivery: Required[dict[str, dict[str, Any]] | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']]
     envelope_id: Required[str]
     interaction_id: Required[str]
     kind: Required[Literal['peer_request_sent']]
@@ -7046,6 +7108,7 @@ class CommsSendResultPeerRequestSent(TypedDict, total=False):
     stream_reserved: Required[bool]
 
 class CommsSendResultPeerResponseSent(TypedDict, total=False):
+    delivery: Required[dict[str, dict[str, Any]] | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']]
     envelope_id: Required[str]
     in_reply_to: Required[str]
     kind: Required[Literal['peer_response_sent']]
@@ -7127,6 +7190,7 @@ class WireSessionMessageSystem(TypedDict, total=False):
     content: Required[str]
     created_at: Required[str]
     identity: NotRequired[Optional[dict[str, Any]]]
+    prompt_version: NotRequired[Optional[SystemPromptVersionIdentity]]
     role: Required[Literal['system']]
 
 class WireSessionMessageSystemNotice(TypedDict, total=False):
@@ -7201,7 +7265,7 @@ def parse_work_edge_kind(value: Any) -> "WorkEdgeKind":
 
 def parse_work_graph_event_kind(value: Any) -> "WorkGraphEventKind":
     """Fail-closed wire parser for WorkGraphEventKind (K21)."""
-    return _expect_wire_enum(value, ('created', 'updated', 'claimed', 'released', 'blocked', 'closed', 'linked', 'evidence_added', 'attention_created', 'attention_updated', 'execution_bound', 'execution_transitioned',), 'WorkGraphEventKind')
+    return _expect_wire_enum(value, ('created', 'updated', 'readiness_observed', 'claimed', 'released', 'blocked', 'closed', 'linked', 'evidence_added', 'attention_created', 'attention_updated', 'execution_bound', 'execution_transitioned',), 'WorkGraphEventKind')
 
 
 def parse_work_evidence_kind(value: Any) -> "WorkEvidenceKind":

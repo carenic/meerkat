@@ -1337,6 +1337,126 @@ fn authorize_seeded_member_peer_rebind(
     trusted_peer_descriptor_from_dsl_member_endpoint(&endpoint)
 }
 
+async fn adopt_resume_peer_only_direct_member(
+    roster: &mut Roster,
+    runtime_metadata: &Arc<dyn crate::store::MobRuntimeMetadataStore>,
+    provisioner: &dyn super::provisioner::MobProvisioner,
+    mob_id: &MobId,
+    entry: &RosterEntry,
+) -> Result<(), MobError> {
+    let MemberRef::BackendPeer {
+        peer_id,
+        address,
+        pubkey,
+        bootstrap_token,
+        session_id: None,
+        ..
+    } = &entry.member_ref
+    else {
+        return Ok(());
+    };
+    let authority = runtime_metadata
+        .load_supervisor_authority(mob_id)
+        .await?
+        .ok_or_else(|| MobError::ExternalMemberCleanupUncertain {
+            reason: format!(
+                "resume direct-member adoption for '{}' has no supervisor authority",
+                entry.agent_identity
+            ),
+        })?;
+    if authority.protocol_version < super::bridge_protocol::BridgeProtocolVersion::V5 {
+        // Explicit compatibility contract: boot never mints or silently
+        // rewrites supervisor authority. The mob resumes with legacy topology
+        // intact; rotate_supervisor is the generated durable V4->V5 crossing.
+        return Ok(());
+    }
+    let incarnation = super::bridge_protocol::BridgeDirectMemberIncarnation {
+        mob_id: mob_id.to_string(),
+        agent_identity: entry.agent_identity.to_string(),
+        generation: entry.generation.get(),
+        fence_token: entry.fence_token.get(),
+    };
+    let records = runtime_metadata
+        .list_external_binding_overlays(mob_id)
+        .await?;
+    let current = records.into_iter().find(|record| {
+        record.agent_identity == entry.agent_identity && record.generation == entry.generation
+    });
+    let member_fence = {
+        let pending = crate::store::ExternalBindingOverlayRecord {
+            agent_identity: entry.agent_identity.clone(),
+            generation: entry.generation,
+            fence_token: Some(entry.fence_token),
+            direct_member_incarnation: Some(incarnation.clone()),
+            direct_member_fence: None,
+            normalized_member_ref: Some(MemberRef::BackendPeer {
+                peer_id: peer_id.clone(),
+                address: super::bridge_protocol::canonicalize_bridge_address(address),
+                pubkey: *pubkey,
+                bootstrap_token: None,
+                session_id: None,
+            }),
+            bootstrap_token: bootstrap_token.clone(),
+            status: crate::store::ExternalBindingOverlayStatus::DirectBindPending,
+            updated_at: chrono::Utc::now(),
+        };
+        let reserved = match current.as_ref() {
+            Some(existing)
+                if existing.status
+                    == crate::store::ExternalBindingOverlayStatus::DirectBindPending
+                    && existing.direct_member_incarnation.as_ref() == Some(&incarnation) =>
+            {
+                true
+            }
+            Some(existing)
+                if existing.status
+                    == crate::store::ExternalBindingOverlayStatus::DirectBindBound
+                    && existing.direct_member_incarnation.as_ref() == Some(&incarnation) =>
+            {
+                true
+            }
+            Some(existing) => {
+                runtime_metadata
+                    .compare_and_set_external_direct_bind(mob_id, existing, &pending)
+                    .await?
+            }
+            None => {
+                runtime_metadata
+                    .put_external_binding_overlay_if_absent(mob_id, &pending)
+                    .await?
+            }
+        };
+        if !reserved {
+            return Err(MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "resume direct-member adoption for '{}' raced a durable successor",
+                    entry.agent_identity
+                ),
+            });
+        }
+        provisioner
+            .adopt_peer_only_direct_member(&entry.member_ref, incarnation)
+            .await?
+    };
+    let identities = std::collections::BTreeSet::from([entry.agent_identity.clone()]);
+    let updated = roster.replace_backend_peer_binding_for_identities(
+        &identities,
+        peer_id,
+        address,
+        bootstrap_token.clone(),
+        Some(member_fence),
+    );
+    if updated.len() != 1 {
+        return Err(MobError::ExternalMemberCleanupUncertain {
+            reason: format!(
+                "resume direct-member adoption for '{}' could not project the exact Bound fence",
+                entry.agent_identity
+            ),
+        });
+    }
+    Ok(())
+}
+
 async fn apply_resume_peer_only_rebind_authority(
     authority: &mut crate::machines::mob_machine::MobMachineAuthority,
     roster: &mut Roster,
@@ -1358,9 +1478,77 @@ async fn apply_resume_peer_only_rebind_authority(
             "resume peer-only rebind for '{agent_identity}' observed endpoint outside generated MobMachine authority"
         )));
     }
+    let legacy_entry = roster.get_by_identity(agent_identity).cloned().ok_or_else(|| {
+        MobError::WiringError(format!(
+            "resume peer-only rebind for '{agent_identity}' requires an exact replayed roster incarnation"
+        ))
+    })?;
+    let direct_member_incarnation = super::bridge_protocol::BridgeDirectMemberIncarnation {
+        mob_id: mob_id.to_string(),
+        agent_identity: agent_identity.to_string(),
+        generation: legacy_entry.generation.get(),
+        fence_token: legacy_entry.fence_token.get(),
+    };
+    let existing_overlays = runtime_metadata
+        .list_external_binding_overlays(mob_id)
+        .await?;
+    let existing_key = existing_overlays.iter().find(|record| {
+        record.agent_identity == *agent_identity && record.generation == legacy_entry.generation
+    });
+    let existing_direct = existing_key.filter(|record| {
+        matches!(
+            record.status,
+            crate::store::ExternalBindingOverlayStatus::DirectBindPending
+                | crate::store::ExternalBindingOverlayStatus::DirectBindBound
+        )
+    });
+    if let Some(existing) = existing_direct {
+        if existing.direct_member_incarnation.as_ref() != Some(&direct_member_incarnation) {
+            return Err(MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "resume peer-only rebind for '{agent_identity}' conflicts with existing direct-bind incarnation"
+                ),
+            });
+        }
+    } else {
+        let pending = crate::store::ExternalBindingOverlayRecord {
+            agent_identity: agent_identity.clone(),
+            generation: legacy_entry.generation,
+            fence_token: Some(legacy_entry.fence_token),
+            direct_member_incarnation: Some(direct_member_incarnation.clone()),
+            direct_member_fence: None,
+            normalized_member_ref: Some(MemberRef::BackendPeer {
+                peer_id: authorized_peer.peer_id.to_string(),
+                address: authorized_peer.address.to_string(),
+                pubkey: authorized_peer.pubkey,
+                bootstrap_token: None,
+                session_id: None,
+            }),
+            bootstrap_token: Some(rebind_observation.bootstrap_token.clone()),
+            status: crate::store::ExternalBindingOverlayStatus::DirectBindPending,
+            updated_at: chrono::Utc::now(),
+        };
+        let reserved = if let Some(existing) = existing_key {
+            runtime_metadata
+                .compare_and_set_external_direct_bind(mob_id, existing, &pending)
+                .await?
+        } else {
+            runtime_metadata
+                .put_external_binding_overlay_if_absent(mob_id, &pending)
+                .await?
+        };
+        if !reserved {
+            return Err(MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "resume peer-only rebind for '{agent_identity}' raced a durable direct-bind reservation"
+                ),
+            });
+        }
+    }
     let rebind_authority = super::provisioner::PeerOnlyRebindAuthority {
         peer: authorized_peer.clone(),
         bootstrap_token: rebind_observation.bootstrap_token.clone(),
+        direct_member_incarnation,
     };
     let identities = std::collections::BTreeSet::from([agent_identity.clone()]);
     let peer_id = authorized_peer.peer_id.to_string();
@@ -1370,33 +1558,16 @@ async fn apply_resume_peer_only_rebind_authority(
         &peer_id,
         &address,
         Some(rebind_observation.bootstrap_token.clone()),
+        None,
     );
     if updated_entries.is_empty() {
         return Err(MobError::WiringError(format!(
             "resume rebound peer binding for '{agent_identity}' requires roster projection for MobMachine member peer authority"
         )));
     }
-    for (identity, generation, pubkey) in updated_entries {
-        runtime_metadata
-            .upsert_external_binding_overlay(
-                mob_id,
-                &crate::store::ExternalBindingOverlayRecord {
-                    agent_identity: identity,
-                    generation,
-                    normalized_member_ref: Some(MemberRef::BackendPeer {
-                        peer_id: peer_id.clone(),
-                        address: address.clone(),
-                        pubkey,
-                        bootstrap_token: None,
-                        session_id: None,
-                    }),
-                    bootstrap_token: Some(rebind_observation.bootstrap_token.clone()),
-                    status: crate::store::ExternalBindingOverlayStatus::Normalized,
-                    updated_at: chrono::Utc::now(),
-                },
-            )
-            .await?;
-    }
+    // The V5 DirectBindPending/Bound row was reserved before this endpoint
+    // projection. It is the sole external-effect retry authority and must not
+    // be demoted to a legacy Normalized overlay here.
 
     // Row #314: record the machine-owned external-member rebind capability for
     // the peer-only resume rebind. A non-empty rebind token means the member is
@@ -2146,6 +2317,39 @@ pub(super) async fn reconcile_resume_topology(
         ) {
             continue;
         }
+        let authority = runtime_metadata
+            .load_supervisor_authority(&definition.id)
+            .await?
+            .ok_or_else(|| {
+                MobError::Internal(
+                    "resume peer-only member has no durable supervisor authority".to_string(),
+                )
+            })?;
+        if authority.protocol_version < super::bridge_protocol::BridgeProtocolVersion::V5 {
+            // V4 is durable legacy authority, not permission to synthesize a
+            // V5 effect during materialization. In particular, do not install
+            // recipient trust, send AuthorizeSupervisor, reserve DirectBind,
+            // or rewrite the roster endpoint here. The explicit generated
+            // rotate_supervisor ceremony is the only V4 -> V5 crossing.
+            tracing::warn!(
+                mob_id = %definition.id,
+                member = %entry.agent_identity,
+                current_protocol = ?authority.protocol_version,
+                "legacy peer-only member requires explicit rotate_supervisor before V5 direct-member reconciliation"
+            );
+            continue;
+        }
+        // V5 direct-member adoption is independent of supervisor rebind.
+        // A v0.8.21 member may still have a valid supervisor Ack while lacking
+        // the semantic/bearer fence required for exact retirement.
+        adopt_resume_peer_only_direct_member(
+            roster,
+            runtime_metadata,
+            provisioner,
+            &definition.id,
+            entry,
+        )
+        .await?;
         let report = provisioner
             .reconcile_peer_only_trust(&entry.member_ref, None, None)
             .await?;
@@ -2185,6 +2389,30 @@ pub(super) async fn reconcile_resume_topology(
                     "resume peer-only rebind for '{}' was rejected after MobMachine authority",
                     entry.agent_identity
                 )));
+            }
+            if let Some(member_fence) = second_report.direct_member_fence {
+                let identities = std::collections::BTreeSet::from([entry.agent_identity.clone()]);
+                let MemberRef::BackendPeer {
+                    peer_id,
+                    address,
+                    bootstrap_token,
+                    ..
+                } = &updated_member_ref
+                else {
+                    return Err(MobError::ExternalMemberCleanupUncertain {
+                        reason: format!(
+                            "resume peer-only rebind for '{}' lost its peer-only projection",
+                            entry.agent_identity
+                        ),
+                    });
+                };
+                roster.replace_backend_peer_binding_for_identities(
+                    &identities,
+                    peer_id,
+                    address,
+                    bootstrap_token.clone(),
+                    Some(member_fence),
+                );
             }
         }
     }
@@ -7835,11 +8063,12 @@ impl MobBuilder {
             ));
 
             let mut per_spawn_external_tools_seed = BTreeMap::new();
+            let mut recovered_direct_member_adoption_pending = false;
             if resumed_state == MobState::Running
                 && recovered_completion_lifecycle_intent.is_none()
                 && !super::actor::lifecycle_origin_fenced(wiring.dsl_authority.state())
             {
-                Self::reconcile_resume(
+                recovered_direct_member_adoption_pending = Self::reconcile_resume(
                     &definition,
                     repaired_epoch_events,
                     &mut roster,
@@ -8016,6 +8245,7 @@ impl MobBuilder {
                 spawn_member_customizer,
                 storage.realm_profiles.clone(),
                 notify_orchestrator_on_resume,
+                recovered_direct_member_adoption_pending,
                 per_spawn_external_tools_seed,
                 retired_event_index,
                 retirement_started_event_index,
@@ -8549,7 +8779,14 @@ impl MobBuilder {
         realm_profile_store: Option<Arc<dyn crate::store::RealmProfileStore>>,
         runtime_metadata: Arc<dyn crate::store::MobRuntimeMetadataStore>,
         per_spawn_external_tools_seed: &mut BTreeMap<AgentIdentity, Arc<dyn AgentToolDispatcher>>,
-    ) -> Result<(), MobError> {
+    ) -> Result<bool, MobError> {
+        let recovered_direct_member_adoption_pending = runtime_metadata
+            .list_external_binding_overlays(&definition.id)
+            .await?
+            .iter()
+            .any(|record| {
+                record.status == crate::store::ExternalBindingOverlayStatus::DirectBindPending
+            });
         let legacy_recovered_session_bindings =
             recovered_session_bindings_without_endpoint(epoch_events);
         let mut new_recovered_session_bindings_without_endpoint = HashSet::new();
@@ -8965,6 +9202,7 @@ impl MobBuilder {
                         binding: crate::RuntimeBinding::Session,
                         peer_name,
                         owner_bridge_session_id: None,
+                        direct_member_incarnation: None,
                         ops_registry: None,
                         generated_self_owned_operation_owner: Some(
                             generated_self_owned_operation_owner,
@@ -9112,6 +9350,7 @@ impl MobBuilder {
                 binding: crate::RuntimeBinding::Session,
                 peer_name,
                 owner_bridge_session_id: None,
+                direct_member_incarnation: None,
                 ops_registry: None,
                 generated_self_owned_operation_owner: None,
                 runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
@@ -9381,7 +9620,7 @@ impl MobBuilder {
                 .await?;
             }
         }
-        Ok(())
+        Ok(recovered_direct_member_adoption_pending)
     }
 
     #[cfg(feature = "runtime-adapter")]
@@ -9480,6 +9719,7 @@ impl MobBuilder {
                 spawn_member_customizer,
                 realm_profile_store,
                 notify_orchestrator_on_resume,
+                false,
                 BTreeMap::new(),
                 HashSet::new(),
                 HashSet::new(),
@@ -9519,6 +9759,7 @@ impl MobBuilder {
         spawn_member_customizer: Option<Arc<dyn super::SpawnMemberCustomizer>>,
         realm_profile_store: Option<Arc<dyn crate::store::RealmProfileStore>>,
         notify_orchestrator_on_resume: bool,
+        recovered_direct_member_adoption_pending: bool,
         per_spawn_external_tools: BTreeMap<AgentIdentity, Arc<dyn AgentToolDispatcher>>,
         retired_event_index: HashSet<String>,
         retirement_started_event_index: HashSet<String>,
@@ -9825,6 +10066,7 @@ impl MobBuilder {
                 pending_routed_effects: Vec::new(),
                 destroy_cleanup_active: false,
                 durable_uncertainty_fail_stop: false,
+                direct_member_adoption_pending: recovered_direct_member_adoption_pending,
                 respawn_topology_reply_withheld: false,
                 #[cfg(not(target_arch = "wasm32"))]
                 controlling_acceptor: controlling_acceptor
@@ -10122,7 +10364,7 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn acceptor_registration(keypair: Arc<meerkat_comms::Keypair>) -> MemberAcceptorRegistration {
-        let (_inbox, inbox_sender) = meerkat_comms::Inbox::new();
+        let (_inbox, inbox_sender) = meerkat_comms::Inbox::new_transport_only();
         MemberAcceptorRegistration {
             pubkey: keypair.public_key(),
             keypair,

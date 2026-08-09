@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use meerkat_jobs::{
-    AttemptWriteAuthority, DetachedJobService, JobId, JobPhase, PredicateObservation,
-    PredicateWatch, RunnerHandleRef,
+    AttemptWriteAuthority, DetachedJobService, JobId, JobPhase, PredicateDeliveryIdempotencyKey,
+    PredicateDeliveryIdentity, PredicateObservation, PredicateWatch, RunnerHandleRef,
 };
 use meerkat_schedule::{
     HostRunnable, HostRunnableError, HostRunnableInvocation, HostRunnableName, HostRunnableOutcome,
@@ -70,7 +70,13 @@ impl PredicateSourceObservationError {
 
 #[async_trait::async_trait]
 pub trait PredicateObservationProvider: Send + Sync {
-    /// Observe the source once.
+    /// Observe the source once without mutating it.
+    ///
+    /// Schedule crash recovery may repeat this read before the detached-job
+    /// CAS proves whether the corresponding durable evaluation committed.
+    /// Implementations that need a mutating observation protocol must own a
+    /// separate durable intent/result seam rather than hiding that effect in
+    /// this read-only callback.
     ///
     /// Source unavailability that should preserve the watch and follow its
     /// retry policy is returned as `PredicateObservation::Unavailable`.
@@ -128,6 +134,22 @@ impl HostRunnable for ScheduledPredicateRunnable {
             )));
         }
 
+        let delivery_identity = PredicateDeliveryIdentity::new(
+            PredicateDeliveryIdempotencyKey::new(invocation.delivery_idempotency_key.clone())
+                .map_err(|error| failed(error.to_string()))?,
+            invocation.occurrence_id.to_string(),
+            invocation.runnable.as_str(),
+        )
+        .map_err(|error| failed(error.to_string()))?;
+        if self
+            .jobs
+            .predicate_delivery_applied(&params.job_id, &delivery_identity)
+            .await
+            .map_err(|error| failed(error.to_string()))?
+        {
+            return Ok(HostRunnableOutcome::completed());
+        }
+
         let snapshot = self
             .jobs
             .get(&params.job_id)
@@ -176,9 +198,10 @@ impl HostRunnable for ScheduledPredicateRunnable {
             .try_into()
             .map_err(|_| failed("current time cannot be represented as milliseconds"))?;
         self.jobs
-            .evaluate_predicate(
+            .evaluate_predicate_idempotent(
                 &params.job_id,
                 write,
+                delivery_identity,
                 &params.watch,
                 observation,
                 observed_at_ms,

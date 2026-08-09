@@ -83,15 +83,19 @@ impl BridgeProtocolVersion {
     /// `outcome_tracking` / `transcript_interaction_id` / `system_prompt`
     /// extensions.
     pub const V4: Self = Self(4);
+    /// Peer-only controller-member incarnation fencing. `BindMember` carries
+    /// the Mob-owned semantic incarnation and returns the receiving runtime's
+    /// exact runtime/session fence; `RetireMember` must present that fence.
+    pub const V5: Self = Self(5);
     /// Current protocol version implemented by this bridge contract.
-    pub const CURRENT: Self = Self::V4;
+    pub const CURRENT: Self = Self::V5;
     /// Default protocol version for newly minted supervisor authority.
     ///
-    /// V4 is a semantic fold: it carries both the multi-host families and the
-    /// durable supervisor-rotation protocol. V2/V3 remain decodable for
-    /// persisted or negotiated legacy peers, but new authorities must not
-    /// silently omit V4 rotation semantics.
-    pub const DEFAULT: Self = Self::V4;
+    /// V5 adds exact peer-only bind/retire incarnation fencing on top of V4's
+    /// multi-host and durable supervisor-rotation protocol. V2-V4 remain
+    /// decodable for persisted or negotiated legacy command families, but new
+    /// authorities must not omit V5 retirement fencing.
+    pub const DEFAULT: Self = Self::V5;
     /// Protocol versions accepted by this bridge contract.
     ///
     /// V2 is retained so persisted supervisor-authority records and V2 peers
@@ -101,10 +105,10 @@ impl BridgeProtocolVersion {
     /// under-versioned command is rejected with a typed
     /// `UnsupportedProtocolVersion` cause rather than a raw
     /// deserialization error.
-    pub const SUPPORTED: &'static [Self] = &[Self::V2, Self::V3, Self::V4];
+    pub const SUPPORTED: &'static [Self] = &[Self::V2, Self::V3, Self::V4, Self::V5];
 
     pub const fn is_supported(self) -> bool {
-        matches!(self.0, 2..=4)
+        matches!(self.0, 2..=5)
     }
 
     pub const fn same_protocol_as(self, other: Self) -> bool {
@@ -134,6 +138,7 @@ impl BridgeProtocolVersion {
             2 => Ok(Self::V2),
             3 => Ok(Self::V3),
             4 => Ok(Self::V4),
+            5 => Ok(Self::V5),
             _ => Err(UnsupportedBridgeProtocolVersion {
                 raw,
                 command: None,
@@ -274,6 +279,13 @@ impl<'de> Deserialize<'de> for BridgeProtocolVersion {
 ///   either side fail closed in both directions: a new receiver rejects the
 ///   missing required field, and the former strict receiver rejects the new
 ///   field through `deny_unknown_fields`.
+/// - `5`: peer-only member lifecycle commands carry explicit controller-member
+///   incarnation authority. `BindMember` accepts the Mob-owned semantic
+///   incarnation and returns an exact runtime/session fence minted by the
+///   receiving runtime. `RetireMember` must present that complete fence, and
+///   stale retirement returns typed presented/current evidence without
+///   touching a successor runtime. V4 peers cannot safely infer this authority
+///   from a session id, so both command shapes require V5.
 pub const SUPERVISOR_BRIDGE_PROTOCOL_VERSION: BridgeProtocolVersion =
     BridgeProtocolVersion::CURRENT;
 /// Canonical current supervisor bridge protocol version.
@@ -390,7 +402,7 @@ pub enum BridgeCommand {
     /// idempotency key rather than a transient run id, so it can close the
     /// stop-before-first-send window and survive host restart.
     CancelTrackedMemberInput(BridgeTrackedInputCancelPayload),
-    RetireMember(BridgeSupervisorPayload),
+    RetireMember(BridgeRetirePayload),
     DestroyMember(BridgeSupervisorPayload),
     WireMember(BridgePeerWiringPayload),
     UnwireMember(BridgePeerWiringPayload),
@@ -427,8 +439,8 @@ impl BridgeCommand {
             Self::AuthorizeSupervisor(payload)
             | Self::RevokeSupervisor(payload)
             | Self::ObserveMember(payload)
-            | Self::RetireMember(payload)
             | Self::DestroyMember(payload) => payload.protocol_version,
+            Self::RetireMember(payload) => payload.protocol_version,
             Self::InterruptMember(payload) => payload.protocol_version,
             Self::HardCancelMember(payload) => payload.protocol_version,
             Self::CancelTrackedMemberInput(payload) => payload.protocol_version,
@@ -550,6 +562,7 @@ fn bridge_command_minimum_protocol(
 ) -> Option<(&'static str, BridgeProtocolVersion)> {
     let command = value.get("command")?.as_str()?;
     let minimum = match command {
+        "bind_member" | "retire_member" => BridgeProtocolVersion::V5,
         "hard_cancel_member"
         | "cancel_tracked_member_input"
         | "read_member_history"
@@ -602,6 +615,8 @@ fn bridge_command_minimum_protocol(
         _ => return None,
     };
     let command = match command {
+        "bind_member" => "BindMember",
+        "retire_member" => "RetireMember",
         "hard_cancel_member" => "HardCancelMember",
         "cancel_tracked_member_input" => "CancelTrackedMemberInput",
         "read_member_history" => "ReadMemberHistory",
@@ -1242,6 +1257,122 @@ pub struct BridgeMemberIncarnation {
     pub fence_token: u64,
 }
 
+/// Mob-owned semantic incarnation presented when a controller binds one
+/// directly addressed peer-only member runtime.
+///
+/// This is identity and topology evidence, not mechanical runtime authority.
+/// The receiving runtime combines it with its own exact runtime/session token
+/// and returns a [`BridgeDirectMemberFence`].
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeDirectMemberIncarnation {
+    pub mob_id: String,
+    pub agent_identity: String,
+    pub generation: u64,
+    pub fence_token: u64,
+}
+
+/// Host-minted opaque identity for one exact peer-only runtime/session epoch.
+///
+/// The UUID-shaped wire value is validated by serde. The private field blocks
+/// unchecked string construction, and Debug remains redacted because this
+/// value participates in effect authorization.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(transparent)]
+pub struct BridgeDirectRuntimeSessionToken(
+    #[cfg_attr(feature = "schema", schemars(with = "String"))] uuid::Uuid,
+);
+
+impl BridgeDirectRuntimeSessionToken {
+    /// Mint a fresh runtime-owned token.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    /// Return the validated UUID identity without granting stringly
+    /// reconstruction authority.
+    #[must_use]
+    pub const fn as_uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+}
+
+impl Default for BridgeDirectRuntimeSessionToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for BridgeDirectRuntimeSessionToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BridgeDirectRuntimeSessionToken(<redacted>)")
+    }
+}
+
+/// Exact controller-member authority minted and stored by the receiving
+/// peer-only runtime during `BindMember`.
+///
+/// `runtime_session_token` is opaque to the controller. It identifies the
+/// exact runtime epoch serving `member_session_id`; callers cannot reconstruct
+/// it from the session id or the Mob semantic incarnation. Retirement must
+/// present this complete value byte-for-byte.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeDirectMemberFence {
+    pub mob_id: String,
+    pub agent_identity: String,
+    pub generation: u64,
+    pub fence_token: u64,
+    pub member_session_id: String,
+    pub runtime_session_token: BridgeDirectRuntimeSessionToken,
+}
+
+/// Non-authorizing observation of one direct member fence.
+///
+/// This deliberately omits [`BridgeDirectRuntimeSessionToken`]. A stale
+/// predecessor may learn which semantic incarnation is current for
+/// convergence, but must never receive the successor's bearer authority.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeDirectMemberFenceEvidence {
+    pub mob_id: String,
+    pub agent_identity: String,
+    pub generation: u64,
+    pub fence_token: u64,
+    pub member_session_id: String,
+}
+
+impl BridgeDirectMemberFence {
+    /// Return the Mob-owned semantic portion of this exact runtime fence.
+    #[must_use]
+    pub fn incarnation(&self) -> BridgeDirectMemberIncarnation {
+        BridgeDirectMemberIncarnation {
+            mob_id: self.mob_id.clone(),
+            agent_identity: self.agent_identity.clone(),
+            generation: self.generation,
+            fence_token: self.fence_token,
+        }
+    }
+
+    /// Project non-authorizing stale/current evidence. The runtime/session
+    /// bearer token is intentionally not observable through this carrier.
+    #[must_use]
+    pub fn evidence(&self) -> BridgeDirectMemberFenceEvidence {
+        BridgeDirectMemberFenceEvidence {
+            mob_id: self.mob_id.clone(),
+            agent_identity: self.agent_identity.clone(),
+            generation: self.generation,
+            fence_token: self.fence_token,
+            member_session_id: self.member_session_id.clone(),
+        }
+    }
+}
+
 /// Flow-step correlation for a directed turn.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1857,6 +1988,10 @@ pub enum BridgeRejectionCause {
     Unsupported,
     /// An unexpected invariant was violated while handling the command.
     Internal,
+    /// V5 direct-member semantic admission is process-owned and may already
+    /// have committed. The controller must retain pending bind authority and
+    /// retry the exact request; this response does not certify no mutation.
+    BindAdmissionOutcomeUnknown,
     // --- V4 multi-host causes (§7) ---
     /// The command carried a superseded `(generation, fence_token)` tuple.
     StaleFence,
@@ -2241,6 +2376,22 @@ pub struct BridgeSupervisorPayload {
     pub protocol_version: BridgeProtocolVersion,
 }
 
+/// Retire one exact peer-only controller-member runtime incarnation (V5).
+///
+/// Supervisor authentication proves who issued the command. `member_fence`
+/// separately proves which exact Mob incarnation and runtime/session epoch the
+/// controller is authorized to retire. Neither authority may be inferred from
+/// the other or from the addressed session id.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeRetirePayload {
+    pub supervisor: BridgePeerSpec,
+    pub epoch: u64,
+    pub protocol_version: BridgeProtocolVersion,
+    pub member_fence: BridgeDirectMemberFence,
+}
+
 /// Stable identifier for one supervisor-rotation operation.
 ///
 /// The UUID is validated at every string/serde ingress boundary. Keeping the
@@ -2589,6 +2740,10 @@ pub struct BridgeBindPayload {
     pub expected_peer_id: String,
     pub expected_address: String,
     pub bootstrap_token: BridgeBootstrapToken,
+    /// Mob-owned semantic identity for the controller-member incarnation being
+    /// installed. The receiving runtime returns the corresponding exact
+    /// runtime/session fence in [`BridgeBindResponse::member_fence`].
+    pub member: BridgeDirectMemberIncarnation,
 }
 
 /// Capabilities advertised by a member runtime on bind.
@@ -2693,6 +2848,7 @@ pub struct BridgeBindResponse {
     pub peer_id: String,
     pub address: String,
     pub capabilities: BridgeCapabilities,
+    pub member_fence: BridgeDirectMemberFence,
 }
 
 /// Simple acknowledgment.
@@ -2932,13 +3088,31 @@ pub struct BridgePeerWiringPayload {
     pub mob_peer_overlay: Option<BridgeMobPeerOverlayHandoff>,
 }
 
+/// Typed outcome of one exact-fence peer-only retirement.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BridgeRetireOutcome {
+    Retired {
+        inputs_abandoned: usize,
+        inputs_pending_drain: usize,
+    },
+    /// The presented fence no longer names the runtime's current direct
+    /// member incarnation. `current: None` means no currently valid direct
+    /// member fence is installed for this runtime/session epoch.
+    Stale {
+        presented: BridgeDirectMemberFenceEvidence,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current: Option<BridgeDirectMemberFenceEvidence>,
+    },
+}
+
 /// Response to a retire command.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeRetireResponse {
-    pub inputs_abandoned: usize,
-    pub inputs_pending_drain: usize,
+    pub outcome: BridgeRetireOutcome,
 }
 
 /// Response to a destroy command.
@@ -3046,6 +3220,27 @@ mod tests {
             member_session_id: "session-1".to_string(),
             generation: 1,
             fence_token: 3,
+        }
+    }
+
+    fn sample_direct_member_incarnation() -> BridgeDirectMemberIncarnation {
+        BridgeDirectMemberIncarnation {
+            mob_id: "mob-1".to_string(),
+            agent_identity: "worker-1".to_string(),
+            generation: 1,
+            fence_token: 3,
+        }
+    }
+
+    fn sample_direct_member_fence() -> BridgeDirectMemberFence {
+        let incarnation = sample_direct_member_incarnation();
+        BridgeDirectMemberFence {
+            mob_id: incarnation.mob_id,
+            agent_identity: incarnation.agent_identity,
+            generation: incarnation.generation,
+            fence_token: incarnation.fence_token,
+            member_session_id: "session-1".to_string(),
+            runtime_session_token: BridgeDirectRuntimeSessionToken(uuid::Uuid::from_u128(0xD1CE)),
         }
     }
 
@@ -3416,12 +3611,13 @@ mod tests {
 
     #[test]
     fn wire_member_v3_payload_round_trips_with_overlay() {
-        let value = serde_json::to_value(BridgeCommand::WireMember(sample_wiring_payload()))
-            .expect("serialize");
+        let mut payload = sample_wiring_payload();
+        payload.protocol_version = BridgeProtocolVersion::V3;
+        let value = serde_json::to_value(BridgeCommand::WireMember(payload)).expect("serialize");
         assert_eq!(
             value["protocol_version"],
-            json!(4),
-            "the sample stamps CURRENT (V4); wiring itself only demands V3"
+            json!(3),
+            "the compatibility fixture explicitly exercises the minimum overlay protocol"
         );
         assert!(
             !value["mob_peer_overlay"].is_null(),
@@ -3492,8 +3688,52 @@ mod tests {
             expected_peer_id: "peer-expected".to_string(),
             expected_address: "tcp://127.0.0.1:9000".to_string(),
             bootstrap_token: "bootstrap-secret".into(),
+            member: sample_direct_member_incarnation(),
         });
         assert_command_round_trip(&cmd);
+    }
+
+    #[test]
+    fn direct_runtime_session_token_rejects_unvalidated_string_and_redacts_debug() {
+        let err = serde_json::from_value::<BridgeDirectRuntimeSessionToken>(json!("not-a-uuid"))
+            .expect_err("runtime/session authority must reject arbitrary strings");
+        assert!(err.to_string().contains("UUID") || err.to_string().contains("uuid"));
+
+        let token = BridgeDirectRuntimeSessionToken(uuid::Uuid::from_u128(0xD1CE));
+        let debug = format!("{token:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("d1ce"));
+    }
+
+    #[test]
+    fn v4_bind_and_retire_fail_as_typed_protocol_mismatches() {
+        let mut bind = serde_json::to_value(BridgeCommand::BindMember(BridgeBindPayload {
+            supervisor: sample_peer_spec(),
+            epoch: 1,
+            protocol_version: BridgeProtocolVersion::V5,
+            expected_peer_id: "peer-expected".to_string(),
+            expected_address: "tcp://127.0.0.1:9000".to_string(),
+            bootstrap_token: "bootstrap-secret".into(),
+            member: sample_direct_member_incarnation(),
+        }))
+        .expect("serialize V5 bind");
+        bind["protocol_version"] = json!(4);
+
+        let mut retire = serde_json::to_value(BridgeCommand::RetireMember(BridgeRetirePayload {
+            supervisor: sample_peer_spec(),
+            epoch: 1,
+            protocol_version: BridgeProtocolVersion::V5,
+            member_fence: sample_direct_member_fence(),
+        }))
+        .expect("serialize V5 retire");
+        retire["protocol_version"] = json!(4);
+
+        for value in [bind, retire] {
+            assert!(matches!(
+                decode_bridge_command(value),
+                Err(BridgeCommandDecodeError::UnsupportedProtocolVersion(_))
+            ));
+        }
     }
 
     #[test]
@@ -3916,7 +4156,13 @@ mod tests {
 
     #[test]
     fn bridge_command_retire_member_round_trip() {
-        let cmd = BridgeCommand::RetireMember(sample_supervisor_payload());
+        let supervisor = sample_supervisor_payload();
+        let cmd = BridgeCommand::RetireMember(BridgeRetirePayload {
+            supervisor: supervisor.supervisor,
+            epoch: supervisor.epoch,
+            protocol_version: BridgeProtocolVersion::V5,
+            member_fence: sample_direct_member_fence(),
+        });
         assert_command_round_trip(&cmd);
     }
 
@@ -4040,19 +4286,20 @@ mod tests {
             &[
                 BridgeProtocolVersion::V2,
                 BridgeProtocolVersion::V3,
-                BridgeProtocolVersion::V4
+                BridgeProtocolVersion::V4,
+                BridgeProtocolVersion::V5,
             ]
         );
-        // V4 is both current and the default for newly minted authorities: it
-        // implements the multi-host families and durable supervisor rotation.
-        // V2/V3 remain explicitly decodable for negotiated legacy peers.
+        // V5 is current/default because peer-only bind and retire now require
+        // exact controller-member incarnation fencing. V2-V4 remain explicitly
+        // decodable for their negotiated legacy command families.
         assert_eq!(
             supervisor_bridge_current_protocol_version(),
-            BridgeProtocolVersion::V4
+            BridgeProtocolVersion::V5
         );
         assert_eq!(
             supervisor_bridge_default_protocol_version(),
-            BridgeProtocolVersion::V4
+            BridgeProtocolVersion::V5
         );
         assert!(supervisor_bridge_protocol_version_supported(
             BridgeProtocolVersion::V2
@@ -4064,9 +4311,13 @@ mod tests {
             SUPERVISOR_BRIDGE_PROTOCOL_VERSION
         ));
         assert!(BridgeProtocolVersion::V4.supports_multi_host());
+        assert!(BridgeProtocolVersion::V5.supports_multi_host());
         assert!(!BridgeProtocolVersion::V3.supports_multi_host());
         assert!(BridgeProtocolVersion::from_supported_u32(1).is_err());
-        assert!(BridgeProtocolVersion::from_supported_u32(5).is_err());
+        assert_eq!(
+            BridgeProtocolVersion::from_supported_u32(5).expect("V5 supported"),
+            BridgeProtocolVersion::V5
+        );
         assert!(BridgeProtocolVersion::from_supported_u32(999).is_err());
     }
 
@@ -4086,7 +4337,8 @@ mod tests {
             vec![
                 BridgeProtocolVersion::V2,
                 BridgeProtocolVersion::V3,
-                BridgeProtocolVersion::V4
+                BridgeProtocolVersion::V4,
+                BridgeProtocolVersion::V5,
             ]
         );
         // V4 host-capability facts default to the incapable/unreported
@@ -4126,7 +4378,8 @@ mod tests {
             vec![
                 BridgeProtocolVersion::V2,
                 BridgeProtocolVersion::V3,
-                BridgeProtocolVersion::V4
+                BridgeProtocolVersion::V4,
+                BridgeProtocolVersion::V5,
             ]
         );
         assert!(capabilities.deliver_member_input);
@@ -4340,6 +4593,10 @@ mod tests {
             (BridgeRejectionCause::AddressMismatch, "address_mismatch"),
             (BridgeRejectionCause::Unsupported, "unsupported"),
             (BridgeRejectionCause::Internal, "internal"),
+            (
+                BridgeRejectionCause::BindAdmissionOutcomeUnknown,
+                "bind_admission_outcome_unknown",
+            ),
             // V4 unit causes.
             (BridgeRejectionCause::StaleFence, "stale_fence"),
             (BridgeRejectionCause::Unavailable, "unavailable"),
@@ -4670,6 +4927,7 @@ mod tests {
                 peer_id: "peer-x".to_string(),
                 address: "inproc://peer-x".to_string(),
                 capabilities: BridgeCapabilities::default(),
+                member_fence: sample_direct_member_fence(),
             }),
             json!({
                 "result": "bind_member",
@@ -4682,6 +4940,7 @@ mod tests {
                         BridgeProtocolVersion::V2,
                         BridgeProtocolVersion::V3,
                         BridgeProtocolVersion::V4,
+                        BridgeProtocolVersion::V5,
                     ],
                     "deliver_member_input": false,
                     "observe_member": false,
@@ -4692,6 +4951,14 @@ mod tests {
                     "wire_member": false,
                     "unwire_member": false,
                 },
+                "member_fence": {
+                    "mob_id": "mob-1",
+                    "agent_identity": "worker-1",
+                    "generation": 1,
+                    "fence_token": 3,
+                    "member_session_id": "session-1",
+                    "runtime_session_token": "00000000-0000-0000-0000-00000000d1ce"
+                }
             }),
         );
     }
@@ -4824,14 +5091,56 @@ mod tests {
     fn bridge_reply_retire_round_trip() {
         assert_reply_round_trip(
             BridgeReply::Retire(BridgeRetireResponse {
-                inputs_abandoned: 2,
-                inputs_pending_drain: 0,
+                outcome: BridgeRetireOutcome::Retired {
+                    inputs_abandoned: 2,
+                    inputs_pending_drain: 0,
+                },
             }),
             json!({
                 "result": "retire",
-                "inputs_abandoned": 2,
-                "inputs_pending_drain": 0,
+                "outcome": {
+                    "status": "retired",
+                    "inputs_abandoned": 2,
+                    "inputs_pending_drain": 0
+                }
             }),
+        );
+    }
+
+    #[test]
+    fn bridge_reply_retire_stale_preserves_presented_and_current_evidence() {
+        let presented = sample_direct_member_fence();
+        let mut current = presented.clone();
+        current.generation = 2;
+        current.fence_token = 4;
+        current.runtime_session_token =
+            BridgeDirectRuntimeSessionToken(uuid::Uuid::from_u128(0xBEEF));
+        assert_reply_round_trip(
+            BridgeReply::Retire(BridgeRetireResponse {
+                outcome: BridgeRetireOutcome::Stale {
+                    presented: presented.evidence(),
+                    current: Some(current.evidence()),
+                },
+            }),
+            json!({
+                "result": "retire",
+                "outcome": {
+                    "status": "stale",
+                    "presented": presented.evidence(),
+                    "current": current.evidence()
+                }
+            }),
+        );
+        let encoded = serde_json::to_value(BridgeRetireOutcome::Stale {
+            presented: presented.evidence(),
+            current: Some(current.evidence()),
+        })
+        .expect("encode stale evidence");
+        assert!(
+            !encoded
+                .to_string()
+                .contains("00000000-0000-0000-0000-00000000beef"),
+            "stale evidence must not disclose successor retirement authority"
         );
     }
 
@@ -4900,15 +5209,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 12. Wire compat on M1: pre-newtype raw JSON must deserialize into the
-    //     newtype BridgeBindPayload and serialize back byte-for-byte.
+    // 12. V5 Bind keeps the bootstrap-token field's transparent string shape
+    //     while requiring the new semantic member incarnation.
     // -----------------------------------------------------------------------
     //
-    // Pins that introducing BridgeBootstrapToken did NOT break wire compat
-    // with supervisors/members that emit a plain string bootstrap_token.
+    // V4 Bind is intentionally rejected by the version gate above; this pins
+    // the unchanged field representation within the new V5 payload.
 
     #[test]
-    fn bridge_bind_payload_wire_compat_with_plain_string_bootstrap_token() {
+    fn bridge_bind_payload_v5_keeps_plain_string_bootstrap_token() {
         let raw = json!({
             "supervisor": {
                 "name": "mob/__mob_supervisor__",
@@ -4920,6 +5229,12 @@ mod tests {
             "expected_peer_id": "00000000-0000-0000-0000-00000000aaaa",
             "expected_address": "inproc://member",
             "bootstrap_token": "tok-raw-string",
+            "member": {
+                "mob_id": "mob-1",
+                "agent_identity": "worker-1",
+                "generation": 1,
+                "fence_token": 3
+            }
         });
         let payload: BridgeBindPayload =
             serde_json::from_value(raw.clone()).expect("decode pre-newtype payload");
@@ -4960,8 +5275,10 @@ mod tests {
     }
 
     fn all_v4_commands() -> Vec<BridgeCommand> {
+        let mut hard_cancel = sample_hard_cancel_payload();
+        hard_cancel.protocol_version = BridgeProtocolVersion::V4;
         vec![
-            BridgeCommand::HardCancelMember(sample_hard_cancel_payload()),
+            BridgeCommand::HardCancelMember(hard_cancel),
             BridgeCommand::CancelTrackedMemberInput(sample_tracked_input_cancel_payload()),
             BridgeCommand::ReadMemberHistory(BridgeReadHistoryPayload {
                 supervisor: sample_peer_spec(),
@@ -5137,7 +5454,7 @@ mod tests {
             value
                 .as_object_mut()
                 .expect("command object")
-                .insert("protocol_version".to_string(), json!(5));
+                .insert("protocol_version".to_string(), json!(6));
             let err = decode_bridge_command(value)
                 .expect_err("future protocol version must reject pre-serde");
             assert!(

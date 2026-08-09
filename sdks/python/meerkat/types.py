@@ -812,6 +812,14 @@ class SessionAssistantBlock:
 
 
 @dataclass(frozen=True, slots=True)
+class SystemPromptVersionIdentity:
+    """Durable key and version carried by one system-prompt history row."""
+
+    key: str = ""
+    version: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class SessionMessage:
     """Canonical transcript message returned by session history APIs."""
 
@@ -824,6 +832,7 @@ class SessionMessage:
     stop_reason: str | None = None
     interaction_id: str | None = None
     run_id: str | None = None
+    prompt_version: SystemPromptVersionIdentity | None = None
     blocks: list[SessionAssistantBlock] = field(default_factory=list)
     results: list[SessionToolResult] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
@@ -976,14 +985,102 @@ TranscriptRewriteInputMessage = TranscriptRewriteMessage | SessionMessage
 """Public rewrite input; accepts raw rewrite messages or SDK-read session messages."""
 
 
+ForkCacheProvider = Literal["anthropic", "openai", "gemini", "self_hosted", "other"]
+ForkCacheLoweredRequestEncoding = Literal[
+    "anthropic_messages_json",
+    "open_ai_responses_json",
+    "open_ai_chat_completions_json",
+    "gemini_generate_content_json",
+]
+ForkCacheTtl = Literal[
+    "five_minutes",
+    "one_hour",
+    "thirty_minutes",
+    "twenty_four_hours",
+    "provider_default",
+]
+ForkCacheInheritanceUnavailableReason = Literal[
+    "no_authored_breakpoint_at_boundary",
+    "provider_model_mismatch",
+    "target_identity_unresolved",
+    "target_lowering_unavailable",
+    "rendered_prefix_projection_unavailable",
+    "authored_evidence_invalid",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ForkCacheBreakpointBoundary:
+    """Canonical transcript boundary with an authored cache breakpoint."""
+
+    kind: Literal["system_profile_prefix", "transcript_after"]
+    message_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ForkCacheLoweredRequestProvenance:
+    """Provenance of the fully lowered provider request body."""
+
+    provider: ForkCacheProvider
+    encoding: ForkCacheLoweredRequestEncoding
+    body_sha256: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ForkAuthoredCacheBreakpoint:
+    """Provider-authored evidence for a cache-compatible boundary."""
+
+    provider: ForkCacheProvider
+    model: str
+    boundary: ForkCacheBreakpointBoundary
+    canonical_prefix_sha256: str
+    canonical_prefix_bytes: int
+    rendered_prefix_sha256: str
+    rendered_prefix_bytes: int
+    lowered_request_provenance: ForkCacheLoweredRequestProvenance
+    ttl: ForkCacheTtl
+
+
+@dataclass(frozen=True, slots=True)
+class ForkPoint:
+    """Verified provider-cache-compatible durable transcript fork point."""
+
+    message_count: int
+    authored_cache_breakpoint: ForkAuthoredCacheBreakpoint
+
+
+@dataclass(frozen=True, slots=True)
+class ForkCacheInheritanceAvailable:
+    """A fork inherited cache evidence at an authored breakpoint."""
+
+    fork_point: ForkPoint
+    status: Literal["available"] = "available"
+
+
+@dataclass(frozen=True, slots=True)
+class ForkCacheInheritanceUnavailable:
+    """A valid durable fork could not inherit provider cache evidence."""
+
+    message_count: int
+    reason: ForkCacheInheritanceUnavailableReason
+    status: Literal["unavailable"] = "unavailable"
+
+
+ForkCacheInheritance = (
+    ForkCacheInheritanceAvailable | ForkCacheInheritanceUnavailable
+)
+"""Exact provider cache inheritance disposition for a durable fork."""
+
+
 @dataclass(frozen=True, slots=True)
 class SessionForkResult:
     """Result of creating a forked transcript branch."""
 
-    source_session_id: str = ""
-    session_id: str = ""
+    source_session_id: str
+    session_id: str
+    message_count: int
+    cache_inheritance: ForkCacheInheritance
     session_ref: str | None = None
-    message_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -995,6 +1092,22 @@ class SessionTranscriptRewriteResult:
     revision: str = ""
     message_count: int = 0
     commit: dict[str, Any] = field(default_factory=dict)
+
+
+SystemPromptUpdateStatus = Literal["applied", "duplicate"]
+
+
+@dataclass(frozen=True, slots=True)
+class SystemPromptUpdateResult:
+    """Result of explicitly replacing one durable system-prompt key."""
+
+    session_id: str = ""
+    key: str = ""
+    version: int = 0
+    message_index: int = 0
+    status: SystemPromptUpdateStatus = "applied"
+    transcript_revision: str = ""
+    commit: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)

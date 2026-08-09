@@ -60,6 +60,20 @@ pub trait LlmClient: Send + Sync {
         Ok(None)
     }
 
+    /// Return non-authoritative claims for cache breakpoints authored by the exact
+    /// provider lowering used for this request.
+    ///
+    /// `canonical_messages` is the pre-projection transcript. Providers must
+    /// return no claim when their replay projection cannot map a lowered
+    /// boundary back to the same canonical message count.
+    fn authored_cache_breakpoints(
+        &self,
+        _request: &LlmRequest,
+        _canonical_messages: &[Message],
+    ) -> Result<Vec<meerkat_core::ProviderCacheBreakpointClaim>, LlmError> {
+        Ok(Vec::new())
+    }
+
     /// Stream a completion request
     ///
     /// Returns a stream of normalized events. The stream completes
@@ -384,7 +398,7 @@ pub enum LlmEvent {
     },
 
     /// Token usage update
-    UsageUpdate { usage: Usage },
+    UsageUpdate { usage: meerkat_core::TurnUsage },
 
     /// Stream completed with stop reason
     Done {
@@ -505,12 +519,17 @@ mod tests {
                 meta: None,
             },
             LlmEvent::UsageUpdate {
-                usage: Usage {
-                    input_tokens: 100,
-                    output_tokens: 50,
-                    cache_creation_tokens: None,
-                    cache_read_tokens: None,
-                },
+                usage: meerkat_core::TurnUsage::host_declared(
+                    Provider::Other,
+                    "event-test",
+                    Usage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        cache_creation_tokens: None,
+                        cache_read_tokens: None,
+                        provider_accounting: None,
+                    },
+                ),
             },
             LlmEvent::Done {
                 outcome: LlmDoneOutcome::Success {

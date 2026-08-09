@@ -9,6 +9,22 @@ semantic owner. The goal is simple: for any important lifecycle question, there
 should be one authoritative answer to what state exists, which transitions are
 legal, and what effects follow.
 
+## Coordination Boundaries
+
+- WorkGraph is the durable shared-work ledger. It owns dependency readiness,
+  work claims and leases, evidence, and terminal work verdicts.
+- Schedule is the time authority. It owns trigger calculation, recurrence,
+  occurrence claims, delivery attempts, and occurrence outcomes. A scheduled
+  wake does not decide whether WorkGraph work remains ready or complete.
+- Peer delivery accelerates discovery of durable work and wakes disposable
+  execution shells. A peer send or handoff receipt is not a WorkGraph claim,
+  Schedule occurrence verdict, or proof that shared work completed.
+- Durable claims are authorized only by their owning machine and store
+  contract. WorkGraph authorizes work claims, Schedule authorizes occurrence
+  claims, and peer FIFO removal requires the exact runtime admission receipt
+  bound to its claim. Queue snapshots, counters, ages, correlations, and
+  projections are observability facts and cannot authorize mutation.
+
 ## Canonical Machines
 
 The canonical registry is `canonical_machine_schemas()` in

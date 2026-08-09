@@ -1542,21 +1542,12 @@ fn image_request(n: u128, target_model: &str) -> ImageOperationRoutingRequest {
 
 struct FakeDrainRuntime {
     notify: Arc<Notify>,
-    dismiss: AtomicBool,
 }
 
 impl FakeDrainRuntime {
-    fn dismissing() -> Self {
-        Self {
-            notify: Arc::new(Notify::new()),
-            dismiss: AtomicBool::new(true),
-        }
-    }
-
     fn idle() -> Self {
         Self {
             notify: Arc::new(Notify::new()),
-            dismiss: AtomicBool::new(false),
         }
     }
 }
@@ -4199,16 +4190,8 @@ fn make_progress_input(label: &str) -> Input {
 
 #[async_trait::async_trait]
 impl CommsRuntime for FakeDrainRuntime {
-    async fn drain_messages(&self) -> Vec<String> {
-        Vec::new()
-    }
-
     fn inbox_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.notify)
-    }
-
-    fn dismiss_received(&self) -> bool {
-        self.dismiss.load(Ordering::Acquire)
     }
 
     async fn claim_classified_inbox_interaction(
@@ -4345,37 +4328,6 @@ async fn wait_for_phase(
     })
     .await
     .expect("phase transition");
-}
-
-#[tokio::test]
-async fn dismiss_exit_updates_authority_before_join() {
-    let adapter = Arc::new(MeerkatMachine::ephemeral());
-    let session_id = SessionId::new();
-    let comms_runtime: Arc<dyn CommsRuntime> = Arc::new(FakeDrainRuntime::dismissing());
-
-    spawn_test_comms_drain(
-        &adapter,
-        &session_id,
-        CommsDrainMode::PersistentHost,
-        comms_runtime,
-        Duration::from_millis(25),
-    )
-    .await;
-
-    wait_for_phase(&adapter, &session_id, CommsDrainPhase::Stopped).await;
-    assert!(
-        !handle_present(&adapter, &session_id).await,
-        "drain task should clear its slot before wait_comms_drain joins"
-    );
-
-    adapter
-        .wait_comms_drain(&session_id)
-        .await
-        .expect("wait_comms_drain");
-    assert_eq!(
-        current_phase(&adapter, &session_id).await,
-        Some(CommsDrainPhase::Stopped)
-    );
 }
 
 #[tokio::test]
@@ -7885,10 +7837,6 @@ impl AcceptingPeerCommsInstallTarget {
 
 #[async_trait::async_trait]
 impl meerkat_core::agent::CommsRuntime for AcceptingPeerCommsInstallTarget {
-    async fn drain_messages(&self) -> Vec<String> {
-        Vec::new()
-    }
-
     fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.notify)
     }
@@ -11992,9 +11940,13 @@ async fn hard_cancel_current_run_uses_prepared_session_interrupt_handle_before_e
 
     #[async_trait::async_trait]
     impl CoreExecutorInterruptHandle for CountingInterruptHandle {
-        async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
+        async fn hard_cancel_run_if_current(
+            &self,
+            _expected_run_id: &RunId,
+            _reason: String,
+        ) -> Result<bool, CoreExecutorError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(true)
         }
     }
 
@@ -12050,6 +12002,7 @@ async fn hard_cancel_current_run_on_attached_runtime_uses_live_handle_during_app
     struct BlockingExecutor {
         apply_calls: Arc<AtomicUsize>,
         cancel_calls: Arc<AtomicUsize>,
+        cancelled_run_ids: Arc<std::sync::Mutex<Vec<RunId>>>,
         apply_started: Arc<Notify>,
         apply_finished: Arc<Notify>,
         allow_finish: Arc<Notify>,
@@ -12057,13 +12010,22 @@ async fn hard_cancel_current_run_on_attached_runtime_uses_live_handle_during_app
 
     struct InterruptHandle {
         cancel_calls: Arc<AtomicUsize>,
+        cancelled_run_ids: Arc<std::sync::Mutex<Vec<RunId>>>,
     }
 
     #[async_trait::async_trait]
     impl CoreExecutorInterruptHandle for InterruptHandle {
-        async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
+        async fn hard_cancel_run_if_current(
+            &self,
+            expected_run_id: &RunId,
+            _reason: String,
+        ) -> Result<bool, CoreExecutorError> {
             self.cancel_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            self.cancelled_run_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(expected_run_id.clone());
+            Ok(true)
         }
     }
 
@@ -12072,6 +12034,7 @@ async fn hard_cancel_current_run_on_attached_runtime_uses_live_handle_during_app
         fn interrupt_handle(&self) -> Option<Arc<dyn CoreExecutorInterruptHandle>> {
             Some(Arc::new(InterruptHandle {
                 cancel_calls: Arc::clone(&self.cancel_calls),
+                cancelled_run_ids: Arc::clone(&self.cancelled_run_ids),
             }))
         }
 
@@ -12118,6 +12081,7 @@ async fn hard_cancel_current_run_on_attached_runtime_uses_live_handle_during_app
     let session_id = SessionId::new();
     let apply_calls = Arc::new(AtomicUsize::new(0));
     let cancel_calls = Arc::new(AtomicUsize::new(0));
+    let cancelled_run_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
     let apply_started = Arc::new(Notify::new());
     let apply_finished = Arc::new(Notify::new());
     let allow_finish = Arc::new(Notify::new());
@@ -12128,6 +12092,7 @@ async fn hard_cancel_current_run_on_attached_runtime_uses_live_handle_during_app
             Box::new(BlockingExecutor {
                 apply_calls: Arc::clone(&apply_calls),
                 cancel_calls: Arc::clone(&cancel_calls),
+                cancelled_run_ids: Arc::clone(&cancelled_run_ids),
                 apply_started: Arc::clone(&apply_started),
                 apply_finished: Arc::clone(&apply_finished),
                 allow_finish: Arc::clone(&allow_finish),
@@ -12243,6 +12208,13 @@ async fn hard_cancel_current_run_on_attached_runtime_uses_live_handle_during_app
         1,
         "hard cancel should reach the live interrupt handle immediately"
     );
+    assert_eq!(
+        *cancelled_run_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![run_a.clone()],
+        "the interrupt handle must receive the exact machine-current run id"
+    );
 
     allow_finish.notify_waiters();
     tokio::time::timeout(Duration::from_secs(1), apply_finished.notified())
@@ -12339,12 +12311,859 @@ async fn hard_cancel_current_run_on_attached_runtime_uses_live_handle_during_app
         1,
         "retry after reply loss must not cancel the newer run"
     );
+    assert_eq!(
+        *cancelled_run_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![run_a],
+        "a stale retry must not reach the handle with the successor run id"
+    );
 
     allow_finish.notify_waiters();
     match completion_b.wait_authorized().await {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!("expected newer prompt to complete normally, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn exact_hard_interrupt_reaches_retiring_draining_run_only() {
+    struct ExactInterruptHandle {
+        calls: Arc<AtomicUsize>,
+        requested_runs: Arc<std::sync::Mutex<Vec<RunId>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutorInterruptHandle for ExactInterruptHandle {
+        async fn hard_cancel_run_if_current(
+            &self,
+            expected_run_id: &RunId,
+            _reason: String,
+        ) -> Result<bool, CoreExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requested_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(expected_run_id.clone());
+            Ok(true)
+        }
+    }
+
+    struct ExactInterruptExecutor {
+        interrupt: Arc<ExactInterruptHandle>,
+        apply_started: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+        apply_release: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for ExactInterruptExecutor {
+        fn interrupt_handle(&self) -> Option<Arc<dyn CoreExecutorInterruptHandle>> {
+            Some(self.interrupt.clone())
+        }
+
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            if let Some(started) = self
+                .apply_started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = started.send(());
+            }
+            let release = self
+                .apply_release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("blocked apply should retain its release receiver");
+            release.await.map_err(|_| {
+                CoreExecutorError::apply_failed_runtime_turn(
+                    "exact retiring interrupt release sender disappeared",
+                )
+            })?;
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        Arc::new(crate::store::InMemoryRuntimeStore::new()),
+        memory_blob_store(),
+    ));
+    let session_id = SessionId::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requested_runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let interrupt = Arc::new(ExactInterruptHandle {
+        calls: Arc::clone(&calls),
+        requested_runs: Arc::clone(&requested_runs),
+    });
+    let (apply_started_tx, apply_started_rx) = tokio::sync::oneshot::channel();
+    let (apply_release_tx, apply_release_rx) = tokio::sync::oneshot::channel();
+
+    adapter
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(ExactInterruptExecutor {
+                interrupt,
+                apply_started: Arc::new(std::sync::Mutex::new(Some(apply_started_tx))),
+                apply_release: Arc::new(std::sync::Mutex::new(Some(apply_release_rx))),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+    adapter
+        .accept_input(
+            &session_id,
+            make_prompt("blocked exact retiring hard-interrupt turn"),
+        )
+        .await
+        .expect("probe input should be accepted");
+    tokio::time::timeout(Duration::from_secs(1), apply_started_rx)
+        .await
+        .expect("probe turn should start")
+        .expect("executor should retain the apply-started signal");
+
+    let run_id = adapter
+        .meerkat_machine_archive_snapshot(&session_id)
+        .await
+        .and_then(|snapshot| snapshot.control.current_run_id)
+        .expect("blocked executor should expose its exact current run");
+    let state = adapter
+        .session_dsl_state(&session_id)
+        .await
+        .expect("running session should retain DSL authority");
+    adapter
+        .apply_session_dsl_input(
+            &session_id,
+            mm_dsl::MeerkatMachineInput::BeginUnregisterSession {
+                session_id: mm_dsl::SessionId::from_domain(&session_id),
+                agent_runtime_id: state.active_runtime_id,
+                fence_token: state.active_fence_token,
+                generation: state.active_runtime_generation,
+                runtime_epoch_id: state.active_runtime_epoch_id,
+            },
+            "BeginUnregisterSession(exact retiring interrupt regression)",
+        )
+        .await
+        .expect("retirement should durably open the unregister drain");
+    {
+        let sessions = adapter.sessions.read().await;
+        let entry = sessions
+            .get(&session_id)
+            .expect("draining attachment should remain registered");
+        MeerkatMachine::stage_dsl_transition_on_authority(
+            &entry.dsl_authority,
+            mm_dsl::MeerkatMachineInput::Retire {
+                session_id: mm_dsl::SessionId::from_domain(&session_id),
+            },
+            "Retire(exact hard-interrupt split-phase regression)",
+        )
+        .expect("retire should preserve raw Running authority while the live run drains");
+        entry.close_handle_teardown_gate();
+        assert!(
+            entry
+                .dsl_mutation_blocked_by_unregister(&session_id)
+                .is_some()
+        );
+    }
+
+    let split = adapter
+        .meerkat_machine_archive_snapshot(&session_id)
+        .await
+        .expect("split-phase fixture should retain its archive snapshot");
+    let retiring_state = adapter
+        .session_dsl_state(&session_id)
+        .await
+        .expect("retiring session should retain DSL authority");
+    assert_eq!(
+        retiring_state.lifecycle_phase,
+        mm_dsl::MeerkatPhase::Running
+    );
+    assert_eq!(
+        retiring_state.pre_run_phase,
+        Some(mm_dsl::PreRunPhase::Retired)
+    );
+    assert_eq!(split.control.phase, RuntimeState::Retired);
+    assert_eq!(split.control.current_run_id.as_ref(), Some(&run_id));
+
+    let ambient = adapter
+        .hard_cancel_current_run(&session_id, "ambient retiring interrupt must remain closed")
+        .await;
+    assert!(
+        matches!(ambient, Err(RuntimeDriverError::NotReady { .. })),
+        "ambient interrupt must remain closed during unregister drain: {ambient:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    assert!(
+        !adapter
+            .hard_cancel_run_if_current(
+                &session_id,
+                &RunId::new(),
+                "stale exact retiring interrupt",
+            )
+            .await
+            .expect("stale exact interrupt should converge without dispatch")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    assert!(
+        adapter
+            .hard_cancel_run_if_current(&session_id, &run_id, "exact retiring interrupt")
+            .await
+            .expect("exact current retiring interrupt should dispatch")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *requested_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![run_id]
+    );
+
+    apply_release_tx
+        .send(())
+        .expect("blocked apply should still retain its release receiver");
+}
+
+#[tokio::test]
+async fn wedged_exact_interrupt_releases_mutation_gate_deduplicates_and_cannot_reach_successor() {
+    struct WedgedInterruptHandle {
+        calls: Arc<AtomicUsize>,
+        requested_runs: Arc<std::sync::Mutex<Vec<RunId>>>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutorInterruptHandle for WedgedInterruptHandle {
+        async fn hard_cancel_run_if_current(
+            &self,
+            expected_run_id: &RunId,
+            _reason: String,
+        ) -> Result<bool, CoreExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requested_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(expected_run_id.clone());
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(true)
+        }
+    }
+
+    struct SequentialBlockingExecutor {
+        interrupt: Arc<WedgedInterruptHandle>,
+        apply_calls: Arc<AtomicUsize>,
+        apply_started: Arc<Notify>,
+        release_apply: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for SequentialBlockingExecutor {
+        fn interrupt_handle(&self) -> Option<Arc<dyn CoreExecutorInterruptHandle>> {
+            Some(self.interrupt.clone())
+        }
+
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            self.apply_calls.fetch_add(1, Ordering::SeqCst);
+            self.apply_started.notify_one();
+            self.release_apply.notified().await;
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requested_runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let interrupt_entered = Arc::new(Notify::new());
+    let release_interrupt = Arc::new(Notify::new());
+    let apply_calls = Arc::new(AtomicUsize::new(0));
+    let apply_started = Arc::new(Notify::new());
+    let release_apply = Arc::new(Notify::new());
+    let interrupt = Arc::new(WedgedInterruptHandle {
+        calls: Arc::clone(&calls),
+        requested_runs: Arc::clone(&requested_runs),
+        entered: Arc::clone(&interrupt_entered),
+        release: Arc::clone(&release_interrupt),
+    });
+    machine
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(SequentialBlockingExecutor {
+                interrupt,
+                apply_calls: Arc::clone(&apply_calls),
+                apply_started: Arc::clone(&apply_started),
+                release_apply: Arc::clone(&release_apply),
+            }),
+        )
+        .await
+        .expect("attach wedged interrupt fixture");
+
+    let (outcome_a, completion_a) = machine
+        .accept_input_with_completion(
+            &session_id,
+            Input::Prompt(crate::input::PromptInput::new("run A", None)),
+        )
+        .await
+        .expect("admit run A");
+    assert!(outcome_a.is_accepted());
+    let completion_a = completion_a.expect("run A completion");
+    tokio::time::timeout(Duration::from_secs(1), apply_started.notified())
+        .await
+        .expect("run A starts");
+    let run_a = machine
+        .meerkat_machine_spine_snapshot(&session_id)
+        .await
+        .expect("run A snapshot")
+        .control
+        .current_run_id
+        .expect("run A id");
+
+    let first = machine
+        .hard_cancel_run_if_current(&session_id, &run_a, "wedged exact interrupt")
+        .await
+        .expect_err("caller acknowledgement must be bounded");
+    assert!(matches!(
+        first,
+        RuntimeDriverError::InterruptDispatchOutcomeUnknown { ref run_id, .. }
+            if run_id == &run_a
+    ));
+    tokio::time::timeout(Duration::from_secs(1), interrupt_entered.notified())
+        .await
+        .expect("owned interrupt callback starts");
+
+    let retry = machine
+        .hard_cancel_run_if_current(&session_id, &run_a, "same-run retry")
+        .await
+        .expect_err("same-run retry must join the pending callback");
+    assert!(matches!(
+        retry,
+        RuntimeDriverError::InterruptDispatchOutcomeUnknown { ref run_id, .. }
+            if run_id == &run_a
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "retry must deduplicate");
+
+    let (outcome_b, completion_b) = machine
+        .accept_input_with_completion(
+            &session_id,
+            Input::Prompt(crate::input::PromptInput::new("run B", None)),
+        )
+        .await
+        .expect("M must be free while the custom interrupt callback is wedged");
+    assert!(outcome_b.is_accepted());
+    let completion_b = completion_b.expect("run B completion");
+
+    release_apply.notify_one();
+    assert!(matches!(
+        completion_a.wait_authorized().await,
+        CompletionOutcome::CompletedWithoutResult
+    ));
+    let run_b = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = machine
+                .meerkat_machine_spine_snapshot(&session_id)
+                .await
+                .expect("successor snapshot");
+            if snapshot.control.phase == RuntimeState::Running
+                && let Some(run_id) = snapshot.control.current_run_id
+                && run_id != run_a
+            {
+                break run_id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("run B becomes current while run A interrupt callback is pending");
+
+    release_interrupt.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let sessions = machine.sessions.read().await;
+            let pending = sessions
+                .get(&session_id)
+                .and_then(|entry| entry.pending_user_interrupt_dispatch.as_ref())
+                .is_some();
+            drop(sessions);
+            if !pending {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late run A callback reconciles without publishing into run B");
+    let still_b = machine
+        .meerkat_machine_spine_snapshot(&session_id)
+        .await
+        .expect("run B remains observable");
+    assert_eq!(still_b.control.current_run_id.as_ref(), Some(&run_b));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *requested_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![run_a],
+        "late completion must retain the original run fence"
+    );
+
+    release_apply.notify_one();
+    assert!(matches!(
+        completion_b.wait_authorized().await,
+        CompletionOutcome::CompletedWithoutResult
+    ));
+}
+
+#[tokio::test]
+async fn panicked_exact_interrupt_clears_retry_slot_and_cannot_reach_successor() {
+    struct PanicOnceInterruptHandle {
+        calls: Arc<AtomicUsize>,
+        requested_runs: Arc<std::sync::Mutex<Vec<RunId>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutorInterruptHandle for PanicOnceInterruptHandle {
+        async fn hard_cancel_run_if_current(
+            &self,
+            expected_run_id: &RunId,
+            _reason: String,
+        ) -> Result<bool, CoreExecutorError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requested_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(expected_run_id.clone());
+            assert_ne!(call, 0, "panic-once exact interrupt fixture");
+            Ok(true)
+        }
+    }
+
+    struct SequentialBlockingExecutor {
+        interrupt: Arc<PanicOnceInterruptHandle>,
+        apply_started: Arc<Notify>,
+        release_apply: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for SequentialBlockingExecutor {
+        fn interrupt_handle(&self) -> Option<Arc<dyn CoreExecutorInterruptHandle>> {
+            Some(self.interrupt.clone())
+        }
+
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            self.apply_started.notify_one();
+            self.release_apply.notified().await;
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requested_runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let apply_started = Arc::new(Notify::new());
+    let release_apply = Arc::new(Notify::new());
+    let interrupt = Arc::new(PanicOnceInterruptHandle {
+        calls: Arc::clone(&calls),
+        requested_runs: Arc::clone(&requested_runs),
+    });
+    machine
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(SequentialBlockingExecutor {
+                interrupt,
+                apply_started: Arc::clone(&apply_started),
+                release_apply: Arc::clone(&release_apply),
+            }),
+        )
+        .await
+        .expect("attach panic-once interrupt fixture");
+
+    let (outcome_a, completion_a) = machine
+        .accept_input_with_completion(
+            &session_id,
+            Input::Prompt(crate::input::PromptInput::new("run A", None)),
+        )
+        .await
+        .expect("admit run A");
+    assert!(outcome_a.is_accepted());
+    let completion_a = completion_a.expect("run A completion");
+    tokio::time::timeout(Duration::from_secs(1), apply_started.notified())
+        .await
+        .expect("run A starts");
+    let run_a = machine
+        .meerkat_machine_spine_snapshot(&session_id)
+        .await
+        .expect("run A snapshot")
+        .control
+        .current_run_id
+        .expect("run A id");
+
+    let panic_error = machine
+        .hard_cancel_run_if_current(&session_id, &run_a, "panic-once exact interrupt")
+        .await
+        .expect_err("custom interrupt panic must cross the owner boundary as typed error");
+    assert!(matches!(
+        panic_error,
+        RuntimeDriverError::InterruptDispatchPanicked {
+            ref run_id,
+            ref reason,
+        } if run_id == &run_a && reason.contains("panic-once exact interrupt fixture")
+    ));
+    {
+        let sessions = machine.sessions.read().await;
+        assert!(
+            sessions
+                .get(&session_id)
+                .and_then(|entry| entry.pending_user_interrupt_dispatch.as_ref())
+                .is_none(),
+            "panic result must not leave a closed dedup receiver installed"
+        );
+    }
+
+    assert!(
+        machine
+            .hard_cancel_run_if_current(&session_id, &run_a, "exact retry after panic")
+            .await
+            .expect("same-run retry should reissue after panic cleanup")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    release_apply.notify_one();
+    assert!(matches!(
+        completion_a.wait_authorized().await,
+        CompletionOutcome::CompletedWithoutResult
+    ));
+    let (outcome_b, completion_b) = machine
+        .accept_input_with_completion(
+            &session_id,
+            Input::Prompt(crate::input::PromptInput::new("run B", None)),
+        )
+        .await
+        .expect("admit successor run B");
+    assert!(outcome_b.is_accepted());
+    let completion_b = completion_b.expect("run B completion");
+    let run_b = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = machine
+                .meerkat_machine_spine_snapshot(&session_id)
+                .await
+                .expect("successor snapshot");
+            if snapshot.control.phase == RuntimeState::Running
+                && let Some(run_id) = snapshot.control.current_run_id
+                && run_id != run_a
+            {
+                break run_id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("run B becomes current");
+
+    assert!(
+        !machine
+            .hard_cancel_run_if_current(&session_id, &run_a, "stale panic retry")
+            .await
+            .expect("stale run A retry is terminal truth")
+    );
+    assert_ne!(run_a, run_b);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *requested_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![run_a.clone(), run_a],
+        "panic retry must remain fenced to run A and never reach run B"
+    );
+
+    release_apply.notify_one();
+    assert!(matches!(
+        completion_b.wait_authorized().await,
+        CompletionOutcome::CompletedWithoutResult
+    ));
+    machine
+        .unregister_session(&session_id)
+        .await
+        .expect("panic fixture runtime should shut down cleanly");
+}
+
+#[tokio::test]
+async fn wedged_durability_degradation_interrupt_is_process_owned_and_deduplicated() {
+    struct WedgedInterruptHandle {
+        calls: Arc<AtomicUsize>,
+        requested_runs: Arc<std::sync::Mutex<Vec<RunId>>>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        completed: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutorInterruptHandle for WedgedInterruptHandle {
+        async fn hard_cancel_run_if_current(
+            &self,
+            expected_run_id: &RunId,
+            _reason: String,
+        ) -> Result<bool, CoreExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requested_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(expected_run_id.clone());
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.completed.notify_one();
+            Ok(true)
+        }
+    }
+
+    struct BlockingExecutor {
+        interrupt: Arc<WedgedInterruptHandle>,
+        apply_started: Arc<Notify>,
+        release_apply: Arc<Notify>,
+        apply_finished: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for BlockingExecutor {
+        fn interrupt_handle(&self) -> Option<Arc<dyn CoreExecutorInterruptHandle>> {
+            Some(self.interrupt.clone())
+        }
+
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            self.apply_started.notify_one();
+            self.release_apply.notified().await;
+            self.apply_finished.notify_one();
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let machine = Arc::new(MeerkatMachine::persistent(
+        Arc::new(crate::store::InMemoryRuntimeStore::new()),
+        memory_blob_store(),
+    ));
+    let session_id = SessionId::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requested_runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let interrupt_entered = Arc::new(Notify::new());
+    let release_interrupt = Arc::new(Notify::new());
+    let interrupt_completed = Arc::new(Notify::new());
+    let apply_started = Arc::new(Notify::new());
+    let release_apply = Arc::new(Notify::new());
+    let apply_finished = Arc::new(Notify::new());
+    let interrupt = Arc::new(WedgedInterruptHandle {
+        calls: Arc::clone(&calls),
+        requested_runs: Arc::clone(&requested_runs),
+        entered: Arc::clone(&interrupt_entered),
+        release: Arc::clone(&release_interrupt),
+        completed: Arc::clone(&interrupt_completed),
+    });
+    machine
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(BlockingExecutor {
+                interrupt,
+                apply_started: Arc::clone(&apply_started),
+                release_apply: Arc::clone(&release_apply),
+                apply_finished: Arc::clone(&apply_finished),
+            }),
+        )
+        .await
+        .expect("attach durability-degradation interrupt fixture");
+
+    let (outcome, _completion) = machine
+        .accept_input_with_completion(
+            &session_id,
+            Input::Prompt(crate::input::PromptInput::new("active durable run", None)),
+        )
+        .await
+        .expect("admit active durable run");
+    assert!(outcome.is_accepted());
+    tokio::time::timeout(Duration::from_secs(1), apply_started.notified())
+        .await
+        .expect("durable run starts");
+    let run_id = machine
+        .meerkat_machine_spine_snapshot(&session_id)
+        .await
+        .expect("durable run snapshot")
+        .control
+        .current_run_id
+        .expect("durable run id");
+    let durability_health = machine
+        .session_durability_health(&session_id)
+        .await
+        .expect("registered session")
+        .expect("persistent session durability health");
+    assert!(durability_health.mark_reload_required(
+        "durability_degradation_interrupt_test",
+        "synthetic unknown durable outcome",
+    ));
+
+    let started = Instant::now();
+    let first = machine
+        .lock_current_durability_ready_session_mutation_gate(&session_id)
+        .await;
+    assert!(matches!(
+        first,
+        Err(RuntimeDriverError::RecoveryRepairBlocked { .. })
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "wedged custom interrupt must not prevent repair-blocked acknowledgement"
+    );
+    tokio::time::timeout(Duration::from_secs(1), interrupt_entered.notified())
+        .await
+        .expect("process-owned exact interrupt starts");
+
+    let retry_started = Instant::now();
+    let retry = machine
+        .lock_current_durability_ready_session_mutation_gate(&session_id)
+        .await;
+    assert!(matches!(
+        retry,
+        Err(RuntimeDriverError::RecoveryRepairBlocked { .. })
+    ));
+    assert!(
+        retry_started.elapsed() < DURABILITY_DEGRADATION_INTERRUPT_ACK_TIMEOUT,
+        "degraded retry must observe the consumed exact handle without spawning or joining the wedge"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "degraded retry deduplicates"
+    );
+
+    release_interrupt.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), interrupt_completed.notified())
+        .await
+        .expect("process-owned exact interrupt converges after caller returned");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *requested_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![run_id],
+        "durability retry authority must retain the original exact run"
+    );
+
+    release_apply.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), apply_finished.notified())
+        .await
+        .expect("detached degraded executor finishes after fixture release");
 }
 
 #[tokio::test]
@@ -12643,7 +13462,11 @@ mod stop_teardown_coordinator_class {
 
     #[async_trait::async_trait]
     impl CoreExecutorInterruptHandle for NonCooperativeInterruptHandle {
-        async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
+        async fn hard_cancel_run_if_current(
+            &self,
+            _expected_run_id: &RunId,
+            _reason: String,
+        ) -> Result<bool, CoreExecutorError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::future::pending().await
         }
@@ -15128,6 +15951,168 @@ async fn wait_for_queued_boundary_cancel(calls: &AtomicUsize) {
     })
     .await
     .expect("the exact queued boundary-cancel effect should be applied");
+}
+
+/// Retirement may open the unregister drain after admitting an input but
+/// before that input binds its run. The drain must continue rejecting public
+/// cancellation as new ingress while allowing teardown to cancel only the
+/// exact run that subsequently became current.
+#[tokio::test]
+async fn exact_run_boundary_cancel_remains_admitted_after_unregister_drain_begins() {
+    let mut race = install_boundary_cancel_callback_race(
+        Arc::new(MeerkatMachine::persistent(
+            Arc::new(crate::store::InMemoryRuntimeStore::new()),
+            memory_blob_store(),
+        )),
+        SessionId::new(),
+        false,
+    )
+    .await;
+    let run_id = race
+        .adapter
+        .meerkat_machine_archive_snapshot(&race.session_id)
+        .await
+        .and_then(|snapshot| snapshot.control.current_run_id)
+        .expect("blocked executor should expose its exact current run");
+    let state = race
+        .adapter
+        .session_dsl_state(&race.session_id)
+        .await
+        .expect("running session should retain DSL authority");
+    race.adapter
+        .apply_session_dsl_input(
+            &race.session_id,
+            mm_dsl::MeerkatMachineInput::BeginUnregisterSession {
+                session_id: mm_dsl::SessionId::from_domain(&race.session_id),
+                agent_runtime_id: state.active_runtime_id,
+                fence_token: state.active_fence_token,
+                generation: state.active_runtime_generation,
+                runtime_epoch_id: state.active_runtime_epoch_id,
+            },
+            "BeginUnregisterSession(exact retire cancel regression)",
+        )
+        .await
+        .expect("retirement should durably open the unregister drain");
+    assert_eq!(
+        race.adapter
+            .session_dsl_state(&race.session_id)
+            .await
+            .expect("draining session should retain DSL authority")
+            .registration_phase,
+        mm_dsl::RegistrationPhase::Draining,
+    );
+    {
+        let sessions = race.adapter.sessions.read().await;
+        let entry = sessions
+            .get(&race.session_id)
+            .expect("draining attachment should remain registered");
+        MeerkatMachine::stage_dsl_transition_on_authority(
+            &entry.dsl_authority,
+            mm_dsl::MeerkatMachineInput::Retire {
+                session_id: mm_dsl::SessionId::from_domain(&race.session_id),
+            },
+            "Retire(exact cancel split-phase regression)",
+        )
+        .expect("retire should preserve raw Running authority while the live run drains");
+        entry.close_handle_teardown_gate();
+        assert!(
+            entry
+                .dsl_mutation_blocked_by_unregister(&race.session_id)
+                .is_some(),
+            "fixture must reproduce the entry-local unregister mutation block"
+        );
+    }
+    let split_snapshot = race
+        .adapter
+        .meerkat_machine_archive_snapshot(&race.session_id)
+        .await
+        .expect("split-phase fixture should retain its archive snapshot");
+    let retiring_state = race
+        .adapter
+        .session_dsl_state(&race.session_id)
+        .await
+        .expect("retiring session should retain DSL authority");
+    assert_eq!(
+        retiring_state.lifecycle_phase,
+        mm_dsl::MeerkatPhase::Running,
+        "retire during a live turn must preserve raw Running authority"
+    );
+    assert_eq!(
+        retiring_state.pre_run_phase,
+        Some(mm_dsl::PreRunPhase::Retired),
+        "retire during a live turn must preserve Retired as its terminal destination"
+    );
+    assert_eq!(
+        split_snapshot.control.phase,
+        RuntimeState::Retired,
+        "raw Running with pre_run_phase Retired must project visible Retired while the exact run drains"
+    );
+    assert_eq!(
+        split_snapshot.control.current_run_id.as_ref(),
+        Some(&run_id)
+    );
+
+    let ordinary = race.adapter.cancel_after_boundary(&race.session_id).await;
+    assert!(
+        matches!(
+            ordinary,
+            Err(RuntimeDriverError::NotReady {
+                state: RuntimeState::Running
+            })
+        ),
+        "public cancellation must remain fenced as ingress during unregister drain: {ordinary:?}"
+    );
+
+    assert!(
+        !race
+            .adapter
+            .cancel_after_boundary_run_if_current(&race.session_id, &RunId::new())
+            .await
+            .expect("stale exact cancellation should converge without dispatch"),
+        "a stale exact-run witness must not reach the current draining run"
+    );
+
+    let exact_adapter = Arc::clone(&race.adapter);
+    let exact_session = race.session_id.clone();
+    let exact_run = run_id.clone();
+    let exact = tokio::spawn(async move {
+        exact_adapter
+            .cancel_after_boundary_run_if_current(&exact_session, &exact_run)
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        race.callback_entered
+            .take()
+            .expect("race should expose its callback-entered receiver"),
+    )
+    .await
+    .expect("exact teardown cancellation should cross the pre-callback drain fence")
+    .expect("boundary handle should retain the callback-entered signal");
+    race.callback_release
+        .take()
+        .expect("race should expose its callback release")
+        .send(())
+        .expect("live callback should still be waiting");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), exact)
+            .await
+            .expect("exact teardown cancellation should cross the post-callback drain fence")
+            .expect("exact cancellation task should not panic")
+            .expect("exact current-run cancellation should succeed"),
+        "the exact run must remain current through cancellation admission"
+    );
+    assert_eq!(
+        race.handle_calls.load(Ordering::SeqCst),
+        1,
+        "exact retiring teardown must dispatch once through the cloneable live boundary authority"
+    );
+
+    race.first_apply_release
+        .take()
+        .expect("race should expose its first-apply release")
+        .send(())
+        .expect("first apply should still be blocked");
 }
 
 /// M1 regression (meerkat-studio P0): a boundary handle that (wrongly)
@@ -18186,6 +19171,50 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_retir
         .await
         .expect("retire should wake the attached runtime loop to drain queued work");
 
+    let draining_run = adapter
+        .session_dsl_state(&session_id)
+        .await
+        .expect("drained queued run should retain raw machine authority");
+    let draining_run_id = draining_run
+        .current_run_id
+        .clone()
+        .expect("drained queued work should bind a current run");
+    assert_eq!(draining_run.lifecycle_phase, mm_dsl::MeerkatPhase::Running);
+    assert_eq!(
+        draining_run.pre_run_phase,
+        Some(mm_dsl::PreRunPhase::Retired),
+        "DrainQueuedRunRetired should retain Retired as the run's terminal destination"
+    );
+
+    let second_report = crate::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
+        .await
+        .expect("a second retire during the drained run must preserve turn terminality");
+    assert_eq!(second_report.inputs_abandoned, 0);
+    assert_eq!(
+        second_report.inputs_pending_drain, 1,
+        "the second retire should retain the active run as pending drain authority"
+    );
+
+    let after_second_retire = adapter
+        .session_dsl_state(&session_id)
+        .await
+        .expect("second retire should preserve raw run authority");
+    assert_eq!(
+        after_second_retire.lifecycle_phase,
+        mm_dsl::MeerkatPhase::Running,
+        "retire during an active drained run must not strand turn authority in raw Retired"
+    );
+    assert_eq!(
+        after_second_retire.current_run_id,
+        Some(draining_run_id.clone()),
+        "second retire must retain the exact current run witness"
+    );
+    assert_eq!(
+        after_second_retire.pre_run_phase,
+        Some(mm_dsl::PreRunPhase::Retired),
+        "second retire must retain Retired as the terminal destination"
+    );
+
     let after_retire = adapter
         .meerkat_machine_spine_snapshot(&session_id)
         .await
@@ -18193,7 +19222,7 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_retir
     assert_eq!(
         after_retire.control.phase,
         RuntimeState::Retired,
-        "post-`e5c5ecaf3` DSL-authoritative: retire holds lifecycle_phase at Retired through the drain window (Retire transition goes to Retired unconditionally); DSL is source of truth, not control_projection cache"
+        "Running with pre_run_phase Retired must remain externally projected as Retired through the drain window"
     );
     assert_eq!(after_retire.completion_waiters.input_count, 1);
     assert_eq!(after_retire.completion_waiters.waiter_count, 1);
@@ -18220,6 +19249,13 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_retir
         .await
         .expect("snapshot should exist after drained completion settles");
     assert_eq!(settled.control.phase, RuntimeState::Retired);
+    assert_eq!(settled.control.current_run_id, None);
+    let settled_raw = adapter
+        .session_dsl_state(&session_id)
+        .await
+        .expect("drained run terminality should settle raw machine authority");
+    assert_eq!(settled_raw.lifecycle_phase, mm_dsl::MeerkatPhase::Retired);
+    assert_eq!(settled_raw.current_run_id, None);
     assert_eq!(settled.completion_waiters.input_count, 0);
     assert_eq!(settled.completion_waiters.waiter_count, 0);
     assert!(
@@ -23868,7 +24904,7 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_retire_with_run
     assert_eq!(
         after_retire.control.phase,
         RuntimeState::Retired,
-        "post-`e5c5ecaf3` DSL-authoritative: retire holds lifecycle_phase at Retired through the drain window (Retire transition goes to Retired unconditionally); DSL is source of truth, not control_projection cache"
+        "raw Running with pre_run_phase Retired must project visible Retired throughout the drain window"
     );
     assert_eq!(
         after_retire.ops.wait_request_id,
@@ -24156,7 +25192,7 @@ async fn meerkat_machine_spine_snapshot_retire_with_runtime_loop_splits_completi
     assert_eq!(
         during_retire.control.phase,
         RuntimeState::Retired,
-        "post-`e5c5ecaf3` DSL-authoritative: retire holds lifecycle_phase at Retired through the drain window (Retire transition goes to Retired unconditionally); DSL is source of truth, not control_projection cache"
+        "raw Running with pre_run_phase Retired must project visible Retired throughout the drain window"
     );
     assert_eq!(during_retire.completion_waiters.input_count, 1);
     assert_eq!(during_retire.completion_waiters.waiter_count, 1);
@@ -27017,10 +28053,6 @@ impl CommsRuntime for RotationEndpointRuntime {
 
     fn advertised_address(&self) -> Option<String> {
         Some("inproc://rotation-persistence-member".to_string())
-    }
-
-    async fn drain_messages(&self) -> Vec<String> {
-        Vec::new()
     }
 
     fn inbox_notify(&self) -> Arc<Notify> {
@@ -38622,6 +39654,15 @@ fn summarize_runtime_parity_driver_error(error: &RuntimeDriverError) -> String {
         RuntimeDriverError::RuntimeStopInProgress { runtime_id } => {
             format!("runtime_stop_in_progress:{runtime_id}")
         }
+        RuntimeDriverError::InterruptDispatchOutcomeUnknown { run_id, reason } => {
+            format!("interrupt_dispatch_outcome_unknown:{run_id}:{reason}")
+        }
+        RuntimeDriverError::InterruptDispatchPanicked { run_id, reason } => {
+            format!("interrupt_dispatch_panicked:{run_id}:{reason}")
+        }
+        RuntimeDriverError::RuntimeTerminalPublicationInProgress { runtime_id } => {
+            format!("runtime_terminal_publication_in_progress:{runtime_id}")
+        }
         RuntimeDriverError::StaleAuthority { reason } => {
             format!("stale_authority:{reason}")
         }
@@ -38636,6 +39677,9 @@ fn summarize_runtime_parity_control_error(error: &RuntimeControlPlaneError) -> S
             format!("invalid_state:{}", runtime_parity_state_label(*state))
         }
         RuntimeControlPlaneError::StoreError(reason) => format!("store_error:{reason}"),
+        RuntimeControlPlaneError::RetirementInProgress { runtime_id, stage } => {
+            format!("retirement_in_progress:{runtime_id}:{stage}")
+        }
         RuntimeControlPlaneError::Internal(reason) => format!("internal:{reason}"),
     }
 }
@@ -40706,8 +41750,12 @@ mod prepared_materialization_transactions {
 
     #[async_trait::async_trait]
     impl CoreExecutorInterruptHandle for CountingInterruptHandle {
-        async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
-            Ok(())
+        async fn hard_cancel_run_if_current(
+            &self,
+            _expected_run_id: &RunId,
+            _reason: String,
+        ) -> Result<bool, CoreExecutorError> {
+            Ok(true)
         }
     }
 
@@ -40739,9 +41787,13 @@ mod prepared_materialization_transactions {
 
     #[async_trait::async_trait]
     impl CoreExecutorInterruptHandle for BlockingInterruptHandle {
-        async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
+        async fn hard_cancel_run_if_current(
+            &self,
+            _expected_run_id: &RunId,
+            _reason: String,
+        ) -> Result<bool, CoreExecutorError> {
             self.entered.notify_one();
-            std::future::pending::<Result<(), CoreExecutorError>>().await
+            std::future::pending::<Result<bool, CoreExecutorError>>().await
         }
     }
 
@@ -40898,14 +41950,14 @@ mod prepared_materialization_transactions {
     }
 
     #[tokio::test]
-    async fn prepared_startup_failure_uses_boundary_aware_exact_cleanup() {
-        struct RejectBoundaryReacquireHandle {
+    async fn boundary_owned_factory_startup_failure_hands_off_wedged_exact_cleanup() {
+        struct RejectStartupBoundaryReacquireHandle {
             acquire_calls: Arc<AtomicUsize>,
         }
 
         #[async_trait::async_trait]
         impl meerkat_core::lifecycle::CoreExecutorTurnFinalizationBoundaryHandle
-            for RejectBoundaryReacquireHandle
+            for RejectStartupBoundaryReacquireHandle
         {
             async fn acquire(
                 &self,
@@ -40915,14 +41967,50 @@ mod prepared_materialization_transactions {
             > {
                 self.acquire_calls.fetch_add(1, Ordering::SeqCst);
                 Err(CoreExecutorError::Internal(
-                    "boundary-aware startup tried to reacquire its caller's B".into(),
+                    "startup attempted to reacquire caller-owned B".into(),
+                ))
+            }
+        }
+
+        struct WedgedCleanupHandle {
+            boundary_reacquires: Arc<AtomicUsize>,
+            boundary_reacquire_started: Arc<Notify>,
+            boundary_reacquire_release: Arc<Notify>,
+            normal: Arc<AtomicUsize>,
+            under_boundary: Arc<AtomicUsize>,
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl meerkat_core::lifecycle::core_executor::CoreExecutorPostStopCleanupHandle
+            for WedgedCleanupHandle
+        {
+            async fn cleanup_after_runtime_stop_terminalized(
+                &self,
+            ) -> Result<(), CoreExecutorError> {
+                self.boundary_reacquires.fetch_add(1, Ordering::SeqCst);
+                self.boundary_reacquire_started.notify_one();
+                self.boundary_reacquire_release.notified().await;
+                self.normal.fetch_add(1, Ordering::SeqCst);
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(())
+            }
+
+            async fn cleanup_after_runtime_stop_terminalized_under_turn_finalization_boundary(
+                &self,
+            ) -> Result<(), CoreExecutorError> {
+                self.under_boundary.fetch_add(1, Ordering::SeqCst);
+                Err(CoreExecutorError::Internal(
+                    "wedged cleanup must not run under caller-owned B".into(),
                 ))
             }
         }
 
         struct RejectStartupExecutor {
-            cleanup: Arc<CountingCleanupHandle>,
-            boundary_reacquires: Arc<AtomicUsize>,
+            cleanup: Arc<WedgedCleanupHandle>,
+            startup_boundary_reacquires: Arc<AtomicUsize>,
         }
 
         #[async_trait::async_trait]
@@ -40943,8 +42031,8 @@ mod prepared_materialization_transactions {
                 &self,
             ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorTurnFinalizationBoundaryHandle>>
             {
-                Some(Arc::new(RejectBoundaryReacquireHandle {
-                    acquire_calls: Arc::clone(&self.boundary_reacquires),
+                Some(Arc::new(RejectStartupBoundaryReacquireHandle {
+                    acquire_calls: Arc::clone(&self.startup_boundary_reacquires),
                 }))
             }
 
@@ -40986,32 +42074,41 @@ mod prepared_materialization_transactions {
         let session_id = SessionId::new();
         let normal = Arc::new(AtomicUsize::new(0));
         let under_boundary = Arc::new(AtomicUsize::new(0));
-        let boundary_reacquires = Arc::new(AtomicUsize::new(0));
-        let mut prepared = machine
-            .prepare_session_materialization(session_id.clone())
-            .await
-            .expect("prepare exact actor materialization");
-        crate::begin_session_runtime_actor_materialization(prepared.bindings())
-            .expect("claim actor construction")
-            .commit()
-            .expect("record actor materialization");
-
+        let startup_boundary_reacquires = Arc::new(AtomicUsize::new(0));
+        let cleanup_boundary_reacquires = Arc::new(AtomicUsize::new(0));
+        let boundary_reacquire_started = Arc::new(Notify::new());
+        let boundary_reacquire_release = Arc::new(Notify::new());
+        let cleanup_started = Arc::new(Notify::new());
+        let cleanup_release = Arc::new(Notify::new());
         let error = tokio::time::timeout(
             Duration::from_secs(2),
-            prepared.ensure_executor_attachment_under_runtime_turn_finalization_boundary({
-                let normal = Arc::clone(&normal);
-                let under_boundary = Arc::clone(&under_boundary);
-                let boundary_reacquires = Arc::clone(&boundary_reacquires);
-                move |_witness| {
-                    Box::new(RejectStartupExecutor {
-                        cleanup: Arc::new(CountingCleanupHandle {
-                            normal,
-                            under_boundary,
-                        }),
-                        boundary_reacquires,
-                    }) as Box<dyn CoreExecutor>
-                }
-            }),
+            machine.ensure_session_with_executor_factory_under_runtime_turn_finalization_boundary(
+                session_id.clone(),
+                {
+                    let normal = Arc::clone(&normal);
+                    let under_boundary = Arc::clone(&under_boundary);
+                    let startup_boundary_reacquires = Arc::clone(&startup_boundary_reacquires);
+                    let cleanup_boundary_reacquires = Arc::clone(&cleanup_boundary_reacquires);
+                    let boundary_reacquire_started = Arc::clone(&boundary_reacquire_started);
+                    let boundary_reacquire_release = Arc::clone(&boundary_reacquire_release);
+                    let cleanup_started = Arc::clone(&cleanup_started);
+                    let cleanup_release = Arc::clone(&cleanup_release);
+                    move |_witness| {
+                        Box::new(RejectStartupExecutor {
+                            cleanup: Arc::new(WedgedCleanupHandle {
+                                boundary_reacquires: cleanup_boundary_reacquires,
+                                boundary_reacquire_started,
+                                boundary_reacquire_release,
+                                normal,
+                                under_boundary,
+                                started: cleanup_started,
+                                release: cleanup_release,
+                            }),
+                            startup_boundary_reacquires,
+                        }) as Box<dyn CoreExecutor>
+                    }
+                },
+            ),
         )
         .await
         .expect("boundary-aware failed startup must not deadlock")
@@ -41022,20 +42119,48 @@ mod prepared_materialization_transactions {
                 .contains("synthetic boundary-owned startup failure"),
             "unexpected startup error: {error}"
         );
-        assert_eq!(normal.load(Ordering::SeqCst), 0);
         assert_eq!(
-            boundary_reacquires.load(Ordering::SeqCst),
+            startup_boundary_reacquires.load(Ordering::SeqCst),
             0,
-            "startup must borrow the caller-owned B instead of reacquiring it"
+            "startup must borrow caller-owned B instead of reacquiring it"
         );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            boundary_reacquire_started.notified(),
+        )
+        .await
+        .expect("process-owned unregister must wait to reacquire B after handoff");
+        assert_eq!(cleanup_boundary_reacquires.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            normal.load(Ordering::SeqCst),
+            0,
+            "surface cleanup must not start while caller-owned B remains held"
+        );
+        boundary_reacquire_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), cleanup_started.notified())
+            .await
+            .expect("process-owned exact cleanup must start after failure handoff");
+        assert_eq!(normal.load(Ordering::SeqCst), 1);
         assert_eq!(
             under_boundary.load(Ordering::SeqCst),
-            1,
-            "failed attachment must run its exact cleanup without reacquiring B"
+            0,
+            "arbitrary cleanup must not execute under caller-owned B"
         );
         assert!(
+            machine.contains_session(&session_id).await,
+            "wedged process-owned cleanup must retain exact retry authority"
+        );
+        cleanup_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while machine.contains_session(&session_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released process-owned cleanup must finish exact unregister");
+        assert!(
             !machine.contains_session(&session_id).await,
-            "startup owner must unregister the exact unserved attachment"
+            "process-owned cleanup must unregister the exact unserved attachment"
         );
     }
 

@@ -26,3 +26,24 @@ impl From<meerkat_core::Usage> for WireUsage {
         }
     }
 }
+
+/// One provider turn with adapter-authored normalized accounting evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WireTurnUsage {
+    #[serde(flatten)]
+    pub usage: WireUsage,
+    pub accounting: meerkat_core::ProviderTokenAccounting,
+}
+
+impl From<meerkat_core::TurnUsage> for WireTurnUsage {
+    fn from(usage: meerkat_core::TurnUsage) -> Self {
+        let normalized_total_tokens = usage.normalized_total_tokens();
+        let mut wire_usage: WireUsage = usage.as_usage().clone().into();
+        wire_usage.total_tokens = normalized_total_tokens;
+        Self {
+            usage: wire_usage,
+            accounting: usage.accounting().clone(),
+        }
+    }
+}

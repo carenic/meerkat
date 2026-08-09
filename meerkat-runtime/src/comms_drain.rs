@@ -31,13 +31,13 @@ use meerkat_contracts::wire::WireMemberHistoryPageBody;
 use meerkat_contracts::wire::supervisor_bridge::{
     BRIDGE_TURN_OUTCOME_ACK_MAX, BridgeAck, BridgeBindResponse, BridgeCapabilities, BridgeCommand,
     BridgeDeliveryOutcome, BridgeDeliveryPayload, BridgeDeliveryRejectionCause,
-    BridgeDeliveryResponse, BridgeDestroyResponse, BridgeEventCursor, BridgeHardCancelPayload,
-    BridgeLiveControlledResponse, BridgeLiveOpenedResponse, BridgeMemberEventsPage,
-    BridgeMemberHistoryPage, BridgeMemberIncarnation, BridgeMemberRuntimeState,
-    BridgeMobPeerOverlayHandoff, BridgeObservationResponse, BridgeOutboundTaintTarget,
-    BridgeOutcomeTracking, BridgePeerConnectivity, BridgePeerIdentity, BridgePeerSpec,
-    BridgeProtocolVersion, BridgeRejectionCause, BridgeReply, BridgeRetireResponse,
-    BridgeSupervisorPayload, BridgeSupervisorRotationObservation,
+    BridgeDeliveryResponse, BridgeDestroyResponse, BridgeDirectMemberFence, BridgeEventCursor,
+    BridgeHardCancelPayload, BridgeLiveControlledResponse, BridgeLiveOpenedResponse,
+    BridgeMemberEventsPage, BridgeMemberHistoryPage, BridgeMemberIncarnation,
+    BridgeMemberRuntimeState, BridgeMobPeerOverlayHandoff, BridgeObservationResponse,
+    BridgeOutboundTaintTarget, BridgeOutcomeTracking, BridgePeerConnectivity, BridgePeerIdentity,
+    BridgePeerSpec, BridgeProtocolVersion, BridgeRejectionCause, BridgeReply, BridgeRetireOutcome,
+    BridgeRetireResponse, BridgeSupervisorPayload, BridgeSupervisorRotationObservation,
     BridgeSupervisorRotationOperationReceipt, BridgeSupervisorRotationPendingPhase,
     BridgeSupervisorRotationRejectionCause, BridgeSupervisorRotationRejectionReceipt,
     BridgeSupervisorRotationState, BridgeSupervisorRotationTargetReceipt,
@@ -75,7 +75,6 @@ use crate::meerkat_machine::{
     SupervisorAuthorizeAdmission, SupervisorBindAdmission, SupervisorBindingStageError,
     SupervisorRotationObservation, SupervisorRotationSubmission,
 };
-use crate::service_ext::SessionServiceRuntimeExt as _;
 use crate::tokio::sync::mpsc;
 use crate::traits::RuntimeControlPlane;
 
@@ -153,7 +152,7 @@ pub fn spawn_comms_drain(
 
             // Drain the CLASSIFIED path directly so a classification fault stays
             // a typed error instead of being laundered into an empty candidate
-            // vec (the old `drain_peer_input_candidates().await` collapsed the
+            // vec (the removed compatibility drain collapsed the
             // fallible drain with `.unwrap_or_default()`, making an error
             // indistinguishable from an idle inbox and triggering the
             // idle/dismiss lifecycle branch below). Empty-because-error must be
@@ -2211,6 +2210,31 @@ async fn register_member_incarnation(
     Ok(())
 }
 
+async fn install_direct_member_fence(
+    adapter: &Arc<MeerkatMachine>,
+    session_id: &SessionId,
+    requested: &meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+) -> Result<BridgeDirectMemberFence, (BridgeRejectionCause, String)> {
+    adapter
+        .install_direct_member_incarnation(session_id, requested)
+        .await
+        .map_err(|error| match error {
+            crate::traits::RuntimeDriverError::StaleAuthority { reason } => {
+                (BridgeRejectionCause::StaleFence, reason)
+            }
+            crate::traits::RuntimeDriverError::ValidationFailed { reason } => {
+                (BridgeRejectionCause::Unsupported, reason)
+            }
+            crate::traits::RuntimeDriverError::RecoveryBackoff { reason } => {
+                (BridgeRejectionCause::BindAdmissionOutcomeUnknown, reason)
+            }
+            other => (
+                BridgeRejectionCause::BindAdmissionOutcomeUnknown,
+                format!("direct member fence installation failed: {other}"),
+            ),
+        })
+}
+
 /// Validate one direct member command against the exact host residency that
 /// the controller admitted before detaching transport. Member generation,
 /// fence, session, and key can all be reused after host replacement, so the
@@ -3425,7 +3449,7 @@ async fn try_handle_supervisor_bridge_delivery(
     let raw_target = delivery.target;
     let (next, preflight_rejection) = if BridgeProtocolVersion::try_from(delivery.protocol_version)
         .ok()
-        == Some(BridgeProtocolVersion::V4)
+        .is_some_and(BridgeProtocolVersion::supports_multi_host)
     {
         match TrustedPeerDescriptor::try_from(raw_target.clone()) {
             Ok(target) => (
@@ -3935,6 +3959,23 @@ async fn try_handle_supervisor_bridge_command(
                         .await;
                         return true;
                     }
+                    let member_fence =
+                        match install_direct_member_fence(adapter, session_id, &payload.member)
+                            .await
+                        {
+                            Ok(fence) => fence,
+                            Err((cause, reason)) => {
+                                send_bridge_failure(
+                                    comms_runtime,
+                                    candidate,
+                                    cause,
+                                    format!("bind member failed: {reason}"),
+                                    Some(payload.supervisor.address.as_str()),
+                                )
+                                .await;
+                                return true;
+                            }
+                        };
                     send_bridge_response(
                         comms_runtime,
                         candidate,
@@ -3943,6 +3984,7 @@ async fn try_handle_supervisor_bridge_command(
                             peer_id,
                             address: canonicalize_bridge_address(&advertised),
                             capabilities: bridge_capabilities(payload.protocol_version),
+                            member_fence,
                         }),
                         None,
                     )
@@ -4023,6 +4065,21 @@ async fn try_handle_supervisor_bridge_command(
                 .await;
                 return true;
             }
+            let member_fence =
+                match install_direct_member_fence(adapter, session_id, &payload.member).await {
+                    Ok(fence) => fence,
+                    Err((cause, reason)) => {
+                        send_bridge_failure(
+                            comms_runtime,
+                            candidate,
+                            cause,
+                            format!("bind member failed after supervisor admission: {reason}"),
+                            Some(payload.supervisor.address.as_str()),
+                        )
+                        .await;
+                        return true;
+                    }
+                };
             send_bridge_response(
                 comms_runtime,
                 candidate,
@@ -4031,6 +4088,7 @@ async fn try_handle_supervisor_bridge_command(
                     peer_id,
                     address: canonicalize_bridge_address(&advertised_address),
                     capabilities: bridge_capabilities(payload.protocol_version),
+                    member_fence,
                 }),
                 None,
             )
@@ -4560,12 +4618,17 @@ async fn try_handle_supervisor_bridge_command(
             true
         }
         BridgeCommand::RetireMember(payload) => {
+            let supervisor_payload = BridgeSupervisorPayload {
+                supervisor: payload.supervisor.clone(),
+                epoch: payload.epoch,
+                protocol_version: payload.protocol_version,
+            };
             if let Err((cause, reason)) = resolve_authorized_supervisor_cleanup_with_response_route(
                 adapter,
                 session_id,
                 comms_runtime,
                 sender,
-                &payload,
+                &supervisor_payload,
                 crate::meerkat_machine::dsl::SupervisorCleanupCommandKind::Retire,
                 "retire member failed",
             )
@@ -4574,21 +4637,41 @@ async fn try_handle_supervisor_bridge_command(
                 send_bridge_failure(comms_runtime, candidate, cause, reason, None).await;
                 return true;
             }
-            match adapter.retire_runtime(session_id).await {
+            match adapter
+                .retire_direct_member_runtime(session_id, &payload.member_fence)
+                .await
+            {
                 Ok(report) => {
                     send_bridge_response(
                         comms_runtime,
                         candidate,
                         meerkat_core::interaction::ResponseStatus::Completed,
                         BridgeReply::Retire(BridgeRetireResponse {
-                            inputs_abandoned: report.inputs_abandoned,
-                            inputs_pending_drain: report.inputs_pending_drain,
+                            outcome: BridgeRetireOutcome::Retired {
+                                inputs_abandoned: report.inputs_abandoned,
+                                inputs_pending_drain: report.inputs_pending_drain,
+                            },
                         }),
                         None,
                     )
                     .await;
                 }
-                Err(error) => {
+                Err(crate::meerkat_machine::DirectMemberRetireError::Stale { current }) => {
+                    send_bridge_response(
+                        comms_runtime,
+                        candidate,
+                        meerkat_core::interaction::ResponseStatus::Completed,
+                        BridgeReply::Retire(BridgeRetireResponse {
+                            outcome: BridgeRetireOutcome::Stale {
+                                presented: payload.member_fence.evidence(),
+                                current,
+                            },
+                        }),
+                        None,
+                    )
+                    .await;
+                }
+                Err(crate::meerkat_machine::DirectMemberRetireError::Runtime(error)) => {
                     send_bridge_failure(
                         comms_runtime,
                         candidate,
@@ -5062,7 +5145,7 @@ async fn try_handle_supervisor_bridge_command(
             true
         }
         BridgeCommand::ObserveSupervisorRotation(payload) => {
-            if payload.protocol_version != BridgeProtocolVersion::V4 {
+            if !payload.protocol_version.supports_multi_host() {
                 send_bridge_failure(
                     comms_runtime,
                     candidate,
@@ -6866,6 +6949,12 @@ mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
     use uuid::Uuid;
 
+    fn durable_direct_member_test_machine() -> Arc<MeerkatMachine> {
+        Arc::new(MeerkatMachine::persistent_without_blobs(Arc::new(
+            crate::store::InMemoryRuntimeStore::new(),
+        )))
+    }
+
     #[derive(Default)]
     struct TestPeerIngressQueue {
         candidates: std::sync::Mutex<VecDeque<PeerInputCandidate>>,
@@ -8059,16 +8148,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CommsRuntime for OneShotPeerRequestRuntime {
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
             self.notify.clone()
-        }
-
-        fn dismiss_received(&self) -> bool {
-            self.queue.remaining() == 0
         }
 
         fn peer_interaction_handle(
@@ -8254,10 +8335,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CommsRuntime for PrefixPausingRuntime {
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
             self.notify.clone()
         }
@@ -8320,10 +8397,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CommsRuntime for ClassifiedDrainOutcomeRuntime {
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
             self.notify.clone()
         }
@@ -8362,7 +8435,7 @@ mod tests {
 
     /// Regression for #341: a classified-drain ERROR must NOT be laundered into
     /// an empty inbox and routed to the idle/dismiss lifecycle branch. With the
-    /// old `drain_peer_input_candidates().await.unwrap_or_default()` collapse,
+    /// removed compatibility-drain collapse,
     /// an error became `Vec::new()` and the loop idled until the (long) idle
     /// timeout. The fix consumes the typed classified path and fails closed
     /// promptly with `DrainExitReason::Failed`, so the drain exits well before
@@ -8974,6 +9047,7 @@ mod tests {
                 expected_peer_id: PEER_ID_RECEIVER.to_string(),
                 expected_address: "inproc://receiver".to_string(),
                 bootstrap_token: "bootstrap".to_string().into(),
+                member: sample_direct_member_incarnation(),
             },
         );
         let id = InteractionId(Uuid::new_v4());
@@ -9294,7 +9368,7 @@ mod tests {
         let supervisor_spec =
             trusted_tcp_peer_from_runtime("mob/__mob_supervisor__", &supervisor_runtime);
 
-        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let adapter = durable_direct_member_test_machine();
         let session_id = SessionId::new();
         adapter
             .register_session(session_id.clone())
@@ -9313,6 +9387,7 @@ mod tests {
                 expected_peer_id: member_spec.peer_id.as_str(),
                 expected_address: member_spec.address.to_string(),
                 bootstrap_token: member_runtime.bridge_bootstrap_token().to_owned().into(),
+                member: sample_direct_member_incarnation(),
             },
         );
         let (request_receipt, candidate) = tokio::join!(
@@ -9438,7 +9513,7 @@ mod tests {
         let supervisor_spec =
             trusted_tcp_peer_from_runtime("mob/__mob_supervisor__", &supervisor_runtime);
 
-        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let adapter = durable_direct_member_test_machine();
         let session_id = SessionId::new();
         adapter
             .register_session(session_id.clone())
@@ -9476,6 +9551,7 @@ mod tests {
                 expected_peer_id: member_spec.peer_id.as_str(),
                 expected_address: member_spec.address.to_string(),
                 bootstrap_token: member_runtime.bridge_bootstrap_token().to_owned().into(),
+                member: sample_direct_member_incarnation(),
             },
         );
         let (request_receipt, candidate) = tokio::join!(
@@ -10215,7 +10291,10 @@ mod tests {
         label: &str,
     ) -> PeerInputCandidate {
         for _ in 0..40 {
-            let candidates = runtime.drain_peer_input_candidates().await;
+            let candidates = runtime
+                .handoff_volatile_peer_input_candidates()
+                .await
+                .expect("volatile peer-input handoff");
             if let Some(candidate) = candidates.into_iter().next() {
                 return candidate;
             }
@@ -10268,8 +10347,8 @@ mod tests {
             .find("notified.as_mut().enable();")
             .expect("drain must enable() its pinned inbox waiter");
         let drain = source
-            .find("comms_runtime.drain_classified_inbox_interactions().await")
-            .expect("drain must consume the typed classified inbox path");
+            .find("comms_runtime.claim_classified_inbox_interaction().await")
+            .expect("drain must claim the typed classified inbox head");
         assert!(
             enable < drain,
             "the inbox waiter must be registered (enable) BEFORE the drain, not after"
@@ -10355,10 +10434,6 @@ mod tests {
 
         fn bridge_bootstrap_token(&self) -> Option<String> {
             self.bootstrap_token.clone()
-        }
-
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
         }
 
         fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
@@ -10532,7 +10607,6 @@ mod tests {
                 auth_required: true,
                 authority_phase: meerkat_core::interaction::PeerIngressAuthorityPhase::Received,
                 trusted_peers: self.trusted_peers.lock().await.values().cloned().collect(),
-                submission_queue_len: 0,
                 queue: meerkat_core::interaction::PeerIngressQueueSnapshot::default(),
             })
         }
@@ -11016,6 +11090,7 @@ mod tests {
             expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: runtime.advertised_address().unwrap(),
             bootstrap_token: "wrong-token".into(),
+            member: sample_direct_member_incarnation(),
         };
 
         let (cause, error) = validate_bind_request(
@@ -11050,6 +11125,7 @@ mod tests {
             expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: runtime.advertised_address().unwrap(),
             bootstrap_token: "expected-token".into(),
+            member: sample_direct_member_incarnation(),
         };
 
         let (authorized, advertised_address) = validate_bind_request(
@@ -11663,6 +11739,7 @@ mod tests {
             expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: runtime.advertised_address().unwrap(),
             bootstrap_token: "expected-token".into(),
+            member: sample_direct_member_incarnation(),
         };
         let attacker_peer_id =
             PeerId::parse(PEER_ID_OLD_SUPERVISOR).expect("valid attacker peer id");
@@ -11702,6 +11779,7 @@ mod tests {
             expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: runtime.advertised_address().unwrap(),
             bootstrap_token: "expected-token".into(),
+            member: sample_direct_member_incarnation(),
         };
 
         let (authorized, advertised_address) = validate_bind_request(
@@ -11736,6 +11814,7 @@ mod tests {
             expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: "inproc://receiver-real".to_string(),
             bootstrap_token: "expected-token".into(),
+            member: sample_direct_member_incarnation(),
         };
 
         let (_, advertised_address) = validate_bind_request(
@@ -11766,6 +11845,7 @@ mod tests {
             expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: "inproc://receiver-stale".to_string(),
             bootstrap_token: "expected-token".into(),
+            member: sample_direct_member_incarnation(),
         };
 
         let (cause, error) = validate_bind_request(
@@ -11887,6 +11967,7 @@ mod tests {
             expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: runtime.advertised_address().unwrap(),
             bootstrap_token: "expected-token".into(),
+            member: sample_direct_member_incarnation(),
         };
 
         let (cause, error) = validate_bind_request(
@@ -11905,6 +11986,16 @@ mod tests {
         );
     }
 
+    fn sample_direct_member_incarnation()
+    -> meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+        meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+            mob_id: "mob-direct-fixture".to_string(),
+            agent_identity: "worker-direct-fixture".to_string(),
+            generation: 1,
+            fence_token: 1,
+        }
+    }
+
     fn sample_bind_payload() -> meerkat_contracts::wire::supervisor_bridge::BridgeBindPayload {
         meerkat_contracts::wire::supervisor_bridge::BridgeBindPayload {
             supervisor: supervisor_bridge_spec(),
@@ -11913,6 +12004,7 @@ mod tests {
             expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: "inproc://receiver".to_string(),
             bootstrap_token: "expected-token".into(),
+            member: sample_direct_member_incarnation(),
         }
     }
 
@@ -12443,6 +12535,7 @@ mod tests {
                     .unwrap_or_else(|| "inproc://bind-rebind-receiver".to_string()),
                 // Even with a *valid* bootstrap token, the rebind must fail.
                 bootstrap_token: runtime.bridge_bootstrap_token().unwrap_or_default().into(),
+                member: sample_direct_member_incarnation(),
             },
         );
         let candidate = bridge_candidate(&adversary_peer_id, &command);
@@ -12518,6 +12611,7 @@ mod tests {
                 expected_peer_id: PEER_ID_RECEIVER.to_string(),
                 expected_address: "inproc://receiver".to_string(),
                 bootstrap_token: "expected-token".into(),
+                member: sample_direct_member_incarnation(),
             },
         );
         let candidate = bridge_candidate(&adversary_peer_id, &command);
@@ -12604,10 +12698,6 @@ mod tests {
             self.bootstrap_token.clone()
         }
 
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
             self.inbox_notify.clone()
         }
@@ -12679,7 +12769,7 @@ mod tests {
             inbox_notify: Arc::new(tokio::sync::Notify::new()),
             sent: sent.clone(),
         });
-        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let adapter = durable_direct_member_test_machine();
         let session_id = SessionId::new();
         adapter
             .register_session(session_id.clone())
@@ -12694,6 +12784,7 @@ mod tests {
                 expected_peer_id: PEER_ID_RECEIVER.to_string(),
                 expected_address: "inproc://receiver".to_string(),
                 bootstrap_token: "expected-token".into(),
+                member: sample_direct_member_incarnation(),
             },
         );
         let candidate = bridge_candidate(&supervisor.peer_id, &command);
@@ -12797,6 +12888,7 @@ mod tests {
                 expected_peer_id: attacker_peer_id.clone(),
                 expected_address: attacker_address.clone(),
                 bootstrap_token: "expected-token".into(),
+                member: sample_direct_member_incarnation(),
             },
         );
         let candidate = bridge_candidate(&authorized.peer_id.as_str(), &command);
@@ -13023,6 +13115,7 @@ mod tests {
             expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: runtime.advertised_address().unwrap(),
             bootstrap_token: "whatever".into(),
+            member: sample_direct_member_incarnation(),
         };
 
         let (cause, _error) = validate_bind_request(
@@ -13053,6 +13146,7 @@ mod tests {
             expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: "inproc://receiver".to_string(),
             bootstrap_token: "expected-token".into(),
+            member: sample_direct_member_incarnation(),
         };
 
         let (cause, error) = validate_bind_request(
@@ -14509,6 +14603,323 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delayed_a_retire_reports_current_b_without_retiring_successor() {
+        let adapter = durable_direct_member_test_machine();
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("register peer-only session");
+
+        let predecessor =
+            meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+                mob_id: "mob-retire-fence".to_string(),
+                agent_identity: "worker-retire-fence".to_string(),
+                generation: 1,
+                fence_token: 11,
+            };
+        let fence_a = adapter
+            .install_direct_member_incarnation(&session_id, &predecessor)
+            .await
+            .expect("install predecessor A");
+        let successor = meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+            generation: 2,
+            fence_token: 12,
+            ..predecessor
+        };
+        let fence_b = adapter
+            .install_direct_member_incarnation(&session_id, &successor)
+            .await
+            .expect("install successor B");
+        assert_ne!(fence_a, fence_b, "successor bind mints exact new authority");
+
+        let before = crate::service_ext::SessionServiceRuntimeExt::runtime_state(
+            adapter.as_ref(),
+            &session_id,
+        )
+        .await
+        .expect("observe runtime before stale retirement");
+        let mut forged_runtime_token = fence_b.clone();
+        forged_runtime_token.runtime_session_token =
+            meerkat_contracts::wire::supervisor_bridge::BridgeDirectRuntimeSessionToken::new();
+        let forged = adapter
+            .retire_direct_member_runtime(&session_id, &forged_runtime_token)
+            .await
+            .expect_err("caller-minted runtime/session token must not authorize retirement");
+        assert!(matches!(
+            forged,
+            crate::meerkat_machine::DirectMemberRetireError::Stale {
+                current: Some(ref current)
+            } if current == &fence_b.evidence()
+        ));
+        let stale = adapter
+            .retire_direct_member_runtime(&session_id, &fence_a)
+            .await
+            .expect_err("delayed predecessor retirement must be fenced");
+        match stale {
+            crate::meerkat_machine::DirectMemberRetireError::Stale { current } => {
+                assert_eq!(current, Some(fence_b.evidence()));
+            }
+            crate::meerkat_machine::DirectMemberRetireError::Runtime(error) => {
+                panic!("expected typed stale evidence, got runtime error: {error}");
+            }
+        }
+        assert_eq!(
+            crate::service_ext::SessionServiceRuntimeExt::runtime_state(
+                adapter.as_ref(),
+                &session_id,
+            )
+            .await
+            .expect("observe runtime after stale retirement"),
+            before,
+            "stale A retirement must not invoke the successor runtime effect"
+        );
+
+        adapter
+            .retire_direct_member_runtime(&session_id, &fence_b)
+            .await
+            .expect("current successor fence may retire its runtime");
+        assert_eq!(
+            crate::service_ext::SessionServiceRuntimeExt::runtime_state(
+                adapter.as_ref(),
+                &session_id,
+            )
+            .await
+            .expect("observe retired successor"),
+            crate::RuntimeState::Retired
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_a_bind_is_rejected_after_same_session_runtime_replacement() {
+        let adapter = durable_direct_member_test_machine();
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("register predecessor runtime");
+        let predecessor =
+            meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+                mob_id: "mob-bind-replacement-fence".to_string(),
+                agent_identity: "worker-bind-replacement-fence".to_string(),
+                generation: 1,
+                fence_token: 21,
+            };
+        adapter
+            .install_direct_member_incarnation(&session_id, &predecessor)
+            .await
+            .expect("install predecessor A");
+        let successor = meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+            generation: 2,
+            fence_token: 22,
+            ..predecessor.clone()
+        };
+        let fence_b_before = adapter
+            .install_direct_member_incarnation(&session_id, &successor)
+            .await
+            .expect("install successor B");
+
+        adapter
+            .unregister_session(&session_id)
+            .await
+            .expect("unregister predecessor runtime epoch");
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("replace same SessionId runtime epoch");
+
+        let delayed_a = adapter
+            .install_direct_member_incarnation(&session_id, &predecessor)
+            .await
+            .expect_err("delayed A bind must not mint authority on replacement runtime");
+        assert!(matches!(
+            delayed_a,
+            crate::traits::RuntimeDriverError::StaleAuthority { .. }
+        ));
+        let fence_b_after = adapter
+            .install_direct_member_incarnation(&session_id, &successor)
+            .await
+            .expect("same successor semantic may rebind to replacement runtime");
+        assert_ne!(
+            fence_b_after.runtime_session_token, fence_b_before.runtime_session_token,
+            "runtime replacement must mint a fresh epoch-local bearer token"
+        );
+        let stale_old_b = adapter
+            .retire_direct_member_runtime(&session_id, &fence_b_before)
+            .await
+            .expect_err("old bearer must not retire same-semantic replacement runtime");
+        assert!(matches!(
+            stale_old_b,
+            crate::meerkat_machine::DirectMemberRetireError::Stale {
+                current: Some(ref current)
+            } if current == &fence_b_after.evidence()
+        ));
+        assert_eq!(
+            crate::service_ext::SessionServiceRuntimeExt::runtime_state(
+                adapter.as_ref(),
+                &session_id,
+            )
+            .await
+            .expect("observe same-semantic replacement after stale retire"),
+            crate::RuntimeState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_a_bind_is_rejected_after_cold_runtime_recovery() {
+        let concrete_store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let store: Arc<dyn crate::store::RuntimeStore> = concrete_store;
+        let session_id = SessionId::new();
+        let predecessor =
+            meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+                mob_id: "mob-bind-cold-fence".to_string(),
+                agent_identity: "worker-bind-cold-fence".to_string(),
+                generation: 1,
+                fence_token: 31,
+            };
+        let successor = meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+            generation: 2,
+            fence_token: 32,
+            ..predecessor.clone()
+        };
+
+        let first = Arc::new(MeerkatMachine::persistent_without_blobs(Arc::clone(&store)));
+        first
+            .register_session(session_id.clone())
+            .await
+            .expect("register first persistent runtime");
+        first
+            .install_direct_member_incarnation(&session_id, &predecessor)
+            .await
+            .expect("install predecessor A");
+        first
+            .install_direct_member_incarnation(&session_id, &successor)
+            .await
+            .expect("durably advance to successor B");
+        drop(first);
+
+        let recovered = Arc::new(MeerkatMachine::persistent_without_blobs(store));
+        recovered
+            .register_session(session_id.clone())
+            .await
+            .expect("cold recover same persistent runtime");
+        let delayed_a = recovered
+            .install_direct_member_incarnation(&session_id, &predecessor)
+            .await
+            .expect_err("durable high-water must reject delayed A before B rebind");
+        assert!(matches!(
+            delayed_a,
+            crate::traits::RuntimeDriverError::StaleAuthority { .. }
+        ));
+        recovered
+            .install_direct_member_incarnation(&session_id, &successor)
+            .await
+            .expect("current B semantic may mint fresh cold-runtime authority");
+    }
+
+    #[tokio::test]
+    async fn direct_member_bind_refuses_runtime_without_durable_high_water_store() {
+        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("register storeless runtime");
+        let error = adapter
+            .install_direct_member_incarnation(
+                &session_id,
+                &meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+                    mob_id: "mob-storeless-refusal".to_string(),
+                    agent_identity: "worker-storeless-refusal".to_string(),
+                    generation: 1,
+                    fence_token: 41,
+                },
+            )
+            .await
+            .expect_err("V5 bind must fail closed without durable high-water authority");
+        assert!(matches!(
+            error,
+            crate::traits::RuntimeDriverError::ValidationFailed { ref reason }
+                if reason.contains("durable semantic high-water store")
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_member_bind_timeout_is_typed_uncertain_and_exact_retry_recovers_fence() {
+        let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let entered = Arc::new(crate::tokio::sync::Notify::new());
+        let release = Arc::new(crate::tokio::sync::Notify::new());
+        store.block_next_direct_member_high_water_admission(
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        );
+        let adapter = Arc::new(MeerkatMachine::persistent_without_blobs(
+            Arc::clone(&store) as Arc<dyn crate::store::RuntimeStore>
+        ));
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("register blocked-store runtime");
+        let requested = meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation {
+            mob_id: "mob-bind-outcome-unknown".to_string(),
+            agent_identity: "worker-bind-outcome-unknown".to_string(),
+            generation: 1,
+            fence_token: 61,
+        };
+        let bind = crate::tokio::spawn({
+            let adapter = Arc::clone(&adapter);
+            let session_id = session_id.clone();
+            let requested = requested.clone();
+            async move { install_direct_member_fence(&adapter, &session_id, &requested).await }
+        });
+        crate::tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("store admission reached deterministic block");
+        let (cause, _) = crate::tokio::time::timeout(std::time::Duration::from_secs(2), bind)
+            .await
+            .expect("bind observer remains bounded")
+            .expect("bind observer task joins")
+            .expect_err("blocked durable admission cannot report success");
+        assert_eq!(
+            cause,
+            BridgeRejectionCause::BindAdmissionOutcomeUnknown,
+            "bounded observer must not certify that the process-owned bind made no mutation"
+        );
+
+        let forged = meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence {
+            mob_id: requested.mob_id.clone(),
+            agent_identity: requested.agent_identity.clone(),
+            generation: requested.generation,
+            fence_token: requested.fence_token,
+            member_session_id: session_id.to_string(),
+            runtime_session_token:
+                meerkat_contracts::wire::supervisor_bridge::BridgeDirectRuntimeSessionToken::new(),
+        };
+        crate::tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            adapter.retire_direct_member_runtime(&session_id, &forged),
+        )
+        .await
+        .expect("retire must not wait on the blocked custom store")
+        .expect_err("no fence is installed before store release");
+
+        release.notify_one();
+        let recovered = adapter
+            .install_direct_member_incarnation(&session_id, &requested)
+            .await
+            .expect("exact retry joins late process-owned admission");
+        let replayed = adapter
+            .install_direct_member_incarnation(&session_id, &requested)
+            .await
+            .expect("exact retry replays installed bearer");
+        assert_eq!(
+            replayed, recovered,
+            "equal retry must recover the exact host-minted bearer token"
+        );
+    }
+
     #[test]
     fn delayed_g1_peer_message_fence_does_not_match_revived_g2_recipient() {
         let current = BridgeMemberIncarnation {
@@ -14707,10 +15118,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CommsRuntime for WaiterReplyRuntime {
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
             self.notify.clone()
         }
@@ -15251,7 +15658,7 @@ mod tests {
         let staged = runtime_impl.staged_reply_endpoints.clone();
         let sent = runtime_impl.sent_commands.clone();
         let runtime: Arc<dyn CommsRuntime> = Arc::new(runtime_impl);
-        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let adapter = durable_direct_member_test_machine();
         let session_id = SessionId::new();
         adapter
             .register_session(session_id.clone())

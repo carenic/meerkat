@@ -187,6 +187,28 @@ pub enum WorkStatus {
     Failed,
 }
 
+/// Policy applied when a direct child linked by a `parent` edge fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FailedChildJoinPolicy {
+    #[default]
+    RequireSuccess,
+    Propagate,
+    Accept,
+}
+
+/// Policy applied when a direct child linked by a `parent` edge is cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CancelledChildJoinPolicy {
+    #[default]
+    RequireSuccess,
+    Propagate,
+    Accept,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -386,7 +408,15 @@ pub struct WorkClaim {
     pub claimed_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_expires_at: Option<DateTime<Utc>>,
+    /// Durable witness that the expired lease fact has already been emitted.
+    /// This is observation provenance, not a second lease authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_observed_at: Option<DateTime<Utc>>,
 }
+
+/// Public upper bound for relative WorkGraph claim leases. Absolute leases
+/// remain supported, but callers must choose exactly one lease representation.
+pub const MAX_WORK_CLAIM_LEASE_SECONDS: u64 = 365 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -926,6 +956,10 @@ pub struct WorkItem {
     pub status: WorkStatus,
     #[serde(default)]
     pub completion_policy: WorkCompletionPolicy,
+    #[serde(default)]
+    pub failed_child_join_policy: FailedChildJoinPolicy,
+    #[serde(default)]
+    pub cancelled_child_join_policy: CancelledChildJoinPolicy,
     pub priority: WorkPriority,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub labels: BTreeSet<String>,
@@ -962,6 +996,10 @@ struct WorkItemWire {
     status: WorkStatus,
     #[serde(default)]
     completion_policy: WorkCompletionPolicy,
+    #[serde(default)]
+    failed_child_join_policy: FailedChildJoinPolicy,
+    #[serde(default)]
+    cancelled_child_join_policy: CancelledChildJoinPolicy,
     priority: WorkPriority,
     #[serde(default)]
     labels: BTreeSet<String>,
@@ -1008,6 +1046,8 @@ impl<'de> Deserialize<'de> for WorkItem {
             description: wire.description,
             status: wire.status,
             completion_policy: wire.completion_policy,
+            failed_child_join_policy: wire.failed_child_join_policy,
+            cancelled_child_join_policy: wire.cancelled_child_join_policy,
             priority: wire.priority,
             labels: wire.labels,
             owner: wire.owner,
@@ -1051,6 +1091,8 @@ impl schemars::JsonSchema for WorkItem {
                 "title",
                 "status",
                 "completion_policy",
+                "failed_child_join_policy",
+                "cancelled_child_join_policy",
                 "priority",
                 "machine_state",
                 "revision",
@@ -1112,6 +1154,14 @@ impl schemars::JsonSchema for WorkItem {
                         }
                     ]
                 },
+                "failed_child_join_policy": {
+                    "type": "string",
+                    "enum": ["require_success", "propagate", "accept"]
+                },
+                "cancelled_child_join_policy": {
+                    "type": "string",
+                    "enum": ["require_success", "propagate", "accept"]
+                },
                 "priority": {
                     "type": "string",
                     "enum": ["low", "medium", "high"]
@@ -1169,7 +1219,8 @@ impl schemars::JsonSchema for WorkItem {
                                     }
                                 },
                                 "claimed_at": { "type": "string", "format": "date-time" },
-                                "lease_expires_at": { "type": ["string", "null"], "format": "date-time" }
+                                "lease_expires_at": { "type": ["string", "null"], "format": "date-time" },
+                                "expiry_observed_at": { "type": ["string", "null"], "format": "date-time" }
                             }
                         },
                         { "type": "null" }
@@ -1310,6 +1361,7 @@ pub struct WorkEdge {
 pub enum WorkGraphEventKind {
     Created,
     Updated,
+    ReadinessObserved,
     Claimed,
     Released,
     Blocked,
@@ -1320,6 +1372,29 @@ pub enum WorkGraphEventKind {
     AttentionUpdated,
     ExecutionBound,
     ExecutionTransitioned,
+}
+
+/// Typed transition facts recorded by the same durable commit as the mutation
+/// that first observes them. These are ledger facts, not wake instructions.
+/// Schedule may cause an observing mutation, but WorkGraph never owns a timer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkGraphFact {
+    ItemReady {
+        item_id: WorkItemId,
+        item_revision: u64,
+    },
+    LeaseExpired {
+        item_id: WorkItemId,
+        expired_owner: WorkOwnerKey,
+        lease_expires_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+    },
+    NamespaceTerminal {
+        namespace: WorkNamespace,
+        observed_at: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1335,6 +1410,10 @@ pub struct WorkGraphEvent {
     pub at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub payload: Value,
+    /// Facts atomically observed by this mutation. A fact is never appended by
+    /// a read-only query or by an observability projection after commit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<WorkGraphFact>,
 }
 
 impl WorkGraphEvent {
@@ -1354,6 +1433,7 @@ impl WorkGraphEvent {
             kind,
             at,
             payload,
+            facts: Vec::new(),
         }
     }
 
@@ -1372,6 +1452,7 @@ impl WorkGraphEvent {
             kind,
             at,
             payload,
+            facts: Vec::new(),
         }
     }
 }
@@ -1390,6 +1471,10 @@ pub struct CreateWorkItemRequest {
     pub priority: WorkPriority,
     #[serde(default)]
     pub completion_policy: WorkCompletionPolicy,
+    #[serde(default)]
+    pub failed_child_join_policy: FailedChildJoinPolicy,
+    #[serde(default)]
+    pub cancelled_child_join_policy: CancelledChildJoinPolicy,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub labels: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1475,6 +1560,37 @@ pub struct ReleaseWorkItemRequest {
     pub expected_revision: u64,
 }
 
+/// Schedule-owned sweeps and other trusted hosts use this to ask WorkGraph to
+/// observe one row at a supplied observation time. WorkGraph validates expiry
+/// from the durable claim row and commits the release plus `LeaseExpired` fact;
+/// it never schedules or wakes itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ObserveLeaseExpiryRequest {
+    pub id: WorkItemId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<WorkNamespace>,
+    pub expected_revision: u64,
+    pub observed_at: DateTime<Utc>,
+}
+
+/// Trusted host observation of a time-dependent ready transition. Schedule may
+/// invoke this as a sweep target, while WorkGraph validates all non-time ledger
+/// conditions and commits `ItemReady` atomically. WorkGraph owns no wake loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ObserveReadinessRequest {
+    pub id: WorkItemId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<WorkNamespace>,
+    pub expected_revision: u64,
+    pub observed_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CloseWorkItemRequest {
@@ -1532,6 +1648,26 @@ pub struct GoalCreateRequest {
     #[serde(default)]
     pub completion_policy: WorkCompletionPolicy,
     #[serde(default)]
+    pub failed_child_join_policy: FailedChildJoinPolicy,
+    #[serde(default)]
+    pub cancelled_child_join_policy: CancelledChildJoinPolicy,
+    #[serde(default)]
+    pub priority: WorkPriority,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub labels: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snoozed_until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_refs: Vec<ExternalWorkRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<WorkEvidenceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<WorkStatus>,
+    #[serde(default)]
     pub delegated_authority: AttentionDelegatedAuthority,
     #[serde(default)]
     pub projection_policy: AttentionProjectionPolicy,
@@ -1553,6 +1689,26 @@ pub struct PublicGoalCreateRequest {
     #[serde(default)]
     pub completion_policy: PublicGoalCompletionPolicy,
     #[serde(default)]
+    pub failed_child_join_policy: FailedChildJoinPolicy,
+    #[serde(default)]
+    pub cancelled_child_join_policy: CancelledChildJoinPolicy,
+    #[serde(default)]
+    pub priority: WorkPriority,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub labels: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snoozed_until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_refs: Vec<ExternalWorkRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<WorkEvidenceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<WorkStatus>,
+    #[serde(default)]
     pub delegated_authority: AttentionDelegatedAuthority,
     #[serde(default)]
     pub projection_policy: AttentionProjectionPolicy,
@@ -1568,6 +1724,16 @@ impl From<PublicGoalCreateRequest> for GoalCreateRequest {
             target: request.target,
             mode: request.mode,
             completion_policy: request.completion_policy.into(),
+            failed_child_join_policy: request.failed_child_join_policy,
+            cancelled_child_join_policy: request.cancelled_child_join_policy,
+            priority: request.priority,
+            labels: request.labels,
+            due_at: request.due_at,
+            not_before: request.not_before,
+            snoozed_until: request.snoozed_until,
+            external_refs: request.external_refs,
+            evidence_refs: request.evidence_refs,
+            status: request.status,
             delegated_authority: request.delegated_authority,
             projection_policy: request.projection_policy,
         }
@@ -1579,6 +1745,26 @@ impl From<PublicGoalCreateRequest> for GoalCreateRequest {
 pub struct GoalCreateResult {
     pub item: WorkItem,
     pub attention: WorkAttentionBinding,
+}
+
+/// Bind goal attention to an already durable WorkGraph item. The item revision
+/// and attention row are checked/inserted in one store transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct GoalBindExistingRequest {
+    pub item_id: WorkItemId,
+    pub expected_item_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<WorkNamespace>,
+    pub target: GoalAttentionTarget,
+    #[serde(default)]
+    pub mode: WorkAttentionMode,
+    #[serde(default)]
+    pub delegated_authority: AttentionDelegatedAuthority,
+    #[serde(default)]
+    pub projection_policy: AttentionProjectionPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

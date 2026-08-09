@@ -32,6 +32,9 @@ calendar. Schedules own time and delivery. They do not own live work state.
 - Use WorkGraph for pending work, dependencies, claims, and evidence.
 - Use Schedule for time. A scheduled prompt may ask an agent to inspect
   WorkGraph, but Schedule should not duplicate WorkGraph readiness logic.
+- Treat an occurrence claim and delivery outcome as Schedule authority only.
+  They do not authorize a WorkGraph claim or prove that the underlying shared
+  work completed.
 - Use memory for recalled knowledge, not for future wakeups.
 - Use builtin tasks for private scratch items that do not need scheduled
   delivery or shared durable coordination.

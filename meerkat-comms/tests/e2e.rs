@@ -14,9 +14,9 @@ use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
 use meerkat_core::comms::TrustedPeerDescriptor;
 use meerkat_core::handles::PeerInteractionHandle;
 use meerkat_core::{
-    BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError, ContentBlock, ContentInput,
-    DslTransitionError, ImageData, InboundPeerRequestState, InteractionStreamState,
-    OutboundPeerRequestState, PeerCorrelationId, ResponseStatus, ToolDispatchContext,
+    BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError, ContentBlock, DslTransitionError,
+    ImageData, InboundPeerRequestState, InteractionStreamState, OutboundPeerRequestState,
+    PeerCorrelationId, ResponseStatus, ToolDispatchContext,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -336,7 +336,7 @@ fn tool_context(runtime: &Arc<CommsRuntime>) -> ToolContext {
 
 #[tokio::test]
 #[ignore = "lane:e2e-smoke"]
-async fn e2e_smoke_mcp_multimodal_blob_current_turn_request_response_loop() {
+async fn e2e_smoke_mcp_multimodal_blob_response_transport() {
     let _lock = INPROC_REGISTRY_LOCK.lock().await;
     meerkat_comms::InprocRegistry::global().clear();
 
@@ -344,26 +344,20 @@ async fn e2e_smoke_mcp_multimodal_blob_current_turn_request_response_loop() {
     let name_a = format!("e2e-image-a-{suffix}");
     let name_b = format!("e2e-image-b-{suffix}");
 
-    let mut runtime_a = CommsRuntime::inproc_only(&name_a).expect("runtime A");
+    let runtime_a = CommsRuntime::inproc_only(&name_a).expect("runtime A");
     let mut runtime_b = CommsRuntime::inproc_only(&name_b).expect("runtime B");
-    let blob_store_a = Arc::new(TestBlobStore::default());
     let blob_store_b = Arc::new(TestBlobStore::default());
-    let message_blob = blob_store_a
-        .put_image("image/png", "bWVzc2FnZS1ibG9i")
-        .await
-        .expect("message blob");
     let response_blob = blob_store_b
         .put_image("image/png", "cmVzcG9uc2UtYmxvYg==")
         .await
         .expect("response blob");
-    runtime_a.set_blob_store(blob_store_a);
     runtime_b.set_blob_store(blob_store_b);
 
     let runtime_a = Arc::new(runtime_a);
     let runtime_b = Arc::new(runtime_b);
     let peer_a = Arc::new(TestPeerInteractionHandle::default());
     let peer_b = Arc::new(TestPeerInteractionHandle::default());
-    install_test_authority(&runtime_a, peer_a);
+    install_test_authority(&runtime_a, peer_a.clone());
     install_test_authority(&runtime_b, peer_b.clone());
     let peer_b_id = runtime_b.public_key().to_peer_id();
     let peer_a_id = runtime_a.public_key().to_peer_id();
@@ -393,113 +387,11 @@ async fn e2e_smoke_mcp_multimodal_blob_current_turn_request_response_loop() {
     )
     .await;
 
-    let ctx_a = tool_context(&runtime_a);
     let ctx_b = tool_context(&runtime_b);
-
-    handle_tools_call_with_context(
-        &ctx_a,
-        "send_message",
-        &json!({
-            "peer_id": peer_b_id,
-            "display_name": name_b,
-            "body": "A->B blob prelude",
-            "blocks": [
-                {"type": "image_ref", "source": "blob", "blob_id": message_blob.blob_id, "media_type": "image/png"},
-                {"type": "text", "text": "Prelude after the image so body synthesis has to decide what to do."}
-            ],
-            "handling_mode": "queue"
-        }),
-        &ToolDispatchContext::default(),
-    )
-    .await
-    .expect("send blob-backed message");
-
-    let b_messages = CoreCommsRuntime::drain_inbox_interactions(runtime_b.as_ref()).await;
-    assert_eq!(b_messages.len(), 1);
-    match &b_messages[0].content {
-        meerkat_core::InteractionContent::Message { body, blocks } => {
-            // Single content authority: the caller supplied a text block, so the
-            // explicit `body` argument is ignored and the carried body is the
-            // projection of the text blocks (mcp/tools.rs `project_body_from_blocks`).
-            assert_eq!(
-                body,
-                "Prelude after the image so body synthesis has to decide what to do."
-            );
-            // Blocks keep caller order: [image, text].
-            let blocks = blocks.as_ref().expect("message blocks");
-            assert_eq!(blocks.len(), 2);
-            assert!(matches!(
-                &blocks[0],
-                ContentBlock::Image {
-                    media_type,
-                    data: ImageData::Inline { data }
-                } if media_type == "image/png" && data == "bWVzc2FnZS1ibG9i"
-            ));
-            assert!(matches!(
-                &blocks[1],
-                ContentBlock::Text { text } if text == "Prelude after the image so body synthesis has to decide what to do."
-            ));
-        }
-        other => panic!("expected B message, got {other:?}"),
-    }
-
-    let request_context =
-        ToolDispatchContext::from_current_turn_input(&ContentInput::Blocks(vec![
-            ContentBlock::Text {
-                text: "not an image".to_string(),
-            },
-            ContentBlock::Image {
-                media_type: "image/png".to_string(),
-                data: ImageData::Inline {
-                    data: "Y3VycmVudC10dXJuLWltYWdl".to_string(),
-                },
-            },
-        ]));
-
-    handle_tools_call_with_context(
-        &ctx_a,
-        "send_request",
-        &json!({
-            "peer_id": peer_b_id,
-            "display_name": name_b,
-            "intent": "checksum_token",
-            "params": {"subject": "describe-current-turn-and-answer-with-image"},
-            "blocks": [
-                {"type": "text", "text": "Request body text block"},
-                {"type": "image_ref", "source": "current_turn", "index": 0}
-            ],
-            "handling_mode": "steer"
-        }),
-        &request_context,
-    )
-    .await
-    .expect("send current-turn image request");
-
-    let b_requests = CoreCommsRuntime::drain_inbox_interactions(runtime_b.as_ref()).await;
-    assert_eq!(b_requests.len(), 1);
-    let request_id = b_requests[0].id;
-    match &b_requests[0].content {
-        meerkat_core::InteractionContent::Request {
-            intent,
-            params,
-            blocks,
-        } => {
-            assert_eq!(intent, "checksum_token");
-            assert_eq!(
-                params["subject"],
-                "describe-current-turn-and-answer-with-image"
-            );
-            let blocks = blocks.as_ref().expect("request blocks");
-            assert!(matches!(
-                &blocks[1],
-                ContentBlock::Image {
-                    data: ImageData::Inline { data },
-                    ..
-                } if data == "Y3VycmVudC10dXJuLWltYWdl"
-            ));
-        }
-        other => panic!("expected B request, got {other:?}"),
-    }
+    let request_id = meerkat_core::InteractionId(Uuid::new_v4());
+    peer_a
+        .request_sent(PeerCorrelationId::from_uuid(request_id.0))
+        .expect("seed A outbound request authority");
     peer_b
         .request_received(
             PeerCorrelationId::from_uuid(request_id.0),
@@ -531,7 +423,12 @@ async fn e2e_smoke_mcp_multimodal_blob_current_turn_request_response_loop() {
     .await
     .expect("send blob-backed response");
 
-    let a_responses = CoreCommsRuntime::drain_inbox_interactions(runtime_a.as_ref()).await;
+    let a_responses = CoreCommsRuntime::handoff_volatile_peer_input_candidates(runtime_a.as_ref())
+        .await
+        .expect("exact volatile response handoff")
+        .into_iter()
+        .map(|candidate| candidate.interaction)
+        .collect::<Vec<_>>();
     assert_eq!(a_responses.len(), 1);
     match &a_responses[0].content {
         meerkat_core::InteractionContent::Response {

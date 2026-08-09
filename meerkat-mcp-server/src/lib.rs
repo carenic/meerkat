@@ -1280,7 +1280,7 @@ impl MeerkatMcpState {
         Self::new_with_bootstrap_options_and_llm(
             bootstrap,
             expose_paths,
-            Some(Arc::new(TestClient::default())),
+            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
         )
         .await
     }
@@ -1434,6 +1434,10 @@ impl MeerkatMcpState {
             Some(Arc::new(meerkat::WorkGraphToolSurface::new(
                 workgraph_service.clone(),
             ))),
+        );
+        meerkat::surface::set_default_workgraph_namespace_grant(
+            &builder,
+            Some(workgraph_service.namespace_grant().clone()),
         );
         let (service, runtime_adapter) =
             meerkat::surface::build_runtime_backed_service(builder, max_sessions, persistence);
@@ -1629,6 +1633,10 @@ impl MeerkatMcpState {
             Some(Arc::new(meerkat::WorkGraphToolSurface::new(
                 workgraph_service.clone(),
             ))),
+        );
+        meerkat::surface::set_default_workgraph_namespace_grant(
+            &builder,
+            Some(workgraph_service.namespace_grant().clone()),
         );
         let blob_store: Arc<dyn meerkat_core::BlobStore> = Arc::new(
             meerkat_store::FsBlobStore::new(realm_paths.root.join("blobs")),
@@ -4137,6 +4145,7 @@ async fn handle_meerkat_run(
                 override_web_search: ToolCategoryOverride::from_override(input.enable_web_search),
                 schedule_tools: None,
                 workgraph_tools: None,
+                workgraph_namespace_grant: None,
                 mob_tool_authority_context: None,
                 preload_skills,
                 realm_id: Some(realm_id),
@@ -4555,6 +4564,7 @@ async fn handle_meerkat_resume(
             override_web_search: ToolCategoryOverride::from_override(input.enable_web_search),
             schedule_tools: None,
             workgraph_tools: None,
+            workgraph_namespace_grant: None,
             mob_tool_authority_context: None,
             preload_skills: preload_skills.clone(),
             peer_meta: input.peer_meta.clone(),
@@ -5348,6 +5358,18 @@ mod tests {
         }
     }
 
+    fn provider_for_successful_mcp_test_model(model: &str) -> meerkat_core::Provider {
+        if model.starts_with("claude-") {
+            meerkat_core::Provider::Anthropic
+        } else if model.starts_with("gpt-") || model.starts_with("o1-") {
+            meerkat_core::Provider::OpenAI
+        } else if model.starts_with("gemini-") {
+            meerkat_core::Provider::Gemini
+        } else {
+            meerkat_core::Provider::Other
+        }
+    }
+
     struct MockLlmClient;
 
     #[async_trait]
@@ -5361,12 +5383,19 @@ mod tests {
 
         fn stream<'a>(
             &'a self,
-            _request: &'a LlmRequest,
+            request: &'a LlmRequest,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
             Box::pin(stream::iter(vec![
                 Ok(LlmEvent::TextDelta {
                     delta: "ok".to_string(),
                     meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider_for_successful_mcp_test_model(&request.model),
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
                 }),
                 Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {
@@ -5401,7 +5430,7 @@ mod tests {
 
         fn stream<'a>(
             &'a self,
-            _request: &'a LlmRequest,
+            request: &'a LlmRequest,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
             assert!(
                 self.old_executor_stopped.load(Ordering::SeqCst),
@@ -5412,6 +5441,13 @@ mod tests {
                 Ok(LlmEvent::TextDelta {
                     delta: "ok".to_string(),
                     meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::Other,
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
                 }),
                 Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {
@@ -5485,7 +5521,7 @@ mod tests {
             Arc::clone(&store),
             Arc::clone(&runtime_store),
             None,
-            Some(Arc::new(TestClient::default())),
+            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
         )
         .await;
         let mut session = Session::new();
@@ -5496,7 +5532,7 @@ mod tests {
                 model: "claude-opus-4-6".to_string(),
                 max_tokens: 4096,
                 structured_output_retries: 2,
-                provider: Provider::Other,
+                provider: Provider::Anthropic,
                 self_hosted_server_id: None,
                 provider_params: None,
                 tooling: meerkat_core::SessionTooling::default(),

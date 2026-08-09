@@ -3283,15 +3283,13 @@ mod tests {
                 .collect()
         }
 
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
             self.notify.clone()
         }
 
-        async fn drain_peer_input_candidates(&self) -> Vec<PeerInputCandidate> {
+        async fn handoff_volatile_peer_input_candidates(
+            &self,
+        ) -> Result<Vec<PeerInputCandidate>, meerkat_core::CommsCapabilityError> {
             let peer_id_by_name: HashMap<String, PeerId> = self
                 .trusted
                 .read()
@@ -3299,8 +3297,11 @@ mod tests {
                 .values()
                 .map(|peer| (peer.name.as_string(), peer.peer_id))
                 .collect();
-            self.drain_inbox_interactions()
-                .await
+            let interactions = {
+                let mut inbox = self.inbox.write().await;
+                std::mem::take(&mut *inbox)
+            };
+            Ok(interactions
                 .into_iter()
                 .map(|interaction| {
                     let canonical_peer_id = peer_id_by_name
@@ -3312,12 +3313,7 @@ mod tests {
                         canonical_peer_id,
                     )
                 })
-                .collect()
-        }
-
-        async fn drain_inbox_interactions(&self) -> Vec<InboxInteraction> {
-            let mut inbox = self.inbox.write().await;
-            std::mem::take(&mut *inbox)
+                .collect())
         }
     }
 
@@ -3585,13 +3581,6 @@ mod tests {
 
     #[async_trait]
     impl meerkat_mob::MobSessionService for RealCommsSessionSvc {
-        async fn prepare_session_for_resume(
-            &self,
-            _session_id: &SessionId,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-
         async fn observe_session_resume_authority(
             &self,
             _session_id: &SessionId,
@@ -3636,6 +3625,7 @@ mod tests {
         async fn create_session_with_actor_witness_under_runtime_turn_boundary(
             &self,
             req: meerkat_core::service::CreateSessionRequest,
+            _resume_preparation: Option<meerkat_mob::SessionResumePreparationReceipt>,
             actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
         ) -> Result<RunResult, SessionError> {
             self.create_session_with_actor_slot(req, actor_witness_slot)
@@ -5202,7 +5192,12 @@ mod tests {
             "helper must trust parent with a non-zero pubkey"
         );
 
-        let parent_inbox = CoreCommsRuntime::drain_inbox_interactions(&*parent_comms).await;
+        let parent_inbox = CoreCommsRuntime::handoff_volatile_peer_input_candidates(&*parent_comms)
+            .await
+            .expect("exact parent volatile handoff")
+            .into_iter()
+            .map(|candidate| candidate.interaction)
+            .collect::<Vec<_>>();
         assert!(
             parent_inbox.iter().any(|interaction| {
                 matches!(
@@ -5214,7 +5209,12 @@ mod tests {
             "delegate wiring must emit mob.peer_added to the creating meerkat"
         );
 
-        let helper_inbox = CoreCommsRuntime::drain_inbox_interactions(&*helper_comms).await;
+        let helper_inbox = CoreCommsRuntime::handoff_volatile_peer_input_candidates(&*helper_comms)
+            .await
+            .expect("exact helper volatile handoff")
+            .into_iter()
+            .map(|candidate| candidate.interaction)
+            .collect::<Vec<_>>();
         assert!(
             helper_inbox.iter().any(|interaction| {
                 matches!(

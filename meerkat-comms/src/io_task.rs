@@ -487,7 +487,7 @@ mod tests {
         let sender_keypair = make_keypair();
         let receiver_keypair = make_keypair();
         let _trusted = make_trusted_peers(&sender_keypair.public_key());
-        let (_inbox, _inbox_sender) = Inbox::new();
+        let (_inbox, _inbox_sender) = Inbox::new_transport_only();
 
         let envelope = make_signed_envelope(
             &sender_keypair,

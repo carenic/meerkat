@@ -2904,7 +2904,7 @@ mod tests {
             &self,
             _session_id: &SessionId,
             _stop_reason: StopReason,
-            _usage: Usage,
+            _usage: meerkat_core::TurnUsage,
             _response_id: Option<&str>,
         ) -> Result<(), LiveProjectionError> {
             Ok(())

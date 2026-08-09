@@ -272,8 +272,10 @@ impl MobBoundMemberRuntimeBridge for LocalMobRuntimeBridge {
     async fn retire_member(&self) -> Result<BridgeRetireResponse, MobError> {
         match self.machine.retire_runtime(&self.session_id).await {
             Ok(report) => Ok(BridgeRetireResponse {
-                inputs_abandoned: report.inputs_abandoned,
-                inputs_pending_drain: report.inputs_pending_drain,
+                outcome: super::bridge_protocol::BridgeRetireOutcome::Retired {
+                    inputs_abandoned: report.inputs_abandoned,
+                    inputs_pending_drain: report.inputs_pending_drain,
+                },
             }),
             Err(error) => Err(MobError::Internal(format!(
                 "local retire_member failed: {error}"
@@ -355,8 +357,13 @@ mod tests {
         let bridge = LocalMobRuntimeBridge::new(machine, session_id);
         let report = bridge.retire_member().await.unwrap();
 
-        assert_eq!(report.inputs_abandoned, 0);
-        assert_eq!(report.inputs_pending_drain, 0);
+        assert_eq!(
+            report.outcome,
+            super::super::bridge_protocol::BridgeRetireOutcome::Retired {
+                inputs_abandoned: 0,
+                inputs_pending_drain: 0,
+            }
+        );
     }
 
     #[tokio::test]
@@ -414,12 +421,13 @@ mod tests {
 
         #[async_trait::async_trait]
         impl CoreExecutorInterruptHandle for InterruptHandle {
-            async fn hard_cancel_current_run(
+            async fn hard_cancel_run_if_current(
                 &self,
+                _expected_run_id: &meerkat_core::RunId,
                 _reason: String,
-            ) -> Result<(), CoreExecutorError> {
+            ) -> Result<bool, CoreExecutorError> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(true)
             }
         }
 

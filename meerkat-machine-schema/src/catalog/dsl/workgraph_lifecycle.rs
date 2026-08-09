@@ -170,6 +170,70 @@ pub enum WorkEvidenceKind {
     ReviewerConfirmation,
 }
 
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FailedChildJoinPolicy {
+    #[default]
+    RequireSuccess,
+    Propagate,
+    Accept,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelledChildJoinPolicy {
+    #[default]
+    RequireSuccess,
+    Propagate,
+    Accept,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildJoinDisposition {
+    #[default]
+    Waiting,
+    Satisfied,
+    PropagateFailure,
+    PropagateCancellation,
+}
+
 /// Typed discriminant the shell extracts from a `WorkGraphError` and feeds back
 /// into the machine. This is a pure typed extraction (one variant per
 /// `WorkGraphError` variant); the shell performs NO grouping — the
@@ -199,6 +263,7 @@ pub enum WorkGraphErrorKind {
     InvalidInput,
     InvalidTimestampMillis,
     Store,
+    NamespaceAssignmentRequired,
     UnsupportedBackend,
 }
 
@@ -499,6 +564,8 @@ machine! {
             principal_confirmation_count: u64,
             supervisor_confirmation_owner_keys: Set<WorkOwnerKey>,
             reviewer_confirmation_owner_keys: Set<WorkOwnerKey>,
+            failed_child_join_policy: Enum<FailedChildJoinPolicy>,
+            cancelled_child_join_policy: Enum<CancelledChildJoinPolicy>,
         }
 
         init(Absent) {
@@ -523,6 +590,8 @@ machine! {
             principal_confirmation_count = 0,
             supervisor_confirmation_owner_keys = EmptySet,
             reviewer_confirmation_owner_keys = EmptySet,
+            failed_child_join_policy = FailedChildJoinPolicy::RequireSuccess,
+            cancelled_child_join_policy = CancelledChildJoinPolicy::RequireSuccess,
         }
 
         terminal [Completed, Cancelled, Failed]
@@ -546,6 +615,8 @@ machine! {
                 completion_supervisor_owner_key: Option<WorkOwnerKey>,
                 completion_reviewer_quorum_threshold: Option<u64>,
                 unresolved_blocker_count: u64,
+                failed_child_join_policy: Enum<FailedChildJoinPolicy>,
+                cancelled_child_join_policy: Enum<CancelledChildJoinPolicy>,
             },
             CreateBlocked {
                 due_at_utc_ms: Option<u64>,
@@ -555,6 +626,8 @@ machine! {
                 completion_supervisor_owner_key: Option<WorkOwnerKey>,
                 completion_reviewer_quorum_threshold: Option<u64>,
                 unresolved_blocker_count: u64,
+                failed_child_join_policy: Enum<FailedChildJoinPolicy>,
+                cancelled_child_join_policy: Enum<CancelledChildJoinPolicy>,
             },
             Update {
                 expected_revision: u64,
@@ -577,10 +650,22 @@ machine! {
                 owner_key: WorkOwnerKey,
                 now_utc_ms: u64,
                 lease_expires_at_utc_ms: Option<u64>,
+                child_join_satisfied: bool,
             },
             Release { expected_revision: u64 },
+            ObserveLeaseExpiry { expected_revision: u64, observed_at_utc_ms: u64 },
+            ObserveReadiness {
+                expected_revision: u64,
+                observed_at_utc_ms: u64,
+                child_join_satisfied: bool,
+            },
             Block { expected_revision: u64 },
             RefreshEligibility { unresolved_blocker_count: u64 },
+            ClassifyChildJoin {
+                active_child_count: u64,
+                failed_child_count: u64,
+                cancelled_child_count: u64,
+            },
             ValidateLink {
                 kind: WorkEdgeKind,
                 from_item_key: WorkItemKey,
@@ -706,7 +791,7 @@ machine! {
             // recovered item state, mirroring the emitted
             // WorkItemReadinessClassified.ready, failing closed. Each transition
             // self-loops in its phase (classification never mutates state).
-            ClassifyReadiness { now_utc_ms: u64 },
+            ClassifyReadiness { now_utc_ms: u64, child_join_satisfied: bool },
         }
 
         effect WorkGraphLifecycleEffect {
@@ -714,6 +799,8 @@ machine! {
             Updated,
             Claimed { owner_key: WorkOwnerKey },
             Released,
+            LeaseExpiryObserved,
+            ReadinessObserved,
             Blocked,
             LinkValidated,
             Closed { terminal_state: WorkLifecycleState, at_utc_ms: u64 },
@@ -742,6 +829,7 @@ machine! {
                 admission: Enum<WorkConfirmationAdmissionKind>,
             },
             WorkItemReadinessClassified { ready: bool },
+            ChildJoinClassified { disposition: Enum<ChildJoinDisposition> },
         }
 
         invariant absent_has_zero_revision {
@@ -1007,6 +1095,8 @@ machine! {
         disposition Updated => local seam NoOwnerRealization,
         disposition Claimed => local seam NoOwnerRealization,
         disposition Released => local seam NoOwnerRealization,
+        disposition LeaseExpiryObserved => local seam NoOwnerRealization,
+        disposition ReadinessObserved => local seam NoOwnerRealization,
         disposition Blocked => local seam NoOwnerRealization,
         disposition LinkValidated => local seam NoOwnerRealization,
         disposition Closed => routed [WorkAttentionLifecycleMachine] seam NoOwnerRealization,
@@ -1022,9 +1112,10 @@ machine! {
         disposition PolicyEscalationAdmissionClassified => local seam SurfaceResultAlignment,
         disposition ConfirmationAdmissionClassified => local seam SurfaceResultAlignment,
         disposition WorkItemReadinessClassified => local seam SurfaceResultAlignment,
+        disposition ChildJoinClassified => local seam SurfaceResultAlignment,
 
         transition CreateOpen {
-            on input CreateOpen { due_at_utc_ms, not_before_utc_ms, snoozed_until_utc_ms, completion_policy, completion_supervisor_owner_key, completion_reviewer_quorum_threshold, unresolved_blocker_count }
+            on input CreateOpen { due_at_utc_ms, not_before_utc_ms, snoozed_until_utc_ms, completion_policy, completion_supervisor_owner_key, completion_reviewer_quorum_threshold, unresolved_blocker_count, failed_child_join_policy, cancelled_child_join_policy }
             guard { self.lifecycle_phase == Phase::Absent }
             guard "completion_policy_payload_valid" {
                 completion_policy_payload_valid(completion_policy, completion_supervisor_owner_key, completion_reviewer_quorum_threshold)
@@ -1038,13 +1129,15 @@ machine! {
                 self.completion_policy = completion_policy;
                 self.completion_supervisor_owner_key = completion_supervisor_owner_key;
                 self.completion_reviewer_quorum_threshold = completion_reviewer_quorum_threshold;
+                self.failed_child_join_policy = failed_child_join_policy;
+                self.cancelled_child_join_policy = cancelled_child_join_policy;
             }
             to Open
             emit Created
         }
 
         transition CreateBlocked {
-            on input CreateBlocked { due_at_utc_ms, not_before_utc_ms, snoozed_until_utc_ms, completion_policy, completion_supervisor_owner_key, completion_reviewer_quorum_threshold, unresolved_blocker_count }
+            on input CreateBlocked { due_at_utc_ms, not_before_utc_ms, snoozed_until_utc_ms, completion_policy, completion_supervisor_owner_key, completion_reviewer_quorum_threshold, unresolved_blocker_count, failed_child_join_policy, cancelled_child_join_policy }
             guard { self.lifecycle_phase == Phase::Absent }
             guard "completion_policy_payload_valid" {
                 completion_policy_payload_valid(completion_policy, completion_supervisor_owner_key, completion_reviewer_quorum_threshold)
@@ -1058,6 +1151,8 @@ machine! {
                 self.completion_policy = completion_policy;
                 self.completion_supervisor_owner_key = completion_supervisor_owner_key;
                 self.completion_reviewer_quorum_threshold = completion_reviewer_quorum_threshold;
+                self.failed_child_join_policy = failed_child_join_policy;
+                self.cancelled_child_join_policy = cancelled_child_join_policy;
             }
             to Blocked
             emit Created
@@ -1250,9 +1345,11 @@ machine! {
         }
 
         transition ClaimOpen {
-            on input Claim { expected_revision, owner_key, now_utc_ms, lease_expires_at_utc_ms }
+            on input Claim { expected_revision, owner_key, now_utc_ms, lease_expires_at_utc_ms, child_join_satisfied }
             guard "revision_matches" { self.lifecycle_phase == Phase::Open && self.revision == expected_revision }
             guard "dependencies_satisfied" { self.unresolved_blocker_count == 0 }
+            guard "child_join_satisfied" { child_join_satisfied }
+            guard "new_lease_valid" { if lease_expires_at_utc_ms == None { true } else { lease_expires_at_utc_ms.get("value") > now_utc_ms } }
             guard "due_eligible" { if self.due_at_utc_ms == None { true } else { self.due_at_utc_ms.get("value") <= now_utc_ms } }
             guard "not_before_eligible" { if self.not_before_utc_ms == None { true } else { self.not_before_utc_ms.get("value") <= now_utc_ms } }
             guard "snooze_eligible" { if self.snoozed_until_utc_ms == None { true } else { self.snoozed_until_utc_ms.get("value") <= now_utc_ms } }
@@ -1267,12 +1364,14 @@ machine! {
         }
 
         transition ClaimExpiredInProgress {
-            on input Claim { expected_revision, owner_key, now_utc_ms, lease_expires_at_utc_ms }
+            on input Claim { expected_revision, owner_key, now_utc_ms, lease_expires_at_utc_ms, child_join_satisfied }
             guard "revision_matches" { self.lifecycle_phase == Phase::InProgress && self.revision == expected_revision }
             guard "prior_claim_present" { self.claim_owner_key != None }
             guard "prior_claim_has_lease" { self.lease_expires_at_utc_ms != None }
             guard "prior_claim_expired" { if self.lease_expires_at_utc_ms == None { false } else { self.lease_expires_at_utc_ms.get("value") <= now_utc_ms } }
             guard "dependencies_satisfied" { self.unresolved_blocker_count == 0 }
+            guard "child_join_satisfied" { child_join_satisfied }
+            guard "new_lease_valid" { if lease_expires_at_utc_ms == None { true } else { lease_expires_at_utc_ms.get("value") > now_utc_ms } }
             guard "due_eligible" { if self.due_at_utc_ms == None { true } else { self.due_at_utc_ms.get("value") <= now_utc_ms } }
             guard "not_before_eligible" { if self.not_before_utc_ms == None { true } else { self.not_before_utc_ms.get("value") <= now_utc_ms } }
             guard "snooze_eligible" { if self.snoozed_until_utc_ms == None { true } else { self.snoozed_until_utc_ms.get("value") <= now_utc_ms } }
@@ -1297,6 +1396,36 @@ machine! {
             }
             to Open
             emit Released
+        }
+
+        transition ObserveLeaseExpiryInProgress {
+            on input ObserveLeaseExpiry { expected_revision, observed_at_utc_ms }
+            guard "revision_matches" { self.lifecycle_phase == Phase::InProgress && self.revision == expected_revision }
+            guard "claim_present" { self.claim_owner_key != None }
+            guard "lease_present" { self.lease_expires_at_utc_ms != None }
+            guard "lease_expired" { self.lease_expires_at_utc_ms.get("value") <= observed_at_utc_ms }
+            update {
+                self.revision += 1;
+                self.claim_owner_key = None;
+                self.claimed_at_utc_ms = None;
+                self.lease_expires_at_utc_ms = None;
+            }
+            to Open
+            emit LeaseExpiryObserved
+            emit Released
+        }
+
+        transition ObserveReadinessOpen {
+            on input ObserveReadiness { expected_revision, observed_at_utc_ms, child_join_satisfied }
+            guard "revision_matches" { self.lifecycle_phase == Phase::Open && self.revision == expected_revision }
+            guard "dependencies_satisfied" { self.unresolved_blocker_count == 0 }
+            guard "child_join_satisfied" { child_join_satisfied }
+            guard "due_eligible" { if self.due_at_utc_ms == None { true } else { self.due_at_utc_ms.get("value") <= observed_at_utc_ms } }
+            guard "not_before_eligible" { if self.not_before_utc_ms == None { true } else { self.not_before_utc_ms.get("value") <= observed_at_utc_ms } }
+            guard "snooze_eligible" { if self.snoozed_until_utc_ms == None { true } else { self.snoozed_until_utc_ms.get("value") <= observed_at_utc_ms } }
+            update { self.revision += 1; }
+            to Open
+            emit ReadinessObserved
         }
 
         transition BlockOpen {
@@ -1787,6 +1916,7 @@ machine! {
             on input ClassifyWorkGraphPublicError { kind }
             guard "store_error_class" {
                 kind == WorkGraphErrorKind::Store
+                    || kind == WorkGraphErrorKind::NamespaceAssignmentRequired
             }
             update {}
             to Absent
@@ -1844,11 +1974,12 @@ machine! {
 
         transition ClassifyReadinessOpen {
             per_phase [Open]
-            on input ClassifyReadiness { now_utc_ms }
+            on input ClassifyReadiness { now_utc_ms, child_join_satisfied }
             update {}
             to Open
             emit WorkItemReadinessClassified {
                 ready: self.unresolved_blocker_count == 0
+                    && child_join_satisfied
                     && claim_time_window_eligible(
                         self.due_at_utc_ms,
                         self.not_before_utc_ms,
@@ -1860,7 +1991,7 @@ machine! {
 
         transition ClassifyReadinessInProgress {
             per_phase [InProgress]
-            on input ClassifyReadiness { now_utc_ms }
+            on input ClassifyReadiness { now_utc_ms, child_join_satisfied }
             update {}
             to InProgress
             emit WorkItemReadinessClassified {
@@ -1868,6 +1999,7 @@ machine! {
                     && self.lease_expires_at_utc_ms != None
                     && self.lease_expires_at_utc_ms.get("value") <= now_utc_ms
                     && self.unresolved_blocker_count == 0
+                    && child_join_satisfied
                     && claim_time_window_eligible(
                         self.due_at_utc_ms,
                         self.not_before_utc_ms,
@@ -1879,10 +2011,44 @@ machine! {
 
         transition ClassifyReadinessNotClaimable {
             per_phase [Absent, Blocked, Completed, Cancelled, Failed]
-            on input ClassifyReadiness { now_utc_ms }
+            on input ClassifyReadiness { now_utc_ms, child_join_satisfied }
             update {}
             to Absent
             emit WorkItemReadinessClassified { ready: false }
+        }
+
+        // Direct-child joins are evaluated from a deterministic snapshot
+        // supplied by the store/service shell. The machine owns the policy
+        // verdict; the shell only counts typed child lifecycle phases.
+        transition ClassifyChildJoin {
+            per_phase [Absent, Open, InProgress, Blocked, Completed, Cancelled, Failed]
+            on input ClassifyChildJoin { active_child_count, failed_child_count, cancelled_child_count }
+            update {}
+            to Absent
+            emit ChildJoinClassified {
+                disposition:
+                    if active_child_count > 0 {
+                        ChildJoinDisposition::Waiting
+                    } else {
+                        if failed_child_count > 0 && self.failed_child_join_policy == FailedChildJoinPolicy::Propagate {
+                            ChildJoinDisposition::PropagateFailure
+                        } else {
+                            if cancelled_child_count > 0 && self.cancelled_child_join_policy == CancelledChildJoinPolicy::Propagate {
+                                ChildJoinDisposition::PropagateCancellation
+                            } else {
+                                if failed_child_count > 0 && self.failed_child_join_policy == FailedChildJoinPolicy::RequireSuccess {
+                                    ChildJoinDisposition::Waiting
+                                } else {
+                                    if cancelled_child_count > 0 && self.cancelled_child_join_policy == CancelledChildJoinPolicy::RequireSuccess {
+                                        ChildJoinDisposition::Waiting
+                                    } else {
+                                        ChildJoinDisposition::Satisfied
+                                    }
+                                }
+                            }
+                        }
+                    }
+            }
         }
 
         // --- Per-blocking-edge satisfaction classification ---
@@ -2397,6 +2563,10 @@ struct WorkGraphLifecycleMachineStateWire {
     supervisor_confirmation_owner_keys: std::collections::BTreeSet<WorkOwnerKey>,
     #[serde(default)]
     reviewer_confirmation_owner_keys: std::collections::BTreeSet<WorkOwnerKey>,
+    #[serde(default)]
+    failed_child_join_policy: FailedChildJoinPolicy,
+    #[serde(default)]
+    cancelled_child_join_policy: CancelledChildJoinPolicy,
 }
 
 impl From<&WorkGraphLifecycleMachineState> for WorkGraphLifecycleMachineStateWire {
@@ -2424,6 +2594,8 @@ impl From<&WorkGraphLifecycleMachineState> for WorkGraphLifecycleMachineStateWir
             principal_confirmation_count: state.principal_confirmation_count,
             supervisor_confirmation_owner_keys: state.supervisor_confirmation_owner_keys.clone(),
             reviewer_confirmation_owner_keys: state.reviewer_confirmation_owner_keys.clone(),
+            failed_child_join_policy: state.failed_child_join_policy,
+            cancelled_child_join_policy: state.cancelled_child_join_policy,
         }
     }
 }
@@ -2453,6 +2625,8 @@ impl From<WorkGraphLifecycleMachineStateWire> for WorkGraphLifecycleMachineState
             principal_confirmation_count: wire.principal_confirmation_count,
             supervisor_confirmation_owner_keys: wire.supervisor_confirmation_owner_keys,
             reviewer_confirmation_owner_keys: wire.reviewer_confirmation_owner_keys,
+            failed_child_join_policy: wire.failed_child_join_policy,
+            cancelled_child_join_policy: wire.cancelled_child_join_policy,
         }
     }
 }

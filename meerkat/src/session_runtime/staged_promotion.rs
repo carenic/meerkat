@@ -80,6 +80,7 @@ async fn materialize_attached_actor_under_runtime_turn_boundary(
     runtime_adapter: &Arc<MeerkatMachine>,
     create_req: CreateSessionRequest,
     admission: ActiveCapacityGuard,
+    publication_refresh: crate::surface::AttachedActorPublicationRefreshFn,
 ) -> Result<RunResult, SessionError> {
     let session = create_req
         .build
@@ -91,21 +92,13 @@ async fn materialize_attached_actor_under_runtime_turn_boundary(
                     .to_string(),
             ))
         })?;
-    let fallback_service = Arc::clone(service);
-    let fallback_adapter = Arc::clone(runtime_adapter);
-    crate::surface::materialize_session_with_reserved_admission_under_runtime_turn_boundary(
+    crate::surface::materialize_session_with_reserved_admission_under_runtime_turn_boundary_and_publication_refresh(
         service,
         runtime_adapter,
         session,
         create_req,
         admission,
-        move |session_id| {
-            crate::surface::default_persistent_executor(
-                fallback_service,
-                fallback_adapter,
-                session_id,
-            )
-        },
+        publication_refresh,
     )
     .await
     .map_err(surface_materialization_error_to_session_error)
@@ -388,6 +381,7 @@ pub fn spawn_pending_create_and_apply_runtime_turn_with_admission_guard(
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
     staged_sessions: Arc<StagedSessionRegistry>,
     runtime_adapter: Arc<MeerkatMachine>,
+    publication_refresh: crate::surface::AttachedActorPublicationRefreshFn,
     comms_context_refresh: CommsContextRefreshFn,
     pre_turn_hook: Option<PreTurnHookFn>,
     session_id: SessionId,
@@ -417,6 +411,7 @@ pub fn spawn_pending_create_and_apply_runtime_turn_with_admission_guard(
                     &runtime_adapter,
                     create_req,
                     admission,
+                    publication_refresh,
                 )
                 .await,
                 true,
@@ -680,6 +675,7 @@ pub fn spawn_pending_create_and_apply_runtime_turn_with_admission_guard(
 pub fn spawn_recovered_create_and_apply_runtime_turn_with_admission_guard(
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
     runtime_adapter: Arc<MeerkatMachine>,
+    publication_refresh: crate::surface::AttachedActorPublicationRefreshFn,
     comms_context_refresh: CommsContextRefreshFn,
     session_id: SessionId,
     create_req: CreateSessionRequest,
@@ -697,6 +693,7 @@ pub fn spawn_recovered_create_and_apply_runtime_turn_with_admission_guard(
             &runtime_adapter,
             create_req,
             admission,
+            publication_refresh,
         )
         .await
         {

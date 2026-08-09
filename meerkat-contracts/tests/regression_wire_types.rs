@@ -270,6 +270,7 @@ fn wire_session_history_required_fields() {
                 content: "system".to_string(),
                 created_at: "2026-04-27T00:00:00Z".to_string(),
                 identity: None,
+                prompt_version: None,
             },
             WireSessionMessage::User {
                 content: meerkat_contracts::WireContentInput::Text("user".to_string()),
@@ -428,7 +429,9 @@ fn agent_event_all_variants_roundtrip() {
                 output_tokens: 5,
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
-            },
+                provider_accounting: None,
+            }
+            .into(),
             terminal_cause_kind: None,
         },
         AgentEvent::RunFailed {
@@ -487,7 +490,11 @@ fn agent_event_all_variants_roundtrip() {
         },
         AgentEvent::TurnCompleted {
             stop_reason: StopReason::EndTurn,
-            usage: Usage::default(),
+            usage: meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Other,
+                "wire-test",
+                Usage::default(),
+            ),
         },
         AgentEvent::ToolExecutionStarted {
             id: "tc2".to_string(),
@@ -678,7 +685,7 @@ fn documented_event_catalog_covers_core_agent_event_discriminators() {
             result: "done".to_string(),
             structured_output: None,
             extraction_required: false,
-            usage: Usage::default(),
+            usage: Usage::default().into(),
             terminal_cause_kind: None,
         },
         AgentEvent::RunFailed {
@@ -737,7 +744,11 @@ fn documented_event_catalog_covers_core_agent_event_discriminators() {
         },
         AgentEvent::TurnCompleted {
             stop_reason: StopReason::EndTurn,
-            usage: Usage::default(),
+            usage: meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Other,
+                "wire-test",
+                Usage::default(),
+            ),
         },
         AgentEvent::ToolExecutionStarted {
             id: "tool-1".to_string(),
@@ -978,6 +989,7 @@ fn wire_run_result_from_run_result_conversion() {
             output_tokens: 100,
             cache_creation_tokens: Some(50),
             cache_read_tokens: Some(30),
+            provider_accounting: None,
         },
         turns: 4,
         tool_calls: 7,
@@ -1038,6 +1050,7 @@ fn wire_usage_from_usage_conversion() {
         output_tokens: 250,
         cache_creation_tokens: Some(100),
         cache_read_tokens: Some(75),
+        provider_accounting: None,
     };
 
     let wire: WireUsage = usage.into();

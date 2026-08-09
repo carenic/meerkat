@@ -121,7 +121,9 @@ machine! {
             self.planning_cursor_utc_ms == None || self.next_occurrence_ordinal > 0
         }
 
-        disposition EmitScheduleNotice => external seam SurfaceResultAlignment,
+        // A post-commit return/log projection, not a replayable external
+        // effect. The committed Schedule row is the authority.
+        disposition EmitScheduleNotice => local seam SurfaceResultAlignment,
         disposition SupersedePendingOccurrences => routed [OccurrenceLifecycleMachine] seam NoOwnerRealization,
         disposition PlanningWindowRecorded => local seam NoOwnerRealization,
 

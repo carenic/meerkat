@@ -1,6 +1,7 @@
 use super::*;
 use crate::input_state::StoredInputState;
 use crate::store::{RuntimeSessionAuthority, RuntimeSessionPersistenceProfile};
+use futures::FutureExt as _;
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -656,6 +657,230 @@ impl MeerkatMachine {
         LogicalRuntimeId::for_session(session_id)
     }
 
+    /// Install or join the process-owned convergence task for one exact
+    /// driver incarnation. The returned start permit must be fired only after
+    /// the caller has released M and every registration/member lease.
+    pub(super) fn prepare_runless_terminal_publication_dispatch(
+        &self,
+        driver: &SharedDriver,
+        completions: &SharedCompletionRegistry,
+        mutation_gate: &Arc<Mutex<()>>,
+        publication_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+    ) -> Result<
+        (
+            crate::tokio::sync::watch::Receiver<Option<Result<(), RuntimeDriverError>>>,
+            Option<crate::tokio::sync::oneshot::Sender<()>>,
+        ),
+        RuntimeDriverError,
+    > {
+        let driver_key = Arc::as_ptr(driver) as usize;
+        let mut pending = self
+            .pending_runless_terminal_publications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = pending.get_mut(&driver_key) {
+            if !Arc::ptr_eq(&existing.driver, driver) {
+                return Err(RuntimeDriverError::StaleAuthority {
+                    reason: "runless terminal publication driver identity was reused while its prior dispatch remained pending"
+                        .to_string(),
+                });
+            }
+            if !Arc::ptr_eq(&existing.mutation_gate, mutation_gate) {
+                return Err(RuntimeDriverError::StaleAuthority {
+                    reason: "runless terminal publication driver changed its mutation gate while a prior dispatch remained pending"
+                        .to_string(),
+                });
+            }
+            existing.requested_generation = existing
+                .requested_generation
+                .checked_add(1)
+                .ok_or_else(|| {
+                    RuntimeDriverError::Internal(
+                        "runless terminal publication request generation overflow".to_string(),
+                    )
+                })?;
+            return Ok((existing.result_rx.clone(), None));
+        }
+
+        let cleanup_spawner = MachineCleanupTaskSpawner::acquire()?;
+        let dispatch_id = uuid::Uuid::new_v4();
+        let (result_tx, result_rx) = crate::tokio::sync::watch::channel(None);
+        let (start_tx, start_rx) = crate::tokio::sync::oneshot::channel();
+        pending.insert(
+            driver_key,
+            PendingRunlessTerminalPublicationDispatch {
+                dispatch_id,
+                driver: driver.clone(),
+                mutation_gate: Arc::clone(mutation_gate),
+                requested_generation: 1,
+                result_rx: result_rx.clone(),
+            },
+        );
+        drop(pending);
+
+        let machine = self.clone();
+        let driver = driver.clone();
+        let completions = completions.clone();
+        let mutation_gate = Arc::clone(mutation_gate);
+        cleanup_spawner.spawn(async move {
+            let result = if start_rx.await.is_err() {
+                Err(RuntimeDriverError::Internal(
+                    "runless terminal publication dispatch lost its post-M start permit"
+                        .to_string(),
+                ))
+            } else {
+                loop {
+                    let requested_generation = {
+                        let pending = machine
+                            .pending_runless_terminal_publications
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let Some(pending) = pending
+                            .get(&driver_key)
+                            .filter(|pending| pending.dispatch_id == dispatch_id)
+                        else {
+                            break Err(RuntimeDriverError::StaleAuthority {
+                                reason: "runless terminal publication dispatch lost its exact process slot"
+                                    .to_string(),
+                            });
+                        };
+                        pending.requested_generation
+                    };
+                    let convergence = std::panic::AssertUnwindSafe(
+                        crate::control_plane::converge_known_committed_runless_runtime_terminations_before(
+                            &driver,
+                            Some(&completions),
+                            Some(publication_handle.as_ref()),
+                            None,
+                        ),
+                    )
+                    .catch_unwind()
+                    .await;
+                    let convergence = match convergence {
+                        Ok(result) => result,
+                        Err(payload) => Err(RuntimeDriverError::Internal(format!(
+                            "runless terminal publication callback panicked: {}",
+                            meerkat_core::panic_payload::panic_payload_detail(payload.as_ref())
+                        ))),
+                    };
+                    if let Err(error) = convergence {
+                        break Err(error);
+                    }
+
+                    // Every exact outbox commit for this driver holds this M.
+                    // Reacquiring it closes the only gap between the durable
+                    // scan and process-slot removal. A caller that committed a
+                    // later carrier must first increment requested_generation,
+                    // forcing this task to scan again before acknowledging it.
+                    let gate_guard = Arc::clone(&mutation_gate).lock_owned().await;
+                    let mut pending = machine
+                        .pending_runless_terminal_publications
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match pending.get(&driver_key) {
+                        Some(current)
+                            if current.dispatch_id == dispatch_id
+                                && current.requested_generation == requested_generation =>
+                        {
+                            pending.remove(&driver_key);
+                            result_tx.send_replace(Some(Ok(())));
+                            drop(pending);
+                            drop(gate_guard);
+                            return;
+                        }
+                        Some(current) if current.dispatch_id == dispatch_id => {
+                            drop(pending);
+                            drop(gate_guard);
+                        }
+                        _ => {
+                            drop(pending);
+                            drop(gate_guard);
+                            break Err(RuntimeDriverError::StaleAuthority {
+                                reason: "runless terminal publication dispatch lost its exact process slot during final reconciliation"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+            };
+
+            let gate_guard = Arc::clone(&mutation_gate).lock_owned().await;
+            let mut pending = machine
+                .pending_runless_terminal_publications
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending
+                .get(&driver_key)
+                .is_some_and(|pending| pending.dispatch_id == dispatch_id)
+            {
+                pending.remove(&driver_key);
+            }
+            result_tx.send_replace(Some(result));
+            drop(pending);
+            drop(gate_guard);
+        });
+        Ok((result_rx, Some(start_tx)))
+    }
+
+    pub(super) fn existing_runless_terminal_publication_dispatch(
+        &self,
+        driver: &SharedDriver,
+    ) -> Option<crate::tokio::sync::watch::Receiver<Option<Result<(), RuntimeDriverError>>>> {
+        let driver_key = Arc::as_ptr(driver) as usize;
+        self.pending_runless_terminal_publications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&driver_key)
+            .filter(|pending| Arc::ptr_eq(&pending.driver, driver))
+            .map(|pending| pending.result_rx.clone())
+    }
+
+    pub(super) fn runless_terminal_publication_dispatch_pending(
+        &self,
+        driver: &SharedDriver,
+    ) -> bool {
+        self.existing_runless_terminal_publication_dispatch(driver)
+            .is_some()
+    }
+
+    pub(super) async fn await_runless_terminal_publication_dispatch(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        mut result_rx: crate::tokio::sync::watch::Receiver<Option<Result<(), RuntimeDriverError>>>,
+        deadline: Option<meerkat_core::time_compat::Instant>,
+    ) -> Result<(), RuntimeDriverError> {
+        loop {
+            if let Some(result) = result_rx.borrow().clone() {
+                return result;
+            }
+            let changed = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline
+                        .saturating_duration_since(meerkat_core::time_compat::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(RuntimeDriverError::RuntimeTerminalPublicationInProgress {
+                            runtime_id: runtime_id.clone(),
+                        });
+                    }
+                    match crate::tokio::time::timeout(remaining, result_rx.changed()).await {
+                        Ok(changed) => changed,
+                        Err(_) => {
+                            return Err(RuntimeDriverError::RuntimeTerminalPublicationInProgress {
+                                runtime_id: runtime_id.clone(),
+                            });
+                        }
+                    }
+                }
+                None => result_rx.changed().await,
+            };
+            if changed.is_err() {
+                return Err(RuntimeDriverError::Internal(
+                    "process-owned runless terminal publication ended without a result".to_string(),
+                ));
+            }
+        }
+    }
+
     pub(super) fn post_admission_signal_from_effects(
         effects: &[crate::meerkat_machine::dsl::MeerkatMachineEffect],
     ) -> crate::driver::ephemeral::PostAdmissionSignal {
@@ -711,6 +936,9 @@ impl MeerkatMachine {
             }
             RuntimeControlPlaneError::InvalidState { state } => {
                 RuntimeDriverError::NotReady { state }
+            }
+            RuntimeControlPlaneError::RetirementInProgress { runtime_id, .. } => {
+                RuntimeDriverError::RuntimeTerminalPublicationInProgress { runtime_id }
             }
             RuntimeControlPlaneError::StoreError(message)
             | RuntimeControlPlaneError::Internal(message) => RuntimeDriverError::Internal(message),
@@ -939,6 +1167,144 @@ impl MeerkatMachine {
     /// Acquire the current session mutation authority for an archive before
     /// the session layer takes its recovery/checkpointer gates.
     pub async fn prepare_session_archive_lease(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<super::MachineSessionArchiveLease>, RuntimeControlPlaneError> {
+        self.prepare_session_archive_lease_owned(session_id).await
+    }
+
+    /// Process-owned archive preparation bounded only at the caller's
+    /// acknowledgement edge. Injected RuntimeStore reads and recovery cannot
+    /// be cancelled by deadline expiry, and no M is acquired by the caller
+    /// while that arbitrary storage future remains pending.
+    pub async fn prepare_session_archive_lease_before(
+        &self,
+        session_id: &SessionId,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<Option<super::MachineSessionArchiveLease>, RuntimeControlPlaneError> {
+        let runtime_id = LogicalRuntimeId::for_session(session_id);
+        loop {
+            if deadline <= meerkat_core::time_compat::Instant::now() {
+                return Err(RuntimeControlPlaneError::RetirementInProgress {
+                    runtime_id,
+                    stage: "archive_lease_preparation".to_string(),
+                });
+            }
+            let existing = self
+                .pending_session_archive_lease_preparations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(session_id)
+                .map(|pending| pending.completion_rx.clone());
+            if let Some(mut completion_rx) = existing {
+                let remaining = deadline
+                    .checked_duration_since(meerkat_core::time_compat::Instant::now())
+                    .ok_or_else(|| RuntimeControlPlaneError::RetirementInProgress {
+                        runtime_id: runtime_id.clone(),
+                        stage: "archive_lease_preparation".to_string(),
+                    })?;
+                let completion = crate::tokio::time::timeout(remaining, async {
+                    loop {
+                        if let Some(result) = completion_rx.borrow().clone() {
+                            break result;
+                        }
+                        completion_rx.changed().await.map_err(|error| {
+                            format!("archive lease preparation leader dropped completion: {error}")
+                        })?;
+                    }
+                })
+                .await
+                .map_err(|_| RuntimeControlPlaneError::RetirementInProgress {
+                    runtime_id: runtime_id.clone(),
+                    stage: "archive_lease_preparation".to_string(),
+                })?
+                .map_err(RuntimeControlPlaneError::Internal);
+                completion?;
+                // The leader's unique lease went to its live caller or was
+                // safely dropped after caller timeout. Reissue only after the
+                // exact slot has completed and been removed; repeated retries
+                // never accumulate behind its registration transaction.
+                continue;
+            }
+
+            let cleanup_spawner = MachineCleanupTaskSpawner::acquire()
+                .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+            let preparation_id = uuid::Uuid::new_v4();
+            let (completion_tx, completion_rx) = crate::tokio::sync::watch::channel(None);
+            let (result_tx, mut result_rx) = crate::tokio::sync::oneshot::channel();
+            {
+                let mut pending = self
+                    .pending_session_archive_lease_preparations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if pending.contains_key(session_id) {
+                    continue;
+                }
+                pending.insert(
+                    session_id.clone(),
+                    super::PendingSessionArchiveLeasePreparation {
+                        preparation_id,
+                        completion_rx,
+                    },
+                );
+            }
+            let machine = self.clone();
+            let owned_session_id = session_id.clone();
+            cleanup_spawner.spawn(async move {
+                let result = std::panic::AssertUnwindSafe(
+                    machine.prepare_session_archive_lease_owned(&owned_session_id),
+                )
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|payload| {
+                    Err(RuntimeControlPlaneError::Internal(format!(
+                        "archive lease preparation panicked: {}",
+                        meerkat_core::panic_payload::panic_payload_detail(payload.as_ref())
+                    )))
+                });
+                completion_tx.send_replace(Some(
+                    result
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(std::string::ToString::to_string),
+                ));
+                {
+                    let mut pending = machine
+                        .pending_session_archive_lease_preparations
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if pending
+                        .get(&owned_session_id)
+                        .is_some_and(|pending| pending.preparation_id == preparation_id)
+                    {
+                        pending.remove(&owned_session_id);
+                    }
+                }
+                // A timed-out caller loses only its acknowledgement. Dropping
+                // the undelivered completed lease releases in-process guards;
+                // durable runtime/outbox authority remains canonical.
+                let _ = result_tx.send(result);
+            });
+            let remaining = deadline
+                .checked_duration_since(meerkat_core::time_compat::Instant::now())
+                .ok_or_else(|| RuntimeControlPlaneError::RetirementInProgress {
+                    runtime_id: runtime_id.clone(),
+                    stage: "archive_lease_preparation".to_string(),
+                })?;
+            return match crate::tokio::time::timeout(remaining, &mut result_rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(RuntimeControlPlaneError::Internal(format!(
+                    "archive lease preparation task ended without an outcome: {error}"
+                ))),
+                Err(_) => Err(RuntimeControlPlaneError::RetirementInProgress {
+                    runtime_id,
+                    stage: "archive_lease_preparation".to_string(),
+                }),
+            };
+        }
+    }
+
+    async fn prepare_session_archive_lease_owned(
         &self,
         session_id: &SessionId,
     ) -> Result<Option<super::MachineSessionArchiveLease>, RuntimeControlPlaneError> {
@@ -1252,53 +1618,213 @@ impl MeerkatMachine {
         &self,
         lease: super::MachineSessionArchiveLease,
     ) -> Result<RetireReport, RuntimeControlPlaneError> {
-        self.realize_retire_with_archive_lease(lease, None).await
+        self.realize_retire_with_archive_lease(lease, None, None)
+            .await
     }
 
-    /// Drain durable runless terminals while an archive lease still owns the
-    /// session mutation gate. Archive calls this before its document verdict,
-    /// so a prior crash after runtime terminalization cannot be hidden behind
-    /// an `AlreadyArchived` document result on retry.
-    pub async fn drain_session_archive_lease_terminals(
+    /// Deadline-aware archive sibling. The absolute caller deadline is
+    /// preserved through process-owned terminal publication.
+    pub async fn retire_session_with_archive_lease_before(
+        &self,
+        lease: super::MachineSessionArchiveLease,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<RetireReport, RuntimeControlPlaneError> {
+        self.realize_retire_with_archive_lease(lease, None, Some(deadline))
+            .await
+    }
+
+    /// Observe whether an archive lease owns a committed runless terminal
+    /// carrier that must cross publication before the document verdict.
+    ///
+    /// This is a read-only observation under the lease's exact M. It never
+    /// invokes a publication callback while authority is retained.
+    pub async fn session_archive_lease_has_pending_terminals(
         &self,
         lease: &super::MachineSessionArchiveLease,
-        archive_publication_handle: Option<
-            &dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle,
-        >,
-    ) -> Result<(), RuntimeControlPlaneError> {
-        let publication_handle = lease
-            .publication_handle
-            .as_deref()
-            .or(archive_publication_handle);
-        crate::control_plane::drain_recovered_runless_runtime_terminations(
-            &lease.driver,
-            Some(&lease.completions),
-            publication_handle,
-        )
-        .await
-        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))
+    ) -> Result<bool, RuntimeControlPlaneError> {
+        crate::control_plane::has_committed_runless_recovery_carrier(&lease.driver)
+            .await
+            .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))
     }
 
-    /// Archive-only sibling that supplies a borrowed, quiescent stored-session
+    /// Whether this exact archive lease's driver already has a process-owned
+    /// publication dispatch. This observation never locks the driver or polls
+    /// custom RuntimeStore IO, so archive can join it before scanning a carrier
+    /// whose receipt CAS may currently retain the driver lock.
+    pub fn session_archive_lease_has_pending_terminal_dispatch(
+        &self,
+        lease: &super::MachineSessionArchiveLease,
+    ) -> bool {
+        self.existing_runless_terminal_publication_dispatch(&lease.driver)
+            .is_some()
+    }
+
+    /// Consume an archive lease and converge its already-committed terminal
+    /// carrier through the process-owned single-flight after releasing M and
+    /// every registration/live lease.
+    ///
+    /// The archive caller must restart its observation after this returns:
+    /// publication deliberately releases the exact lease rather than carrying
+    /// a pre-publication document verdict across arbitrary callback IO.
+    pub async fn converge_session_archive_lease_terminals_before(
+        &self,
+        lease: super::MachineSessionArchiveLease,
+        archive_publication_handle: Option<
+            Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+        >,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<(), RuntimeControlPlaneError> {
+        let super::MachineSessionArchiveLease {
+            session_id,
+            runtime_id,
+            driver,
+            completions,
+            wake_tx: _,
+            publication_handle,
+            recovered_registration_for_archive: _,
+            _registration_transaction_guard: registration_transaction_guard,
+            _live_lifecycle_lease: live_lifecycle_lease,
+            _mutation_guard: mutation_guard,
+        } = lease;
+        // Clone an existing exact slot before releasing M. Its owner cannot
+        // remove the slot while this lease retains M because successful
+        // compare-remove itself reacquires the same gate. This path therefore
+        // never waits on the driver lock held across receipt persistence.
+        let existing_dispatch = self.existing_runless_terminal_publication_dispatch(&driver);
+        let (result_rx, start_tx) = match existing_dispatch {
+            Some(result_rx) => (result_rx, None),
+            None => {
+                let publication_handle = publication_handle
+                    .or(archive_publication_handle)
+                    .ok_or_else(|| {
+                        RuntimeControlPlaneError::Internal(format!(
+                            "archive terminal carrier for {runtime_id} has no exact publication capability"
+                        ))
+                    })?;
+                let mutation_gate_identity = self
+                    .session_mutation_gate(&session_id)
+                    .await
+                    .ok_or_else(|| RuntimeControlPlaneError::NotFound(runtime_id.clone()))?;
+                self.prepare_runless_terminal_publication_dispatch(
+                    &driver,
+                    &completions,
+                    &mutation_gate_identity,
+                    publication_handle,
+                )
+                .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?
+            }
+        };
+
+        drop(mutation_guard);
+        drop(live_lifecycle_lease);
+        drop(registration_transaction_guard);
+        if let Some(start_tx) = start_tx {
+            let _ = start_tx.send(());
+        }
+        self.await_runless_terminal_publication_dispatch(&runtime_id, result_rx, Some(deadline))
+            .await
+            .map_err(|error| match error {
+                RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. } => {
+                    RuntimeControlPlaneError::RetirementInProgress {
+                        runtime_id,
+                        stage: "terminal_publication".to_string(),
+                    }
+                }
+                other => RuntimeControlPlaneError::Internal(other.to_string()),
+            })
+    }
+
+    /// Archive-only sibling that supplies an owned, quiescent stored-session
     /// publisher when the restarted runtime has no attached executor. The
     /// lease-retained live publisher always wins when present.
     pub async fn retire_session_with_archive_lease_and_publication_handle(
         &self,
         lease: super::MachineSessionArchiveLease,
-        publication_handle: &dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle,
+        publication_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
     ) -> Result<RetireReport, RuntimeControlPlaneError> {
-        self.realize_retire_with_archive_lease(lease, Some(publication_handle))
+        self.realize_retire_with_archive_lease(lease, Some(publication_handle), None)
             .await
+    }
+
+    /// Deadline-aware archive-only sibling for a provably stored-only
+    /// publisher. The callback runs only after the archive lease releases M.
+    pub async fn retire_session_with_archive_lease_and_publication_handle_before(
+        &self,
+        lease: super::MachineSessionArchiveLease,
+        publication_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<RetireReport, RuntimeControlPlaneError> {
+        self.realize_retire_with_archive_lease(lease, Some(publication_handle), Some(deadline))
+            .await
+    }
+
+    /// Retire while consuming the caller's single absolute acknowledgement
+    /// deadline. The deadline is never extended or converted into a fresh
+    /// relative budget inside the runtime.
+    pub async fn retire_runtime_control_plane_before(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<RetireReport, RuntimeControlPlaneError> {
+        self.retire_runtime_control_plane_inner(runtime_id, Some(deadline), None)
+            .await
+            .map_err(|error| match error {
+                super::DirectMemberRetireError::Runtime(error) => error,
+                super::DirectMemberRetireError::Stale { .. } => RuntimeControlPlaneError::Internal(
+                    "ordinary retirement unexpectedly entered direct-member fencing".to_string(),
+                ),
+            })
     }
 
     pub async fn retire_runtime_control_plane(
         &self,
         runtime_id: &LogicalRuntimeId,
     ) -> Result<RetireReport, RuntimeControlPlaneError> {
+        self.retire_runtime_control_plane_inner(runtime_id, None, None)
+            .await
+            .map_err(|error| match error {
+                super::DirectMemberRetireError::Runtime(error) => error,
+                super::DirectMemberRetireError::Stale { .. } => RuntimeControlPlaneError::Internal(
+                    "ordinary retirement unexpectedly entered direct-member fencing".to_string(),
+                ),
+            })
+    }
+
+    /// Retire only while the exact V5 peer-only controller-member fence is
+    /// still current. Validation and current-evidence capture occur under the
+    /// stable member slot and the session registration transaction immediately
+    /// before the canonical retire lease is captured.
+    pub(crate) async fn retire_direct_member_runtime(
+        &self,
+        session_id: &SessionId,
+        expected: &meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence,
+    ) -> Result<RetireReport, super::DirectMemberRetireError> {
+        if expected.member_session_id != session_id.to_string() {
+            return Err(super::DirectMemberRetireError::Stale { current: None });
+        }
+        let runtime_id = MeerkatMachine::logical_runtime_id(session_id);
+        self.retire_runtime_control_plane_inner(&runtime_id, None, Some(expected))
+            .await
+    }
+
+    async fn retire_runtime_control_plane_inner(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        deadline: Option<meerkat_core::time_compat::Instant>,
+        expected_direct_member: Option<
+            &meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence,
+        >,
+    ) -> Result<RetireReport, super::DirectMemberRetireError> {
         // Resolve only the transaction key optimistically. The authoritative
         // entry capture happens after the stable registration transaction is
         // held, so an old entry can never dispose a replacement's live state.
         let (session_id, _, _, _) = self.lookup_entry(runtime_id).await?;
+        let direct_member_slot =
+            expected_direct_member.map(|_| self.member_incarnation_slot(&session_id));
+        let direct_member_slot_guard = match direct_member_slot.as_ref() {
+            Some(slot) => Some(Arc::clone(&slot.gate).lock_owned().await),
+            None => None,
+        };
         let registration_transaction_guard = self
             .lock_session_registration_transaction(&session_id)
             .await;
@@ -1306,7 +1832,43 @@ impl MeerkatMachine {
         if resolved_session_id != session_id {
             return Err(RuntimeControlPlaneError::Internal(format!(
                 "runtime {runtime_id} changed session identity from {session_id} to {resolved_session_id} during retirement"
-            )));
+            )).into());
+        }
+        if let (Some(expected), Some(slot)) = (expected_direct_member, direct_member_slot.as_ref())
+        {
+            let (runtime_epoch_id, session_mutation_gate) = {
+                let sessions = self.sessions.read().await;
+                let Some(entry) = sessions.get(&resolved_session_id) else {
+                    return Err(super::DirectMemberRetireError::Stale { current: None });
+                };
+                (entry.epoch_id.clone(), Arc::clone(&entry.mutation_gate))
+            };
+            let current = {
+                let state = slot
+                    .state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match &*state {
+                    MemberResidencyState::PeerOnly {
+                        direct_member: Some(registration),
+                    } if registration.runtime_epoch_id == runtime_epoch_id
+                        && Arc::ptr_eq(
+                            &registration.session_mutation_gate,
+                            &session_mutation_gate,
+                        ) =>
+                    {
+                        Some(registration.fence.clone())
+                    }
+                    MemberResidencyState::PeerOnly { .. }
+                    | MemberResidencyState::VacantPlaced
+                    | MemberResidencyState::Placed(_) => None,
+                }
+            };
+            if current.as_ref() != Some(expected) {
+                return Err(super::DirectMemberRetireError::Stale {
+                    current: current.map(|fence| fence.evidence()),
+                });
+            }
         }
         self.reject_unregister_overlap_under_registration_transaction(&resolved_session_id)
             .await?;
@@ -1348,15 +1910,20 @@ impl MeerkatMachine {
             _live_lifecycle_lease: live_lifecycle_lease,
             _mutation_guard: mutation_guard,
         };
-        self.realize_retire_with_archive_lease(lease, None).await
+        let result = self
+            .realize_retire_with_archive_lease(lease, None, deadline)
+            .await;
+        drop(direct_member_slot_guard);
+        result.map_err(super::DirectMemberRetireError::Runtime)
     }
 
     async fn realize_retire_with_archive_lease(
         &self,
         lease: super::MachineSessionArchiveLease,
         archive_publication_handle: Option<
-            &dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle,
+            Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
         >,
+        deadline: Option<meerkat_core::time_compat::Instant>,
     ) -> Result<RetireReport, RuntimeControlPlaneError> {
         let super::MachineSessionArchiveLease {
             session_id,
@@ -1366,14 +1933,15 @@ impl MeerkatMachine {
             wake_tx,
             publication_handle,
             recovered_registration_for_archive,
-            _registration_transaction_guard,
-            _live_lifecycle_lease,
-            _mutation_guard,
+            _registration_transaction_guard: registration_transaction_guard,
+            _live_lifecycle_lease: live_lifecycle_lease,
+            _mutation_guard: mutation_guard,
         } = lease;
-        let retained_publication_handle = publication_handle;
-        let publication_handle = retained_publication_handle
-            .as_deref()
-            .or(archive_publication_handle);
+        let retained_publication_handle = publication_handle.or(archive_publication_handle);
+        let mutation_gate_identity = self
+            .session_mutation_gate(&session_id)
+            .await
+            .ok_or_else(|| RuntimeControlPlaneError::NotFound(runtime_id.clone()))?;
         tracing::info!(
             runtime_id = %runtime_id,
             "MeerkatMachine::retire_runtime_control_plane start"
@@ -1434,67 +2002,117 @@ impl MeerkatMachine {
             commit_error = Some(reason);
         }
 
-        crate::control_plane::drain_recovered_runless_runtime_terminations(
-            &driver,
-            Some(&completions),
-            publication_handle,
-        )
-        .await
-        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-
+        let mut abandoned_batch = None;
         if report.inputs_pending_drain > 0 {
-            if let Some(ref tx) = wake_tx
-                && tx.send(()).await.is_ok()
-            {
-                if let Some(reason) = commit_error {
-                    return Err(RuntimeControlPlaneError::Internal(reason));
-                }
-                return Ok(report);
+            let woke_runtime = if let Some(ref tx) = wake_tx {
+                tx.send(()).await.is_ok()
+            } else {
+                false
+            };
+            if !woke_runtime {
+                let reason = "retired without runtime loop";
+                let (abandoned, completion_input_ids, candidate_owner_input_id) = {
+                    let mut drv = driver.lock().await;
+                    let completion_input_ids = drv.as_driver().active_input_ids();
+                    let prepared = drv
+                        .prepare_runless_runtime_terminated_interaction_outboxes(
+                            &completion_input_ids,
+                            reason.to_string(),
+                        )
+                        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+                    let abandoned = match drv
+                        .abandon_pending_inputs(crate::input_state::InputAbandonReason::Retired)
+                        .await
+                    {
+                        Ok(abandoned) => abandoned,
+                        Err(error) => {
+                            drv.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
+                            return Err(RuntimeControlPlaneError::Internal(error.to_string()));
+                        }
+                    };
+                    let candidate_owner_input_id = crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
+                    (abandoned, completion_input_ids, candidate_owner_input_id)
+                };
+                report.inputs_abandoned += abandoned;
+                report.inputs_pending_drain = 0;
+                abandoned_batch = Some((completion_input_ids, candidate_owner_input_id, reason));
             }
+        }
 
-            let reason = "retired without runtime loop";
-            let (abandoned, completion_input_ids, candidate_owner_input_id) = {
-                let mut drv = driver.lock().await;
-                let completion_input_ids = drv.as_driver().active_input_ids();
-                let prepared = drv
-                    .prepare_runless_runtime_terminated_interaction_outboxes(
-                        &completion_input_ids,
-                        reason.to_string(),
+        let dispatch = match retained_publication_handle {
+            Some(publication_handle) => {
+                let (result_rx, start_tx) = self
+                    .prepare_runless_terminal_publication_dispatch(
+                        &driver,
+                        &completions,
+                        &mutation_gate_identity,
+                        publication_handle,
                     )
                     .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-                let abandoned = match drv
-                    .abandon_pending_inputs(crate::input_state::InputAbandonReason::Retired)
-                    .await
-                {
-                    Ok(abandoned) => abandoned,
-                    Err(error) => {
-                        drv.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
-                        return Err(RuntimeControlPlaneError::Internal(error.to_string()));
-                    }
-                };
-                let candidate_owner_input_id =
-                    crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
-                (abandoned, completion_input_ids, candidate_owner_input_id)
-            };
-            crate::control_plane::publish_and_resolve_runless_runtime_termination(
-                &driver,
-                Some(&completions),
-                publication_handle,
-                &completion_input_ids,
-                candidate_owner_input_id.as_ref(),
-                reason,
-            )
-            .await
-            .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-            report.inputs_abandoned += abandoned;
-            report.inputs_pending_drain = 0;
-        }
-        if let Some(reason) = commit_error {
-            return Err(RuntimeControlPlaneError::Internal(reason));
-        }
+                Some((result_rx, start_tx))
+            }
+            None => None,
+        };
+
         if recovered_registration_for_archive {
             self.remove_archive_recovered_registration_exact(&session_id, &runtime_id, &driver)
                 .await?;
+        }
+        drop(mutation_guard);
+        drop(live_lifecycle_lease);
+        drop(registration_transaction_guard);
+
+        if let Some((result_rx, start_tx)) = dispatch {
+            if let Some(start_tx) = start_tx {
+                let _ = start_tx.send(());
+            }
+            self.await_runless_terminal_publication_dispatch(&runtime_id, result_rx, deadline)
+                .await
+                .map_err(|error| match error {
+                    RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. } => {
+                        RuntimeControlPlaneError::RetirementInProgress {
+                            runtime_id: runtime_id.clone(),
+                            stage: "terminal_publication".to_string(),
+                        }
+                    }
+                    other => RuntimeControlPlaneError::Internal(other.to_string()),
+                })?;
+        } else {
+            crate::control_plane::converge_known_committed_runless_runtime_terminations_before(
+                &driver,
+                Some(&completions),
+                None,
+                deadline,
+            )
+            .await
+            .map_err(|error| match error {
+                RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. } => {
+                    RuntimeControlPlaneError::RetirementInProgress {
+                        runtime_id: runtime_id.clone(),
+                        stage: "terminal_publication".to_string(),
+                    }
+                }
+                other => RuntimeControlPlaneError::Internal(other.to_string()),
+            })?;
+        }
+
+        if let Some((completion_input_ids, candidate_owner_input_id, reason)) = abandoned_batch
+            && candidate_owner_input_id.is_none()
+        {
+            crate::control_plane::publish_and_resolve_runless_runtime_termination_before(
+                &driver,
+                Some(&completions),
+                None,
+                &completion_input_ids,
+                None,
+                reason,
+                deadline,
+            )
+            .await
+            .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+        }
+        if let Some(reason) = commit_error {
+            return Err(RuntimeControlPlaneError::Internal(reason));
         }
         Ok(report)
     }
@@ -1684,6 +2302,1375 @@ impl crate::traits::RuntimeControlPlane for MeerkatMachine {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::driver::ephemeral::EphemeralRuntimeDriver;
+    use crate::input_state::InteractionTerminalOutboxPhase;
+    use crate::meerkat_machine::driver::DriverEntry;
+    use crate::traits::RuntimeDriver as _;
+    use meerkat_core::lifecycle::core_executor::{
+        CoreExecutorError, CoreInteractionTerminalPublicationReceipt,
+    };
+    use meerkat_core::types::ContentInput;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    struct GatedDispatchPublisher {
+        calls: AtomicUsize,
+        batches: StdMutex<Vec<Vec<meerkat_core::event::AgentEvent>>>,
+        first_entered: Arc<crate::tokio::sync::Notify>,
+        release_first: Arc<crate::tokio::sync::Notify>,
+        first_returning: Arc<crate::tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::CoreExecutorPublicationHandle for GatedDispatchPublisher {
+        async fn publish_interaction_terminals(
+            &self,
+            events: &[meerkat_core::event::AgentEvent],
+        ) -> Result<Vec<CoreInteractionTerminalPublicationReceipt>, CoreExecutorError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 1 {
+                self.first_entered.notify_one();
+                self.release_first.notified().await;
+                self.first_returning.notify_one();
+            }
+            self.batches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(events.to_vec());
+            events
+                .iter()
+                .enumerate()
+                .map(|(index, event)| {
+                    CoreInteractionTerminalPublicationReceipt::try_new(
+                        event,
+                        call as u64 * 100 + index as u64,
+                    )
+                })
+                .collect()
+        }
+    }
+
+    struct PanicOnceDispatchPublisher {
+        calls: AtomicUsize,
+    }
+
+    struct CountingDispatchPublisher {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::CoreExecutorPublicationHandle for CountingDispatchPublisher {
+        async fn publish_interaction_terminals(
+            &self,
+            events: &[meerkat_core::event::AgentEvent],
+        ) -> Result<Vec<CoreInteractionTerminalPublicationReceipt>, CoreExecutorError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            events
+                .iter()
+                .enumerate()
+                .map(|(index, event)| {
+                    CoreInteractionTerminalPublicationReceipt::try_new(
+                        event,
+                        call as u64 * 100 + index as u64,
+                    )
+                })
+                .collect()
+        }
+    }
+
+    struct PublicationHandleExecutor {
+        publication_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+    }
+
+    struct NoPublicationHandleExecutor;
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutor for NoPublicationHandleExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+        ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, CoreExecutorError>
+        {
+            Err(CoreExecutorError::Internal(
+                "stored-only publication fixture received work".to_string(),
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutor for PublicationHandleExecutor {
+        fn publication_handle(
+            &self,
+        ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>> {
+            Some(Arc::clone(&self.publication_handle))
+        }
+
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+        ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, CoreExecutorError>
+        {
+            Err(CoreExecutorError::Internal(
+                "publication-handle recovery fixture received work".to_string(),
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::CoreExecutorPublicationHandle for PanicOnceDispatchPublisher {
+        async fn publish_interaction_terminals(
+            &self,
+            events: &[meerkat_core::event::AgentEvent],
+        ) -> Result<Vec<CoreInteractionTerminalPublicationReceipt>, CoreExecutorError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            assert_ne!(call, 1, "synthetic public publication callback panic");
+            events
+                .iter()
+                .enumerate()
+                .map(|(index, event)| {
+                    CoreInteractionTerminalPublicationReceipt::try_new(
+                        event,
+                        call as u64 * 100 + index as u64,
+                    )
+                })
+                .collect()
+        }
+    }
+
+    fn seed_dispatch_attached_authority(
+        driver: &mut DriverEntry,
+        session_id: &SessionId,
+        runtime_id: &LogicalRuntimeId,
+    ) {
+        let mut authority =
+            crate::meerkat_machine::dsl_authority::new_registered_authority(session_id)
+                .expect("register dispatch test authority");
+        crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+            &mut authority,
+            crate::meerkat_machine::dsl::MeerkatMachineInput::PrepareBindings {
+                agent_runtime_id: crate::meerkat_machine::dsl::AgentRuntimeId::from(
+                    runtime_id.to_string(),
+                ),
+                fence_token: crate::meerkat_machine::dsl::FenceToken::from(31),
+                generation: Some(crate::meerkat_machine::dsl::Generation::from(7)),
+                runtime_epoch_id: Some(crate::meerkat_machine::dsl::RuntimeEpochId::from(
+                    "dispatch-test-epoch".to_string(),
+                )),
+                session_id: crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
+            },
+        )
+        .expect("attach dispatch test authority");
+        *driver
+            .shared_dsl_authority()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = authority;
+        driver.set_control_projection(crate::RuntimeState::Attached, None, None);
+    }
+
+    async fn dispatch_test_driver(
+        runtime_id: &LogicalRuntimeId,
+        session_id: &SessionId,
+        labels: &[&str],
+    ) -> (SharedDriver, Vec<InputId>) {
+        let mut driver = DriverEntry::Ephemeral(EphemeralRuntimeDriver::new(runtime_id.clone()));
+        seed_dispatch_attached_authority(&mut driver, session_id, runtime_id);
+        let mut input_ids = Vec::with_capacity(labels.len());
+        for label in labels {
+            let interaction_uuid = meerkat_core::time_compat::new_uuid_v7();
+            let input = crate::mob_adapter::create_tracked_flow_step_input(
+                label,
+                ContentInput::Text((*label).to_string()),
+                "dispatch-liveness-flow",
+                None,
+                &interaction_uuid.to_string(),
+            )
+            .expect("construct directed dispatch input");
+            input_ids.push(input.id().clone());
+            assert!(
+                driver
+                    .as_driver_mut()
+                    .accept_input(input)
+                    .await
+                    .expect("accept directed dispatch input")
+                    .is_accepted()
+            );
+        }
+        {
+            let authority_handle = driver.shared_dsl_authority();
+            let mut authority = authority_handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::Retire {
+                    session_id: crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
+                },
+            )
+            .expect("retire dispatch test authority after input admission");
+        }
+        driver.set_control_projection(crate::RuntimeState::Retired, None, None);
+        (Arc::new(crate::tokio::sync::Mutex::new(driver)), input_ids)
+    }
+
+    async fn commit_dispatch_outbox(
+        driver: &SharedDriver,
+        input_id: &InputId,
+        reason: &str,
+        abandon_active_inputs: bool,
+    ) {
+        let mut driver = driver.lock().await;
+        let prepared = driver
+            .prepare_runless_runtime_terminated_interaction_outboxes(
+                std::slice::from_ref(input_id),
+                reason.to_string(),
+            )
+            .expect("prepare exact dispatch outbox");
+        if abandon_active_inputs {
+            driver
+                .abandon_pending_inputs(crate::input_state::InputAbandonReason::Retired)
+                .await
+                .expect("abandon dispatch inputs before committing terminal outbox");
+        }
+        assert_eq!(
+            DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared),
+            Some(input_id.clone())
+        );
+    }
+
+    async fn seed_durable_attached_archive_authority(
+        machine: &Arc<MeerkatMachine>,
+        session_id: SessionId,
+    ) {
+        let mut prepared = machine
+            .prepare_session_materialization(session_id)
+            .await
+            .expect("prepare durable archive authority fixture");
+        crate::begin_session_runtime_actor_materialization(prepared.bindings())
+            .expect("claim durable archive authority actor construction")
+            .commit()
+            .expect("record durable archive authority actor materialization");
+        let pending = match prepared
+            .ensure_executor_attachment(|_witness| Box::new(NoPublicationHandleExecutor))
+            .await
+            .expect("attach durable archive authority executor")
+        {
+            super::super::EnsureRuntimeExecutorAttachment::Pending(pending) => pending,
+            super::super::EnsureRuntimeExecutorAttachment::Existing(witness) => {
+                panic!("fresh durable archive authority reused {witness:?}")
+            }
+        };
+        pending
+            .commit()
+            .await
+            .expect("commit durable archive authority executor");
+    }
+
+    fn assert_dispatch_outboxes_published(driver: &DriverEntry, expected: usize) {
+        let published = driver
+            .as_driver()
+            .stored_input_states_snapshot()
+            .expect("snapshot dispatch test outboxes")
+            .into_iter()
+            .filter_map(|stored| stored.state.interaction_terminal_outbox)
+            .filter(|outbox| {
+                matches!(
+                    outbox.phase,
+                    InteractionTerminalOutboxPhase::Published { .. }
+                )
+            })
+            .count();
+        assert_eq!(published, expected);
+    }
+
+    #[tokio::test]
+    async fn runless_publication_generation_covers_commit_before_slot_removal() {
+        let machine = MeerkatMachine::ephemeral();
+        let runtime_id = LogicalRuntimeId::new("runless-publication-high-water");
+        let session_id = SessionId::new();
+        let (driver, input_ids) =
+            dispatch_test_driver(&runtime_id, &session_id, &["first", "second"]).await;
+        let completions = Arc::new(crate::tokio::sync::Mutex::new(
+            crate::completion::CompletionRegistry::new(),
+        ));
+        let mutation_gate = Arc::new(crate::tokio::sync::Mutex::new(()));
+        let first_entered = Arc::new(crate::tokio::sync::Notify::new());
+        let release_first = Arc::new(crate::tokio::sync::Notify::new());
+        let first_returning = Arc::new(crate::tokio::sync::Notify::new());
+        let publisher = Arc::new(GatedDispatchPublisher {
+            calls: AtomicUsize::new(0),
+            batches: StdMutex::new(Vec::new()),
+            first_entered: Arc::clone(&first_entered),
+            release_first: Arc::clone(&release_first),
+            first_returning: Arc::clone(&first_returning),
+        });
+
+        let first_guard = Arc::clone(&mutation_gate).lock_owned().await;
+        commit_dispatch_outbox(&driver, &input_ids[0], "first generation", true).await;
+        let (first_result, start) = machine
+            .prepare_runless_terminal_publication_dispatch(
+                &driver,
+                &completions,
+                &mutation_gate,
+                publisher.clone(),
+            )
+            .expect("install first exact dispatch");
+        drop(first_guard);
+        start
+            .expect("new dispatch returns a post-M start permit")
+            .send(())
+            .expect("start exact dispatch");
+        crate::tokio::time::timeout(std::time::Duration::from_secs(5), first_entered.notified())
+            .await
+            .expect("first callback enters after M is released");
+
+        let second_guard = crate::tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            Arc::clone(&mutation_gate).lock_owned(),
+        )
+        .await
+        .expect("wedged public callback must not retain M");
+        let timed_out = machine
+            .await_runless_terminal_publication_dispatch(
+                &runtime_id,
+                first_result,
+                Some(
+                    meerkat_core::time_compat::Instant::now()
+                        + std::time::Duration::from_millis(10),
+                ),
+            )
+            .await;
+        assert!(matches!(
+            timed_out,
+            Err(RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. })
+        ));
+
+        release_first.notify_one();
+        crate::tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            first_returning.notified(),
+        )
+        .await
+        .expect("first callback returns while final M reconciliation is fenced");
+        commit_dispatch_outbox(&driver, &input_ids[1], "second generation", false).await;
+        let (joined_result, joined_start) = machine
+            .prepare_runless_terminal_publication_dispatch(
+                &driver,
+                &completions,
+                &mutation_gate,
+                publisher.clone(),
+            )
+            .expect("second commit joins exact dispatch and advances high-water");
+        assert!(joined_start.is_none());
+        assert_eq!(
+            publisher.calls.load(Ordering::SeqCst),
+            1,
+            "join must not mint a second callback authority while the first is pending"
+        );
+        drop(second_guard);
+
+        machine
+            .await_runless_terminal_publication_dispatch(&runtime_id, joined_result, None)
+            .await
+            .expect("generation loop must publish the post-scan commit before success");
+        assert_eq!(publisher.calls.load(Ordering::SeqCst), 2);
+        {
+            let driver = driver.lock().await;
+            assert_dispatch_outboxes_published(&driver, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn runless_publication_panic_clears_slot_and_cold_authority_reissues() {
+        let machine = MeerkatMachine::ephemeral();
+        let runtime_id = LogicalRuntimeId::new("runless-publication-panic-retry");
+        let session_id = SessionId::new();
+        let (driver, input_ids) =
+            dispatch_test_driver(&runtime_id, &session_id, &["panic-retry"]).await;
+        let completions = Arc::new(crate::tokio::sync::Mutex::new(
+            crate::completion::CompletionRegistry::new(),
+        ));
+        let mutation_gate = Arc::new(crate::tokio::sync::Mutex::new(()));
+        let publisher = Arc::new(PanicOnceDispatchPublisher {
+            calls: AtomicUsize::new(0),
+        });
+
+        let guard = Arc::clone(&mutation_gate).lock_owned().await;
+        commit_dispatch_outbox(&driver, &input_ids[0], "panic remains durable", true).await;
+        let (first_result, start) = machine
+            .prepare_runless_terminal_publication_dispatch(
+                &driver,
+                &completions,
+                &mutation_gate,
+                publisher.clone(),
+            )
+            .expect("install panic dispatch");
+        drop(guard);
+        start
+            .expect("first start permit")
+            .send(())
+            .expect("start panic dispatch");
+        let first = machine
+            .await_runless_terminal_publication_dispatch(&runtime_id, first_result, None)
+            .await
+            .expect_err("panic must surface as a typed internal failure");
+        assert!(
+            first.to_string().contains("callback panicked"),
+            "unexpected first dispatch error: {first:?}"
+        );
+        {
+            let driver = driver.lock().await;
+            assert_dispatch_outboxes_published(&driver, 0);
+        }
+
+        let cold_machine = MeerkatMachine::ephemeral();
+        let retry_guard = Arc::clone(&mutation_gate).lock_owned().await;
+        let (retry_result, retry_start) = cold_machine
+            .prepare_runless_terminal_publication_dispatch(
+                &driver,
+                &completions,
+                &mutation_gate,
+                publisher.clone(),
+            )
+            .expect("panic cleanup must remove the poisoned process slot");
+        drop(retry_guard);
+        retry_start
+            .expect("cold authority must install its own process dispatch")
+            .send(())
+            .expect("start durable retry");
+        cold_machine
+            .await_runless_terminal_publication_dispatch(&runtime_id, retry_result, None)
+            .await
+            .expect("cold authority reissues the durable outbox after panic");
+        assert_eq!(publisher.calls.load(Ordering::SeqCst), 2);
+        {
+            let driver = driver.lock().await;
+            assert_dispatch_outboxes_published(&driver, 1);
+        }
+
+        let cleanup_probe_guard = Arc::clone(&mutation_gate).lock_owned().await;
+        let (cleanup_probe, cleanup_probe_start) = machine
+            .prepare_runless_terminal_publication_dispatch(
+                &driver,
+                &completions,
+                &mutation_gate,
+                publisher.clone(),
+            )
+            .expect("panicking process dispatch must remove its poisoned slot");
+        drop(cleanup_probe_guard);
+        cleanup_probe_start
+            .expect("original machine must install a fresh slot after panic cleanup")
+            .send(())
+            .expect("start panic cleanup probe");
+        machine
+            .await_runless_terminal_publication_dispatch(&runtime_id, cleanup_probe, None)
+            .await
+            .expect("published durable authority makes the fresh probe a no-op");
+        assert_eq!(
+            publisher.calls.load(Ordering::SeqCst),
+            2,
+            "already-published durable authority must not duplicate the callback"
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_archive_publication_releases_m_and_retries_join_exact_dispatch() {
+        let machine = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        let runtime_id = LogicalRuntimeId::for_session(&session_id);
+        let entered = Arc::new(crate::tokio::sync::Notify::new());
+        let release = Arc::new(crate::tokio::sync::Notify::new());
+        let returning = Arc::new(crate::tokio::sync::Notify::new());
+        let publisher = Arc::new(GatedDispatchPublisher {
+            calls: AtomicUsize::new(0),
+            batches: StdMutex::new(Vec::new()),
+            first_entered: Arc::clone(&entered),
+            release_first: Arc::clone(&release),
+            first_returning: Arc::clone(&returning),
+        });
+        let publisher_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle> =
+            publisher.clone();
+        let mut prepared = machine
+            .prepare_session_materialization(session_id.clone())
+            .await
+            .expect("prepare attached archive fixture");
+        crate::begin_session_runtime_actor_materialization(prepared.bindings())
+            .expect("claim attached archive actor construction")
+            .commit()
+            .expect("record attached archive actor materialization");
+        let executor_publication = Arc::clone(&publisher_handle);
+        let pending = match prepared
+            .ensure_executor_attachment(move |_witness| {
+                Box::new(PublicationHandleExecutor {
+                    publication_handle: Arc::clone(&executor_publication),
+                })
+            })
+            .await
+            .expect("attach public archive publication capability")
+        {
+            super::super::EnsureRuntimeExecutorAttachment::Pending(pending) => pending,
+            super::super::EnsureRuntimeExecutorAttachment::Existing(witness) => {
+                panic!("fresh archive fixture reused {witness:?}")
+            }
+        };
+        pending
+            .commit()
+            .await
+            .expect("commit attached archive executor");
+
+        let interaction_uuid = meerkat_core::time_compat::new_uuid_v7();
+        let input = crate::mob_adapter::create_tracked_flow_step_input(
+            "attached-archive-publication",
+            ContentInput::Text("pending attached archive work".to_string()),
+            "attached-archive-flow",
+            None,
+            &interaction_uuid.to_string(),
+        )
+        .expect("construct attached archive directed input");
+        let input_id = input.id().clone();
+        assert!(
+            machine
+                .accept_input_without_wake(&session_id, input)
+                .await
+                .expect("admit attached archive directed input")
+                .is_accepted()
+        );
+        let driver = machine
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|entry| Arc::clone(&entry.driver))
+            .expect("attached archive driver remains registered");
+        commit_dispatch_outbox(&driver, &input_id, "attached archive", true).await;
+
+        let first_lease = machine
+            .prepare_session_archive_lease(&session_id)
+            .await
+            .expect("prepare first attached archive lease")
+            .expect("attached archive lease must exist");
+        let first_started = meerkat_core::time_compat::Instant::now();
+        let first_error = machine
+            .retire_session_with_archive_lease_before(
+                first_lease,
+                first_started + meerkat_core::time_compat::Duration::from_millis(150),
+            )
+            .await
+            .expect_err("wedged attached publication must respect the caller deadline");
+        assert!(
+            matches!(
+                first_error,
+                RuntimeControlPlaneError::RetirementInProgress {
+                    ref runtime_id,
+                    ref stage,
+                } if runtime_id == &LogicalRuntimeId::for_session(&session_id)
+                    && stage == "terminal_publication"
+            ),
+            "unexpected first archive error: {first_error:?}"
+        );
+        assert!(
+            first_started.elapsed() < meerkat_core::time_compat::Duration::from_secs(1),
+            "archive caller must not wait for a wedged custom publisher"
+        );
+        assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);
+
+        let probe = crate::tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            machine.prepare_session_archive_lease(&session_id),
+        )
+        .await
+        .expect("publication wait must release the machine mutation lease")
+        .expect("archive lease probe should remain valid")
+        .expect("runtime remains registered while publication is pending");
+        drop(probe);
+
+        let retry_lease = machine
+            .prepare_session_archive_lease(&session_id)
+            .await
+            .expect("prepare retry attached archive lease")
+            .expect("retry archive lease must exist");
+        let retry_error = machine
+            .retire_session_with_archive_lease_before(
+                retry_lease,
+                meerkat_core::time_compat::Instant::now()
+                    + meerkat_core::time_compat::Duration::from_millis(150),
+            )
+            .await
+            .expect_err("same-process retry must join the retained publication dispatch");
+        assert!(matches!(
+            retry_error,
+            RuntimeControlPlaneError::RetirementInProgress { ref stage, .. }
+                if stage == "terminal_publication"
+        ));
+        assert_eq!(
+            publisher.calls.load(Ordering::SeqCst),
+            1,
+            "retry must not invoke the exact publication capability twice"
+        );
+
+        release.notify_waiters();
+        let final_lease = machine
+            .prepare_session_archive_lease(&session_id)
+            .await
+            .expect("prepare converging attached archive lease")
+            .expect("converging archive lease must exist");
+        machine
+            .retire_session_with_archive_lease_before(
+                final_lease,
+                meerkat_core::time_compat::Instant::now()
+                    + meerkat_core::time_compat::Duration::from_secs(2),
+            )
+            .await
+            .expect("released attached publication must converge archive retirement");
+        assert_eq!(
+            publisher.calls.load(Ordering::SeqCst),
+            1,
+            "successful retry must preserve one exact callback"
+        );
+        let driver = driver.lock().await;
+        assert_dispatch_outboxes_published(&driver, 1);
+        assert_eq!(
+            driver.runtime_id(),
+            &runtime_id,
+            "archive must retain the exact runtime identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_only_archive_publication_releases_m_and_retries_join_exact_dispatch() {
+        let machine = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        let runtime_id = LogicalRuntimeId::for_session(&session_id);
+        let entered = Arc::new(crate::tokio::sync::Notify::new());
+        let release = Arc::new(crate::tokio::sync::Notify::new());
+        let returning = Arc::new(crate::tokio::sync::Notify::new());
+        let publisher = Arc::new(GatedDispatchPublisher {
+            calls: AtomicUsize::new(0),
+            batches: StdMutex::new(Vec::new()),
+            first_entered: Arc::clone(&entered),
+            release_first: Arc::clone(&release),
+            first_returning: Arc::clone(&returning),
+        });
+        let publisher_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle> =
+            publisher.clone();
+
+        let mut prepared = machine
+            .prepare_session_materialization(session_id.clone())
+            .await
+            .expect("prepare stored-only archive fixture");
+        crate::begin_session_runtime_actor_materialization(prepared.bindings())
+            .expect("claim stored-only archive actor construction")
+            .commit()
+            .expect("record stored-only archive actor materialization");
+        let pending = match prepared
+            .ensure_executor_attachment(|_witness| Box::new(NoPublicationHandleExecutor))
+            .await
+            .expect("attach executor without a publication capability")
+        {
+            super::super::EnsureRuntimeExecutorAttachment::Pending(pending) => pending,
+            super::super::EnsureRuntimeExecutorAttachment::Existing(witness) => {
+                panic!("fresh stored-only archive fixture reused {witness:?}")
+            }
+        };
+        pending
+            .commit()
+            .await
+            .expect("commit stored-only archive executor");
+        drop(prepared);
+
+        let interaction_uuid = meerkat_core::time_compat::new_uuid_v7();
+        let input = crate::mob_adapter::create_tracked_flow_step_input(
+            "stored-only-archive-publication",
+            ContentInput::Text("pending stored-only archive work".to_string()),
+            "stored-only-archive-flow",
+            None,
+            &interaction_uuid.to_string(),
+        )
+        .expect("construct stored-only archive directed input");
+        let input_id = input.id().clone();
+        let driver = machine
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|entry| Arc::clone(&entry.driver))
+            .expect("stored-only archive driver remains registered");
+        assert!(
+            driver
+                .lock()
+                .await
+                .as_driver_mut()
+                .accept_input(input)
+                .await
+                .expect("restore previously admitted stored-only archive input")
+                .is_accepted()
+        );
+        {
+            let mut driver = driver.lock().await;
+            let authority_handle = driver.shared_dsl_authority();
+            let mut authority = authority_handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::Retire {
+                    session_id: crate::meerkat_machine::dsl::SessionId::from_domain(&session_id),
+                },
+            )
+            .expect("restore committed retired lifecycle for stored-only archive");
+            drop(authority);
+            driver.set_control_projection(crate::RuntimeState::Retired, None, None);
+        }
+        commit_dispatch_outbox(&driver, &input_id, "stored-only archive", true).await;
+
+        let first_lease = machine
+            .prepare_session_archive_lease(&session_id)
+            .await
+            .expect("prepare first stored-only archive lease")
+            .expect("stored-only archive lease must exist");
+        assert!(
+            machine
+                .session_archive_lease_has_pending_terminals(&first_lease)
+                .await
+                .expect("observe committed stored-only terminal carrier")
+        );
+        let first_started = meerkat_core::time_compat::Instant::now();
+        let first_error = machine
+            .converge_session_archive_lease_terminals_before(
+                first_lease,
+                Some(Arc::clone(&publisher_handle)),
+                first_started + meerkat_core::time_compat::Duration::from_millis(150),
+            )
+            .await
+            .expect_err("wedged stored-only publication must respect the caller deadline");
+        assert!(
+            matches!(
+                first_error,
+                RuntimeControlPlaneError::RetirementInProgress {
+                    ref runtime_id,
+                    ref stage,
+                } if runtime_id == &LogicalRuntimeId::for_session(&session_id)
+                    && stage == "terminal_publication"
+            ),
+            "unexpected first stored-only archive error: {first_error:?}"
+        );
+        assert!(
+            first_started.elapsed() < meerkat_core::time_compat::Duration::from_secs(1),
+            "stored-only archive caller must not wait for a wedged custom publisher"
+        );
+        assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);
+
+        let probe = crate::tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            machine.prepare_session_archive_lease(&session_id),
+        )
+        .await
+        .expect("stored-only publication wait must release the machine mutation lease")
+        .expect("stored-only archive lease probe should remain valid")
+        .expect("stored-only runtime remains registered while publication is pending");
+        drop(probe);
+
+        let retry_lease = machine
+            .prepare_session_archive_lease(&session_id)
+            .await
+            .expect("prepare retry stored-only archive lease")
+            .expect("retry stored-only archive lease must exist");
+        let retry_error = machine
+            .converge_session_archive_lease_terminals_before(
+                retry_lease,
+                Some(Arc::clone(&publisher_handle)),
+                meerkat_core::time_compat::Instant::now()
+                    + meerkat_core::time_compat::Duration::from_millis(150),
+            )
+            .await
+            .expect_err("same-process retry must join the retained stored-only dispatch");
+        assert!(matches!(
+            retry_error,
+            RuntimeControlPlaneError::RetirementInProgress { ref stage, .. }
+                if stage == "terminal_publication"
+        ));
+        assert_eq!(
+            publisher.calls.load(Ordering::SeqCst),
+            1,
+            "stored-only retry must not invoke the exact publication capability twice"
+        );
+
+        release.notify_waiters();
+        let final_lease = machine
+            .prepare_session_archive_lease(&session_id)
+            .await
+            .expect("prepare converging stored-only archive lease")
+            .expect("converging stored-only archive lease must exist");
+        machine
+            .converge_session_archive_lease_terminals_before(
+                final_lease,
+                Some(publisher_handle),
+                meerkat_core::time_compat::Instant::now()
+                    + meerkat_core::time_compat::Duration::from_secs(2),
+            )
+            .await
+            .expect("released stored-only publication must converge");
+        assert_eq!(
+            publisher.calls.load(Ordering::SeqCst),
+            1,
+            "successful stored-only retry must preserve one exact callback"
+        );
+        let driver = driver.lock().await;
+        assert_dispatch_outboxes_published(&driver, 1);
+        assert_eq!(
+            driver.runtime_id(),
+            &runtime_id,
+            "stored-only archive must retain the exact runtime identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_lease_preparation_deadline_does_not_cancel_wedged_store_read() {
+        let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let session_id = SessionId::new();
+        let first = Arc::new(MeerkatMachine::persistent(
+            store.clone(),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        ));
+        seed_durable_attached_archive_authority(&first, session_id.clone()).await;
+        drop(first);
+
+        let entered = Arc::new(crate::tokio::sync::Notify::new());
+        let release = Arc::new(crate::tokio::sync::Notify::new());
+        let baseline_load_calls = store.machine_lifecycle_load_calls();
+        let expired = MeerkatMachine::persistent(
+            store.clone(),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        );
+        let expired_error = match expired
+            .prepare_session_archive_lease_before(
+                &session_id,
+                meerkat_core::time_compat::Instant::now(),
+            )
+            .await
+        {
+            Ok(_) => panic!("an expired archive budget must fail before spawning preparation"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            expired_error,
+            RuntimeControlPlaneError::RetirementInProgress { ref stage, .. }
+                if stage == "archive_lease_preparation"
+        ));
+        assert_eq!(
+            store.machine_lifecycle_load_calls(),
+            baseline_load_calls,
+            "zero-budget retry must not issue or queue mutable RuntimeStore work"
+        );
+        drop(expired);
+        store.block_next_machine_lifecycle_load(Arc::clone(&entered), Arc::clone(&release));
+        let restarted = Arc::new(MeerkatMachine::persistent(
+            store.clone(),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        ));
+        let first_machine = Arc::clone(&restarted);
+        let first_session_id = session_id.clone();
+        let first_prepare = crate::tokio::spawn(async move {
+            first_machine
+                .prepare_session_archive_lease_before(
+                    &first_session_id,
+                    meerkat_core::time_compat::Instant::now()
+                        + meerkat_core::time_compat::Duration::from_millis(100),
+                )
+                .await
+        });
+        entered.notified().await;
+        let mut followers = Vec::new();
+        for _ in 0..4 {
+            let follower_machine = Arc::clone(&restarted);
+            let follower_session_id = session_id.clone();
+            followers.push(crate::tokio::spawn(async move {
+                follower_machine
+                    .prepare_session_archive_lease_before(
+                        &follower_session_id,
+                        meerkat_core::time_compat::Instant::now()
+                            + meerkat_core::time_compat::Duration::from_millis(100),
+                    )
+                    .await
+            }));
+        }
+        let first_error = match first_prepare
+            .await
+            .expect("deadline-aware archive preparation task must join")
+        {
+            Ok(_) => panic!("wedged RuntimeStore read must return typed pending"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            first_error,
+            RuntimeControlPlaneError::RetirementInProgress { ref stage, .. }
+                if stage == "archive_lease_preparation"
+        ));
+        for follower in followers {
+            let follower_error = match follower
+                .await
+                .expect("archive preparation follower task must join")
+            {
+                Ok(_) => panic!("followers must share the wedged leader deadline outcome"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                follower_error,
+                RuntimeControlPlaneError::RetirementInProgress { ref stage, .. }
+                    if stage == "archive_lease_preparation"
+            ));
+        }
+        assert_eq!(
+            store.machine_lifecycle_load_calls(),
+            baseline_load_calls + 1,
+            "bounded retries must join one exact process-owned RuntimeStore read"
+        );
+
+        release.notify_waiters();
+        let lease = restarted
+            .prepare_session_archive_lease_before(
+                &session_id,
+                meerkat_core::time_compat::Instant::now()
+                    + meerkat_core::time_compat::Duration::from_secs(2),
+            )
+            .await
+            .expect("retry must proceed after the process-owned store read completes")
+            .expect("durable runtime authority must still yield an archive lease");
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn archive_lease_preparation_panic_clears_singleflight_for_retry() {
+        let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let session_id = SessionId::new();
+        let first = Arc::new(MeerkatMachine::persistent(
+            store.clone(),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        ));
+        seed_durable_attached_archive_authority(&first, session_id.clone()).await;
+        drop(first);
+
+        let restarted = MeerkatMachine::persistent(
+            store.clone(),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        );
+        let baseline_load_calls = store.machine_lifecycle_load_calls();
+        store.panic_next_machine_lifecycle_load();
+        let panic_error = match restarted
+            .prepare_session_archive_lease_before(
+                &session_id,
+                meerkat_core::time_compat::Instant::now()
+                    + meerkat_core::time_compat::Duration::from_secs(2),
+            )
+            .await
+        {
+            Ok(_) => panic!("panicking RuntimeStore preparation must return a typed error"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                panic_error,
+                RuntimeControlPlaneError::Internal(ref detail)
+                    if detail.contains("archive lease preparation panicked")
+            ),
+            "unexpected archive preparation panic result: {panic_error:?}"
+        );
+        assert!(
+            !restarted
+                .pending_session_archive_lease_preparations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&session_id),
+            "panicking preparation must remove its exact single-flight slot"
+        );
+        assert_eq!(
+            store.machine_lifecycle_load_calls(),
+            baseline_load_calls + 1,
+            "the panicking leader must issue exactly one lifecycle load"
+        );
+
+        let lease = restarted
+            .prepare_session_archive_lease_before(
+                &session_id,
+                meerkat_core::time_compat::Instant::now()
+                    + meerkat_core::time_compat::Duration::from_secs(2),
+            )
+            .await
+            .expect("retry must reissue after panic cleanup")
+            .expect("durable runtime authority must survive preparation panic");
+        assert_eq!(
+            store.machine_lifecycle_load_calls(),
+            baseline_load_calls + 2,
+            "retry must issue one fresh lifecycle load after exact slot cleanup"
+        );
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn archive_retry_joins_before_wedged_publication_receipt_cas() {
+        let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let machine = Arc::new(MeerkatMachine::persistent(
+            store.clone(),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        ));
+        let session_id = SessionId::new();
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("register receipt-CAS archive fixture");
+        let driver = machine
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|entry| Arc::clone(&entry.driver))
+            .expect("receipt-CAS driver remains registered");
+        let input = crate::mob_adapter::create_tracked_flow_step_input(
+            "archive-receipt-cas",
+            ContentInput::Text("terminal awaiting durable receipt CAS".to_string()),
+            "archive-receipt-cas-flow",
+            None,
+            &meerkat_core::time_compat::new_uuid_v7().to_string(),
+        )
+        .expect("construct receipt-CAS directed input");
+        let input_id = input.id().clone();
+        {
+            let mut driver = driver.lock().await;
+            seed_dispatch_attached_authority(
+                &mut driver,
+                &session_id,
+                &LogicalRuntimeId::for_session(&session_id),
+            );
+        }
+        assert!(
+            driver
+                .lock()
+                .await
+                .as_driver_mut()
+                .accept_input(input)
+                .await
+                .expect("admit receipt-CAS directed input")
+                .is_accepted()
+        );
+        {
+            let mut driver = driver.lock().await;
+            let authority_handle = driver.shared_dsl_authority();
+            let mut authority = authority_handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::Retire {
+                    session_id: crate::meerkat_machine::dsl::SessionId::from_domain(&session_id),
+                },
+            )
+            .expect("restore retired receipt-CAS lifecycle");
+            drop(authority);
+            driver.set_control_projection(crate::RuntimeState::Retired, None, None);
+        }
+        commit_dispatch_outbox(&driver, &input_id, "archive receipt CAS", true).await;
+
+        let entered = Arc::new(crate::tokio::sync::Notify::new());
+        let release = Arc::new(crate::tokio::sync::Notify::new());
+        store.block_next_input_state_batch_cas_before_mutation(
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        );
+        let publisher = Arc::new(CountingDispatchPublisher {
+            calls: AtomicUsize::new(0),
+        });
+        let first_lease = machine
+            .prepare_session_archive_lease(&session_id)
+            .await
+            .expect("prepare first receipt-CAS archive lease")
+            .expect("receipt-CAS archive lease must exist");
+        let first_machine = Arc::clone(&machine);
+        let first_publisher = publisher.clone();
+        let first = crate::tokio::spawn(async move {
+            first_machine
+                .converge_session_archive_lease_terminals_before(
+                    first_lease,
+                    Some(first_publisher),
+                    meerkat_core::time_compat::Instant::now()
+                        + meerkat_core::time_compat::Duration::from_secs(5),
+                )
+                .await
+        });
+        entered.notified().await;
+
+        let retry_lease = machine
+            .prepare_session_archive_lease(&session_id)
+            .await
+            .expect("prepare retry while receipt CAS is wedged")
+            .expect("receipt-CAS retry lease must exist");
+        assert!(
+            machine.session_archive_lease_has_pending_terminal_dispatch(&retry_lease),
+            "retry must observe the exact process slot without locking the wedged driver"
+        );
+        let retry_error = machine
+            .converge_session_archive_lease_terminals_before(
+                retry_lease,
+                None,
+                meerkat_core::time_compat::Instant::now()
+                    + meerkat_core::time_compat::Duration::from_millis(100),
+            )
+            .await
+            .expect_err("retry acknowledgement must remain bounded while receipt CAS is wedged");
+        assert!(matches!(
+            retry_error,
+            RuntimeControlPlaneError::RetirementInProgress { ref stage, .. }
+                if stage == "terminal_publication"
+        ));
+        let probe = crate::tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            machine.prepare_session_archive_lease(&session_id),
+        )
+        .await
+        .expect("wedged receipt CAS retry must not retain M")
+        .expect("archive lease probe must remain valid")
+        .expect("receipt-CAS runtime remains registered");
+        drop(probe);
+
+        release.notify_waiters();
+        first
+            .await
+            .expect("receipt-CAS convergence task must join")
+            .expect("released receipt CAS must converge");
+        assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);
+        let stored = crate::store::RuntimeStore::load_input_state(
+            store.as_ref(),
+            &LogicalRuntimeId::for_session(&session_id),
+            &input_id,
+        )
+        .await
+        .expect("load durably published receipt-CAS input")
+        .expect("receipt-CAS input must remain durably addressable");
+        assert!(matches!(
+            stored
+                .state
+                .interaction_terminal_outbox
+                .map(|outbox| outbox.phase),
+            Some(InteractionTerminalOutboxPhase::Published { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_stored_only_terminal_fences_successor_actor_materialization() {
+        let machine = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("register cold stored-only runtime fixture");
+        let driver = machine
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|entry| Arc::clone(&entry.driver))
+            .expect("cold stored-only driver remains registered");
+        let input = crate::mob_adapter::create_tracked_flow_step_input(
+            "stored-only-successor-fence",
+            ContentInput::Text("terminal pending before successor revival".to_string()),
+            "stored-only-successor-flow",
+            None,
+            &meerkat_core::time_compat::new_uuid_v7().to_string(),
+        )
+        .expect("construct stored-only successor-fence input");
+        let input_id = input.id().clone();
+        {
+            let mut driver = driver.lock().await;
+            seed_dispatch_attached_authority(
+                &mut driver,
+                &session_id,
+                &LogicalRuntimeId::for_session(&session_id),
+            );
+        }
+        assert!(
+            driver
+                .lock()
+                .await
+                .as_driver_mut()
+                .accept_input(input)
+                .await
+                .expect("admit stored-only successor-fence input")
+                .is_accepted()
+        );
+        {
+            let mut driver = driver.lock().await;
+            let authority_handle = driver.shared_dsl_authority();
+            let mut authority = authority_handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::Retire {
+                    session_id: crate::meerkat_machine::dsl::SessionId::from_domain(&session_id),
+                },
+            )
+            .expect("restore retired stored-only successor-fence lifecycle");
+            drop(authority);
+            driver.set_control_projection(crate::RuntimeState::Retired, None, None);
+        }
+        commit_dispatch_outbox(&driver, &input_id, "stored-only successor fence", true).await;
+
+        let error = machine
+            .prepare_session_materialization(session_id.clone())
+            .await
+            .expect_err("pending predecessor terminal must fence actor B materialization");
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("runtime terminal publication remains in progress"),
+            "unexpected successor-fence error: {error:?}"
+        );
+
+        let publisher = Arc::new(CountingDispatchPublisher {
+            calls: AtomicUsize::new(0),
+        });
+        let lease = machine
+            .prepare_session_archive_lease(&session_id)
+            .await
+            .expect("prepare exact stored-only convergence lease")
+            .expect("stored-only successor-fence lease remains present");
+        machine
+            .converge_session_archive_lease_terminals_before(
+                lease,
+                Some(publisher.clone()),
+                meerkat_core::time_compat::Instant::now()
+                    + meerkat_core::time_compat::Duration::from_secs(2),
+            )
+            .await
+            .expect("predecessor terminal must converge before successor materialization");
+        assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);
+
+        machine
+            .unregister_session(&session_id)
+            .await
+            .expect("remove the retired predecessor only after exact receipt convergence");
+        let mut prepared = machine
+            .prepare_session_materialization(session_id)
+            .await
+            .expect("actor B materialization may proceed after exact receipt convergence");
+        prepared
+            .rollback_now()
+            .await
+            .expect("rollback successor-fence test materialization");
+    }
+
+    #[tokio::test]
+    async fn attached_actor_recovery_replaces_machine_retained_publication_handle_exactly() {
+        let machine = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        let actor_a = Arc::new(CountingDispatchPublisher {
+            calls: AtomicUsize::new(0),
+        });
+        let actor_b = Arc::new(CountingDispatchPublisher {
+            calls: AtomicUsize::new(0),
+        });
+        let mut prepared = machine
+            .prepare_session_materialization(session_id.clone())
+            .await
+            .expect("prepare actor A materialization");
+        crate::begin_session_runtime_actor_materialization(prepared.bindings())
+            .expect("claim actor A construction")
+            .commit()
+            .expect("record actor A materialization");
+        let actor_a_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle> =
+            actor_a.clone();
+        let actor_a_factory_handle = Arc::clone(&actor_a_handle);
+        let pending = match prepared
+            .ensure_executor_attachment(move |_witness| {
+                Box::new(PublicationHandleExecutor {
+                    publication_handle: Arc::clone(&actor_a_factory_handle),
+                })
+            })
+            .await
+            .expect("attach actor A executor")
+        {
+            super::super::EnsureRuntimeExecutorAttachment::Pending(pending) => pending,
+            super::super::EnsureRuntimeExecutorAttachment::Existing(witness) => {
+                panic!("fresh publication fixture reused {witness:?}")
+            }
+        };
+        let attachment = pending.commit().await.expect("commit actor A attachment");
+
+        let mut recovery = machine
+            .prepare_attached_session_actor_recovery(&attachment)
+            .await
+            .expect("open actor B recovery under exact attachment M");
+        crate::begin_session_runtime_actor_materialization(recovery.bindings())
+            .expect("claim actor B construction")
+            .commit()
+            .expect("record actor B materialization");
+        let actor_b_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle> =
+            actor_b.clone();
+        recovery
+            .replace_publication_handle_for_recovered_actor(actor_b_handle)
+            .await
+            .expect("replace retained publication capability before releasing M");
+        recovery
+            .commit_actor()
+            .expect("commit actor B under the unchanged executor attachment");
+
+        let retained = machine
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .and_then(RuntimeSessionEntry::publication_handle)
+            .expect("machine retains actor B publication handle");
+        let event = meerkat_core::event::AgentEvent::InteractionComplete {
+            interaction_id: meerkat_core::interaction::InteractionId(
+                meerkat_core::time_compat::new_uuid_v7(),
+            ),
+            result: "actor B exact retained handle".to_string(),
+            structured_output: None,
+        };
+        retained
+            .publish_interaction_terminals(std::slice::from_ref(&event))
+            .await
+            .expect("machine-retained actor B capability publishes");
+        assert_eq!(actor_a.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(actor_b.calls.load(Ordering::SeqCst), 1);
+
+        actor_a_handle
+            .publish_interaction_terminals(std::slice::from_ref(&event))
+            .await
+            .expect("detached actor A fixture remains a distinct capability");
+        assert_eq!(actor_a.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(actor_b.calls.load(Ordering::SeqCst), 1);
+    }
 
     /// Row #45 gate: control-plane not-found must map to the dedicated
     /// `RuntimeDriverError::NotFound` carrying the runtime id, NOT to

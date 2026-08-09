@@ -47,7 +47,7 @@ use crate::turn_execution_authority::{
 };
 use crate::types::{
     AssistantBlock, BlockAssistantMessage, Message, OutputSchema, StopReason, ToolCallView,
-    ToolDef, ToolName, ToolNameSet, Usage,
+    ToolDef, ToolName, ToolNameSet, TurnUsage, Usage,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,34 @@ use std::sync::Arc;
 
 pub use builder::{AgentBuildPolicyError, AgentBuilder, DefaultSystemPromptPolicy};
 pub use runner::{AgentControlStateError, AgentRunner, SnapshotProjectionError};
+
+fn validate_provider_turn_usage_identity(
+    turn_usage: &TurnUsage,
+    active_provider: crate::Provider,
+    active_model: &str,
+) -> Result<(), AgentError> {
+    let accounting = turn_usage.accounting();
+    if accounting.provider == active_provider && accounting.model == active_model {
+        return Ok(());
+    }
+
+    Err(AgentError::llm(
+        active_provider.as_str(),
+        crate::error::LlmFailureReason::ProviderError(
+            crate::error::LlmProviderError::non_retryable(
+                crate::error::LlmProviderErrorKind::IncompleteResponse,
+                serde_json::json!({
+                    "reason": "normalized_provider_accounting_identity_mismatch",
+                    "expected_provider": active_provider,
+                    "expected_model": active_model,
+                    "reported_provider": accounting.provider,
+                    "reported_model": accounting.model,
+                }),
+            ),
+        ),
+        "provider turn usage accounting did not match the active provider/model identity",
+    ))
+}
 
 /// Trait for LLM clients that can be used with the agent
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -86,6 +114,23 @@ pub trait AgentLlmClient: Send + Sync {
         _provider_params: Option<&ProviderParamsOverride>,
     ) -> Result<Option<crate::ProviderRequestPressure>, AgentError> {
         Ok(None)
+    }
+
+    /// Freshly lower the target request while core lends an ephemeral issuer.
+    ///
+    /// Implementations must return capabilities only from the lowering they
+    /// would use for this exact request. Persisted source cache evidence is not
+    /// an input and cannot satisfy this method's target-proof contract.
+    fn target_cache_lowering_capabilities(
+        &self,
+        _issuer: &crate::TargetCacheLoweringIssuer,
+        _messages: &[Message],
+        _tools: &[Arc<ToolDef>],
+        _max_tokens: u32,
+        _temperature: Option<f32>,
+        _provider_params: Option<&ProviderParamsOverride>,
+    ) -> Result<Vec<crate::TargetCacheLoweringCapability>, AgentError> {
+        Ok(Vec::new())
     }
 
     /// Get the typed catalog provider identity for this client.
@@ -217,6 +262,27 @@ pub trait AgentLlmClient: Send + Sync {
     }
 }
 
+/// Ask the active adapter to freshly lower one target request under a
+/// core-issued, non-persistable cache-proof authority.
+pub fn target_cache_lowering_capabilities(
+    client: &dyn AgentLlmClient,
+    messages: &[Message],
+    tools: &[Arc<ToolDef>],
+    max_tokens: u32,
+    temperature: Option<f32>,
+    provider_params: Option<&ProviderParamsOverride>,
+) -> Result<Vec<crate::TargetCacheLoweringCapability>, AgentError> {
+    let issuer = crate::TargetCacheLoweringIssuer::new();
+    client.target_cache_lowering_capabilities(
+        &issuer,
+        messages,
+        tools,
+        max_tokens,
+        temperature,
+        provider_params,
+    )
+}
+
 /// Hook for wrapping the final agent-facing LLM client.
 ///
 /// Factories and runtimes apply this after provider/raw-client adaptation so
@@ -323,6 +389,7 @@ pub struct LlmStreamResult {
     blocks: Vec<AssistantBlock>,
     stop_reason: StopReason,
     usage: Usage,
+    cache_breakpoint_claims: Vec<crate::ProviderCacheBreakpointClaim>,
 }
 
 impl LlmStreamResult {
@@ -331,6 +398,7 @@ impl LlmStreamResult {
             blocks,
             stop_reason,
             usage,
+            cache_breakpoint_claims: Vec::new(),
         }
     }
 
@@ -344,12 +412,40 @@ impl LlmStreamResult {
         &self.usage
     }
 
+    pub fn with_cache_breakpoint_claims(
+        mut self,
+        cache_breakpoint_claims: Vec<crate::ProviderCacheBreakpointClaim>,
+    ) -> Self {
+        self.cache_breakpoint_claims = cache_breakpoint_claims;
+        self
+    }
+
+    pub fn cache_breakpoint_claims(&self) -> &[crate::ProviderCacheBreakpointClaim] {
+        &self.cache_breakpoint_claims
+    }
+
     pub fn into_message(self) -> BlockAssistantMessage {
         BlockAssistantMessage::new(self.blocks, self.stop_reason)
     }
 
     pub fn into_parts(self) -> (Vec<AssistantBlock>, StopReason, Usage) {
         (self.blocks, self.stop_reason, self.usage)
+    }
+
+    pub fn into_parts_with_cache_claims(
+        self,
+    ) -> (
+        Vec<AssistantBlock>,
+        StopReason,
+        Usage,
+        Vec<crate::ProviderCacheBreakpointClaim>,
+    ) {
+        (
+            self.blocks,
+            self.stop_reason,
+            self.usage,
+            self.cache_breakpoint_claims,
+        )
     }
 }
 
@@ -1339,6 +1435,10 @@ pub enum CommsCapabilityError {
     /// The runtime does not support this capability.
     #[error("comms capability not supported: {0}")]
     Unsupported(String),
+    /// The runtime supports the capability but could not complete its exact
+    /// queue handoff contract.
+    #[error("comms capability failed: {0}")]
+    HandoffFailed(String),
 }
 
 /// Trait for comms runtime that can be used with the agent
@@ -1576,14 +1676,8 @@ pub trait CommsRuntime: Send + Sync {
         })
     }
 
-    /// Drain comms inbox and return messages formatted for the LLM
-    async fn drain_messages(&self) -> Vec<String>;
     /// Get a notification when new messages arrive
     fn inbox_notify(&self) -> Arc<tokio::sync::Notify>;
-    /// Returns true if a DISMISS signal was seen during the last `drain_messages` call.
-    fn dismiss_received(&self) -> bool {
-        false
-    }
     /// Get an event injector for this runtime's inbox.
     ///
     /// Surfaces use this to push external events into the agent inbox.
@@ -1598,31 +1692,6 @@ pub trait CommsRuntime: Send + Sync {
         &self,
     ) -> Option<Arc<dyn crate::event_injector::SubscribableInjector>> {
         None
-    }
-
-    /// Drain comms inbox and return structured interactions.
-    ///
-    /// Default implementation wraps `drain_messages()` results as `InteractionContent::Message`
-    /// with generated IDs.
-    async fn drain_inbox_interactions(&self) -> Vec<crate::interaction::InboxInteraction> {
-        self.drain_messages()
-            .await
-            .into_iter()
-            .map(|text| crate::interaction::InboxInteraction {
-                objective_id: None,
-                id: crate::interaction::InteractionId(uuid::Uuid::new_v4()),
-                from_route: None,
-                from: "unknown".into(),
-                content: crate::interaction::InteractionContent::Message {
-                    body: text.clone(),
-                    blocks: None,
-                },
-                rendered_text: text,
-                handling_mode: crate::types::HandlingMode::Queue,
-                render_metadata: None,
-                sender_taint: None,
-            })
-            .collect()
     }
 
     /// Look up and remove a one-shot subscriber for the given interaction.
@@ -1687,22 +1756,6 @@ pub trait CommsRuntime: Send + Sync {
         None
     }
 
-    /// Drain the contiguous volatile-control prefix of classified ingress.
-    ///
-    /// Durable-runtime heads are never removed through this compatibility
-    /// surface; they require `claim_classified_inbox_interaction` and an
-    /// AcceptWithCompletion receipt. The host loop routes returned control
-    /// interactions on their stored `PeerInputClass`.
-    ///
-    /// Default returns `Unsupported`. Comms-enabled runtimes must override.
-    async fn drain_classified_inbox_interactions(
-        &self,
-    ) -> Result<Vec<crate::interaction::ClassifiedInboxInteraction>, CommsCapabilityError> {
-        Err(CommsCapabilityError::Unsupported(
-            "drain_classified_inbox_interactions".to_string(),
-        ))
-    }
-
     /// Non-destructively claim at most one classified FIFO-head interaction.
     ///
     /// A DurableRuntime head remains queued until committed with an opaque
@@ -1716,21 +1769,47 @@ pub trait CommsRuntime: Send + Sync {
         ))
     }
 
-    /// Drain canonical volatile-control ingress candidates.
+    /// Hand off one volatile-control FIFO head by an exact claim.
     ///
-    /// This remains the compatibility bridge for control consumers that own
-    /// `PeerInputCandidate` directly. DurableRuntime input is intentionally
-    /// absent and must use the claim/receipt path.
-    async fn drain_peer_input_candidates(&self) -> Vec<crate::interaction::PeerInputCandidate> {
-        self.drain_classified_inbox_interactions()
-            .await
-            .unwrap_or_default()
+    /// A durable-runtime head is retained and reported as no volatile item.
+    async fn handoff_one_volatile_peer_input_candidate(
+        &self,
+    ) -> Result<Option<crate::interaction::PeerInputCandidate>, CommsCapabilityError> {
+        let Some(claim) = self.claim_classified_inbox_interaction().await? else {
+            return Ok(None);
+        };
+        if claim.delivery_contract()
+            == crate::interaction::PeerIngressDeliveryContract::DurableRuntime
+        {
+            return Ok(None);
+        }
+        claim
+            .__handoff_volatile()
+            .map_err(|error| CommsCapabilityError::HandoffFailed(error.to_string()))
+    }
+
+    /// Hand off the contiguous volatile-control FIFO prefix by exact claims.
+    ///
+    /// Durable-runtime heads remain queued for AcceptWithCompletion. Unlike
+    /// the removed drain compatibility seams, this method never turns an
+    /// unsupported capability or a failed claim CAS into an empty batch.
+    async fn handoff_volatile_peer_input_candidates(
+        &self,
+    ) -> Result<Vec<crate::interaction::PeerInputCandidate>, CommsCapabilityError> {
+        let mut candidates = Vec::new();
+        loop {
+            let Some(candidate) = self.handoff_one_volatile_peer_input_candidate().await? else {
+                break;
+            };
+            candidates.push(candidate);
+        }
+        Ok(candidates)
     }
 
     /// Snapshot the currently queued peer-ingress surface without draining it.
     ///
-    /// This is a hidden diagnostic capability used while mapping the internal
-    /// MeerkatMachine boundary onto existing comms ownership.
+    /// The result is a read-only projection. Claim ids, correlations, counts,
+    /// and ages exposed here cannot authorize queue mutation.
     async fn peer_ingress_queue_snapshot(
         &self,
     ) -> Result<crate::interaction::PeerIngressQueueSnapshot, CommsCapabilityError> {
@@ -1739,10 +1818,10 @@ pub trait CommsRuntime: Send + Sync {
         ))
     }
 
-    /// Snapshot the current peer runtime surface for MeerkatMachine mapping.
+    /// Snapshot the current peer runtime surface for read-only diagnostics.
     ///
-    /// This extends the queued ingress snapshot with the local trust membership
-    /// that governs peer admission.
+    /// This extends the queued ingress projection with the currently observed
+    /// local trust membership. It cannot mutate trust or admission state.
     async fn peer_ingress_runtime_snapshot(
         &self,
     ) -> Result<crate::interaction::PeerIngressRuntimeSnapshot, CommsCapabilityError> {
@@ -2416,10 +2495,6 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl CommsRuntime for NoopCommsRuntime {
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> std::sync::Arc<Notify> {
             self.notify.clone()
         }

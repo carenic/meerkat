@@ -11,6 +11,7 @@ use meerkat_contracts::wire::{
     WireHostUnavailableDetail, WireMobErrorDetail, WireScopeDeniedDetail, WireStaleCursorDetail,
     WireStaleFenceDetail,
 };
+use std::sync::Arc;
 
 /// Runtime capability required from a seated mob member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +185,43 @@ pub enum MobError {
     #[error("mob member already exists: {0}")]
     MemberAlreadyExists(AgentIdentity),
 
+    /// The durable child session committed, but ordinary resume provisioning
+    /// did not seat the requested member identity. The child session id is
+    /// retained so an operator can retry resume rather than losing the fork.
+    #[error(
+        "durable fork session '{fork_session_id}' committed for member '{member_id}', but resume provisioning failed: {reason}"
+    )]
+    ForkMemberProvisionFailed {
+        member_id: AgentIdentity,
+        fork_session_id: meerkat_core::SessionId,
+        reason: String,
+    },
+
+    /// Receiver-side compact helper projection rejected an invalid label or
+    /// byte bound before reading/storing any worker payload.
+    #[error("invalid bounded helper result request: {reason}")]
+    InvalidBoundedHelperResult { reason: String },
+
+    /// Canonical member/session authority changed while the receiver was
+    /// projecting an exact bounded helper result. The worker remains intact;
+    /// callers may retry the read against a stable terminal observation.
+    #[error("bounded helper result for member '{member_id}' is temporarily unavailable: {reason}")]
+    BoundedHelperResultUnavailable {
+        member_id: AgentIdentity,
+        reason: String,
+    },
+
+    /// Exact bounded projection succeeded, but retirement did not. The member
+    /// and durable session identities remain explicit recovery authority.
+    #[error(
+        "bounded helper result was certified for member '{member_id}' and session '{session_id}', but retirement failed: {reason}"
+    )]
+    BoundedHelperRetirementFailed {
+        member_id: AgentIdentity,
+        session_id: meerkat_core::SessionId,
+        reason: String,
+    },
+
     /// The mob member's profile does not allow external turns.
     #[error("mob member is not externally addressable: {0}")]
     NotExternallyAddressable(AgentIdentity),
@@ -208,6 +246,46 @@ pub enum MobError {
     /// cleanup can be retried instead of publishing a false terminal event.
     #[error("retirement topology cleanup incomplete: {0}")]
     RetirementTopologyIncomplete(String),
+
+    /// Retirement was durably admitted and remains non-routable, but the
+    /// exact runtime teardown could not converge before the owner deadline.
+    /// The roster, session, and runtime witnesses are retained for retry.
+    #[error(
+        "member retirement remains in progress for session '{session_id}' at {stage}; the owner deadline was reached"
+    )]
+    RetirementInProgress {
+        session_id: meerkat_core::SessionId,
+        stage: String,
+    },
+
+    /// Peer-only retirement has no controller-local session identity. The
+    /// durable member identity remains the exact retry anchor while the same
+    /// bounded lifecycle cleanup continues.
+    #[error(
+        "member retirement remains in progress for peer-only member '{member_id}' at {stage}; the owner deadline was reached"
+    )]
+    MemberRetirementInProgress {
+        member_id: AgentIdentity,
+        stage: String,
+    },
+
+    /// The exact retirement command is process-owned and single-flight, but
+    /// the actor has not yet durably published Retiring. This is retryable
+    /// busy state, not authority to claim that teardown was already admitted.
+    #[error(
+        "member retirement admission is still pending for '{member_id}' at {stage}; no durable Retiring claim is implied"
+    )]
+    MemberRetirementAdmissionPending {
+        member_id: AgentIdentity,
+        stage: String,
+    },
+
+    /// One process-owned exact-incarnation retirement is shared by concurrent
+    /// callers. The actor produces a single owned error; this transparent Arc
+    /// preserves that exact typed cause for every joined observer without
+    /// re-running the retirement command or reducing it to display text.
+    #[error(transparent)]
+    SharedRetirementFailure(Arc<MobError>),
 
     /// Supervisor rotation reached one or more remote members but did not
     /// complete, so local supervisor authority stayed at the pre-rotation
@@ -375,6 +453,26 @@ pub enum MobError {
         mode: crate::MobRuntimeMode,
         reason: String,
     },
+
+    /// A peer-only lifecycle effect requires the explicit durable supervisor
+    /// protocol rotation ceremony before V5 direct-member authority exists.
+    #[error(
+        "operation '{operation}' requires supervisor protocol {required:?}; current durable protocol is {current:?}"
+    )]
+    SupervisorProtocolUpgradeRequired {
+        operation: String,
+        current: meerkat_contracts::wire::supervisor_bridge::BridgeProtocolVersion,
+        required: meerkat_contracts::wire::supervisor_bridge::BridgeProtocolVersion,
+    },
+
+    /// Supervisor rotation already committed the V5 authority, but one or
+    /// more direct peer-member bearers have not yet converged. Retrying the
+    /// same rotation request drains adoption at the committed epoch; it must
+    /// not mint another supervisor authority.
+    #[error(
+        "supervisor authority is committed at epoch {current_epoch}, but direct-member adoption remains pending: {reason}"
+    )]
+    DirectMemberAdoptionPending { current_epoch: u64, reason: String },
 
     /// A member is missing a required runtime capability for the requested operation.
     #[error("mob member {member_id} missing required capability {capability}: {context}")]
@@ -636,6 +734,9 @@ pub enum ForkSourceUnavailableCause {
     /// The source member has no session (peer-only external source —
     /// unchanged semantics, now typed).
     NoSession,
+    /// The source owns an active runtime turn or live actor admission. The
+    /// persistent fork owner refuses to observe and copy it concurrently.
+    Running,
     /// The source is placed on a member host; the proxied fork-context
     /// history read lands in phase 6 (§19.L2). Typed from birth so the
     /// phase-3→6 window never ships the untyped shape.
@@ -646,6 +747,7 @@ impl std::fmt::Display for ForkSourceUnavailableCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoSession => f.write_str("source member has no session"),
+            Self::Running => f.write_str("source member session is running"),
             Self::RemoteReadUnavailable => f.write_str(
                 "source member is placed on a member host; remote history reads are unavailable",
             ),
@@ -719,7 +821,75 @@ impl MobError {
     /// layer to reclassify authentication itself.
     pub fn structured_data(&self) -> Option<serde_json::Value> {
         match self {
+            Self::SharedRetirementFailure(error) => error.structured_data(),
             Self::SessionError(error) => error.structured_data(),
+            Self::ForkMemberProvisionFailed {
+                member_id,
+                fork_session_id,
+                ..
+            } => Some(serde_json::json!({
+                "kind": "fork_member_provision_failed",
+                "member_id": member_id.as_str(),
+                "fork_session_id": fork_session_id.to_string(),
+                "recovery": "resume_committed_fork_session",
+            })),
+            Self::RetirementInProgress { session_id, stage } => Some(serde_json::json!({
+                "kind": "mob_retirement_in_progress",
+                "session_id": session_id.to_string(),
+                "stage": stage,
+                "deadline_reached": true,
+                "retryable": true,
+                "authority_retained": true,
+            })),
+            Self::MemberRetirementInProgress { member_id, stage } => Some(serde_json::json!({
+                "kind": "mob_retirement_in_progress",
+                "member_id": member_id.as_str(),
+                "stage": stage,
+                "deadline_reached": true,
+                "retryable": true,
+                "authority_retained": true,
+            })),
+            Self::MemberRetirementAdmissionPending { member_id, stage } => {
+                Some(serde_json::json!({
+                    "kind": "mob_retirement_admission_pending",
+                    "member_id": member_id.as_str(),
+                    "stage": stage,
+                    "deadline_reached": true,
+                    "retryable": true,
+                    "authority_retained": false,
+                }))
+            }
+            Self::LifecycleOperationPending { intent } => Some(serde_json::json!({
+                "kind": "mob_lifecycle_operation_pending",
+                "intent": intent,
+                "retryable": true,
+                "authority_retained": true,
+            })),
+            Self::SupervisorProtocolUpgradeRequired {
+                operation,
+                current,
+                required,
+            } => Some(serde_json::json!({
+                "kind": "mob_supervisor_protocol_upgrade_required",
+                "operation": operation,
+                "current_protocol": current,
+                "required_protocol": required,
+                "required_action": "rotate_supervisor",
+                "retryable": false,
+                "authority_retained": true,
+            })),
+            Self::DirectMemberAdoptionPending {
+                current_epoch,
+                reason,
+            } => Some(serde_json::json!({
+                "kind": "mob_direct_member_adoption_pending",
+                "current_epoch": current_epoch,
+                "reason": reason,
+                "retryable": true,
+                "authority_retained": true,
+                "supervisor_authority_committed": true,
+                "required_action": "retry_rotate_supervisor",
+            })),
             Self::BridgeCommandRejected {
                 cause:
                     BridgeRejectionCause::MaterializeBuildRejected {
@@ -733,8 +903,33 @@ impl MobError {
         }
     }
 
+    /// Canonical public wire status for Mob failures that carry a stable
+    /// transport classification. Typed detail remains owned by
+    /// [`Self::wire_detail`]; this sibling also covers retryable lifecycle
+    /// states whose structured payload is not one of the four multi-host
+    /// detail envelopes.
+    pub fn wire_error_code(&self) -> Option<meerkat_contracts::ErrorCode> {
+        self.wire_detail()
+            .map(|detail| detail.code())
+            .or_else(|| match self {
+                Self::SharedRetirementFailure(error) => error.wire_error_code(),
+                Self::RetirementInProgress { .. }
+                | Self::MemberRetirementInProgress { .. }
+                | Self::MemberRetirementAdmissionPending { .. }
+                | Self::LifecycleOperationPending { .. }
+                | Self::DirectMemberAdoptionPending { .. } => {
+                    Some(meerkat_contracts::ErrorCode::SessionBusy)
+                }
+                Self::SupervisorProtocolUpgradeRequired { .. } => {
+                    Some(meerkat_contracts::ErrorCode::SupervisorRotationIncomplete)
+                }
+                _ => None,
+            })
+    }
+
     pub fn bridge_rejection_cause(&self) -> Option<BridgeRejectionCause> {
         match self {
+            Self::SharedRetirementFailure(error) => error.bridge_rejection_cause(),
             // Cloned: `BridgeRejectionCause` carries payload variants since V4.
             Self::BridgeCommandRejected { cause, .. } => Some(cause.clone()),
             _ => None,
@@ -774,6 +969,7 @@ impl MobError {
     /// own domain vocabularies rather than re-matching the variant list.
     pub fn failure_class(&self) -> MobFailureClass {
         match self {
+            Self::SharedRetirementFailure(error) => error.failure_class(),
             Self::MobNotFound(_)
             | Self::ProfileNotFound(_)
             | Self::MemberNotFound(_)
@@ -786,7 +982,7 @@ impl MobError {
                     MobFailureClass::TargetArchived
                 }
                 SessionResumeUnavailableReason::CommittedBoundaryUnprovable => {
-                    MobFailureClass::Transport
+                    MobFailureClass::RuntimeRejected
                 }
                 SessionResumeUnavailableReason::AuthorityChangedDuringMaterialization => {
                     MobFailureClass::Transport
@@ -799,6 +995,7 @@ impl MobError {
             Self::StorageError(_)
             | Self::SessionError(_)
             | Self::MemberProvisionFailed { .. }
+            | Self::ForkMemberProvisionFailed { .. }
             | Self::CommsError(_)
             | Self::RetirementTopologyIncomplete(_)
             | Self::MemberRestoreFailed { .. }
@@ -811,6 +1008,11 @@ impl MobError {
             }
             Self::CallbackPending { .. }
             | Self::CallbackBatchPending { .. }
+            | Self::RetirementInProgress { .. }
+            | Self::MemberRetirementInProgress { .. }
+            | Self::MemberRetirementAdmissionPending { .. }
+            | Self::SupervisorProtocolUpgradeRequired { .. }
+            | Self::DirectMemberAdoptionPending { .. }
             | Self::RuntimeEffectRefused { .. } => MobFailureClass::RuntimeRejected,
             _ => MobFailureClass::MobRejected,
         }
@@ -832,6 +1034,7 @@ impl MobError {
     ///   `mob_rotate_supervisor_error` renderer and richer data envelope.
     pub fn wire_detail(&self) -> Option<WireMobErrorDetail> {
         match self {
+            Self::SharedRetirementFailure(error) => error.wire_detail(),
             Self::ScopeDenied(denial) => Some(WireMobErrorDetail::ScopeDenied(
                 WireScopeDeniedDetail::from(denial),
             )),
@@ -914,6 +1117,18 @@ impl crate::runtime::MobRespawnError {
     pub fn wire_detail(&self) -> Option<WireMobErrorDetail> {
         match self {
             Self::Mob(inner) => inner.wire_detail(),
+            _ => None,
+        }
+    }
+
+    /// Delegate the canonical Mob-owned public status projection through
+    /// wrappers that can surface retirement-in-progress after the old member
+    /// has entered durable Retiring.
+    pub fn wire_error_code(&self) -> Option<meerkat_contracts::ErrorCode> {
+        match self {
+            Self::Mob(inner) | Self::SpawnAfterRetireWithCause { cause: inner, .. } => {
+                inner.wire_error_code()
+            }
             _ => None,
         }
     }
@@ -1447,6 +1662,41 @@ mod tests {
                 "{err} must NOT map to a console wire code"
             );
         }
+    }
+
+    #[test]
+    fn supervisor_v5_crossing_errors_report_exact_retry_authority() {
+        let upgrade = MobError::SupervisorProtocolUpgradeRequired {
+            operation: "retire_member".to_string(),
+            current: meerkat_contracts::wire::supervisor_bridge::BridgeProtocolVersion::V4,
+            required: meerkat_contracts::wire::supervisor_bridge::BridgeProtocolVersion::V5,
+        };
+        assert_eq!(
+            upgrade.wire_error_code(),
+            Some(meerkat_contracts::ErrorCode::SupervisorRotationIncomplete)
+        );
+        let upgrade_data = upgrade.structured_data().expect("typed upgrade data");
+        assert_eq!(
+            upgrade_data["kind"],
+            "mob_supervisor_protocol_upgrade_required"
+        );
+        assert_eq!(upgrade_data["required_action"], "rotate_supervisor");
+        assert_eq!(upgrade_data["authority_retained"], true);
+
+        let adoption = MobError::DirectMemberAdoptionPending {
+            current_epoch: 7,
+            reason: "receiver reply lost after BindMember".to_string(),
+        };
+        assert_eq!(
+            adoption.wire_error_code(),
+            Some(meerkat_contracts::ErrorCode::SessionBusy)
+        );
+        let adoption_data = adoption.structured_data().expect("typed adoption data");
+        assert_eq!(adoption_data["kind"], "mob_direct_member_adoption_pending");
+        assert_eq!(adoption_data["current_epoch"], 7);
+        assert_eq!(adoption_data["supervisor_authority_committed"], true);
+        assert_eq!(adoption_data["authority_retained"], true);
+        assert_eq!(adoption.failure_class(), MobFailureClass::RuntimeRejected);
     }
 
     /// T-B3 (respawn half): `MobRespawnError::wire_detail` delegates for

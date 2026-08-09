@@ -5,7 +5,7 @@
 //! `CoreExecutor::apply()` on this executor, which translates the `RunPrimitive`
 //! into a machine-owned `SessionRuntime::apply_runtime_turn_with_pre_admission()` call.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use meerkat_core::EventEnvelope;
 use meerkat_core::event::AgentEvent;
@@ -28,6 +28,54 @@ use crate::{error, protocol::RpcError};
 #[cfg(feature = "mob")]
 use meerkat_mob::MobSessionService;
 
+#[derive(Clone)]
+pub(crate) struct RpcRuntimePublicationHandle {
+    current: Arc<StdRwLock<Arc<dyn CoreExecutorPublicationHandle>>>,
+}
+
+impl RpcRuntimePublicationHandle {
+    pub(crate) fn new(current: Arc<dyn CoreExecutorPublicationHandle>) -> Self {
+        Self {
+            current: Arc::new(StdRwLock::new(current)),
+        }
+    }
+
+    pub(crate) fn replace(&self, current: Arc<dyn CoreExecutorPublicationHandle>) {
+        *self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = current;
+    }
+
+    pub(crate) fn snapshot(&self) -> Arc<dyn CoreExecutorPublicationHandle> {
+        Arc::clone(
+            &self
+                .current
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl CoreExecutorPublicationHandle for RpcRuntimePublicationHandle {
+    async fn publish_interaction_terminals(
+        &self,
+        events: &[AgentEvent],
+    ) -> Result<
+        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
+        CoreExecutorError,
+    > {
+        let current = Arc::clone(
+            &self
+                .current
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        current.publish_interaction_terminals(events).await
+    }
+}
+
 /// Implements `CoreExecutor` by delegating to the runtime-owned apply path.
 ///
 /// Each session gets its own executor instance, which is owned by the
@@ -37,6 +85,7 @@ use meerkat_mob::MobSessionService;
 pub struct SessionRuntimeExecutor {
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
+    publication_handle: RpcRuntimePublicationHandle,
 }
 
 #[cfg(feature = "mob")]
@@ -45,6 +94,7 @@ pub struct MobRpcRuntimeExecutor {
     session_service: Arc<dyn MobSessionService>,
     runtime: Option<Arc<SessionRuntime>>,
     session_id: SessionId,
+    publication_handle: RpcRuntimePublicationHandle,
     notification_sink: NotificationSink,
 }
 
@@ -53,15 +103,24 @@ impl MobRpcRuntimeExecutor {
     pub fn new(
         session_service: Arc<dyn MobSessionService>,
         runtime: Option<Arc<SessionRuntime>>,
-        session_id: SessionId,
+        actor_witness: meerkat::LiveSessionActorWitness,
         notification_sink: NotificationSink,
     ) -> Self {
+        let session_id = actor_witness.session_id().clone();
+        let publication_handle = RpcRuntimePublicationHandle::new(
+            mob_runtime_publication_handle_for_actor(Arc::clone(&session_service), actor_witness),
+        );
         Self {
             session_service,
             runtime,
             session_id,
+            publication_handle,
             notification_sink,
         }
+    }
+
+    pub(crate) fn replaceable_publication_handle(&self) -> RpcRuntimePublicationHandle {
+        self.publication_handle.clone()
     }
 }
 
@@ -71,11 +130,48 @@ impl SessionRuntimeExecutor {
     /// The notification sink is NOT captured here — the executor reads the
     /// current sink from the runtime at apply time so reconnected TCP clients
     /// always get events routed to the live transport.
-    pub fn new(runtime: Arc<SessionRuntime>, session_id: SessionId) -> Self {
+    pub fn new(
+        runtime: Arc<SessionRuntime>,
+        actor_witness: meerkat::LiveSessionActorWitness,
+    ) -> Self {
+        let session_id = actor_witness.session_id().clone();
+        let publication_handle = RpcRuntimePublicationHandle::new(
+            meerkat::surface::persistent_runtime_publication_handle(
+                runtime.persistent_service(),
+                actor_witness,
+            ),
+        );
         Self {
             runtime,
             session_id,
+            publication_handle,
         }
+    }
+
+    /// Create an executor before its exact service actor has been inserted.
+    /// The service must publish that actor into this one-shot slot during the
+    /// same materialization transaction; publication fails closed until then.
+    pub fn new_for_actor_slot(
+        runtime: Arc<SessionRuntime>,
+        session_id: SessionId,
+        actor_witness_slot: meerkat::LiveSessionActorWitnessSlot,
+    ) -> Self {
+        let publication_handle = RpcRuntimePublicationHandle::new(
+            meerkat::surface::persistent_runtime_publication_handle_for_actor_slot(
+                runtime.persistent_service(),
+                session_id.clone(),
+                actor_witness_slot,
+            ),
+        );
+        Self {
+            runtime,
+            session_id,
+            publication_handle,
+        }
+    }
+
+    pub(crate) fn replaceable_publication_handle(&self) -> RpcRuntimePublicationHandle {
+        self.publication_handle.clone()
     }
 }
 
@@ -160,12 +256,16 @@ impl CoreExecutorPostStopCleanupHandle for SessionRuntimePostStopCleanupHandle {
 
 #[async_trait::async_trait]
 impl CoreExecutorInterruptHandle for SessionRuntimeInterruptHandle {
-    async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
+    async fn hard_cancel_run_if_current(
+        &self,
+        expected_run_id: &meerkat_core::lifecycle::RunId,
+        _reason: String,
+    ) -> Result<bool, CoreExecutorError> {
         self.runtime
-            .interrupt_live_with_machine_authority(&self.session_id)
+            .interrupt_run_live_with_machine_authority(&self.session_id, expected_run_id)
             .await
             .or_else(|err| match err {
-                SessionError::NotRunning { .. } => Ok(()),
+                SessionError::NotRunning { .. } => Ok(false),
                 err => Err(err),
             })
             .map_err(|err| CoreExecutorError::control_failed_runtime(err.to_string()))
@@ -249,7 +349,18 @@ struct MobRpcRuntimeInterruptHandle {
 #[cfg(feature = "mob")]
 struct MobRpcRuntimePublicationHandle {
     session_service: Arc<dyn MobSessionService>,
-    session_id: SessionId,
+    actor_witness: meerkat::LiveSessionActorWitness,
+}
+
+#[cfg(feature = "mob")]
+pub(crate) fn mob_runtime_publication_handle_for_actor(
+    session_service: Arc<dyn MobSessionService>,
+    actor_witness: meerkat::LiveSessionActorWitness,
+) -> Arc<dyn CoreExecutorPublicationHandle> {
+    Arc::new(MobRpcRuntimePublicationHandle {
+        session_service,
+        actor_witness,
+    })
 }
 
 #[cfg(feature = "mob")]
@@ -318,7 +429,7 @@ impl CoreExecutorPublicationHandle for MobRpcRuntimePublicationHandle {
         CoreExecutorError,
     > {
         self.session_service
-            .publish_interaction_terminals(&self.session_id, events)
+            .publish_interaction_terminals_for_actor(&self.actor_witness, events)
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
@@ -327,13 +438,17 @@ impl CoreExecutorPublicationHandle for MobRpcRuntimePublicationHandle {
 #[cfg(feature = "mob")]
 #[async_trait::async_trait]
 impl CoreExecutorInterruptHandle for MobRpcRuntimeInterruptHandle {
-    async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
+    async fn hard_cancel_run_if_current(
+        &self,
+        expected_run_id: &meerkat_core::lifecycle::RunId,
+        _reason: String,
+    ) -> Result<bool, CoreExecutorError> {
         if let Some(runtime) = self.runtime.as_ref() {
             return runtime
-                .interrupt_live_with_machine_authority(&self.session_id)
+                .interrupt_run_live_with_machine_authority(&self.session_id, expected_run_id)
                 .await
                 .or_else(|err| match err {
-                    SessionError::NotRunning { .. } => Ok(()),
+                    SessionError::NotRunning { .. } => Ok(false),
                     err => Err(err),
                 })
                 .map_err(|err| CoreExecutorError::control_failed_runtime(err.to_string()));
@@ -341,13 +456,14 @@ impl CoreExecutorInterruptHandle for MobRpcRuntimeInterruptHandle {
         if let Some(adapter) = self.session_service.runtime_adapter() {
             return self
                 .session_service
-                .interrupt_with_machine_authority(
+                .interrupt_run_with_machine_authority(
                     &self.session_id,
+                    expected_run_id,
                     adapter.session_control_authority(),
                 )
                 .await
                 .or_else(|err| match err {
-                    SessionError::NotRunning { .. } => Ok(()),
+                    SessionError::NotRunning { .. } => Ok(false),
                     err => Err(err),
                 })
                 .map_err(|err| CoreExecutorError::control_failed_runtime(err.to_string()));
@@ -510,10 +626,7 @@ impl CoreExecutor for SessionRuntimeExecutor {
     }
 
     fn publication_handle(&self) -> Option<Arc<dyn CoreExecutorPublicationHandle>> {
-        Some(meerkat::surface::persistent_runtime_publication_handle(
-            self.runtime.persistent_service(),
-            self.session_id.clone(),
-        ))
+        Some(self.publication_handle.snapshot())
     }
 
     fn machine_managed_post_stop_unregister(&self) -> bool {
@@ -688,11 +801,9 @@ impl CoreExecutor for SessionRuntimeExecutor {
         Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
         CoreExecutorError,
     > {
-        self.runtime
-            .persistent_service()
-            .publish_interaction_terminals_exact_batch(&self.session_id, events)
+        self.publication_handle
+            .publish_interaction_terminals(events)
             .await
-            .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
 
     async fn cancel_after_boundary(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
@@ -740,10 +851,7 @@ impl CoreExecutor for MobRpcRuntimeExecutor {
     }
 
     fn publication_handle(&self) -> Option<Arc<dyn CoreExecutorPublicationHandle>> {
-        Some(Arc::new(MobRpcRuntimePublicationHandle {
-            session_service: Arc::clone(&self.session_service),
-            session_id: self.session_id.clone(),
-        }))
+        Some(self.publication_handle.snapshot())
     }
 
     fn machine_managed_post_stop_unregister(&self) -> bool {
@@ -898,10 +1006,9 @@ impl CoreExecutor for MobRpcRuntimeExecutor {
         Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
         CoreExecutorError,
     > {
-        self.session_service
-            .publish_interaction_terminals(&self.session_id, events)
+        self.publication_handle
+            .publish_interaction_terminals(events)
             .await
-            .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
 
     async fn cancel_after_boundary(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
@@ -971,6 +1078,23 @@ mod tests {
         outcome: BoundaryCancelOutcome,
         reconcile_calls: Arc<AtomicUsize>,
         abort_calls: Arc<AtomicUsize>,
+    }
+
+    struct UnusedPublicationHandle;
+
+    #[async_trait::async_trait]
+    impl CoreExecutorPublicationHandle for UnusedPublicationHandle {
+        async fn publish_interaction_terminals(
+            &self,
+            _events: &[AgentEvent],
+        ) -> Result<
+            Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
+            CoreExecutorError,
+        > {
+            Err(CoreExecutorError::Internal(
+                "compaction forwarding fixture has no actor publication authority".to_string(),
+            ))
+        }
     }
 
     impl BoundaryCancelSessionService {
@@ -1093,13 +1217,6 @@ mod tests {
             Ok(meerkat_mob::SessionResumeAuthority::default())
         }
 
-        async fn prepare_session_for_resume(
-            &self,
-            _session_id: &SessionId,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-
         async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
             &self,
             _session_id: &SessionId,
@@ -1140,6 +1257,15 @@ mod tests {
             self.archive_with_mob_lifecycle_authority(session_id).await
         }
 
+        async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+            &self,
+            session_id: &SessionId,
+            _deadline: meerkat_core::time_compat::Instant,
+        ) -> Result<(), SessionError> {
+            self.archive_with_mob_lifecycle_authority_under_runtime_turn_boundary(session_id)
+                .await
+        }
+
         async fn discard_live_session_under_runtime_turn_boundary(
             &self,
             session_id: &SessionId,
@@ -1155,8 +1281,13 @@ mod tests {
         let reconcile_calls = Arc::clone(&service.reconcile_calls);
         let abort_calls = Arc::clone(&service.abort_calls);
         let session_service: Arc<dyn MobSessionService> = Arc::new(service);
-        let mut executor =
-            MobRpcRuntimeExecutor::new(session_service, None, session_id, NotificationSink::noop());
+        let mut executor = MobRpcRuntimeExecutor {
+            session_service,
+            runtime: None,
+            session_id,
+            publication_handle: RpcRuntimePublicationHandle::new(Arc::new(UnusedPublicationHandle)),
+            notification_sink: NotificationSink::noop(),
+        };
 
         CoreExecutor::reconcile_committed_compaction_projections(&mut executor, &[])
             .await

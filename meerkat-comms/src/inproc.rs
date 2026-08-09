@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! // Register an agent's inbox
-//! let (inbox, sender) = Inbox::new();
+//! let (inbox, sender) = Inbox::new_transport_only();
 //! InprocRegistry::global().register("my-agent", pubkey, sender);
 //!
 //! // Delivery is pubkey-keyed: the Router resolves a trusted peer's

@@ -254,7 +254,7 @@ pub async fn create_session_with_params(
     params: CreateSessionParams,
     runtime: Arc<SessionRuntime>,
     notification_sink: &NotificationSink,
-    runtime_adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+    _runtime_adapter: &Arc<meerkat_runtime::MeerkatMachine>,
     request_context: Option<RequestContext>,
 ) -> RpcResponse {
     if let Err(err) = meerkat::surface::validate_public_peer_meta(params.peer_meta.as_ref()) {
@@ -450,28 +450,21 @@ pub async fn create_session_with_params(
     // points; eagerly attaching here is redundant and can recurse through the
     // runtime control path before the pending session has ever been exercised.
     if params.initial_turn != Some(InitialTurn::Deferred) {
-        let executor = Box::new(crate::session_executor::SessionRuntimeExecutor::new(
-            runtime.clone(),
-            session_id.clone(),
-        ));
-        if let Err(error) = runtime_adapter
-            .ensure_session_with_executor(session_id.clone(), executor)
-            .await
-        {
+        if let Err(error) = runtime.ensure_runtime_executor(&session_id).await {
             if let Err(cleanup_error) = runtime.archive_session(&session_id).await {
                 return RpcResponse::error(
                     id,
                     error::INTERNAL_ERROR,
                     format!(
-                        "runtime executor registration failed: {error}; staged session cleanup failed: {}",
-                        cleanup_error.message
+                        "runtime executor registration failed: {}; staged session cleanup failed: {}",
+                        error.message, cleanup_error.message
                     ),
                 );
             }
             return RpcResponse::error(
                 id,
                 error::INTERNAL_ERROR,
-                format!("runtime executor registration failed: {error}"),
+                format!("runtime executor registration failed: {}", error.message),
             );
         }
     }

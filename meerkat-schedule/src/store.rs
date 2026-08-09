@@ -28,6 +28,106 @@ pub struct ClaimDueRequest {
     pub lease_duration: Duration,
 }
 
+/// Store-issued authority for one schedule executor incarnation.
+///
+/// The opaque token fences process restarts while `fencing_token` gives
+/// operators and remote stores a monotonic liveness epoch. A host may plan or
+/// claim firing work only while this exact witness is current in the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleExecutorLease {
+    owner_id: String,
+    lease_token: Uuid,
+    fencing_token: u64,
+    acquired_at_utc: DateTime<Utc>,
+    expires_at_utc: DateTime<Utc>,
+}
+
+impl ScheduleExecutorLease {
+    pub fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+
+    pub fn lease_token(&self) -> Uuid {
+        self.lease_token
+    }
+
+    pub fn fencing_token(&self) -> u64 {
+        self.fencing_token
+    }
+
+    pub fn acquired_at_utc(&self) -> DateTime<Utc> {
+        self.acquired_at_utc
+    }
+
+    pub fn expires_at_utc(&self) -> DateTime<Utc> {
+        self.expires_at_utc
+    }
+
+    #[doc(hidden)]
+    pub fn from_store_commit(
+        owner_id: String,
+        lease_token: Uuid,
+        fencing_token: u64,
+        acquired_at_utc: DateTime<Utc>,
+        expires_at_utc: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            owner_id,
+            lease_token,
+            fencing_token,
+            acquired_at_utc,
+            expires_at_utc,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquireScheduleExecutorLeaseRequest {
+    /// Unique executor-incarnation identity, not a stable host name. A
+    /// restarted process mints a new value and waits for or takes over expiry.
+    pub owner_id: String,
+    pub lease_duration: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcquireScheduleExecutorLeaseOutcome {
+    Acquired(ScheduleExecutorLease),
+    Busy {
+        current_owner_id: String,
+        expires_at_utc: DateTime<Utc>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewScheduleExecutorLeaseRequest {
+    pub lease: ScheduleExecutorLease,
+    pub lease_duration: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewScheduleExecutorLeaseOutcome {
+    Renewed(ScheduleExecutorLease),
+    Stale,
+}
+
+/// Non-authorizing view of the store's schedule firing lease.
+///
+/// The bearer token is deliberately absent. This is liveness evidence for
+/// service/tool surfaces, not a capability to claim occurrences.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveScheduleExecutor {
+    pub owner_id: String,
+    pub fencing_token: u64,
+    pub acquired_at_utc: DateTime<Utc>,
+    pub expires_at_utc: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleExecutorLeaseObservation {
+    pub store_now_utc: DateTime<Utc>,
+    pub active: Option<ActiveScheduleExecutor>,
+}
+
 #[derive(Debug)]
 pub struct ClaimDueResult {
     pub store_now_utc: DateTime<Utc>,
@@ -390,6 +490,43 @@ pub trait ScheduleStore: Send + Sync {
     /// may be coalesced and are advisory; store reads remain authoritative.
     async fn wait_for_durable_wake(&self) -> Result<(), ScheduleStoreError>;
 
+    /// Acquire the realm store's singular schedule firing authority.
+    ///
+    /// Stores must sample their own clock and perform expiry takeover plus
+    /// fencing-token advancement in one atomic boundary. Custom stores that do
+    /// not implement this contract cannot host schedule firing.
+    async fn acquire_executor_lease(
+        &self,
+        _request: AcquireScheduleExecutorLeaseRequest,
+    ) -> Result<AcquireScheduleExecutorLeaseOutcome, ScheduleStoreError> {
+        Err(unsupported(self.kind()))
+    }
+
+    /// Renew an exact store-issued executor witness. Stale and expired
+    /// witnesses return `Stale`; they never recreate authority implicitly.
+    async fn renew_executor_lease(
+        &self,
+        _request: RenewScheduleExecutorLeaseRequest,
+    ) -> Result<RenewScheduleExecutorLeaseOutcome, ScheduleStoreError> {
+        Err(unsupported(self.kind()))
+    }
+
+    /// Relinquish an exact executor witness. This is an optimization only:
+    /// expiry remains the durable crash-recovery path.
+    async fn release_executor_lease(
+        &self,
+        _lease: ScheduleExecutorLease,
+    ) -> Result<(), ScheduleStoreError> {
+        Err(unsupported(self.kind()))
+    }
+
+    /// Observe durable firing-host liveness without receiving claim authority.
+    async fn observe_executor_lease(
+        &self,
+    ) -> Result<ScheduleExecutorLeaseObservation, ScheduleStoreError> {
+        Err(unsupported(self.kind()))
+    }
+
     async fn get_store_time_utc(&self) -> Result<DateTime<Utc>, ScheduleStoreError>;
 
     async fn next_action_time_utc(&self) -> Result<ScheduleStoreActionTime, ScheduleStoreError>;
@@ -494,8 +631,13 @@ pub trait ScheduleStore: Send + Sync {
         occurrence_id: &OccurrenceId,
     ) -> Result<Vec<DeliveryReceipt>, ScheduleStoreError>;
 
+    /// Claim due work under the exact executor lease in the same store
+    /// transaction that screens and writes occurrence claims. There is no
+    /// unfenced compatibility method: a caller without store-issued firing
+    /// authority cannot dequeue schedule work.
     async fn claim_due_occurrences(
         &self,
+        lease: &ScheduleExecutorLease,
         request: ClaimDueRequest,
     ) -> Result<ClaimDueResult, ScheduleStoreError>;
 
@@ -640,6 +782,7 @@ impl ScheduleStore for DisabledScheduleStore {
 
     async fn claim_due_occurrences(
         &self,
+        _lease: &ScheduleExecutorLease,
         _request: ClaimDueRequest,
     ) -> Result<ClaimDueResult, ScheduleStoreError> {
         Err(unsupported(self.kind()))
@@ -677,6 +820,7 @@ impl ScheduleStore for DisabledScheduleStore {
 #[derive(Default)]
 pub struct MemoryScheduleStore {
     inner: Arc<RwLock<MemoryScheduleState>>,
+    executor_gate: Arc<crate::tokio::sync::Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -687,6 +831,8 @@ struct MemoryScheduleState {
     refill_deadlines: BTreeMap<ScheduleId, DateTime<Utc>>,
     refill_queue: BTreeSet<(DateTime<Utc>, ScheduleId)>,
     refill_scan_cursor: Option<(DateTime<Utc>, ScheduleId)>,
+    executor_lease: Option<ScheduleExecutorLease>,
+    executor_fencing_high_water: u64,
 }
 
 fn memory_set_schedule_refill_deadline(
@@ -905,6 +1051,130 @@ impl ScheduleStore for MemoryScheduleStore {
     async fn wait_for_durable_wake(&self) -> Result<(), ScheduleStoreError> {
         Err(ScheduleStoreError::DurableWakeUnsupported {
             backend: self.kind(),
+        })
+    }
+
+    async fn acquire_executor_lease(
+        &self,
+        request: AcquireScheduleExecutorLeaseRequest,
+    ) -> Result<AcquireScheduleExecutorLeaseOutcome, ScheduleStoreError> {
+        if request.owner_id.trim().is_empty() || request.lease_duration.num_milliseconds() <= 0 {
+            return Err(ScheduleStoreError::InvalidExecutorLease(
+                "executor owner must be non-empty and lease duration must be at least 1ms".into(),
+            ));
+        }
+        let _gate = self.executor_gate.lock().await;
+        let mut state = self.inner.write().await;
+        let store_now_utc = Utc::now();
+        if let Some(current) = state.executor_lease.as_ref()
+            && current.expires_at_utc > store_now_utc
+        {
+            return Ok(AcquireScheduleExecutorLeaseOutcome::Busy {
+                current_owner_id: current.owner_id.clone(),
+                expires_at_utc: current.expires_at_utc,
+            });
+        }
+        let expires_at_utc = store_now_utc
+            .checked_add_signed(request.lease_duration)
+            .ok_or_else(|| {
+                ScheduleStoreError::InvalidExecutorLease(
+                    "executor lease expiry is outside the supported UTC range".into(),
+                )
+            })?;
+        state.executor_fencing_high_water = state
+            .executor_fencing_high_water
+            .checked_add(1)
+            .ok_or_else(|| {
+                ScheduleStoreError::Internal("executor fencing token exhausted".into())
+            })?;
+        let lease = ScheduleExecutorLease::from_store_commit(
+            request.owner_id,
+            Uuid::now_v7(),
+            state.executor_fencing_high_water,
+            store_now_utc,
+            expires_at_utc,
+        );
+        state.executor_lease = Some(lease.clone());
+        Ok(AcquireScheduleExecutorLeaseOutcome::Acquired(lease))
+    }
+
+    async fn renew_executor_lease(
+        &self,
+        request: RenewScheduleExecutorLeaseRequest,
+    ) -> Result<RenewScheduleExecutorLeaseOutcome, ScheduleStoreError> {
+        if request.lease_duration.num_milliseconds() <= 0 {
+            return Err(ScheduleStoreError::InvalidExecutorLease(
+                "executor lease duration must be at least 1ms".into(),
+            ));
+        }
+        let _gate = self.executor_gate.lock().await;
+        let mut state = self.inner.write().await;
+        let store_now_utc = Utc::now();
+        let Some(current) = state.executor_lease.as_ref() else {
+            return Ok(RenewScheduleExecutorLeaseOutcome::Stale);
+        };
+        if current.owner_id != request.lease.owner_id
+            || current.lease_token != request.lease.lease_token
+            || current.fencing_token != request.lease.fencing_token
+            || current.acquired_at_utc != request.lease.acquired_at_utc
+            || current.expires_at_utc != request.lease.expires_at_utc
+            || current.expires_at_utc <= store_now_utc
+        {
+            return Ok(RenewScheduleExecutorLeaseOutcome::Stale);
+        }
+        let expires_at_utc = store_now_utc
+            .checked_add_signed(request.lease_duration)
+            .ok_or_else(|| {
+                ScheduleStoreError::InvalidExecutorLease(
+                    "executor lease expiry is outside the supported UTC range".into(),
+                )
+            })?;
+        let renewed = ScheduleExecutorLease::from_store_commit(
+            current.owner_id.clone(),
+            current.lease_token,
+            current.fencing_token,
+            current.acquired_at_utc,
+            expires_at_utc,
+        );
+        state.executor_lease = Some(renewed.clone());
+        Ok(RenewScheduleExecutorLeaseOutcome::Renewed(renewed))
+    }
+
+    async fn release_executor_lease(
+        &self,
+        lease: ScheduleExecutorLease,
+    ) -> Result<(), ScheduleStoreError> {
+        let _gate = self.executor_gate.lock().await;
+        let mut state = self.inner.write().await;
+        if state.executor_lease.as_ref().is_some_and(|current| {
+            current.owner_id == lease.owner_id
+                && current.lease_token == lease.lease_token
+                && current.fencing_token == lease.fencing_token
+                && current.acquired_at_utc == lease.acquired_at_utc
+                && current.expires_at_utc == lease.expires_at_utc
+        }) {
+            state.executor_lease = None;
+        }
+        Ok(())
+    }
+
+    async fn observe_executor_lease(
+        &self,
+    ) -> Result<ScheduleExecutorLeaseObservation, ScheduleStoreError> {
+        let _gate = self.executor_gate.lock().await;
+        let store_now_utc = Utc::now();
+        let state = self.inner.read().await;
+        let active = state.executor_lease.as_ref().and_then(|lease| {
+            (lease.expires_at_utc > store_now_utc).then(|| ActiveScheduleExecutor {
+                owner_id: lease.owner_id.clone(),
+                fencing_token: lease.fencing_token,
+                acquired_at_utc: lease.acquired_at_utc,
+                expires_at_utc: lease.expires_at_utc,
+            })
+        });
+        Ok(ScheduleExecutorLeaseObservation {
+            store_now_utc,
+            active,
         })
     }
 
@@ -1221,9 +1491,23 @@ impl ScheduleStore for MemoryScheduleStore {
 
     async fn claim_due_occurrences(
         &self,
+        lease: &ScheduleExecutorLease,
         request: ClaimDueRequest,
     ) -> Result<ClaimDueResult, ScheduleStoreError> {
+        let _gate = self.executor_gate.lock().await;
         let store_now_utc = Utc::now();
+        let mut state = self.inner.write().await;
+        let authorized = state.executor_lease.as_ref().is_some_and(|current| {
+            current.owner_id == lease.owner_id
+                && current.lease_token == lease.lease_token
+                && current.fencing_token == lease.fencing_token
+                && current.acquired_at_utc == lease.acquired_at_utc
+                && current.expires_at_utc == lease.expires_at_utc
+                && current.expires_at_utc > store_now_utc
+        });
+        if !authorized {
+            return Err(ScheduleStoreError::ExecutorLeaseStale);
+        }
         if request.limit == 0 {
             return Ok(ClaimDueResult {
                 store_now_utc,
@@ -1231,8 +1515,6 @@ impl ScheduleStore for MemoryScheduleStore {
                 row_faults: Vec::new(),
             });
         }
-        let mut state = self.inner.write().await;
-
         let active_schedules: BTreeMap<ScheduleId, SchedulePhase> = state
             .schedules
             .iter()
@@ -1591,4 +1873,86 @@ fn reject_standalone_supersession_write(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod executor_lease_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn memory_executor_lease_is_singular_fenced_and_releasable()
+    -> Result<(), ScheduleStoreError> {
+        let store = MemoryScheduleStore::new();
+        let first_acquire = store
+            .acquire_executor_lease(AcquireScheduleExecutorLeaseRequest {
+                owner_id: "host-a".into(),
+                lease_duration: Duration::seconds(30),
+            })
+            .await?;
+        let AcquireScheduleExecutorLeaseOutcome::Acquired(first) = first_acquire else {
+            return Err(ScheduleStoreError::Internal(format!(
+                "first executor lease acquisition unexpectedly returned {first_acquire:?}"
+            )));
+        };
+        let observed = store
+            .observe_executor_lease()
+            .await?
+            .active
+            .ok_or_else(|| {
+                ScheduleStoreError::Internal(
+                    "active executor lease was absent immediately after acquisition".into(),
+                )
+            })?;
+        assert_eq!(observed.owner_id, first.owner_id());
+        assert_eq!(observed.fencing_token, first.fencing_token());
+        let competing_acquire = store
+            .acquire_executor_lease(AcquireScheduleExecutorLeaseRequest {
+                owner_id: "host-b".into(),
+                lease_duration: Duration::seconds(30),
+            })
+            .await?;
+        assert!(matches!(
+            competing_acquire,
+            AcquireScheduleExecutorLeaseOutcome::Busy { .. }
+        ));
+
+        store.release_executor_lease(first.clone()).await?;
+        assert!(store.observe_executor_lease().await?.active.is_none());
+        let takeover = store
+            .acquire_executor_lease(AcquireScheduleExecutorLeaseRequest {
+                owner_id: "host-b".into(),
+                lease_duration: Duration::seconds(30),
+            })
+            .await?;
+        let AcquireScheduleExecutorLeaseOutcome::Acquired(second) = takeover else {
+            return Err(ScheduleStoreError::Internal(format!(
+                "released executor lease unexpectedly remained busy: {takeover:?}"
+            )));
+        };
+        assert!(second.fencing_token() > first.fencing_token());
+        assert_eq!(
+            store
+                .renew_executor_lease(RenewScheduleExecutorLeaseRequest {
+                    lease: first,
+                    lease_duration: Duration::seconds(30),
+                })
+                .await?,
+            RenewScheduleExecutorLeaseOutcome::Stale
+        );
+        let current_renewal = store
+            .renew_executor_lease(RenewScheduleExecutorLeaseRequest {
+                lease: second.clone(),
+                lease_duration: Duration::seconds(60),
+            })
+            .await?;
+        let RenewScheduleExecutorLeaseOutcome::Renewed(renewed) = current_renewal else {
+            return Err(ScheduleStoreError::Internal(
+                "current executor lease unexpectedly became stale during renewal".into(),
+            ));
+        };
+        store.release_executor_lease(second).await?;
+        assert!(store.observe_executor_lease().await?.active.is_some());
+        store.release_executor_lease(renewed).await?;
+        Ok(())
+    }
 }

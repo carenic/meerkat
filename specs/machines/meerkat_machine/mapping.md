@@ -875,6 +875,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `InterruptCurrentRun`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `InterruptCurrentRunForRunRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `InterruptCurrentRunForRunRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `ResolveUserInterruptPublicResultAcceptedInitializing`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -1016,6 +1022,18 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `CancelAfterBoundaryAlreadyPending`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `CancelAfterBoundaryForRunRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CancelAfterBoundaryForRunRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CancelAfterBoundaryForRunRunningAlreadyPending`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CancelAfterBoundaryForRunRetiredAlreadyPending`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `AbortCancelAfterBoundaryDispatchInitializing`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -1056,6 +1074,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `RetireRequestedFromIdleUnbound`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireRequestedWhileRunBound`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireRequestedWhileRunUnbound`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `RetireAlreadyRetired`

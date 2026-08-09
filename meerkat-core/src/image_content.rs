@@ -12,6 +12,103 @@ use crate::realtime_transcript::RealtimeTranscriptEvent;
 use crate::session::SessionDeferredTurnState;
 use crate::types::{ContentBlock, ContentInput, ImageData, Message, SystemNoticeBlock};
 
+/// Maximum decoded size of one blob copied by the durable transcript-fork
+/// preflight. It matches the per-image live admission ceiling while applying
+/// independently to every referenced blob in the selected prefix.
+pub const MAX_DURABLE_FORK_IMAGE_BYTES: usize = crate::live_adapter::MAX_LIVE_IMAGE_BYTES;
+
+/// Validate every image blob in a transcript branch before its session row is
+/// committed, externalizing and verifying inline images along the way.
+///
+/// Existing references are read and content-address verified. Inline payloads
+/// are stored through the receipt-grade verifier, then rewritten to the exact
+/// verified reference. The caller receives a fully normalized prefix only
+/// after the complete scan succeeds, so persistence never commits a child
+/// whose later messages hide a missing or mismatched blob.
+pub async fn preflight_messages_for_durable_fork(
+    blob_store: &dyn BlobStore,
+    messages: &mut [Message],
+) -> Result<(), crate::ImageBlobIntegrityError> {
+    async fn preflight_blocks(
+        blob_store: &dyn BlobStore,
+        blocks: &mut [ContentBlock],
+    ) -> Result<(), crate::ImageBlobIntegrityError> {
+        for block in blocks {
+            match block {
+                ContentBlock::Image {
+                    media_type,
+                    data: ImageData::Inline { data },
+                } => {
+                    let verified = crate::ensure_stored_image_blob(
+                        blob_store,
+                        media_type,
+                        data,
+                        MAX_DURABLE_FORK_IMAGE_BYTES,
+                    )
+                    .await?;
+                    *block = ContentBlock::Image {
+                        media_type: verified.blob_ref.media_type,
+                        data: ImageData::Blob {
+                            blob_id: verified.blob_ref.blob_id,
+                        },
+                    };
+                }
+                ContentBlock::Image {
+                    media_type,
+                    data: ImageData::Blob { blob_id },
+                } => {
+                    crate::blob::verify_stored_image_blob(
+                        blob_store,
+                        blob_id,
+                        media_type,
+                        MAX_DURABLE_FORK_IMAGE_BYTES,
+                    )
+                    .await?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    for message in messages {
+        match message {
+            Message::User(user) => preflight_blocks(blob_store, &mut user.content).await?,
+            Message::ToolResults { results, .. } => {
+                for result in results {
+                    preflight_blocks(blob_store, &mut result.content).await?;
+                }
+            }
+            Message::SystemNotice(notice) => {
+                for block in &mut notice.blocks {
+                    match block {
+                        SystemNoticeBlock::Comms { content, .. }
+                        | SystemNoticeBlock::ExternalEvent { content, .. } => {
+                            preflight_blocks(blob_store, content).await?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Message::BlockAssistant(assistant) => {
+                for block in &assistant.blocks {
+                    if let crate::AssistantBlock::Image { blob_ref, .. } = block {
+                        crate::blob::verify_stored_image_blob(
+                            blob_store,
+                            &blob_ref.blob_id,
+                            &blob_ref.media_type,
+                            MAX_DURABLE_FORK_IMAGE_BYTES,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            Message::System(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Maximum decoded user-image bytes hydrated into a realtime provider
 /// projection at once.
 ///

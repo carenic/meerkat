@@ -583,6 +583,7 @@ fn test_usage_accumulation() {
         output_tokens: 50,
         cache_creation_tokens: Some(10),
         cache_read_tokens: None,
+        provider_accounting: None,
     };
 
     let turn2 = Usage {
@@ -590,20 +591,42 @@ fn test_usage_accumulation() {
         output_tokens: 75,
         cache_creation_tokens: None,
         cache_read_tokens: Some(10),
+        provider_accounting: None,
     };
 
     total.add(&turn1);
     assert_eq!(total.input_tokens, 100);
     assert_eq!(total.output_tokens, 50);
-    assert_eq!(total.cache_creation_tokens, Some(10));
+    assert_eq!(total.cache_creation_tokens, None);
     assert_eq!(total.cache_read_tokens, None);
 
     total.add(&turn2);
     assert_eq!(total.input_tokens, 250);
     assert_eq!(total.output_tokens, 125);
-    assert_eq!(total.cache_creation_tokens, Some(10));
-    assert_eq!(total.cache_read_tokens, Some(10));
+    assert_eq!(total.cache_creation_tokens, None);
+    assert_eq!(total.cache_read_tokens, None);
     assert_eq!(total.total_tokens(), 375);
+}
+
+#[test]
+fn cumulative_usage_uses_normalized_presented_total_not_cache_details() {
+    let turn = TurnUsage::new(
+        Usage {
+            input_tokens: 10,
+            output_tokens: 7,
+            cache_creation_tokens: Some(20),
+            cache_read_tokens: Some(30),
+            provider_accounting: None,
+        },
+        crate::ProviderTokenAccounting::anthropic("claude-test", 10, 20, 30),
+    );
+    let mut cumulative = CumulativeUsage::default();
+    cumulative.add_turn(&turn);
+
+    assert_eq!(cumulative.input_tokens, 60);
+    assert_eq!(cumulative.output_tokens, 7);
+    assert_eq!(cumulative.cache_creation_tokens, None);
+    assert_eq!(cumulative.cache_read_tokens, None);
 }
 
 #[test]
@@ -616,6 +639,7 @@ fn test_run_result_json_schema() {
             output_tokens: 500,
             cache_creation_tokens: None,
             cache_read_tokens: None,
+            provider_accounting: None,
         },
         turns: 3,
         tool_calls: 5,

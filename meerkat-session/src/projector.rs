@@ -842,7 +842,7 @@ mod tests {
                     result: "Hi there!".to_string(),
                     structured_output: None,
                     extraction_required: false,
-                    usage: Usage::default(),
+                    usage: Usage::default().into(),
                     terminal_cause_kind: None,
                 },
             ],

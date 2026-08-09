@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::blob::BlobId;
-use crate::types::{ContentBlock, StopReason, Usage};
+use crate::types::{ContentBlock, StopReason};
 
 /// WholeBlob/0.8.10 metadata key for the accumulated realtime reducer
 /// projection.
@@ -244,7 +244,7 @@ pub enum RealtimeTranscriptEvent {
     AssistantTurnCompleted {
         response_id: String,
         stop_reason: StopReason,
-        usage: Usage,
+        usage: crate::types::TurnUsage,
     },
     /// Provider turn was interrupted before terminal materialization.
     AssistantTurnInterrupted { response_id: String },
@@ -291,7 +291,7 @@ pub enum RealtimeTranscriptMaterializedMessage {
         response_id: String,
         text: String,
         stop_reason: StopReason,
-        usage: Usage,
+        usage: Option<crate::types::TurnUsage>,
         /// T9/T10: which output lane the staged content arrived on.
         /// Drives whether the materializer flushes
         /// [`crate::types::AssistantBlock::Text`] (Display) or

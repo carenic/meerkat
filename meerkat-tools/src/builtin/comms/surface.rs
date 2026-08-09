@@ -152,7 +152,7 @@ mod tests {
 
     fn make_tool_context() -> (Arc<Router>, TrustedPeersView) {
         let keypair = make_keypair();
-        let (_, inbox_sender) = meerkat_comms::Inbox::new();
+        let (_, inbox_sender) = meerkat_comms::Inbox::new_transport_only();
         let router = Arc::new(Router::new(
             keypair,
             CommsConfig::default(),
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_comms_callability_true_with_trusted_peers() {
-        let (_, inbox_sender) = meerkat_comms::Inbox::new();
+        let (_, inbox_sender) = meerkat_comms::Inbox::new_transport_only();
         let router = Arc::new(Router::new(
             make_keypair(),
             CommsConfig::default(),
@@ -218,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_comms_tools_remain_visible_without_trusted_peers() {
-        let (_, inbox_sender) = meerkat_comms::Inbox::new();
+        let (_, inbox_sender) = meerkat_comms::Inbox::new_transport_only();
         let router = Arc::new(Router::new(
             make_keypair(),
             CommsConfig::default(),

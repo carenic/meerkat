@@ -7,6 +7,7 @@ pub mod transport;
 
 use crate::event::AgentEvent;
 use crate::event::EventEnvelope;
+use crate::lifecycle::RunId;
 use crate::lifecycle::run_primitive::{ConversationAppend, CoreRenderable, RuntimeTurnMetadata};
 use crate::session::SystemMessageAppendError;
 use crate::time_compat::SystemTime;
@@ -504,6 +505,32 @@ pub enum HostPromptSections {
     SpecPinned,
 }
 
+/// Host-issued authority for exactly one immutable WorkGraph namespace.
+/// WorkGraph enablement without this grant is a build error. Namespace is
+/// durable identity, so rename is unsupported; hosts archive one namespace and
+/// mint another instead of rewriting ownership.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct WorkGraphNamespaceGrant {
+    pub realm_id: String,
+    pub namespace: String,
+}
+
+impl WorkGraphNamespaceGrant {
+    pub fn new(realm_id: impl Into<String>, namespace: impl Into<String>) -> Result<Self, String> {
+        let realm_id = realm_id.into();
+        let namespace = namespace.into();
+        if realm_id.trim().is_empty() || namespace.trim().is_empty() {
+            return Err("WorkGraph namespace grant realm and namespace must be non-empty".into());
+        }
+        Ok(Self {
+            realm_id,
+            namespace,
+        })
+    }
+}
+
 /// Optional build-time options used by factory-backed session builders.
 #[derive(Clone)]
 pub struct SessionBuildOptions {
@@ -605,6 +632,8 @@ pub struct SessionBuildOptions {
     pub schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
     /// Agent-facing WorkGraph tools supplied by the embedding surface.
     pub workgraph_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    /// Host-issued namespace authority required whenever WorkGraph resolves on.
+    pub workgraph_namespace_grant: Option<WorkGraphNamespaceGrant>,
     pub preload_skills: Option<Vec<crate::skills::SkillKey>>,
     pub realm_id: Option<crate::RealmId>,
     pub instance_id: Option<String>,
@@ -1412,6 +1441,7 @@ impl Default for SessionBuildOptions {
             override_web_search: ToolCategoryOverride::Inherit,
             schedule_tools: None,
             workgraph_tools: None,
+            workgraph_namespace_grant: None,
             preload_skills: None,
             realm_id: None,
             instance_id: None,
@@ -1479,6 +1509,7 @@ impl std::fmt::Debug for SessionBuildOptions {
             .field("override_mob", &self.override_mob)
             .field("schedule_tools", &self.schedule_tools.is_some())
             .field("workgraph_tools", &self.workgraph_tools.is_some())
+            .field("workgraph_namespace_grant", &self.workgraph_namespace_grant)
             .field("preload_skills", &self.preload_skills)
             .field("realm_id", &self.realm_id)
             .field("instance_id", &self.instance_id)
@@ -1718,6 +1749,9 @@ pub enum AppendSystemContextStatus {
 }
 
 /// Ephemeral per-turn tool overlay for flow-dispatched turns.
+pub const TURN_DEFERRED_TOOL_AUTHORITIES_CONTEXT_KEY: &str =
+    "meerkat.turn_deferred_tool_authorities";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TurnToolOverlay {
@@ -2136,6 +2170,182 @@ pub struct SessionForkReplaceRequest {
     pub tool_access_policy: Option<crate::ops::ToolAccessPolicy>,
 }
 
+/// A provider-cache-compatible durable transcript fork point.
+///
+/// Construction routes through [`ForkPoint::prove`]. A value exists only after
+/// that core-owned verifier proves both a complete transcript boundary and an
+/// source provider-authored cache-breakpoint witness and an independently
+/// authored target lowering over byte-identical provider-rendered bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ForkPoint {
+    message_count: usize,
+    authored_cache_breakpoint: crate::AuthoredCacheBreakpoint,
+}
+
+impl ForkPoint {
+    /// Prove that a selected transcript prefix ends at this provider-authored
+    /// breakpoint and preserves complete tool-use/result groups.
+    pub fn prove(
+        messages: &[Message],
+        source_capability: crate::ValidatedSourceCacheBreakpoint,
+        target_capability: crate::TargetCacheLoweringCapability,
+    ) -> Result<ForkCacheInheritanceInstall, ForkPointError> {
+        if !crate::types::superseded_system_prompt_offsets(messages).is_empty() {
+            return Err(ForkPointError::RenderedPrefixProjectionUnavailable);
+        }
+        let source_breakpoint = source_capability.into_authored_evidence();
+        source_breakpoint.validate_rendered_identity()?;
+        let target_breakpoint = target_capability.into_authored_evidence();
+        target_breakpoint.validate_rendered_identity()?;
+        let message_count = usize::try_from(target_breakpoint.boundary().message_count())
+            .map_err(|_| ForkPointError::BoundaryOutOfRange)?;
+        if message_count != messages.len() {
+            return Err(ForkPointError::BoundaryDoesNotEndPrefix {
+                boundary: message_count,
+                prefix_len: messages.len(),
+            });
+        }
+        crate::session::validate_fork_transcript_boundary(messages).map_err(|error| {
+            ForkPointError::IncompleteTranscriptGroup {
+                detail: error.to_string(),
+            }
+        })?;
+        let (digest, bytes) = crate::canonical_cache_prefix_identity(
+            messages,
+            target_breakpoint.boundary().message_count(),
+        )?;
+        if source_breakpoint.canonical_prefix_sha256() != digest
+            || source_breakpoint.canonical_prefix_bytes() != bytes
+            || target_breakpoint.canonical_prefix_sha256() != digest
+            || target_breakpoint.canonical_prefix_bytes() != bytes
+        {
+            return Err(ForkPointError::AuthoredEvidenceMismatch);
+        }
+        if source_breakpoint.provider() != target_breakpoint.provider()
+            || source_breakpoint.model() != target_breakpoint.model()
+            || source_breakpoint.boundary() != target_breakpoint.boundary()
+            || source_breakpoint.lowered_request_provenance().encoding
+                != target_breakpoint.lowered_request_provenance().encoding
+            || source_breakpoint.rendered_prefix_sha256()
+                != target_breakpoint.rendered_prefix_sha256()
+            || source_breakpoint.rendered_prefix_bytes()
+                != target_breakpoint.rendered_prefix_bytes()
+        {
+            return Err(ForkPointError::TargetLoweringMismatch);
+        }
+        Ok(ForkCacheInheritanceInstall {
+            fork_point: Self {
+                message_count,
+                authored_cache_breakpoint: target_breakpoint,
+            },
+        })
+    }
+
+    pub const fn message_count(&self) -> usize {
+        self.message_count
+    }
+
+    pub fn authored_cache_breakpoint(&self) -> &crate::AuthoredCacheBreakpoint {
+        &self.authored_cache_breakpoint
+    }
+}
+
+/// One-shot authority to install verified provider cache inheritance on a
+/// fork child.
+///
+/// This capability is deliberately neither cloneable nor serializable. A
+/// persisted or caller-constructed [`ForkPoint`] is observational only and
+/// cannot authorize cross-session evidence installation.
+#[derive(Debug)]
+pub struct ForkCacheInheritanceInstall {
+    fork_point: ForkPoint,
+}
+
+impl ForkCacheInheritanceInstall {
+    pub fn fork_point(&self) -> &ForkPoint {
+        &self.fork_point
+    }
+
+    pub(crate) fn into_fork_point(self) -> ForkPoint {
+        self.fork_point
+    }
+}
+
+/// Failure to prove a cache-compatible durable fork point.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ForkPointError {
+    #[error("provider cache-breakpoint boundary exceeds the host index range")]
+    BoundaryOutOfRange,
+    #[error("cache breakpoint boundary {boundary} does not end prefix of length {prefix_len}")]
+    BoundaryDoesNotEndPrefix { boundary: usize, prefix_len: usize },
+    #[error("fork prefix does not preserve a complete transcript group: {detail}")]
+    IncompleteTranscriptGroup { detail: String },
+    #[error("provider-authored cache evidence does not match canonical prefix bytes")]
+    AuthoredEvidenceMismatch,
+    #[error("fresh target lowering does not match source rendered-prefix evidence")]
+    TargetLoweringMismatch,
+    #[error("durable prompt history cannot be mapped to the projected provider prefix")]
+    RenderedPrefixProjectionUnavailable,
+    #[error(transparent)]
+    CacheEvidence(#[from] crate::CacheBreakpointEvidenceError),
+}
+
+/// Why a durable transcript fork could not inherit a provider cache entry.
+///
+/// The fork itself may still be valid and durable. This typed result prevents
+/// callers from interpreting a byte-identical transcript prefix as proof that
+/// a provider actually authored a cache breakpoint there.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ForkCacheInheritanceUnavailableReason {
+    /// No provider-authored breakpoint exists at the selected boundary.
+    NoAuthoredBreakpointAtBoundary,
+    /// A breakpoint exists at the boundary, but it was authored for a
+    /// provider/model other than the session identity the child will resume.
+    ProviderModelMismatch,
+    /// The caller could not prove the exact provider/model the child will
+    /// materialize before the durable fork commit.
+    TargetIdentityUnresolved,
+    /// No sealed provider-authored lowering witness exists for the child
+    /// request that will actually be materialized.
+    TargetLoweringUnavailable,
+    /// Durable history contains superseded keyed prompt rows and current
+    /// provider evidence carries no raw-to-projected boundary map.
+    RenderedPrefixProjectionUnavailable,
+    /// Stored provider evidence did not match the canonical prefix and was
+    /// rejected rather than copied to the child.
+    AuthoredEvidenceInvalid,
+}
+
+/// Provider cache inheritance disposition for a durable fork.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ForkCacheInheritance {
+    Available {
+        fork_point: ForkPoint,
+    },
+    Unavailable {
+        message_count: usize,
+        reason: ForkCacheInheritanceUnavailableReason,
+    },
+}
+
+/// Durable ownership target for a fork that will be resumed as a mob member.
+///
+/// The persistent session owner applies this identity before committing the
+/// child. `cache_identity` is deliberately optional: callers that cannot prove
+/// the exact provider/model the ordinary resume pipeline will materialize must
+/// pass `None`, which makes cache inheritance explicitly unavailable instead
+/// of persisting evidence that a later profile override could invalidate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DurableSessionForkTarget {
+    pub member_binding: crate::MobMemberBinding,
+    pub cache_identity: Option<crate::SessionLlmIdentity>,
+}
+
 /// Result of creating an edited transcript branch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -2145,6 +2355,8 @@ pub struct SessionForkResult {
     #[cfg_attr(feature = "schema", schemars(with = "String"))]
     pub session_id: SessionId,
     pub message_count: usize,
+    /// Exact cache-breakpoint inheritance disposition for the selected prefix.
+    pub cache_inheritance: ForkCacheInheritance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<String>,
 }
@@ -2262,6 +2474,21 @@ pub trait SessionService: Send + Sync {
     ///
     /// Returns `NotRunning` if no turn is active.
     async fn interrupt(&self, id: &SessionId) -> Result<(), SessionError>;
+
+    /// Hard-cancel one exact in-flight run.
+    ///
+    /// `false` is the level-triggered stale-run terminal. Services without an
+    /// actor-local exact-run comparison fail closed rather than widening to
+    /// [`Self::interrupt`].
+    async fn interrupt_run_if_current(
+        &self,
+        _id: &SessionId,
+        _expected_run_id: &RunId,
+    ) -> Result<bool, SessionError> {
+        Err(SessionError::Unsupported(
+            "interrupt_run_if_current".to_string(),
+        ))
+    }
 
     /// Cancel an in-flight turn once it reaches the next boundary.
     ///
@@ -2585,6 +2812,22 @@ pub trait SessionServiceTranscriptEditExt: SessionService {
         let _ = (id, req);
         Err(SessionError::Unsupported(
             "rewrite_session_transcript".to_string(),
+        ))
+    }
+
+    /// Explicitly replace one durable keyed system-prompt slot.
+    ///
+    /// Only this host-invoked operation may mint a prompt version. Session
+    /// boot, resume, materialization, and compaction are consumers of the
+    /// resulting version history and never call this seam.
+    async fn update_system_prompt(
+        &self,
+        id: &SessionId,
+        req: crate::SystemPromptUpdateRequest,
+    ) -> Result<crate::SystemPromptUpdateResult, SessionError> {
+        let _ = (id, req);
+        Err(SessionError::Unsupported(
+            "update_system_prompt".to_string(),
         ))
     }
 

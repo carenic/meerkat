@@ -216,6 +216,7 @@ mod tests {
         ) -> Result<MemberSpawnReceipt, MobError> {
             Ok(MemberSpawnReceipt {
                 member_ref: MemberRef::from_bridge_session_id(SessionId::new()),
+                direct_member_fence: None,
                 operation_id: meerkat_core::ops::OperationId::new(),
                 session_origin: ProvisionSessionOrigin::Fresh,
                 rollback_authority: None,
@@ -261,6 +262,15 @@ mod tests {
                 return Err(MobError::Internal("retire failed".to_string()));
             }
             Ok(crate::machines::mob_machine::MemberSessionDisposal::Archived)
+        }
+
+        async fn retire_member_until(
+            &self,
+            member_ref: &MemberRef,
+            _member_identity: &AgentIdentity,
+            _deadline: meerkat_core::time_compat::Instant,
+        ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
+            self.retire_member(member_ref).await
         }
 
         async fn interrupt_member(

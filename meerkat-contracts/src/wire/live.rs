@@ -1637,7 +1637,7 @@ pub enum WireRealtimeTranscriptEvent {
     AssistantTurnCompleted {
         response_id: String,
         stop_reason: meerkat_core::StopReason,
-        usage: meerkat_core::Usage,
+        usage: meerkat_core::TurnUsage,
     },
     AssistantTurnInterrupted {
         response_id: String,
@@ -1842,6 +1842,9 @@ pub enum WireLiveAdapterObservation {
         response_id: Option<String>,
         text: String,
         stop_reason: WireStopReason,
+        /// Best-effort observational usage attached to the transcript-final
+        /// sentinel. Authoritative normalized usage arrives only with the
+        /// subsequent `TurnCompleted` observation.
         usage: crate::wire::WireUsage,
     },
     AssistantTranscriptTruncated {
@@ -1896,7 +1899,7 @@ pub enum WireLiveAdapterObservation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response_id: Option<String>,
         stop_reason: WireStopReason,
-        usage: crate::wire::WireUsage,
+        usage: crate::wire::WireTurnUsage,
     },
     StatusChanged {
         status: WireLiveAdapterStatus,
@@ -2569,12 +2572,17 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_audio".into(),
                 stop_reason: meerkat_core::StopReason::EndTurn,
-                usage: meerkat_core::Usage {
-                    input_tokens: 3,
-                    output_tokens: 5,
-                    cache_creation_tokens: Some(1),
-                    cache_read_tokens: Some(2),
-                },
+                usage: meerkat_core::TurnUsage::host_declared(
+                    meerkat_core::Provider::Other,
+                    "wire-realtime-test",
+                    meerkat_core::Usage {
+                        input_tokens: 3,
+                        output_tokens: 5,
+                        cache_creation_tokens: Some(1),
+                        cache_read_tokens: Some(2),
+                        provider_accounting: None,
+                    },
+                ),
             },
             RealtimeTranscriptEvent::AssistantTurnInterrupted {
                 response_id: "resp_interrupted".into(),
@@ -2772,12 +2780,19 @@ mod tests {
             WireLiveAdapterObservation::TurnCompleted {
                 response_id: Some("resp_done".into()),
                 stop_reason: WireStopReason::EndTurn,
-                usage: crate::wire::WireUsage {
-                    input_tokens: 12,
-                    output_tokens: 34,
-                    total_tokens: 46,
-                    cache_creation_tokens: Some(1),
-                    cache_read_tokens: Some(2),
+                usage: crate::wire::WireTurnUsage {
+                    usage: crate::wire::WireUsage {
+                        input_tokens: 12,
+                        output_tokens: 34,
+                        total_tokens: 46,
+                        cache_creation_tokens: Some(1),
+                        cache_read_tokens: Some(2),
+                    },
+                    accounting: meerkat_core::ProviderTokenAccounting::host_declared(
+                        meerkat_core::Provider::Other,
+                        "wire-live-test",
+                        12,
+                    ),
                 },
             },
             WireLiveAdapterObservation::StatusChanged {

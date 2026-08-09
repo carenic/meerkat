@@ -1541,6 +1541,7 @@ impl HostMemberMaterializer {
             resumed_session,
             resume_materialization,
             resume_authority,
+            resume_preparation,
             launch_outcome,
             generation_start_seq,
             residency_update,
@@ -1556,6 +1557,7 @@ impl HostMemberMaterializer {
                     .await;
                 (
                     id,
+                    None,
                     None,
                     None,
                     None,
@@ -1623,17 +1625,28 @@ impl HostMemberMaterializer {
                         authority,
                         materialization,
                         session,
+                        preparation,
                         ..
-                    } => (
-                        id,
-                        Some(*session),
-                        Some(materialization),
-                        Some(authority),
-                        MaterializeLaunchOutcome::ResumedFromSnapshot,
-                        generation_start_seq,
-                        residency_update,
-                        Some(boundary),
-                    ),
+                    } => {
+                        if !preparation.matches_authority(&authority) {
+                            return Err(MaterializeServeError::Bindings {
+                                detail: format!(
+                                    "resume preparation receipt for '{id}' was not issued for its carried authority"
+                                ),
+                            });
+                        }
+                        (
+                            id,
+                            Some(*session),
+                            Some(materialization),
+                            Some(authority),
+                            Some(preparation),
+                            MaterializeLaunchOutcome::ResumedFromSnapshot,
+                            generation_start_seq,
+                            residency_update,
+                            Some(boundary),
+                        )
+                    }
                     crate::runtime::SessionResumeVerdict::Rejected(rejection) => {
                         return Err(MaterializeServeError::ResumeRejected(rejection));
                     }
@@ -1787,12 +1800,16 @@ impl HostMemberMaterializer {
                 ),
             }
         })?;
-        let route = match resume_materialization {
-            None => crate::runtime::session_service::SessionActorMaterializationRoute::Fresh,
-            Some(crate::runtime::SessionResumeMaterialization::Active) => {
-                crate::runtime::session_service::SessionActorMaterializationRoute::Resume
+        let route = match (resume_materialization, resume_preparation) {
+            (None, None) => {
+                crate::runtime::session_service::SessionActorMaterializationRoute::Fresh
             }
-            Some(crate::runtime::SessionResumeMaterialization::Revivable) => {
+            (Some(crate::runtime::SessionResumeMaterialization::Active), Some(preparation)) => {
+                crate::runtime::session_service::SessionActorMaterializationRoute::Resume {
+                    preparation,
+                }
+            }
+            (Some(crate::runtime::SessionResumeMaterialization::Revivable), Some(preparation)) => {
                 let authorization = prepared.archived_resume_authorization().map_err(|error| {
                     MaterializeServeError::Bindings {
                         detail: format!(
@@ -1802,7 +1819,15 @@ impl HostMemberMaterializer {
                 })?;
                 crate::runtime::session_service::SessionActorMaterializationRoute::Revivable {
                     authorization,
+                    preparation,
                 }
+            }
+            _ => {
+                return Err(MaterializeServeError::Bindings {
+                    detail: format!(
+                        "materialization for session {session_id} lost its typed resume preparation receipt"
+                    ),
+                });
             }
         };
         let actor_transaction = PreparedServiceActorTransaction::new(
@@ -2096,8 +2121,16 @@ impl HostMemberMaterializer {
             authority: resume_authority,
             materialization: resume_materialization,
             session,
+            preparation: resume_preparation,
             ..
         } = authorized;
+        if !resume_preparation.matches_authority(&resume_authority) {
+            return Err(MaterializeServeError::Bindings {
+                detail: format!(
+                    "resume preparation receipt for '{session_id}' was not issued for its carried authority"
+                ),
+            });
+        }
         let session = match resume_materialization {
             crate::runtime::SessionResumeMaterialization::Active => *session,
             crate::runtime::SessionResumeMaterialization::Revivable => {
@@ -2306,7 +2339,9 @@ impl HostMemberMaterializer {
         })?;
         let route = match resume_materialization {
             crate::runtime::SessionResumeMaterialization::Active => {
-                crate::runtime::session_service::SessionActorMaterializationRoute::Resume
+                crate::runtime::session_service::SessionActorMaterializationRoute::Resume {
+                    preparation: resume_preparation,
+                }
             }
             crate::runtime::SessionResumeMaterialization::Revivable => {
                 let authorization = prepared.archived_resume_authorization().map_err(|error| {
@@ -2318,6 +2353,7 @@ impl HostMemberMaterializer {
                 })?;
                 crate::runtime::session_service::SessionActorMaterializationRoute::Revivable {
                     authorization,
+                    preparation: resume_preparation,
                 }
             }
         };
@@ -2604,7 +2640,6 @@ impl HostMemberMaterializer {
         .map_err(|err| MaterializeServeError::Comms {
             detail: err.to_string(),
         })?;
-        runtime.require_peer_comms_machine_authority();
         if let Some(meta) = config.peer_meta.clone() {
             runtime.set_peer_meta(meta);
         }

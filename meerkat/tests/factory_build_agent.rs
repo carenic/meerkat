@@ -102,6 +102,7 @@ impl AgentLlmClient for MockAgentLlmClient {
                 output_tokens: 0,
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
+                provider_accounting: None,
             },
         ))
     }
@@ -1274,6 +1275,9 @@ async fn build_agent_with_resume_uses_stored_metadata() {
         provider: Some(Provider::OpenAI),
         max_tokens: Some(1024),
         workgraph_tools: Some(test_workgraph_tools()),
+        workgraph_namespace_grant: Some(
+            meerkat::WorkGraphNamespaceGrant::new("dev", "default").unwrap(),
+        ),
         provider_params: Some(
             meerkat_core::lifecycle::run_primitive::ProviderParamsOverride {
                 temperature: Some(0.1),
@@ -1386,6 +1390,9 @@ async fn build_agent_workgraph_enabled_without_dispatcher_fails_closed() {
         provider: Some(Provider::Anthropic),
         max_tokens: Some(1024),
         realm_id: Some(meerkat_core::RealmId::parse("dev").expect("valid realm")),
+        workgraph_namespace_grant: Some(
+            meerkat::WorkGraphNamespaceGrant::new("dev", "default").unwrap(),
+        ),
         ..AgentBuildConfig::new("claude-sonnet-4-5")
     };
 
@@ -1395,6 +1402,34 @@ async fn build_agent_workgraph_enabled_without_dispatcher_fails_closed() {
     assert!(
         error.to_string().contains("without a supplied dispatcher"),
         "expected the typed fail-closed Config error, got: {error}"
+    );
+}
+
+/// A dispatcher does not imply namespace authority. Any profile that resolves
+/// WorkGraph on without a host-issued grant must fail loudly at build time.
+#[tokio::test]
+async fn build_agent_workgraph_enabled_without_namespace_grant_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let factory = temp_factory(&temp);
+    let config = Config::default();
+
+    let build_config = AgentBuildConfig {
+        llm_client_override: Some(Arc::new(MockLlmClient)),
+        provider: Some(Provider::Anthropic),
+        max_tokens: Some(1024),
+        realm_id: Some(meerkat_core::RealmId::parse("dev").expect("valid realm")),
+        override_workgraph: ToolCategoryOverride::Enable,
+        workgraph_tools: Some(test_workgraph_tools()),
+        ..AgentBuildConfig::new("claude-sonnet-4-5")
+    };
+
+    let Err(error) = factory.build_agent(build_config, &config).await else {
+        panic!("WorkGraph enable without a namespace grant must fail the build closed");
+    };
+    assert!(
+        matches!(error, BuildAgentError::Config(_))
+            && error.to_string().contains("host-issued namespace grant"),
+        "expected the typed missing-grant Config error, got: {error}"
     );
 }
 

@@ -2004,6 +2004,30 @@ pub struct MobForkHelperParams {
     pub backend: Option<WireMobBackendKind>,
 }
 
+/// Typed terminal/truncation state for a bounded helper projection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MobBoundedHelperResultStatus {
+    Completed,
+    CompletedTruncated,
+    Failed,
+    FailedTruncated,
+    InProgress,
+    InProgressTruncated,
+    Unavailable,
+    UnavailableTruncated,
+}
+
+/// Receiver-bounded helper payload with explicit truncation state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobBoundedHelperResult {
+    pub label: String,
+    pub status: MobBoundedHelperResultStatus,
+    pub text: String,
+}
+
 /// Response payload for `mob/spawn_helper` and `mob/fork_helper`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -2013,6 +2037,8 @@ pub struct MobHelperResult {
     pub tokens_used: u64,
     pub agent_identity: String,
     pub member_ref: WireMemberRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_result: Option<MobBoundedHelperResult>,
 }
 
 /// Response payload for `mob/force_cancel`.

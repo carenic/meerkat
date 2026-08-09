@@ -246,6 +246,12 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
             "SessionTranscriptRewriteResult",
         ),
         RpcMethodDescriptor::typed(
+            "session/update_system_prompt",
+            "Explicitly replace one durable versioned system-prompt key",
+            "UpdateSystemPromptParams",
+            "SystemPromptUpdateResult",
+        ),
+        RpcMethodDescriptor::typed(
             "session/transcript_revision",
             "Read a retained immutable transcript revision body",
             "ReadSessionTranscriptRevisionParams",

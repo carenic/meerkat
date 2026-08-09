@@ -1210,7 +1210,7 @@ mod tests {
     /// Sender-side router whose ack validation (`ack.from == sent_to`) is
     /// the per-member ack-signing assertion.
     fn sender_router(sender_keypair: &Keypair) -> (Router, Inbox) {
-        let (inbox, inbox_sender) = Inbox::new();
+        let (inbox, inbox_sender) = Inbox::new_transport_only();
         let router = Router::new(
             sender_keypair.clone(),
             CommsConfig::default(),
@@ -1304,7 +1304,7 @@ mod tests {
         let committed_registry = Arc::new(HostAcceptorIdentityRegistry::new());
         let committed_owner: Arc<dyn Any + Send + Sync> = Arc::new(());
         let committed_keypair = Arc::new(Keypair::generate());
-        let (_inbox, committed_inbox_sender) = Inbox::new();
+        let (_inbox, committed_inbox_sender) = Inbox::new_transport_only();
         committed_registry
             .reserve_identity(
                 committed_owner,
@@ -1330,8 +1330,8 @@ mod tests {
             .expect("owner install");
         let current = Arc::new(Keypair::generate());
         let replacement = Arc::new(Keypair::generate());
-        let (_current_inbox, current_sender) = Inbox::new();
-        let (_replacement_inbox, replacement_sender) = Inbox::new();
+        let (_current_inbox, current_sender) = Inbox::new_transport_only();
+        let (_replacement_inbox, replacement_sender) = Inbox::new_transport_only();
         registry
             .register_identity(
                 &owner,
@@ -1389,8 +1389,8 @@ mod tests {
             .expect("owner install");
         let current = Arc::new(Keypair::generate());
         let replacement = Arc::new(Keypair::generate());
-        let (_current_inbox, current_sender) = Inbox::new();
-        let (_stale_inbox, stale_sender) = Inbox::new();
+        let (_current_inbox, current_sender) = Inbox::new_transport_only();
+        let (_stale_inbox, stale_sender) = Inbox::new_transport_only();
         registry
             .register_identity(
                 &owner,
@@ -1420,7 +1420,7 @@ mod tests {
     fn registry_mutations_require_installed_owner() {
         let registry = HostAcceptorIdentityRegistry::new();
         let keypair = Keypair::generate();
-        let (_inbox, inbox_sender) = Inbox::new();
+        let (_inbox, inbox_sender) = Inbox::new_transport_only();
         let stranger: Arc<dyn Any + Send + Sync> = Arc::new(());
 
         // No owner installed yet: register/remove fail closed.
@@ -1471,7 +1471,7 @@ mod tests {
         registry.install_owner(owner.clone()).unwrap();
         let keypair = Keypair::generate();
         let other_keypair = Keypair::generate();
-        let (_inbox, inbox_sender) = Inbox::new();
+        let (_inbox, inbox_sender) = Inbox::new_transport_only();
 
         // A keypair that cannot sign for the claimed pubkey is a typed error.
         assert!(matches!(

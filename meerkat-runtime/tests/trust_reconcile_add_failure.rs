@@ -122,10 +122,6 @@ impl std::fmt::Debug for AddFailingCommsRuntime {
 
 #[async_trait]
 impl CommsRuntime for AddFailingCommsRuntime {
-    async fn drain_messages(&self) -> Vec<String> {
-        Vec::new()
-    }
-
     fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
         Arc::new(tokio::sync::Notify::new())
     }
@@ -166,7 +162,6 @@ impl CommsRuntime for AddFailingCommsRuntime {
             auth_required: true,
             authority_phase: PeerIngressAuthorityPhase::Received,
             trusted_peers: self.successful_add_calls(),
-            submission_queue_len: 0,
             queue: PeerIngressQueueSnapshot::default(),
         })
     }

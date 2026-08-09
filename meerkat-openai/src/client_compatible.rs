@@ -532,6 +532,56 @@ impl LlmClient for OpenAiCompatibleClient {
         )
     }
 
+    fn request_pressure(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<meerkat_core::ProviderRequestPressure>, LlmError> {
+        let mut projected_request = request.clone();
+        projected_request.messages = self.project_replay_messages(&request.messages)?;
+        match self.mode {
+            OpenAiCompatibleMode::Responses => {
+                let Some(delegate) = self.responses_delegate.as_ref() else {
+                    return Ok(None);
+                };
+                let translated = self.request_with_remote_model(&projected_request);
+                let Some(mut pressure) = delegate.request_pressure(&translated)? else {
+                    return Ok(None);
+                };
+                pressure.max_bytes = meerkat_models::approximate_request_byte_cap(
+                    meerkat_core::Provider::SelfHosted,
+                );
+                if let Some(provenance) = pressure.lowered_request_provenance.as_mut() {
+                    provenance.provider = meerkat_core::Provider::SelfHosted;
+                }
+                Ok(Some(pressure))
+            }
+            OpenAiCompatibleMode::ChatCompletions => {
+                let body = self.build_chat_completions_body(&projected_request)?;
+                let encoded_body =
+                    serde_json::to_vec(&body).map_err(|error| LlmError::InvalidRequest {
+                        message: format!(
+                            "failed to serialize OpenAI-compatible request body: {error}"
+                        ),
+                    })?;
+                Ok(Some(
+                    meerkat_core::ProviderRequestPressure::new(
+                        encoded_body.len() as u64,
+                        meerkat_models::approximate_request_byte_cap(
+                            meerkat_core::Provider::SelfHosted,
+                        ),
+                    )
+                    .with_lowered_request_provenance(
+                        meerkat_core::LoweredRequestProvenance::from_body(
+                            meerkat_core::Provider::SelfHosted,
+                            meerkat_core::LoweredRequestEncoding::OpenAiChatCompletionsJson,
+                            &encoded_body,
+                        ),
+                    ),
+                ))
+            }
+        }
+    }
+
     fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
         match self.mode {
             OpenAiCompatibleMode::Responses => {
@@ -549,7 +599,20 @@ impl LlmClient for OpenAiCompatibleClient {
                     translated.messages = self.project_replay_messages(&request.messages)?;
                     let mut stream = delegate.stream(&translated);
                     while let Some(event) = stream.next().await {
-                        yield event?;
+                        match event? {
+                            LlmEvent::UsageUpdate { usage } => {
+                                let raw = usage.as_usage().clone();
+                                let accounting =
+                                    meerkat_core::ProviderTokenAccounting::openai_compatible(
+                                        &request.model,
+                                        raw.input_tokens,
+                                    );
+                                yield LlmEvent::UsageUpdate {
+                                    usage: meerkat_core::TurnUsage::new(raw, accounting),
+                                };
+                            }
+                            other => yield other,
+                        }
                     }
                 });
                 streaming::ensure_terminal_done(inner)
@@ -610,8 +673,19 @@ impl LlmClient for OpenAiCompatibleClient {
                                             .prompt_tokens_details
                                             .as_ref()
                                             .and_then(|details| details.cached_tokens),
+                                        provider_accounting: Some(
+                                            meerkat_core::ProviderTokenAccounting::openai_compatible(
+                                                &request.model,
+                                                event_usage.prompt_tokens.unwrap_or(0),
+                                            ),
+                                        ),
                                     };
-                                    yield LlmEvent::UsageUpdate { usage };
+                                    yield LlmEvent::UsageUpdate {
+                                        usage: meerkat_core::TurnUsage::try_from_usage(usage)
+                                            .map_err(|error| LlmError::Unknown {
+                                                message: error.to_string(),
+                                            })?,
+                                    };
                                 }
 
                                 for choice in event.choices {

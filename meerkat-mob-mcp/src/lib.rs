@@ -126,6 +126,13 @@ impl MobAppendSystemContextError {
             Self::Session(_) => None,
         }
     }
+
+    pub fn wire_error_code(&self) -> Option<meerkat_contracts::ErrorCode> {
+        match self {
+            Self::Mob(error) => error.wire_error_code(),
+            Self::Session(_) => None,
+        }
+    }
 }
 
 impl MobMcpDestroyError {
@@ -155,6 +162,13 @@ impl MobMcpDestroyError {
         match self {
             Self::Incomplete { .. } => None,
             Self::Mob(inner) => inner.wire_detail(),
+        }
+    }
+
+    pub fn wire_error_code(&self) -> Option<meerkat_contracts::ErrorCode> {
+        match self {
+            Self::Incomplete { .. } => None,
+            Self::Mob(inner) => inner.wire_error_code(),
         }
     }
 
@@ -3281,16 +3295,8 @@ impl CoreCommsRuntime for LocalCommsRuntime {
         })
     }
 
-    async fn drain_messages(&self) -> Vec<String> {
-        Vec::new()
-    }
-
     fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
         self.notify.clone()
-    }
-
-    async fn drain_peer_input_candidates(&self) -> Vec<PeerInputCandidate> {
-        Vec::new()
     }
 }
 
@@ -3545,7 +3551,11 @@ impl SessionService for LocalSessionService {
                 None,
                 AgentEvent::TurnCompleted {
                     stop_reason: meerkat_core::types::StopReason::EndTurn,
-                    usage: turn_usage,
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::Other,
+                        "mob-mcp-test-agent",
+                        turn_usage,
+                    ),
                 },
             ));
             let _ = event_tx.send(EventEnvelope::new_session(
@@ -3557,7 +3567,7 @@ impl SessionService for LocalSessionService {
                     result: "ok".to_string(),
                     structured_output: None,
                     extraction_required: false,
-                    usage,
+                    usage: usage.into(),
                     terminal_cause_kind: None,
                 },
             ));
@@ -3794,13 +3804,6 @@ impl SessionServiceHistoryExt for LocalSessionService {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl MobSessionService for LocalSessionService {
-    async fn prepare_session_for_resume(
-        &self,
-        _session_id: &SessionId,
-    ) -> Result<(), SessionError> {
-        Ok(())
-    }
-
     async fn observe_session_resume_authority(
         &self,
         _session_id: &SessionId,
@@ -3845,6 +3848,7 @@ impl MobSessionService for LocalSessionService {
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         req: CreateSessionRequest,
+        _resume_preparation: Option<meerkat_mob::SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<RunResult, SessionError> {
         self.create_session_with_actor_slot(req, actor_witness_slot)
@@ -5232,7 +5236,9 @@ impl McpToolError {
         match err.wire_detail() {
             Some(detail) => Self::from_wire_detail(detail, err.to_string()),
             None => Self {
-                code: -32602,
+                code: err
+                    .wire_error_code()
+                    .map_or(-32602, meerkat_contracts::ErrorCode::jsonrpc_code),
                 message: err.to_string(),
                 data: err.structured_data(),
             },
@@ -6314,16 +6320,8 @@ mod tests {
             })
         }
 
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<Notify> {
             self.notify.clone()
-        }
-
-        async fn drain_peer_input_candidates(&self) -> Vec<PeerInputCandidate> {
-            Vec::new()
         }
     }
 
@@ -6874,13 +6872,6 @@ mod tests {
 
     #[async_trait]
     impl MobSessionService for MockSessionSvc {
-        async fn prepare_session_for_resume(
-            &self,
-            _session_id: &SessionId,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-
         async fn observe_session_resume_authority(
             &self,
             _session_id: &SessionId,
@@ -6925,6 +6916,7 @@ mod tests {
         async fn create_session_with_actor_witness_under_runtime_turn_boundary(
             &self,
             req: CreateSessionRequest,
+            _resume_preparation: Option<meerkat_mob::SessionResumePreparationReceipt>,
             actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
         ) -> Result<RunResult, SessionError> {
             self.create_session_with_actor_slot(req, actor_witness_slot)
@@ -10664,6 +10656,35 @@ mod tests {
         let data = err.data.expect("stale cursor data");
         assert_eq!(data["watermark"], 5, "reply carries the current watermark");
         assert_eq!(data["requested"], 12);
+
+        let pending = MobError::RetirementInProgress {
+            session_id: SessionId::new(),
+            stage: "session_archive_and_unregister".to_string(),
+        };
+        let err = McpToolError::from_mob(&pending);
+        assert_eq!(
+            err.code,
+            meerkat_contracts::ErrorCode::SessionBusy.jsonrpc_code()
+        );
+        let data = err.data.expect("typed retirement retry data");
+        assert_eq!(data["kind"], "mob_retirement_in_progress");
+        assert_eq!(data["retryable"], true);
+        assert_eq!(data["authority_retained"], true);
+
+        let peer_pending = MobError::MemberRetirementInProgress {
+            member_id: AgentIdentity::from("peer-worker"),
+            stage: "peer_retirement_reply".to_string(),
+        };
+        let err = McpToolError::from_mob(&peer_pending);
+        assert_eq!(
+            err.code,
+            meerkat_contracts::ErrorCode::SessionBusy.jsonrpc_code()
+        );
+        let data = err.data.expect("typed peer retirement retry data");
+        assert_eq!(data["member_id"], "peer-worker");
+        assert_eq!(data["stage"], "peer_retirement_reply");
+        assert_eq!(data["retryable"], true);
+        assert_eq!(data["authority_retained"], true);
 
         let unmapped = MobError::MobNotFound(MobId::from("missing"));
         let err = McpToolError::from_mob(&unmapped);

@@ -1668,7 +1668,7 @@ mod tests {
             result: result.to_string(),
             structured_output: None,
             extraction_required: false,
-            usage: meerkat_core::Usage::default(),
+            usage: meerkat_core::Usage::default().into(),
             terminal_cause_kind: None,
         }
     }

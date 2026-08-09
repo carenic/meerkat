@@ -1,51 +1,16 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execSync } from "node:child_process";
-import { existsSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { resolveRequiredSmokeBinary } from "./support/required_smoke_binary.mjs";
 
-const binaryPath = (() => {
-  try {
-    const envOutput = execSync("../../scripts/repo-cargo --print-env", {
-      cwd: fileURLToPath(new URL("..", import.meta.url)),
-      encoding: "utf8",
-    });
-    const targetDir = envOutput
-      .split("\n")
-      .find((line) => line.startsWith("CARGO_TARGET_DIR="))
-      ?.slice("CARGO_TARGET_DIR=".length);
-    if (targetDir) {
-      const repoCargoBinary = `${targetDir}/debug/rkat-rpc`;
-      if (existsSync(repoCargoBinary)) {
-        return repoCargoBinary;
-      }
-    }
-  } catch {
-    // Fall through to legacy workspace/PATH resolution for installed-package smoke.
-  }
-  const workspaceBinary = fileURLToPath(
-    new URL("../../../target-codex/debug/rkat-rpc", import.meta.url),
-  );
-  if (existsSync(workspaceBinary)) {
-    return workspaceBinary;
-  }
-  try {
-    return execSync("which rkat-rpc", { encoding: "utf8" }).trim();
-  } catch {
-    try {
-      return execSync("which rkat", { encoding: "utf8" }).trim();
-    } catch {
-      return "";
-    }
-  }
-})();
+const binaryPath = resolveRequiredSmokeBinary();
 
 const fakeStreamBinary = fileURLToPath(
   new URL("../../test-fixtures/fake_stream_rpc.mjs", import.meta.url),
 );
 
-describe("E2E Smoke: TypeScript SDK package", { skip: !binaryPath }, () => {
+describe("E2E Smoke: TypeScript SDK package", () => {
   let MeerkatClient;
   let client;
 

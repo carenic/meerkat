@@ -24,6 +24,8 @@ They are useful scratch structure, not the shared durable WorkGraph.
 
 - Builtin tasks: private scratch, local task lists, simple progress tracking.
 - WorkGraph: realm-scoped durable commitments, readiness, dependency topology,
-  claims, leases, evidence, and terminal truth.
-- Schedule: time-based wakeups and recurrence.
+  authorized claims, leases, evidence, and terminal truth. Its ledger is the
+  shared authority, not a peer message, prompt, actor, or task-list projection.
+- Schedule: time-based wakeups, recurrence, occurrence claims, and delivery
+  outcomes. It does not decide WorkGraph readiness or completion.
 - Memory: recalled knowledge, not live task state.

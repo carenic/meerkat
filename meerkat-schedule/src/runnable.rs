@@ -96,6 +96,13 @@ pub enum HostRunnableRegistryError {
 #[async_trait]
 pub trait HostRunnable: Send + Sync {
     /// Execute one occurrence attempt.
+    ///
+    /// The callback is a machine-effect realizer. Before producing any
+    /// non-idempotent external effect it must durably claim or deduplicate
+    /// `invocation.delivery_idempotency_key`. Returning `Ok` acknowledges
+    /// that stable identity, including an exact replay of earlier completed
+    /// work. Returning `Err` is allowed only before admission, or after a
+    /// durable terminal failure for that same key has been recorded.
     async fn run(
         &self,
         invocation: HostRunnableInvocation,
@@ -114,7 +121,8 @@ pub trait ScheduleRunnableHost: Send + Sync {
     /// Report whether `runnable` is registered with this host.
     fn probe_runnable(&self, runnable: &HostRunnableName) -> RunnableProbe;
 
-    /// Invoke the named runnable for one occurrence attempt.
+    /// Invoke the named runnable for one occurrence attempt under the same
+    /// stable-key admission contract as [`HostRunnable::run`].
     async fn run_occurrence(
         &self,
         invocation: HostRunnableInvocation,

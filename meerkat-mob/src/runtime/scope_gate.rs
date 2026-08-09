@@ -754,8 +754,22 @@ mod tests {
     #[tokio::test]
     async fn reject_scope_denied_sends_typed_error() {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let identity = crate::ids::AgentIdentity::from("m");
+        let generation = crate::ids::Generation::INITIAL;
+        let (admission_tx, _admission_rx) = tokio::sync::watch::channel(false);
         let cmd = MobCommand::Retire {
-            agent_identity: crate::ids::AgentIdentity::from("m"),
+            agent_identity: identity.clone(),
+            expected_incarnation: super::super::state::RetireMemberIncarnation {
+                agent_identity: identity.clone(),
+                agent_runtime_id: crate::ids::AgentRuntimeId::new(identity, generation),
+                generation,
+                fence_token: crate::ids::FenceToken::new(1),
+                member_ref: crate::event::MemberRef::from_bridge_session_id(
+                    meerkat_core::SessionId::new(),
+                ),
+            },
+            deadline: meerkat_core::time_compat::Instant::now(),
+            admission_tx,
             reply_tx,
         };
         cmd.reject_scope_denied(ScopeDenial {

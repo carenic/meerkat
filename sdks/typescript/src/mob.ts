@@ -168,11 +168,28 @@ export interface ExternalPeerTarget {
 
 export type MobPeerTarget = string | ExternalPeerTarget;
 
+export type MobBoundedHelperResultStatus =
+  | "completed"
+  | "completed_truncated"
+  | "failed"
+  | "failed_truncated"
+  | "in_progress"
+  | "in_progress_truncated"
+  | "unavailable"
+  | "unavailable_truncated";
+
+export interface MobBoundedHelperResult {
+  label: string;
+  status: MobBoundedHelperResultStatus;
+  text: string;
+}
+
 export interface MobHelperResult {
   output?: string;
   tokensUsed: number;
   agentIdentity: string;
   memberRef: MobMemberRef;
+  boundedResult?: MobBoundedHelperResult;
 }
 
 export class Member {

@@ -948,8 +948,8 @@ fn diagnose_jsonl_session_index_projection(
                  rebuildable=true authority_rows={} projection_rows={projection_rows} \
                  missing={missing} extra={extra} mismatched={mismatched} \
                  authority_unreadable={authority_unreadable} \
-                 projection_unreadable={projection_unreadable}; listing may serve stale metadata \
-                 until the index is rebuilt",
+                 projection_unreadable={projection_unreadable}; listing refuses with a typed \
+                 projection error until the index is rebuilt",
                 authority_ids.len(),
             ),
         )

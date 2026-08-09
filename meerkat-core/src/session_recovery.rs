@@ -606,6 +606,10 @@ pub fn resolve_effective_turn_config(
             .unwrap_or(metadata.tooling.web_search),
         schedule_tools: None,
         workgraph_tools: None,
+        // Namespace grants are host-issued build authority, not durable
+        // session metadata. Generic recovery cannot reconstruct one; a host
+        // that enables WorkGraph must explicitly resupply the exact grant.
+        workgraph_namespace_grant: None,
         preload_skills: overrides
             .preload_skills
             .clone()

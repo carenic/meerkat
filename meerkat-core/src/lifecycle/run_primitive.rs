@@ -517,6 +517,23 @@ pub enum AnthropicCacheControlPolicy {
     Automatic,
     /// Mark the stable top-level system prompt as an ephemeral cache prefix.
     SystemPrefix,
+    /// Mark the stable system/profile prefix and up to three recent
+    /// conversation boundaries. This is explicit provider authoring, not a
+    /// process-wide cache default.
+    SystemAndConversation,
+}
+
+/// Anthropic prompt-cache TTL selected per agent/profile.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicCacheTtl {
+    /// Provider-default five-minute cache lifetime.
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    /// One-hour cache lifetime for sufficiently frequent profiles.
+    #[serde(rename = "1h")]
+    OneHour,
 }
 
 /// Per-turn Anthropic-specific knobs carried in `ProviderTag::Anthropic`.
@@ -557,6 +574,10 @@ pub struct AnthropicProviderTag {
     /// Prompt-cache breakpoint policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<AnthropicCacheControlPolicy>,
+    /// Prompt-cache lifetime. Effective only when this profile explicitly
+    /// enables a cache-control policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<AnthropicCacheTtl>,
     /// Internal override: force-enable temperature for this request even
     /// when the model profile says unsupported. Used by proxied /
     /// custom deployments.

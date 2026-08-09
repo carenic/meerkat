@@ -31,7 +31,7 @@ use crate::tokio;
 use crate::tool_scope::ToolFilter;
 use crate::types::{
     AssistantBlock, BlockAssistantMessage, ContentBlock, ContentInput, Message, SessionId,
-    StopReason, ToolDef, ToolName, ToolProvenance, ToolResult, Usage, UserMessage,
+    StopReason, ToolDef, ToolName, ToolProvenance, ToolResult, TurnUsage, Usage, UserMessage,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -119,6 +119,7 @@ impl SessionGeneration {
 mod digest_accumulator;
 mod head_metadata;
 mod import_0810;
+mod system_prompt_update;
 mod transcript_history;
 
 pub(crate) use digest_accumulator::TranscriptMessages;
@@ -132,6 +133,10 @@ pub use import_0810::{
     ImportedReleased0810Session, Released0810ImportError, Released0810ImportEvidence,
     Released0810ImportReceipt, import_released_0810_session,
     released_0810_transcript_serialized_rows_digest,
+};
+pub use system_prompt_update::{
+    SystemPromptUpdateError, SystemPromptUpdateRequest, SystemPromptUpdateResult,
+    SystemPromptUpdateStatus,
 };
 #[cfg(test)]
 pub(crate) use transcript_history::graph::TRANSCRIPT_DIGEST_FORMAT_RELEASED_0810;
@@ -643,6 +648,32 @@ pub fn transcript_messages_digest(messages: &[Message]) -> Result<String, serde_
     sha256_json_digest(&canonicalize_messages_for_digest(messages))
 }
 
+pub(crate) fn validate_fork_transcript_boundary(
+    messages: &[Message],
+) -> Result<(), TranscriptEditError> {
+    validate_transcript_tool_result_shape(messages)
+}
+
+/// Canonical byte identity of a transcript prefix used by provider cache
+/// authoring and durable fork inheritance.
+///
+/// Both consumers must bind the same serialization domain. Returning the byte
+/// count beside the digest makes an accidental hash-domain substitution fail
+/// closed even if a caller happens to supply a digest-shaped string.
+pub(crate) fn canonical_transcript_prefix_identity(
+    messages: &[Message],
+) -> Result<(String, u64), serde_json::Error> {
+    let canonical = canonicalize_messages_for_digest(messages);
+    let bytes = serde_json::to_vec(&canonical)?;
+    let byte_count = u64::try_from(bytes.len()).map_err(|_| {
+        <serde_json::Error as serde::ser::Error>::custom(
+            "canonical transcript prefix byte count exceeds u64",
+        )
+    })?;
+    let digest = Sha256::digest(&bytes);
+    Ok((format!("sha256:{digest:x}"), byte_count))
+}
+
 /// Full transcript digest that does NOT bump the content-digest budget
 /// counter.
 ///
@@ -1062,6 +1093,8 @@ impl<'de> Deserialize<'de> for Session {
             crate::digest_observability::DIGEST_SITE_DECODE,
         );
         let serde_repr = SessionSerde::deserialize(deserializer)?;
+        crate::types::validate_system_prompt_version_order(&serde_repr.messages)
+            .map_err(<D::Error as serde::de::Error>::custom)?;
         let version = session_persistence_version_authority::restore_session_envelope_version(
             serde_repr.version,
         )
@@ -1476,6 +1509,7 @@ impl Session {
                     .to_string(),
             );
         }
+        crate::types::validate_system_prompt_version_order(&messages)?;
         let transcript = TranscriptMessages::from_vec(messages);
         if let Some(prefix) = exact_row_prefix
             && !transcript.install_exact_row_prefix(prefix)
@@ -1620,6 +1654,9 @@ pub const SESSION_BUILD_STATE_KEY: &str = "session_build_state";
 /// Metadata key used to store durable session-local tool visibility intent.
 pub const SESSION_TOOL_VISIBILITY_STATE_KEY: &str = "session_tool_visibility_state_v1";
 
+/// Reserved typed metadata key for provider-authored cache-breakpoint proofs.
+pub const SESSION_AUTHORED_CACHE_BREAKPOINTS_KEY: &str = "session_authored_cache_breakpoints_v1";
+
 /// Metadata key used to store the typed session lifecycle-terminal fact.
 pub const SESSION_LIFECYCLE_TERMINAL_KEY: &str = "session_lifecycle_terminal";
 
@@ -1644,6 +1681,7 @@ fn is_session_authority_metadata_key(key: &str) -> bool {
     // Single reserved-key authority: the typed classifier owns the
     // session-authority key set (the `session_*` state constants).
     key == SESSION_TRANSCRIPT_REWRITE_PREFIX_AUTHORITY_KEY
+        || key == SESSION_AUTHORED_CACHE_BREAKPOINTS_KEY
         || crate::surface_metadata::ReservedMetadataKey::is_session_authority(key)
 }
 
@@ -3279,6 +3317,17 @@ impl std::fmt::Display for SystemMessageAppendError {
 
 impl std::error::Error for SystemMessageAppendError {}
 
+#[track_caller]
+fn assert_host_append_does_not_mint_system_prompt(message: &Message) {
+    assert!(
+        !matches!(
+            message,
+            Message::System(system) if system.prompt_version.is_some()
+        ),
+        "ordinary Session append cannot mint a system prompt version; use update_system_prompt",
+    );
+}
+
 impl Session {
     /// Validate callback-result ingress against the exact durable callback
     /// batch without mutating transcript or deferred-turn state.
@@ -3673,7 +3722,14 @@ impl Session {
     /// Add a message to the session
     ///
     /// Updates the timestamp. For adding multiple messages, prefer `push_batch`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when passed a versioned System row. Prompt-version identities
+    /// are minted only through [`Session::update_system_prompt`]; ordinary
+    /// append APIs cannot import or manufacture them.
     pub fn push(&mut self, message: Message) {
+        assert_host_append_does_not_mint_system_prompt(&message);
         // SEAM 2 (append): the accumulator folds only the appended bytes.
         // Retained rewrite history is intentionally untouched: its head is the
         // latest AUDITED endpoint, while this live append is owned by
@@ -3685,9 +3741,17 @@ impl Session {
     /// Add multiple messages in one operation (single timestamp update)
     ///
     /// More efficient than multiple `push` calls when adding many messages.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any message is a versioned System row. Prompt-version
+    /// identities are minted only through [`Session::update_system_prompt`].
     pub fn push_batch(&mut self, messages: Vec<Message>) {
         if messages.is_empty() {
             return;
+        }
+        for message in &messages {
+            assert_host_append_does_not_mint_system_prompt(message);
         }
         // SEAM 3 (append): the accumulator folds only the appended batch.
         // See `push`: ordinary appends never materialize or rewrite the
@@ -3731,6 +3795,26 @@ impl Session {
         };
         self.messages.finish_in_place_scan(lowest_mutated);
         Ok(())
+    }
+
+    /// Preflight every image carried by a not-yet-persisted durable fork.
+    ///
+    /// This is a typed cross-crate mutation seam: it normalizes inline images
+    /// and verifies all referenced blobs without exposing `messages_mut` to
+    /// persistence shells. Callers must invoke it before committing the child
+    /// session boundary.
+    pub async fn preflight_durable_fork_blobs(
+        &mut self,
+        blob_store: &dyn crate::BlobStore,
+    ) -> Result<(), crate::ImageBlobIntegrityError> {
+        let buffer = self.messages.begin_in_place_scan();
+        let result =
+            crate::image_content::preflight_messages_for_durable_fork(blob_store, buffer).await;
+        // Inline media may have been normalized before a later blob failed.
+        // Discard the digest midstate on both success and failure; the child is
+        // not yet durable and must recompute its exact normalized prefix.
+        self.messages.finish_in_place_scan(Some(0));
+        result
     }
 
     /// Hydrate user-message images in-place for a realtime provider replay,
@@ -3807,10 +3891,154 @@ impl Session {
         self.usage.clone()
     }
 
-    /// Update cumulative usage after an LLM call.
-    pub fn record_usage(&mut self, turn_usage: Usage) {
-        self.usage.add(&turn_usage);
+    /// Update cumulative usage after a provider LLM call.
+    pub fn record_turn_usage(&mut self, turn_usage: &TurnUsage) {
+        let mut cumulative = crate::types::CumulativeUsage::from_usage(self.usage.clone());
+        cumulative.add_turn(turn_usage);
+        self.usage = cumulative.into_inner();
         self.mark_content_mutated(SystemTime::now());
+    }
+
+    /// Merge usage that is already cumulative and normalized.
+    ///
+    /// This is reserved for durable import/rollback paths. Provider turns use
+    /// [`Self::record_turn_usage`] so raw cache counters never enter policy.
+    pub fn record_cumulative_usage(&mut self, usage: Usage) {
+        self.usage.add(&usage);
+        self.mark_content_mutated(SystemTime::now());
+    }
+
+    /// Read and revalidate provider-authored cache-breakpoint proofs against
+    /// this session's current canonical transcript.
+    ///
+    /// Evidence is durable session authority, not an opaque metadata hint. A
+    /// malformed row or a prefix mismatch fails closed so a later fork cannot
+    /// infer cache inheritance from stale provider state.
+    pub fn authored_cache_breakpoints(
+        &self,
+    ) -> Result<Vec<crate::AuthoredCacheBreakpoint>, crate::CacheBreakpointEvidenceError> {
+        if !crate::types::superseded_system_prompt_offsets(self.messages()).is_empty() {
+            // Provider requests see only the latest keyed prompt version. The
+            // current evidence shape has no raw-to-projected boundary map, so
+            // an authored index cannot be rebound to this durable history.
+            return Ok(Vec::new());
+        }
+        let Some(value) = self.metadata.get(SESSION_AUTHORED_CACHE_BREAKPOINTS_KEY) else {
+            return Ok(Vec::new());
+        };
+        let evidence: Vec<crate::AuthoredCacheBreakpoint> = serde_json::from_value(value.clone())
+            .map_err(|error| {
+            crate::CacheBreakpointEvidenceError::PersistedEvidenceMalformed {
+                detail: error.to_string(),
+            }
+        })?;
+        for breakpoint in &evidence {
+            breakpoint.validate_rendered_identity()?;
+            let (digest, bytes) = crate::canonical_cache_prefix_identity(
+                self.messages(),
+                breakpoint.boundary().message_count(),
+            )?;
+            if breakpoint.canonical_prefix_sha256() != digest
+                || breakpoint.canonical_prefix_bytes() != bytes
+            {
+                return Err(crate::CacheBreakpointEvidenceError::CanonicalPrefixMismatch);
+            }
+        }
+        Ok(evidence)
+    }
+
+    /// Revalidate persisted source evidence and convert it into one-shot fork
+    /// proof capabilities. Raw deserialized evidence never crosses this seam
+    /// without canonical, rendered-identity, and provider/encoding checks.
+    pub fn validated_source_cache_breakpoints(
+        &self,
+    ) -> Result<Vec<crate::ValidatedSourceCacheBreakpoint>, crate::CacheBreakpointEvidenceError>
+    {
+        self.authored_cache_breakpoints().map(|breakpoints| {
+            breakpoints
+                .into_iter()
+                .map(crate::ValidatedSourceCacheBreakpoint::new)
+                .collect()
+        })
+    }
+
+    /// Persist provider-authored breakpoints for the request represented by
+    /// this exact transcript head.
+    ///
+    /// Providers may report several explicit breakpoints. The session keeps a
+    /// bounded latest proof per provider/model/boundary and validates every
+    /// proof before changing durable state.
+    pub(crate) fn record_authored_cache_breakpoints(
+        &mut self,
+        authored: &[crate::AuthoredCacheBreakpoint],
+    ) -> Result<(), crate::CacheBreakpointEvidenceError> {
+        if !crate::types::superseded_system_prompt_offsets(self.messages()).is_empty() {
+            // Do not fail the completed provider turn merely because durable
+            // history retains superseded prompt versions. Drop any older proof
+            // and decline to persist the un-mappable projected boundary.
+            self.invalidate_authored_cache_breakpoints();
+            return Ok(());
+        }
+        if authored.is_empty() {
+            return Ok(());
+        }
+        for breakpoint in authored {
+            breakpoint.validate_rendered_identity()?;
+            let (digest, bytes) = crate::canonical_cache_prefix_identity(
+                self.messages(),
+                breakpoint.boundary().message_count(),
+            )?;
+            if breakpoint.canonical_prefix_sha256() != digest
+                || breakpoint.canonical_prefix_bytes() != bytes
+            {
+                return Err(crate::CacheBreakpointEvidenceError::CanonicalPrefixMismatch);
+            }
+        }
+
+        let mut retained = self.authored_cache_breakpoints()?;
+        for replacement in authored {
+            retained.retain(|existing| {
+                existing.provider() != replacement.provider()
+                    || existing.model() != replacement.model()
+                    || existing.boundary() != replacement.boundary()
+            });
+            retained.push(replacement.clone());
+        }
+        const MAX_DURABLE_CACHE_BREAKPOINTS: usize = 64;
+        if retained.len() > MAX_DURABLE_CACHE_BREAKPOINTS {
+            let remove = retained.len() - MAX_DURABLE_CACHE_BREAKPOINTS;
+            retained.drain(..remove);
+        }
+        let value = serde_json::to_value(retained).map_err(|error| {
+            crate::CacheBreakpointEvidenceError::PersistedEvidenceMalformed {
+                detail: error.to_string(),
+            }
+        })?;
+        self.set_metadata_unchecked(SESSION_AUTHORED_CACHE_BREAKPOINTS_KEY, value);
+        Ok(())
+    }
+
+    /// Consume verifier-issued authority to install cache evidence on a fork
+    /// child and return the observational fork-point receipt.
+    ///
+    /// Generic fork metadata projection excludes the reserved key. The
+    /// one-shot capability can only be minted by `ForkPoint::prove` after a
+    /// fresh target adapter lowering matches the persisted source evidence.
+    pub fn install_verified_fork_cache_inheritance(
+        &mut self,
+        install: crate::ForkCacheInheritanceInstall,
+    ) -> Result<crate::ForkPoint, crate::CacheBreakpointEvidenceError> {
+        let fork_point = install.into_fork_point();
+        self.record_authored_cache_breakpoints(std::slice::from_ref(
+            fork_point.authored_cache_breakpoint(),
+        ))?;
+        Ok(fork_point)
+    }
+
+    /// Invalidate provider-authored cache proof after a change to model-visible
+    /// prompt material or its durable-to-projected boundary mapping.
+    pub(crate) fn invalidate_authored_cache_breakpoints(&mut self) {
+        self.remove_metadata_unchecked(SESSION_AUTHORED_CACHE_BREAKPOINTS_KEY);
     }
 
     /// Append externally-produced user content to the canonical transcript.
@@ -3825,7 +4053,7 @@ impl Session {
         &mut self,
         blocks: Vec<AssistantBlock>,
         stop_reason: StopReason,
-        usage: Usage,
+        usage: TurnUsage,
     ) {
         if !blocks.is_empty() {
             self.push(Message::BlockAssistant(BlockAssistantMessage::new(
@@ -3833,9 +4061,7 @@ impl Session {
                 stop_reason,
             )));
         }
-        if usage != Usage::default() {
-            self.record_usage(usage);
-        }
+        self.record_turn_usage(&usage);
     }
 
     /// Apply an identity-bearing provider realtime transcript event.
@@ -3863,7 +4089,7 @@ impl Session {
         }
         self.push_batch(commit.messages);
         if commit.usage != Usage::default() {
-            self.record_usage(commit.usage);
+            self.record_cumulative_usage(commit.usage);
         }
         commit.outcome
     }
@@ -4080,16 +4306,19 @@ impl Session {
             content,
             created_at,
             identity,
+            prompt_version: None,
         }));
         Ok(crate::service::AppendSystemContextStatus::Applied)
     }
 
     /// Clone the active ordered transcript for a model request.
     ///
-    /// System messages are ordinary durable rows. No request-local System
-    /// message is synthesized or repositioned at this boundary.
+    /// Ordinary System messages remain ordered durable rows. For an explicitly
+    /// versioned prompt key, historical rows remain in transcript history but
+    /// only the latest version is selected. No request-local System message is
+    /// synthesized or repositioned at this boundary.
     pub fn messages_for_model_boundary(&self) -> Vec<Message> {
-        self.messages().to_vec()
+        crate::types::materialize_latest_system_prompt_versions(self.messages())
     }
 
     /// Get the last assistant message text content.
@@ -5516,6 +5745,7 @@ impl Session {
                 "typed compaction rewrites require a core-validated compaction witness".to_string(),
             ));
         }
+        self.validate_generic_rewrite_prompt_versions(&replacement)?;
         self.commit_transcript_rewrite_authorized(
             selection,
             replacement,
@@ -5523,6 +5753,58 @@ impl Session {
             actor,
             expected_parent_revision,
         )
+    }
+
+    /// Prove that a generic rewrite only reuses versioned System rows already
+    /// owned by this session lineage.
+    ///
+    /// Prompt-version identities are minted exclusively by the keyed prompt
+    /// update operation. Generic rewrites may retain, move, or restore an exact
+    /// current/historical row, but they must not author a new identity or
+    /// change the content/timestamp carried by an existing identity.
+    fn validate_generic_rewrite_prompt_versions(
+        &self,
+        replacement: &[Message],
+    ) -> Result<(), TranscriptEditError> {
+        let unknown_versioned = replacement
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    Message::System(system) if system.prompt_version.is_some()
+                )
+            })
+            .filter(|message| !self.messages().iter().any(|current| current == *message))
+            .collect::<Vec<_>>();
+        if unknown_versioned.is_empty() {
+            return Ok(());
+        }
+
+        let historical_bodies = self
+            .validated_transcript_history_state()?
+            .map(|history| history.materialize_revision_bodies())
+            .transpose()?
+            .unwrap_or_default();
+        for message in unknown_versioned {
+            if historical_bodies
+                .iter()
+                .any(|body| body.messages.iter().any(|historical| historical == message))
+            {
+                continue;
+            }
+            let Some(identity) = (match message {
+                Message::System(system) => system.prompt_version.as_ref(),
+                _ => None,
+            }) else {
+                continue;
+            };
+            return Err(TranscriptEditError::InvalidTranscriptShape(format!(
+                "generic transcript rewrite cannot mint or alter system prompt key '{}' version {}; use the explicit keyed prompt-update operation",
+                identity.key,
+                identity.version.get(),
+            )));
+        }
+        Ok(())
     }
 
     fn commit_transcript_rewrite_authorized(
@@ -5590,6 +5872,8 @@ impl Session {
         rewritten.extend(replacement.iter().cloned());
         rewritten.extend_from_slice(&self.messages[end..]);
         validate_transcript_tool_result_shape(&rewritten)?;
+        crate::types::validate_system_prompt_version_order(&rewritten)
+            .map_err(TranscriptEditError::InvalidTranscriptShape)?;
         // One required hash of the genuinely new content, computed FIRST so
         // the whole-span digests below reuse it instead of re-hashing the
         // same bytes. The reuse conditions are slice-identity arithmetic,
@@ -5783,6 +6067,10 @@ impl Session {
         self.realtime_transcript
             .apply_prepared_rebase(realtime_rebase);
         self.messages.replace(rewritten);
+        // Every successful rewrite changes provider-visible transcript bytes
+        // or their durable boundary mapping. A prior provider-authored cache
+        // proof therefore cannot survive rewrite, restore, or compaction.
+        self.invalidate_authored_cache_breakpoints();
         self.mark_content_mutated(commit.committed_at);
         if !self.install_exact_message_row_prefix(result_row_prefix) {
             return Err(TranscriptEditError::HistoryStateMalformed(
@@ -5850,6 +6138,25 @@ impl Session {
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: self.usage.clone(),
         }
+    }
+
+    /// Fork at one complete transcript boundary.
+    ///
+    /// Unlike [`Self::fork_at`], this operation refuses out-of-range indices
+    /// and any prefix that separates an assistant tool-use message from its
+    /// complete tool-results group. Durable fork owners use this constructor
+    /// before persisting a branch, so an admitted child can never begin with a
+    /// dangling provider tool call or an orphan tool result.
+    pub fn fork_at_complete_boundary(&self, index: usize) -> Result<Self, TranscriptEditError> {
+        if index > self.messages.len() {
+            return Err(TranscriptEditError::MessageIndexOutOfBounds {
+                message_index: index,
+                message_count: self.messages.len(),
+            });
+        }
+        let forked = self.fork_at(index);
+        validate_transcript_tool_result_shape(forked.messages())?;
+        Ok(forked)
     }
 
     /// Fork the session and replace the message at `message_index`.
@@ -5951,6 +6258,7 @@ impl Session {
 
         let mut forked = self.fork_at(message_index);
         forked.push(replacement_message);
+        validate_transcript_tool_result_shape(forked.messages())?;
         Ok(forked)
     }
 
@@ -6520,6 +6828,10 @@ impl PersistedSessionMetadataView {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+
+    fn test_turn_usage(usage: Usage) -> crate::types::TurnUsage {
+        crate::types::TurnUsage::host_declared(crate::Provider::Other, "session-test", usage)
+    }
 
     #[test]
     fn audited_history_install_accepts_exact_live_revision_without_row_lineage()
@@ -9887,7 +10199,7 @@ mod tests {
         let terminal = RealtimeTranscriptEvent::AssistantTurnCompleted {
             response_id: "resp_assistant".to_string(),
             stop_reason: StopReason::EndTurn,
-            usage: Usage::default(),
+            usage: test_turn_usage(Usage::default()),
         };
         assert!(
             !session
@@ -10044,7 +10356,7 @@ mod tests {
                 .append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTurnCompleted {
                     response_id: "resp_image".to_string(),
                     stop_reason: StopReason::EndTurn,
-                    usage: Usage::default(),
+                    usage: test_turn_usage(Usage::default()),
                 },)
                 .is_inert(),
             "materialized image predecessor must unblock the assistant response"
@@ -10623,7 +10935,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_a".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         );
         assert!(!outcome.is_inert());
@@ -10673,7 +10985,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_a".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         );
         assert!(!outcome.is_inert());
@@ -10714,7 +11026,7 @@ mod tests {
                 .append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTurnCompleted {
                     response_id: "resp_assistant".to_string(),
                     stop_reason: StopReason::EndTurn,
-                    usage: Usage::default(),
+                    usage: test_turn_usage(Usage::default()),
                 })
                 .is_inert()
         );
@@ -10761,7 +11073,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_assistant".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         ];
 
@@ -10866,7 +11178,7 @@ mod tests {
         let assistant_complete = RealtimeTranscriptEvent::AssistantTurnCompleted {
             response_id: "resp_assistant".to_string(),
             stop_reason: StopReason::EndTurn,
-            usage: Usage::default(),
+            usage: test_turn_usage(Usage::default()),
         };
         assert!(
             session
@@ -11059,7 +11371,7 @@ mod tests {
                 .append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTurnCompleted {
                     response_id: "resp_loop".to_string(),
                     stop_reason: StopReason::EndTurn,
-                    usage: Usage::default(),
+                    usage: test_turn_usage(Usage::default()),
                 })
                 .is_inert(),
             "late completion for an interrupted response must not resurrect its deltas"
@@ -11107,7 +11419,7 @@ mod tests {
                 .append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTurnCompleted {
                     response_id: "resp_b".to_string(),
                     stop_reason: StopReason::EndTurn,
-                    usage: Usage::default(),
+                    usage: test_turn_usage(Usage::default()),
                 })
                 .is_inert(),
             "a completion for another response must not finalize buffered assistant text"
@@ -11118,7 +11430,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_a".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         );
         assert_eq!(outcome.materialized_messages.len(), 1);
@@ -11146,7 +11458,7 @@ mod tests {
                 .append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTurnCompleted {
                     response_id: "resp_a".to_string(),
                     stop_reason: StopReason::EndTurn,
-                    usage: Usage::default(),
+                    usage: test_turn_usage(Usage::default()),
                 })
                 .is_inert()
         );
@@ -11207,7 +11519,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_a".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         );
         assert_eq!(session.messages().len(), 2);
@@ -11229,7 +11541,7 @@ mod tests {
                 .append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTurnCompleted {
                     response_id: "resp_a".to_string(),
                     stop_reason: StopReason::EndTurn,
-                    usage: Usage::default(),
+                    usage: test_turn_usage(Usage::default()),
                 })
                 .is_inert(),
             "a duplicate late terminal for resp_a must not finalize resp_b"
@@ -11240,7 +11552,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_b".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         );
         assert_eq!(outcome.materialized_messages.len(), 1);
@@ -11300,7 +11612,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_b".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         );
         assert_eq!(
@@ -12125,11 +12437,12 @@ mod tests {
             identity: crate::types::TranscriptMessageIdentity::default(),
             created_at: crate::types::message_timestamp_now(),
         }));
-        session.record_usage(Usage {
+        session.record_cumulative_usage(Usage {
             input_tokens: 10,
             output_tokens: 5,
             cache_creation_tokens: None,
             cache_read_tokens: None,
+            provider_accounting: None,
         });
 
         let meta = SessionMeta::from(&session);
@@ -12301,7 +12614,7 @@ mod tests {
         let terminal = RealtimeTranscriptEvent::AssistantTurnCompleted {
             response_id: "resp_spoken".to_string(),
             stop_reason: StopReason::EndTurn,
-            usage: Usage::default(),
+            usage: test_turn_usage(Usage::default()),
         };
         let outcome = session.append_realtime_transcript_event(terminal);
         assert_eq!(outcome.materialized_messages.len(), 1);
@@ -12421,7 +12734,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_cc2".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         );
         assert_eq!(outcome.materialized_messages.len(), 1);
@@ -12470,7 +12783,7 @@ mod tests {
         let terminal = RealtimeTranscriptEvent::AssistantTurnCompleted {
             response_id: "resp_display".to_string(),
             stop_reason: StopReason::EndTurn,
-            usage: Usage::default(),
+            usage: test_turn_usage(Usage::default()),
         };
         let outcome = session.append_realtime_transcript_event(terminal);
         assert_eq!(outcome.materialized_messages.len(), 1);
@@ -12575,12 +12888,11 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_mixed_1".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage {
+                usage: test_turn_usage(Usage {
                     input_tokens: 11,
                     output_tokens: 22,
-                    cache_creation_tokens: None,
-                    cache_read_tokens: None,
-                },
+                    ..Usage::default()
+                }),
             },
         );
         // Materializer reports two staged items got materialized.
@@ -12694,7 +13006,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_mixed_2".to_string(),
                 stop_reason: StopReason::Cancelled,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         );
         assert_eq!(
@@ -12871,7 +13183,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_a".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         );
         assert_eq!(outcome.materialized_messages.len(), 1);
@@ -12928,7 +13240,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_a".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         );
 
@@ -12988,7 +13300,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_a".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         );
 
@@ -13050,7 +13362,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_a".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         );
 
@@ -13100,7 +13412,7 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_a".to_string(),
                 stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
+                usage: test_turn_usage(Usage::default()),
             },
         );
         assert_eq!(commit_outcome.materialized_messages.len(), 1);

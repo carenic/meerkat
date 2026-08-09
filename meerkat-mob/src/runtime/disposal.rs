@@ -9,6 +9,7 @@ use crate::ids::AgentIdentity;
 use crate::roster::RosterEntry;
 use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
 use meerkat_core::comms::{CommsTrustMutationAuthority, TrustedPeerDescriptor};
+use meerkat_core::time_compat::Instant;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -70,6 +71,9 @@ pub(super) struct DisposalContext {
         BTreeMap<crate::ids::AgentIdentity, CommsTrustMutationAuthority>,
     pub historical_trust_unwire_authorities_by_peer:
         BTreeMap<crate::ids::AgentIdentity, Vec<(String, CommsTrustMutationAuthority)>>,
+    /// One absolute budget minted when MobMachine publishes Retiring. It is
+    /// carried through every local runtime teardown stage without reset.
+    pub retirement_deadline: Option<Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +228,7 @@ mod tests {
                 kickoff: None,
                 effective_profile_override: None,
                 effective_model_override: None,
+                direct_member_fence: None,
             },
             retiring_key: None,
             retiring_comms: None,
@@ -232,6 +237,7 @@ mod tests {
             machine_wired_peer_identities: BTreeSet::new(),
             trust_unwire_authority_by_peer: BTreeMap::new(),
             historical_trust_unwire_authorities_by_peer: BTreeMap::new(),
+            retirement_deadline: None,
         }
     }
 

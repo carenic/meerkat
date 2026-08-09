@@ -10,6 +10,8 @@ use crate::runtime::handle::MemberSpawnReceipt;
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 use async_trait::async_trait;
+#[cfg(feature = "runtime-adapter")]
+use futures::FutureExt as _;
 use meerkat_core::comms::{PeerAddress, PeerName, TrustedPeerDescriptor};
 use meerkat_core::event_injector::SubscribableInjector;
 #[cfg(feature = "runtime-adapter")]
@@ -29,9 +31,7 @@ use meerkat_core::ops::OperationId;
 use meerkat_core::ops_lifecycle::OperationStatus;
 use meerkat_core::ops_lifecycle::{OperationSource, OpsLifecycleRegistry};
 use meerkat_core::service::{CreateSessionRequest, SessionError, StartTurnRequest};
-use meerkat_core::time_compat::Duration;
-#[cfg(feature = "runtime-adapter")]
-use meerkat_core::time_compat::Instant;
+use meerkat_core::time_compat::{Duration, Instant};
 use meerkat_core::types::SessionId;
 #[cfg(feature = "runtime-adapter")]
 use meerkat_core::{TurnTerminalClassifier, TurnTerminalKind};
@@ -76,6 +76,27 @@ type ArchiveDisposalFuture<'a> = std::pin::Pin<
 #[cfg(feature = "runtime-adapter")]
 const DEFERRED_TURN_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
+#[cfg(not(test))]
+pub(super) const MEMBER_RETIRE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+pub(super) const MEMBER_RETIRE_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(all(feature = "runtime-adapter", not(test)))]
+const MEMBER_RETIRE_COOPERATIVE_GRACE: Duration = Duration::from_secs(2);
+
+#[cfg(all(feature = "runtime-adapter", test))]
+const MEMBER_RETIRE_COOPERATIVE_GRACE: Duration = Duration::from_millis(100);
+
+#[cfg(all(feature = "runtime-adapter", not(test)))]
+const MEMBER_RETIRE_CALLBACK_WAIT: Duration = Duration::from_millis(250);
+
+#[cfg(all(feature = "runtime-adapter", test))]
+const MEMBER_RETIRE_CALLBACK_WAIT: Duration = Duration::from_millis(50);
+
+#[cfg(feature = "runtime-adapter")]
+const MEMBER_RETIRE_IN_PROGRESS_KIND: &str = "mob_runtime_retirement_in_progress";
+
 #[derive(Debug, Clone)]
 pub(crate) struct PeerOnlyRebindObservation {
     pub observed_peer: TrustedPeerDescriptor,
@@ -91,6 +112,7 @@ pub(crate) struct PeerOnlyRebindObservation {
 pub(crate) struct PeerOnlyRebindAuthority {
     pub peer: TrustedPeerDescriptor,
     pub bootstrap_token: super::bridge_protocol::BridgeBootstrapToken,
+    pub direct_member_incarnation: super::bridge_protocol::BridgeDirectMemberIncarnation,
 }
 
 #[derive(Debug, Clone)]
@@ -172,12 +194,14 @@ fn trusted_peer_descriptor_from_generated_member_endpoint(
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PeerOnlyTrustReconcileReport {
     pub rebind_required: Option<PeerOnlyRebindObservation>,
+    pub direct_member_fence: Option<super::bridge_protocol::BridgeDirectMemberFence>,
 }
 
 #[derive(Debug, Clone)]
 struct PeerOnlySupervisorAuthorization {
     peer: TrustedPeerDescriptor,
     rebind_required: Option<PeerOnlyRebindObservation>,
+    direct_member_fence: Option<super::bridge_protocol::BridgeDirectMemberFence>,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -373,6 +397,11 @@ pub struct ProvisionMemberRequest {
     /// that delivery-time revival may publish the missing-owner observation
     /// and re-run same-session readmission before attaching its replacement.
     pub(crate) runtime_revival_intent: RuntimeRevivalIntent,
+    /// Mob-owned semantic incarnation reserved before a peer-only V5 bind.
+    /// The receiving runtime combines this with its opaque runtime/session
+    /// token and returns the exact retirement fence.
+    pub(crate) direct_member_incarnation:
+        Option<super::bridge_protocol::BridgeDirectMemberIncarnation>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -399,21 +428,32 @@ pub enum ProvisionSessionOrigin {
 /// and retains the durable document's archived fact until the runtime machine
 /// can authorize the exact revival route.
 #[cfg(feature = "runtime-adapter")]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 enum RequestedSessionMaterialization {
     Fresh,
     Resume {
         materialization: super::session_service::SessionResumeMaterialization,
         authority: super::session_service::SessionResumeAuthority,
+        preparation: Option<super::session_service::SessionResumePreparationReceipt>,
     },
 }
 
 #[cfg(feature = "runtime-adapter")]
 impl RequestedSessionMaterialization {
-    fn actor_route(&self) -> super::session_service::SessionActorMaterializationRoute {
+    fn actor_route(
+        &mut self,
+    ) -> Result<super::session_service::SessionActorMaterializationRoute, MobError> {
         match self {
-            Self::Fresh => super::session_service::SessionActorMaterializationRoute::Fresh,
-            Self::Resume { .. } => super::session_service::SessionActorMaterializationRoute::Resume,
+            Self::Fresh => Ok(super::session_service::SessionActorMaterializationRoute::Fresh),
+            Self::Resume { preparation, .. } => Ok(
+                super::session_service::SessionActorMaterializationRoute::Resume {
+                    preparation: preparation.take().ok_or_else(|| {
+                        MobError::Internal(
+                            "durable resume preparation receipt was already consumed".to_string(),
+                        )
+                    })?,
+                },
+            ),
         }
     }
 
@@ -429,17 +469,26 @@ impl RequestedSessionMaterialization {
 
     fn authorize_revival(
         &self,
+        route: super::session_service::SessionActorMaterializationRoute,
         authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
     ) -> Result<super::session_service::SessionActorMaterializationRoute, MobError> {
         match self {
             Self::Resume {
                 materialization: super::session_service::SessionResumeMaterialization::Revivable,
                 ..
-            } => Ok(
-                super::session_service::SessionActorMaterializationRoute::Revivable {
-                    authorization,
-                },
-            ),
+            } => match route {
+                super::session_service::SessionActorMaterializationRoute::Resume {
+                    preparation,
+                } => Ok(
+                    super::session_service::SessionActorMaterializationRoute::Revivable {
+                        authorization,
+                        preparation,
+                    },
+                ),
+                _ => Err(MobError::Internal(
+                    "revivable resume lost its typed resume actor route".to_string(),
+                )),
+            },
             Self::Resume {
                 materialization: super::session_service::SessionResumeMaterialization::Active,
                 ..
@@ -795,6 +844,17 @@ pub trait MobProvisioner: Send + Sync {
         &self,
         member_ref: &MemberRef,
     ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError>;
+
+    /// Retire under one owner-minted absolute deadline. Implementations that
+    /// do not own a runtime callback boundary may use the ordinary method;
+    /// runtime-backed implementations must carry this exact deadline through
+    /// cancellation, backlog drain, and finalization-boundary acquisition.
+    async fn retire_member_until(
+        &self,
+        member_ref: &MemberRef,
+        member_identity: &AgentIdentity,
+        deadline: Instant,
+    ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError>;
     async fn interrupt_member(
         &self,
         member_ref: &MemberRef,
@@ -991,6 +1051,20 @@ pub trait MobProvisioner: Send + Sync {
     ) -> Result<PeerOnlyTrustReconcileReport, MobError> {
         let _ = (member_ref, desired_trust, rebind_authority);
         Ok(PeerOnlyTrustReconcileReport::default())
+    }
+    /// Complete or replay the V5 direct-member bind ceremony for one exact
+    /// Mob-owned semantic incarnation. The caller must durably reserve the
+    /// DirectBindPending row before invoking this method.
+    async fn adopt_peer_only_direct_member(
+        &self,
+        member_ref: &MemberRef,
+        incarnation: super::bridge_protocol::BridgeDirectMemberIncarnation,
+    ) -> Result<super::bridge_protocol::BridgeDirectMemberFence, MobError> {
+        let _ = (member_ref, incarnation);
+        Err(MobError::UnsupportedForMode {
+            mode: crate::MobRuntimeMode::TurnDriven,
+            reason: "provisioner does not implement V5 direct-member adoption".to_string(),
+        })
     }
     /// Resolve the live canonical mob-child lifecycle operation for an
     /// existing member bridge.
@@ -1196,6 +1270,35 @@ pub struct MemberSessionDisposalArc {
 }
 
 #[cfg(feature = "runtime-adapter")]
+struct PendingTurnFinalizationBoundary {
+    completed: Arc<tokio::sync::Notify>,
+    followers: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PendingTurnFinalizationBoundaryKey {
+    session_service_identity: usize,
+    session_id: SessionId,
+}
+
+#[cfg(feature = "runtime-adapter")]
+/// Process-wide coordination only, never lifecycle authority. Keying by the
+/// exact service allocation plus session lets a replacement Mob actor or
+/// provisioner join a predecessor's still-running cleanup task without
+/// queueing another custom B acquisition. Cold restart needs no persisted
+/// slot because the process-owned task cannot survive the process.
+fn pending_turn_finalization_boundaries()
+-> &'static Mutex<HashMap<PendingTurnFinalizationBoundaryKey, Arc<PendingTurnFinalizationBoundary>>>
+{
+    static PENDING: std::sync::OnceLock<
+        Mutex<HashMap<PendingTurnFinalizationBoundaryKey, Arc<PendingTurnFinalizationBoundary>>>,
+    > = std::sync::OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[derive(Clone)]
 enum RuntimeSessionDisposalTarget {
     Absent,
     ExactAttachment {
@@ -1241,27 +1344,21 @@ impl MemberSessionDisposalArc {
         &self,
         session_id: &SessionId,
     ) -> Result<MemberSessionDisposalVerdict, SessionError> {
-        // DEC-P3H-6: the archive walk is idempotent, so it reports `Archived`
-        // for a terminal that already held (an out-of-band archive). Probe
-        // the distinction BEFORE the walk: owned by the archive authority
-        // (unfiltered read) while invisible to the archived-filtered read
-        // means the durable terminal already holds.
-        let already_archived = self
-            .session_service
-            .session_known_to_archive_authority(session_id)
-            .await?
-            && self
-                .session_service
-                .load_persisted_session(session_id)
-                .await?
-                .is_none();
-        match self.archive_with_authority_then_unregister(session_id).await {
+        self.dispose_until(session_id, Instant::now() + MEMBER_RETIRE_TOTAL_TIMEOUT)
+            .await
+    }
+
+    pub async fn dispose_until(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<MemberSessionDisposalVerdict, SessionError> {
+        match self
+            .archive_with_authority_then_unregister_until(session_id, deadline)
+            .await
+        {
             Ok(crate::machines::mob_machine::MemberSessionDisposal::Archived) => {
-                Ok(if already_archived {
-                    MemberSessionDisposalVerdict::AlreadyArchived
-                } else {
-                    MemberSessionDisposalVerdict::Archived
-                })
+                Ok(MemberSessionDisposalVerdict::Archived)
             }
             Ok(
                 crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned,
@@ -1284,20 +1381,56 @@ impl MemberSessionDisposalArc {
     /// outer quiesce, durable runtime retire, binding release. No durable
     /// archive exists to write.
     pub async fn release_runtime_only(&self, session_id: &SessionId) -> Result<(), SessionError> {
-        let expected_state = self
-            .capture_exact_runtime_state_for_disposal(session_id)
+        self.release_runtime_only_until(session_id, Instant::now() + MEMBER_RETIRE_TOTAL_TIMEOUT)
+            .await
+    }
+
+    pub async fn release_runtime_only_until(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<(), SessionError> {
+        let boundary = self
+            .acquire_quiescent_runtime_turn_finalization_boundary(session_id, deadline)
             .await?;
-        self.cancel_active_runtime_turn_before_retire(session_id)
-            .await?;
-        let mut boundary =
-            RuntimeTurnFinalizationBoundaryLease::acquire(&self.session_service, session_id)
-                .await
-                .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
-        self.retire_runtime_after_turn_boundary(session_id, &mut boundary)
-            .await?;
-        self.unregister_runtime_session_binding(session_id, &expected_state, boundary)
-            .await?;
-        Ok(())
+        let remaining =
+            Self::retirement_remaining(session_id, deadline, "runtime_binding_unregister")?;
+        let cleanup_spawner = meerkat_runtime::RuntimeCleanupTaskSpawner::acquire()
+            .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
+        let task_owner = self.clone();
+        let task_session_id = session_id.clone();
+        let (result_tx, result_rx) = oneshot::channel();
+        cleanup_spawner.spawn_detached(async move {
+            let result = std::panic::AssertUnwindSafe(async {
+                let expected_state = task_owner
+                    .capture_exact_runtime_state_for_disposal(&task_session_id)
+                    .await?;
+                let boundary = task_owner
+                    .retire_runtime_after_turn_boundary(&task_session_id, boundary, deadline)
+                    .await?;
+                task_owner
+                    .unregister_runtime_session_binding(&task_session_id, &expected_state, boundary)
+                    .await
+            })
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                Err(Self::runtime_archive_error(format!(
+                    "process-owned runtime-only disposal panicked for session {task_session_id}"
+                )))
+            });
+            let _ = result_tx.send(result);
+        });
+        tokio::time::timeout(remaining, result_rx)
+            .await
+            .map_err(|_| {
+                Self::runtime_retirement_in_progress(session_id, "runtime_binding_unregister")
+            })?
+            .map_err(|error| {
+                Self::runtime_archive_error(format!(
+                    "process-owned runtime-only disposal ended without a result for {session_id}: {error}"
+                ))
+            })?
     }
 
     async fn remove_runtime_session_state(
@@ -1596,19 +1729,76 @@ impl MemberSessionDisposalArc {
         ))
     }
 
+    fn runtime_retirement_in_progress(session_id: &SessionId, stage: &'static str) -> SessionError {
+        SessionError::FailedWithData {
+            message: format!(
+                "runtime retirement for session '{session_id}' remains in progress at {stage}; exact teardown authority is retained for retry"
+            ),
+            data: serde_json::json!({
+                "kind": MEMBER_RETIRE_IN_PROGRESS_KIND,
+                "session_id": session_id.to_string(),
+                "stage": stage,
+                "deadline_reached": true,
+                "retryable": true,
+                "authority_retained": true,
+            }),
+        }
+    }
+
+    pub(super) fn map_runtime_retirement_error(
+        session_id: &SessionId,
+        error: SessionError,
+    ) -> MobError {
+        match error {
+            SessionError::FailedWithData { data, .. }
+                if data
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| {
+                        kind == MEMBER_RETIRE_IN_PROGRESS_KIND
+                            || kind == "runtime_retirement_in_progress"
+                    }) =>
+            {
+                MobError::RetirementInProgress {
+                    session_id: session_id.clone(),
+                    stage: data
+                        .get("stage")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("runtime_teardown")
+                        .to_string(),
+                }
+            }
+            error => MobError::from(error),
+        }
+    }
+
+    fn retirement_remaining(
+        session_id: &SessionId,
+        deadline: Instant,
+        stage: &'static str,
+    ) -> Result<Duration, SessionError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            Err(Self::runtime_retirement_in_progress(session_id, stage))
+        } else {
+            Ok(remaining)
+        }
+    }
+
     async fn retire_runtime_after_turn_boundary(
         &self,
         session_id: &SessionId,
-        boundary: &mut RuntimeTurnFinalizationBoundaryLease,
-    ) -> Result<(), SessionError> {
+        boundary: RuntimeTurnFinalizationBoundaryLease,
+        deadline: Instant,
+    ) -> Result<RuntimeTurnFinalizationBoundaryLease, SessionError> {
         boundary
             .require_session(session_id)
             .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
         let Some(adapter) = &self.runtime_adapter else {
-            return Ok(());
+            return Ok(boundary);
         };
         if !adapter.contains_session(session_id).await {
-            return Ok(());
+            return Ok(boundary);
         }
         let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(session_id);
         let already_terminal = match adapter.meerkat_machine_archive_snapshot(session_id).await {
@@ -1616,20 +1806,55 @@ impl MemberSessionDisposalArc {
                 snapshot.control.phase,
                 meerkat_runtime::RuntimeState::Retired | meerkat_runtime::RuntimeState::Stopped
             ),
-            None => return Ok(()),
+            None => return Ok(boundary),
         };
-        if !already_terminal {
-            match adapter.retire_runtime_control_plane(&runtime_id).await {
+        let boundary = if !already_terminal {
+            let cleanup_spawner = meerkat_runtime::RuntimeCleanupTaskSpawner::acquire()
+                .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
+            let remaining =
+                Self::retirement_remaining(session_id, deadline, "runtime_control_retire")?;
+            let task_adapter = Arc::clone(adapter);
+            let (retire_result_tx, retire_result_rx) = oneshot::channel();
+            cleanup_spawner.spawn_detached(async move {
+                let result = task_adapter
+                    .retire_runtime_control_plane_before(&runtime_id, deadline)
+                    .await;
+                let _ = retire_result_tx.send((boundary, result));
+            });
+            let (boundary, result) = tokio::time::timeout(remaining, retire_result_rx)
+                .await
+                .map_err(|_| {
+                    Self::runtime_retirement_in_progress(session_id, "runtime_control_retire")
+                })?
+                .map_err(|error| {
+                    Self::runtime_archive_error(format!(
+                        "process-owned runtime retire ended without a result for {session_id}: {error}"
+                    ))
+                })?;
+            match result {
                 Ok(_) => {}
-                Err(meerkat_runtime::RuntimeControlPlaneError::NotFound(_)) => return Ok(()),
+                Err(meerkat_runtime::RuntimeControlPlaneError::NotFound(_)) => {
+                    return Ok(boundary);
+                }
+                Err(meerkat_runtime::RuntimeControlPlaneError::RetirementInProgress { .. }) => {
+                    return Err(Self::runtime_retirement_in_progress(
+                        session_id,
+                        "runtime_control_retire",
+                    ));
+                }
                 Err(error) => {
                     return Err(Self::runtime_archive_error(format!(
                         "runtime retire under exact disposal boundary failed for {session_id}: {error}"
                     )));
                 }
             }
-        }
-        self.wait_for_runtime_retire_drain(session_id).await
+            boundary
+        } else {
+            boundary
+        };
+        self.wait_for_runtime_retire_drain(session_id, deadline)
+            .await?;
+        Ok(boundary)
     }
 
     fn runtime_run_bound(snapshot: &meerkat_runtime::MeerkatArchiveSnapshot) -> bool {
@@ -1637,17 +1862,183 @@ impl MemberSessionDisposalArc {
     }
 
     fn runtime_turn_cancellable(snapshot: &meerkat_runtime::MeerkatArchiveSnapshot) -> bool {
-        snapshot.control.phase == meerkat_runtime::RuntimeState::Running
-            && Self::runtime_run_bound(snapshot)
+        // Visible Retired with a bound run is the canonical projection of
+        // generated Running + pre_run(Retired) while a retire drain executes.
+        // The exact run witness, not the visible lifecycle projection, is the
+        // cancellation authority. The generated CancelAfterBoundary input
+        // still validates the underlying Running lifecycle and exact run id.
+        Self::runtime_run_bound(snapshot)
+    }
+
+    async fn acquire_runtime_turn_finalization_boundary_until(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<RuntimeTurnFinalizationBoundaryLease, SessionError> {
+        let cleanup_spawner = meerkat_runtime::RuntimeCleanupTaskSpawner::acquire()
+            .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
+        let pending_key = PendingTurnFinalizationBoundaryKey {
+            session_service_identity: Arc::as_ptr(&self.session_service) as *const () as usize,
+            session_id: session_id.clone(),
+        };
+        loop {
+            let remaining =
+                Self::retirement_remaining(session_id, deadline, "turn_finalization_boundary")?;
+            let (pending, leader, follower_completion) = {
+                let mut acquisitions = pending_turn_finalization_boundaries().lock().await;
+                if let Some(pending) = acquisitions.get(&pending_key) {
+                    let pending = Arc::clone(pending);
+                    pending
+                        .followers
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    let completion = Arc::clone(&pending.completed).notified_owned();
+                    (pending, None, Some(completion))
+                } else {
+                    let pending = Arc::new(PendingTurnFinalizationBoundary {
+                        completed: Arc::new(tokio::sync::Notify::new()),
+                        followers: std::sync::atomic::AtomicU64::new(0),
+                    });
+                    let (result_tx, result_rx) = oneshot::channel();
+                    acquisitions.insert(pending_key.clone(), Arc::clone(&pending));
+                    (pending, Some((result_tx, result_rx)), None)
+                }
+            };
+
+            let Some((result_tx, result_rx)) = leader else {
+                let Some(completion) = follower_completion else {
+                    return Err(Self::runtime_archive_error(format!(
+                        "turn-finalization boundary election for {session_id} produced neither leader nor follower"
+                    )));
+                };
+                tokio::time::timeout(remaining, completion)
+                    .await
+                    .map_err(|_| {
+                        Self::runtime_retirement_in_progress(
+                            session_id,
+                            "turn_finalization_boundary",
+                        )
+                    })?;
+                continue;
+            };
+
+            let task_session_service = Arc::clone(&self.session_service);
+            let task_session_id = session_id.clone();
+            let task_pending_key = pending_key.clone();
+            let task_pending = Arc::clone(&pending);
+            cleanup_spawner.spawn_detached(async move {
+                let result = std::panic::AssertUnwindSafe(
+                    RuntimeTurnFinalizationBoundaryLease::acquire(
+                        &task_session_service,
+                        &task_session_id,
+                    ),
+                )
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| {
+                    Err(MobError::Internal(format!(
+                        "turn-finalization boundary acquisition panicked for session '{task_session_id}'"
+                    )))
+                });
+                let (consumed_tx, consumed_rx) = oneshot::channel();
+                if result_tx.send((result, consumed_tx)).is_ok() {
+                    // The exact lease keeps this acknowledgement until its
+                    // owner drops B. If the caller disappears, dropping the
+                    // channel payload closes the acknowledgement instead.
+                    let _ = consumed_rx.await;
+                }
+                let mut acquisitions = pending_turn_finalization_boundaries().lock().await;
+                if acquisitions
+                    .get(&task_pending_key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &task_pending))
+                {
+                    acquisitions.remove(&task_pending_key);
+                }
+                drop(acquisitions);
+                task_pending.completed.notify_waiters();
+            });
+
+            let (result, consumed_tx) = tokio::time::timeout(remaining, result_rx)
+                .await
+                .map_err(|_| {
+                    Self::runtime_retirement_in_progress(
+                        session_id,
+                        "turn_finalization_boundary",
+                    )
+                })?
+                .map_err(|error| {
+                    Self::runtime_archive_error(format!(
+                        "process-owned turn-finalization boundary acquisition ended without a result for {session_id}: {error}"
+                    ))
+                })?;
+            match result {
+                Ok(mut boundary) => {
+                    boundary.pending_acquire_completion = Some(consumed_tx);
+                    return Ok(boundary);
+                }
+                Err(error) => {
+                    let _ = consumed_tx.send(());
+                    return Err(Self::runtime_archive_error(error.to_string()));
+                }
+            }
+        }
+    }
+
+    async fn acquire_quiescent_runtime_turn_finalization_boundary(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<RuntimeTurnFinalizationBoundaryLease, SessionError> {
+        loop {
+            self.cancel_active_runtime_turn_before_retire_until(session_id, deadline)
+                .await?;
+            let boundary = self
+                .acquire_runtime_turn_finalization_boundary_until(session_id, deadline)
+                .await?;
+            let Some(adapter) = &self.runtime_adapter else {
+                return Ok(boundary);
+            };
+            let active_run = adapter
+                .meerkat_machine_archive_snapshot(session_id)
+                .await
+                .is_some_and(|snapshot| Self::runtime_run_bound(&snapshot));
+            if !active_run {
+                return Ok(boundary);
+            }
+
+            // A queued retire-drain run may bind after the pre-boundary
+            // cancellation observation but before B is acquired. Drop B so
+            // that exact run can reach a generated cancellation terminal,
+            // then repeat. MobMachine's durable Retiring state has already
+            // fenced new member admission, so this loop drains a finite set
+            // of already-admitted runs rather than racing an open producer.
+            drop(boundary);
+            tracing::debug!(
+                session_id = %session_id,
+                "runtime run bound while acquiring mob retire boundary; cancelling exact run before retry"
+            );
+        }
     }
 
     async fn cancel_active_runtime_turn_before_retire(
         &self,
         session_id: &SessionId,
     ) -> Result<(), SessionError> {
-        Self::cancel_active_runtime_turn_before_retire_with_adapter(
+        self.cancel_active_runtime_turn_before_retire_until(
+            session_id,
+            Instant::now() + MEMBER_RETIRE_TOTAL_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn cancel_active_runtime_turn_before_retire_until(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<(), SessionError> {
+        Self::cancel_active_runtime_turn_before_retire_with_adapter_until(
             self.runtime_adapter.as_ref(),
             session_id,
+            deadline,
         )
         .await
     }
@@ -1656,18 +2047,33 @@ impl MemberSessionDisposalArc {
         runtime_adapter: Option<&Arc<MeerkatMachine>>,
         session_id: &SessionId,
     ) -> Result<(), SessionError> {
+        Self::cancel_active_runtime_turn_before_retire_with_adapter_until(
+            runtime_adapter,
+            session_id,
+            Instant::now() + MEMBER_RETIRE_TOTAL_TIMEOUT,
+        )
+        .await
+    }
+
+    pub(super) async fn cancel_active_runtime_turn_before_retire_with_adapter_until(
+        runtime_adapter: Option<&Arc<MeerkatMachine>>,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<(), SessionError> {
         let Some(adapter) = runtime_adapter else {
             return Ok(());
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let cleanup_spawner = meerkat_runtime::RuntimeCleanupTaskSpawner::acquire()
+            .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
         // Cooperative grace: a boundary cancel ends well-behaved turns; a
         // turn parked INSIDE a provider stream never reaches a boundary, so
         // retire/release (which owns the runtime teardown) escalates to the
         // machine-admitted hard cancel — the same user-interrupt authority
         // the explicit `HardCancelMember` verb rides (DEC-P6E-7).
-        let escalate_at = Instant::now() + Duration::from_secs(2);
-        let mut cancel_requested = false;
-        let mut hard_cancel_requested = false;
+        let mut escalate_at = Instant::now() + MEMBER_RETIRE_COOPERATIVE_GRACE;
+        let mut observed_run = None;
+        let mut cancel_requested_for = None;
+        let mut hard_cancel_requested_for = None;
 
         loop {
             tracing::info!(
@@ -1692,66 +2098,174 @@ impl MemberSessionDisposalArc {
                 steer_queue_len = snapshot.steer_queue.len(),
                 "SessionBackend::cancel_active_runtime_turn_before_retire observed snapshot"
             );
-            if snapshot.control.phase != meerkat_runtime::RuntimeState::Running
-                || !Self::runtime_run_bound(&snapshot)
-            {
+            if !Self::runtime_run_bound(&snapshot) {
                 return Ok(());
             }
-
-            if !cancel_requested {
-                tracing::info!(
-                    session_id = %session_id,
-                    "SessionBackend::cancel_active_runtime_turn_before_retire requesting boundary cancel"
-                );
-                if let Err(error) = adapter.cancel_after_boundary(session_id).await {
-                    let still_active = adapter
-                        .meerkat_machine_archive_snapshot(session_id)
-                        .await
-                        .is_some_and(|snapshot| Self::runtime_turn_cancellable(&snapshot));
-                    if still_active {
-                        if matches!(
-                            error,
-                            meerkat_runtime::RuntimeDriverError::NotReady {
-                                state: meerkat_runtime::RuntimeState::Running
-                            }
-                        ) {
-                            cancel_requested = true;
-                            continue;
-                        }
-                        return Err(Self::runtime_archive_error(format!(
-                            "runtime cancel-before-retire failed for {session_id}: {error}"
-                        )));
-                    }
-                    continue;
-                }
-                cancel_requested = true;
+            let Some(active_run_id) = snapshot.control.current_run_id.clone() else {
+                return Err(Self::runtime_archive_error(format!(
+                    "runtime snapshot for {session_id} lost its exact run witness during retire classification"
+                )));
+            };
+            if observed_run.as_ref() != Some(&active_run_id) {
+                observed_run = Some(active_run_id.clone());
+                cancel_requested_for = None;
+                hard_cancel_requested_for = None;
+                escalate_at = Instant::now() + MEMBER_RETIRE_COOPERATIVE_GRACE;
             }
 
-            if !hard_cancel_requested && Instant::now() >= escalate_at {
-                if let Err(error) = adapter
-                    .hard_cancel_current_run(session_id, "member retire requires runtime teardown")
-                    .await
-                {
-                    // NotReady = the turn ended between the snapshot and the
-                    // escalation; the loop re-checks and returns.
-                    tracing::debug!(
-                        session_id = %session_id,
-                        error = %error,
-                        "hard-cancel escalation before retire rejected; retire wait continues"
-                    );
+            if cancel_requested_for.as_ref() != Some(&active_run_id) {
+                tracing::info!(
+                    session_id = %session_id,
+                    run_id = %active_run_id,
+                    "SessionBackend::cancel_active_runtime_turn_before_retire requesting boundary cancel"
+                );
+                let remaining =
+                    Self::retirement_remaining(session_id, deadline, "cooperative_cancel")?;
+                let callback_wait = remaining.min(MEMBER_RETIRE_CALLBACK_WAIT);
+                let task_adapter = Arc::clone(adapter);
+                let task_session_id = session_id.clone();
+                let task_run_id = active_run_id.clone();
+                let (cancel_result_tx, cancel_result_rx) = oneshot::channel();
+                cleanup_spawner.spawn_detached(async move {
+                    let result = task_adapter
+                        .cancel_after_boundary_run_if_current(&task_session_id, &task_run_id)
+                        .await;
+                    let _ = cancel_result_tx.send(result);
+                });
+                match tokio::time::timeout(callback_wait, cancel_result_rx).await {
+                    Ok(Ok(Ok(_))) => {}
+                    Ok(Ok(Err(error))) => {
+                        let still_exact = adapter
+                            .meerkat_machine_archive_snapshot(session_id)
+                            .await
+                            .is_some_and(|snapshot| {
+                                snapshot.control.current_run_id.as_ref() == Some(&active_run_id)
+                                    && Self::runtime_turn_cancellable(&snapshot)
+                            });
+                        if still_exact {
+                            // Cooperative cancellation is best-effort. A live
+                            // session actor can already be ShuttingDown while
+                            // the runtime machine still owns this exact
+                            // Running run, so its boundary hook may reject.
+                            // Preserve the exact observation and continue the
+                            // documented escalation ladder instead of turning
+                            // that rejection into a fatal retirement result.
+                            tracing::debug!(
+                                session_id = %session_id,
+                                run_id = %active_run_id,
+                                %error,
+                                "cooperative exact-run cancellation rejected while the run remained current; retaining witness for hard-cancel escalation"
+                            );
+                        } else {
+                            continue;
+                        }
+                    }
+                    Ok(Err(receive_error)) => {
+                        return Err(Self::runtime_archive_error(format!(
+                            "process-owned exact-run cancel-before-retire task ended without a result for {session_id} run {active_run_id}: {receive_error}"
+                        )));
+                    }
+                    Err(_) => {
+                        // The process-owned exact-run task retains its machine
+                        // authority after this acknowledgement wait expires.
+                        // It will either converge this run or revalidate stale.
+                        tracing::warn!(
+                            session_id = %session_id,
+                            run_id = %active_run_id,
+                            "cooperative retire cancellation callback exceeded grace; exact task retained while escalation proceeds"
+                        );
+                    }
                 }
-                hard_cancel_requested = true;
+                cancel_requested_for = Some(active_run_id.clone());
+            }
+
+            if hard_cancel_requested_for.as_ref() != Some(&active_run_id)
+                && Instant::now() >= escalate_at
+            {
+                let remaining = Self::retirement_remaining(session_id, deadline, "hard_cancel")?;
+                let callback_wait = remaining.min(MEMBER_RETIRE_CALLBACK_WAIT);
+                let task_adapter = Arc::clone(adapter);
+                let task_session_id = session_id.clone();
+                let task_run_id = active_run_id.clone();
+                let (hard_cancel_result_tx, hard_cancel_result_rx) = oneshot::channel();
+                cleanup_spawner.spawn_detached(async move {
+                    let result = task_adapter
+                        .hard_cancel_run_if_current(
+                            &task_session_id,
+                            &task_run_id,
+                            "member retire requires runtime teardown",
+                        )
+                        .await;
+                    let _ = hard_cancel_result_tx.send(result);
+                });
+                let retain_hard_cancel_attempt = match tokio::time::timeout(
+                    callback_wait,
+                    hard_cancel_result_rx,
+                )
+                .await
+                {
+                    Ok(Ok(Ok(true))) => true,
+                    Ok(Ok(Ok(false))) => {
+                        // `false` is a level-triggered stale observation, not
+                        // proof that the run seen by this retirement owner is
+                        // terminal. Reobserve under the exact run witness and
+                        // leave escalation eligible when the same run remains
+                        // current. This covers projection races without ever
+                        // redirecting the retry onto a successor run.
+                        let still_exact = adapter
+                            .meerkat_machine_archive_snapshot(session_id)
+                            .await
+                            .is_some_and(|snapshot| {
+                                snapshot.control.current_run_id.as_ref() == Some(&active_run_id)
+                                    && Self::runtime_turn_cancellable(&snapshot)
+                            });
+                        if still_exact {
+                            tracing::debug!(
+                                session_id = %session_id,
+                                run_id = %active_run_id,
+                                "exact hard-cancel reported stale while the run remained current; retaining escalation authority for retry"
+                            );
+                        }
+                        false
+                    }
+                    Ok(Ok(Err(error))) => {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            run_id = %active_run_id,
+                            error = %error,
+                            "exact hard-cancel escalation before retire rejected; retaining escalation authority for exact retry"
+                        );
+                        // The process-owned attempt has completed with a
+                        // typed error, so no callback remains in flight. Keep
+                        // the same run eligible for another exact attempt;
+                        // the next snapshot either proves convergence/stale
+                        // or reissues without ever targeting a successor.
+                        false
+                    }
+                    Ok(Err(receive_error)) => {
+                        return Err(Self::runtime_archive_error(format!(
+                            "process-owned exact hard-cancel task ended without a result for {session_id} run {active_run_id}: {receive_error}"
+                        )));
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            run_id = %active_run_id,
+                            "hard-cancel callback exceeded bounded wait; exact task retained until it converges or revalidates stale"
+                        );
+                        true
+                    }
+                };
+                if retain_hard_cancel_attempt {
+                    hard_cancel_requested_for = Some(active_run_id.clone());
+                }
             }
 
             if Instant::now() >= deadline {
-                return Err(Self::runtime_archive_error(format!(
-                    "timed out waiting for active runtime turn before mob archive for {session_id}: phase={:?}, control_run={:?}, ingress_run={:?}, queue_len={}, steer_queue_len={}",
-                    snapshot.control.phase,
-                    snapshot.control.current_run_id,
-                    snapshot.control.current_run_id,
-                    snapshot.queue.len(),
-                    snapshot.steer_queue.len(),
-                )));
+                return Err(Self::runtime_retirement_in_progress(
+                    session_id,
+                    "active_runtime_turn",
+                ));
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1760,11 +2274,11 @@ impl MemberSessionDisposalArc {
     async fn wait_for_runtime_retire_drain(
         &self,
         session_id: &SessionId,
+        deadline: Instant,
     ) -> Result<(), SessionError> {
         let Some(adapter) = &self.runtime_adapter else {
             return Ok(());
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
         let mut terminal_abandon_requested = false;
 
         loop {
@@ -1782,8 +2296,7 @@ impl MemberSessionDisposalArc {
                 snapshot.control.phase,
                 meerkat_runtime::RuntimeState::Retired | meerkat_runtime::RuntimeState::Stopped
             );
-            let no_run_bound = snapshot.control.current_run_id.is_none()
-                && snapshot.control.current_run_id.is_none();
+            let no_run_bound = snapshot.control.current_run_id.is_none();
             let no_completion_waiters = snapshot.completion_waiters.input_count == 0
                 && snapshot.completion_waiters.waiter_count == 0;
             if (ingress_quiescent && (lifecycle_retired || no_run_bound))
@@ -1793,30 +2306,38 @@ impl MemberSessionDisposalArc {
             }
             if lifecycle_retired && no_run_bound && !terminal_abandon_requested {
                 terminal_abandon_requested = true;
-                adapter
-                    .abandon_retired_pending_inputs(
+                let result = adapter
+                    .abandon_retired_pending_inputs_before(
                         session_id,
                         "mob archive terminal retire drain cleanup".to_string(),
+                        deadline,
                     )
-                    .await
-                    .map_err(|error| {
-                        Self::runtime_archive_error(format!(
+                    .await;
+                match result {
+                    Ok(_) => {}
+                    Err(
+                        meerkat_runtime::RuntimeDriverError::RuntimeTerminalPublicationInProgress {
+                            ..
+                        },
+                    ) => {
+                        return Err(Self::runtime_retirement_in_progress(
+                            session_id,
+                            "retire_terminal_publication",
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(Self::runtime_archive_error(format!(
                             "runtime stop after terminal retire before mob archive failed for {session_id}: {error}"
-                        ))
-                    })?;
+                        )));
+                    }
+                }
                 continue;
             }
             if Instant::now() >= deadline {
-                return Err(Self::runtime_archive_error(format!(
-                    "timed out waiting for runtime retire drain before mob archive for {session_id}: phase={:?}, control_run={:?}, ingress_run={:?}, queue_len={}, steer_queue_len={}, completion_inputs={}, completion_waiters={}",
-                    snapshot.control.phase,
-                    snapshot.control.current_run_id,
-                    snapshot.control.current_run_id,
-                    snapshot.queue.len(),
-                    snapshot.steer_queue.len(),
-                    snapshot.completion_waiters.input_count,
-                    snapshot.completion_waiters.waiter_count,
-                )));
+                return Err(Self::runtime_retirement_in_progress(
+                    session_id,
+                    "retire_drain",
+                ));
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1825,6 +2346,67 @@ impl MemberSessionDisposalArc {
     fn archive_with_authority_then_unregister<'a>(
         &'a self,
         session_id: &'a SessionId,
+    ) -> ArchiveDisposalFuture<'a> {
+        self.archive_with_authority_then_unregister_until(
+            session_id,
+            Instant::now() + MEMBER_RETIRE_TOTAL_TIMEOUT,
+        )
+    }
+
+    fn archive_with_authority_then_unregister_until<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        deadline: Instant,
+    ) -> ArchiveDisposalFuture<'a> {
+        Box::pin(async move {
+            let boundary = self
+                .acquire_quiescent_runtime_turn_finalization_boundary(session_id, deadline)
+                .await?;
+            let remaining =
+                Self::retirement_remaining(session_id, deadline, "session_archive_and_unregister")?;
+            let cleanup_spawner = meerkat_runtime::RuntimeCleanupTaskSpawner::acquire()
+                .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
+            let task_owner = self.clone();
+            let task_session_id = session_id.clone();
+            let (result_tx, result_rx) = oneshot::channel();
+            cleanup_spawner.spawn_detached(async move {
+                let result = std::panic::AssertUnwindSafe(
+                    task_owner.archive_with_authority_then_unregister_under_boundary(
+                        &task_session_id,
+                        deadline,
+                        boundary,
+                    ),
+                )
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Self::runtime_archive_error(format!(
+                        "process-owned archive disposal panicked for session {task_session_id}"
+                    )))
+                });
+                let _ = result_tx.send(result);
+            });
+            tokio::time::timeout(remaining, result_rx)
+                .await
+                .map_err(|_| {
+                    Self::runtime_retirement_in_progress(
+                        session_id,
+                        "session_archive_and_unregister",
+                    )
+                })?
+                .map_err(|error| {
+                    Self::runtime_archive_error(format!(
+                        "process-owned archive disposal ended without a result for {session_id}: {error}"
+                    ))
+                })?
+        })
+    }
+
+    fn archive_with_authority_then_unregister_under_boundary<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        deadline: Instant,
+        boundary: RuntimeTurnFinalizationBoundaryLease,
     ) -> ArchiveDisposalFuture<'a> {
         Box::pin(async move {
             tracing::info!(
@@ -1862,19 +2444,12 @@ impl MemberSessionDisposalArc {
                 && let Some(adapter) = &self.runtime_adapter
                 && adapter.contains_session(session_id).await
             {
-                self.cancel_active_runtime_turn_before_retire(session_id)
-                    .await?;
-                let mut boundary = RuntimeTurnFinalizationBoundaryLease::acquire(
-                    &self.session_service,
-                    session_id,
-                )
-                .await
-                .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
                 tracing::info!(
                     session_id = %session_id,
                     "mob archive authority does not own this session's durable record; completing host-owned disposal (runtime retire + binding release)"
                 );
-                self.retire_runtime_after_turn_boundary(session_id, &mut boundary)
+                let boundary = self
+                    .retire_runtime_after_turn_boundary(session_id, boundary, deadline)
                     .await?;
                 self.unregister_runtime_session_binding(session_id, &expected_state, boundary)
                     .await?;
@@ -1893,15 +2468,11 @@ impl MemberSessionDisposalArc {
             // protocol, but do not pre-retire the owned session here: doing so
             // destroys the very snapshot that protocol must archive and lets
             // an in-flight RunCompleted race a Retired machine.
-            self.cancel_active_runtime_turn_before_retire(session_id)
-                .await?;
-            let mut boundary =
-                RuntimeTurnFinalizationBoundaryLease::acquire(&self.session_service, session_id)
-                    .await
-                    .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
             match self
                 .session_service
-                .archive_with_mob_lifecycle_authority_under_runtime_turn_boundary(session_id)
+                .archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+                    session_id, deadline,
+                )
                 .await
             {
                 Ok(()) => {
@@ -1951,7 +2522,8 @@ impl MemberSessionDisposalArc {
                                 state = ?runtime_state,
                                 "mob archive authority returned NotFound for a terminal-phase registered runtime; completing disposal"
                             );
-                            self.retire_runtime_after_turn_boundary(session_id, &mut boundary)
+                            let boundary = self
+                                .retire_runtime_after_turn_boundary(session_id, boundary, deadline)
                                 .await?;
                             self.unregister_runtime_session_binding(
                                 session_id,
@@ -2055,6 +2627,22 @@ pub(super) enum FailedResumeRuntimeAuthority<'a> {
 
 #[cfg(feature = "runtime-adapter")]
 impl SessionBackend {
+    #[cfg(test)]
+    pub(super) async fn pending_turn_finalization_boundary_followers(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<u64> {
+        let key = PendingTurnFinalizationBoundaryKey {
+            session_service_identity: Arc::as_ptr(&self.session_service) as *const () as usize,
+            session_id: session_id.clone(),
+        };
+        pending_turn_finalization_boundaries()
+            .lock()
+            .await
+            .get(&key)
+            .map(|pending| pending.followers.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     /// Replace one retained serving attachment at the explicit mob-resume seam.
     ///
     /// A newly reconstructed mob owns a fresh attachment-local sidecar map, so
@@ -3538,6 +4126,7 @@ impl Drop for StagedRuntimeSessionActivation {
 pub(super) struct RuntimeTurnFinalizationBoundaryLease {
     session_id: SessionId,
     _guard: Box<dyn CoreExecutorTurnFinalizationGuard>,
+    pending_acquire_completion: Option<oneshot::Sender<()>>,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -3552,6 +4141,7 @@ impl RuntimeTurnFinalizationBoundaryLease {
         Ok(Self {
             session_id: session_id.clone(),
             _guard: guard,
+            pending_acquire_completion: None,
         })
     }
 
@@ -3573,21 +4163,47 @@ impl RuntimeTurnFinalizationBoundaryLease {
 /// caller cancellation may lose the response but cannot leave a half-published
 /// actor or replace the executor attachment.
 #[cfg(feature = "runtime-adapter")]
-async fn create_attached_session_actor_recovery_owned(
+struct AttachedSessionActorRecoveryContext {
     session_id: SessionId,
     session_service: Arc<dyn MobSessionService>,
-    mut prepared: PreparedAttachedSessionActorRecovery,
+    prepared: PreparedAttachedSessionActorRecovery,
     boundary: RuntimeTurnFinalizationBoundaryLease,
     state: Arc<RuntimeSessionState>,
+    route: super::session_service::SessionActorMaterializationRoute,
     actor_witness_slot: meerkat_session::LiveSessionActorWitnessSlot,
     req: meerkat_core::service::CreateSessionRequest,
+}
+
+#[cfg(feature = "runtime-adapter")]
+async fn create_attached_session_actor_recovery_owned(
+    context: AttachedSessionActorRecoveryContext,
 ) -> Result<meerkat_core::RunResult, MobError> {
+    let AttachedSessionActorRecoveryContext {
+        session_id,
+        session_service,
+        mut prepared,
+        boundary,
+        state,
+        route,
+        actor_witness_slot,
+        req,
+    } = context;
     boundary.require_session(&session_id)?;
     if prepared.witness().session_id() != &session_id || state.witness() != prepared.witness() {
         return Err(MobError::Internal(format!(
             "actor-only recovery for '{session_id}' lost its exact attachment tuple"
         )));
     }
+    let preparation = match route {
+        super::session_service::SessionActorMaterializationRoute::Resume { preparation } => {
+            preparation
+        }
+        _ => {
+            return Err(MobError::Internal(format!(
+                "actor-only recovery for '{session_id}' lost its active resume preparation receipt"
+            )));
+        }
+    };
     let cleanup_spawner = meerkat_runtime::RuntimeCleanupTaskSpawner::acquire()
         .map_err(|error| MobError::Internal(error.to_string()))?;
     let wait_session_id = session_id.clone();
@@ -3598,7 +4214,9 @@ async fn create_attached_session_actor_recovery_owned(
             super::session_service::execute_session_actor_materialization_under_runtime_turn_boundary(
                 session_service.as_ref(),
                 req,
-                super::session_service::SessionActorMaterializationRoute::AttachedActorRecovery,
+                super::session_service::SessionActorMaterializationRoute::AttachedActorRecovery {
+                    preparation,
+                },
                 &actor_witness_slot,
             )
             .await;
@@ -3643,13 +4261,28 @@ async fn create_attached_session_actor_recovery_owned(
                         return;
                     }
                 };
-                let publication = state
-                    .replace_actor_witness(prepared.witness(), actor_witness.clone())
-                    .and_then(|()| {
+                let publication = match state.replace_actor_witness(
+                    prepared.witness(),
+                    actor_witness.clone(),
+                ) {
+                    Err(error) => Err(error),
+                    Ok(()) => {
+                        let publication_handle: Arc<dyn CoreExecutorPublicationHandle> =
+                            Arc::new(MobSessionTerminalPublicationHandle {
+                                session_service: Arc::clone(&session_service),
+                                actor_witness: actor_witness.clone(),
+                            });
                         prepared
-                            .commit_actor()
+                            .replace_publication_handle_for_recovered_actor(publication_handle)
+                            .await
                             .map_err(|error| MobError::Internal(error.to_string()))
-                    });
+                            .and_then(|()| {
+                                prepared
+                                    .commit_actor()
+                                    .map_err(|error| MobError::Internal(error.to_string()))
+                            })
+                    }
+                };
                 match publication {
                     Ok(()) => Ok(created),
                     Err(error) => {
@@ -6235,7 +6868,7 @@ struct MobSessionServiceInterruptHandle {
 #[cfg(feature = "runtime-adapter")]
 struct MobSessionTerminalPublicationHandle {
     session_service: Arc<dyn MobSessionService>,
-    bridge_session_id: SessionId,
+    actor_witness: meerkat_session::LiveSessionActorWitness,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -6427,7 +7060,7 @@ impl CoreExecutorPublicationHandle for MobSessionTerminalPublicationHandle {
         CoreExecutorError,
     > {
         self.session_service
-            .publish_interaction_terminals(&self.bridge_session_id, events)
+            .publish_interaction_terminals_for_actor(&self.actor_witness, events)
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
@@ -6437,15 +7070,20 @@ impl CoreExecutorPublicationHandle for MobSessionTerminalPublicationHandle {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl CoreExecutorInterruptHandle for MobSessionServiceInterruptHandle {
-    async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
+    async fn hard_cancel_run_if_current(
+        &self,
+        expected_run_id: &CoreRunId,
+        _reason: String,
+    ) -> Result<bool, CoreExecutorError> {
         self.session_service
-            .interrupt_with_machine_authority(
+            .interrupt_run_with_machine_authority(
                 &self.bridge_session_id,
+                expected_run_id,
                 self.runtime_adapter.session_control_authority(),
             )
             .await
             .or_else(|err| match err {
-                SessionError::NotRunning { .. } => Ok(()),
+                SessionError::NotRunning { .. } => Ok(false),
                 err => Err(err),
             })
             .map_err(|err| CoreExecutorError::control_failed_runtime(err.to_string()))
@@ -6501,9 +7139,10 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
     }
 
     fn publication_handle(&self) -> Option<Arc<dyn CoreExecutorPublicationHandle>> {
+        let actor_witness = self.state.actor_witness()?;
         Some(Arc::new(MobSessionTerminalPublicationHandle {
             session_service: Arc::clone(&self.session_service),
-            bridge_session_id: self.bridge_session_id.clone(),
+            actor_witness,
         }))
     }
 
@@ -6683,9 +7322,15 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
         Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
         CoreExecutorError,
     > {
+        let actor_witness = self.state.actor_witness().ok_or_else(|| {
+            CoreExecutorError::control_failed_runtime(format!(
+                "runtime sidecar for session '{}' has no exact live actor witness for terminal publication",
+                self.bridge_session_id
+            ))
+        })?;
         MobSessionTerminalPublicationHandle {
             session_service: Arc::clone(&self.session_service),
-            bridge_session_id: self.bridge_session_id.clone(),
+            actor_witness,
         }
         .publish_interaction_terminals(events)
         .await
@@ -6744,7 +7389,7 @@ impl MobProvisioner for SessionBackend {
         // rollback capability to the owning PendingProvision.
         let backend = self;
         let mut session_origin = req.session_origin;
-        let requested_materialization = match session_origin {
+        let mut requested_materialization = match session_origin {
             ProvisionSessionOrigin::Fresh => {
                 if req.authorized_resume.is_some() {
                     return Err(MobError::Internal(
@@ -6792,8 +7437,14 @@ impl MobProvisioner for SessionBackend {
                     authority,
                     materialization,
                     session,
+                    preparation,
                     ..
                 } = authorized;
+                if !preparation.matches_authority(&authority) {
+                    return Err(MobError::Internal(format!(
+                        "resume preparation receipt for '{resume_id}' was not issued for the carried authority"
+                    )));
+                }
                 req.create_session
                     .build
                     .as_mut()
@@ -6806,10 +7457,11 @@ impl MobProvisioner for SessionBackend {
                 RequestedSessionMaterialization::Resume {
                     materialization,
                     authority,
+                    preparation: Some(preparation),
                 }
             }
         };
-        let mut actor_materialization_route = requested_materialization.actor_route();
+        let mut actor_materialization_route = requested_materialization.actor_route()?;
         let missing_live_revival =
             req.runtime_revival_intent == RuntimeRevivalIntent::MissingLiveMaterialization;
         let local_materialization_mode = if missing_live_revival {
@@ -6987,8 +7639,12 @@ impl MobProvisioner for SessionBackend {
                                 "prepare exact archived-resume authorization failed: {error}"
                             ))
                         })?;
+                    let resume_route = std::mem::replace(
+                        &mut actor_materialization_route,
+                        super::session_service::SessionActorMaterializationRoute::Fresh,
+                    );
                     actor_materialization_route =
-                        requested_materialization.authorize_revival(authorization)?;
+                        requested_materialization.authorize_revival(resume_route, authorization)?;
                 }
                 if let Some(ref mut build) = req.create_session.build {
                     build.runtime_build_mode =
@@ -7042,13 +7698,32 @@ impl MobProvisioner for SessionBackend {
             let revalidation = if let Some(transaction) = actor_transaction.as_ref() {
                 match transaction.prepared() {
                     Ok(prepared) => {
-                        requested_materialization
+                        match requested_materialization
                             .revalidate_authority_after_machine_prepare(
                                 &backend.session_service,
                                 session_id,
                                 prepared,
                             )
                             .await
+                        {
+                            Ok(()) => {
+                                let route = std::mem::replace(
+                                    &mut actor_materialization_route,
+                                    super::session_service::SessionActorMaterializationRoute::Fresh,
+                                );
+                                match route
+                                    .advance_resume_preparation_after_machine_prepare(prepared)
+                                    .await
+                                {
+                                    Ok(route) => {
+                                        actor_materialization_route = route;
+                                        Ok(())
+                                    }
+                                    Err(error) => Err(MobError::SessionError(error)),
+                                }
+                            }
+                            Err(error) => Err(error),
+                        }
                     }
                     Err(error) => Err(error),
                 }
@@ -7088,13 +7763,16 @@ impl MobProvisioner for SessionBackend {
                         ))
                     })?;
                 let created = create_attached_session_actor_recovery_owned(
-                    recovery_session_id,
-                    Arc::clone(&backend.session_service),
-                    prepared,
-                    boundary,
-                    Arc::clone(&state),
-                    actor_witness_slot.clone(),
-                    req.create_session,
+                    AttachedSessionActorRecoveryContext {
+                        session_id: recovery_session_id,
+                        session_service: Arc::clone(&backend.session_service),
+                        prepared,
+                        boundary,
+                        state: Arc::clone(&state),
+                        route: actor_materialization_route,
+                        actor_witness_slot: actor_witness_slot.clone(),
+                        req: req.create_session,
+                    },
                 )
                 .await?;
                 recovered_attached_state = Some(state);
@@ -7283,6 +7961,7 @@ impl MobProvisioner for SessionBackend {
         }
         Ok(MemberSpawnReceipt {
             member_ref: MemberRef::from_bridge_session_id(created_bridge_session_id),
+            direct_member_fence: None,
             operation_id,
             session_origin,
             rollback_authority,
@@ -7439,12 +8118,34 @@ impl MobProvisioner for SessionBackend {
         &self,
         member_ref: &MemberRef,
     ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
+        self.retire_member_until(
+            member_ref,
+            &AgentIdentity::from("session-backed-retirement"),
+            Instant::now() + MEMBER_RETIRE_TOTAL_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn retire_member_until(
+        &self,
+        member_ref: &MemberRef,
+        _member_identity: &AgentIdentity,
+        deadline: Instant,
+    ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
         tracing::debug!(
             member_ref = ?member_ref,
             "SessionBackend::retire_member start"
         );
         let session_id = Self::require_session(member_ref, "retire")?;
-        let disposal = self.disposal.dispose(&session_id).await?;
+        let disposal = match self.disposal.dispose_until(&session_id, deadline).await {
+            Ok(disposal) => disposal,
+            Err(error) => {
+                return Err(MemberSessionDisposalArc::map_runtime_retirement_error(
+                    &session_id,
+                    error,
+                ));
+            }
+        };
         self.ops_adapter
             .mark_member_retired_after_disposal(member_ref, disposal)
             .await?;
@@ -7940,6 +8641,7 @@ impl MobProvisioner for SessionBackend {
 }
 
 #[cfg(feature = "runtime-adapter")]
+#[derive(Clone)]
 pub struct MultiBackendProvisioner {
     session: SessionBackend,
     /// Presence carrier: a definition that never declared an external
@@ -7960,6 +8662,7 @@ struct ExternalBindingTarget {
     /// supervisor's trust store so inbound signed-envelope replies admit past
     /// ingress `is_trusted` gating.
     pubkey: [u8; 32],
+    direct_member_incarnation: super::bridge_protocol::BridgeDirectMemberIncarnation,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -8028,6 +8731,108 @@ impl MultiBackendProvisioner {
                 "peer-only spec requested for non-peer-only member".to_string(),
             )),
         }
+    }
+
+    async fn direct_member_binding_for_ref(
+        &self,
+        member_ref: &MemberRef,
+        expected_identity: Option<&AgentIdentity>,
+    ) -> Result<crate::store::ExternalBindingOverlayRecord, MobError> {
+        let persistence =
+            self.binding_persistence
+                .as_ref()
+                .ok_or_else(|| MobError::UnsupportedForMode {
+                    mode: crate::MobRuntimeMode::TurnDriven,
+                    reason: "peer-only V5 retirement requires durable direct-bind authority"
+                        .to_string(),
+                })?;
+        let authority = persistence
+            .runtime_metadata
+            .load_supervisor_authority(&persistence.mob_id)
+            .await?
+            .ok_or_else(|| {
+                MobError::Internal(
+                    "peer-only retirement has no durable supervisor authority".to_string(),
+                )
+            })?;
+        if authority.protocol_version < super::bridge_protocol::BridgeProtocolVersion::V5 {
+            return Err(MobError::SupervisorProtocolUpgradeRequired {
+                operation: "retire_member".to_string(),
+                current: authority.protocol_version,
+                required: super::bridge_protocol::BridgeProtocolVersion::V5,
+            });
+        }
+        let mut matches = persistence
+            .runtime_metadata
+            .list_external_binding_overlays(&persistence.mob_id)
+            .await?
+            .into_iter()
+            .filter(|record| {
+                record.status == crate::store::ExternalBindingOverlayStatus::DirectBindBound
+                    && matches!(
+                        (record.normalized_member_ref.as_ref(), member_ref),
+                        (
+                            Some(MemberRef::BackendPeer {
+                                peer_id: stored_peer_id,
+                                address: stored_address,
+                                pubkey: stored_pubkey,
+                                session_id: stored_session_id,
+                                ..
+                            }),
+                            MemberRef::BackendPeer {
+                                peer_id,
+                                address,
+                                pubkey,
+                                session_id,
+                                ..
+                            }
+                        ) if stored_peer_id == peer_id
+                            && stored_address == address
+                            && stored_pubkey == pubkey
+                            && stored_session_id == session_id
+                    )
+                    && expected_identity.map_or(true, |identity| record.agent_identity == *identity)
+            });
+        let record = matches.next().ok_or_else(|| MobError::UnsupportedForMode {
+            mode: crate::MobRuntimeMode::TurnDriven,
+            reason: "peer-only member has no exact V5 direct-bind fence".to_string(),
+        })?;
+        if matches.next().is_some() {
+            return Err(MobError::ExternalMemberCleanupUncertain {
+                reason: "peer-only member resolves to multiple direct-bind fences".to_string(),
+            });
+        }
+        if record.direct_member_fence.is_none() {
+            return Err(MobError::ExternalMemberCleanupUncertain {
+                reason: "bound direct-member authority has no runtime fence".to_string(),
+            });
+        }
+        Ok(record)
+    }
+
+    async fn delete_exact_direct_member_binding(
+        &self,
+        expected: &crate::store::ExternalBindingOverlayRecord,
+    ) -> Result<(), MobError> {
+        let persistence = self.binding_persistence.as_ref().ok_or_else(|| {
+            MobError::ExternalMemberCleanupUncertain {
+                reason: "exact direct-member cleanup lost its durable binding store".to_string(),
+            }
+        })?;
+        let deleted = persistence
+            .runtime_metadata
+            .compare_and_delete_external_direct_bind(&persistence.mob_id, expected)
+            .await?;
+        if !deleted {
+            return Err(MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "direct-member cleanup for '{}' generation {} observed a newer durable fence and retained it",
+                    expected.agent_identity,
+                    expected.generation.get()
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn peer_only_spec_from_parts(
@@ -8238,6 +9043,7 @@ impl MultiBackendProvisioner {
                             bootstrap_token: effective_bootstrap_token,
                             rejection_cause: cause,
                         }),
+                        direct_member_fence: None,
                     });
                 };
                 let pending_rotation = match self.pending_supervisor_rotation().await {
@@ -8275,7 +9081,13 @@ impl MultiBackendProvisioner {
                 // rolls that trust back; sent-but-unterminated ambiguity keeps
                 // it as exact reconciliation authority.
                 let bind: super::bridge_protocol::BridgeBindResponse = match self
-                    .bind_peer_only_member(peer, peer_id, address, bootstrap_token)
+                    .bind_peer_only_member(
+                        peer,
+                        peer_id,
+                        address,
+                        bootstrap_token,
+                        rebind_authority.direct_member_incarnation.clone(),
+                    )
                     .await
                 {
                     Ok((bind, _bind_trust_install)) => bind,
@@ -8302,9 +9114,81 @@ impl MultiBackendProvisioner {
                         ),
                     });
                 }
+                if bind.member_fence.incarnation() != rebind_authority.direct_member_incarnation {
+                    return Err(MobError::ExternalMemberCleanupUncertain {
+                        reason: format!(
+                            "peer-only rebind for '{peer_id}' returned a different semantic incarnation"
+                        ),
+                    });
+                }
+                let persistence = self.binding_persistence.as_ref().ok_or_else(|| {
+                    MobError::ExternalMemberCleanupUncertain {
+                        reason: format!(
+                            "peer-only rebind for '{peer_id}' returned an exact fence without a durable binding store"
+                        ),
+                    }
+                })?;
+                let current = persistence
+                    .runtime_metadata
+                    .list_external_binding_overlays(&persistence.mob_id)
+                    .await?
+                    .into_iter()
+                    .find(|record| {
+                        record.agent_identity.as_str()
+                            == rebind_authority.direct_member_incarnation.agent_identity
+                            && record.generation.get()
+                                == rebind_authority.direct_member_incarnation.generation
+                    })
+                    .ok_or_else(|| MobError::ExternalMemberCleanupUncertain {
+                        reason: format!(
+                            "peer-only rebind for '{peer_id}' lost its durable direct-bind authority"
+                        ),
+                    })?;
+                if !matches!(
+                    current.status,
+                    crate::store::ExternalBindingOverlayStatus::DirectBindPending
+                        | crate::store::ExternalBindingOverlayStatus::DirectBindBound
+                ) || current.direct_member_incarnation.as_ref()
+                    != Some(&rebind_authority.direct_member_incarnation)
+                    || !matches!(
+                        current.normalized_member_ref.as_ref(),
+                        Some(MemberRef::BackendPeer {
+                            peer_id: stored_peer_id,
+                            address: stored_address,
+                            pubkey: stored_pubkey,
+                            session_id: None,
+                            ..
+                        }) if stored_peer_id == peer_id
+                            && super::bridge_protocol::canonicalize_bridge_address(stored_address)
+                                == expected_address
+                            && *stored_pubkey == pubkey
+                    )
+                {
+                    return Err(MobError::ExternalMemberCleanupUncertain {
+                        reason: format!(
+                            "peer-only rebind for '{peer_id}' found non-matching durable direct-bind authority"
+                        ),
+                    });
+                }
+                let mut bound = current.clone();
+                bound.status = crate::store::ExternalBindingOverlayStatus::DirectBindBound;
+                bound.direct_member_fence = Some(bind.member_fence.clone());
+                bound.updated_at = chrono::Utc::now();
+                if !persistence
+                    .runtime_metadata
+                    .compare_and_set_external_direct_bind(&persistence.mob_id, &current, &bound)
+                    .await?
+                {
+                    return Err(MobError::ExternalMemberCleanupUncertain {
+                        reason: format!(
+                            "peer-only rebind for '{peer_id}' was superseded before exact Bound persistence"
+                        ),
+                    });
+                }
                 return Ok(PeerOnlySupervisorAuthorization {
                     peer: expected_peer,
                     rebind_required: None,
+                    direct_member_fence: Some(bind.member_fence),
                 });
             }
             return Err(self
@@ -8330,7 +9214,87 @@ impl MultiBackendProvisioner {
         Ok(PeerOnlySupervisorAuthorization {
             peer: peer.clone(),
             rebind_required: None,
+            direct_member_fence: None,
         })
+    }
+
+    /// Revalidate a peer that already has a durable DirectBindBound trust
+    /// anchor without starting another trust mutation. The bridge transport
+    /// owns its request timeout, so reaching the retirement deadline does not
+    /// cancel an in-flight custom trust/store future or discard exact retry
+    /// authority.
+    async fn authorize_pretrusted_peer_before(
+        &self,
+        peer: &TrustedPeerDescriptor,
+        deadline: Instant,
+    ) -> Result<(), MobError> {
+        let payload = self.bridge_supervisor_payload_for_recipient(peer).await?;
+        let command = super::bridge_protocol::BridgeCommand::AuthorizeSupervisor(payload);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(MobError::BridgeRequestTimedOut {
+                request_envelope_id: "retirement-authorize-not-dispatched".to_string(),
+                timeout_ms: 0,
+            });
+        }
+        let value = self
+            .supervisor_bridge
+            .send_bridge_command(peer, &command, remaining.min(Duration::from_secs(10)))
+            .await?;
+        if let Some(rejection) = Self::bridge_rejection_reply(command.protocol_version(), &value) {
+            return Err(Self::bridge_rejection_error(rejection));
+        }
+        let _ack = super::bridge_protocol::decode_bridge_ack(
+            &command,
+            value,
+            "pretrusted retirement supervisor authorization",
+        )?;
+        Ok(())
+    }
+
+    async fn adopt_pretrusted_direct_member_before(
+        &self,
+        member_ref: &MemberRef,
+        incarnation: super::bridge_protocol::BridgeDirectMemberIncarnation,
+        deadline: Instant,
+    ) -> Result<super::bridge_protocol::BridgeDirectMemberFence, MobError> {
+        let MemberRef::BackendPeer {
+            peer_id,
+            address,
+            bootstrap_token,
+            pubkey,
+            session_id: None,
+            ..
+        } = member_ref
+        else {
+            return Err(MobError::UnsupportedForMode {
+                mode: crate::MobRuntimeMode::TurnDriven,
+                reason: "direct-member adoption requires a peer-only member".to_string(),
+            });
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(MobError::BridgeRequestTimedOut {
+                request_envelope_id: "retirement-bind-not-dispatched".to_string(),
+                timeout_ms: 0,
+            });
+        }
+        let peer = self.peer_only_spec(member_ref).await?;
+        let (bind, _existing_trust) = self
+            .bind_peer_only_member_with_trust(
+                &peer,
+                peer_id,
+                address,
+                bootstrap_token
+                    .as_ref()
+                    .map(super::bridge_protocol::BridgeBootstrapToken::as_str),
+                incarnation.clone(),
+                remaining.min(Duration::from_secs(10)),
+                false,
+            )
+            .await?;
+        self.persist_adopted_direct_member_fence(member_ref, &incarnation, &bind)
+            .await
     }
 
     /// Fail-closed rollback for supervisor recipient trust installed ahead of an
@@ -8417,6 +9381,25 @@ impl MultiBackendProvisioner {
         self.send_bridge_command_typed_with_trust_install(peer, command, timeout)
             .await
             .map(|(response, _)| response)
+    }
+
+    /// Typed bridge request for a peer whose recipient trust is already a
+    /// durable retry anchor. This never installs or rolls back trust, which is
+    /// essential for deadline-bounded retirement observation.
+    async fn send_bridge_command_typed_pretrusted<R: super::bridge_protocol::FromBridgeReply>(
+        &self,
+        peer: &TrustedPeerDescriptor,
+        command: &super::bridge_protocol::BridgeCommand,
+        timeout: Duration,
+    ) -> Result<R, MobError> {
+        let value = self
+            .supervisor_bridge
+            .send_bridge_command(peer, command, timeout)
+            .await?;
+        if let Some(rejection) = Self::bridge_rejection_reply(command.protocol_version(), &value) {
+            return Err(Self::bridge_rejection_error(rejection));
+        }
+        super::bridge_protocol::decode_bridge_payload(command, value, "pretrusted command")
     }
 
     async fn send_bridge_command_typed_with_trust_install<
@@ -8518,6 +9501,36 @@ impl MultiBackendProvisioner {
         peer_id: &str,
         address: &str,
         bootstrap_token: Option<&str>,
+        direct_member_incarnation: super::bridge_protocol::BridgeDirectMemberIncarnation,
+    ) -> Result<
+        (
+            super::bridge_protocol::BridgeBindResponse,
+            super::supervisor_bridge::RecipientTrustInstall,
+        ),
+        MobError,
+    > {
+        self.bind_peer_only_member_with_trust(
+            peer,
+            peer_id,
+            address,
+            bootstrap_token,
+            direct_member_incarnation,
+            Duration::from_secs(60),
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bind_peer_only_member_with_trust(
+        &self,
+        peer: &TrustedPeerDescriptor,
+        peer_id: &str,
+        address: &str,
+        bootstrap_token: Option<&str>,
+        direct_member_incarnation: super::bridge_protocol::BridgeDirectMemberIncarnation,
+        timeout: Duration,
+        install_recipient_trust: bool,
     ) -> Result<
         (
             super::bridge_protocol::BridgeBindResponse,
@@ -8527,6 +9540,13 @@ impl MultiBackendProvisioner {
     > {
         let bootstrap_token = Self::bridge_bootstrap_token_from_binding(address, bootstrap_token)?;
         let authority = self.supervisor_bridge.authority().await;
+        if authority.protocol_version < super::bridge_protocol::BridgeProtocolVersion::V5 {
+            return Err(MobError::SupervisorProtocolUpgradeRequired {
+                operation: "bind_member".to_string(),
+                current: authority.protocol_version,
+                required: super::bridge_protocol::BridgeProtocolVersion::V5,
+            });
+        }
         let sup_spec = self
             .supervisor_bridge
             .supervisor_spec_for_recipient(peer)
@@ -8535,24 +9555,33 @@ impl MultiBackendProvisioner {
             super::bridge_protocol::BridgeBindPayload {
                 supervisor: sup_spec.into(),
                 epoch: authority.epoch,
-                protocol_version: authority.protocol_version,
+                // V5 BindMember is the clean-cut adoption seam for persisted
+                // V4 supervisor authority. The supervisor epoch/spec remain
+                // unchanged; only this exact member-effect command upgrades
+                // to the protocol that carries semantic and opaque fences.
+                protocol_version: super::bridge_protocol::BridgeProtocolVersion::V5,
                 expected_peer_id: peer_id.to_string(),
                 expected_address: address.to_string(),
                 bootstrap_token,
+                member: direct_member_incarnation,
             },
         );
-        // 60s (not 30s): tolerate async trust/peer-registration propagation lag
-        // before the bind reply lands (matches the responder's 60s wait). Bounds
-        // failure-lag only; under high-parallelism RBE loopback registration can
-        // lag tens of seconds, in real deployments it propagates in ms.
-        let install = self
-            .supervisor_bridge
-            .trust_recipient(peer)
-            .await
-            .map_err(Self::uncertain_recipient_trust_install)?;
+        // Initial Bind installs recipient trust before send. Retirement
+        // refreshes use a previously confirmed DirectBindBound row, whose
+        // recipient trust is retained as exact retry authority; those callers
+        // deliberately skip this potentially mutating wait and never roll it
+        // back on a bounded observation failure.
+        let install = if install_recipient_trust {
+            self.supervisor_bridge
+                .trust_recipient(peer)
+                .await
+                .map_err(Self::uncertain_recipient_trust_install)?
+        } else {
+            super::supervisor_bridge::RecipientTrustInstall::AlreadyTrusted
+        };
         let value = match self
             .supervisor_bridge
-            .send_bridge_command_classified(peer, &command, Duration::from_secs(60))
+            .send_bridge_command_classified(peer, &command, timeout)
             .await
         {
             Ok(value) => value,
@@ -8574,8 +9603,23 @@ impl MultiBackendProvisioner {
             }
         };
         if let Some(rejection) = Self::bridge_rejection_reply(command.protocol_version(), &value) {
-            // An authenticated command rejection is the only post-send reply
-            // that certifies BindMember made no mutation.
+            if matches!(
+                rejection.typed_cause(),
+                Some(
+                    super::bridge_protocol::BridgeRejectionCause::BindAdmissionOutcomeUnknown
+                        | super::bridge_protocol::BridgeRejectionCause::Internal
+                        | super::bridge_protocol::BridgeRejectionCause::Unavailable
+                )
+            ) {
+                return Err(MobError::ExternalMemberCleanupUncertain {
+                    reason: format!(
+                        "BindMember admission outcome is ambiguous after send: {}; exact pending authority and recipient trust retained",
+                        rejection.reason()
+                    ),
+                });
+            }
+            // Only typed pre-admission causes certify that BindMember made no
+            // mutation. Ambiguous process-owned outcomes above retain trust.
             return Err(self
                 .rollback_supervisor_recipient_trust(
                     peer,
@@ -8594,6 +9638,100 @@ impl MultiBackendProvisioner {
         }
     }
 
+    async fn persist_adopted_direct_member_fence(
+        &self,
+        member_ref: &MemberRef,
+        incarnation: &super::bridge_protocol::BridgeDirectMemberIncarnation,
+        bind: &super::bridge_protocol::BridgeBindResponse,
+    ) -> Result<super::bridge_protocol::BridgeDirectMemberFence, MobError> {
+        let MemberRef::BackendPeer {
+            peer_id,
+            address,
+            pubkey,
+            session_id: None,
+            ..
+        } = member_ref
+        else {
+            return Err(MobError::UnsupportedForMode {
+                mode: crate::MobRuntimeMode::TurnDriven,
+                reason: "direct-member adoption requires a peer-only member".to_string(),
+            });
+        };
+        if bind.member_fence.incarnation() != *incarnation
+            || bind.peer_id != *peer_id
+            || super::bridge_protocol::canonicalize_bridge_address(&bind.address)
+                != super::bridge_protocol::canonicalize_bridge_address(address)
+        {
+            return Err(MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "V5 direct-member adoption for '{}' returned authority outside the reserved incarnation/endpoint",
+                    incarnation.agent_identity
+                ),
+            });
+        }
+        let persistence = self.binding_persistence.as_ref().ok_or_else(|| {
+            MobError::ExternalMemberCleanupUncertain {
+                reason: "V5 direct-member adoption has no durable binding store".to_string(),
+            }
+        })?;
+        let current = persistence
+            .runtime_metadata
+            .list_external_binding_overlays(&persistence.mob_id)
+            .await
+            .map_err(|error| MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "V5 direct-member adoption committed remotely but durable authority could not be read: {error}"
+                ),
+            })?
+            .into_iter()
+            .find(|record| {
+                record.agent_identity.as_str() == incarnation.agent_identity
+                    && record.generation.get() == incarnation.generation
+            })
+            .ok_or_else(|| MobError::ExternalMemberCleanupUncertain {
+                reason: "V5 direct-member adoption committed remotely without its Pending authority"
+                    .to_string(),
+            })?;
+        if current.direct_member_incarnation.as_ref() != Some(incarnation) {
+            return Err(MobError::ExternalMemberCleanupUncertain {
+                reason: "V5 direct-member adoption found a conflicting durable incarnation"
+                    .to_string(),
+            });
+        }
+        if !matches!(
+            current.status,
+            crate::store::ExternalBindingOverlayStatus::DirectBindPending
+                | crate::store::ExternalBindingOverlayStatus::DirectBindBound
+        ) || (current.status == crate::store::ExternalBindingOverlayStatus::DirectBindPending
+            && current.direct_member_fence.is_some())
+        {
+            return Err(MobError::ExternalMemberCleanupUncertain {
+                reason: "V5 direct-member adoption found a superseded durable receipt".to_string(),
+            });
+        }
+        let mut bound = current.clone();
+        bound.status = crate::store::ExternalBindingOverlayStatus::DirectBindBound;
+        bound.direct_member_fence = Some(bind.member_fence.clone());
+        bound.updated_at = chrono::Utc::now();
+        if !persistence
+            .runtime_metadata
+            .compare_and_set_external_direct_bind(&persistence.mob_id, &current, &bound)
+            .await
+            .map_err(|error| MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "V5 direct-member adoption committed remotely but Bound CAS failed: {error}"
+                ),
+            })?
+        {
+            return Err(MobError::ExternalMemberCleanupUncertain {
+                reason: "V5 direct-member adoption Bound CAS observed a successor authority"
+                    .to_string(),
+            });
+        }
+        let _ = pubkey;
+        Ok(bind.member_fence.clone())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn compensate_failed_external_member_after_bind(
         &self,
@@ -8603,20 +9741,75 @@ impl MultiBackendProvisioner {
         peer_name: &str,
         operation_source: &OperationSource,
         operation_id: &OperationId,
+        member_fence: &super::bridge_protocol::BridgeDirectMemberFence,
         trust_install: super::supervisor_bridge::RecipientTrustInstall,
         original_error: MobError,
     ) -> MobError {
         let retire_result = match self.bridge_supervisor_payload_for_recipient(peer).await {
-            Ok(payload) => {
-                let command = super::bridge_protocol::BridgeCommand::RetireMember(payload);
-                self.send_bridge_command_typed::<super::bridge_protocol::BridgeRetireResponse>(
+            Ok(payload) => async {
+                let command = super::bridge_protocol::BridgeCommand::RetireMember(
+                    super::bridge_protocol::BridgeRetirePayload {
+                        supervisor: payload.supervisor.clone(),
+                        epoch: payload.epoch,
+                        protocol_version: super::bridge_protocol::BridgeProtocolVersion::V5,
+                        member_fence: member_fence.clone(),
+                    },
+                );
+                let reply = self.send_bridge_command_typed::<super::bridge_protocol::BridgeRetireResponse>(
                     peer,
                     &command,
                     Duration::from_secs(10),
                 )
-                .await
-                .map(|_| ())
+                .await?;
+                match reply.outcome {
+                    super::bridge_protocol::BridgeRetireOutcome::Retired { .. } => Ok(()),
+                    super::bridge_protocol::BridgeRetireOutcome::Stale { current, .. } => {
+                        let refresh_presented = current.as_ref().is_none_or(|current| {
+                            current.mob_id == member_fence.mob_id
+                                && current.agent_identity == member_fence.agent_identity
+                                && current.generation == member_fence.generation
+                                && current.fence_token == member_fence.fence_token
+                        });
+                        if !refresh_presented {
+                            Ok(())
+                        } else {
+                            let refreshed = self
+                                .adopt_peer_only_direct_member(
+                                    member_ref,
+                                    member_fence.incarnation(),
+                                )
+                                .await?;
+                            let retry = super::bridge_protocol::BridgeCommand::RetireMember(
+                                super::bridge_protocol::BridgeRetirePayload {
+                                    supervisor: payload.supervisor,
+                                    epoch: payload.epoch,
+                                    protocol_version:
+                                        super::bridge_protocol::BridgeProtocolVersion::V5,
+                                    member_fence: refreshed,
+                                },
+                            );
+                            let retry = self
+                                .send_bridge_command_typed::<
+                                    super::bridge_protocol::BridgeRetireResponse,
+                                >(peer, &retry, Duration::from_secs(10))
+                                .await?;
+                            if matches!(
+                                retry.outcome,
+                                super::bridge_protocol::BridgeRetireOutcome::Retired { .. }
+                            ) {
+                                Ok(())
+                            } else {
+                                Err(MobError::ExternalMemberCleanupUncertain {
+                                    reason: format!(
+                                        "compensating retirement for operation '{operation_id}' remained stale after exact rebind"
+                                    ),
+                                })
+                            }
+                        }
+                    }
+                }
             }
+            .await,
             Err(error) => Err(error),
         };
         if let Err(error) = retire_result {
@@ -8663,6 +9856,61 @@ impl MultiBackendProvisioner {
                 ),
             };
         }
+        let persistence = match self.binding_persistence.as_ref() {
+            Some(persistence) => persistence,
+            None => {
+                return MobError::ExternalMemberCleanupUncertain {
+                    reason: format!(
+                        "external member provisioning failed after BindMember ({original_error}); remote retirement and local cleanup confirmed but exact durable fence cleanup has no binding store"
+                    ),
+                };
+            }
+        };
+        let expected = match persistence
+            .runtime_metadata
+            .list_external_binding_overlays(&persistence.mob_id)
+            .await
+        {
+            Ok(records) => records.into_iter().find(|record| {
+                record.direct_member_incarnation.as_ref() == Some(&member_fence.incarnation())
+                    && record.status == crate::store::ExternalBindingOverlayStatus::DirectBindBound
+            }),
+            Err(error) => {
+                return MobError::ExternalMemberCleanupUncertain {
+                    reason: format!(
+                        "external member provisioning failed after BindMember ({original_error}); cleanup confirmed but durable exact fence could not be reobserved: {error}"
+                    ),
+                };
+            }
+        };
+        let Some(expected) = expected else {
+            return MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "external member provisioning failed after BindMember ({original_error}); cleanup confirmed but exact Bound authority was absent or superseded"
+                ),
+            };
+        };
+        match persistence
+            .runtime_metadata
+            .compare_and_delete_external_direct_bind(&persistence.mob_id, &expected)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return MobError::ExternalMemberCleanupUncertain {
+                    reason: format!(
+                        "external member provisioning failed after BindMember ({original_error}); delayed cleanup retained a newer durable direct-member fence"
+                    ),
+                };
+            }
+            Err(error) => {
+                return MobError::ExternalMemberCleanupUncertain {
+                    reason: format!(
+                        "external member provisioning failed after BindMember ({original_error}); exact durable fence cleanup failed: {error}"
+                    ),
+                };
+            }
+        }
         original_error
     }
 
@@ -8679,6 +9927,7 @@ impl MultiBackendProvisioner {
             address: real_address,
             bootstrap_token,
             pubkey,
+            direct_member_incarnation,
         } = target;
         let effective_bootstrap_token = Self::bridge_bootstrap_token_from_binding(
             &real_address,
@@ -8737,6 +9986,7 @@ impl MultiBackendProvisioner {
                 &real_peer_id,
                 &canonical_requested_address,
                 Some(bind_bootstrap_token.as_str()),
+                direct_member_incarnation.clone(),
             )
             .await
         {
@@ -8787,6 +10037,7 @@ impl MultiBackendProvisioner {
                         &peer_name,
                         &operation_source,
                         &operation_id,
+                        &bind_response.member_fence,
                         trust_install,
                         error,
                     )
@@ -8807,10 +10058,95 @@ impl MultiBackendProvisioner {
                     &peer_name,
                     &operation_source,
                     &operation_id,
+                    &bind_response.member_fence,
                     trust_install,
                     error,
                 )
                 .await);
+        }
+        if bind_response.member_fence.incarnation() != direct_member_incarnation {
+            let error = MobError::WiringError(format!(
+                "external BindMember response for '{peer_name}' changed the durably reserved Mob incarnation"
+            ));
+            return Err(self
+                .compensate_failed_external_member_after_bind(
+                    &peer,
+                    &member_ref,
+                    &owner_bridge_session_id,
+                    &peer_name,
+                    &operation_source,
+                    &operation_id,
+                    &bind_response.member_fence,
+                    trust_install,
+                    error,
+                )
+                .await);
+        }
+        let persistence = self.binding_persistence.as_ref().ok_or_else(|| {
+            MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "BindMember for '{peer_name}' returned an exact runtime fence but no durable Mob binding store is configured"
+                ),
+            }
+        })?;
+        let current = persistence
+            .runtime_metadata
+            .list_external_binding_overlays(&persistence.mob_id)
+            .await
+            .map_err(|error| MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "BindMember for '{peer_name}' committed remotely but its pending durable authority could not be read: {error}"
+                ),
+            })?
+            .into_iter()
+            .find(|record| {
+                record.agent_identity.as_str() == direct_member_incarnation.agent_identity
+                    && record.generation.get() == direct_member_incarnation.generation
+            })
+            .ok_or_else(|| MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "BindMember for '{peer_name}' committed remotely but its pending durable authority is absent"
+                ),
+            })?;
+        if current.direct_member_incarnation.as_ref() != Some(&direct_member_incarnation) {
+            return Err(MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "BindMember for '{peer_name}' committed remotely but its durable semantic authority changed before fence persistence"
+                ),
+            });
+        }
+        if !matches!(
+            current.status,
+            crate::store::ExternalBindingOverlayStatus::DirectBindPending
+                | crate::store::ExternalBindingOverlayStatus::DirectBindBound
+        ) || (current.status == crate::store::ExternalBindingOverlayStatus::DirectBindPending
+            && current.direct_member_fence.is_some())
+        {
+            return Err(MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "BindMember for '{peer_name}' committed remotely but its exact durable authority is neither the expected pending row nor an identical bound replay"
+                ),
+            });
+        }
+        let mut bound = current.clone();
+        bound.status = crate::store::ExternalBindingOverlayStatus::DirectBindBound;
+        bound.direct_member_fence = Some(bind_response.member_fence.clone());
+        bound.updated_at = chrono::Utc::now();
+        let persisted = persistence
+            .runtime_metadata
+            .compare_and_set_external_direct_bind(&persistence.mob_id, &current, &bound)
+            .await
+            .map_err(|error| MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "BindMember for '{peer_name}' committed remotely but its exact fence could not be persisted: {error}"
+                ),
+            })?;
+        if !persisted {
+            return Err(MobError::ExternalMemberCleanupUncertain {
+                reason: format!(
+                    "BindMember for '{peer_name}' committed remotely but its pending durable authority was superseded before exact fence persistence"
+                ),
+            });
         }
         if let Err(error) = self
             .session
@@ -8831,6 +10167,7 @@ impl MultiBackendProvisioner {
                     &peer_name,
                     &operation_source,
                     &operation_id,
+                    &bind_response.member_fence,
                     trust_install,
                     error,
                 )
@@ -8838,6 +10175,7 @@ impl MultiBackendProvisioner {
         }
         Ok(MemberSpawnReceipt {
             member_ref,
+            direct_member_fence: Some(bind_response.member_fence),
             operation_id,
             session_origin: ProvisionSessionOrigin::Fresh,
             rollback_authority: None,
@@ -8878,6 +10216,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                         generated_self_owned_operation_owner: req
                             .generated_self_owned_operation_owner,
                         runtime_revival_intent: req.runtime_revival_intent,
+                        direct_member_incarnation: None,
                     })
                     .await
             }
@@ -8887,6 +10226,15 @@ impl MobProvisioner for MultiBackendProvisioner {
                 bootstrap_token,
                 pubkey,
             } => {
+                let direct_member_incarnation =
+                    req.direct_member_incarnation.take().ok_or_else(|| {
+                        MobError::UnsupportedForMode {
+                        mode: crate::MobRuntimeMode::TurnDriven,
+                        reason:
+                            "peer-only V5 provisioning requires a durably reserved Mob incarnation"
+                                .to_string(),
+                    }
+                    })?;
                 let (owner_bridge_session_id, ops_registry) =
                     match (req.owner_bridge_session_id.take(), req.ops_registry.take()) {
                         (Some(owner_bridge_session_id), Some(ops_registry)) => {
@@ -8914,6 +10262,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                         address,
                         bootstrap_token,
                         pubkey,
+                        direct_member_incarnation,
                     },
                 )
                 .await
@@ -9048,6 +10397,7 @@ impl MobProvisioner for MultiBackendProvisioner {
         Ok(MaterializedSpawnReceipt {
             receipt: MemberSpawnReceipt {
                 member_ref,
+                direct_member_fence: None,
                 operation_id,
                 session_origin: ProvisionSessionOrigin::Fresh,
                 rollback_authority: None,
@@ -9326,6 +10676,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                 session_id: None,
                 ..
             } => {
+                let mut binding = self.direct_member_binding_for_ref(member_ref, None).await?;
                 let peer = self.peer_only_spec(member_ref).await?;
                 let authorization = self
                     .ensure_supervisor_authorized(
@@ -9353,14 +10704,72 @@ impl MobProvisioner for MultiBackendProvisioner {
                 }
                 let peer = authorization.peer;
                 let payload = self.bridge_supervisor_payload_for_recipient(&peer).await?;
-                let command = super::bridge_protocol::BridgeCommand::RetireMember(payload);
-                let _retire: super::bridge_protocol::BridgeRetireResponse = self
+                let member_fence = binding.direct_member_fence.clone().ok_or_else(|| {
+                    MobError::ExternalMemberCleanupUncertain {
+                        reason: "bound direct-member authority lost its exact runtime fence"
+                            .to_string(),
+                    }
+                })?;
+                let presented_fence = member_fence.clone();
+                let command = super::bridge_protocol::BridgeCommand::RetireMember(
+                    super::bridge_protocol::BridgeRetirePayload {
+                        supervisor: payload.supervisor.clone(),
+                        epoch: payload.epoch,
+                        protocol_version: super::bridge_protocol::BridgeProtocolVersion::V5,
+                        member_fence,
+                    },
+                );
+                let retire: super::bridge_protocol::BridgeRetireResponse = self
                     .send_bridge_command_typed(&peer, &command, Duration::from_secs(10))
                     .await?;
+                match retire.outcome {
+                    super::bridge_protocol::BridgeRetireOutcome::Retired { .. } => {}
+                    super::bridge_protocol::BridgeRetireOutcome::Stale { current, .. } => {
+                        let refresh_presented = current.as_ref().is_none_or(|current| {
+                            current.mob_id == presented_fence.mob_id
+                                && current.agent_identity == presented_fence.agent_identity
+                                && current.generation == presented_fence.generation
+                                && current.fence_token == presented_fence.fence_token
+                        });
+                        if refresh_presented {
+                            let refreshed = self
+                                .adopt_peer_only_direct_member(
+                                    member_ref,
+                                    presented_fence.incarnation(),
+                                )
+                                .await?;
+                            binding = self.direct_member_binding_for_ref(member_ref, None).await?;
+                            let retry = super::bridge_protocol::BridgeCommand::RetireMember(
+                                super::bridge_protocol::BridgeRetirePayload {
+                                    supervisor: payload.supervisor.clone(),
+                                    epoch: payload.epoch,
+                                    protocol_version:
+                                        super::bridge_protocol::BridgeProtocolVersion::V5,
+                                    member_fence: refreshed,
+                                },
+                            );
+                            let retry: super::bridge_protocol::BridgeRetireResponse = self
+                                .send_bridge_command_typed(&peer, &retry, Duration::from_secs(10))
+                                .await?;
+                            if !matches!(
+                                retry.outcome,
+                                super::bridge_protocol::BridgeRetireOutcome::Retired { .. }
+                            ) {
+                                return Err(MobError::MemberRetirementInProgress {
+                                    member_id: binding.agent_identity.clone(),
+                                    stage: "peer_retirement_rotated_fence".to_string(),
+                                });
+                            }
+                        }
+                        // A different semantic incarnation proves the exact
+                        // predecessor absent. Never retarget the successor.
+                    }
+                }
                 self.session
                     .ops_adapter
-                    .mark_member_retired(member_ref)
+                    .mark_member_retired_if_bound(member_ref)
                     .await?;
+                self.delete_exact_direct_member_binding(&binding).await?;
                 // The controlling side only asked the remote member's own host
                 // to retire its runtime; the member's durable session (if any)
                 // is owned by that host and no archive happened here.
@@ -9369,6 +10778,168 @@ impl MobProvisioner for MultiBackendProvisioner {
                 )
             }
             _ => self.session.retire_member(member_ref).await,
+        }
+    }
+
+    async fn retire_member_until(
+        &self,
+        member_ref: &MemberRef,
+        member_identity: &AgentIdentity,
+        deadline: Instant,
+    ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
+        match member_ref {
+            MemberRef::BackendPeer {
+                session_id: None, ..
+            } => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(MobError::MemberRetirementInProgress {
+                        member_id: member_identity.clone(),
+                        stage: "peer_retirement_dispatch".to_string(),
+                    });
+                }
+                let mut binding = self
+                    .direct_member_binding_for_ref(member_ref, Some(member_identity))
+                    .await?;
+                let peer = self.peer_only_spec(member_ref).await?;
+                if let Err(error) = self.authorize_pretrusted_peer_before(&peer, deadline).await {
+                    return match error {
+                        MobError::BridgeRequestTimedOut { .. } => {
+                            Err(MobError::MemberRetirementInProgress {
+                                member_id: member_identity.clone(),
+                                stage: "peer_retirement_authorization".to_string(),
+                            })
+                        }
+                        error => Err(error),
+                    };
+                }
+                let payload = self.bridge_supervisor_payload_for_recipient(&peer).await?;
+                let member_fence = binding.direct_member_fence.clone().ok_or_else(|| {
+                    MobError::ExternalMemberCleanupUncertain {
+                        reason: "bound direct-member authority lost its exact runtime fence"
+                            .to_string(),
+                    }
+                })?;
+                let presented_fence = member_fence.clone();
+                let command = super::bridge_protocol::BridgeCommand::RetireMember(
+                    super::bridge_protocol::BridgeRetirePayload {
+                        supervisor: payload.supervisor.clone(),
+                        epoch: payload.epoch,
+                        protocol_version: super::bridge_protocol::BridgeProtocolVersion::V5,
+                        member_fence,
+                    },
+                );
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(MobError::MemberRetirementInProgress {
+                        member_id: member_identity.clone(),
+                        stage: "peer_retirement_authorization".to_string(),
+                    });
+                }
+                match self
+                    .send_bridge_command_typed_pretrusted::<
+                        super::bridge_protocol::BridgeRetireResponse,
+                    >(
+                        &peer,
+                        &command,
+                        remaining.min(Duration::from_secs(10)),
+                    )
+                    .await
+                {
+                    Ok(retire) => match retire.outcome {
+                        super::bridge_protocol::BridgeRetireOutcome::Retired { .. } => {}
+                        super::bridge_protocol::BridgeRetireOutcome::Stale { current, .. } => {
+                            let refresh_presented = current.as_ref().is_none_or(|current| {
+                                current.mob_id == presented_fence.mob_id
+                                    && current.agent_identity == presented_fence.agent_identity
+                                    && current.generation == presented_fence.generation
+                                    && current.fence_token == presented_fence.fence_token
+                            });
+                            if refresh_presented {
+                                let refreshed = self
+                                    .adopt_pretrusted_direct_member_before(
+                                        member_ref,
+                                        presented_fence.incarnation(),
+                                        deadline,
+                                    )
+                                    .await
+                                    .map_err(|error| match error {
+                                        MobError::BridgeRequestTimedOut { .. } => {
+                                            MobError::MemberRetirementInProgress {
+                                                member_id: member_identity.clone(),
+                                                stage: "peer_retirement_rebind".to_string(),
+                                            }
+                                        }
+                                        error => error,
+                                    })?;
+                                binding = self
+                                    .direct_member_binding_for_ref(
+                                        member_ref,
+                                        Some(member_identity),
+                                    )
+                                    .await?;
+                                let remaining = deadline.saturating_duration_since(Instant::now());
+                                if remaining.is_zero() {
+                                    return Err(MobError::MemberRetirementInProgress {
+                                        member_id: member_identity.clone(),
+                                        stage: "peer_retirement_rotated_fence".to_string(),
+                                    });
+                                }
+                                let retry = super::bridge_protocol::BridgeCommand::RetireMember(
+                                    super::bridge_protocol::BridgeRetirePayload {
+                                        supervisor: payload.supervisor.clone(),
+                                        epoch: payload.epoch,
+                                        protocol_version:
+                                            super::bridge_protocol::BridgeProtocolVersion::V5,
+                                        member_fence: refreshed,
+                                    },
+                                );
+                                let retry = self
+                                    .send_bridge_command_typed_pretrusted::<
+                                        super::bridge_protocol::BridgeRetireResponse,
+                                    >(
+                                        &peer,
+                                        &retry,
+                                        remaining.min(Duration::from_secs(10)),
+                                    )
+                                    .await?;
+                                if !matches!(
+                                    retry.outcome,
+                                    super::bridge_protocol::BridgeRetireOutcome::Retired { .. }
+                                ) {
+                                    return Err(MobError::MemberRetirementInProgress {
+                                        member_id: member_identity.clone(),
+                                        stage: "peer_retirement_rotated_fence".to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    },
+                    Err(MobError::BridgeRequestTimedOut { .. }) => {
+                        return Err(MobError::MemberRetirementInProgress {
+                            member_id: member_identity.clone(),
+                            stage: "peer_retirement_reply".to_string(),
+                        });
+                    }
+                    Err(error) => return Err(error),
+                }
+                // Remote success is a partial effect. Finish the exact local
+                // idempotent projection even when the observation deadline has
+                // elapsed; the actor-side process-owned saga retains authority.
+                self.session
+                    .ops_adapter
+                    .mark_member_retired_if_bound(member_ref)
+                    .await?;
+                self.delete_exact_direct_member_binding(&binding).await?;
+                Ok(
+                    crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned,
+                )
+            }
+            _ => {
+                self.session
+                    .retire_member_until(member_ref, member_identity, deadline)
+                    .await
+            }
         }
     }
 
@@ -10093,8 +11664,8 @@ impl MobProvisioner for MultiBackendProvisioner {
         let MemberRef::BackendPeer {
             peer_id,
             address,
-            pubkey,
             bootstrap_token,
+            pubkey,
             session_id: None,
             ..
         } = member_ref
@@ -10119,6 +11690,7 @@ impl MobProvisioner for MultiBackendProvisioner {
             .await?;
         let report = PeerOnlyTrustReconcileReport {
             rebind_required: authorization.rebind_required,
+            direct_member_fence: authorization.direct_member_fence,
         };
         if report.rebind_required.is_some() {
             return Ok(report);
@@ -10151,6 +11723,62 @@ impl MobProvisioner for MultiBackendProvisioner {
                 .await?;
         }
         Ok(report)
+    }
+
+    async fn adopt_peer_only_direct_member(
+        &self,
+        member_ref: &MemberRef,
+        incarnation: super::bridge_protocol::BridgeDirectMemberIncarnation,
+    ) -> Result<super::bridge_protocol::BridgeDirectMemberFence, MobError> {
+        let MemberRef::BackendPeer {
+            peer_id,
+            address,
+            pubkey,
+            bootstrap_token,
+            session_id: None,
+            ..
+        } = member_ref
+        else {
+            return Err(MobError::UnsupportedForMode {
+                mode: crate::MobRuntimeMode::TurnDriven,
+                reason: "direct-member adoption requires a peer-only member".to_string(),
+            });
+        };
+        let persistence = self.binding_persistence.as_ref().ok_or_else(|| {
+            MobError::ExternalMemberCleanupUncertain {
+                reason: "V5 direct-member adoption has no durable binding store".to_string(),
+            }
+        })?;
+        let authority = persistence
+            .runtime_metadata
+            .load_supervisor_authority(&persistence.mob_id)
+            .await?
+            .ok_or_else(|| {
+                MobError::Internal(
+                    "direct-member adoption requires durable supervisor authority".to_string(),
+                )
+            })?;
+        if authority.protocol_version < super::bridge_protocol::BridgeProtocolVersion::V5 {
+            return Err(MobError::SupervisorProtocolUpgradeRequired {
+                operation: "adopt_peer_only_direct_member".to_string(),
+                current: authority.protocol_version,
+                required: super::bridge_protocol::BridgeProtocolVersion::V5,
+            });
+        }
+        let peer = self.peer_only_spec(member_ref).await?;
+        let (bind, _trust_install) = self
+            .bind_peer_only_member(
+                &peer,
+                peer_id,
+                address,
+                bootstrap_token
+                    .as_ref()
+                    .map(super::bridge_protocol::BridgeBootstrapToken::as_str),
+                incarnation.clone(),
+            )
+            .await?;
+        self.persist_adopted_direct_member_fence(member_ref, &incarnation, &bind)
+            .await
     }
 
     async fn interaction_event_injector(

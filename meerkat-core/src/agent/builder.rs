@@ -547,38 +547,39 @@ impl AgentBuilder {
 
         let budget = Budget::new(self.budget_limits.unwrap_or_default());
         let catalog_mode = select_tool_catalog_mode(tools.as_ref());
-        let (control_tool_names, deferred_tool_names) =
-            if tools.tool_catalog_capabilities().exact_catalog {
-                let catalog = tools.tool_catalog();
-                let control_names = catalog
+        let catalog_capabilities = tools.tool_catalog_capabilities();
+        let (control_tool_names, deferred_tool_names) = if catalog_capabilities.exact_catalog {
+            let catalog = tools.tool_catalog();
+            let control_names = catalog
+                .iter()
+                .filter(|entry| entry.plane == ToolPlaneClass::Control)
+                .map(|entry| entry.tool.name.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let deferred_names = if (!control_names.is_empty()
+                || catalog_capabilities.may_require_catalog_control_plane)
+                && matches!(catalog_mode, ToolCatalogMode::Deferred)
+            {
+                catalog
                     .iter()
-                    .filter(|entry| entry.plane == ToolPlaneClass::Control)
+                    .filter(|entry| entry.plane == ToolPlaneClass::Session)
+                    .filter(|entry| {
+                        matches!(
+                            entry.deferred_eligibility,
+                            ToolCatalogDeferredEligibility::DeferredEligible { .. }
+                        )
+                    })
                     .map(|entry| entry.tool.name.clone())
-                    .collect::<std::collections::HashSet<_>>();
-                let deferred_names = if !control_names.is_empty()
-                    && matches!(catalog_mode, ToolCatalogMode::Deferred)
-                {
-                    catalog
-                        .iter()
-                        .filter(|entry| entry.plane == ToolPlaneClass::Session)
-                        .filter(|entry| {
-                            matches!(
-                                entry.deferred_eligibility,
-                                ToolCatalogDeferredEligibility::DeferredEligible { .. }
-                            )
-                        })
-                        .map(|entry| entry.tool.name.clone())
-                        .collect()
-                } else {
-                    std::collections::HashSet::new()
-                };
-                (control_names, deferred_names)
+                    .collect()
             } else {
-                (
-                    std::collections::HashSet::new(),
-                    std::collections::HashSet::new(),
-                )
+                std::collections::HashSet::new()
             };
+            (control_names, deferred_names)
+        } else {
+            (
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            )
+        };
         let tool_scope = match tool_visibility_owner {
             Some(owner) => ToolScope::new_with_visibility_owner(
                 tools.tools(),
@@ -1132,6 +1133,13 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::mpsc;
 
+    fn normalized_test_usage(
+        client: &dyn AgentLlmClient,
+        usage: crate::types::Usage,
+    ) -> crate::types::Usage {
+        crate::TurnUsage::host_declared(client.provider(), client.model(), usage).into_inner()
+    }
+
     struct MockClient;
 
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -1151,7 +1159,7 @@ mod tests {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                crate::types::Usage::default(),
+                normalized_test_usage(self, crate::types::Usage::default()),
             ))
         }
 

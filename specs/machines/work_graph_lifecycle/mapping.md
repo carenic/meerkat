@@ -59,6 +59,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ReleaseInProgress`
   - anchors: `workgraph_lifecycle`
   - scenarios: `workgraph_claim_release_recovery`
+- `ObserveLeaseExpiryInProgress`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveReadinessOpen`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `BlockOpen`
   - anchors: `workgraph_lifecycle`
   - scenarios: `workgraph_create_update_ready_claim`, `workgraph_block_close_evidence`, `workgraph_topology_legality`
@@ -291,6 +297,27 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `ClassifyReadinessNotClaimableFailed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyChildJoinAbsent`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyChildJoinOpen`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyChildJoinInProgress`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyChildJoinBlocked`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyChildJoinCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyChildJoinCancelled`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyChildJoinFailed`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `ClassifyBlockerSatisfactionAbsent`
@@ -1000,6 +1027,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `Released`
   - anchors: `workgraph_lifecycle`
   - scenarios: `workgraph_claim_release_recovery`
+- `LeaseExpiryObserved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReadinessObserved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `Blocked`
   - anchors: `workgraph_lifecycle`
   - scenarios: `workgraph_create_update_ready_claim`, `workgraph_claim_release_recovery`, `workgraph_block_close_evidence`, `workgraph_topology_legality`
@@ -1043,6 +1076,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: `workgraph_lifecycle`
   - scenarios: (unclaimed)
 - `WorkItemReadinessClassified`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ChildJoinClassified`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 

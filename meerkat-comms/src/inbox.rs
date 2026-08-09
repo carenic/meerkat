@@ -17,7 +17,9 @@ use tokio::sync::{Notify, oneshot};
 use crate::classify::{IngressClassificationContext, PeerCommsHandleSlot, PreparedIngressItem};
 use crate::peer_types::PeerIngressState;
 use crate::trust::TrustStore;
-use crate::types::{Envelope, InboxItem};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::types::Envelope;
+use crate::types::InboxItem;
 use meerkat_core::{
     InteractionId, PeerIngressAdmissionDiagnostic, PeerIngressAuthDecision,
     PeerIngressDeliveryContract, PeerIngressDequeueAuthority, PeerIngressDequeueFacts,
@@ -162,6 +164,7 @@ struct ClassifiedInboxQueue {
     capacity_notify: Arc<Notify>,
     ingress_notify: Arc<Notify>,
     outstanding_claim: Option<OutstandingClaim>,
+    claim_acquired_count: u64,
     handed_off_count: u64,
     durably_admitted_count: u64,
     runtime_handover_count: u64,
@@ -237,6 +240,7 @@ impl ClassifiedInboxQueue {
             capacity_notify: Arc::new(Notify::new()),
             ingress_notify,
             outstanding_claim: None,
+            claim_acquired_count: 0,
             handed_off_count: 0,
             durably_admitted_count: 0,
             runtime_handover_count: 0,
@@ -436,6 +440,7 @@ impl ClassifiedInboxQueue {
         }
     }
 
+    #[cfg(test)]
     fn drain_volatile(&mut self) -> Vec<ClassifiedInboxEntry> {
         if self.outstanding_claim.is_some() {
             return Vec::new();
@@ -451,6 +456,7 @@ impl ClassifiedInboxQueue {
         drained
     }
 
+    #[cfg(test)]
     fn pop_front_volatile(&mut self) -> Option<ClassifiedInboxEntry> {
         if self.outstanding_claim.is_some()
             || self.entries.front()?.delivery_contract
@@ -460,6 +466,7 @@ impl ClassifiedInboxQueue {
         }
         let entry = self.entries.pop_front();
         if let Some(entry_ref) = entry.as_ref() {
+            self.handed_off_count = self.handed_off_count.saturating_add(1);
             self.note_peer_dequeue(entry_ref);
             self.capacity_notify.notify_one();
             if let Some(completion) = &entry_ref.ingress_completion {
@@ -481,7 +488,7 @@ impl ClassifiedInboxQueue {
             claimed_at: std::time::Instant::now(),
         };
         self.outstanding_claim = Some(claim);
-        self.handed_off_count = self.handed_off_count.saturating_add(1);
+        self.claim_acquired_count = self.claim_acquired_count.saturating_add(1);
         Some((claim, entry))
     }
 
@@ -541,6 +548,7 @@ impl ClassifiedInboxQueue {
             .entries
             .pop_front()
             .ok_or(meerkat_core::interaction::PeerIngressClaimCommitError::HeadMismatch)?;
+        self.handed_off_count = self.handed_off_count.saturating_add(1);
         self.outstanding_claim = None;
         self.note_peer_dequeue(&entry);
         self.capacity_notify.notify_one();
@@ -620,6 +628,7 @@ impl ClassifiedInboxQueue {
             .entries
             .pop_front()
             .ok_or(meerkat_core::interaction::PeerIngressClaimCommitError::HeadMismatch)?;
+        self.handed_off_count = self.handed_off_count.saturating_add(1);
         self.outstanding_claim = None;
         self.note_peer_dequeue(&entry);
         self.capacity_notify.notify_one();
@@ -697,6 +706,7 @@ impl ClassifiedInboxQueue {
                     age: claim.claimed_at.elapsed(),
                 }
             }),
+            claim_acquired_count: self.claim_acquired_count,
             handed_off_count: self.handed_off_count,
             durably_admitted_count: self.durably_admitted_count,
             runtime_handover_count: self.runtime_handover_count,
@@ -706,9 +716,8 @@ impl ClassifiedInboxQueue {
         }
     }
 
-    fn runtime_snapshot(&self) -> (PeerIngressQueueSnapshot, PeerIngressState, usize) {
-        let queue_len = self.entries.len();
-        (self.snapshot(), self.phase, queue_len)
+    fn runtime_snapshot(&self) -> (PeerIngressQueueSnapshot, PeerIngressState) {
+        (self.snapshot(), self.phase)
     }
 }
 
@@ -777,7 +786,7 @@ impl Inbox {
     /// no delivery queue: sending semantic `InboxItem`s through the public
     /// sender fails closed. Runtime peer/event ingress must use
     /// [`Self::new_classified`] with an installed machine handle.
-    pub fn new() -> (Self, InboxSender) {
+    pub fn new_transport_only() -> (Self, InboxSender) {
         let notify = Arc::new(Notify::new());
         (
             Inbox {
@@ -857,6 +866,7 @@ impl Inbox {
     /// Try to drain the contiguous volatile-control prefix without blocking.
     /// Durable runtime entries are never removed through this legacy control
     /// seam and an outstanding exact claim blocks destructive handoff.
+    #[cfg(test)]
     pub(crate) fn try_drain_classified(&mut self) -> Vec<ClassifiedInboxEntry> {
         self.classified_queue
             .as_ref()
@@ -865,6 +875,7 @@ impl Inbox {
     }
 
     /// Try to receive one volatile-control entry without blocking.
+    #[cfg(test)]
     pub(crate) fn try_recv_one_classified(&mut self) -> Option<ClassifiedInboxEntry> {
         self.classified_queue.as_ref()?.lock().pop_front_volatile()
     }
@@ -905,7 +916,7 @@ impl Inbox {
 
     pub(crate) fn peer_runtime_snapshot(
         &self,
-    ) -> Option<(PeerIngressQueueSnapshot, PeerIngressState, usize)> {
+    ) -> Option<(PeerIngressQueueSnapshot, PeerIngressState)> {
         self.classified_queue
             .as_ref()
             .map(|queue| queue.lock().runtime_snapshot())
@@ -1008,6 +1019,7 @@ impl InboxSender {
     /// transport task. Classified runtimes route through `send_classified()`;
     /// raw inboxes are transport-only and cannot assert semantic peer ingress
     /// admission without machine authority.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn send_connection_ingress(
         &self,
         envelope: Envelope,
@@ -1029,6 +1041,7 @@ impl InboxSender {
     /// Admit a connection envelope, then wait until its exact queue claim is
     /// either durably resolved by runtime admission or explicitly handed to a
     /// volatile control consumer.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn send_connection_ingress_for_delivery(
         &self,
         envelope: Envelope,
@@ -1311,6 +1324,7 @@ impl InboxSender {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn send_classified_for_delivery(
         &self,
         item: InboxItem,
@@ -1471,21 +1485,21 @@ mod tests {
 
     #[test]
     fn test_inbox_struct() {
-        let (inbox, _sender) = Inbox::new();
+        let (inbox, _sender) = Inbox::new_transport_only();
         // Inbox exists and has the receiver
         drop(inbox);
     }
 
     #[test]
     fn test_inbox_sender_struct() {
-        let (_inbox, sender) = Inbox::new();
+        let (_inbox, sender) = Inbox::new_transport_only();
         // Sender exists and can be cloned
         let _sender2 = sender;
     }
 
     #[test]
     fn test_inbox_new() {
-        let (inbox, sender) = Inbox::new();
+        let (inbox, sender) = Inbox::new_transport_only();
         // Both parts exist
         drop(inbox);
         drop(sender);
@@ -1493,7 +1507,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_raw_inbox_sender_send_fails_closed_without_machine_context() {
-        let (_inbox, sender) = Inbox::new();
+        let (_inbox, sender) = Inbox::new_transport_only();
         let item = InboxItem::External {
             envelope: make_test_envelope(),
         };
@@ -1508,7 +1522,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_raw_inbox_repeated_sends_fail_closed() {
-        let (_inbox, sender) = Inbox::new();
+        let (_inbox, sender) = Inbox::new_transport_only();
 
         // Raw inboxes cannot classify semantic peer ingress without machine authority.
         for i in 0..3 {
@@ -1525,7 +1539,7 @@ mod tests {
 
     #[test]
     fn test_sender_error_on_closed_inbox() {
-        let (inbox, sender) = Inbox::new();
+        let (inbox, sender) = Inbox::new_transport_only();
         drop(inbox); // Close the inbox
 
         let result = sender.send(InboxItem::External {
@@ -1565,7 +1579,7 @@ mod tests {
 
     #[test]
     fn test_inbox_has_notify() {
-        let (inbox, _sender) = Inbox::new();
+        let (inbox, _sender) = Inbox::new_transport_only();
         // Inbox should expose a Notify
         let notify = inbox.notify();
         // Arc should be clonable
@@ -1574,7 +1588,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_raw_sender_does_not_notify_after_rejected_send() {
-        let (inbox, sender) = Inbox::new();
+        let (inbox, sender) = Inbox::new_transport_only();
         let notify = inbox.notify();
 
         // Spawn a task that waits for notification
@@ -1600,7 +1614,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_raw_rejected_send_does_not_wake_waiting_task() {
-        let (inbox, sender) = Inbox::new();
+        let (inbox, sender) = Inbox::new_transport_only();
         let notify = inbox.notify();
 
         // Spawn a task that waits for notification
@@ -2783,6 +2797,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn test_raw_connection_ingress_rejects_untrusted_bridge_without_machine_authority() {
         // Raw transport ingress is not a classification authority. Without the
@@ -2790,7 +2805,7 @@ mod tests {
         // auth exemption from a local compatibility path.
         let receiver = crate::identity::Keypair::generate();
         let sender = crate::identity::Keypair::generate();
-        let (_inbox, inbox_sender) = Inbox::new();
+        let (_inbox, inbox_sender) = Inbox::new_transport_only();
 
         let mut envelope = Envelope {
             id: Uuid::new_v4(),

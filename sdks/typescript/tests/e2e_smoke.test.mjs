@@ -4,59 +4,13 @@
 
 import { afterEach, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execSync } from "node:child_process";
-import { existsSync, mkdtempSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { resolveRequiredSmokeBinary } from "./support/required_smoke_binary.mjs";
 
-const workspaceRoot = path.resolve(
-  path.dirname(new URL(import.meta.url).pathname),
-  "..",
-  "..",
-  "..",
-);
-
-const candidateBinaries = [
-  (() => {
-    try {
-      const envOutput = execSync("./scripts/repo-cargo --print-env", {
-        cwd: workspaceRoot,
-        encoding: "utf8",
-      });
-      const targetDir = envOutput
-        .split("\n")
-        .find((line) => line.startsWith("CARGO_TARGET_DIR="))
-        ?.slice("CARGO_TARGET_DIR=".length);
-      return targetDir ? path.join(targetDir, "debug", "rkat-rpc") : "";
-    } catch {
-      return "";
-    }
-  })(),
-  path.join(workspaceRoot, "target", "debug", "rkat-rpc"),
-  path.join(workspaceRoot, "target-codex", "debug", "rkat-rpc"),
-];
-
-const binaryPath = (() => {
-  const override = process.env.MEERKAT_BIN_PATH || process.env.MEERKAT_RPC_BINARY;
-  if (override) {
-    return override;
-  }
-  for (const candidate of candidateBinaries) {
-    if (existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  try {
-    return execSync("which rkat-rpc", { encoding: "utf8" }).trim();
-  } catch {
-    try {
-      return execSync("which rkat", { encoding: "utf8" }).trim();
-    } catch {
-      return "";
-    }
-  }
-})();
+const binaryPath = resolveRequiredSmokeBinary();
 
 function hasAnthropicKey() {
   return Boolean(
@@ -204,7 +158,7 @@ async function assertFetchableImageBlob(client, block) {
   assert.ok(payload.dataBase64.length > 1024);
 }
 
-describe("Live Smoke: TypeScript SDK", { skip: !binaryPath }, () => {
+describe("Live Smoke: TypeScript SDK", () => {
   let MeerkatClient;
   let MeerkatError;
   const clients = [];

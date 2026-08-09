@@ -12,7 +12,7 @@ use crate::compact::{
 use crate::event::AgentEvent;
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
-use crate::types::{AssistantBlock, Message, Usage};
+use crate::types::{AssistantBlock, Message, TurnUsage, Usage};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -42,6 +42,31 @@ pub enum CompactionError {
     InvalidRebuild(String),
 }
 
+fn validated_compaction_summary_usage(
+    usage: Usage,
+    active_provider: crate::Provider,
+    active_model: &str,
+) -> Result<TurnUsage, CompactionError> {
+    let turn_usage = TurnUsage::try_from_usage(usage).map_err(|error| {
+        CompactionError::LlmFailed(crate::error::AgentError::llm(
+            active_provider.as_str(),
+            crate::error::LlmFailureReason::ProviderError(
+                crate::error::LlmProviderError::non_retryable(
+                    crate::error::LlmProviderErrorKind::IncompleteResponse,
+                    serde_json::json!({
+                        "reason": "normalized_provider_accounting_unavailable",
+                        "model": active_model,
+                    }),
+                ),
+            ),
+            error.to_string(),
+        ))
+    })?;
+    super::validate_provider_turn_usage_identity(&turn_usage, active_provider, active_model)
+        .map_err(CompactionError::LlmFailed)?;
+    Ok(turn_usage)
+}
+
 fn checked_offset(kind: &str, offset: u64, upper_bound: usize) -> Result<usize, CompactionError> {
     let offset = usize::try_from(offset).map_err(|_| {
         CompactionError::InvalidRebuild(format!("{kind} offset {offset} does not fit this target"))
@@ -67,6 +92,8 @@ fn validate_compaction_rebuild(
         Retained,
         Discarded,
     }
+
+    let superseded_system_prompts = crate::types::superseded_system_prompt_offsets(messages);
 
     if discarded.is_empty() {
         return Err(CompactionError::InvalidRebuild(
@@ -200,17 +227,23 @@ fn validate_compaction_rebuild(
         if !matches!(message, Message::System(_)) {
             continue;
         }
+        let must_retain = !superseded_system_prompts.contains(&source_offset);
         let source_offset = u64::try_from(source_offset).map_err(|_| {
             CompactionError::InvalidRebuild(
                 "source System offset exceeds the compaction mapping range".to_string(),
             )
         })?;
-        if !retained
+        let was_retained = retained
             .iter()
-            .any(|retention| retention.source_offset == source_offset)
-        {
+            .any(|retention| retention.source_offset == source_offset);
+        if must_retain && !was_retained {
             return Err(CompactionError::InvalidRebuild(format!(
-                "ordered System message at source offset {source_offset} must be retained verbatim"
+                "active ordered System message at source offset {source_offset} must be retained verbatim"
+            )));
+        }
+        if !must_retain && was_retained {
+            return Err(CompactionError::InvalidRebuild(format!(
+                "superseded versioned System message at source offset {source_offset} must be discarded"
             )));
         }
     }
@@ -559,6 +592,10 @@ fn is_compaction_capacity_error(error: &crate::error::AgentError) -> bool {
 }
 
 pub(crate) struct CompactionInvocation<'a> {
+    /// Exact model-facing projection. Superseded prompt versions remain in
+    /// the durable `window` for rewrite validation but never enter forecasts
+    /// or the summarization request.
+    pub(crate) model_messages: &'a [Message],
     pub(crate) window: CompactionWindow<'a>,
     pub(crate) request_pressure: Option<crate::ProviderRequestPressure>,
     pub(crate) parent_revision: String,
@@ -576,6 +613,7 @@ where
     C: crate::agent::AgentLlmClient + ?Sized,
 {
     let CompactionInvocation {
+        model_messages,
         window,
         request_pressure,
         parent_revision,
@@ -585,8 +623,8 @@ where
         last_input_tokens,
         session_boundary_index,
     } = window;
-    let estimated = estimate_tokens(messages)?;
-    let message_count = messages.len();
+    let estimated = estimate_tokens(model_messages)?;
+    let message_count = model_messages.len();
     let mut event_stream_open = true;
 
     // 1. Emit CompactionStarted
@@ -611,12 +649,19 @@ where
     // curator failure is terminal for this compaction attempt (no fallback).
     let (summary_text, summary_usage) = if let Some(curator) = curator {
         let curator_window = CompactionWindow {
-            messages,
+            messages: model_messages,
             last_input_tokens,
             session_boundary_index,
         };
         match curator.curate_summary(curator_window).await {
-            Ok(summary) => (summary.into_string(), Usage::default()),
+            Ok(summary) => (
+                summary.into_string(),
+                TurnUsage::host_declared(
+                    crate::Provider::Other,
+                    "host-compaction-curator",
+                    Usage::default(),
+                ),
+            ),
             Err(e) => {
                 if event_stream_open
                     && !crate::event_tap::tap_emit(
@@ -642,7 +687,7 @@ where
         let compaction_prompt = compactor.compaction_prompt();
         let max_summary_tokens = compactor.max_summary_tokens();
 
-        let mut compaction_messages = compactor.prepare_for_summarization(messages);
+        let mut compaction_messages = compactor.prepare_for_summarization(model_messages);
         compaction_messages.push(Message::User(crate::types::UserMessage::text(
             compaction_prompt.to_string(),
         )));
@@ -678,7 +723,12 @@ where
                     }
                     return Err(CompactionError::EmptySummary);
                 }
-                (summary, result.usage().clone())
+                let usage = validated_compaction_summary_usage(
+                    result.usage().clone(),
+                    client.provider(),
+                    client.model(),
+                )?;
+                (summary, usage)
             }
             Err(e) if is_compaction_capacity_error(&e) => {
                 tracing::warn!(
@@ -687,7 +737,14 @@ where
                     estimated_history_tokens = estimated,
                     "compaction summary request exceeded provider capacity; using mechanical progress fallback"
                 );
-                (MECHANICAL_CAPACITY_SUMMARY.to_string(), Usage::default())
+                (
+                    MECHANICAL_CAPACITY_SUMMARY.to_string(),
+                    TurnUsage::host_declared(
+                        crate::Provider::Other,
+                        "mechanical-compaction-fallback",
+                        Usage::default(),
+                    ),
+                )
             }
             Err(e) => {
                 if event_stream_open
@@ -865,7 +922,7 @@ pub struct CompactionOutcome {
     /// Messages that were discarded (for future memory indexing).
     pub discarded: Vec<CompactionDiscard>,
     /// Usage from the summary LLM call.
-    pub summary_usage: Usage,
+    pub summary_usage: TurnUsage,
     /// Session boundary index at which compaction occurred.
     pub session_boundary_index: u64,
     /// Number of messages before compaction.
@@ -893,6 +950,44 @@ mod tests {
         (message, mapping)
     }
 
+    fn assert_compaction_usage_identity_rejected(usage: Usage) {
+        let error =
+            validated_compaction_summary_usage(usage, crate::Provider::OpenAI, "active-model")
+                .expect_err("compaction usage with a foreign identity must fail closed");
+        assert!(matches!(
+            error,
+            CompactionError::LlmFailed(crate::error::AgentError::Llm {
+                reason: crate::error::LlmFailureReason::ProviderError(ref provider_error),
+                ..
+            }) if provider_error.kind == crate::error::LlmProviderErrorKind::IncompleteResponse
+        ));
+    }
+
+    #[test]
+    fn compaction_summary_usage_rejects_wrong_provider() {
+        assert_compaction_usage_identity_rejected(Usage {
+            input_tokens: 5,
+            output_tokens: 1,
+            provider_accounting: Some(crate::ProviderTokenAccounting::anthropic(
+                "active-model",
+                5,
+                0,
+                0,
+            )),
+            ..Usage::default()
+        });
+    }
+
+    #[test]
+    fn compaction_summary_usage_rejects_same_provider_wrong_model() {
+        assert_compaction_usage_identity_rejected(Usage {
+            input_tokens: 5,
+            output_tokens: 1,
+            provider_accounting: Some(crate::ProviderTokenAccounting::openai("wrong-model", 5)),
+            ..Usage::default()
+        });
+    }
+
     #[test]
     fn load_compaction_cadence_infers_boundary_count_from_existing_history() {
         let mut session = Session::new();
@@ -912,7 +1007,7 @@ mod tests {
             }],
             StopReason::EndTurn,
         )));
-        session.record_usage(Usage::default());
+        session.record_cumulative_usage(Usage::default());
 
         let cadence = load_compaction_cadence(&mut session).unwrap();
         assert_eq!(cadence.session_boundary_index, 2);

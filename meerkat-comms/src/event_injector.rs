@@ -413,7 +413,7 @@ mod tests {
         use meerkat_core::event_injector::SubscribableInjector;
 
         let registry = new_subscriber_registry();
-        let (inbox, sender) = Inbox::new();
+        let (inbox, sender) = Inbox::new_transport_only();
         drop(inbox); // close receiver
 
         let injector = CommsEventInjector::new(sender, registry.clone());

@@ -370,10 +370,6 @@ mod tests {
 
     #[async_trait]
     impl CommsRuntime for RecordingCommsRuntime {
-        async fn drain_messages(&self) -> Vec<String> {
-            Vec::new()
-        }
-
         fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
             Arc::new(tokio::sync::Notify::new())
         }
@@ -447,7 +443,6 @@ mod tests {
                 auth_required: true,
                 authority_phase: PeerIngressAuthorityPhase::Received,
                 trusted_peers,
-                submission_queue_len: 0,
                 queue: PeerIngressQueueSnapshot::default(),
             })
         }

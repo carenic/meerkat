@@ -24,6 +24,7 @@ use std::sync::RwLock as StdRwLock;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Mutex as StdMutex, OnceLock, Weak};
 
+use futures::FutureExt as _;
 use meerkat_core::lifecycle::{InputId, RunId};
 use meerkat_core::time_compat::Instant;
 use meerkat_core::tool_scope::ToolScopeTurnOverlay;
@@ -1348,6 +1349,11 @@ struct RuntimeSessionEntry {
     /// that run before the runtime loop attachment is published.
     provisional_interrupt_handle:
         Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorInterruptHandle>>,
+    /// Exact process-owned hard-interrupt dispatch. Same-run retries join this
+    /// result instead of spawning duplicate callbacks against a wedged custom
+    /// executor. Cold restart drops this process-local slot and reissues from
+    /// durable run/lifecycle authority.
+    pending_user_interrupt_dispatch: Option<PendingUserInterruptDispatch>,
     /// Exact prepared-materialization transaction that installed the
     /// provisional interrupt/cleanup pair. A stale binding cannot replace or
     /// clear another transaction's provisional ownership.
@@ -1381,9 +1387,21 @@ struct MemberIncarnationRegistration {
     tracked_turn_journal: Option<Arc<dyn crate::member_observation::TrackedTurnJournal>>,
 }
 
+#[derive(Clone)]
+struct DirectMemberIncarnationRegistration {
+    fence: meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence,
+    runtime_epoch_id: meerkat_core::RuntimeEpochId,
+    session_mutation_gate: Arc<Mutex<()>>,
+}
+
 enum MemberResidencyState {
     /// Ordinary runtime session with no host-placement authority.
-    PeerOnly,
+    PeerOnly {
+        /// Exact controller-member authority installed by V5 `BindMember`.
+        /// This remains under the stable residency slot so successor binds and
+        /// retire validation share one serialization boundary.
+        direct_member: Option<DirectMemberIncarnationRegistration>,
+    },
     /// A host-owned session id whose placed incarnation is absent, released,
     /// or in cutover. This must never be treated as peer-only.
     VacantPlaced,
@@ -1411,6 +1429,21 @@ pub(crate) struct MemberEffectAuthorityGuard {
     _session_guard: crate::tokio::sync::OwnedMutexGuard<()>,
 }
 
+#[derive(Debug)]
+pub(crate) enum DirectMemberRetireError {
+    Stale {
+        current:
+            Option<meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFenceEvidence>,
+    },
+    Runtime(crate::traits::RuntimeControlPlaneError),
+}
+
+impl From<crate::traits::RuntimeControlPlaneError> for DirectMemberRetireError {
+    fn from(error: crate::traits::RuntimeControlPlaneError) -> Self {
+        Self::Runtime(error)
+    }
+}
+
 /// Exact residency plus registration-stability interval for member-live work.
 ///
 /// Unlike an ordinary member effect, member-live operations call back into
@@ -1428,7 +1461,9 @@ impl MemberResidencySlot {
     fn peer_only() -> Self {
         Self {
             gate: Arc::new(Mutex::new(())),
-            state: StdRwLock::new(MemberResidencyState::PeerOnly),
+            state: StdRwLock::new(MemberResidencyState::PeerOnly {
+                direct_member: None,
+            }),
         }
     }
 }
@@ -1911,6 +1946,21 @@ static MACHINE_CLEANUP_RUNTIME: OnceLock<StdMutex<Option<crate::tokio::runtime::
 #[cfg(not(target_arch = "wasm32"))]
 const MACHINE_CLEANUP_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 
+/// A durability-degradation caller must observe its canonical repair-blocked
+/// result even when a public custom interrupt handle never completes. The
+/// exact process-owned callback continues after this acknowledgement budget.
+#[cfg(test)]
+const DURABILITY_DEGRADATION_INTERRUPT_ACK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(100);
+#[cfg(not(test))]
+const DURABILITY_DEGRADATION_INTERRUPT_ACK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+#[cfg(test)]
+const DIRECT_MEMBER_BIND_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(not(test))]
+const DIRECT_MEMBER_BIND_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Cloneable proof that cancellation-safe machine cleanup can be dispatched.
 ///
 /// Every RAII owner with asynchronous cleanup acquires and stores this before
@@ -1921,6 +1971,40 @@ const MACHINE_CLEANUP_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 struct MachineCleanupTaskSpawner {
     #[cfg(not(target_arch = "wasm32"))]
     handle: crate::tokio::runtime::Handle,
+}
+
+/// One process-owned convergence attempt for the exact durable runless
+/// terminal carriers attached to a single driver incarnation.
+///
+/// The map entry is installed while that incarnation still owns M. The task
+/// starts only after its caller releases every session/registration guard, so
+/// arbitrary publication code cannot wedge replacement. Same-process retries
+/// join `result_rx`; a cold machine has no process slot and reissues solely
+/// from the durable outbox.
+struct PendingRunlessTerminalPublicationDispatch {
+    dispatch_id: uuid::Uuid,
+    driver: SharedDriver,
+    mutation_gate: Arc<Mutex<()>>,
+    requested_generation: u64,
+    result_rx: crate::tokio::sync::watch::Receiver<Option<Result<(), RuntimeDriverError>>>,
+}
+
+struct PendingSessionArchiveLeasePreparation {
+    preparation_id: uuid::Uuid,
+    completion_rx: crate::tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+}
+
+struct PendingDirectMemberBindAdmission {
+    admission_id: uuid::Uuid,
+    requested: meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+    completion_rx: crate::tokio::sync::watch::Receiver<
+        Option<
+            Result<
+                meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence,
+                RuntimeDriverError,
+            >,
+        >,
+    >,
 }
 
 /// Process-lifetime cleanup dispatcher for surface transactions that must
@@ -2538,15 +2622,14 @@ impl PendingRuntimeExecutorAttachment {
         })?
     }
 
-    /// Abort while the caller owns the stable session turn boundary. The
-    /// stored attachment-local cleanup handle is completed through its
-    /// non-reentrant variant before the exact unregister saga runs.
+    /// Abort while the caller owns the stable session turn boundary.
+    ///
+    /// The exact mutation guard is transferred to the process-owned unregister
+    /// saga. This method returns after handoff so arbitrary post-stop cleanup
+    /// runs only after the caller releases B and cannot wedge that caller.
     pub async fn abort_under_runtime_turn_finalization_boundary(
         mut self,
     ) -> Result<(), RuntimeDriverError> {
-        self.machine
-            .complete_executor_attachment_cleanup_under_runtime_turn_boundary(&self.witness)
-            .await?;
         let guard = self.mutation_guard.take().ok_or_else(|| {
             RuntimeDriverError::Internal(
                 "pending runtime attachment lost its mutation fence before boundary-owned abort"
@@ -2555,17 +2638,20 @@ impl PendingRuntimeExecutorAttachment {
         })?;
         let machine = Arc::clone(&self.machine);
         let witness = self.witness.clone();
-        let completion = self.cleanup_spawner.spawn(async move {
-            machine
-                .abort_pending_executor_attachment(witness, guard)
+        self.cleanup_spawner.spawn(async move {
+            if let Err(error) = machine
+                .abort_pending_executor_attachment(witness.clone(), guard)
                 .await
+            {
+                tracing::warn!(
+                    session_id = %witness.session_id(),
+                    %error,
+                    "process-owned boundary-aware pending attachment abort failed"
+                );
+            }
         });
         self.armed = false;
-        completion.await.map_err(|error| {
-            RuntimeDriverError::Internal(format!(
-                "owned boundary-aware runtime attachment abort ended without a result: {error}"
-            ))
-        })?
+        Ok(())
     }
 }
 
@@ -2933,6 +3019,68 @@ impl PreparedAttachedSessionActorRecovery {
 
     pub fn witness(&self) -> &RuntimeExecutorAttachmentWitness {
         &self.witness
+    }
+
+    /// Replace the retained terminal-publication capability for the actor
+    /// reconstructed under this exact serving attachment.
+    ///
+    /// Publication handles deliberately snapshot one service-actor
+    /// incarnation. Actor-only recovery therefore has to install B's handle
+    /// while this lease still holds the attachment's M; an already-issued A
+    /// handle must remain fenced to A and can only fail closed after A is
+    /// revoked. The durable outbox then retries through the newly retained B
+    /// handle without resolving a live actor by logical session id.
+    pub async fn replace_publication_handle_for_recovered_actor(
+        &self,
+        publication_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+    ) -> Result<(), RuntimeDriverError> {
+        if !self.armed || self.mutation_guard.is_none() {
+            return Err(RuntimeDriverError::StaleAuthority {
+                reason: "attached actor-recovery lease is no longer active".to_string(),
+            });
+        }
+        let machine =
+            self.witness
+                .machine
+                .upgrade()
+                .ok_or_else(|| RuntimeDriverError::StaleAuthority {
+                    reason: "attached actor-recovery machine no longer exists".to_string(),
+                })?;
+        let mut sessions = machine.sessions.write().await;
+        let entry =
+            sessions
+                .get_mut(self.witness.session_id())
+                .ok_or(RuntimeDriverError::NotReady {
+                    state: RuntimeState::Destroyed,
+                })?;
+        let exact_attachment = entry.epoch_id == self.witness.epoch_id
+            && Arc::ptr_eq(&entry.materialization_claim_state, &self.claim_state)
+            && entry.generated_executor_registration_active()
+            && matches!(
+                &entry.attachment_slot,
+                RuntimeLoopAttachmentSlot::Attached(attachment)
+                    if attachment.id == self.witness.attachment_id
+                        && !attachment.wake_tx.is_closed()
+                        && !attachment.effect_tx.is_closed()
+            );
+        let exact_actor_commit = self
+            .claim_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .exact_claim_is(
+                self.claim_id,
+                &[crate::RuntimeActorMaterializationClaimPhase::ActorMaterializedPendingCommit],
+            );
+        if !exact_attachment || !exact_actor_commit {
+            return Err(RuntimeDriverError::StaleAuthority {
+                reason: format!(
+                    "actor recovery for session {} lost its exact attachment before publication capability replacement",
+                    self.bindings.session_id()
+                ),
+            });
+        }
+        entry.publication_handle = Some(publication_handle);
+        Ok(())
     }
 
     /// Commit successful actor reconstruction while preserving the same exact
@@ -3675,6 +3823,13 @@ impl MachineSessionArchiveLease {
     pub async fn runtime_is_retired(&self) -> bool {
         self.runtime_state().await == RuntimeState::Retired
     }
+
+    /// Whether this exact runtime attachment supplied a live publication
+    /// capability. Archive must not invoke that public callback while this
+    /// lease still owns the session mutation gate.
+    pub fn has_attached_publication_handle(&self) -> bool {
+        self.publication_handle.is_some()
+    }
 }
 
 /// Capability bundle for an attached runtime loop.
@@ -3821,6 +3976,16 @@ struct RuntimeLoopAttachment {
     boundary_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorBoundaryHandle>>,
     interrupt_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorInterruptHandle>>,
     loop_handle: tokio::task::JoinHandle<()>,
+}
+
+struct PendingUserInterruptDispatch {
+    dispatch_id: uuid::Uuid,
+    expected_run_id: RunId,
+    attachment_id: Option<RuntimeLoopAttachmentId>,
+    provisional_materialization_claim_id: Option<uuid::Uuid>,
+    interrupt_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorInterruptHandle>,
+    expected_member: Option<meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation>,
+    result_rx: crate::tokio::sync::watch::Receiver<Option<Result<bool, RuntimeDriverError>>>,
 }
 
 /// Mechanical runtime-loop channel slot.
@@ -4374,7 +4539,13 @@ impl MeerkatMachine {
                 },
             )?;
             let gate_guard = Arc::clone(&gate).lock_owned().await;
-            let (reload_required, interrupt_handle, detached_attachment) = {
+            let (
+                reload_required,
+                interrupt_handle,
+                expected_run_id,
+                detached_attachment,
+                cleanup_spawner,
+            ) = {
                 let mut sessions = self.sessions.write().await;
                 let entry = sessions
                     .get_mut(session_id)
@@ -4388,9 +4559,52 @@ impl MeerkatMachine {
                     Ok(()) => return Ok(gate_guard),
                     Err(reload_required) => {
                         let interrupt_handle = entry.interrupt_handle();
+                        let expected_run_id = entry
+                            .dsl_authority
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .state()
+                            .current_run_id
+                            .as_ref()
+                            .and_then(
+                                crate::meerkat_machine::dsl_authority::current_run_id_from_dsl,
+                            );
+                        // Acquire process-owned execution before consuming the
+                        // entry-local handle/attachment authority. A runtime
+                        // setup failure leaves that authority installed for a
+                        // later degraded retry instead of orphaning it.
+                        let cleanup_spawner = match (&interrupt_handle, &expected_run_id) {
+                            (Some(_), Some(_)) => match MachineCleanupTaskSpawner::acquire() {
+                                Ok(cleanup_spawner) => Some(cleanup_spawner),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %session_id,
+                                        operation = reload_required.operation(),
+                                        reason = reload_required.reason(),
+                                        %error,
+                                        "could not acquire process-owned durability-degradation interrupt dispatcher; exact attachment retained for retry"
+                                    );
+                                    return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                                        evidence_digest: None,
+                                        reason: reload_required.to_string(),
+                                    });
+                                }
+                            },
+                            _ => None,
+                        };
                         let detached_attachment = entry.take_runtime_loop_attachment();
+                        // Consume every entry-local interrupt source under M.
+                        // This is the dedup handoff: later degraded callers
+                        // see no handle and cannot spawn a second callback for
+                        // the same exact attachment/run.
                         entry.provisional_interrupt_handle = None;
-                        (reload_required, interrupt_handle, detached_attachment)
+                        (
+                            reload_required,
+                            interrupt_handle,
+                            expected_run_id,
+                            detached_attachment,
+                            cleanup_spawner,
+                        )
                     }
                 }
             };
@@ -4403,22 +4617,85 @@ impl MeerkatMachine {
             // interrupt callback: actor cancellation may itself need to finish
             // a machine-owned terminal callback.
             drop(gate_guard);
-            if let Some(interrupt_handle) = interrupt_handle
-                && let Err(error) = interrupt_handle
-                    .hard_cancel_current_run(format!(
-                        "durability reload required after `{}`: {}",
-                        reload_required.operation(),
-                        reload_required.reason()
-                    ))
-                    .await
+            if let (Some(interrupt_handle), Some(expected_run_id), Some(cleanup_spawner)) =
+                (interrupt_handle, expected_run_id, cleanup_spawner)
             {
-                tracing::warn!(
-                    %session_id,
-                    operation = reload_required.operation(),
-                    reason = reload_required.reason(),
-                    %error,
-                    "failed to hard-cancel executor after durability degradation"
+                let reason = format!(
+                    "durability reload required after `{}`: {}",
+                    reload_required.operation(),
+                    reload_required.reason()
                 );
+                let (ack_tx, ack_rx) = crate::tokio::sync::oneshot::channel();
+                cleanup_spawner.spawn(async move {
+                    let mut first_ack = Some(ack_tx);
+                    let mut retry_delay = std::time::Duration::from_millis(100);
+                    loop {
+                        let result = match std::panic::AssertUnwindSafe(
+                            interrupt_handle
+                                .hard_cancel_run_if_current(&expected_run_id, reason.clone()),
+                        )
+                        .catch_unwind()
+                        .await
+                        {
+                            Ok(Ok(delivered)) => Ok(delivered),
+                            Ok(Err(error)) => Err(format!(
+                                "exact durability-degradation interrupt failed: {error}"
+                            )),
+                            Err(payload) => Err(format!(
+                                "exact durability-degradation interrupt panicked: {}",
+                                meerkat_core::panic_payload::panic_payload_detail(payload.as_ref())
+                            )),
+                        };
+                        if let Some(ack_tx) = first_ack.take() {
+                            let _ = ack_tx.send(result.clone());
+                        }
+                        if result.is_ok() {
+                            break;
+                        }
+                        // ReloadRequired remains the durable shell authority
+                        // while this exact handle/run pair retries
+                        // process-owned. No successor can be admitted through
+                        // the degraded entry.
+                        crate::tokio::time::sleep(retry_delay).await;
+                        retry_delay = retry_delay
+                            .saturating_mul(2)
+                            .min(std::time::Duration::from_secs(5));
+                    }
+                });
+                match crate::tokio::time::timeout(
+                    DURABILITY_DEGRADATION_INTERRUPT_ACK_TIMEOUT,
+                    ack_rx,
+                )
+                .await
+                {
+                    Ok(Ok(Ok(_))) => {}
+                    Ok(Ok(Err(error))) => {
+                        tracing::warn!(
+                            %session_id,
+                            operation = reload_required.operation(),
+                            reason = reload_required.reason(),
+                            %error,
+                            "exact durability-degradation interrupt failed; process-owned retry retained"
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            %session_id,
+                            operation = reload_required.operation(),
+                            reason = reload_required.reason(),
+                            %error,
+                            "exact durability-degradation interrupt task ended before acknowledgement"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            %session_id,
+                            operation = reload_required.operation(),
+                            reason = reload_required.reason(),
+                            "exact durability-degradation interrupt exceeded acknowledgement budget; process-owned attempt retained"
+                        );
+                    }
+                }
             }
             return Err(RuntimeDriverError::RecoveryRepairBlocked {
                 evidence_digest: None,
@@ -4891,6 +5168,7 @@ impl MeerkatMachine {
         projected_effect: crate::effect::ProjectedRuntimeEffect,
         dispatch_generation: u64,
         dispatch_lifecycle_phase: dsl::MeerkatPhase,
+        allow_during_unregister_drain: bool,
         context: &str,
     ) -> Result<crate::tokio::sync::OwnedMutexGuard<()>, RuntimeDriverError> {
         let cleanup_spawner = MachineCleanupTaskSpawner::acquire()?;
@@ -4911,6 +5189,7 @@ impl MeerkatMachine {
                     projected_effect,
                     dispatch_generation,
                     dispatch_lifecycle_phase,
+                    allow_during_unregister_drain,
                     &context,
                 )
                 .await
@@ -4937,6 +5216,7 @@ impl MeerkatMachine {
         projected_effect: crate::effect::ProjectedRuntimeEffect,
         dispatch_generation: u64,
         dispatch_lifecycle_phase: dsl::MeerkatPhase,
+        allow_during_unregister_drain: bool,
         context: &str,
     ) -> Result<crate::tokio::sync::OwnedMutexGuard<()>, RuntimeDriverError> {
         // Executor callbacks are allowed to route back into the machine. Drop
@@ -5063,8 +5343,10 @@ impl MeerkatMachine {
             .existing_session_runtime_state(session_id)
             .await
             .unwrap_or(RuntimeState::Destroyed);
-        self.reject_unregistration_drain_ingress(session_id, state)
-            .await?;
+        if !allow_during_unregister_drain {
+            self.reject_unregistration_drain_ingress(session_id, state)
+                .await?;
+        }
 
         debug_assert!(witness.effect_tx.same_channel(&current_effect_tx));
         let effect_permit = effect_permit
@@ -5184,6 +5466,7 @@ impl MeerkatMachine {
                     cancel_plan.projected_effect,
                     cancel_plan.dispatch_generation,
                     cancel_plan.dispatch_lifecycle_phase,
+                    false,
                     "AcceptWithCompletion",
                 )
                 .await?;
@@ -5853,6 +6136,21 @@ pub struct MeerkatMachineShared {
     /// every new lookup prunes dead slots, so historical session ids cannot
     /// accumulate while overlapping transactions still rendezvous on one gate.
     registration_transaction_slots: StdRwLock<HashMap<SessionId, std::sync::Weak<Mutex<()>>>>,
+    /// Process-local dedup for exact runless-terminal publication callbacks.
+    /// Keys are stable Arc identities for driver incarnations; values retain
+    /// that Arc, preventing address reuse while a dispatch remains pending.
+    pending_runless_terminal_publications:
+        StdMutex<HashMap<usize, PendingRunlessTerminalPublicationDispatch>>,
+    /// Per-session single-flight for process-owned archive lease preparation.
+    /// Followers wait on the leader's completion instead of accumulating tasks
+    /// behind a wedged registration transaction or injected RuntimeStore read.
+    pending_session_archive_lease_preparations:
+        StdMutex<HashMap<SessionId, PendingSessionArchiveLeasePreparation>>,
+    /// Per-session process-owned serialization for durable V5 direct-member
+    /// semantic admission. The task never holds residency or registration
+    /// authority while awaiting a custom store.
+    pending_direct_member_bind_admissions:
+        StdMutex<HashMap<SessionId, PendingDirectMemberBindAdmission>>,
     /// Optional RuntimeStore for persistent drivers.
     store: Option<Arc<dyn RuntimeStore>>,
     /// Blob store used by persistent drivers for durable input externalization.
@@ -6501,7 +6799,7 @@ impl MeerkatMachine {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &*state {
             MemberResidencyState::Placed(registration) => registration.tracked_turn_journal.clone(),
-            MemberResidencyState::PeerOnly | MemberResidencyState::VacantPlaced => None,
+            MemberResidencyState::PeerOnly { .. } | MemberResidencyState::VacantPlaced => None,
         }
     }
 
@@ -6546,8 +6844,303 @@ impl MeerkatMachine {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &*state {
             MemberResidencyState::Placed(registration) => Some(registration.incarnation.clone()),
-            MemberResidencyState::PeerOnly | MemberResidencyState::VacantPlaced => None,
+            MemberResidencyState::PeerOnly { .. } | MemberResidencyState::VacantPlaced => None,
         }
+    }
+
+    /// Install or replay the exact V5 controller-member fence for a peer-only
+    /// runtime. The Mob owns semantic generation/fence ordering; the runtime
+    /// owns the opaque runtime/session token and binds it to the current epoch
+    /// plus mutation-gate identity under the stable residency slot.
+    pub(crate) async fn install_direct_member_incarnation(
+        self: &Arc<Self>,
+        session_id: &SessionId,
+        requested: &meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+    ) -> Result<
+        meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence,
+        RuntimeDriverError,
+    > {
+        if requested.mob_id.is_empty()
+            || requested.agent_identity.is_empty()
+            || requested.fence_token == 0
+        {
+            return Err(RuntimeDriverError::ValidationFailed {
+                reason: "direct member incarnation requires non-empty mob/agent identity and a nonzero fence token"
+                    .to_string(),
+            });
+        }
+        if self.store.is_none() {
+            return Err(RuntimeDriverError::ValidationFailed {
+                reason: "V5 direct member bind requires a durable semantic high-water store"
+                    .to_string(),
+            });
+        }
+
+        loop {
+            let existing = self
+                .pending_direct_member_bind_admissions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(session_id)
+                .map(|pending| {
+                    (
+                        pending.requested == *requested,
+                        pending.completion_rx.clone(),
+                    )
+                });
+            if let Some((same_request, mut completion_rx)) = existing {
+                let outcome = crate::tokio::time::timeout(DIRECT_MEMBER_BIND_ACK_TIMEOUT, async {
+                    loop {
+                        if let Some(result) = completion_rx.borrow().clone() {
+                            break result;
+                        }
+                        completion_rx.changed().await.map_err(|error| {
+                            RuntimeDriverError::Internal(format!(
+                                "direct member bind owner dropped completion: {error}"
+                            ))
+                        })?;
+                    }
+                })
+                .await
+                .map_err(|_| RuntimeDriverError::RecoveryBackoff {
+                    reason: format!(
+                        "direct member bind admission for {session_id} remains process-owned"
+                    ),
+                })?;
+                if same_request {
+                    return outcome;
+                }
+                continue;
+            }
+
+            let spawner = MachineCleanupTaskSpawner::acquire()?;
+            let admission_id = uuid::Uuid::new_v4();
+            let (completion_tx, completion_rx) = crate::tokio::sync::watch::channel(None);
+            {
+                let mut pending = self
+                    .pending_direct_member_bind_admissions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if pending.contains_key(session_id) {
+                    continue;
+                }
+                pending.insert(
+                    session_id.clone(),
+                    PendingDirectMemberBindAdmission {
+                        admission_id,
+                        requested: requested.clone(),
+                        completion_rx: completion_rx.clone(),
+                    },
+                );
+            }
+
+            let machine = Arc::clone(self);
+            let owned_session_id = session_id.clone();
+            let owned_requested = requested.clone();
+            spawner.spawn(async move {
+                let result =
+                    std::panic::AssertUnwindSafe(machine.install_direct_member_incarnation_owned(
+                        &owned_session_id,
+                        &owned_requested,
+                    ))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|payload| {
+                        Err(RuntimeDriverError::Internal(format!(
+                            "direct member bind admission panicked: {}",
+                            meerkat_core::panic_payload::panic_payload_detail(payload.as_ref())
+                        )))
+                    });
+                completion_tx.send_replace(Some(result));
+                let mut pending = machine
+                    .pending_direct_member_bind_admissions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if pending
+                    .get(&owned_session_id)
+                    .is_some_and(|pending| pending.admission_id == admission_id)
+                {
+                    pending.remove(&owned_session_id);
+                }
+            });
+            let mut completion_rx = completion_rx;
+            return crate::tokio::time::timeout(DIRECT_MEMBER_BIND_ACK_TIMEOUT, async {
+                loop {
+                    if let Some(result) = completion_rx.borrow().clone() {
+                        break result;
+                    }
+                    completion_rx.changed().await.map_err(|error| {
+                        RuntimeDriverError::Internal(format!(
+                            "direct member bind owner dropped completion: {error}"
+                        ))
+                    })?;
+                }
+            })
+            .await
+            .map_err(|_| RuntimeDriverError::RecoveryBackoff {
+                reason: format!(
+                    "direct member bind admission for {session_id} remains process-owned"
+                ),
+            })?;
+        }
+    }
+
+    async fn install_direct_member_incarnation_owned(
+        self: &Arc<Self>,
+        session_id: &SessionId,
+        requested: &meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation,
+    ) -> Result<
+        meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence,
+        RuntimeDriverError,
+    > {
+        let slot = self.member_incarnation_slot(session_id);
+        let slot_guard = Arc::clone(&slot.gate).lock_owned().await;
+        let registration_guard = self.lock_session_registration_transaction(session_id).await;
+        let (captured_runtime_epoch_id, captured_session_mutation_gate) = {
+            let sessions = self.sessions.read().await;
+            let entry = sessions
+                .get(session_id)
+                .ok_or(RuntimeDriverError::NotReady {
+                    state: RuntimeState::Destroyed,
+                })?;
+            (entry.epoch_id.clone(), Arc::clone(&entry.mutation_gate))
+        };
+
+        let local_semantic_high_water = {
+            let state = slot
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*state {
+                MemberResidencyState::PeerOnly { direct_member } => direct_member
+                    .as_ref()
+                    .map(|registration| registration.fence.incarnation()),
+                MemberResidencyState::Placed(registration) => {
+                    return Err(RuntimeDriverError::StaleAuthority {
+                        reason: format!(
+                            "direct member bind cannot replace placed residency {:?}",
+                            registration.incarnation
+                        ),
+                    });
+                }
+                MemberResidencyState::VacantPlaced => {
+                    return Err(RuntimeDriverError::StaleAuthority {
+                        reason: "direct member bind cannot claim a vacant placed residency"
+                            .to_string(),
+                    });
+                }
+            }
+        };
+
+        if let Some(current) = local_semantic_high_water.as_ref()
+            && !crate::store::direct_member_high_water_accepts(current, requested)
+        {
+            return Err(RuntimeDriverError::StaleAuthority {
+                reason: format!(
+                    "direct member bind presented stale semantic incarnation {requested:?}; current is {current:?}"
+                ),
+            });
+        }
+
+        drop(registration_guard);
+        drop(slot_guard);
+
+        let store = Arc::clone(self.store.as_ref().ok_or_else(|| {
+            RuntimeDriverError::Internal(
+                "V5 direct member bind lost its durable semantic high-water store".to_string(),
+            )
+        })?);
+        let durable_current = store
+            .admit_direct_member_incarnation_high_water(&session_id.to_string(), requested)
+            .await
+            .map_err(|error| {
+                RuntimeDriverError::Internal(format!(
+                    "direct member semantic high-water admission failed closed: {error}"
+                ))
+            })?;
+        if &durable_current != requested {
+            return Err(RuntimeDriverError::StaleAuthority {
+                reason: format!(
+                    "direct member bind presented stale semantic incarnation {requested:?}; durable current is {durable_current:?}"
+                ),
+            });
+        }
+
+        let _slot_guard = Arc::clone(&slot.gate).lock_owned().await;
+        let _registration_guard = self.lock_session_registration_transaction(session_id).await;
+        let (runtime_epoch_id, session_mutation_gate) = {
+            let sessions = self.sessions.read().await;
+            let entry = sessions
+                .get(session_id)
+                .ok_or(RuntimeDriverError::StaleAuthority {
+                    reason: "direct member runtime disappeared during durable admission"
+                        .to_string(),
+                })?;
+            (entry.epoch_id.clone(), Arc::clone(&entry.mutation_gate))
+        };
+        if runtime_epoch_id != captured_runtime_epoch_id
+            || !Arc::ptr_eq(&session_mutation_gate, &captured_session_mutation_gate)
+        {
+            return Err(RuntimeDriverError::StaleAuthority {
+                reason: "direct member runtime was replaced during durable admission".to_string(),
+            });
+        }
+
+        let mut state = slot
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let direct_member = match &mut *state {
+            MemberResidencyState::PeerOnly { direct_member } => direct_member,
+            MemberResidencyState::Placed(registration) => {
+                return Err(RuntimeDriverError::StaleAuthority {
+                    reason: format!(
+                        "direct member runtime became placed during durable admission: {:?}",
+                        registration.incarnation
+                    ),
+                });
+            }
+            MemberResidencyState::VacantPlaced => {
+                return Err(RuntimeDriverError::StaleAuthority {
+                    reason: "direct member runtime became vacant-placed during durable admission"
+                        .to_string(),
+                });
+            }
+        };
+
+        if let Some(current) = direct_member.as_ref() {
+            let current_runtime_is_exact = current.runtime_epoch_id == runtime_epoch_id
+                && Arc::ptr_eq(&current.session_mutation_gate, &session_mutation_gate);
+            let current_semantic = current.fence.incarnation();
+            if &current_semantic == requested {
+                if current_runtime_is_exact {
+                    return Ok(current.fence.clone());
+                }
+            } else if !crate::store::direct_member_high_water_accepts(&current_semantic, requested)
+            {
+                return Err(RuntimeDriverError::StaleAuthority {
+                    reason: format!(
+                        "direct member bind presented stale semantic incarnation {requested:?}; current is {current_semantic:?}"
+                    ),
+                });
+            }
+        }
+
+        let fence = meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence {
+            mob_id: requested.mob_id.clone(),
+            agent_identity: requested.agent_identity.clone(),
+            generation: requested.generation,
+            fence_token: requested.fence_token,
+            member_session_id: session_id.to_string(),
+            runtime_session_token:
+                meerkat_contracts::wire::supervisor_bridge::BridgeDirectRuntimeSessionToken::new(),
+        };
+        *direct_member = Some(DirectMemberIncarnationRegistration {
+            fence: fence.clone(),
+            runtime_epoch_id,
+            session_mutation_gate,
+        });
+        Ok(fence)
     }
 
     #[cfg(test)]
@@ -6733,7 +7326,7 @@ impl MeerkatMachine {
                 }
                 (
                     Some(expected),
-                    MemberResidencyState::PeerOnly | MemberResidencyState::VacantPlaced,
+                    MemberResidencyState::PeerOnly { .. } | MemberResidencyState::VacantPlaced,
                 ) => {
                     return Err(RuntimeDriverError::StaleAuthority {
                         reason: format!(
@@ -6755,7 +7348,7 @@ impl MeerkatMachine {
                             .to_string(),
                     });
                 }
-                (None, MemberResidencyState::PeerOnly) => None,
+                (None, MemberResidencyState::PeerOnly { .. }) => None,
             }
         };
         let registered_gate = match registered_gate {
@@ -6836,13 +7429,13 @@ impl MeerkatMachine {
             }
             (
                 Some(expected),
-                MemberResidencyState::PeerOnly | MemberResidencyState::VacantPlaced,
+                MemberResidencyState::PeerOnly { .. } | MemberResidencyState::VacantPlaced,
             ) => Err(RuntimeDriverError::StaleAuthority {
                 reason: format!(
                     "member effect expected incarnation {expected:?}; current residency is absent"
                 ),
             }),
-            (None, MemberResidencyState::PeerOnly) => Ok(()),
+            (None, MemberResidencyState::PeerOnly { .. }) => Ok(()),
             (None, MemberResidencyState::Placed(registration)) => {
                 Err(RuntimeDriverError::StaleAuthority {
                     reason: format!(
@@ -6910,6 +7503,9 @@ impl MeerkatMachine {
                 boundary_panic_log_gate: meerkat_core::panic_payload::PanicPayloadLogGate::default(
                 ),
                 registration_transaction_slots: StdRwLock::new(HashMap::new()),
+                pending_runless_terminal_publications: StdMutex::new(HashMap::new()),
+                pending_session_archive_lease_preparations: StdMutex::new(HashMap::new()),
+                pending_direct_member_bind_admissions: StdMutex::new(HashMap::new()),
                 store: None,
                 blob_store: None,
                 llm_reconfigure_host: StdRwLock::new(None),
@@ -6970,6 +7566,9 @@ impl MeerkatMachine {
                 boundary_panic_log_gate: meerkat_core::panic_payload::PanicPayloadLogGate::default(
                 ),
                 registration_transaction_slots: StdRwLock::new(HashMap::new()),
+                pending_runless_terminal_publications: StdMutex::new(HashMap::new()),
+                pending_session_archive_lease_preparations: StdMutex::new(HashMap::new()),
+                pending_direct_member_bind_admissions: StdMutex::new(HashMap::new()),
                 store: Some(store),
                 blob_store: Some(blob_store),
                 llm_reconfigure_host: StdRwLock::new(None),
@@ -7030,6 +7629,9 @@ impl MeerkatMachine {
                 boundary_panic_log_gate: meerkat_core::panic_payload::PanicPayloadLogGate::default(
                 ),
                 registration_transaction_slots: StdRwLock::new(HashMap::new()),
+                pending_runless_terminal_publications: StdMutex::new(HashMap::new()),
+                pending_session_archive_lease_preparations: StdMutex::new(HashMap::new()),
+                pending_direct_member_bind_admissions: StdMutex::new(HashMap::new()),
                 store: Some(store),
                 blob_store: Some(Arc::new(UnavailableBlobStore)),
                 llm_reconfigure_host: StdRwLock::new(None),

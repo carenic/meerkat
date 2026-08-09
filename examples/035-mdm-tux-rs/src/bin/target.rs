@@ -31,7 +31,7 @@ use meerkat::PersistentSessionService;
 use meerkat::surface::{
     NoopScheduleMobHost, ScheduledEventDispatch, ScheduledPromptDispatch,
     SharedScheduleTargetAdapter, SurfaceScheduleSessionHost,
-    runtime_delivery_dispatch_from_admission, schedule_host_supported,
+    accept_schedule_runtime_input_with_reconciliation, schedule_host_supported,
     schedule_runtime_correlation_id, schedule_runtime_delivery_idempotency_key,
     spawn_schedule_host,
 };
@@ -63,8 +63,8 @@ use meerkat_store::{JsonlStore, MemoryBlobStore, SessionFilter, SessionStore};
 
 use mdm_tux::{
     DirectControlPayload, ExampleGeneratedCommsTrustRouter, KennelPayload, ProviderKind,
-    auto_detect, build_signed_envelope, direct_control_request, parse_direct_control_message,
-    read_envelope, verify_envelope, write_envelope,
+    auto_detect, build_signed_envelope, direct_control_request, read_envelope, verify_envelope,
+    write_envelope,
 };
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
@@ -111,6 +111,21 @@ impl TargetScheduleSessionHost {
             Arc::clone(&self.runtime_adapter),
             Arc::clone(&self.mob_state),
             session_id,
+            None,
+        )
+    }
+
+    fn executor_for_actor(
+        &self,
+        session_id: SessionId,
+        actor_witness: meerkat::LiveSessionActorWitness,
+    ) -> TargetCoreExecutor {
+        TargetCoreExecutor::new(
+            Arc::clone(&self.service),
+            Arc::clone(&self.runtime_adapter),
+            Arc::clone(&self.mob_state),
+            session_id,
+            Some(actor_witness),
         )
     }
 
@@ -212,6 +227,7 @@ impl SurfaceScheduleSessionHost for TargetScheduleSessionHost {
                 prepared.bindings(),
                 Arc::new(TargetCoreInterruptHandle {
                     service: Arc::clone(&self.service),
+                    runtime_adapter: Arc::clone(&self.runtime_adapter),
                     session_id: session_id.clone(),
                 }),
                 Arc::new(TargetCorePostStopCleanupHandle {
@@ -258,23 +274,33 @@ impl SurfaceScheduleSessionHost for TargetScheduleSessionHost {
             ..SessionBuildOptions::default()
         };
 
+        let actor_witness_slot = meerkat::LiveSessionActorWitnessSlot::default();
+        let admission = self
+            .service
+            .reserve_create_session_admission()
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
         let result = match self
             .service
-            .create_session(CreateSessionRequest {
-                injected_context: Vec::new(),
-                model: create.model.clone(),
-                prompt: ContentInput::Text(String::new()),
-                system_prompt: match create.system_prompt.clone() {
-                    Some(s) => meerkat::SystemPromptOverride::Set(s),
-                    None => meerkat::SystemPromptOverride::Inherit,
+            .create_session_with_reserved_admission_and_actor_witness(
+                CreateSessionRequest {
+                    injected_context: Vec::new(),
+                    model: create.model.clone(),
+                    prompt: ContentInput::Text(String::new()),
+                    system_prompt: match create.system_prompt.clone() {
+                        Some(s) => meerkat::SystemPromptOverride::Set(s),
+                        None => meerkat::SystemPromptOverride::Inherit,
+                    },
+                    max_tokens: create.max_tokens,
+                    event_tx: None,
+                    initial_turn: InitialTurnPolicy::Defer,
+                    deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                    build: Some(build),
+                    labels: Some(create.labels.clone()),
                 },
-                max_tokens: create.max_tokens,
-                event_tx: None,
-                initial_turn: InitialTurnPolicy::Defer,
-                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
-                build: Some(build),
-                labels: Some(create.labels.clone()),
-            })
+                admission,
+                &actor_witness_slot,
+            )
             .await
         {
             Ok(result) => result,
@@ -288,12 +314,18 @@ impl SurfaceScheduleSessionHost for TargetScheduleSessionHost {
                 }));
             }
         };
+        let actor_witness = actor_witness_slot.witness().ok_or_else(|| {
+            meerkat::ScheduleDomainError::Internal(format!(
+                "scheduled target materialization did not publish exact actor authority for {}",
+                result.session_id
+            ))
+        })?;
 
         let executor_host = self.clone();
         let executor_session_id = result.session_id.clone();
         let pending = match prepared
             .ensure_executor_attachment(move |_witness| {
-                Box::new(executor_host.executor(executor_session_id))
+                Box::new(executor_host.executor_for_actor(executor_session_id, actor_witness))
                     as Box<dyn meerkat_core::CoreExecutor>
             })
             .await
@@ -393,20 +425,17 @@ impl SurfaceScheduleSessionHost for TargetScheduleSessionHost {
         ));
         prompt_input.header.correlation_id = Some(schedule_runtime_correlation_id(identity)?);
 
-        let (outcome, handle) = self
-            .runtime_adapter
-            .accept_input_with_completion(session_id, Input::Prompt(prompt_input))
-            .await
-            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
-
-        runtime_delivery_dispatch_from_admission(
+        accept_schedule_runtime_input_with_reconciliation(
             self.runtime_adapter.as_ref(),
             session_id,
             occurrence,
             identity,
-            outcome,
-            handle,
+            Input::Prompt(prompt_input),
             dispatch.materialized_session_id,
+            |input| {
+                self.runtime_adapter
+                    .accept_input_with_completion(session_id, input)
+            },
         )
         .await
     }
@@ -450,20 +479,17 @@ impl SurfaceScheduleSessionHost for TargetScheduleSessionHost {
             render_metadata: dispatch.render_metadata,
         });
 
-        let (outcome, handle) = self
-            .runtime_adapter
-            .accept_input_with_completion(session_id, input)
-            .await
-            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
-
-        runtime_delivery_dispatch_from_admission(
+        accept_schedule_runtime_input_with_reconciliation(
             self.runtime_adapter.as_ref(),
             session_id,
             occurrence,
             identity,
-            outcome,
-            handle,
+            input,
             dispatch.materialized_session_id,
+            |input| {
+                self.runtime_adapter
+                    .accept_input_with_completion(session_id, input)
+            },
         )
         .await
     }
@@ -999,6 +1025,7 @@ async fn setup_session(
             prepared.bindings(),
             Arc::new(TargetCoreInterruptHandle {
                 service: Arc::clone(service),
+                runtime_adapter: Arc::clone(runtime_adapter),
                 session_id: prepared_session_id.clone(),
             }),
             Arc::new(TargetCorePostStopCleanupHandle {
@@ -1034,7 +1061,19 @@ async fn setup_session(
         labels: None,
     };
 
-    let result = match service.create_session(req).await {
+    let actor_witness_slot = meerkat::LiveSessionActorWitnessSlot::default();
+    let admission = service
+        .reserve_create_session_admission()
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let result = match service
+        .create_session_with_reserved_admission_and_actor_witness(
+            req,
+            admission,
+            &actor_witness_slot,
+        )
+        .await
+    {
         Ok(result) => result,
         Err(error) => {
             let rollback = prepared.rollback_now().await;
@@ -1048,6 +1087,9 @@ async fn setup_session(
     };
 
     let session_id = result.session_id;
+    let actor_witness = actor_witness_slot.witness().ok_or_else(|| {
+        anyhow::anyhow!("target setup did not publish exact actor authority for {session_id}")
+    })?;
     eprintln!("[target] session ready: {session_id}");
 
     // Consume the exact actor-materialization claim into one attachment for
@@ -1063,6 +1105,7 @@ async fn setup_session(
                 executor_runtime_adapter,
                 executor_mob_state,
                 executor_session_id,
+                Some(actor_witness),
             )) as Box<dyn meerkat_core::CoreExecutor>
         })
         .await
@@ -1120,6 +1163,7 @@ struct TargetCoreExecutor {
     runtime_adapter: Arc<MeerkatMachine>,
     mob_state: Arc<MobMcpState>,
     session_id: SessionId,
+    publication_actor_witness: Option<meerkat::LiveSessionActorWitness>,
 }
 
 struct TargetCorePostStopCleanupHandle {
@@ -1177,12 +1221,14 @@ impl TargetCoreExecutor {
         runtime_adapter: Arc<MeerkatMachine>,
         mob_state: Arc<MobMcpState>,
         session_id: SessionId,
+        publication_actor_witness: Option<meerkat::LiveSessionActorWitness>,
     ) -> Self {
         Self {
             service,
             runtime_adapter,
             mob_state,
             session_id,
+            publication_actor_witness,
         }
     }
 }
@@ -1231,17 +1277,26 @@ impl CoreExecutorBoundaryHandle for TargetCoreBoundaryHandle {
 
 struct TargetCoreInterruptHandle {
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    runtime_adapter: Arc<MeerkatMachine>,
     session_id: SessionId,
 }
 
 #[async_trait::async_trait]
 impl CoreExecutorInterruptHandle for TargetCoreInterruptHandle {
-    async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
+    async fn hard_cancel_run_if_current(
+        &self,
+        expected_run_id: &RunId,
+        _reason: String,
+    ) -> Result<bool, CoreExecutorError> {
         self.service
-            .interrupt(&self.session_id)
+            .interrupt_run_with_machine_authority(
+                &self.session_id,
+                expected_run_id,
+                self.runtime_adapter.session_control_authority(),
+            )
             .await
             .or_else(|error| match error {
-                SessionError::NotRunning { .. } => Ok(()),
+                SessionError::NotRunning { .. } => Ok(false),
                 error => Err(error),
             })
             .map_err(|error| CoreExecutorError::control_failed_runtime(error.to_string()))
@@ -1286,15 +1341,18 @@ impl CoreExecutor for TargetCoreExecutor {
     fn interrupt_handle(&self) -> Option<Arc<dyn CoreExecutorInterruptHandle>> {
         Some(Arc::new(TargetCoreInterruptHandle {
             service: Arc::clone(&self.service),
+            runtime_adapter: Arc::clone(&self.runtime_adapter),
             session_id: self.session_id.clone(),
         }))
     }
 
     fn publication_handle(&self) -> Option<Arc<dyn CoreExecutorPublicationHandle>> {
-        Some(meerkat::surface::persistent_runtime_publication_handle(
-            Arc::clone(&self.service),
-            self.session_id.clone(),
-        ))
+        self.publication_actor_witness.clone().map(|actor_witness| {
+            meerkat::surface::persistent_runtime_publication_handle(
+                Arc::clone(&self.service),
+                actor_witness,
+            )
+        })
     }
 
     fn machine_managed_post_stop_unregister(&self) -> bool {
@@ -1396,8 +1454,14 @@ impl CoreExecutor for TargetCoreExecutor {
         Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
         CoreExecutorError,
     > {
+        let actor_witness = self.publication_actor_witness.as_ref().ok_or_else(|| {
+            CoreExecutorError::Internal(format!(
+                "target terminal publication for session {} has no exact actor witness",
+                self.session_id
+            ))
+        })?;
         self.service
-            .publish_interaction_terminals_exact_batch(&self.session_id, events)
+            .publish_interaction_terminals_exact_batch_for_actor(actor_witness, events)
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
@@ -2027,6 +2091,11 @@ async fn run_adopted_loop_inner(
     disconnect_tx: &tokio::sync::watch::Sender<bool>,
     disconnect_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<Option<String>> {
+    if attach_required {
+        bail!(
+            "attach_required direct-control receive is unsupported: mdm.direct must move to a registered machine-owned control handler or the kennel control protocol"
+        );
+    }
     let mut heartbeat: Option<tokio::task::JoinHandle<()>> = None;
     let initial_event = if attach_required {
         TkcEvent::Adopted {
@@ -2088,56 +2157,6 @@ async fn run_adopted_loop_inner(
         );
 
         tokio::select! {
-            msg = comms_runtime.recv_message(), if machine_state.state().phase() == TargetAttachmentPhase::Attaching => {
-                let Some(msg) = msg else {
-                    if let Some(h) = heartbeat.take() { h.abort(); }
-                    let (_state, effects) = target_attachment::transition(
-                        machine_state,
-                        TkcEvent::DirectLinkLost,
-                    )
-                    .map_err(|e| anyhow::anyhow!("direct-link-lost transition: {e}"))?;
-                    let (_, reregister_attached_tux_id) = apply_target_control_effects(
-                        comms_runtime,
-                        comms_trust,
-                        &effects,
-                        &mut heartbeat,
-                        disconnect_tx,
-                        attachment_hint_path,
-                    )
-                    .await?;
-                    return require_generated_reregister_intent(
-                        reregister_attached_tux_id,
-                        "direct link lost before attach ack",
-                    );
-                };
-                // Handle attach-ack from TUX (kennel protocol).
-                if let Some(payload) = parse_direct_control_message(&msg)?
-                    && let DirectControlPayload::AttachAck { lease_id } = payload
-                    && machine_state.state().phase() == TargetAttachmentPhase::Attaching
-                {
-                    let (s, effects) = target_attachment::transition(
-                        machine_state,
-                        TkcEvent::DirectAttachAck { lease_id },
-                    )
-                    .map_err(|e| anyhow::anyhow!("direct-attach-ack transition: {e}"))?;
-                    machine_state = s;
-                    let _ = apply_target_control_effects(
-                        comms_runtime,
-                        comms_trust,
-                        &effects,
-                        &mut heartbeat,
-                        disconnect_tx,
-                        attachment_hint_path,
-                    )
-                    .await?;
-                    continue;
-                }
-                // Once attached, ordinary peer traffic is left entirely to
-                // the runtime adapter's peer ingress drain. This branch only
-                // exists to receive the direct attach ACK during the short
-                // Attaching phase.
-                tracing::debug!(from = %msg.from_peer, "ignoring non-control comms message while attaching");
-            }
             _ = kennel_heartbeat.tick(), if poll_kennel => {
                 let kennel_hb = build_signed_envelope(
                     comms_runtime.router_arc().keypair_arc().as_ref(), &adoption.target_id,

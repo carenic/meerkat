@@ -95,12 +95,16 @@ impl RosterAuthority {
         next_peer_id: &str,
         next_address: &str,
         bootstrap_token: Option<meerkat_contracts::wire::supervisor_bridge::BridgeBootstrapToken>,
+        direct_member_fence: Option<
+            meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence,
+        >,
     ) -> Vec<(AgentIdentity, Generation, [u8; 32])> {
         self.roster.replace_backend_peer_binding_for_identities(
             identities,
             next_peer_id,
             next_address,
             bootstrap_token,
+            direct_member_fence,
         )
     }
 }

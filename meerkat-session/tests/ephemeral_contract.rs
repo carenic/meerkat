@@ -88,6 +88,7 @@ impl SessionAgent for MockAgent {
                 output_tokens: 5,
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
+                provider_accounting: None,
             },
             turns: 1,
             tool_calls: 0,
@@ -147,6 +148,7 @@ impl SessionAgent for MockAgent {
                 output_tokens: 5,
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
+                provider_accounting: None,
             },
             last_assistant_text: Some("Hello from mock".to_string()),
         }
@@ -458,7 +460,11 @@ impl SessionAgent for RealSessionAgent {
                 meta: None,
             }],
             StopReason::EndTurn,
-            Usage::default(),
+            meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Other,
+                "ephemeral-contract-test",
+                Usage::default(),
+            ),
         );
 
         Ok(successful_run_result(&self.session, "ok"))
@@ -585,7 +591,11 @@ impl SessionAgent for CompactionSessionAgent {
                 meta: None,
             }],
             StopReason::EndTurn,
-            Usage::default(),
+            meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Other,
+                "ephemeral-contract-test",
+                Usage::default(),
+            ),
         );
 
         Ok(successful_run_result(&self.session, "ok"))

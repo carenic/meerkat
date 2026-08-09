@@ -2124,6 +2124,22 @@ impl MobOpsAdapter {
         result
     }
 
+    /// Project retirement into an operation binding when this process owns
+    /// one. Peer-only bindings are intentionally process-local; cold Mob
+    /// replay can therefore have durable member authority without a volatile
+    /// operation projection to terminalize.
+    pub(crate) async fn mark_member_retired_if_bound(
+        &self,
+        member_ref: &MemberRef,
+    ) -> Result<bool, MobError> {
+        let member_key = Self::require_member_key(member_ref, "mark retired for")?;
+        if self.binding_for_key(&member_key).is_none() {
+            return Ok(false);
+        }
+        self.mark_member_retired(member_ref).await?;
+        Ok(true)
+    }
+
     /// Complete the ops-lifecycle half of an archive-confirmed retirement.
     ///
     /// A missing binding remains fail-closed for a fresh archive. It is

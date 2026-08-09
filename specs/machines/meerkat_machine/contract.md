@@ -377,7 +377,9 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ResolvePeerIngressReceive`(kind: PeerIngressAdmittedKind, auth_required: Bool, auth_exempt: Bool, trusted: Bool, queued_work_present: Bool, queue_closed: Bool, queue_capacity_available: Bool)
 - `ResolvePeerIngressDequeue`(kind: PeerIngressAdmittedKind, auth: PeerIngressAuthClass, queued_work_remaining: Bool)
 - `InterruptCurrentRun`
+- `InterruptCurrentRunForRun`(run_id: RunId)
 - `ResolveUserInterruptPublicResult`(observation: UserInterruptObservationKind, target_present: Bool, staged_promotion_busy: Bool)
+- `CancelAfterBoundaryForRun`(run_id: RunId, reason: String)
 - `AbortCancelAfterBoundaryDispatch`(dispatch_generation: u64)
 - `StageDeferredSession`(session_id: SessionId, keep_alive: Bool, has_comms_name: Bool, llm_identity: SessionLlmIdentity, machine_archived_resume_authorized: Bool)
 - `UpdateDeferredSessionKeepAlive`(session_id: SessionId, keep_alive: Bool, has_comms_name: Bool)
@@ -3898,8 +3900,26 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ### `InterruptCurrentRun`
 - From: `Running`
 - On: `InterruptCurrentRun`()
+- Guards:
+  - `not_retiring`
 - Emits: `WakeInterrupt`, `RequestCancellationAtBoundary`
 - To: `Running`
+
+### `InterruptCurrentRunForRunRunning`
+- From: `Running`
+- On: `InterruptCurrentRunForRun`(run_id)
+- Guards:
+  - `run_matches_current`
+- Emits: `WakeInterrupt`, `RequestCancellationAtBoundary`
+- To: `Running`
+
+### `InterruptCurrentRunForRunRetired`
+- From: `Retired`
+- On: `InterruptCurrentRunForRun`(run_id)
+- Guards:
+  - `run_matches_current`
+- Emits: `WakeInterrupt`, `RequestCancellationAtBoundary`
+- To: `Retired`
 
 ### `ResolveUserInterruptPublicResultAcceptedInitializing`
 - From: `Initializing`
@@ -4305,6 +4325,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Running`
 - On: `CancelAfterBoundary`(reason)
 - Guards:
+  - `not_retiring`
   - `no_dispatch_outstanding`
 - Emits: `RequestCancellationAtBoundary`, `RuntimeEffectFact`
 - To: `Running`
@@ -4321,9 +4342,46 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Running`
 - On: `CancelAfterBoundary`(reason)
 - Guards:
+  - `not_retiring`
   - `dispatch_outstanding`
 - Emits: `BoundaryCancelAlreadyPending`
 - To: `Running`
+
+### `CancelAfterBoundaryForRunRunning`
+- From: `Running`
+- On: `CancelAfterBoundaryForRun`(run_id, reason)
+- Guards:
+  - `run_matches_current`
+  - `no_dispatch_outstanding`
+- Emits: `RequestCancellationAtBoundary`, `RuntimeEffectFact`
+- To: `Running`
+
+### `CancelAfterBoundaryForRunRetired`
+- From: `Retired`
+- On: `CancelAfterBoundaryForRun`(run_id, reason)
+- Guards:
+  - `run_matches_current`
+  - `no_dispatch_outstanding`
+- Emits: `RequestCancellationAtBoundary`, `RuntimeEffectFact`
+- To: `Retired`
+
+### `CancelAfterBoundaryForRunRunningAlreadyPending`
+- From: `Running`
+- On: `CancelAfterBoundaryForRun`(run_id, reason)
+- Guards:
+  - `run_matches_current`
+  - `dispatch_outstanding`
+- Emits: `BoundaryCancelAlreadyPending`
+- To: `Running`
+
+### `CancelAfterBoundaryForRunRetiredAlreadyPending`
+- From: `Retired`
+- On: `CancelAfterBoundaryForRun`(run_id, reason)
+- Guards:
+  - `run_matches_current`
+  - `dispatch_outstanding`
+- Emits: `BoundaryCancelAlreadyPending`
+- To: `Retired`
 
 ### `AbortCancelAfterBoundaryDispatchInitializing`
 - From: `Initializing`
@@ -4460,7 +4518,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - To: `Retired`
 
 ### `RetireRequestedFromIdle`
-- From: `Idle`, `Attached`, `Running`, `Stopped`
+- From: `Idle`, `Attached`, `Stopped`
 - On: `Retire`(session_id)
 - Guards:
   - `runtime_binding_present`
@@ -4468,11 +4526,28 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - To: `Retired`
 
 ### `RetireRequestedFromIdleUnbound`
-- From: `Idle`, `Attached`, `Running`, `Stopped`
+- From: `Idle`, `Attached`, `Stopped`
 - On: `Retire`(session_id)
 - Guards:
   - `runtime_binding_absent`
 - To: `Retired`
+
+### `RetireRequestedWhileRunBound`
+- From: `Running`
+- On: `Retire`(session_id)
+- Guards:
+  - `current_run_present`
+  - `runtime_binding_present`
+- Emits: `RuntimeRetired`
+- To: `Running`
+
+### `RetireRequestedWhileRunUnbound`
+- From: `Running`
+- On: `Retire`(session_id)
+- Guards:
+  - `current_run_present`
+  - `runtime_binding_absent`
+- To: `Running`
 
 ### `RetireAlreadyRetired`
 - From: `Retired`

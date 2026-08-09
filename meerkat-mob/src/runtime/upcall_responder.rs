@@ -1161,7 +1161,13 @@ async fn run_upcall_responder(
         }
 
         let mut requests = bridge.take_buffered_upcall_requests().await;
-        let drained = runtime.drain_peer_input_candidates().await;
+        let drained = match runtime.handoff_volatile_peer_input_candidates().await {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                tracing::error!(%error, "upcall responder stopped with FIFO head retained");
+                return;
+            }
+        };
         let mut foreign = Vec::new();
         for candidate in drained {
             if matches!(

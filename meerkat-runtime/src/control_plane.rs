@@ -42,7 +42,7 @@ fn generated_runtime_termination_reason(
 }
 
 #[derive(Debug, thiserror::Error)]
-enum RunlessTerminalConvergenceError {
+pub(crate) enum RunlessTerminalConvergenceError {
     #[error("retryable runless terminal failure during {context}: {error}")]
     Retryable {
         context: &'static str,
@@ -73,6 +73,9 @@ impl RunlessTerminalConvergenceError {
             error @ (RuntimeDriverError::UnregisterFinalizationOutcomeUnknown { .. }
             | RuntimeDriverError::UnregisterInProgress { .. }
             | RuntimeDriverError::RuntimeStopInProgress { .. }
+            | RuntimeDriverError::InterruptDispatchOutcomeUnknown { .. }
+            | RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. }
+            | RuntimeDriverError::InterruptDispatchPanicked { .. }
             | RuntimeDriverError::RecoveryBackoff { .. }
             | RuntimeDriverError::Internal(_)) => Self::Retryable { context, error },
         }
@@ -598,7 +601,7 @@ pub(crate) async fn drain_recovered_runless_runtime_terminations(
     .map_err(RunlessTerminalConvergenceError::into_driver_error)
 }
 
-async fn has_committed_runless_recovery_carrier(
+pub(crate) async fn has_committed_runless_recovery_carrier(
     driver: &SharedDriver,
 ) -> Result<bool, RunlessTerminalConvergenceError> {
     let driver = driver.lock().await;
