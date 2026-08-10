@@ -39764,6 +39764,49 @@ async fn test_destroy_cancels_inflight_flow_run() {
 }
 
 #[tokio::test]
+async fn test_destroy_wired_members_does_not_wait_for_peer_lifecycle_handoff() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let left = AgentIdentity::from("w-destroy-left");
+    let right = AgentIdentity::from("w-destroy-right");
+    for identity in [&left, &right] {
+        handle
+            .spawn(ProfileName::from("worker"), identity.clone(), None)
+            .await
+            .expect("spawn wired destroy member");
+    }
+    handle
+        .wire(left.clone(), right.clone())
+        .await
+        .expect("wire destroy members");
+
+    // Model a lifecycle recipient whose volatile comms drain is already
+    // quiescent. Destroy has admitted every member into Retiring, so it must
+    // preserve generated trust cleanup without waiting for a redundant peer
+    // notification to be handed off by that drain.
+    for identity in [&left, &right] {
+        service
+            .set_comms_behavior(
+                &test_comms_name("worker", identity.as_str()),
+                MockCommsBehavior {
+                    peer_lifecycle_delay_ms: 60_000,
+                    ..MockCommsBehavior::default()
+                },
+            )
+            .await;
+    }
+
+    let report = tokio::time::timeout(Duration::from_secs(2), handle.destroy())
+        .await
+        .expect("destroy must not wait for peer lifecycle handoff")
+        .expect("destroy wired members");
+    assert!(
+        report.errors.is_empty(),
+        "destroy trust cleanup must remain complete: {:?}",
+        report.errors
+    );
+}
+
+#[tokio::test]
 async fn test_run_flow_store_admission_failure_does_not_commit_mob_machine_authority() {
     let run_store = Arc::new(RecordingRunStore::new());
     let definition = sample_definition_with_single_step_flow(60_000, 8);

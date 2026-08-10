@@ -39200,6 +39200,15 @@ impl MobActor {
                 }
             }
         }
+        // Destroy admits every roster member into Retiring before disposal
+        // starts. A peer-lifecycle send from one destroy-admitted member to
+        // another waits for that recipient's comms drain to hand off the
+        // volatile notice, but teardown is the sole remaining authority and
+        // the drain may already be quiescent. The notice carries no cleanup
+        // authority: MobMachine owns topology and the exact trust removals
+        // below own the physical rows. Skip only that redundant notice while
+        // preserving every generated trust mutation and wiring cleanup.
+        let emit_peer_lifecycle_notice = !self.destroy_cleanup_active;
         let actor = &*self;
         let retiring_key = Self::trusted_peer_removal_key(retiring_spec);
         let retiring_comms = ctx.retiring_comms.clone();
@@ -39214,7 +39223,9 @@ impl MobActor {
             let retired_id = ctx.agent_identity.clone();
             let retired_entry = ctx.entry.clone();
             local_tasks.push(async move {
-                if let Some(retiring_comms) = retiring_comms.as_ref() {
+                if emit_peer_lifecycle_notice
+                    && let Some(retiring_comms) = retiring_comms.as_ref()
+                {
                     if let Err(error) = actor
                         .notify_peer_retired(
                             &recipient_spec,
@@ -39249,7 +39260,7 @@ impl MobActor {
                             "dispose_notify_peers: lifecycle notice sent"
                         );
                     }
-                } else {
+                } else if emit_peer_lifecycle_notice {
                     if super::member_runtime_is_host_owned(
                         actor.dsl_authority.state(),
                         &retired_id,
@@ -39268,6 +39279,13 @@ impl MobActor {
                             "dispose_notify_peers: skipping lifecycle notice because retiring member has no live comms runtime"
                         );
                     }
+                } else {
+                    tracing::debug!(
+                        mob_id = %actor.definition.id,
+                        agent_identity = %retired_id,
+                        peer_id = %peer_identity,
+                        "dispose_notify_peers: skipping redundant lifecycle notice between destroy-admitted members"
+                    );
                 }
                 for (historical_peer_id, historical_authority) in historical_authorities {
                     actor
@@ -39365,7 +39383,8 @@ impl MobActor {
             }
         }
         for (peer_identity, recipient_spec, recipient_binding) in peer_only_jobs {
-            if let Some(retiring_comms) = ctx.retiring_comms.as_ref() {
+            if emit_peer_lifecycle_notice && let Some(retiring_comms) = ctx.retiring_comms.as_ref()
+            {
                 if let Err(error) = self
                     .notify_peer_retired(
                         &recipient_spec,
@@ -39400,7 +39419,7 @@ impl MobActor {
                         "dispose_notify_peers: lifecycle notice sent"
                     );
                 }
-            } else {
+            } else if emit_peer_lifecycle_notice {
                 if super::member_runtime_is_host_owned(
                     self.dsl_authority.state(),
                     &ctx.agent_identity,
@@ -39419,6 +39438,13 @@ impl MobActor {
                         "dispose_notify_peers: skipping lifecycle notice because retiring member has no live comms runtime"
                     );
                 }
+            } else {
+                tracing::debug!(
+                    mob_id = %self.definition.id,
+                    agent_identity = %ctx.agent_identity,
+                    peer_id = %peer_identity,
+                    "dispose_notify_peers: skipping redundant lifecycle notice between destroy-admitted members"
+                );
             }
             if ctx.preserve_machine_topology {
                 if let Err(error) = self

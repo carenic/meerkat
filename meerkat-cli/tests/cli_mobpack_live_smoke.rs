@@ -557,7 +557,13 @@ async fn rpc_call(
         }),
     )
     .await?;
-    let response = rpc_read_response(surface, timeout_secs).await?;
+    let response = rpc_read_response(surface, timeout_secs)
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "rpc {method} id {id} response failed after {timeout_secs}s: {error}"
+            ))
+        })?;
     if !response["error"].is_null() {
         return Err(format!("rpc {method} failed: {response}").into());
     }

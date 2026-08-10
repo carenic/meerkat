@@ -175,6 +175,34 @@ impl WorkAttentionMachine {
         })
     }
 
+    /// Match the public status-filter contract at one store-observed time.
+    ///
+    /// `Active` is an eligibility projection, not a persisted-phase equality:
+    /// an Active binding and a Paused binding whose deadline has elapsed both
+    /// match. `Paused` means a Paused binding whose deadline has not elapsed.
+    /// Terminal filters remain exact typed lifecycle observations. Keeping this
+    /// composition beside the machine classifier lets stores apply an honest
+    /// bound after status classification without re-deriving lifecycle policy.
+    pub fn matches_status_filter_at(
+        binding: &WorkAttentionBinding,
+        filter: &WorkAttentionStatus,
+        now: DateTime<Utc>,
+    ) -> Result<bool, WorkGraphError> {
+        Ok(match filter {
+            WorkAttentionStatus::Active => Self::classify_eligibility_at(binding, now)?,
+            WorkAttentionStatus::Paused { .. } => {
+                matches!(binding.status, WorkAttentionStatus::Paused { .. })
+                    && !Self::classify_eligibility_at(binding, now)?
+            }
+            WorkAttentionStatus::Superseded => {
+                matches!(binding.status, WorkAttentionStatus::Superseded)
+            }
+            WorkAttentionStatus::Stopped => {
+                matches!(binding.status, WorkAttentionStatus::Stopped)
+            }
+        })
+    }
+
     /// Resolve the projected attention authority for the binding.
     ///
     /// The shell extracts only the raw binding facts (`mode`,

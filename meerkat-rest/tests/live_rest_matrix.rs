@@ -213,7 +213,7 @@ async fn read_http_response_head(socket: &mut TcpStream) -> Vec<u8> {
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "lane:e2e-smoke"]
 async fn e2e_scenario_23_rest_sse_events_follow_continue_turn() {
     let Some(client) = live_client() else {
         eprintln!("Skipping scenario 23: missing ANTHROPIC_API_KEY");
@@ -290,10 +290,8 @@ async fn e2e_scenario_23_rest_sse_events_follow_continue_turn() {
         "follow-up turn should preserve context, got: {text}"
     );
 
-    let mut saw_follow_up_event = initial_text.contains("session_loaded")
-        || initial_text.contains("assistant_delta")
-        || initial_text.contains("run_finished")
-        || initial_text.contains("session_updated");
+    let follow_up_event_offset = sse_bytes.len();
+    let mut saw_follow_up_event = false;
     for _ in 0..12 {
         if saw_follow_up_event {
             break;
@@ -307,17 +305,14 @@ async fn e2e_scenario_23_rest_sse_events_follow_continue_turn() {
             break;
         }
         sse_bytes.extend_from_slice(&buffer[..read]);
-        let body = String::from_utf8_lossy(&sse_bytes);
-        if body.contains("assistant_delta")
-            || body.contains("run_finished")
-            || body.contains("session_updated")
-        {
-            saw_follow_up_event = true;
-        }
+        let body = String::from_utf8_lossy(&sse_bytes[follow_up_event_offset..]);
+        saw_follow_up_event = body
+            .lines()
+            .any(|line| line.trim() == "event: run_completed");
     }
     assert!(
         saw_follow_up_event,
-        "expected streamed session events in SSE body, got: {}",
+        "expected the follow-up run_completed SSE event, got: {}",
         String::from_utf8_lossy(&sse_bytes)
     );
     drop(sse);
@@ -372,7 +367,7 @@ async fn e2e_scenario_24_rest_config_capabilities_health_and_skills() {
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "lane:e2e-smoke"]
 async fn e2e_scenario_25_rest_reload_and_resume_on_same_realm_root() {
     let Some(client) = live_client() else {
         eprintln!("Skipping scenario 25: missing ANTHROPIC_API_KEY");

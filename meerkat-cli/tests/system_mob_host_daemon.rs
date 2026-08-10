@@ -45,7 +45,11 @@ use tokio::process::{Child, Command};
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const DESCRIPTOR_TIMEOUT: Duration = Duration::from_secs(60);
-const SCHEDULE_TIMEOUT: Duration = Duration::from_secs(60);
+// Lifetime 1 is terminated without a graceful lease release. The replacement
+// driver must wait out the exact 60-second executor lease before it can claim
+// the overdue occurrence, so the observation bound needs deterministic room
+// beyond that ownership fence.
+const SCHEDULE_TIMEOUT: Duration = Duration::from_secs(75);
 const REALM_ID: &str = "mob-host-e2e";
 
 fn rkat_binary_path() -> Option<PathBuf> {
@@ -195,6 +199,23 @@ fn host_trust_descriptor(descriptor: &WireHostBindingDescriptor) -> TrustedPeerD
 async fn shutdown(mut daemon: Child) {
     let _ = daemon.kill().await;
     let _ = daemon.wait().await;
+}
+
+async fn terminate_and_wait(mut daemon: Child) {
+    let pid = daemon.id().expect("running daemon has a pid");
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("send SIGTERM to mob host");
+    assert!(status.success(), "kill -TERM failed: {status}");
+    let exit = tokio::time::timeout(Duration::from_secs(10), daemon.wait())
+        .await
+        .expect("mob host must complete graceful SIGTERM shutdown")
+        .expect("wait for SIGTERM mob host");
+    assert!(
+        exit.success(),
+        "SIGTERM mob host exited unsuccessfully: {exit}"
+    );
 }
 
 async fn seed_overdue_exact_session_schedule(
@@ -473,6 +494,29 @@ async fn integration_real_mob_host_daemon_lifecycle() {
         matches!(second, BridgeReply::BindHost(_)),
         "the daemon stays bindable across restarts (A14), got {second:?}"
     );
+
+    // A real service-manager SIGTERM must traverse the same reverse cleanup as
+    // Ctrl+C and release the executor lease. A replacement daemon must then
+    // claim new overdue work immediately, not after the 60-second expiry.
+    let descriptor_before_term: WireHostBindingDescriptor = serde_json::from_slice(
+        &std::fs::read(home.descriptor_path()).expect("read descriptor before SIGTERM"),
+    )
+    .expect("descriptor before SIGTERM parses");
+    terminate_and_wait(daemon).await;
+    let (post_term_service, post_term_schedule_id) =
+        seed_overdue_exact_session_schedule(&home, &materialized.session_id).await;
+    let mut daemon = home.spawn_daemon(&rkat);
+    home.wait_for_descriptor(
+        Some(descriptor_before_term.bootstrap_token.as_str()),
+        &mut daemon,
+    )
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        wait_for_completed_occurrence(&post_term_service, &post_term_schedule_id, &mut daemon),
+    )
+    .await
+    .expect("SIGTERM must release the executor lease before restart");
 
     shutdown(daemon).await;
 }

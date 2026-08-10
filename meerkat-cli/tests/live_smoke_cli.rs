@@ -160,7 +160,7 @@ async fn write_smoke_config(
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "lane:e2e-smoke"]
 async fn e2e_scenario_26_cli_run_resume_persistence() -> Result<(), Box<dyn std::error::Error>> {
     if skip_if_no_api_prereqs() {
         return Ok(());
@@ -1051,6 +1051,77 @@ async fn inner_e2e_002_bg_keepalive() -> Result<(), Box<dyn std::error::Error>> 
         "E2E-002: expected background job completion surfaced during idle keep-alive.\n\
          The runtime should have woken the session without user input (REQ-002).\n\
          stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    Ok(())
+}
+
+// ===========================================================================
+// Scenario 94: CLI shorthand prompt defaults to `run`
+// ===========================================================================
+
+#[tokio::test]
+#[ignore = "lane:e2e-smoke"]
+async fn e2e_scenario_94_cli_shorthand_prompt() -> Result<(), Box<dyn std::error::Error>> {
+    if skip_if_no_api_prereqs() {
+        return Ok(());
+    }
+
+    if std::env::var("RUN_TEST_E2E_S94_INNER").is_ok() {
+        return inner_e2e_cli_shorthand_prompt().await;
+    }
+
+    let temp_dir = TempDir::new()?;
+    let project_dir = temp_dir.path().join("project");
+    tokio::fs::create_dir_all(project_dir.join(".rkat")).await?;
+    let data_dir = temp_dir.path().join("data");
+    tokio::fs::create_dir_all(&data_dir).await?;
+    let rkat = rkat_binary_path().ok_or("rkat binary not found")?;
+
+    let status = Command::new(std::env::current_exe()?)
+        .arg("e2e_scenario_94_cli_shorthand_prompt")
+        .arg("--ignored")
+        .env("RUN_TEST_E2E_S94_INNER", "1")
+        .env("CARGO_BIN_EXE_rkat", &rkat)
+        .env("HOME", temp_dir.path())
+        .env("XDG_DATA_HOME", &data_dir)
+        .env("TEST_PROJECT_DIR", &project_dir)
+        .status()
+        .await?;
+
+    assert!(status.success(), "inner test failed");
+    Ok(())
+}
+
+async fn inner_e2e_cli_shorthand_prompt() -> Result<(), Box<dyn std::error::Error>> {
+    let project_dir = PathBuf::from(std::env::var("TEST_PROJECT_DIR")?);
+    std::env::set_current_dir(&project_dir)?;
+    write_smoke_config(&project_dir).await?;
+
+    let rkat = rkat_binary_path().ok_or("rkat binary not found")?;
+    let output = timeout(
+        Duration::from_secs(120),
+        Command::new(&rkat)
+            .current_dir(&project_dir)
+            .arg("Hello Meerkat!")
+            .output(),
+    )
+    .await??;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "shorthand `rkat 'Hello Meerkat!'` failed (exit {:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status.code()
+    );
+    assert!(
+        !stdout.trim().is_empty(),
+        "shorthand prompt succeeded without an assistant response\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("unrecognized subcommand") && !stderr.contains("Usage: rkat"),
+        "shorthand prompt was parsed as a subcommand instead of the default run path\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     Ok(())

@@ -361,26 +361,26 @@ impl WorkGraphService {
             filter.namespace = Some(self.default_namespace.clone());
         }
         self.scope(filter.realm_id.clone(), filter.namespace.clone())?;
-        let status_filter = filter.status.take();
+        let status_filter = filter.status.clone();
         let now = self.store.get_store_time_utc().await?;
-        let candidates = self
+        let attention = self
             .store
-            .list_attention_bounded(filter, MAX_COLLECTION_LIMIT.saturating_add(1))
+            .list_attention_matching_bounded(filter, now, MAX_COLLECTION_LIMIT.saturating_add(1))
             .await?;
-        if candidates.len() > MAX_COLLECTION_LIMIT {
+        if let Some(status) = status_filter.as_ref() {
+            for binding in &attention {
+                if !WorkAttentionMachine::matches_status_filter_at(binding, status, now)? {
+                    return Err(WorkGraphError::Store(format!(
+                        "workgraph store returned attention binding {} outside the effective status filter",
+                        binding.binding_id
+                    )));
+                }
+            }
+        }
+        if attention.len() > MAX_COLLECTION_LIMIT {
             return Err(WorkGraphError::InvalidInput(format!(
                 "attention list exceeds the atomic {MAX_COLLECTION_LIMIT}-row limit; narrow the scope"
             )));
-        }
-        let mut attention = Vec::new();
-        for binding in candidates {
-            let matches = match status_filter.as_ref() {
-                Some(status) => attention_status_matches_at(&binding, status, now)?,
-                None => true,
-            };
-            if matches {
-                attention.push(binding);
-            }
         }
         Ok(AttentionListResult { attention })
     }
@@ -2067,30 +2067,6 @@ fn validate_completion_policy(policy: &WorkCompletionPolicy) -> Result<(), WorkG
     Ok(())
 }
 
-fn attention_status_matches_at(
-    binding: &WorkAttentionBinding,
-    filter: &WorkAttentionStatus,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<bool, WorkGraphError> {
-    // The "active at now" verdict over the machine-owned lifecycle phase +
-    // paused-until deadline is a WorkAttentionLifecycleMachine fact: it is exactly
-    // the machine's ClassifyAttentionEligibility verdict (Active, or Paused past
-    // its deadline). The shell extracts no fact — it drives the machine classifier
-    // and mirrors the emitted eligibility, failing closed. The Superseded/Stopped
-    // filter arms remain a pure typed phase observation.
-    Ok(match filter {
-        WorkAttentionStatus::Active => WorkAttentionMachine::classify_eligibility_at(binding, now)?,
-        WorkAttentionStatus::Paused { .. } => {
-            matches!(binding.status, WorkAttentionStatus::Paused { .. })
-                && !WorkAttentionMachine::classify_eligibility_at(binding, now)?
-        }
-        WorkAttentionStatus::Superseded => {
-            matches!(binding.status, WorkAttentionStatus::Superseded)
-        }
-        WorkAttentionStatus::Stopped => matches!(binding.status, WorkAttentionStatus::Stopped),
-    })
-}
-
 /// Count the unresolved blocking edges for `item`.
 ///
 /// The per-blocking-edge SATISFACTION verdict ("is this blocker resolved?") is a
@@ -2400,6 +2376,17 @@ mod tests {
             filter: AttentionListRequest,
         ) -> Result<Vec<WorkAttentionBinding>, crate::WorkGraphError> {
             self.inner.list_attention(filter).await
+        }
+
+        async fn list_attention_matching_bounded(
+            &self,
+            filter: AttentionListRequest,
+            observed_at: chrono::DateTime<chrono::Utc>,
+            limit: usize,
+        ) -> Result<Vec<WorkAttentionBinding>, crate::WorkGraphError> {
+            self.inner
+                .list_attention_matching_bounded(filter, observed_at, limit)
+                .await
         }
 
         async fn insert_edge(

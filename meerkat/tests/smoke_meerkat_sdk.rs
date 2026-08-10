@@ -914,7 +914,7 @@ mod scenario_07_session_resume {
 
             eprintln!("[scenario 7] Phase 2: {}", result.text.trim());
             assert!(
-                result.text.contains("ALPHA") || result.text.contains('7'),
+                result.text.contains("ALPHA") && result.text.contains('7'),
                 "Resumed agent should remember the secret code: {}",
                 result.text
             );

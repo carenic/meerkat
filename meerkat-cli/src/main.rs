@@ -10877,7 +10877,7 @@ async fn run_agent(
 
         if keep_alive {
             eprintln!(
-                "Running in keep-alive mode{} (Ctrl+C to exit)...",
+                "Running in keep-alive mode{} (Ctrl+C or SIGTERM to exit)...",
                 if verbose { " with verbose output" } else { "" }
             );
         }
@@ -11182,12 +11182,12 @@ async fn run_agent(
         // The runtime adapter, comms drain, and detached wake will inject new turns
         // automatically. Without this, the process exits after the first turn.
         if keep_alive && matches!(&turn_result, Ok(CliRuntimeTurnResult::Completed(_))) {
-            eprintln!("Keep-alive: initial turn complete, waiting for events (Ctrl+C to exit)...");
+            eprintln!(
+                "Keep-alive: initial turn complete, waiting for events (Ctrl+C or SIGTERM to exit)..."
+            );
             // Block until SIGINT/SIGTERM. The runtime loop, comms drain, and
             // detached wake tasks continue running in background tokio tasks.
-            tokio::signal::ctrl_c()
-                .await
-                .map_err(|e| anyhow::anyhow!("signal wait failed: {e}"))?;
+            mob_host::wait_for_shutdown_signal().await?;
             eprintln!("\nShutting down...");
         }
 
@@ -11868,10 +11868,10 @@ async fn resume_session_with_llm_override(
         .await;
 
         if keep_alive && matches!(&turn_result, Ok(CliRuntimeTurnResult::Completed(_))) {
-            eprintln!("Keep-alive: resume turn complete, waiting for events (Ctrl+C to exit)...");
-            tokio::signal::ctrl_c()
-                .await
-                .map_err(|e| anyhow::anyhow!("signal wait failed: {e}"))?;
+            eprintln!(
+                "Keep-alive: resume turn complete, waiting for events (Ctrl+C or SIGTERM to exit)..."
+            );
+            mob_host::wait_for_shutdown_signal().await?;
             eprintln!("\nShutting down...");
         }
 
@@ -20051,6 +20051,37 @@ default_model = "gemma"
 
         fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
             Some(Arc::clone(&self.runtime_adapter))
+        }
+
+        fn supports_runtime_turn_apply(&self) -> bool {
+            true
+        }
+
+        async fn apply_runtime_turn(
+            &self,
+            session_id: &SessionId,
+            run_id: meerkat_core::RunId,
+            req: meerkat_core::service::StartTurnRequest,
+            boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary,
+            contributing_input_ids: Vec<meerkat_core::InputId>,
+        ) -> Result<
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+            meerkat_core::service::SessionError,
+        > {
+            <Self as SessionService>::start_turn(self, session_id, req).await?;
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                    meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
+                        run_id,
+                        boundary,
+                        contributing_input_ids,
+                        conversation_digest: None,
+                        message_count: 0,
+                    },
+                    None,
+                    None,
+                ),
+            )
         }
 
         async fn live_session_actor_registered(

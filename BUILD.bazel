@@ -251,8 +251,12 @@ E2E_SMOKE_REMOTE_DATA = [
     "//meerkat-cli:cli_mobpack_live_smoke_test",
     "//meerkat-cli:live_smoke_cli_test",
     "//meerkat-cli:rkat",
+    "//meerkat-cli:storage_migrate_test",
+    "//meerkat-cli:system_mob_host_daemon_test",
     "//meerkat-comms:e2e_test",
     "//meerkat:live_meerkat_regression_test",
+    "//meerkat:smoke_meerkat_sdk_test",
+    "//meerkat-mcp-server:live_mcp_matrix_test",
     "//meerkat-mcp-server:rkat_mcp_bin",
     "//meerkat-mob:smoke_mob_flow_runtime_test",
     "//meerkat-mob:smoke_mob_generated_image_comms_test",
@@ -260,6 +264,7 @@ E2E_SMOKE_REMOTE_DATA = [
     "//meerkat-mob:smoke_mob_turn_latency_test",
     "//meerkat-mob:smoke_mob_resume_test",
     "//meerkat-rest:rkat_rest_bin",
+    "//meerkat-rest:live_rest_matrix_test",
     "//meerkat-rpc:live_smoke_rpc_test",
     "//meerkat-rpc:rkat_rpc_bin",
     "//tests/integration:e2e_artifacts_bin",
@@ -282,9 +287,10 @@ E2E_SMOKE_REMOTE_ENV = {
 }
 
 E2E_SMOKE_TURBO_S_SCENARIOS = [
-    16, 21, 22, 28, 30, 44, 47, 48, 49, 50, 51, 52,
-    53, 54, 71, 72, 74, 75, 76, 77, 78, 79, 80, 81,
-    82, 83, 84, 85, 86, 87, 88, 89, 90, 92, 93,
+    16, 21, 22, 23, 25, 26, 27, 28, 30, 31, 38, 39,
+    43, 44, 47, 48, 49, 50, 51, 52, 53, 54, 71, 72,
+    74, 76, 77, 79, 80, 82, 83, 84, 85, 86, 87, 88,
+    89, 90, 92, 93, 94,
 ]
 
 E2E_SMOKE_TURBO_S_SUITES = [
@@ -296,6 +302,9 @@ E2E_SMOKE_TURBO_S_SUITES = [
     ("durable_jobs_workgraph_recovery", "durable-jobs-workgraph-recovery"),
     ("mob_live_smoke", "mob-live-smoke"),
     ("mob_external_tcp_production_drain", "mob-external-tcp-production-drain"),
+    ("rust_sdk_persist_resume", "rust-sdk-persist-resume"),
+    ("rust_sdk_hooks", "rust-sdk-hooks"),
+    ("cli_storage_split_brain", "cli-storage-split-brain"),
     ("mob_idle_burn", "mob-idle-burn"),
     ("mob_turn_latency", "mob-turn-latency"),
 ]
@@ -308,15 +317,6 @@ E2E_SMOKE_TURBO_S_FLOW_RUNTIME_TESTS = [
     ("parallel_body_siblings_join", "e2e_flow_runtime_parallel_body_siblings_join_smoke"),
     ("nested_outer_inner_loop", "e2e_flow_runtime_nested_outer_inner_loop_smoke"),
     ("fanin_after_parallel_loops", "e2e_flow_runtime_fanin_after_parallel_loops_smoke"),
-    ("conditional_skip_inside_body_loop", "e2e_flow_runtime_conditional_skip_inside_body_loop_smoke"),
-    ("three_way_branch_loop_audit", "e2e_flow_runtime_three_way_branch_loop_audit_smoke"),
-    ("sequential_loop_chain", "e2e_flow_runtime_sequential_loop_chain_smoke"),
-    ("three_sibling_loops_join", "e2e_flow_runtime_three_sibling_loops_join_smoke"),
-    ("outer_branch_inner_loop", "e2e_flow_runtime_outer_branch_inner_loop_smoke"),
-    ("persisted_branch_parallel_review_loop", "e2e_flow_runtime_persisted_branch_parallel_review_loop_smoke"),
-    ("persisted_dual_loops_fanin", "e2e_flow_runtime_persisted_dual_loops_fanin_smoke"),
-    ("persisted_sequential_loop_chain", "e2e_flow_runtime_persisted_sequential_loop_chain_smoke"),
-    ("persisted_three_sibling_loops_join", "e2e_flow_runtime_persisted_three_sibling_loops_join_smoke"),
     ("persisted_branch_dual_loops_audit", "e2e_flow_runtime_persisted_branch_dual_loops_audit_smoke"),
 ]
 

@@ -172,10 +172,17 @@ macro_rules! e2e_smoke_lane_entries {
             scenario(e2e_smoke_s16_rpc_kitchen_sink, 16);
             scenario(e2e_smoke_s21_rpc_mob_callback_tools, 21);
             scenario(e2e_smoke_s22_rpc_transport_backpressure, 22);
+            scenario(e2e_smoke_s23_rest_sse_follow_up, 23);
+            scenario(e2e_smoke_s25_rest_reload_and_resume, 25);
+            scenario(e2e_smoke_s26_cli_run_and_resume, 26);
             scenario(e2e_smoke_s27_cli_shell_and_structured_output, 27);
             scenario(e2e_smoke_s28_cli_signed_mobpack_deploy, 28);
             scenario(e2e_smoke_s30_cli_mob_flow_probe, 30);
+            scenario(e2e_smoke_s31_mcp_stdio_run_and_resume, 31);
+            scenario(e2e_smoke_s38_python_sdk_context_injection, 38);
+            scenario(e2e_smoke_s39_python_sdk_persistent_reconnect, 39);
             scenario(e2e_smoke_s40_python_sdk_mixed_provider_swarm_probe, 40);
+            scenario(e2e_smoke_s43_typescript_sdk_persistent_reconnect, 43);
             scenario(e2e_smoke_s44_typescript_sdk_mixed_provider_swarm_probe, 44);
             scenario(e2e_smoke_s47_browser_mobpack_session_flow, 47);
             scenario(e2e_smoke_s48_browser_raw_mob_lifecycle, 48);
@@ -209,6 +216,7 @@ macro_rules! e2e_smoke_lane_entries {
             scenario(e2e_smoke_s91_live_adapter_image_input, 91);
             scenario(e2e_smoke_s92_remote_mob_live_placed_overlay_roundtrip, 92);
             scenario(e2e_smoke_s93_remote_mob_two_host_constellation_join, 93);
+            scenario(e2e_smoke_s94_cli_shorthand_prompt, 94);
             suite(e2e_smoke_rpc_dynamic_tool_pickup, "rpc-dynamic-tool-pickup");
             suite(e2e_smoke_rpc_deferred_catalog_session, "rpc-deferred-catalog-session");
             suite(e2e_smoke_cli_background_job_active_turn, "cli-background-job-active-turn");
@@ -217,6 +225,9 @@ macro_rules! e2e_smoke_lane_entries {
             suite(e2e_smoke_durable_jobs_workgraph_recovery, "durable-jobs-workgraph-recovery");
             suite(e2e_smoke_mob_live_smoke, "mob-live-smoke");
             suite(e2e_smoke_mob_external_tcp_production_drain, "mob-external-tcp-production-drain");
+            suite(e2e_smoke_rust_sdk_persist_resume, "rust-sdk-persist-resume");
+            suite(e2e_smoke_rust_sdk_hooks, "rust-sdk-hooks");
+            suite(e2e_smoke_cli_storage_split_brain, "cli-storage-split-brain");
             suite(e2e_smoke_mob_flow_runtime_suite, "mob-flow-runtime");
             suite(e2e_smoke_turbo_s_idle_burn, "mob-idle-burn");
             suite(e2e_smoke_turbo_s_turn_latency, "mob-turn-latency");
@@ -2481,9 +2492,14 @@ fn bazel_rust_test_relative(key: &str) -> Result<&'static str, String> {
         "meerkat-mob:smoke_mob_pictionary" => Ok("meerkat-mob/smoke_mob_pictionary_test"),
         "meerkat-mob:smoke_mob_resume" => Ok("meerkat-mob/smoke_mob_resume_test"),
         "meerkat:live_meerkat_regression" => Ok("meerkat/live_meerkat_regression_test"),
+        "meerkat:smoke_meerkat_sdk" => Ok("meerkat/smoke_meerkat_sdk_test"),
+        "meerkat-mcp-server:live_mcp_matrix" => Ok("meerkat-mcp-server/live_mcp_matrix_test"),
+        "meerkat-rest:live_rest_matrix" => Ok("meerkat-rest/live_rest_matrix_test"),
         "meerkat-rpc:live_smoke_rpc" => Ok("meerkat-rpc/live_smoke_rpc_test"),
         "rkat:cli_mobpack_live_smoke" => Ok("meerkat-cli/cli_mobpack_live_smoke_test"),
         "rkat:live_smoke_cli" => Ok("meerkat-cli/live_smoke_cli_test"),
+        "rkat:storage_migrate" => Ok("meerkat-cli/storage_migrate_test"),
+        "rkat:system_mob_host_daemon" => Ok("meerkat-cli/system_mob_host_daemon_test"),
         other => Err(format!(
             "no Bazel e2e artifact mapping for Rust test {other}"
         )),
@@ -2891,7 +2907,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
         }),
         23 => Some(&Spec {
             id: Some(23),
-            lane: Lane::Live,
+            lane: Lane::Smoke,
             title: "REST SSE follow-up event stream",
             timeout_secs: 900,
             required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
@@ -2929,7 +2945,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
         }),
         25 => Some(&Spec {
             id: Some(25),
-            lane: Lane::Live,
+            lane: Lane::Smoke,
             title: "REST reload and resume on same realm root",
             timeout_secs: 900,
             required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
@@ -2948,7 +2964,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
         }),
         26 => Some(&Spec {
             id: Some(26),
-            lane: Lane::Live,
+            lane: Lane::Smoke,
             title: "CLI run and resume persistence",
             timeout_secs: 900,
             required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
@@ -3043,7 +3059,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
         }),
         31 => Some(&Spec {
             id: Some(31),
-            lane: Lane::Live,
+            lane: Lane::Smoke,
             title: "MCP stdio run and resume lifecycle",
             timeout_secs: 1200,
             required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
@@ -3267,7 +3283,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
         }),
         38 => Some(&Spec {
             id: Some(38),
-            lane: Lane::Live,
+            lane: Lane::Smoke,
             title: "Python SDK context injection and streaming",
             timeout_secs: 1200,
             required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
@@ -3299,7 +3315,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
         }),
         39 => Some(&Spec {
             id: Some(39),
-            lane: Lane::Live,
+            lane: Lane::Smoke,
             title: "Python SDK persistent reconnect and runtime accept",
             timeout_secs: 1500,
             required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
@@ -3424,7 +3440,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
         }),
         43 => Some(&Spec {
             id: Some(43),
-            lane: Lane::Live,
+            lane: Lane::Smoke,
             title: "TypeScript SDK persistent reconnect and resume",
             timeout_secs: 1500,
             required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
@@ -3893,7 +3909,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
         71 => Some(&Spec {
             id: Some(71),
             lane: Lane::Smoke,
-            title: "Live adapter realtime audio roundtrip with TTS barge-in and tool dispatch",
+            title: "Live adapter realtime audio roundtrip with TTS barge-in and recall",
             timeout_secs: 600,
             required_env: &[&["RKAT_OPENAI_API_KEY", "OPENAI_API_KEY"]],
             required_bins: &["cargo"],
@@ -4002,6 +4018,25 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
                 package: "meerkat-mob",
                 test_target: "smoke_mob_flow_runtime",
                 test_name: "e2e_smoke_s93_remote_mob_two_host_constellation_join",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        94 => Some(&Spec {
+            id: Some(94),
+            lane: Lane::Smoke,
+            title: "CLI shorthand prompt default command",
+            timeout_secs: 600,
+            required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &["rkat"],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "live_smoke_cli",
+                test_name: "e2e_scenario_94_cli_shorthand_prompt",
                 features: &["integration-real-tests"],
                 all_features: false,
             },
@@ -4344,7 +4379,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
             command: CommandSpec::CargoTest {
                 package: "meerkat-comms",
                 test_target: "e2e",
-                test_name: "e2e_smoke_mcp_multimodal_blob_current_turn_request_response_loop",
+                test_name: "e2e_smoke_mcp_multimodal_blob_response_transport",
                 features: &["integration-real-tests"],
                 all_features: false,
             },
@@ -5210,6 +5245,72 @@ fn suite_spec(name: &str) -> Option<&'static Spec> {
                 output_policy: OutputPolicy::CargoTest,
             },
         }),
+        "rust-sdk-persist-resume" => Some(&Spec {
+            id: None,
+            lane: Lane::Smoke,
+            title: "Native Rust SDK session persistence and resume",
+            timeout_secs: 900,
+            required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "meerkat",
+                test_target: "smoke_meerkat_sdk",
+                test_name: "e2e_smoke_session_persist_and_resume",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "rust-sdk-hooks" => Some(&Spec {
+            id: None,
+            lane: Lane::Smoke,
+            title: "Native Rust SDK hooks pipeline",
+            timeout_secs: 900,
+            required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "meerkat",
+                test_target: "smoke_meerkat_sdk",
+                test_name: "e2e_smoke_hooks_pipeline",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "cli-storage-split-brain" => Some(&Spec {
+            id: None,
+            lane: Lane::Smoke,
+            title: "CLI storage split-brain refusal and recovery",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &["rkat"],
+            pre_commands: &[],
+            command: CommandSpec::Raw {
+                argv: &[
+                    "cargo",
+                    "test",
+                    "-p",
+                    "rkat",
+                    "--features",
+                    "integration-real-tests",
+                    "--test",
+                    "storage_migrate",
+                    "split_brain_refuses_without_adopt_root_then_archives_the_other_copy",
+                    "--",
+                    "--nocapture",
+                ],
+                output_policy: OutputPolicy::CargoTest,
+            },
+        }),
         "rpc-mob-callback-tools" => Some(&Spec {
             id: None,
             lane: Lane::Smoke,
@@ -5787,8 +5888,8 @@ mod tests {
         let system = (15..=56)
             .filter(|id| scenario_spec(*id).map(|spec| spec.lane) == Some(Lane::System))
             .count();
-        assert_eq!(live, 24);
-        assert_eq!(smoke, 17);
+        assert_eq!(live, 17);
+        assert_eq!(smoke, 24);
         assert_eq!(system, 1);
     }
 

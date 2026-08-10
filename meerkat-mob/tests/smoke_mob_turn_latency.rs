@@ -128,13 +128,20 @@ impl meerkat_client::LlmClient for CaptureClient {
 
     fn stream<'a>(
         &'a self,
-        _request: &'a meerkat_client::LlmRequest,
+        request: &'a meerkat_client::LlmRequest,
     ) -> meerkat_client::types::LlmStream<'a> {
         self.requests.fetch_add(1, Ordering::SeqCst);
         let events = vec![
             meerkat_client::LlmEvent::TextDelta {
                 delta: "ok".to_string(),
                 meta: None,
+            },
+            meerkat_client::LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    meerkat_core::Provider::OpenAI,
+                    &request.model,
+                    meerkat_core::Usage::default(),
+                ),
             },
             meerkat_client::LlmEvent::Done {
                 outcome: meerkat_client::LlmDoneOutcome::Success {

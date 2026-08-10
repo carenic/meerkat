@@ -156,7 +156,9 @@ pub async fn spawn_production_external_tcp_target(peer_name: &str) -> Production
     // and the supervisor trust publish is rejected ("minted by a different
     // generated owner"). A real session-backed external member gets this wiring
     // from its SessionRuntimeBindings; this simulation installs it explicitly.
-    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let adapter = Arc::new(MeerkatMachine::persistent_without_blobs(Arc::new(
+        meerkat_runtime::InMemoryRuntimeStore::default(),
+    )));
     adapter
         .register_session(session_id.clone())
         .await

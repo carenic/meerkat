@@ -48,6 +48,8 @@ fn mcp_bootstrap(root: &Path, instance_id: &str) -> RuntimeBootstrap {
 }
 
 fn stdio_server_config(root: &Path, instance_id: &str) -> McpServerConfig {
+    let project_root = root.join("project");
+    std::fs::create_dir_all(project_root.join(".rkat")).expect("project root should initialize");
     let mut env = HashMap::new();
     env.insert(
         "ANTHROPIC_API_KEY".to_string(),
@@ -65,7 +67,7 @@ fn stdio_server_config(root: &Path, instance_id: &str) -> McpServerConfig {
             "--state-root".to_string(),
             root.join("realms").display().to_string(),
             "--context-root".to_string(),
-            root.join("project").display().to_string(),
+            project_root.display().to_string(),
             "--expose-paths".to_string(),
         ],
         env,
@@ -447,7 +449,7 @@ async fn read_http_response(socket: &mut TcpStream) -> io::Result<(u16, Vec<u8>)
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "lane:e2e-smoke"]
 async fn e2e_scenario_31_mcp_stdio_run_resume_lifecycle() {
     let Some(_client) = live_client() else {
         eprintln!("Skipping scenario 31: missing ANTHROPIC_API_KEY");

@@ -308,6 +308,23 @@ pub trait WorkGraphStore: Send + Sync {
         Ok(bindings)
     }
 
+    /// Return at most `limit` rows after applying the public effective-status
+    /// contract at `observed_at`.
+    ///
+    /// This is required because `Active` includes deadline-elapsed Paused rows,
+    /// while pending Paused rows do not match. Applying a storage limit before
+    /// that machine-owned classification lets terminal history crowd every live
+    /// row out of the bounded result. Durable backends must push coarse phase
+    /// and scope predicates into their query, then apply the exact machine
+    /// classifier before counting a row toward `limit`. Results are ordered by
+    /// `updated_at`, then `binding_id`, matching the ordinary list contract.
+    async fn list_attention_matching_bounded(
+        &self,
+        filter: AttentionListRequest,
+        observed_at: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<WorkAttentionBinding>, WorkGraphError>;
+
     /// Delete TERMINAL (superseded/stopped) attention binding rows in scope.
     /// The event stream keeps the audit history; binding rows otherwise grow
     /// monotonically with reassignment churn. Returns the pruned row count.
@@ -476,6 +493,15 @@ impl WorkGraphStore for DisabledWorkGraphStore {
     async fn list_attention(
         &self,
         _filter: AttentionListRequest,
+    ) -> Result<Vec<WorkAttentionBinding>, WorkGraphError> {
+        Err(unsupported(self.kind()))
+    }
+
+    async fn list_attention_matching_bounded(
+        &self,
+        _filter: AttentionListRequest,
+        _observed_at: DateTime<Utc>,
+        _limit: usize,
     ) -> Result<Vec<WorkAttentionBinding>, WorkGraphError> {
         Err(unsupported(self.kind()))
     }
@@ -1138,6 +1164,49 @@ impl WorkGraphStore for MemoryWorkGraphStore {
         });
         if let Some(limit) = filter.limit {
             bindings.truncate(limit);
+        }
+        Ok(bindings)
+    }
+
+    async fn list_attention_matching_bounded(
+        &self,
+        filter: AttentionListRequest,
+        observed_at: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<WorkAttentionBinding>, WorkGraphError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let guard = self.inner.read().await;
+        let compare = |left: &WorkAttentionBinding, right: &WorkAttentionBinding| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.binding_id.cmp(&right.binding_id))
+        };
+        let mut bindings = Vec::with_capacity(limit.min(1024));
+        for binding in guard.attention.values() {
+            if !attention_matches_non_status_filter(binding, &filter) {
+                continue;
+            }
+            if let Some(status) = filter.status.as_ref()
+                && (!attention_is_coarse_status_candidate(&binding.status, status)
+                    || !WorkAttentionMachine::matches_status_filter_at(
+                        binding,
+                        status,
+                        observed_at,
+                    )?)
+            {
+                continue;
+            }
+            let index = bindings
+                .binary_search_by(|existing| compare(existing, binding))
+                .unwrap_or_else(|index| index);
+            if index < limit {
+                bindings.insert(index, binding.clone());
+                if bindings.len() > limit {
+                    bindings.pop();
+                }
+            }
         }
         Ok(bindings)
     }
@@ -2033,7 +2102,10 @@ fn attention_transition_event(
     )
 }
 
-fn attention_matches_filter(binding: &WorkAttentionBinding, filter: &AttentionListRequest) -> bool {
+fn attention_matches_non_status_filter(
+    binding: &WorkAttentionBinding,
+    filter: &AttentionListRequest,
+) -> bool {
     if let Some(realm_id) = &filter.realm_id
         && &binding.work_ref.realm_id != realm_id
     {
@@ -2049,12 +2121,15 @@ fn attention_matches_filter(binding: &WorkAttentionBinding, filter: &AttentionLi
     {
         return false;
     }
-    if let Some(status) = &filter.status
-        && !attention_status_matches_filter(&binding.status, status)
-    {
-        return false;
-    }
     true
+}
+
+fn attention_matches_filter(binding: &WorkAttentionBinding, filter: &AttentionListRequest) -> bool {
+    attention_matches_non_status_filter(binding, filter)
+        && filter
+            .status
+            .as_ref()
+            .is_none_or(|status| attention_status_matches_filter(&binding.status, status))
 }
 
 fn attention_status_matches_filter(
@@ -2077,6 +2152,27 @@ fn attention_status_matches_filter(
             },
         ) => actual_until == filter_until,
         _ => false,
+    }
+}
+
+fn attention_is_coarse_status_candidate(
+    actual: &WorkAttentionStatus,
+    filter: &WorkAttentionStatus,
+) -> bool {
+    match filter {
+        WorkAttentionStatus::Active => {
+            matches!(
+                actual,
+                WorkAttentionStatus::Active | WorkAttentionStatus::Paused { .. }
+            )
+        }
+        WorkAttentionStatus::Paused { .. } => {
+            matches!(actual, WorkAttentionStatus::Paused { .. })
+        }
+        WorkAttentionStatus::Superseded => {
+            matches!(actual, WorkAttentionStatus::Superseded)
+        }
+        WorkAttentionStatus::Stopped => matches!(actual, WorkAttentionStatus::Stopped),
     }
 }
 
@@ -2602,6 +2698,7 @@ impl WorkGraphStore for SqliteWorkGraphStore {
                     status: None,
                 },
                 None,
+                None,
             )?;
             let mut stopped_attention = Vec::new();
             for binding in attention.into_iter().filter(|binding| {
@@ -2713,6 +2810,7 @@ impl WorkGraphStore for SqliteWorkGraphStore {
                     target: None,
                     status: None,
                 },
+                None,
                 None,
             )?;
             let event_high_water_mark = latest_sqlite_event_seq(
@@ -3237,7 +3335,7 @@ impl WorkGraphStore for SqliteWorkGraphStore {
         &self,
         filter: AttentionListRequest,
     ) -> Result<Vec<WorkAttentionBinding>, WorkGraphError> {
-        self.with_connection(|conn| list_sqlite_attention(conn, &filter, None))
+        self.with_connection(|conn| list_sqlite_attention(conn, &filter, None, None))
     }
 
     async fn list_attention_bounded(
@@ -3245,7 +3343,18 @@ impl WorkGraphStore for SqliteWorkGraphStore {
         filter: AttentionListRequest,
         limit: usize,
     ) -> Result<Vec<WorkAttentionBinding>, WorkGraphError> {
-        self.with_connection(|conn| list_sqlite_attention(conn, &filter, Some(limit)))
+        self.with_connection(|conn| list_sqlite_attention(conn, &filter, Some(limit), None))
+    }
+
+    async fn list_attention_matching_bounded(
+        &self,
+        filter: AttentionListRequest,
+        observed_at: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<WorkAttentionBinding>, WorkGraphError> {
+        self.with_connection(|conn| {
+            list_sqlite_attention(conn, &filter, Some(limit), Some(observed_at))
+        })
     }
 
     async fn prune_terminal_attention(
@@ -4418,6 +4527,7 @@ fn list_sqlite_attention(
     conn: &Connection,
     filter: &AttentionListRequest,
     limit: Option<usize>,
+    effective_at: Option<DateTime<Utc>>,
 ) -> Result<Vec<WorkAttentionBinding>, WorkGraphError> {
     if limit == Some(0) {
         return Ok(Vec::new());
@@ -4437,8 +4547,35 @@ fn list_sqlite_attention(
         clauses.push(format!("namespace = ?{}", params.len()));
     }
     if let Some(status) = &filter.status {
-        params.push(Box::new(status.status_key().to_string()));
-        clauses.push(format!("(status = ?{} OR status IS NULL)", params.len()));
+        match (status, effective_at) {
+            (WorkAttentionStatus::Active, Some(_)) => {
+                clauses.push(
+                    "(status NOT IN ('superseded', 'stopped') OR status IS NULL)".to_string(),
+                );
+            }
+            (WorkAttentionStatus::Paused { .. }, Some(_)) => {
+                clauses.push(
+                    "(status = 'paused' OR status NOT IN ('active', 'paused', 'superseded', 'stopped') OR status IS NULL)"
+                        .to_string(),
+                );
+            }
+            (WorkAttentionStatus::Superseded, Some(_)) => {
+                clauses.push(
+                    "(status = 'superseded' OR status NOT IN ('active', 'paused', 'superseded', 'stopped') OR status IS NULL)"
+                        .to_string(),
+                );
+            }
+            (WorkAttentionStatus::Stopped, Some(_)) => {
+                clauses.push(
+                    "(status = 'stopped' OR status NOT IN ('active', 'paused', 'superseded', 'stopped') OR status IS NULL)"
+                        .to_string(),
+                );
+            }
+            _ => {
+                params.push(Box::new(status.status_key().to_string()));
+                clauses.push(format!("(status = ?{} OR status IS NULL)", params.len()));
+            }
+        }
     }
     if let Some(target) = &filter.target {
         params.push(Box::new(target.target_key()));
@@ -4467,7 +4604,15 @@ fn list_sqlite_attention(
     let mut bindings = Vec::new();
     for row in rows {
         let binding = row.map_err(|err| WorkGraphError::Store(err.to_string()))?;
-        if attention_matches_filter(&binding, filter) {
+        let matches = attention_matches_non_status_filter(&binding, filter)
+            && match (filter.status.as_ref(), effective_at) {
+                (Some(status), Some(observed_at)) => {
+                    WorkAttentionMachine::matches_status_filter_at(&binding, status, observed_at)?
+                }
+                (Some(status), None) => attention_status_matches_filter(&binding.status, status),
+                (None, _) => true,
+            };
+        if matches {
             bindings.push(binding);
             if limit.is_some_and(|limit| bindings.len() >= limit) {
                 break;

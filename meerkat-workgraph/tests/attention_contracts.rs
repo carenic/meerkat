@@ -662,6 +662,40 @@ async fn goal_attention_status_contract_is_identical_on_sqlite_store() {
         .expect("list paused sqlite attention");
     assert_eq!(listed.attention.len(), 1);
 
+    let resumed = service
+        .resume_attention(AttentionResumeRequest {
+            binding_id: listed.attention[0].binding_id.clone(),
+            realm_id: Some("realm-sqlite".to_string()),
+            namespace: Some(WorkNamespace::new("goals").expect("namespace")),
+            expected_revision: listed.attention[0].machine_state.revision,
+        })
+        .await
+        .expect("resume sqlite attention");
+    service
+        .pause_attention(AttentionPauseRequest {
+            binding_id: resumed.attention.binding_id.clone(),
+            realm_id: Some("realm-sqlite".to_string()),
+            namespace: Some(WorkNamespace::new("goals").expect("namespace")),
+            expected_revision: resumed.attention.machine_state.revision,
+            until: Some(Utc::now() - chrono::Duration::seconds(1)),
+        })
+        .await
+        .expect("pause sqlite attention with elapsed deadline");
+    let active = service
+        .list_attention(AttentionListRequest {
+            realm_id: Some("realm-sqlite".to_string()),
+            namespace: Some(WorkNamespace::new("goals").expect("namespace")),
+            target: None,
+            status: Some(WorkAttentionStatus::Active),
+        })
+        .await
+        .expect("elapsed paused sqlite attention is effectively active");
+    assert_eq!(active.attention.len(), 1);
+    assert!(matches!(
+        active.attention[0].status,
+        WorkAttentionStatus::Paused { .. }
+    ));
+
     service
         .goal_request_close(GoalRequestCloseRequest {
             binding_id: goal.attention.binding_id.clone(),
@@ -682,6 +716,69 @@ async fn goal_attention_status_contract_is_identical_on_sqlite_store() {
         .await
         .expect("sqlite goal status");
     assert_eq!(status.attention.status, WorkAttentionStatus::Stopped);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+async fn sqlite_effective_status_query_reclassifies_unknown_legacy_index_values() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("workgraph.sqlite3");
+    let service = WorkGraphService::with_scope(
+        std::sync::Arc::new(
+            meerkat_workgraph::SqliteWorkGraphStore::open(&path)
+                .expect("open sqlite workgraph store"),
+        ),
+        "realm-legacy-status",
+        WorkNamespace::new("goals").expect("namespace"),
+    );
+    let session_id =
+        SessionId::parse("019e63c2-0000-7000-8000-000000000056").expect("valid session id");
+    let goal = service
+        .create_goal(GoalCreateRequest {
+            failed_child_join_policy: Default::default(),
+            cancelled_child_join_policy: Default::default(),
+            priority: Default::default(),
+            labels: Default::default(),
+            due_at: None,
+            not_before: None,
+            snoozed_until: None,
+            external_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: None,
+            realm_id: Some("realm-legacy-status".to_string()),
+            namespace: Some(WorkNamespace::new("goals").expect("namespace")),
+            title: "Legacy index status".to_string(),
+            description: None,
+            target: GoalAttentionTarget::Session { session_id },
+            mode: WorkAttentionMode::Review,
+            completion_policy: WorkCompletionPolicy::SelfAttest,
+            delegated_authority: AttentionDelegatedAuthority::CloseIfPolicyAllows,
+            projection_policy: AttentionProjectionPolicy::default(),
+        })
+        .await
+        .expect("create sqlite goal");
+
+    // Simulate an older binary writing an index vocabulary that this binary
+    // does not know. The authoritative JSON remains decodable and Active, so a
+    // coarse SQL predicate must admit the row for machine-owned classification.
+    let conn = rusqlite::Connection::open(&path).expect("open sqlite index for legacy mutation");
+    conn.execute(
+        "UPDATE workgraph_attention SET status = 'legacy-active-v0' WHERE binding_id = ?1",
+        [goal.attention.binding_id.as_str()],
+    )
+    .expect("write unknown legacy status index");
+    drop(conn);
+
+    let listed = service
+        .list_attention(AttentionListRequest {
+            realm_id: Some("realm-legacy-status".to_string()),
+            namespace: Some(WorkNamespace::new("goals").expect("namespace")),
+            target: None,
+            status: Some(WorkAttentionStatus::Active),
+        })
+        .await
+        .expect("unknown legacy index value reaches exact status classifier");
+    assert_eq!(listed.attention, vec![goal.attention]);
 }
 
 #[tokio::test]
@@ -3070,6 +3167,62 @@ async fn prune_terminal_attention_removes_only_terminal_bindings() {
         "only the live binding survives the prune"
     );
     assert_eq!(listed.attention[0].binding_id, second.attention.binding_id);
+}
+
+#[tokio::test]
+async fn terminal_attention_history_cannot_crowd_live_rows_out_of_a_bounded_list() {
+    let service = WorkGraphService::with_scope(
+        std::sync::Arc::new(meerkat_workgraph::MemoryWorkGraphStore::new()),
+        "realm-attention-history",
+        WorkNamespace::new("goals").expect("namespace"),
+    );
+    let session_a =
+        SessionId::parse("019e63c2-0000-7000-8000-0000000000f1").expect("valid session id");
+    let session_b =
+        SessionId::parse("019e63c2-0000-7000-8000-0000000000f2").expect("valid session id");
+    let mut request = contract_goal_request(session_a.clone(), "history pressure");
+    request.realm_id = Some("realm-attention-history".to_string());
+    request.namespace = Some(WorkNamespace::new("goals").expect("namespace"));
+    let goal = service
+        .create_goal(request)
+        .await
+        .expect("create active goal");
+    let mut current = goal.attention;
+
+    // The old service bounded the unfiltered phase rows first. Once 1,001
+    // superseded bindings preceded the live row, `status=active` failed closed
+    // even though exactly one effective match existed.
+    for index in 0..=1_000 {
+        let target = if index % 2 == 0 {
+            session_b.clone()
+        } else {
+            session_a.clone()
+        };
+        current = service
+            .break_glass_reassign_attention(meerkat_workgraph::BreakGlassAttentionReassignRequest {
+                binding_id: current.binding_id.clone(),
+                realm_id: Some("realm-attention-history".to_string()),
+                namespace: Some(WorkNamespace::new("goals").expect("namespace")),
+                expected_revision: current.machine_state.revision,
+                target: GoalAttentionTarget::Session { session_id: target },
+                principal: "operator@test".to_string(),
+                reason: "exercise bounded effective-status listing".to_string(),
+            })
+            .await
+            .expect("reassign attention while retaining terminal history")
+            .attention;
+    }
+
+    let listed = service
+        .list_attention(AttentionListRequest {
+            realm_id: Some("realm-attention-history".to_string()),
+            namespace: Some(WorkNamespace::new("goals").expect("namespace")),
+            target: None,
+            status: Some(WorkAttentionStatus::Active),
+        })
+        .await
+        .expect("terminal history cannot cause false collection overflow");
+    assert_eq!(listed.attention, vec![current]);
 }
 
 // ---------------------------------------------------------------------------

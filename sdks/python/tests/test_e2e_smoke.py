@@ -321,6 +321,7 @@ if include_scenario(38):
             assert result is not None
             final_text = (result.text or streamed_text).lower()
             assert "orbit-38" in final_text or "orbit 38" in final_text
+            assert "[py-ctx-38]" in final_text
 
             async with await session.subscribe_events() as subscription:
                 await session.turn("Repeat the codeword in two words.")
