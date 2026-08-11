@@ -2510,6 +2510,37 @@ pub struct WorkDeliveryReceipt {
     pub(crate) runtime_id: AgentRuntimeId,
 }
 
+/// Completion-bearing handle for one admitted unit of internal work.
+///
+/// [`MobHandle::submit_work`] and [`MobHandle::submit_work_with_mode`] retain
+/// their ingress-only contract. Callers that need proof of the exact runtime
+/// commit boundary use [`MobHandle::start_work_with_mode`] and await this
+/// handle instead of inferring completion from a session-wide event stream.
+#[must_use = "work turns must be awaited or deliberately detached"]
+#[derive(Debug)]
+pub struct WorkTurnHandle {
+    receipt: WorkDeliveryReceipt,
+    completion_rx: tokio::sync::oneshot::Receiver<Result<(), MobError>>,
+}
+
+impl WorkTurnHandle {
+    /// Admission receipt for the exact work item carried by this handle.
+    pub fn receipt(&self) -> &WorkDeliveryReceipt {
+        &self.receipt
+    }
+
+    /// Await the authoritative committed terminal boundary for this work item.
+    pub async fn wait(self) -> Result<WorkDeliveryReceipt, MobError> {
+        match self.completion_rx.await {
+            Ok(Ok(())) => Ok(self.receipt),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(MobError::Internal(
+                "work turn completion channel closed before terminal outcome".to_string(),
+            )),
+        }
+    }
+}
+
 /// Options for helper convenience spawns.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -8197,6 +8228,104 @@ impl MobHandle {
     ) -> Result<WorkDeliveryReceipt, MobError> {
         self.submit_work_with_mode(runtime_id, fence_token, work_ref, spec, HandlingMode::Queue)
             .await
+    }
+
+    /// Admit internal work and return an exact committed-completion handle.
+    ///
+    /// This is the completion-bearing counterpart to
+    /// [`Self::submit_work_with_mode`]. Admission still returns promptly; the
+    /// returned [`WorkTurnHandle`] resolves only after the runtime commits the
+    /// terminal boundary for this exact `SubmitWork` command.
+    pub async fn start_work_with_mode(
+        &self,
+        runtime_id: AgentRuntimeId,
+        fence_token: FenceToken,
+        work_ref: WorkRef,
+        spec: WorkSpec,
+        handling_mode: HandlingMode,
+    ) -> Result<WorkTurnHandle, MobError> {
+        self.start_work_with_mode_inner(
+            runtime_id,
+            fence_token,
+            work_ref,
+            spec,
+            handling_mode,
+            None,
+        )
+        .await
+    }
+
+    /// Admit caller-identified internal work and return its exact committed
+    /// completion handle.
+    ///
+    /// The stable delivery identity remains the single idempotency authority:
+    /// it derives the work reference and is carried through runtime admission
+    /// exactly as in [`Self::submit_work_with_mode_and_delivery_identity`].
+    pub async fn start_work_with_mode_and_delivery_identity(
+        &self,
+        runtime_id: AgentRuntimeId,
+        fence_token: FenceToken,
+        spec: WorkSpec,
+        handling_mode: HandlingMode,
+        delivery_identity: crate::store::MobDeliveryIdentity,
+    ) -> Result<WorkTurnHandle, MobError> {
+        delivery_identity.validate()?;
+        let work_ref = WorkRef::for_delivery(
+            &self.definition.id,
+            &runtime_id.identity,
+            &delivery_identity.idempotency_key,
+        );
+        self.start_work_with_mode_inner(
+            runtime_id,
+            fence_token,
+            work_ref,
+            spec,
+            handling_mode,
+            Some(delivery_identity),
+        )
+        .await
+    }
+
+    async fn start_work_with_mode_inner(
+        &self,
+        runtime_id: AgentRuntimeId,
+        fence_token: FenceToken,
+        work_ref: WorkRef,
+        spec: WorkSpec,
+        handling_mode: HandlingMode,
+        external_delivery_identity: Option<crate::store::MobDeliveryIdentity>,
+    ) -> Result<WorkTurnHandle, MobError> {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let cmd = Box::new(crate::mob_machine::SubmitWorkCommand {
+            runtime_id: runtime_id.clone(),
+            fence_token,
+            work_ref: work_ref.clone(),
+            spec,
+            handling_mode,
+            external_delivery_identity,
+            turn_metadata: None,
+            event_tx: None,
+            completion_tx: Some(completion_tx),
+            llm_identity_applied_tx: None,
+            ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
+        });
+        match self
+            .execute_machine_command(MobMachineCommand::SubmitWork(cmd))
+            .await?
+        {
+            MobMachineCommandResult::WorkReceipt {
+                work_ref: admitted_ref,
+            } => Ok(WorkTurnHandle {
+                receipt: WorkDeliveryReceipt {
+                    work_ref: admitted_ref,
+                    runtime_id,
+                },
+                completion_rx,
+            }),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
     }
 
     /// Submit a unit of work to a mob member with an explicit turn handling mode.

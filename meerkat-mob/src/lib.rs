@@ -239,7 +239,7 @@ pub use runtime::{
     SessionResumeRejection, SessionResumeVerdict, SpawnContinuityIntent, SpawnCustomizationContext,
     SpawnMemberAdmission, SpawnMemberAdmissionObservations, SpawnMemberCustomizer, SpawnMemberSpec,
     SpawnPolicy, SpawnResult, SpawnSource, SpawnSpec, SpawnSystemPromptOverride,
-    SpawnToolAdmission, SupervisorRotationReport, WorkDeliveryReceipt,
+    SpawnToolAdmission, SupervisorRotationReport, WorkDeliveryReceipt, WorkTurnHandle,
     materialize_nonpersistent_session_resume_verdict, mob_error_wire_code, profile_to_wire,
     stored_realm_profile_to_wire,
 };

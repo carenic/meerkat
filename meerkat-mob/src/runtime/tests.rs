@@ -48904,6 +48904,135 @@ async fn test_turn_completed_submission_does_not_block_actor_commands() {
 }
 
 #[tokio::test]
+async fn completion_bearing_internal_work_waits_for_its_committed_turn_boundary() {
+    let _serial = lock_real_comms_tests();
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("lead"))
+        .expect("lead profile")
+        .as_inline_mut()
+        .unwrap()
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let (handle, service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+    service.set_keep_alive_turns_complete_immediately(true);
+
+    let member_id = AgentIdentity::from("completion-bearing-internal-work");
+    let session_id = handle
+        .spawn(ProfileName::from("lead"), member_id.clone(), None)
+        .await
+        .expect("spawn turn-driven member")
+        .bridge_session_id()
+        .expect("session-backed member")
+        .clone();
+    handle
+        .wait_for_ready(Some(Duration::from_secs(2)))
+        .await
+        .expect("startup should settle");
+    handle
+        .wait_for_members_kickoff_complete(
+            std::slice::from_ref(&member_id),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .expect("kickoff should resolve before the tracked turn");
+
+    let entry = handle
+        .get_member(&member_id)
+        .await
+        .expect("read member")
+        .expect("member exists");
+    let prompt = "completion-bearing internal work owns this exact turn";
+    let authored_system = "completion-bearing system append";
+    let baseline_turn_metadata = service
+        .applied_runtime_turn_metadata(&session_id)
+        .await
+        .len();
+    let apply_entered = service
+        .arm_runtime_turn_content_barrier(&session_id, prompt)
+        .await;
+    let work_ref = WorkRef::new();
+    let turn = handle
+        .start_work_with_mode(
+            entry.agent_runtime_id,
+            entry.fence_token,
+            work_ref.clone(),
+            WorkSpec::new(prompt, WorkOrigin::Internal).with_system_prompt(authored_system),
+            HandlingMode::Queue,
+        )
+        .await
+        .expect("internal work should be admitted");
+    assert_eq!(turn.receipt().work_ref, work_ref);
+
+    tokio::time::timeout(Duration::from_secs(2), apply_entered.notified())
+        .await
+        .expect("the tracked work should enter its runtime boundary");
+    let mut completion = Box::pin(turn.wait());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut completion)
+            .await
+            .is_err(),
+        "the work handle must remain pending while its exact runtime boundary is blocked"
+    );
+
+    service
+        .clear_runtime_turn_content_barrier(&session_id)
+        .await;
+    service.release_one_runtime_turn();
+    let receipt = tokio::time::timeout(Duration::from_secs(2), completion)
+        .await
+        .expect("the exact completion should resolve after runtime release")
+        .expect("the committed internal work should succeed");
+    assert_eq!(receipt.work_ref, work_ref);
+    let applied_metadata = service.applied_runtime_turn_metadata(&session_id).await;
+    assert_eq!(
+        applied_metadata[baseline_turn_metadata..]
+            .iter()
+            .map(|metadata| {
+                metadata
+                    .as_ref()
+                    .expect("runtime-backed work carries turn metadata")
+                    .system_prompts
+                    .clone()
+            })
+            .collect::<Vec<_>>(),
+        vec![vec![authored_system.to_string()]],
+        "the completion-bearing path must preserve the exact WorkSpec system content"
+    );
+
+    service.set_fail_runtime_turns(true);
+    let failed_work_ref = WorkRef::new();
+    let failed = handle
+        .start_work_with_mode(
+            handle
+                .get_member(&member_id)
+                .await
+                .expect("read member after completed turn")
+                .expect("member remains active")
+                .agent_runtime_id,
+            entry.fence_token,
+            failed_work_ref,
+            WorkSpec::new(
+                "completion-bearing internal work propagates its exact failure",
+                WorkOrigin::Internal,
+            ),
+            HandlingMode::Queue,
+        )
+        .await
+        .expect("failing internal work should still be admitted");
+    let error = failed
+        .wait()
+        .await
+        .expect_err("the exact runtime failure must resolve the work handle as an error");
+    assert!(
+        error.to_string().contains("injected runtime turn failure"),
+        "the work handle must preserve the exact terminal error, got: {error}"
+    );
+
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
 async fn test_internal_queued_submit_work_drains_after_running_turn() {
     let (handle, service) = create_test_mob(sample_definition()).await;
     let member_id = AgentIdentity::from("lead-internal-queue-drain");
