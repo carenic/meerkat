@@ -747,6 +747,114 @@ mod tests {
         .expect("authority-backed sample run")
     }
 
+    fn mixed_step_run(run_id: RunId) -> MobRun {
+        MobRun::authority_backed_for_steps(
+            run_id,
+            MobId::from("mob"),
+            FlowId::from("flow"),
+            [
+                StepId::from("absent"),
+                StepId::from("dispatched"),
+                StepId::from("completed"),
+                StepId::from("failed"),
+                StepId::from("skipped"),
+                StepId::from("canceled"),
+            ],
+            MobRunStatus::Running,
+            serde_json::json!({}),
+        )
+        .expect("authority-backed mixed-step run")
+    }
+
+    fn mixed_step_commands(
+        terminal: crate::run::MobMachineFlowRunCommand,
+    ) -> Vec<crate::run::MobMachineFlowRunCommand> {
+        use crate::run::MobMachineFlowRunCommand as Command;
+        use crate::run::flow_run::inputs;
+
+        vec![
+            Command::DispatchStep(inputs::DispatchStep {
+                step_id: StepId::from("completed"),
+            }),
+            Command::CompleteStep(inputs::CompleteStep {
+                step_id: StepId::from("completed"),
+            }),
+            Command::DispatchStep(inputs::DispatchStep {
+                step_id: StepId::from("failed"),
+            }),
+            Command::FailStep(inputs::FailStep {
+                step_id: StepId::from("failed"),
+            }),
+            Command::DispatchStep(inputs::DispatchStep {
+                step_id: StepId::from("skipped"),
+            }),
+            Command::SkipStep(inputs::SkipStep {
+                step_id: StepId::from("skipped"),
+            }),
+            Command::DispatchStep(inputs::DispatchStep {
+                step_id: StepId::from("canceled"),
+            }),
+            Command::CancelStep(inputs::CancelStep {
+                step_id: StepId::from("canceled"),
+            }),
+            Command::DispatchStep(inputs::DispatchStep {
+                step_id: StepId::from("dispatched"),
+            }),
+            terminal,
+        ]
+    }
+
+    fn assert_mixed_terminal_fold(state: &crate::run::flow_run::State) {
+        use crate::run::flow_run::StepRunStatus;
+
+        for step_id in ["absent", "dispatched"] {
+            assert_eq!(
+                state.step_status.get(&StepId::from(step_id)),
+                Some(&Some(StepRunStatus::Canceled))
+            );
+        }
+        for (step_id, expected) in [
+            ("completed", StepRunStatus::Completed),
+            ("failed", StepRunStatus::Failed),
+            ("skipped", StepRunStatus::Skipped),
+            ("canceled", StepRunStatus::Canceled),
+        ] {
+            assert_eq!(
+                state.step_status.get(&StepId::from(step_id)),
+                Some(&Some(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn test_generated_machine_terminal_projection_atomically_folds_mixed_steps() {
+        use crate::run::MobMachineFlowRunCommand as Command;
+        use crate::run::flow_run::{Phase, inputs};
+
+        for (terminal, expected_phase) in [
+            (
+                Command::TerminalizeFailed(inputs::TerminalizeFailed {}),
+                Phase::Failed,
+            ),
+            (
+                Command::TerminalizeCanceled(inputs::TerminalizeCanceled {}),
+                Phase::Canceled,
+            ),
+        ] {
+            let run = mixed_step_run(RunId::new());
+            let (state, _) = run
+                .flow_run_commands_projection_for_test(mixed_step_commands(terminal))
+                .expect("generated machine projects atomic terminal fold");
+            assert_eq!(state.phase, expected_phase);
+            assert_mixed_terminal_fold(&state);
+            assert_eq!(state.failure_count, 1, "only the real failed step counts");
+            assert_eq!(
+                state.consecutive_failure_count, 1,
+                "terminal folding must not synthesize supervisor failures"
+            );
+        }
+    }
+
     #[test]
     fn test_flow_failure_cause_classifies_typed_error_into_typed_event_cause() {
         use crate::error::MobError;
@@ -791,14 +899,14 @@ mod tests {
         );
 
         let run_id = RunId::new();
-        let run = sample_run(run_id.clone(), MobRunStatus::Running);
+        let run = mixed_step_run(run_id.clone());
         let expected_flow_state = run.flow_state.clone();
-        let (next_flow_state, authority_input) = run
-            .flow_run_command_projection_for_test(
+        let (next_flow_state, authority_inputs) = run
+            .flow_run_commands_projection_for_test(mixed_step_commands(
                 crate::run::MobMachineFlowRunCommand::TerminalizeCanceled(
                     crate::run::flow_run::inputs::TerminalizeCanceled {},
                 ),
-            )
+            ))
             .expect("project canceled run state");
         run_store.create_run(run).await.expect("create run");
 
@@ -810,7 +918,7 @@ mod tests {
                 MobRunStatus::Running,
                 &expected_flow_state,
                 &next_flow_state,
-                vec![authority_input],
+                authority_inputs,
             )
             .await
             .expect("terminalize");
@@ -822,6 +930,7 @@ mod tests {
             .expect("get run")
             .expect("run exists");
         assert_eq!(run.status, MobRunStatus::Canceled);
+        assert_mixed_terminal_fold(&run.flow_state);
         let emitted = events.replay_all().await.expect("replay events");
         assert_eq!(emitted.len(), 1);
         assert!(matches!(emitted[0].kind, MobEventKind::FlowCanceled { .. }));

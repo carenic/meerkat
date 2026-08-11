@@ -267,7 +267,6 @@ impl FlowEngine {
                                 .await;
                         }
                         FlowFrameTerminalPhase::Canceled => {
-                            self.cancel_unfinished_steps(&run_id).await?;
                             let _ = self
                                 .terminalize_canceled(run_id.clone(), config.flow_id.clone())
                                 .await?;
@@ -298,7 +297,6 @@ impl FlowEngine {
                     // condition, one canonical terminal path). The flat-step path calls
                     // terminalize_canceled when canceled — the frame path must too.
                     if matches!(e, MobError::RunCanceled(_)) {
-                        self.cancel_unfinished_steps(&run_id).await?;
                         if let TerminalizationOutcome::Transitioned = self
                             .terminalize_canceled(run_id.clone(), config.flow_id.clone())
                             .await?
@@ -1172,20 +1170,17 @@ impl FlowEngine {
         config: &FlowRunConfig,
         error: MobError,
     ) -> Result<(), MobError> {
-        // Classify the typed error ONCE; the display string below is a
-        // projection of the same typed cause for ledger/escalation rendering.
+        // Classify the typed error once for the durable terminal event.
         let cause = FlowFailureCause::from_step_error(&error);
-        let reason = error.to_string();
-        let escalation_steps = self.fail_unfinished_steps(run_id, &reason).await?;
-        if !escalation_steps.is_empty() {
-            let supervisor = Supervisor::new(self.handle.clone(), self.emitter.clone());
-            for step_id in &escalation_steps {
-                supervisor
-                    .escalate(config, run_id, step_id, &reason)
-                    .await?;
-            }
-            supervisor.force_reset().await?;
-        }
+        // TerminalizeFailed is the single formal owner of unfinished work. It
+        // atomically folds absent/dispatched steps to Canceled while committing
+        // the Failed run snapshot and terminal event. Serial FailStep cleanup
+        // here used to leave the run durably Running for every intermediate
+        // store/projection round trip and could outlive the declared deadline
+        // by many minutes on a large persisted frame graph. Run-level faults do
+        // not fabricate per-step failure counters, ledgers, or supervisor
+        // escalation. Those remain owned by an exact FailStep projection. A
+        // future run-level escalation policy must be its own machine command.
         let _ = self
             .terminalize_failed(run_id.clone(), config.flow_id.clone(), cause)
             .await?;
@@ -1651,28 +1646,8 @@ impl FlowEngine {
         .await
     }
 
-    pub(crate) async fn cancel_unfinished_steps(&self, run_id: &RunId) -> Result<(), MobError> {
-        for step_id in self.ordered_steps(run_id).await? {
-            let step_terminal = match self.step_status(run_id, &step_id).await? {
-                Some(status) => mob_machine_step_status_is_terminal(run_id, &step_id, &status)?,
-                None => false,
-            };
-            if step_terminal {
-                continue;
-            }
-            let _ = self
-                .cas_flow_input_with_effects(
-                    run_id,
-                    MobMachineFlowRunCommand::CancelStep(flow_run::inputs::CancelStep {
-                        step_id: step_id.clone(),
-                    }),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn fail_unfinished_steps(
+    #[cfg(test)]
+    pub(crate) async fn fail_unfinished_steps_for_projection_test(
         &self,
         run_id: &RunId,
         reason: &str,
@@ -2008,7 +1983,6 @@ impl FlowEngine {
         machine_effects: Vec<mob_dsl::MobMachineEffect>,
     ) -> Result<TerminalizationOutcome, MobError> {
         let authority_input = input.authority_input(&run_id);
-        self.verify_terminal_run_steps(&run_id).await?;
         for attempt in 0..5u32 {
             let run = self.run_snapshot(&run_id).await?;
             if mob_machine_run_status_is_terminal(&run_id, &run.status)?
@@ -2030,6 +2004,7 @@ impl FlowEngine {
                 &machine_effects,
             )?
             .next_state;
+            Self::verify_terminal_flow_state_steps(&run_id, &next_state)?;
             // Terminal status and terminal event commit through ONE store
             // seam (a single SQLite transaction on durable storage) so they
             // cannot split.
@@ -2057,11 +2032,18 @@ impl FlowEngine {
         )))
     }
 
-    async fn verify_terminal_run_steps(&self, run_id: &RunId) -> Result<(), MobError> {
-        let steps = self.ordered_steps(run_id).await?;
-        for step_id in &steps {
-            match self.step_status(run_id, step_id).await? {
-                Some(status) if mob_machine_step_status_is_terminal(run_id, step_id, &status)? => {}
+    fn verify_terminal_flow_state_steps(
+        run_id: &RunId,
+        state: &flow_run::State,
+    ) -> Result<(), MobError> {
+        for step_id in &state.ordered_steps {
+            match state.step_status.get(step_id).copied().flatten() {
+                Some(
+                    flow_run::StepRunStatus::Completed
+                    | flow_run::StepRunStatus::Failed
+                    | flow_run::StepRunStatus::Skipped
+                    | flow_run::StepRunStatus::Canceled,
+                ) => {}
                 Some(status) => {
                     return Err(MobError::Internal(format!(
                         "TerminalRunStepInvariant violated: run '{run_id}' is terminal but \

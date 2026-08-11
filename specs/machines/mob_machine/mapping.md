@@ -4429,6 +4429,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `placed_completion_sequences_are_bounded`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `failed_or_canceled_runs_have_only_terminal_steps`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 
 <!-- GENERATED_COVERAGE_END -->

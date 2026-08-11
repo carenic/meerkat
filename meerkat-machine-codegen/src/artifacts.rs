@@ -4002,6 +4002,24 @@ fn infer_expr_type(
                 )),
             ))
         }
+        Expr::Call { helper, .. }
+            if helper == "mob_machine_run_step_status_after_cancel_unfinished" =>
+        {
+            Some(TypeRef::Map(
+                Box::new(TypeRef::Named(
+                    meerkat_machine_schema::identity::NamedTypeId::parse("RunId").ok()?,
+                )),
+                Box::new(TypeRef::Map(
+                    Box::new(TypeRef::Named(
+                        meerkat_machine_schema::identity::NamedTypeId::parse("StepId").ok()?,
+                    )),
+                    Box::new(TypeRef::Option(Box::new(TypeRef::Enum(
+                        meerkat_machine_schema::identity::EnumTypeId::parse("StepRunStatus")
+                            .ok()?,
+                    )))),
+                )),
+            ))
+        }
         Expr::Call { helper, .. } if helper == "mob_machine_run_step_bool_after_set" => {
             Some(TypeRef::Map(
                 Box::new(TypeRef::Named(
@@ -9854,6 +9872,21 @@ impl<'a> MachineTlaCompiler<'a> {
             out,
             "    IN MapSet(all_statuses, run_id, MapSet(current, step_id, Some(status)))"
         );
+        writeln!(
+            out,
+            "{}(all_statuses, run_id) ==",
+            prefix("mob_machine_run_step_status_after_cancel_unfinished")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "    LET current == IF run_id \\in DOMAIN all_statuses THEN all_statuses[run_id] ELSE [x \\in {{}} |-> None]"
+        );
+        pushln!(
+            out,
+            "        folded == [step_id \\in DOMAIN current |-> IF current[step_id] = None \\/ current[step_id] = Some(\"Dispatched\") THEN Some(\"Canceled\") ELSE current[step_id]]"
+        );
+        pushln!(out, "    IN MapSet(all_statuses, run_id, folded)");
         writeln!(
             out,
             "{}(all_values, run_id, step_id, value) ==",

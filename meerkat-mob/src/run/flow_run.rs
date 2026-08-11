@@ -1104,6 +1104,7 @@ pub(crate) fn transition<C: Context>(
                 return Err(refusal(&state.phase, InputKind::TerminalizeFailed));
             }
             let mut next_state = state.clone();
+            cancel_unfinished_steps(&mut next_state);
             next_state.phase = Phase::Failed;
             Ok(Outcome {
                 transition_id: TransitionId::TerminalizeFailed,
@@ -1119,6 +1120,7 @@ pub(crate) fn transition<C: Context>(
                 return Err(refusal(&state.phase, InputKind::TerminalizeCanceled));
             }
             let mut next_state = state.clone();
+            cancel_unfinished_steps(&mut next_state);
             next_state.phase = Phase::Canceled;
             Ok(Outcome {
                 transition_id: TransitionId::TerminalizeCanceled,
@@ -1129,5 +1131,113 @@ pub(crate) fn transition<C: Context>(
                 ],
             })
         }
+    }
+}
+
+fn cancel_unfinished_steps(state: &mut State) {
+    for status in state.step_status.values_mut() {
+        if status.is_none() || *status == Some(StepRunStatus::Dispatched) {
+            *status = Some(StepRunStatus::Canceled);
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_fold_tests {
+    use super::*;
+
+    fn mixed_running_state() -> State {
+        let absent = StepId::from("absent");
+        let dispatched = StepId::from("dispatched");
+        let completed = StepId::from("completed");
+        let failed = StepId::from("failed");
+        let skipped = StepId::from("skipped");
+        let canceled = StepId::from("canceled");
+        let ordered_steps = vec![
+            absent.clone(),
+            dispatched.clone(),
+            completed.clone(),
+            failed.clone(),
+            skipped.clone(),
+            canceled.clone(),
+        ];
+        State {
+            phase: Phase::Running,
+            tracked_steps: ordered_steps.iter().cloned().collect(),
+            ordered_steps,
+            step_status: [
+                (absent, None),
+                (dispatched, Some(StepRunStatus::Dispatched)),
+                (completed, Some(StepRunStatus::Completed)),
+                (failed, Some(StepRunStatus::Failed)),
+                (skipped, Some(StepRunStatus::Skipped)),
+                (canceled, Some(StepRunStatus::Canceled)),
+            ]
+            .into_iter()
+            .collect(),
+            failure_count: 4,
+            consecutive_failure_count: 2,
+            escalation_threshold: 3,
+            ..State::default()
+        }
+    }
+
+    fn assert_unfinished_folded_and_terminal_facts_preserved(state: &State) {
+        assert_eq!(
+            state.step_status.get(&StepId::from("absent")),
+            Some(&Some(StepRunStatus::Canceled))
+        );
+        assert_eq!(
+            state.step_status.get(&StepId::from("dispatched")),
+            Some(&Some(StepRunStatus::Canceled))
+        );
+        assert_eq!(
+            state.step_status.get(&StepId::from("completed")),
+            Some(&Some(StepRunStatus::Completed))
+        );
+        assert_eq!(
+            state.step_status.get(&StepId::from("failed")),
+            Some(&Some(StepRunStatus::Failed))
+        );
+        assert_eq!(
+            state.step_status.get(&StepId::from("skipped")),
+            Some(&Some(StepRunStatus::Skipped))
+        );
+        assert_eq!(
+            state.step_status.get(&StepId::from("canceled")),
+            Some(&Some(StepRunStatus::Canceled))
+        );
+    }
+
+    #[test]
+    fn terminalize_failed_atomically_cancels_only_unfinished_steps() {
+        let outcome = transition(
+            &mixed_running_state(),
+            Input::TerminalizeFailed(inputs::TerminalizeFailed {}),
+            &EmptyContext,
+        )
+        .expect("failed terminal fold");
+
+        assert_eq!(outcome.next_state.phase, Phase::Failed);
+        assert_unfinished_folded_and_terminal_facts_preserved(&outcome.next_state);
+        assert_eq!(outcome.next_state.failure_count, 4);
+        assert_eq!(outcome.next_state.consecutive_failure_count, 2);
+        assert!(outcome.effects.iter().all(|effect| matches!(
+            effect,
+            Effect::EmitFlowRunNotice(_) | Effect::FlowTerminalized(_)
+        )));
+    }
+
+    #[test]
+    fn terminalize_canceled_atomically_cancels_only_unfinished_steps() {
+        let outcome = transition(
+            &mixed_running_state(),
+            Input::TerminalizeCanceled(inputs::TerminalizeCanceled {}),
+            &EmptyContext,
+        )
+        .expect("canceled terminal fold");
+
+        assert_eq!(outcome.next_state.phase, Phase::Canceled);
+        assert_unfinished_folded_and_terminal_facts_preserved(&outcome.next_state);
     }
 }

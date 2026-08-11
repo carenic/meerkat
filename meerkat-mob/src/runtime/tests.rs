@@ -41298,6 +41298,20 @@ async fn test_flow_failed_append_failure_does_not_write_raw_failure_ledger_entry
         MobRunStatus::Failed,
         "cold recovery must preserve Failed after the durable run CAS wins before terminal event append"
     );
+    assert!(
+        recovered_run
+            .step_status_snapshot()
+            .expect("recovered failed step projection")
+            .values()
+            .all(|status| matches!(
+                status,
+                StepRunStatus::Completed
+                    | StepRunStatus::Failed
+                    | StepRunStatus::Skipped
+                    | StepRunStatus::Canceled
+            )),
+        "cold recovery must preserve the machine-owned terminal fold for every failed-run step"
+    );
     let machine_state = resumed
         .query_machine_state()
         .await
@@ -41473,6 +41487,20 @@ async fn test_flow_canceled_append_failure_does_not_write_raw_failure_ledger_ent
         recovered_run.status,
         MobRunStatus::Canceled,
         "cold recovery must preserve Canceled after the durable run CAS wins before terminal event append"
+    );
+    assert!(
+        recovered_run
+            .step_status_snapshot()
+            .expect("recovered canceled step projection")
+            .values()
+            .all(|status| matches!(
+                status,
+                StepRunStatus::Completed
+                    | StepRunStatus::Failed
+                    | StepRunStatus::Skipped
+                    | StepRunStatus::Canceled
+            )),
+        "cold recovery must preserve the machine-owned terminal fold for every canceled-run step"
     );
     let machine_state = resumed
         .query_machine_state()
@@ -41951,7 +41979,7 @@ async fn test_supervisor_escalation_forces_reset_via_retire_path() {
 }
 
 #[tokio::test]
-async fn test_cleanup_fail_step_routes_generated_supervisor_escalation_effect() {
+async fn test_explicit_fail_step_routes_generated_supervisor_escalation_effect() {
     use crate::machines::mob_machine as mob_dsl;
     use crate::run::{
         MobMachineFlowAuthorityToken, MobMachineFlowRunCommand, apply_mob_machine_flow_run_command,
@@ -42041,7 +42069,7 @@ async fn test_cleanup_fail_step_routes_generated_supervisor_escalation_effect() 
         )),
     );
     let escalation_steps = engine
-        .fail_unfinished_steps(&run_id, "cleanup failure")
+        .fail_unfinished_steps_for_projection_test(&run_id, "explicit step failure")
         .await
         .expect("fail unfinished steps");
     assert_eq!(escalation_steps, vec![step_id("start")]);
@@ -42062,7 +42090,7 @@ async fn test_cleanup_fail_step_routes_generated_supervisor_escalation_effect() 
     assert_eq!(stored.step_ledger[0].status, StepRunStatus::Failed);
     assert_eq!(stored.failure_ledger.len(), 1);
     assert_eq!(stored.failure_ledger[0].step_id, step_id("start"));
-    assert_eq!(stored.failure_ledger[0].reason, "cleanup failure");
+    assert_eq!(stored.failure_ledger[0].reason, "explicit step failure");
 }
 
 #[tokio::test]

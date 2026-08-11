@@ -234,6 +234,7 @@ fn renders_kernel_seam_composition_with_namespaced_mob_native_helpers() {
         "mob__entry_packet__mob_machine_placed_cleanup_absent_for_identity(arg_obligations, arg_agent_identity) ==",
         "mob__entry_packet__mob_machine_placed_cleanup_obligation(arg_agent_identity, arg_spawn_id, arg_generation, arg_fence_token, arg_provision_operation_id, arg_operation_owner_session_id, arg_expected_phase) ==",
         "mob__mob_machine_run_step_status_after_set(",
+        "mob__mob_machine_run_step_status_after_cancel_unfinished(",
         "mob__mob_machine_run_step_bool_after_set(",
         "mob__mob_machine_run_step_condition_result_after_set(",
         "mob__mob_machine_run_step_u64_after_set(",
