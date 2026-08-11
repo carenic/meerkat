@@ -3607,6 +3607,7 @@ struct DeferredResumeProvision {
     agent_identity: AgentIdentity,
     profile: crate::profile::Profile,
     external_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    compaction_curator_override: Option<Arc<dyn meerkat_core::CompactionCurator>>,
     context: Option<serde_json::Value>,
     labels: Option<std::collections::BTreeMap<String, String>>,
     additional_instructions: Option<Vec<String>>,
@@ -3697,6 +3698,7 @@ impl DeferredResumeProvision {
             agent_identity,
             profile,
             external_tools,
+            compaction_curator_override,
             context,
             labels,
             additional_instructions,
@@ -3733,6 +3735,7 @@ impl DeferredResumeProvision {
                 profile: &profile,
                 definition: &definition,
                 external_tools,
+                compaction_curator_override,
                 context,
                 labels,
                 additional_instructions,
@@ -11720,6 +11723,7 @@ impl MobActor {
                 profile: &profile,
                 definition: &self.definition,
                 external_tools,
+                compaction_curator_override: None,
                 context: None,
                 labels: Some(entry.labels.clone()),
                 additional_instructions: None,
@@ -23651,6 +23655,15 @@ impl MobActor {
         if let Err(error) = self.customize_spawn_spec(spawn_source, spawner.as_ref(), &mut spec) {
             reject_spawn_before_custody!("customize_spawn_spec", error);
         }
+        if spec.placement.is_some() && spec.compaction_curator_override.is_some() {
+            reject_spawn_before_custody!(
+                "compaction_curator_placement",
+                MobError::WiringError(
+                    "compaction curator overrides are in-process host behavior and cannot be submitted to a remote member host"
+                        .to_string(),
+                )
+            );
+        }
         // Multi-host §7.3: a placed spawn takes the remote materialization
         // lane wholesale (compile → digest-authorized ladder open at enqueue
         // → bridge dispatch → ack-fed remote commit).
@@ -23707,6 +23720,7 @@ impl MobActor {
             objective_id,
             auth_binding,
             external_tools: per_spawn_external_tools,
+            compaction_curator_override,
             system_prompt_override,
             continuity_intent,
             placement: _,
@@ -23924,6 +23938,7 @@ impl MobActor {
                             agent_identity: agent_identity.clone(),
                             profile,
                             external_tools,
+                            compaction_curator_override: compaction_curator_override.clone(),
                             context,
                             labels: labels.clone(),
                             additional_instructions,
@@ -23992,6 +24007,7 @@ impl MobActor {
                                 profile: &profile,
                                 definition: &self.definition,
                                 external_tools,
+                                compaction_curator_override: compaction_curator_override.clone(),
                                 context,
                                 labels: labels.clone(),
                                 additional_instructions,
@@ -24086,6 +24102,7 @@ impl MobActor {
                 profile: &profile,
                 definition: &self.definition,
                 external_tools,
+                compaction_curator_override,
                 context,
                 labels: labels.clone(),
                 additional_instructions,
@@ -25398,6 +25415,7 @@ impl MobActor {
             objective_id,
             auth_binding,
             external_tools: per_spawn_external_tools,
+            compaction_curator_override,
             system_prompt_override,
             continuity_intent,
             placement,
@@ -25407,6 +25425,12 @@ impl MobActor {
                 "enqueue_spawn_remote invoked without placement".to_string()
             ));
         };
+        if compaction_curator_override.is_some() {
+            fail!(MobError::WiringError(
+                "compaction curator overrides are in-process host behavior and cannot be submitted to a remote member host"
+                    .to_string(),
+            ));
+        }
         // DEC-P3-3: one transport story per member — placement and an
         // explicit backend/binding are mutually exclusive, BEFORE any
         // machine input.
@@ -26846,6 +26870,7 @@ impl MobActor {
             objective_id: _,
             auth_binding,
             external_tools: per_spawn_external_tools,
+            compaction_curator_override,
             system_prompt_override,
             continuity_intent,
             placement: _,
@@ -26918,6 +26943,7 @@ impl MobActor {
             profile: &profile,
             definition: &self.definition,
             external_tools,
+            compaction_curator_override,
             context,
             labels: Some(labels.clone()),
             additional_instructions,
@@ -37311,6 +37337,12 @@ impl MobActor {
                 "spawn customizer cannot change respawn runtime binding for '{original_identity}'"
             ))));
         }
+        if placed_host.is_some() && replacement_spec.compaction_curator_override.is_some() {
+            return Err(MobRespawnError::from(MobError::WiringError(
+                "compaction curator overrides are in-process host behavior and cannot be submitted to a remote member host"
+                    .to_string(),
+            )));
+        }
         if placed_host.is_some() && replacement_spec.binding.is_some() {
             return Err(MobRespawnError::from(MobError::Internal(format!(
                 "spawn customizer cannot bind respawn of placed member '{original_identity}' \
@@ -37373,6 +37405,7 @@ impl MobActor {
             objective_id: _,
             auth_binding: replacement_auth_binding,
             external_tools: replacement_external_tools,
+            compaction_curator_override: replacement_compaction_curator_override,
             system_prompt_override: replacement_system_prompt_override,
             continuity_intent: replacement_continuity_intent,
             placement: _,
@@ -37566,6 +37599,7 @@ impl MobActor {
             profile: &profile,
             definition: &self.definition,
             external_tools,
+            compaction_curator_override: replacement_compaction_curator_override,
             context: replacement_context,
             labels: Some(replacement_labels.clone()),
             additional_instructions: replacement_additional_instructions,

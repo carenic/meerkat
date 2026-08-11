@@ -10944,6 +10944,7 @@ async fn run_agent(
             custom_models: std::collections::BTreeMap::new(),
             image_generation_provider: None,
             auto_compact_threshold_override: None,
+            compaction_curator_override: None,
             provider: Some(provider.as_core()),
             override_comms: Default::default(),
             self_hosted_server_id: None,
@@ -12461,6 +12462,7 @@ impl SurfaceScheduleSessionHost for CliScheduleSessionHost {
             custom_models: std::collections::BTreeMap::new(),
             image_generation_provider: None,
             auto_compact_threshold_override: None,
+            compaction_curator_override: None,
             provider: create.provider,
             output_schema: create.output_schema.clone(),
             structured_output_retries: create.structured_output_retries,
@@ -24248,6 +24250,7 @@ capabilities = ["rpc"]
             custom_models: std::collections::BTreeMap::new(),
             image_generation_provider: None,
             auto_compact_threshold_override: None,
+            compaction_curator_override: None,
             mob_tools: Some(mob_factory),
             llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
                 llm_override,
@@ -24537,6 +24540,7 @@ default_model = "gpt-5.4"
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
                         llm_override,
                     )),
@@ -24688,6 +24692,7 @@ default_model = "gpt-5.4"
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(session),
                     runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
                     llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
@@ -24924,6 +24929,7 @@ default_model = "gpt-5.4"
                 custom_models: std::collections::BTreeMap::new(),
                 image_generation_provider: None,
                 auto_compact_threshold_override: None,
+                compaction_curator_override: None,
                 llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
                     llm_override,
                 )),
@@ -25065,6 +25071,7 @@ default_model = "gpt-5.4"
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(session),
                     runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
                     llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
@@ -25142,6 +25149,7 @@ default_model = "gpt-5.4"
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
                         llm_override,
                     )),
@@ -25247,6 +25255,7 @@ default_model = "gpt-5.4"
                 custom_models: std::collections::BTreeMap::new(),
                 image_generation_provider: None,
                 auto_compact_threshold_override: None,
+                compaction_curator_override: None,
                 resume_session: Some(session),
                 runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
                 initial_turn_metadata: Some(meerkat_runtime::runtime_stamped_prompt_turn_metadata(
@@ -25318,6 +25327,7 @@ default_model = "gpt-5.4"
                 custom_models: std::collections::BTreeMap::new(),
                 image_generation_provider: None,
                 auto_compact_threshold_override: None,
+                compaction_curator_override: None,
                 resume_session: Some(session),
                 runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
                 initial_turn_metadata: Some(meerkat_runtime::runtime_stamped_prompt_turn_metadata(

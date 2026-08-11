@@ -77,6 +77,18 @@ use uuid::Uuid;
 
 type TestMeerkatMachineAuthority = std::sync::Arc<meerkat_runtime::HandleDslAuthority>;
 
+struct TestCompactionCurator;
+
+#[async_trait]
+impl meerkat_core::CompactionCurator for TestCompactionCurator {
+    async fn curate_summary(
+        &self,
+        _window: meerkat_core::CompactionWindow<'_>,
+    ) -> Result<meerkat_core::CuratedCompactionSummary, meerkat_core::CompactionCuratorError> {
+        meerkat_core::CuratedCompactionSummary::new("runtime-test summary")
+    }
+}
+
 fn retirement_error_cause(mut error: &MobError) -> &MobError {
     while let MobError::SharedRetirementFailure(shared) = error {
         error = shared.as_ref();
@@ -1533,6 +1545,8 @@ struct MockSessionService {
     create_requests: RwLock<Vec<CreateSessionRecord>>,
     /// Records whether each create_session had external_tools configured.
     create_with_external_tools: RwLock<Vec<bool>>,
+    /// Records the exact host curator carried by each create_session request.
+    create_with_compaction_curators: RwLock<Vec<Option<Arc<dyn meerkat_core::CompactionCurator>>>>,
     /// Records the declarative MCP server names per create_session call,
     /// in call order.
     mcp_server_names: RwLock<Vec<(SessionId, Vec<String>)>>,
@@ -1699,6 +1713,7 @@ impl MockSessionService {
             prompts: RwLock::new(Vec::new()),
             create_requests: RwLock::new(Vec::new()),
             create_with_external_tools: RwLock::new(Vec::new()),
+            create_with_compaction_curators: RwLock::new(Vec::new()),
             mcp_server_names: RwLock::new(Vec::new()),
             external_tools_by_session: RwLock::new(HashMap::new()),
             comms_behaviors: RwLock::new(HashMap::new()),
@@ -1947,6 +1962,12 @@ impl MockSessionService {
 
     async fn recorded_external_tools_flags(&self) -> Vec<bool> {
         self.create_with_external_tools.read().await.clone()
+    }
+
+    async fn recorded_compaction_curators(
+        &self,
+    ) -> Vec<Option<Arc<dyn meerkat_core::CompactionCurator>>> {
+        self.create_with_compaction_curators.read().await.clone()
     }
 
     async fn recorded_mcp_server_names(&self) -> Vec<(SessionId, Vec<String>)> {
@@ -2842,6 +2863,12 @@ impl MockSessionService {
             .write()
             .await
             .push(external_tools.is_some());
+        self.create_with_compaction_curators.write().await.push(
+            req.build
+                .as_ref()
+                .and_then(|build| build.compaction_curator_override.as_ref())
+                .cloned(),
+        );
         if let Some(dispatcher) = external_tools {
             self.external_tools_by_session
                 .write()
@@ -24112,6 +24139,7 @@ async fn test_build_resumed_agent_config_rejects_mismatched_session_identity() {
                 profile,
                 definition: &definition,
                 external_tools: None,
+                compaction_curator_override: None,
                 context: None,
                 labels: None,
                 additional_instructions: None,
@@ -54765,6 +54793,62 @@ async fn test_rotate_supervisor_reinstalls_private_trust_on_session_backed_membe
     assert!(
         previous_name.as_str().starts_with(mob_id.as_str()),
         "private-trust entry name must be scoped to this mob; got: {previous_name}"
+    );
+}
+
+#[tokio::test]
+async fn test_spawn_threads_exact_compaction_curator_to_session_build_options() {
+    let definition = sample_definition();
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let curator: Arc<dyn meerkat_core::CompactionCurator> = Arc::new(TestCompactionCurator);
+    let mut spec = SpawnMemberSpec::new("worker", "curated-worker");
+    spec.compaction_curator_override = Some(Arc::clone(&curator));
+
+    handle.spawn_spec(spec).await.expect("spawn curated member");
+
+    let recorded = service.recorded_compaction_curators().await;
+    assert_eq!(recorded.len(), 1, "one member session should be created");
+    assert!(
+        recorded[0]
+            .as_ref()
+            .is_some_and(|actual| Arc::ptr_eq(actual, &curator)),
+        "the exact host curator Arc must reach the final session build options"
+    );
+}
+
+#[tokio::test]
+async fn test_remote_spawn_rejects_host_compaction_curator_before_submit() {
+    let definition = sample_definition();
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let mut spec = SpawnMemberSpec::new("worker", "remote-curated-worker");
+    spec.compaction_curator_override = Some(Arc::new(TestCompactionCurator));
+    spec.placement = Some(crate::machines::mob_machine::HostId::from("remote-host"));
+
+    let error = handle
+        .spawn_spec(spec)
+        .await
+        .expect_err("host curator must never enter remote placement");
+
+    assert!(matches!(
+        error,
+        MobError::WiringError(message)
+            if message.contains("cannot be submitted to a remote member host")
+    ));
+    assert!(
+        service.recorded_compaction_curators().await.is_empty(),
+        "refusal must happen before local session creation or remote submission"
     );
 }
 

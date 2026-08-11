@@ -3271,6 +3271,11 @@ pub struct SpawnMemberSpec {
     /// dropped at retire). Not persisted: re-supply across process restarts
     /// via `SpawnMemberCustomizer` (`SpawnSource::Resume`).
     pub external_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    /// Host-supplied compaction summary curator for this member.
+    ///
+    /// In-process only. Remote placement rejects a populated slot before
+    /// submit because executable host behavior has no wire representation.
+    pub compaction_curator_override: Option<Arc<dyn meerkat_core::CompactionCurator>>,
     /// Typed prompt replacement for this spawn.
     pub system_prompt_override: Option<SpawnSystemPromptOverride>,
     /// Explicit helper/member continuity intent.
@@ -3306,6 +3311,10 @@ impl std::fmt::Debug for SpawnMemberSpec {
             .field("objective_id", &self.objective_id)
             .field("auth_binding", &self.auth_binding)
             .field("external_tools", &self.external_tools.is_some())
+            .field(
+                "compaction_curator_override",
+                &self.compaction_curator_override.is_some(),
+            )
             .field("system_prompt_override", &self.system_prompt_override)
             .field("continuity_intent", &self.continuity_intent)
             .field("placement", &self.placement)
@@ -3336,6 +3345,7 @@ impl SpawnMemberSpec {
             objective_id: None,
             auth_binding: None,
             external_tools: None,
+            compaction_curator_override: None,
             system_prompt_override: None,
             continuity_intent: SpawnContinuityIntent::Ephemeral,
             placement: None,

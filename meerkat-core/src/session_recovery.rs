@@ -523,6 +523,7 @@ pub fn resolve_effective_turn_config(
         custom_models: std::collections::BTreeMap::new(),
         image_generation_provider: None,
         auto_compact_threshold_override: None,
+        compaction_curator_override: None,
         session_comms_runtime_override: None,
         host_prompt_sections: Default::default(),
         output_schema: overrides

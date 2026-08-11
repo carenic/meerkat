@@ -867,6 +867,7 @@ impl AgentBuildConfig {
         self.custom_models = build.custom_models.clone();
         self.image_generation_provider = build.image_generation_provider;
         self.auto_compact_threshold_override = build.auto_compact_threshold_override;
+        self.compaction_curator_override = build.compaction_curator_override.clone();
         self.output_schema = build.output_schema.clone();
         self.structured_output_retries = build.structured_output_retries;
         self.hooks_override = build.hooks_override.clone();
@@ -941,6 +942,7 @@ impl AgentBuildConfig {
             custom_models: self.custom_models.clone(),
             image_generation_provider: self.image_generation_provider,
             auto_compact_threshold_override: self.auto_compact_threshold_override,
+            compaction_curator_override: self.compaction_curator_override.clone(),
             output_schema: self.output_schema.clone(),
             structured_output_retries: self.structured_output_retries,
             hooks_override: self.hooks_override.clone(),

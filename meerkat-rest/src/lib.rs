@@ -4865,6 +4865,7 @@ async fn create_session_inner(
         custom_models: std::collections::BTreeMap::new(),
         image_generation_provider: None,
         auto_compact_threshold_override: None,
+        compaction_curator_override: None,
         provider: Some(model_resolution.provider),
         override_comms: Default::default(),
         self_hosted_server_id: initial_identity.self_hosted_server_id.clone(),
@@ -6013,6 +6014,7 @@ async fn continue_session_inner(
             custom_models: std::collections::BTreeMap::new(),
             image_generation_provider: None,
             auto_compact_threshold_override: None,
+            compaction_curator_override: None,
             provider: llm_binding.provider,
             override_comms: Default::default(),
             self_hosted_server_id: llm_binding.self_hosted_server_id,
@@ -9155,6 +9157,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(pre_session),
                     llm_client_override: state
                         .llm_client_override
@@ -9207,6 +9210,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(pre_session),
                     llm_client_override: state
                         .llm_client_override
@@ -9396,6 +9400,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(pre_session),
                     llm_client_override: state
                         .llm_client_override
@@ -9450,6 +9455,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(pre_session),
                     comms_name: Some("rest-capacity-target".to_string()),
                     keep_alive: false,
@@ -10657,6 +10663,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -12262,6 +12269,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -12343,6 +12351,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(pre_session),
                     llm_client_override: state
                         .llm_client_override
@@ -12422,6 +12431,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(pre_session),
                     llm_client_override: state
                         .llm_client_override
@@ -13169,6 +13179,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -13242,6 +13253,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     comms_name: Some("stale-rest-agent".to_string()),
                     llm_client_override: state
                         .llm_client_override
@@ -13335,6 +13347,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -13431,6 +13444,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -13525,6 +13539,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -13610,6 +13625,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -14913,6 +14929,7 @@ mod tests {
                         custom_models: std::collections::BTreeMap::new(),
                         image_generation_provider: None,
                         auto_compact_threshold_override: None,
+                        compaction_curator_override: None,
                         resume_session: Some(pre_session),
                         llm_client_override: state
                             .llm_client_override
@@ -14982,6 +14999,7 @@ mod tests {
                         custom_models: std::collections::BTreeMap::new(),
                         image_generation_provider: None,
                         auto_compact_threshold_override: None,
+                        compaction_curator_override: None,
                         resume_session: Some(pre_session),
                         llm_client_override: state
                             .llm_client_override
