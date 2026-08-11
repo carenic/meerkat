@@ -377,3 +377,67 @@ async fn test_phase2_external_turn_routing_by_runtime_mode() {
         "autonomous path should invoke event injector"
     );
 }
+
+#[tokio::test]
+async fn test_autonomous_role_wiring_allows_second_member_while_first_turn_is_live() {
+    let start_turn_calls = Arc::new(AtomicU64::new(0));
+    let inject_calls = Arc::new(AtomicU64::new(0));
+    let service = Arc::new(EphemeralSessionService::new(
+        MockSessionAgentBuilder {
+            start_turn_calls: Arc::clone(&start_turn_calls),
+            inject_calls,
+        },
+        16,
+    ));
+    let definition = MobDefinition::from_toml(
+        "[mob]\nid = \"autonomous-role-wiring\"\norchestrator = \"builder\"\n\n[[wiring.role_wiring]]\na = \"builder\"\nb = \"reviewer\"\n\n[profiles.builder]\nmodel = \"claude-sonnet-4-6\"\nruntime_mode = \"autonomous_host\"\n\n[profiles.builder.tools]\ncomms = true\n\n[profiles.reviewer]\nmodel = \"claude-sonnet-4-6\"\nruntime_mode = \"autonomous_host\"\n\n[profiles.reviewer.tools]\ncomms = true\n",
+    )
+    .expect("parse autonomous role-wiring mob definition");
+    let handle = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(service)
+        .allow_ephemeral_sessions(true)
+        .create()
+        .await
+        .expect("create autonomous role-wiring mob");
+
+    handle
+        .spawn_spec(SpawnMemberSpec::new("builder", "builder-1"))
+        .await
+        .expect("spawn first autonomous member");
+    let first_turn_deadline = Instant::now() + Duration::from_secs(2);
+    while start_turn_calls.load(Ordering::Relaxed) == 0 {
+        assert!(
+            Instant::now() < first_turn_deadline,
+            "first autonomous member must own a live turn before the second spawn"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        handle.spawn_spec(SpawnMemberSpec::new("reviewer", "reviewer-1")),
+    )
+    .await
+    .expect("second autonomous spawn must not wait for the first member's live turn")
+    .expect("spawn second autonomous member");
+
+    let builder = handle
+        .get_member(&AgentIdentity::from("builder-1"))
+        .await
+        .expect("read builder")
+        .expect("builder remains in roster");
+    let reviewer = handle
+        .get_member(&AgentIdentity::from("reviewer-1"))
+        .await
+        .expect("read reviewer")
+        .expect("reviewer remains in roster");
+    assert!(
+        builder
+            .wired_to
+            .contains(&AgentIdentity::from("reviewer-1"))
+    );
+    assert!(
+        reviewer
+            .wired_to
+            .contains(&AgentIdentity::from("builder-1"))
+    );
+}

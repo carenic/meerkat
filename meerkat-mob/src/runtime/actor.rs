@@ -129,6 +129,12 @@ const STARTUP_FAILURE_AUTONOMOUS_STOP_DEADLINE: Duration = Duration::from_secs(1
 /// actor behind a slow or wedged session-runtime read. Unknown progress is a
 /// truthful result; delaying lifecycle commands is not.
 const MEMBER_PROGRESS_OBSERVATION_TIMEOUT: Duration = Duration::from_millis(250);
+/// Retirement lifecycle notices are advisory - MobMachine topology and the
+/// generated trust mutations below own the actual cleanup. A retiring
+/// member's comms drain may already be quiescent after `StopHostLoop`, so an
+/// unbounded handoff here would prevent those authoritative cleanup steps
+/// from ever running.
+const RETIRE_PEER_LIFECYCLE_NOTICE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Actor-owned task termination policy at a `JoinError` boundary.
 ///
@@ -28395,15 +28401,15 @@ impl MobActor {
         }
 
         // Durable peer lifecycle delivery waits for the receiver's runtime
-        // admission before send returns. A freshly spawned turn-driven local
-        // member therefore needs its exact mob comms drain before role/parent
-        // wiring can send `peer_added` to it. Starting the drain later in the
-        // kickoff phase creates a circular wait: wiring holds the actor while
-        // waiting for admission, and the actor cannot reach kickoff to start
-        // the admitting drain. Initial-turn dispatch deliberately remains in
+        // admission before send returns. Every freshly spawned local member
+        // therefore needs its exact mob comms drain before role/parent wiring
+        // can send `peer_added` to it. Starting the drain later in the kickoff
+        // phase creates a circular wait: wiring holds the actor while waiting
+        // for admission, and the actor cannot reach kickoff to start the
+        // admitting drain. This applies to both autonomous and turn-driven
+        // local members. Initial-turn dispatch deliberately remains in
         // kickoff, after wiring has committed.
         if !state.planned_wiring_targets.is_empty()
-            && state.runtime_mode == crate::MobRuntimeMode::TurnDriven
             && state.member_ref.bridge_session_id().is_some()
             && !super::member_runtime_is_host_owned(self.dsl_authority.state(), agent_identity)
             && let Err(drain_error) = self
@@ -39227,7 +39233,7 @@ impl MobActor {
                     && let Some(retiring_comms) = retiring_comms.as_ref()
                 {
                     if let Err(error) = actor
-                        .notify_peer_retired(
+                        .notify_peer_retired_bounded(
                             &recipient_spec,
                             &retired_id,
                             &retired_entry,
@@ -39386,7 +39392,7 @@ impl MobActor {
             if emit_peer_lifecycle_notice && let Some(retiring_comms) = ctx.retiring_comms.as_ref()
             {
                 if let Err(error) = self
-                    .notify_peer_retired(
+                    .notify_peer_retired_bounded(
                         &recipient_spec,
                         &ctx.agent_identity,
                         &ctx.entry,
@@ -51371,6 +51377,35 @@ impl MobActor {
             retiring_comms,
         )
         .await
+    }
+
+    /// Attempt the advisory retirement notice without letting a stopped or
+    /// quiescent sender hold the actor's authoritative retirement pipeline.
+    async fn notify_peer_retired_bounded(
+        &self,
+        recipient_spec: &TrustedPeerDescriptor,
+        retired_id: &AgentIdentity,
+        retired_entry: &RosterEntry,
+        retired_spec: &TrustedPeerDescriptor,
+        retiring_comms: &Arc<dyn CoreCommsRuntime>,
+    ) -> Result<(), MobError> {
+        tokio::time::timeout(
+            RETIRE_PEER_LIFECYCLE_NOTICE_TIMEOUT,
+            self.notify_peer_retired(
+                recipient_spec,
+                retired_id,
+                retired_entry,
+                retired_spec,
+                retiring_comms,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            MobError::WiringError(format!(
+                "mob.peer_retired lifecycle handoff for '{retired_id}' exceeded {}ms",
+                RETIRE_PEER_LIFECYCLE_NOTICE_TIMEOUT.as_millis()
+            ))
+        })?
     }
 
     /// Notify a peer that another peer was unwired (trust link removed).

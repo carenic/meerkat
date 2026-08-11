@@ -39807,6 +39807,60 @@ async fn test_destroy_wired_members_does_not_wait_for_peer_lifecycle_handoff() {
 }
 
 #[tokio::test]
+async fn test_retire_wired_member_does_not_wait_for_peer_lifecycle_handoff() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let retiring = AgentIdentity::from("w-retire-left");
+    let peer = AgentIdentity::from("w-retire-right");
+    for identity in [&retiring, &peer] {
+        handle
+            .spawn(ProfileName::from("worker"), identity.clone(), None)
+            .await
+            .expect("spawn wired retire member");
+    }
+    handle
+        .wire(retiring.clone(), peer.clone())
+        .await
+        .expect("wire retire members");
+
+    // Model the ordinary shutdown shape: the member being retired owns a
+    // comms drain whose peer-lifecycle handoff is no longer making progress.
+    // Retirement must still converge its machine-owned topology and trust
+    // cleanup without waiting on that redundant volatile notification.
+    service
+        .set_comms_behavior(
+            &test_comms_name("worker", retiring.as_str()),
+            MockCommsBehavior {
+                peer_lifecycle_delay_ms: 60_000,
+                ..MockCommsBehavior::default()
+            },
+        )
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(2), handle.retire(retiring.clone()))
+        .await
+        .expect("retire must not wait for peer lifecycle handoff")
+        .expect("retire wired member");
+
+    assert!(
+        handle
+            .get_member(&retiring)
+            .await
+            .expect("read retired member")
+            .is_none(),
+        "retired member must leave the roster"
+    );
+    let surviving_peer = handle
+        .get_member(&peer)
+        .await
+        .expect("read surviving peer")
+        .expect("surviving peer remains in the roster");
+    assert!(
+        !surviving_peer.wired_to.contains(&retiring),
+        "retirement must remove the reciprocal topology edge"
+    );
+}
+
+#[tokio::test]
 async fn test_run_flow_store_admission_failure_does_not_commit_mob_machine_authority() {
     let run_store = Arc::new(RecordingRunStore::new());
     let definition = sample_definition_with_single_step_flow(60_000, 8);
@@ -44888,7 +44942,11 @@ impl SessionService for RuntimeBackedRealCommsSessionService {
             return Err(SessionError::NotFound { id: id.clone() });
         }
         drop(sessions);
-        if let Some(notifier) = self.keep_alive_notifiers.read().await.get(id).cloned() {
+        let keep_alive_notifier = {
+            let notifiers = self.keep_alive_notifiers.read().await;
+            notifiers.get(id).cloned()
+        };
+        if let Some(notifier) = keep_alive_notifier {
             if self
                 .keep_alive_turns_complete_immediately
                 .load(Ordering::Relaxed)
@@ -45426,12 +45484,11 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
             ));
         }
 
-        if let Some(notifier) = self
-            .keep_alive_notifiers
-            .read()
-            .await
-            .get(session_id)
-            .cloned()
+        let keep_alive_notifier = {
+            let notifiers = self.keep_alive_notifiers.read().await;
+            notifiers.get(session_id).cloned()
+        };
+        if let Some(notifier) = keep_alive_notifier
             && !self
                 .keep_alive_turns_complete_immediately
                 .load(Ordering::Relaxed)
@@ -45613,6 +45670,53 @@ async fn test_turn_driven_role_wiring_starts_durable_ingress_before_peer_lifecyc
     .await
     .expect("second spawn must not wait for its own later comms-drain kickoff")
     .expect("spawn role-wired turn-driven member");
+
+    let lead = handle
+        .get_member(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("read lead")
+        .expect("lead roster entry");
+    let reviewer = handle
+        .get_member(&AgentIdentity::from("reviewer-1"))
+        .await
+        .expect("read reviewer")
+        .expect("reviewer roster entry");
+    assert!(lead.wired_to.contains(&AgentIdentity::from("reviewer-1")));
+    assert!(reviewer.wired_to.contains(&AgentIdentity::from("lead-1")));
+}
+
+#[tokio::test]
+async fn test_autonomous_role_wiring_starts_durable_ingress_before_peer_lifecycle_send() {
+    let _serial = lock_real_comms_tests();
+    let mut definition = sample_definition_with_cross_role_wiring();
+    for binding in definition.profiles.values_mut() {
+        if let crate::profile::ProfileBinding::Inline(profile) = binding {
+            profile.runtime_mode = crate::MobRuntimeMode::AutonomousHost;
+            profile.tools.comms = true;
+        }
+    }
+    let (handle, _service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+
+    handle
+        .spawn(
+            ProfileName::from("lead"),
+            AgentIdentity::from("lead-1"),
+            None,
+        )
+        .await
+        .expect("spawn first autonomous member");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        handle.spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("reviewer-1"),
+            None,
+        ),
+    )
+    .await
+    .expect("second spawn must not wait for its own later autonomous comms-drain kickoff")
+    .expect("spawn role-wired autonomous member");
 
     let lead = handle
         .get_member(&AgentIdentity::from("lead-1"))
