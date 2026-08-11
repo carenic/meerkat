@@ -521,6 +521,12 @@ pub fn apply_domain_migrations(
     })
 }
 
+/// Offline preparation callback retained under the ledger migration transaction.
+pub type MaintenancePrepareFn =
+    for<'connection> fn(
+        &Transaction<'connection>,
+    ) -> Result<MaintenancePrepareReport, rusqlite::Error>;
+
 /// Explicitly authenticate and migrate an unledgered historical domain.
 ///
 /// This is an offline maintenance bridge, not an ambient-open fallback.
@@ -550,7 +556,7 @@ pub fn bridge_unledgered_domain(
     domain: &SchemaDomain,
     target_version: i64,
     recoverable_source_versions: &[i64],
-    prepare: Option<fn(&Transaction<'_>) -> Result<MaintenancePrepareReport, rusqlite::Error>>,
+    prepare: Option<MaintenancePrepareFn>,
 ) -> Result<MaintenanceBridgeReport, SqliteStoreError> {
     domain.validate()?;
     let supported = domain.supported_version();

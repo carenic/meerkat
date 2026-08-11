@@ -45,6 +45,7 @@ async fn inner_test_rest_resume_metadata() {
     let (event_tx, _) = tokio::sync::broadcast::channel(16);
 
     let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+    let shared_runtime_store = Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
 
     let factory = AgentFactory::new(store_path.clone())
         .builtins(true)
@@ -55,7 +56,7 @@ async fn inner_test_rest_resume_metadata() {
     builder.default_llm_client = Some(Arc::new(TestClient::default()));
     let persistence = PersistenceBundle::new(
         store.clone(),
-        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+        shared_runtime_store.clone(),
         Arc::new(meerkat_store::MemoryBlobStore::new()),
     );
     let runtime_adapter = persistence.runtime_adapter();
@@ -67,6 +68,7 @@ async fn inner_test_rest_resume_metadata() {
     let mut session_service =
         PersistentSessionService::new(builder, 100, session_store_inner, runtime_store, blob_store);
     let session_service = Arc::new(session_service);
+    let session_service_probe = Arc::clone(&session_service);
     #[cfg(feature = "mob")]
     let mob_state = wire_mob_tools(
         &builder_mob_tools_slot,
@@ -174,10 +176,10 @@ async fn inner_test_rest_resume_metadata() {
         .expect("session_id")
         .to_string();
 
-    let session = store
-        .load(&SessionId::parse(&session_id).expect("session id"))
+    let session = session_service_probe
+        .load_authoritative_session(&SessionId::parse(&session_id).expect("session id"))
         .await
-        .expect("load session")
+        .expect("load authoritative session")
         .expect("session exists");
     let metadata = session.session_metadata().expect("metadata");
 
@@ -195,7 +197,7 @@ async fn inner_test_rest_resume_metadata() {
     builder2.default_llm_client = Some(Arc::new(TestClient::default()));
     let persistence2 = PersistenceBundle::new(
         store.clone(),
-        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+        shared_runtime_store,
         Arc::new(meerkat_store::MemoryBlobStore::new()),
     );
     let runtime_adapter2 = persistence2.runtime_adapter();
@@ -213,6 +215,7 @@ async fn inner_test_rest_resume_metadata() {
         blob_store2,
     );
     let session_service2 = Arc::new(session_service2);
+    let session_service2_probe = Arc::clone(&session_service2);
     #[cfg(feature = "mob")]
     let mob_state2 = wire_mob_tools(
         &builder2_mob_tools_slot,
@@ -317,10 +320,12 @@ async fn inner_test_rest_resume_metadata() {
         .expect("resume request");
     assert_eq!(response.status(), StatusCode::OK);
 
-    let session = store
-        .load(&SessionId::parse(run_json["session_id"].as_str().unwrap()).expect("session id"))
+    let session = session_service2_probe
+        .load_authoritative_session(
+            &SessionId::parse(run_json["session_id"].as_str().unwrap()).expect("session id"),
+        )
         .await
-        .expect("load session")
+        .expect("load authoritative session")
         .expect("session exists");
     let metadata = session.session_metadata().expect("metadata");
 

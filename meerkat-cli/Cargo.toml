@@ -110,7 +110,7 @@ jsonl-store = ["meerkat/jsonl-store"]
 session-store = ["meerkat/session-store"]
 session-compaction = ["meerkat/session-compaction"]
 # Enables both the memory backend capability and memory_search/session wiring.
-memory-store = ["meerkat/memory-store", "meerkat/memory-store-session"]
+memory-store = ["meerkat/memory-store", "memory-store-session"]
 memory-store-session = ["meerkat/memory-store-session"]
 
 # Subsystems

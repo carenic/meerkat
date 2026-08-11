@@ -1125,6 +1125,13 @@ capabilities = ["shell"]
     let pack_out = run_rkat(&rkat, &project_dir, &pack_refs, None).await?;
     let _ = output_ok_or_err(pack_out, &pack_refs).map_err(std::io::Error::other)?;
 
+    let wasm = project_dir.join("test_runtime_bg.wasm");
+    tokio::fs::write(&wasm, b"\0asm\x01\0\0\0").await?;
+    tokio::fs::write(
+        project_dir.join("test_runtime.js"),
+        "export default async function init() {}\n",
+    )
+    .await?;
     let wasm_args = [
         "mob".to_string(),
         "web".to_string(),
@@ -1132,6 +1139,8 @@ capabilities = ["shell"]
         pack.display().to_string(),
         "--trust-policy".to_string(),
         "permissive".to_string(),
+        "--wasm".to_string(),
+        wasm.display().to_string(),
         "-o".to_string(),
         project_dir.join("web-out").display().to_string(),
     ];
