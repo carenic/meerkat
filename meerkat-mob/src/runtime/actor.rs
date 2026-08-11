@@ -1464,7 +1464,7 @@ enum SubmitWorkDispatchCompletion {
         operation_id: Option<meerkat_core::ops::OperationId>,
         member_ref: MemberRef,
         req: Box<meerkat_core::service::StartTurnRequest>,
-        completion_tx: Option<oneshot::Sender<Result<(), MobError>>>,
+        completion_tx: Option<super::handle::ExactTurnCompletionSender>,
         llm_identity_applied_tx: Option<super::handle::MemberTurnLlmIdentityAppliedSender>,
         /// `Some(identity)` iff the target is machine-placed on a member
         /// host: a typed delivery failure then fires the W-D.2 revival
@@ -1529,7 +1529,7 @@ struct SubmitWorkDispatchRequest {
     turn_metadata: Option<meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata>,
     event_tx:
         Option<tokio::sync::mpsc::Sender<meerkat_core::EventEnvelope<meerkat_core::AgentEvent>>>,
-    completion_tx: Option<oneshot::Sender<Result<(), MobError>>>,
+    completion_tx: Option<super::handle::ExactTurnCompletionSender>,
     llm_identity_applied_tx: Option<super::handle::MemberTurnLlmIdentityAppliedSender>,
     ack_mode: crate::mob_machine::SubmitWorkAckMode,
     operation_id: Option<meerkat_core::ops::OperationId>,
@@ -47301,7 +47301,7 @@ impl MobActor {
         provisioner: Arc<dyn MobProvisioner>,
         member_ref: MemberRef,
         req: Box<meerkat_core::service::StartTurnRequest>,
-        completion_tx: Option<oneshot::Sender<Result<(), MobError>>>,
+        completion_tx: Option<super::handle::ExactTurnCompletionSender>,
         llm_identity_applied_tx: Option<super::handle::MemberTurnLlmIdentityAppliedSender>,
         reply_tx: oneshot::Sender<Result<(), MobError>>,
         revival: Option<(mpsc::Sender<RoutedMobCommand>, AgentIdentity)>,

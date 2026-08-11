@@ -396,7 +396,7 @@ pub(super) struct SubmitWorkPayload {
     pub event_tx:
         Option<tokio::sync::mpsc::Sender<meerkat_core::EventEnvelope<meerkat_core::AgentEvent>>>,
     /// Optional committed-completion result channel for a tracked turn.
-    pub completion_tx: Option<oneshot::Sender<Result<(), MobError>>>,
+    pub completion_tx: Option<super::handle::ExactTurnCompletionSender>,
     /// Executor-bound acknowledgement for a host-requested LLM identity.
     pub llm_identity_applied_tx: Option<super::handle::MemberTurnLlmIdentityAppliedSender>,
     pub ack_mode: crate::mob_machine::SubmitWorkAckMode,

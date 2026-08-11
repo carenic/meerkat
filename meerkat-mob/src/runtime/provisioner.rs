@@ -968,7 +968,7 @@ pub trait MobProvisioner: Send + Sync {
         &self,
         member_ref: &MemberRef,
         req: StartTurnRequest,
-        completion_tx: tokio::sync::oneshot::Sender<Result<(), MobError>>,
+        completion_tx: super::handle::ExactTurnCompletionSender,
         llm_identity_applied_tx: Option<super::handle::MemberTurnLlmIdentityAppliedSender>,
     ) -> Result<(), MobError> {
         let _ = (member_ref, req, completion_tx, llm_identity_applied_tx);
@@ -3353,7 +3353,7 @@ impl SessionBackend {
         session_id: &SessionId,
         input: Input,
         event_tx: Option<TurnEventTx>,
-        completion_tx: Option<oneshot::Sender<Result<(), MobError>>>,
+        completion_tx: Option<super::handle::ExactTurnCompletionSender>,
         llm_identity_applied_tx: Option<super::handle::MemberTurnLlmIdentityAppliedSender>,
     ) -> Result<(), MobError> {
         let adapter = self.runtime_adapter.as_ref().ok_or_else(|| {
@@ -3437,7 +3437,7 @@ impl SessionBackend {
                         drop(queued_context);
                         let delivery_outcome = deferred_turn_outcome_from_completion(&completion);
                         (
-                            runtime_completion_to_mob_result(&task_session_id, completion),
+                            runtime_completion_to_exact_turn(&task_session_id, completion),
                             delivery_outcome,
                         )
                     }
@@ -3446,7 +3446,15 @@ impl SessionBackend {
                             queued_context.resolve_without_execution(None);
                         }
                         drop(queued_context);
-                        (Ok(()), DeferredTurnEventOutcome::Succeeded)
+                        (
+                            Ok(super::handle::ExactTurnCompletion {
+                                session_id: task_session_id.clone(),
+                                terminal: super::handle::ExactTurnTerminal::Runtime(
+                                    meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult,
+                                ),
+                            }),
+                            DeferredTurnEventOutcome::Succeeded,
+                        )
                     }
                     Err(error) => (Err(error), DeferredTurnEventOutcome::Failed),
                 };
@@ -3522,7 +3530,12 @@ impl SessionBackend {
                     delivery.release(DeferredTurnEventOutcome::Succeeded);
                 }
                 if let Some(completion_tx) = completion_tx {
-                    let _ = completion_tx.send(Ok(()));
+                    let _ = completion_tx.send(Ok(super::handle::ExactTurnCompletion {
+                        session_id: session_id.clone(),
+                        terminal: super::handle::ExactTurnTerminal::Runtime(
+                            meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult,
+                        ),
+                    }));
                 }
                 return Ok(());
             };
@@ -3532,7 +3545,7 @@ impl SessionBackend {
                 let completion = handle.wait().await;
                 drop(queued_context);
                 let delivery_outcome = deferred_turn_outcome_from_completion(&completion);
-                let result = runtime_completion_to_mob_result(&completion_session_id, completion);
+                let result = runtime_completion_to_exact_turn(&completion_session_id, completion);
                 if let Some(delivery) = deferred_delivery {
                     delivery.release(delivery_outcome);
                 }
@@ -3547,6 +3560,23 @@ impl SessionBackend {
 }
 
 #[cfg(feature = "runtime-adapter")]
+fn runtime_completion_to_exact_turn(
+    session_id: &SessionId,
+    completion: Result<
+        meerkat_runtime::completion::CompletionOutcome,
+        meerkat_runtime::completion::CompletionWaitError,
+    >,
+) -> Result<super::handle::ExactTurnCompletion, MobError> {
+    let outcome = completion.map_err(|error| {
+        MobError::Internal(format!("runtime completion waiter failed: {error}"))
+    })?;
+    Ok(super::handle::ExactTurnCompletion {
+        session_id: session_id.clone(),
+        terminal: super::handle::ExactTurnTerminal::Runtime(outcome),
+    })
+}
+
+#[cfg(feature = "runtime-adapter")]
 fn runtime_completion_to_mob_result(
     session_id: &SessionId,
     completion: Result<
@@ -3554,53 +3584,9 @@ fn runtime_completion_to_mob_result(
         meerkat_runtime::completion::CompletionWaitError,
     >,
 ) -> Result<(), MobError> {
-    let completion = completion.map_err(|error| {
-        MobError::Internal(format!("runtime completion waiter failed: {error}"))
-    })?;
-    match completion {
-        meerkat_runtime::completion::CompletionOutcome::Completed(_) => Ok(()),
-        meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult => Ok(()),
-        meerkat_runtime::completion::CompletionOutcome::CallbackPending {
-            tool_use_id,
-            tool_name,
-            args,
-        } => Err(MobError::CallbackPending {
-            session_id: session_id.clone(),
-            tool_use_id,
-            tool_name,
-            args,
-        }),
-        meerkat_runtime::completion::CompletionOutcome::CallbackBatchPending {
-            pending_tool_calls,
-        } => Err(MobError::CallbackBatchPending {
-            session_id: session_id.clone(),
-            pending_tool_calls,
-        }),
-        meerkat_runtime::completion::CompletionOutcome::Cancelled => {
-            Err(MobError::Internal("turn cancelled".to_string()))
-        }
-        meerkat_runtime::completion::CompletionOutcome::Abandoned { reason, .. } => {
-            Err(MobError::Internal(format!("turn abandoned: {reason}")))
-        }
-        meerkat_runtime::completion::CompletionOutcome::AbandonedWithError { reason, error } => {
-            Err(MobError::Internal(format!(
-                "turn abandoned: {reason}; error={}",
-                serde_json::to_string(&error).unwrap_or_else(|_| "<unserializable>".to_string())
-            )))
-        }
-        meerkat_runtime::completion::CompletionOutcome::CompletedWithFinalizationFailure {
-            error,
-        } => Err(MobError::Internal(format!(
-            "turn finalization failed after output: {}",
-            error
-                .detail
-                .as_deref()
-                .unwrap_or("turn finalization failed"),
-        ))),
-        meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated { reason, .. } => {
-            Err(MobError::Internal(format!("runtime terminated: {reason}")))
-        }
-    }
+    runtime_completion_to_exact_turn(session_id, completion)
+        .and_then(super::handle::legacy_exact_turn_result)
+        .map(drop)
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -3638,25 +3624,7 @@ fn deferred_turn_outcome_from_completion(
 }
 
 fn session_turn_error_to_mob_error(bridge_session_id: &SessionId, error: SessionError) -> MobError {
-    match error {
-        SessionError::Agent(meerkat_core::error::AgentError::CallbackPending {
-            tool_use_id,
-            tool_name,
-            args,
-        }) => MobError::CallbackPending {
-            session_id: bridge_session_id.clone(),
-            tool_use_id,
-            tool_name,
-            args,
-        },
-        SessionError::Agent(meerkat_core::error::AgentError::CallbackBatchPending {
-            pending_tool_calls,
-        }) => MobError::CallbackBatchPending {
-            session_id: bridge_session_id.clone(),
-            pending_tool_calls,
-        },
-        other => other.into(),
-    }
+    super::handle::legacy_direct_session_error(bridge_session_id, error)
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -8486,7 +8454,7 @@ impl MobProvisioner for SessionBackend {
         &self,
         member_ref: &MemberRef,
         req: StartTurnRequest,
-        completion_tx: tokio::sync::oneshot::Sender<Result<(), MobError>>,
+        completion_tx: super::handle::ExactTurnCompletionSender,
         llm_identity_applied_tx: Option<super::handle::MemberTurnLlmIdentityAppliedSender>,
     ) -> Result<(), MobError> {
         let session_id = Self::require_session(member_ref, "admit tracked turn")?;
@@ -8518,12 +8486,19 @@ impl MobProvisioner for SessionBackend {
         }
         let session_service = self.session_service.clone();
         tokio::spawn(async move {
-            let result = session_service
-                .start_turn(&session_id, req)
-                .await
-                .map(|_| ())
-                .map_err(|error| session_turn_error_to_mob_error(&session_id, error));
-            let _ = completion_tx.send(result);
+            let completion = match session_service.start_turn(&session_id, req).await {
+                Ok(result) => super::handle::ExactTurnCompletion {
+                    session_id: session_id.clone(),
+                    terminal: super::handle::ExactTurnTerminal::Runtime(
+                        meerkat_runtime::completion::CompletionOutcome::Completed(Box::new(result)),
+                    ),
+                },
+                Err(error) => super::handle::ExactTurnCompletion {
+                    session_id: session_id.clone(),
+                    terminal: super::handle::ExactTurnTerminal::DirectSessionError(error),
+                },
+            };
+            let _ = completion_tx.send(Ok(completion));
         });
         Ok(())
     }
@@ -11786,7 +11761,7 @@ impl MobProvisioner for MultiBackendProvisioner {
         &self,
         member_ref: &MemberRef,
         req: StartTurnRequest,
-        completion_tx: tokio::sync::oneshot::Sender<Result<(), MobError>>,
+        completion_tx: super::handle::ExactTurnCompletionSender,
         llm_identity_applied_tx: Option<super::handle::MemberTurnLlmIdentityAppliedSender>,
     ) -> Result<(), MobError> {
         match member_ref {

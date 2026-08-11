@@ -210,7 +210,7 @@ pub(crate) struct SubmitWorkCommand {
     pub turn_metadata: Option<meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata>,
     pub event_tx:
         Option<tokio::sync::mpsc::Sender<meerkat_core::EventEnvelope<meerkat_core::AgentEvent>>>,
-    pub completion_tx: Option<tokio::sync::oneshot::Sender<Result<(), crate::MobError>>>,
+    pub completion_tx: Option<crate::runtime::ExactTurnCompletionSender>,
     pub llm_identity_applied_tx: Option<crate::runtime::MemberTurnLlmIdentityAppliedSender>,
     pub ack_mode: SubmitWorkAckMode,
 }

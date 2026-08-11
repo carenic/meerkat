@@ -44533,6 +44533,7 @@ struct RuntimeBackedRealCommsSessionService {
     fail_runtime_turns: AtomicBool,
     fail_runtime_boundary_acknowledgement: AtomicBool,
     return_extraction_failure: AtomicBool,
+    return_exact_run_result: AtomicBool,
     runtime_turn_started: tokio::sync::Notify,
     runtime_turn_content_barriers: RwLock<HashMap<SessionId, RuntimeTurnContentBarrier>>,
     release_runtime_turns: tokio::sync::Notify,
@@ -44580,6 +44581,7 @@ impl RuntimeBackedRealCommsSessionService {
             fail_runtime_turns: AtomicBool::new(false),
             fail_runtime_boundary_acknowledgement: AtomicBool::new(false),
             return_extraction_failure: AtomicBool::new(false),
+            return_exact_run_result: AtomicBool::new(false),
             runtime_turn_started: tokio::sync::Notify::new(),
             runtime_turn_content_barriers: RwLock::new(HashMap::new()),
             release_runtime_turns: tokio::sync::Notify::new(),
@@ -44759,6 +44761,11 @@ impl RuntimeBackedRealCommsSessionService {
 
     fn set_return_extraction_failure(&self, enabled: bool) {
         self.return_extraction_failure
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    fn set_return_exact_run_result(&self, enabled: bool) {
+        self.return_exact_run_result
             .store(enabled, Ordering::Relaxed);
     }
 
@@ -45374,6 +45381,7 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
         let event_tx = req.event_tx.clone();
         let applied_turn_metadata = req.runtime.turn_metadata.clone();
         let provider_visible_prompt = provider_visible_prompt_from_start_turn_request(&req);
+        let exact_result_text = provider_visible_prompt.text_content();
         let content_barrier = self
             .runtime_turn_content_barriers
             .read()
@@ -45584,15 +45592,18 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
             message_count: 0,
         };
         let output = if self.return_extraction_failure.load(Ordering::Relaxed) {
-            let mut result = mock_run_result(
-                session_id.clone(),
-                "runtime main turn completed".to_string(),
-            );
+            let mut result = mock_run_result(session_id.clone(), exact_result_text.clone());
             result.extraction_error = Some(meerkat_core::types::ExtractionError {
                 last_output: result.text.clone(),
                 attempts: 1,
                 reason: "injected extraction failure".to_string(),
             });
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_run_result(
+                receipt, None, result,
+            )
+        } else if self.return_exact_run_result.load(Ordering::Relaxed) {
+            let mut result = mock_run_result(session_id.clone(), exact_result_text);
+            result.usage.output_tokens = result.text.len() as u64;
             meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_run_result(
                 receipt, None, result,
             )
@@ -49087,6 +49098,338 @@ async fn completion_bearing_internal_work_waits_for_its_committed_turn_boundary(
     );
 
     handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn exact_turn_runtime_member_results_remain_correlated_in_reverse_completion_order() {
+    let _serial = lock_real_comms_tests();
+    let mut definition = sample_definition();
+    for profile in definition
+        .profiles
+        .values_mut()
+        .filter_map(|binding| binding.as_inline_mut())
+    {
+        profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
+        profile.external_addressable = true;
+    }
+    let (handle, service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+
+    let first_identity = AgentIdentity::from("exact-first");
+    let second_identity = AgentIdentity::from("exact-second");
+    let first_session = handle
+        .spawn(ProfileName::from("lead"), first_identity.clone(), None)
+        .await
+        .expect("spawn first runtime-backed member")
+        .bridge_session_id()
+        .expect("first bridge session")
+        .clone();
+    let second_session = handle
+        .spawn(ProfileName::from("worker"), second_identity.clone(), None)
+        .await
+        .expect("spawn second runtime-backed member")
+        .bridge_session_id()
+        .expect("second bridge session")
+        .clone();
+    service.set_return_exact_run_result(true);
+
+    let first_prompt = "first exact runtime result is held at its apply barrier";
+    let first_entered = service
+        .arm_runtime_turn_content_barrier(&first_session, first_prompt)
+        .await;
+    let first_turn = handle
+        .member(&first_identity)
+        .await
+        .expect("first member handle")
+        .start_turn(
+            ContentInput::Text(first_prompt.to_string()),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("admit first exact runtime turn");
+    first_entered.notified().await;
+
+    let second_prompt = "second exact runtime result completes first";
+    let second = handle
+        .member(&second_identity)
+        .await
+        .expect("second member handle")
+        .start_turn(
+            ContentInput::Text(second_prompt.to_string()),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("admit second exact runtime turn")
+        .wait_bounded(BoundedResultSpec::new("second", 256).expect("valid bound"))
+        .await
+        .expect("second exact runtime result");
+    assert_eq!(second.receipt().identity, second_identity);
+    assert_eq!(second.result().session_id(), &second_session);
+    assert_eq!(second.result().result().text(), second_prompt);
+    assert_eq!(
+        second.result().usage().output_tokens,
+        second_prompt.len() as u64
+    );
+
+    service
+        .clear_runtime_turn_content_barrier(&first_session)
+        .await;
+    service.release_one_runtime_turn();
+    let first = first_turn
+        .wait_bounded(BoundedResultSpec::new("first", 256).expect("valid bound"))
+        .await
+        .expect("first exact runtime result after release");
+    assert_eq!(first.receipt().identity, first_identity);
+    assert_eq!(first.result().session_id(), &first_session);
+    assert_eq!(first.result().result().text(), first_prompt);
+    assert_eq!(
+        first.result().usage().output_tokens,
+        first_prompt.len() as u64
+    );
+
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn exact_turn_runtime_work_preserves_result_and_completed_without_result_is_typed() {
+    let _serial = lock_real_comms_tests();
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("lead"))
+        .expect("lead profile")
+        .as_inline_mut()
+        .expect("inline lead profile")
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let (handle, service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+    let identity = AgentIdentity::from("exact-work-member");
+    let session_id = handle
+        .spawn(ProfileName::from("lead"), identity.clone(), None)
+        .await
+        .expect("spawn runtime-backed work member")
+        .bridge_session_id()
+        .expect("work bridge session")
+        .clone();
+    let entry = handle
+        .get_member(&identity)
+        .await
+        .expect("read work member")
+        .expect("work member exists");
+
+    service.set_return_exact_run_result(true);
+    let exact_prompt = "exact internal work result";
+    let exact_work_ref = WorkRef::new();
+    let exact = handle
+        .start_work_with_mode(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            exact_work_ref.clone(),
+            WorkSpec::new(exact_prompt, WorkOrigin::Internal),
+            HandlingMode::Queue,
+        )
+        .await
+        .expect("admit exact internal work")
+        .wait_bounded(BoundedResultSpec::new("work", 256).expect("valid bound"))
+        .await
+        .expect("exact internal work result");
+    assert_eq!(exact.receipt().work_ref, exact_work_ref);
+    assert_eq!(exact.result().session_id(), &session_id);
+    assert_eq!(exact.result().result().text(), exact_prompt);
+    assert_eq!(
+        exact.result().usage().output_tokens,
+        exact_prompt.len() as u64
+    );
+
+    service.set_return_exact_run_result(false);
+    let no_result = handle
+        .member(&identity)
+        .await
+        .expect("member handle for no-result turn")
+        .start_turn(
+            ContentInput::Text("runtime commits no result".to_string()),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("admit no-result runtime turn")
+        .wait_bounded(BoundedResultSpec::new("no-result", 256).expect("valid bound"))
+        .await
+        .expect_err("CompletedWithoutResult must not become a fabricated result");
+    assert!(matches!(
+        no_result.failure(),
+        BoundedTurnFailure::CompletedWithoutResult {
+            session_id: actual
+        } if actual == &session_id
+    ));
+
+    service.set_return_extraction_failure(true);
+    let extraction_cap = crate::HELPER_RESULT_TRUNCATION_MARKER.len() + 4;
+    let extraction = handle
+        .member(&identity)
+        .await
+        .expect("member handle for extraction turn")
+        .start_turn(
+            ContentInput::Text(format!(
+                "ab💡{}private-extraction-tail",
+                "x".repeat(crate::HELPER_RESULT_TRUNCATION_MARKER.len() + 32)
+            )),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("admit extraction runtime turn")
+        .wait_bounded(
+            BoundedResultSpec::new("extraction", extraction_cap).expect("valid extraction bound"),
+        )
+        .await
+        .expect_err("runtime extraction failure must remain a bounded failure");
+    match extraction.failure() {
+        BoundedTurnFailure::ExtractionFailed {
+            session_id: actual,
+            reason,
+            last_output,
+            attempts,
+        } => {
+            assert_eq!(actual, &session_id);
+            assert_eq!(*attempts, 1);
+            assert_eq!(reason.status(), BoundedHelperResultStatus::FailedTruncated);
+            assert!(reason.text().len() <= extraction_cap);
+            assert!(
+                reason
+                    .text()
+                    .ends_with(crate::HELPER_RESULT_TRUNCATION_MARKER)
+            );
+            assert_eq!(
+                last_output.status(),
+                BoundedHelperResultStatus::FailedTruncated
+            );
+            assert_eq!(
+                last_output.text(),
+                format!("ab{}", crate::HELPER_RESULT_TRUNCATION_MARKER)
+            );
+            assert!(last_output.text().len() <= extraction_cap);
+            assert!(!last_output.text().contains("private-extraction-tail"));
+        }
+        other => panic!("expected bounded runtime extraction failure, got {other:?}"),
+    }
+
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn exact_turn_runtime_failure_and_direct_session_failure_keep_distinct_types() {
+    let _serial = lock_real_comms_tests();
+    let mut runtime_definition = sample_definition();
+    runtime_definition
+        .profiles
+        .get_mut(&ProfileName::from("lead"))
+        .expect("lead profile")
+        .as_inline_mut()
+        .expect("inline lead profile")
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let (runtime_handle, runtime_service) =
+        create_test_mob_with_runtime_backed_real_comms(runtime_definition).await;
+    let runtime_identity = AgentIdentity::from("exact-runtime-failure");
+    let runtime_session = runtime_handle
+        .spawn(ProfileName::from("lead"), runtime_identity.clone(), None)
+        .await
+        .expect("spawn runtime failure member")
+        .bridge_session_id()
+        .expect("runtime failure bridge session")
+        .clone();
+    runtime_service.set_fail_runtime_turns(true);
+    let runtime_error = runtime_handle
+        .member(&runtime_identity)
+        .await
+        .expect("runtime failure member handle")
+        .start_turn(
+            ContentInput::Text("fail through the real runtime adapter".to_string()),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("runtime failure is post-admission")
+        .wait_bounded(BoundedResultSpec::new("runtime-failure", 256).expect("valid bound"))
+        .await
+        .expect_err("runtime machine failure must remain typed");
+    match runtime_error.failure() {
+        BoundedTurnFailure::AbandonedWithError {
+            session_id: actual,
+            error,
+            ..
+        } => {
+            assert_eq!(actual, &runtime_session);
+            assert!(
+                error
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("injected runtime turn failure")),
+                "typed runtime failure must retain its injected cause: {error:?}"
+            );
+        }
+        other => panic!("expected typed runtime machine failure, got {other:?}"),
+    }
+    runtime_handle
+        .shutdown()
+        .await
+        .expect("shutdown runtime-backed test mob");
+
+    let direct_service = Arc::new(MockSessionService::new());
+    let direct_session = direct_service
+        .create_session(CreateSessionRequest {
+            injected_context: Vec::new(),
+            model: "direct-test-model".to_string(),
+            prompt: ContentInput::Text("create direct tracked session".to_string()),
+            system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+            max_tokens: None,
+            event_tx: None,
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            build: None,
+            labels: None,
+        })
+        .await
+        .expect("create direct tracked session")
+        .session_id;
+    direct_service.set_fail_start_turn(true);
+    let direct_backend =
+        super::provisioner::SessionBackend::new(direct_service.clone(), None, None);
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    MobProvisioner::admit_tracked_turn(
+        &direct_backend,
+        &MemberRef::Session {
+            session_id: direct_session.clone(),
+        },
+        StartTurnRequest {
+            injected_context: Vec::new(),
+            prompt: ContentInput::Text("fail through direct SessionService".to_string()),
+            system_prompt: None,
+            event_tx: None,
+            runtime: meerkat_core::service::StartTurnRuntimeSemantics::default(),
+        },
+        completion_tx,
+        None,
+    )
+    .await
+    .expect("direct semantic failure is post-admission");
+    let direct_completion = completion_rx
+        .await
+        .expect("direct completion authority remains live")
+        .expect("direct semantic failure must not become completion plumbing");
+    assert_eq!(direct_completion.session_id, direct_session);
+    match direct_completion.terminal {
+        super::handle::ExactTurnTerminal::DirectSessionError(error) => {
+            assert_eq!(error.code(), "SESSION_STORE_ERROR");
+            assert!(error.to_string().contains("mock start_turn failure"));
+        }
+        other => panic!("expected typed direct SessionError carrier, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -66686,10 +67029,13 @@ async fn test_finalization_failure_suppresses_buffered_success_terminal() {
     let (handle, service) =
         create_test_mob_with_persistent_runtime_backed_real_comms(definition).await;
     let identity = AgentIdentity::from("lead-finalization-failure");
-    handle
+    let session_id = handle
         .spawn(ProfileName::from("lead"), identity.clone(), None)
         .await
-        .expect("spawn lead");
+        .expect("spawn lead")
+        .bridge_session_id()
+        .expect("finalization failure bridge session")
+        .clone();
     service.set_emit_runtime_event_before_completion(true);
     service.set_fail_runtime_boundary_acknowledgement(true);
     let llm_host = Arc::new(RecordingSessionLlmReconfigureHost::new());
@@ -66722,15 +67068,26 @@ async fn test_finalization_failure_suppresses_buffered_success_terminal() {
         .expect("identity override");
     assert_eq!(applied.model, "finalization-model");
     let error = turn
-        .wait()
+        .wait_bounded(BoundedResultSpec::new("finalization", 256).expect("valid bound"))
         .await
         .expect_err("checkpoint failure must fail tracked completion");
-    assert!(
-        error
-            .to_string()
-            .contains("runtime session checkpoint failed after commit"),
-        "unexpected finalization error: {error}"
-    );
+    match error.failure() {
+        BoundedTurnFailure::AbandonedWithError {
+            session_id: actual,
+            reason,
+            error,
+        } => {
+            assert_eq!(actual, &session_id);
+            assert!(reason.contains("runtime session checkpoint failed after commit"));
+            assert!(
+                error.detail.as_deref().is_some_and(
+                    |detail| detail.contains("runtime session checkpoint failed after commit")
+                ),
+                "typed finalization failure must retain its machine cause: {error:?}"
+            );
+        }
+        other => panic!("expected typed finalization failure, got {other:?}"),
+    }
 
     let mut saw_delta = false;
     while let Ok(Some(event)) =

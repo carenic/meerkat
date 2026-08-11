@@ -308,9 +308,9 @@ mod tests {
 
         async fn admit_tracked_turn(
             &self,
-            _member_ref: &MemberRef,
+            member_ref: &MemberRef,
             _req: StartTurnRequest,
-            completion_tx: tokio::sync::oneshot::Sender<Result<(), MobError>>,
+            completion_tx: crate::runtime::handle::ExactTurnCompletionSender,
             llm_identity_applied_tx: Option<
                 crate::runtime::handle::MemberTurnLlmIdentityAppliedSender,
             >,
@@ -318,7 +318,16 @@ mod tests {
             if let Some(llm_identity_applied_tx) = llm_identity_applied_tx {
                 let _ = llm_identity_applied_tx.send(Ok(None));
             }
-            let _ = completion_tx.send(Ok(()));
+            let session_id = member_ref
+                .bridge_session_id()
+                .cloned()
+                .unwrap_or_else(|| SessionId::new());
+            let _ = completion_tx.send(Ok(crate::runtime::handle::ExactTurnCompletion {
+                session_id,
+                terminal: crate::runtime::handle::ExactTurnTerminal::Runtime(
+                    meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult,
+                ),
+            }));
             Ok(())
         }
 
