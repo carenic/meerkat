@@ -53690,6 +53690,17 @@ fn unused_loopback_port() -> u16 {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn reserve_supervisor_bridge_port() -> (u16, std::net::TcpListener) {
+    let reservation = std::net::TcpListener::bind(std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
+        .expect("reserve wildcard supervisor bridge port");
+    let port = reservation
+        .local_addr()
+        .expect("reserved supervisor bridge listener local addr")
+        .port();
+    (port, reservation)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[tokio::test]
 async fn test_external_tcp_bind_uses_configured_supervisor_advertised_address() {
     let _serial = lock_real_comms_tests();
@@ -53698,7 +53709,7 @@ async fn test_external_tcp_bind_uses_configured_supervisor_advertised_address() 
         "external-tcp-advertised-supervisor",
     );
     let mob_id = definition.id.clone();
-    let port = unused_loopback_port();
+    let (port, port_reservation) = reserve_supervisor_bridge_port();
     let advertised_address = format!("tcp://127.0.0.1:{port}");
     definition
         .backend
@@ -53709,6 +53720,7 @@ async fn test_external_tcp_bind_uses_configured_supervisor_advertised_address() 
         bind_address: Some(format!("0.0.0.0:{port}")),
         advertised_address: Some(advertised_address.clone()),
     });
+    drop(port_reservation);
     let (handle, service) = create_test_mob(definition).await;
     let external_name = test_comms_name_for(&mob_id, "lead", "l-tcp-advertised");
     let external = spawn_live_external_tcp_peer(&external_name).await;
@@ -53794,7 +53806,7 @@ async fn test_external_tcp_fixed_supervisor_bridge_pending_rotation_retry_reuses
         "external-tcp-fixed-supervisor-pending-retry",
     );
     let mob_id = definition.id.clone();
-    let port = unused_loopback_port();
+    let (port, port_reservation) = reserve_supervisor_bridge_port();
     let advertised_address = format!("tcp://127.0.0.1:{port}");
     definition
         .backend
@@ -53816,6 +53828,7 @@ async fn test_external_tcp_fixed_supervisor_bridge_pending_rotation_retry_reuses
     let runtime_metadata = storage.runtime_metadata.clone();
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
+    drop(port_reservation);
     let handle = MobBuilder::new(definition, storage)
         .with_session_service(service.clone())
         // External peer-only members are owned by the MobMachine owner bridge
