@@ -4804,10 +4804,10 @@ async fn handle_config_set(
     Ok(())
 }
 
-/// `rkat --default-model <MODEL>`: validate the model against the injected
-/// catalog + configured custom models, then persist `agent.model` through the
-/// same scope-resolved config runtime every other command reads (project /
-/// user / realm resolution included).
+/// `rkat --default-model <MODEL>`: validate the model against the effective
+/// model registry, then persist `agent.model` through the same scope-resolved
+/// config runtime every other command reads (project / user / realm resolution
+/// included).
 async fn handle_set_default_model(model: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
     let model = model.trim();
     if model.is_empty() {
@@ -4817,15 +4817,31 @@ async fn handle_set_default_model(model: &str, scope: &RuntimeScope) -> anyhow::
     }
     let catalog = meerkat_models::canonical();
     let (config, _) = load_config(scope).await?;
-    let provider = catalog
-        .infer_provider(model)
-        .or_else(|| config.models.custom.get(model).map(|custom| custom.provider))
+    let registry = config
+        .model_registry(catalog)
+        .map_err(|error| anyhow::anyhow!("Invalid effective model registry: {error}"))?;
+    let provider = registry
+        .entry(model)
+        .map(|entry| entry.provider)
         .ok_or_else(|| {
-            let mut known: Vec<&str> = catalog.entries.iter().map(|entry| entry.id).collect();
-            let customs: Vec<&str> = config.models.custom.keys().map(String::as_str).collect();
-            known.extend(customs.iter());
+            let mut known = Vec::new();
+            for provider in [
+                meerkat_core::Provider::Anthropic,
+                meerkat_core::Provider::OpenAI,
+                meerkat_core::Provider::Gemini,
+                meerkat_core::Provider::SelfHosted,
+                meerkat_core::Provider::Other,
+            ] {
+                known.extend(
+                    registry
+                        .entries_for_provider(provider)
+                        .map(|entry| entry.id.as_str()),
+                );
+            }
+            known.sort_unstable();
+            known.dedup();
             anyhow::anyhow!(
-                "unknown model `{model}`. Known models: {}. Custom models are added under [models.<id>] in config with a `provider`.",
+                "unknown model `{model}`. Known models: {}. Custom hosted models are added under [models.<id>] with a `provider`; self-hosted aliases are added under [self_hosted.models.<id>].",
                 known.join(", ")
             )
         })?;
@@ -26422,6 +26438,65 @@ supports_reasoning = true
 
         let (config, _) = load_config(&scope).await.expect("reload config");
         assert_eq!(config.agent.model, "my-local-llm");
+    }
+
+    #[tokio::test]
+    async fn test_set_default_model_honors_configured_self_hosted_alias() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = test_scope_with_context(dir.path().to_path_buf());
+
+        handle_config_patch(
+            None,
+            Some(
+                serde_json::json!({
+                    "self_hosted": {
+                        "default_model": "muse-glimmer-30b",
+                        "servers": {
+                            "muse_vllm": {
+                                "transport": "openai_compatible",
+                                "base_url": "http://127.0.0.1:8000",
+                                "api_style": "chat_completions"
+                            }
+                        },
+                        "models": {
+                            "muse-glimmer-30b": {
+                                "server": "muse_vllm",
+                                "remote_model": "muse-glimmer-30b",
+                                "display_name": "Muse Glimmer 30B",
+                                "family": "muse-glimmer",
+                                "tier": "supported",
+                                "context_window": 262144,
+                                "max_output_tokens": 16384,
+                                "vision": false,
+                                "image_tool_results": false,
+                                "inline_video": false,
+                                "supports_temperature": true,
+                                "supports_thinking": true,
+                                "supports_reasoning": true,
+                                "supports_web_search": false,
+                                "call_timeout_secs": 1800
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+            None,
+            &scope,
+        )
+        .await
+        .expect("register self-hosted alias");
+
+        handle_set_default_model("muse-glimmer-30b", &scope)
+            .await
+            .expect("self-hosted alias persists");
+
+        let (config, _) = load_config(&scope).await.expect("reload config");
+        assert_eq!(config.agent.model, "muse-glimmer-30b");
+        let resolved = resolve_cli_create_session_model(&config, None, None, None)
+            .expect("omitted run model resolves through the configured agent default");
+        assert_eq!(resolved.model, "muse-glimmer-30b");
+        assert_eq!(resolved.provider, meerkat_core::Provider::SelfHosted);
     }
 
     #[tokio::test]
