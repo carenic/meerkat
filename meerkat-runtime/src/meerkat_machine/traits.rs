@@ -2666,31 +2666,27 @@ mod tests {
     }
 
     async fn seed_durable_attached_archive_authority(
-        machine: &Arc<MeerkatMachine>,
-        session_id: SessionId,
+        store: &crate::store::InMemoryRuntimeStore,
+        session_id: &SessionId,
     ) {
-        let mut prepared = machine
-            .prepare_session_materialization(session_id)
+        let runtime_id = LogicalRuntimeId::for_session(session_id);
+        store
+            .commit_machine_lifecycle(
+                &runtime_id,
+                crate::store::MachineLifecycleCommit::new_with_binding(
+                    RuntimeState::Attached,
+                    crate::store::MachineLifecycleBindingFacts::new(
+                        Some(runtime_id.0.clone()),
+                        Some(1),
+                        Some(1),
+                        Some("archive-fixture-epoch".to_string()),
+                    ),
+                    crate::store::SupervisorAuthoritySnapshot::UnboundNoReceipt,
+                ),
+                &[],
+            )
             .await
-            .expect("prepare durable archive authority fixture");
-        crate::begin_session_runtime_actor_materialization(prepared.bindings())
-            .expect("claim durable archive authority actor construction")
-            .commit()
-            .expect("record durable archive authority actor materialization");
-        let pending = match prepared
-            .ensure_executor_attachment(|_witness| Box::new(NoPublicationHandleExecutor))
-            .await
-            .expect("attach durable archive authority executor")
-        {
-            super::super::EnsureRuntimeExecutorAttachment::Pending(pending) => pending,
-            super::super::EnsureRuntimeExecutorAttachment::Existing(witness) => {
-                panic!("fresh durable archive authority reused {witness:?}")
-            }
-        };
-        pending
-            .commit()
-            .await
-            .expect("commit durable archive authority executor");
+            .expect("seed durable attached archive authority");
     }
 
     fn assert_dispatch_outboxes_published(driver: &DriverEntry, expected: usize) {
@@ -3255,12 +3251,7 @@ mod tests {
     async fn archive_lease_preparation_deadline_does_not_cancel_wedged_store_read() {
         let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
         let session_id = SessionId::new();
-        let first = Arc::new(MeerkatMachine::persistent(
-            store.clone(),
-            Arc::new(meerkat_store::MemoryBlobStore::new()),
-        ));
-        seed_durable_attached_archive_authority(&first, session_id.clone()).await;
-        drop(first);
+        seed_durable_attached_archive_authority(store.as_ref(), &session_id).await;
 
         let entered = Arc::new(crate::tokio::sync::Notify::new());
         let release = Arc::new(crate::tokio::sync::Notify::new());
@@ -3377,12 +3368,7 @@ mod tests {
     async fn archive_lease_preparation_panic_clears_singleflight_for_retry() {
         let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
         let session_id = SessionId::new();
-        let first = Arc::new(MeerkatMachine::persistent(
-            store.clone(),
-            Arc::new(meerkat_store::MemoryBlobStore::new()),
-        ));
-        seed_durable_attached_archive_authority(&first, session_id.clone()).await;
-        drop(first);
+        seed_durable_attached_archive_authority(store.as_ref(), &session_id).await;
 
         let restarted = MeerkatMachine::persistent(
             store.clone(),

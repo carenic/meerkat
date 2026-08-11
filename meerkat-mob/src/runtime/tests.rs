@@ -47774,8 +47774,15 @@ async fn test_peer_response_reaches_requester_in_runtime_backed_real_comms() {
     // locks.
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if service.applied_runtime_prompts(&sid_requester).await.len()
-                > requester_prompt_baseline
+            let prompts = service.applied_runtime_prompts(&sid_requester).await;
+            if prompts
+                .iter()
+                .skip(requester_prompt_baseline)
+                .any(|prompt| {
+                    let text = prompt.text_content();
+                    text.contains("Peer response terminal")
+                        && text.contains(&requester_response_request_id)
+                })
             {
                 break;
             }
@@ -47785,19 +47792,25 @@ async fn test_peer_response_reaches_requester_in_runtime_backed_real_comms() {
     .await
     .expect("terminal peer response should start the requester reaction turn");
     let requester_prompts_after_response = service.applied_runtime_prompts(&sid_requester).await;
-    assert_eq!(
-        requester_prompts_after_response.len(),
-        requester_prompt_baseline + 1,
-        "terminal peer response should append runtime system context and kick exactly one requester reaction turn: {requester_prompts_after_response:?}"
-    );
+    let mut requester_reaction_prompts = requester_prompts_after_response
+        .iter()
+        .skip(requester_prompt_baseline)
+        .filter(|prompt| {
+            let text = prompt.text_content();
+            text.contains("Peer response terminal") && text.contains(&requester_response_request_id)
+        });
     // The mandatory requester reaction turn carries the typed comms-notice
     // projection as its model-visible content — never a fabricated empty
     // prompt (providers reject empty user messages) and never raw user
     // prose authored by the responder outside the typed notice rendering.
-    let reaction_prompt = requester_prompts_after_response
-        .last()
+    let reaction_prompt = requester_reaction_prompts
+        .next()
         .expect("reaction turn prompt should exist")
         .text_content();
+    assert!(
+        requester_reaction_prompts.next().is_none(),
+        "one terminal peer response must kick exactly one matching requester reaction turn: {requester_prompts_after_response:?}"
+    );
     assert!(
         !reaction_prompt.trim().is_empty(),
         "terminal peer response reaction turn must have model-visible content, \
