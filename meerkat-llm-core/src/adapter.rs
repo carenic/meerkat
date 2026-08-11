@@ -81,6 +81,37 @@ impl LlmClientAdapter {
         })
     }
 
+    /// Project host-declared usage from a provider-agnostic raw client onto
+    /// the canonical identity that owns this adapter.
+    ///
+    /// `Provider::Other` is the explicit wildcard accepted by
+    /// [`Self::validate_provider_binding`]. A wildcard client cannot author a
+    /// concrete provider identity, so its host-declared accounting inherits
+    /// the canonical provider selected by the owning factory/session. Concrete
+    /// provider evidence, provider-authored conventions, and model mismatches
+    /// remain untouched so the core identity validator can reject them.
+    fn project_wildcard_host_declared_usage(
+        &self,
+        usage: meerkat_core::TurnUsage,
+    ) -> meerkat_core::TurnUsage {
+        let accounting = usage.accounting();
+        let should_project = self.client.provider() == Provider::Other
+            && self.provider != Provider::Other
+            && accounting.provider == Provider::Other
+            && accounting.model == self.model
+            && accounting.convention
+                == meerkat_core::PresentedTokenConvention::HostDeclaredInclusiveInputTotal;
+        if !should_project {
+            return usage;
+        }
+
+        let raw_usage = usage.as_usage().clone();
+        let mut accounting = accounting.clone();
+        accounting.provider = self.provider;
+        accounting.model.clone_from(&self.model);
+        meerkat_core::TurnUsage::new(raw_usage, accounting)
+    }
+
     fn new_bound(
         client: Arc<dyn LlmClient>,
         model: String,
@@ -438,7 +469,7 @@ impl AgentLlmClient for LlmClientAdapter {
                         }
                     }
                     LlmEvent::UsageUpdate { usage: u } => {
-                        usage = u.into_inner();
+                        usage = self.project_wildcard_host_declared_usage(u).into_inner();
                     }
                     LlmEvent::Done { outcome } => match outcome {
                         LlmDoneOutcome::Success { stop_reason: sr } => {
@@ -693,6 +724,190 @@ mod tests {
         };
 
         assert!(error.to_string().contains("cannot back canonical identity"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_bound_adapter_projects_wildcard_host_declared_usage() -> Result<(), String> {
+        let adapter = LlmClientAdapter::try_for_provider_identity(
+            Arc::new(crate::TestClient::default()),
+            "gpt-5.5".to_string(),
+            Provider::OpenAI,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let result = adapter
+            .stream_response(
+                &[Message::User(UserMessage::text("hello"))],
+                &[],
+                1024,
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let accounting = result
+            .usage()
+            .provider_accounting
+            .as_ref()
+            .ok_or_else(|| "projected usage must retain accounting".to_string())?;
+
+        assert_eq!(accounting.provider, Provider::OpenAI);
+        assert_eq!(accounting.model, "gpt-5.5");
+        assert_eq!(accounting.presented_tokens, 0);
+        assert_eq!(
+            accounting.convention,
+            meerkat_core::PresentedTokenConvention::HostDeclaredInclusiveInputTotal
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_bound_adapter_does_not_rewrite_concrete_provider_usage() -> Result<(), String>
+    {
+        let adapter = LlmClientAdapter::try_for_provider_identity(
+            Arc::new(ScriptedClient {
+                events: vec![
+                    Ok(LlmEvent::UsageUpdate {
+                        usage: meerkat_core::TurnUsage::host_declared(
+                            Provider::Anthropic,
+                            "gpt-5.5",
+                            Usage::default(),
+                        ),
+                    }),
+                    Ok(LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Success {
+                            stop_reason: StopReason::EndTurn,
+                        },
+                    }),
+                ],
+            }),
+            "gpt-5.5".to_string(),
+            Provider::OpenAI,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let result = adapter
+            .stream_response(
+                &[Message::User(UserMessage::text("hello"))],
+                &[],
+                1024,
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let accounting = result
+            .usage()
+            .provider_accounting
+            .as_ref()
+            .ok_or_else(|| "usage must retain accounting".to_string())?;
+
+        assert_eq!(accounting.provider, Provider::Anthropic);
+        assert_eq!(accounting.model, "gpt-5.5");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_bound_adapter_does_not_rewrite_wildcard_model_mismatch() -> Result<(), String>
+    {
+        let adapter = LlmClientAdapter::try_for_provider_identity(
+            Arc::new(ScriptedClient {
+                events: vec![
+                    Ok(LlmEvent::UsageUpdate {
+                        usage: meerkat_core::TurnUsage::host_declared(
+                            Provider::Other,
+                            "different-model",
+                            Usage::default(),
+                        ),
+                    }),
+                    Ok(LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Success {
+                            stop_reason: StopReason::EndTurn,
+                        },
+                    }),
+                ],
+            }),
+            "gpt-5.5".to_string(),
+            Provider::OpenAI,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let result = adapter
+            .stream_response(
+                &[Message::User(UserMessage::text("hello"))],
+                &[],
+                1024,
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let accounting = result
+            .usage()
+            .provider_accounting
+            .as_ref()
+            .ok_or_else(|| "usage must retain accounting".to_string())?;
+
+        assert_eq!(accounting.provider, Provider::Other);
+        assert_eq!(accounting.model, "different-model");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_bound_adapter_does_not_rewrite_provider_authored_wildcard_usage()
+    -> Result<(), String> {
+        let adapter = LlmClientAdapter::try_for_provider_identity(
+            Arc::new(ScriptedClient {
+                events: vec![
+                    Ok(LlmEvent::UsageUpdate {
+                        usage: meerkat_core::TurnUsage::new(
+                            Usage {
+                                input_tokens: 5,
+                                ..Usage::default()
+                            },
+                            meerkat_core::ProviderTokenAccounting {
+                                provider: Provider::Other,
+                                model: "gpt-5.5".to_string(),
+                                presented_tokens: 5,
+                                convention: meerkat_core::PresentedTokenConvention::OpenAiInputIncludesCachedSubset,
+                                aggregation: meerkat_core::TokenAggregationProvenance::ProviderInclusiveInputTotal,
+                            },
+                        ),
+                    }),
+                    Ok(LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Success {
+                            stop_reason: StopReason::EndTurn,
+                        },
+                    }),
+                ],
+            }),
+            "gpt-5.5".to_string(),
+            Provider::OpenAI,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let result = adapter
+            .stream_response(
+                &[Message::User(UserMessage::text("hello"))],
+                &[],
+                1024,
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let accounting = result
+            .usage()
+            .provider_accounting
+            .as_ref()
+            .ok_or_else(|| "usage must retain accounting".to_string())?;
+
+        assert_eq!(accounting.provider, Provider::Other);
+        assert_eq!(
+            accounting.convention,
+            meerkat_core::PresentedTokenConvention::OpenAiInputIncludesCachedSubset
+        );
         Ok(())
     }
 
