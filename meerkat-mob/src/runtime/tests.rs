@@ -48969,9 +48969,10 @@ async fn completion_bearing_internal_work_waits_for_its_committed_turn_boundary(
         .expect("the tracked work should enter its runtime boundary");
     let mut completion = Box::pin(turn.wait());
     assert!(
-        tokio::time::timeout(Duration::from_millis(50), &mut completion)
-            .await
-            .is_err(),
+        matches!(
+            futures::poll!(completion.as_mut()),
+            std::task::Poll::Pending
+        ),
         "the work handle must remain pending while its exact runtime boundary is blocked"
     );
 
