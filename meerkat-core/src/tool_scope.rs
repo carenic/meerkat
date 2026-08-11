@@ -1413,9 +1413,8 @@ impl ToolScope {
         visibility_owner.replace_deferred_tool_authority_catalog(
             deferred_authority_catalog_for_base_tools(&base_tools, &deferred_tool_names),
         )?;
-        visibility_owner.replace_filter_tool_authority_catalog(
-            filter_authority_catalog_for_base_tools(&base_tools),
-        )?;
+        visibility_owner
+            .replace_filter_tool_authority_catalog(base_tool_authority_catalog(&base_tools))?;
 
         Ok(Self::build_with_visibility_owner(
             base_tools,
@@ -1631,7 +1630,7 @@ impl ToolScope {
         self.visibility_owner
             .replace_deferred_tool_authority_catalog(deferred_authority_catalog)?;
 
-        let mut filter_authority_catalog = filter_authority_catalog_for_base_tools(&new_base_tools);
+        let mut filter_authority_catalog = base_tool_authority_catalog(&new_base_tools);
         extend_filter_authority_catalog_from_visibility_state(
             &mut filter_authority_catalog,
             visibility_state,
@@ -1985,7 +1984,7 @@ impl ToolScope {
         self.visibility_owner
             .replace_deferred_tool_authority_catalog(deferred_authority_catalog)?;
 
-        let mut filter_authority_catalog = filter_authority_catalog_for_base_tools(&base_tools);
+        let mut filter_authority_catalog = base_tool_authority_catalog(&base_tools);
         extend_filter_authority_catalog_from_visibility_state(
             &mut filter_authority_catalog,
             &current_visibility_state,
@@ -2355,10 +2354,15 @@ impl ToolScopeHandle {
                 .state
                 .read()
                 .map_err(|_| ToolScopeStageError::LockPoisoned)?;
-            let catalog = deferred_authority_catalog_for_base_tools(
-                &state.base_tools,
-                &state.deferred_tool_names,
-            );
+            // Validate every turn authority against the immutable base
+            // catalog, including dispatchers that intentionally stay in
+            // inline mode. Only names selected into the deferred projection
+            // need ephemeral activation; a correctly witnessed inline name is
+            // an accepted no-op. Restricting validation itself to
+            // `deferred_tool_names` makes a trusted overlay fail whenever an
+            // exact-catalog surface is wrapped by a conservative non-exact
+            // dispatcher, even though the definition is already visible.
+            let catalog = base_tool_authority_catalog(&state.base_tools);
             let mut activated = ToolNameSet::new();
             let mut invalid = Vec::new();
             for authority in authorities {
@@ -2367,7 +2371,7 @@ impl ToolScopeHandle {
                     .is_some_and(|names| names.contains(authority.name.as_str()));
                 if !allowed || catalog.get(authority.name.as_str()) != Some(&authority.witness) {
                     invalid.push(authority.name.clone());
-                } else {
+                } else if state.deferred_tool_names.contains(authority.name.as_str()) {
                     activated.insert(authority.name.clone());
                 }
             }
@@ -2587,7 +2591,7 @@ fn deferred_authority_catalog_for_base_tools(
         .collect()
 }
 
-fn filter_authority_catalog_for_base_tools(
+fn base_tool_authority_catalog(
     base_tools: &[Arc<ToolDef>],
 ) -> std::collections::BTreeMap<ToolName, ToolVisibilityWitness> {
     base_tools
@@ -3151,6 +3155,64 @@ mod tests {
             scope.visible_tool_names().unwrap(),
             ["visible".into()].into_iter().collect(),
             "clearing the turn overlay must remove ephemeral activation"
+        );
+    }
+
+    #[test]
+    fn catalog_witnessed_turn_authority_is_inert_for_inline_tool() {
+        let inline = tool_with_provenance("inline", "attention-binding-a");
+        let scope =
+            scope_with_generated_projection_names(vec![Arc::clone(&inline)].into(), raw_set(&[]));
+        let handle = scope.handle();
+        let authority = crate::DeferredToolLoadAuthority::new(
+            "inline",
+            crate::ToolVisibilityWitness {
+                last_seen_provenance: inline.provenance.clone(),
+            },
+        );
+
+        handle
+            .set_turn_overlay_with_deferred_authorities(
+                Some(raw_set(&["inline"])),
+                raw_set(&[]),
+                &[authority],
+            )
+            .expect("an exact witness for an inline definition should be an accepted no-op");
+        assert_eq!(
+            scope.visible_tool_names().unwrap(),
+            ["inline".into()].into_iter().collect(),
+            "inline definitions stay visible without deferred activation"
+        );
+    }
+
+    #[test]
+    fn inline_turn_authority_still_rejects_forged_witness() {
+        let inline = tool_with_provenance("inline", "attention-binding-a");
+        let scope =
+            scope_with_generated_projection_names(vec![Arc::clone(&inline)].into(), raw_set(&[]));
+        let handle = scope.handle();
+        let forged = crate::DeferredToolLoadAuthority::new(
+            "inline",
+            crate::ToolVisibilityWitness {
+                last_seen_provenance: Some(ToolProvenance {
+                    kind: ToolSourceKind::Callback,
+                    source_id: "forged".into(),
+                }),
+            },
+        );
+
+        let err = handle
+            .set_turn_overlay_with_deferred_authorities(
+                Some(raw_set(&["inline"])),
+                raw_set(&[]),
+                &[forged],
+            )
+            .expect_err("an inline definition must not weaken exact witness validation");
+        assert_eq!(
+            err,
+            ToolScopeStageError::InvalidWitnesses {
+                names: vec!["inline".into()],
+            }
         );
     }
 
