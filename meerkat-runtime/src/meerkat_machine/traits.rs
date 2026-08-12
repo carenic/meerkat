@@ -1408,6 +1408,7 @@ impl MeerkatMachine {
                         self.prepare_archive_session_registration(
                             session_id.clone(),
                             lifecycle_is_quiescent,
+                            None,
                         )
                         .await
                         .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?,
@@ -1702,7 +1703,7 @@ impl MeerkatMachine {
         &self,
         lease: super::MachineSessionArchiveLease,
     ) -> Result<RetireReport, RuntimeControlPlaneError> {
-        self.realize_retire_with_archive_lease(lease, None, None)
+        self.realize_retire_with_archive_lease(lease, None, None, None)
             .await
     }
 
@@ -1713,7 +1714,17 @@ impl MeerkatMachine {
         lease: super::MachineSessionArchiveLease,
         deadline: meerkat_core::time_compat::Instant,
     ) -> Result<RetireReport, RuntimeControlPlaneError> {
-        self.realize_retire_with_archive_lease(lease, None, Some(deadline))
+        self.realize_retire_with_archive_lease(lease, None, Some(deadline), None)
+            .await
+    }
+
+    pub async fn retire_session_with_archive_lease_and_post_commit_hook_before(
+        &self,
+        lease: super::MachineSessionArchiveLease,
+        post_commit_hook: Arc<dyn super::MachineSessionArchivePostCommitHook>,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<RetireReport, RuntimeControlPlaneError> {
+        self.realize_retire_with_archive_lease(lease, None, Some(deadline), Some(post_commit_hook))
             .await
     }
 
@@ -1835,7 +1846,7 @@ impl MeerkatMachine {
         lease: super::MachineSessionArchiveLease,
         publication_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
     ) -> Result<RetireReport, RuntimeControlPlaneError> {
-        self.realize_retire_with_archive_lease(lease, Some(publication_handle), None)
+        self.realize_retire_with_archive_lease(lease, Some(publication_handle), None, None)
             .await
     }
 
@@ -1847,8 +1858,13 @@ impl MeerkatMachine {
         publication_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
         deadline: meerkat_core::time_compat::Instant,
     ) -> Result<RetireReport, RuntimeControlPlaneError> {
-        self.realize_retire_with_archive_lease(lease, Some(publication_handle), Some(deadline))
-            .await
+        self.realize_retire_with_archive_lease(
+            lease,
+            Some(publication_handle),
+            Some(deadline),
+            None,
+        )
+        .await
     }
 
     /// Retire while consuming the caller's single absolute acknowledgement
@@ -2005,7 +2021,7 @@ impl MeerkatMachine {
             _mutation_guard: mutation_guard,
         };
         let result = self
-            .realize_retire_with_archive_lease(lease, None, deadline)
+            .realize_retire_with_archive_lease(lease, None, deadline, None)
             .await;
         drop(direct_member_slot_guard);
         result.map_err(super::DirectMemberRetireError::Runtime)
@@ -2018,6 +2034,7 @@ impl MeerkatMachine {
             Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
         >,
         deadline: Option<meerkat_core::time_compat::Instant>,
+        post_commit_hook: Option<Arc<dyn super::MachineSessionArchivePostCommitHook>>,
     ) -> Result<RetireReport, RuntimeControlPlaneError> {
         let super::MachineSessionArchiveLease {
             session_id,
@@ -2149,6 +2166,13 @@ impl MeerkatMachine {
             None => None,
         };
 
+        if let Some(reason) = commit_error {
+            return Err(RuntimeControlPlaneError::Internal(reason));
+        }
+        if let Some(hook) = post_commit_hook {
+            hook.after_runtime_retire_commit().await?;
+        }
+
         drop(mutation_guard);
         #[cfg(feature = "live")]
         drop(live_lifecycle_lease);
@@ -2208,9 +2232,6 @@ impl MeerkatMachine {
             )
             .await
             .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-        }
-        if let Some(reason) = commit_error {
-            return Err(RuntimeControlPlaneError::Internal(reason));
         }
         Ok(report)
     }

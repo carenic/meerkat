@@ -1531,6 +1531,18 @@ pub trait CoreExecutorPublicationHandle: Send + Sync {
     ) -> Result<Vec<CoreInteractionTerminalPublicationReceipt>, CoreExecutorError>;
 }
 
+/// Registration-time declaration for durability-reload cleanup semantics.
+///
+/// Persistent machine registrations accept only the explicit non-terminal
+/// capability. The default unsupported state lets unrelated executors remain
+/// source-compatible while preventing them from entering a registration that
+/// could later require degraded cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreDurabilityReloadCleanupCapability {
+    Unsupported,
+    ProcessLocalNonTerminal,
+}
+
 /// Cloneable service/surface cleanup authority retained by the runtime entry.
 ///
 /// Unlike adapter unregister, this handle owns only the executor's live actor
@@ -1543,7 +1555,37 @@ pub trait CoreExecutorPublicationHandle: Send + Sync {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait CoreExecutorPostStopCleanupHandle: Send + Sync {
+    fn durability_reload_cleanup_capability(&self) -> CoreDurabilityReloadCleanupCapability {
+        CoreDurabilityReloadCleanupCapability::Unsupported
+    }
+
+    /// Bind any service-local identity needed by degraded cleanup before the
+    /// executor attachment is published. Persistent machine registration
+    /// invokes this exactly once after validating the explicit capability.
+    async fn prepare_durability_reload_cleanup(&self) -> Result<(), CoreExecutorError> {
+        Err(CoreExecutorError::control_failed_runtime(
+            "executor surface does not support durability-reload cleanup preparation",
+        ))
+    }
+
     async fn cleanup_after_runtime_stop_terminalized(&self) -> Result<(), CoreExecutorError>;
+
+    /// Discard process-local executor material after durable authority is lost.
+    ///
+    /// This is not a stopped or retired lifecycle claim. Implementations may
+    /// remove only process-local sidecar material and must not persist a
+    /// terminal session or runtime state. This callback runs while another
+    /// surface owner may itself be awaiting the degraded-runtime coordinator,
+    /// so it must not acquire a turn-finalization boundary, synchronously join
+    /// or discard a live actor, or route through ordinary terminal cleanup.
+    /// Persistent registration validates the explicit capability above before
+    /// publishing an executor attachment. The default remains a defensive
+    /// rejection for non-persistent or directly invoked unsupported handles.
+    async fn cleanup_after_durability_reload_required(&self) -> Result<(), CoreExecutorError> {
+        Err(CoreExecutorError::control_failed_runtime(
+            "executor surface does not support durability-reload cleanup",
+        ))
+    }
 
     /// Cleanup when the runtime loop already owns this session's stable outer
     /// turn-finalization boundary. Implementations backed by that boundary must
@@ -1615,6 +1657,12 @@ pub trait CoreExecutor: Send + Sync {
     /// cleans the service incarnation while preserving the registered
     /// `Stopped` machine state; explicit unregister owns the later `Draining`
     /// transition and registration removal.
+    ///
+    /// Returning `false` is also an ownership declaration: the executor has no
+    /// process-local actor or surface sidecar whose cleanup is required before
+    /// a persistent registration can be cold-recovered. Such executors need no
+    /// durability-reload capability because dropping their executor handoff is
+    /// the complete process-local cleanup.
     fn machine_managed_post_stop_unregister(&self) -> bool {
         false
     }

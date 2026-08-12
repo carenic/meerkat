@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use meerkat_core::lifecycle::core_executor::{
     CoreApplyOutput, CoreExecutor, CoreExecutorBoundaryHandle, CoreExecutorError,
@@ -1279,6 +1279,7 @@ struct PersistentRuntimePostStopCleanupHandle<B: SessionAgentBuilder> {
     service: Arc<PersistentSessionService<B>>,
     session_id: SessionId,
     actor_witness_slot: Option<crate::LiveSessionActorWitnessSlot>,
+    prepared_actor_witness: OnceLock<Option<crate::LiveSessionActorWitness>>,
 }
 
 struct PersistentRuntimeTurnFinalizationBoundaryHandle<B: SessionAgentBuilder> {
@@ -1331,6 +1332,7 @@ pub fn persistent_runtime_post_stop_cleanup_handle<B: SessionAgentBuilder + 'sta
         service,
         session_id,
         actor_witness_slot: None,
+        prepared_actor_witness: OnceLock::new(),
     })
 }
 
@@ -1351,6 +1353,7 @@ pub fn persistent_runtime_post_stop_cleanup_handle_for_actor_slot<
         service,
         session_id,
         actor_witness_slot: Some(actor_witness_slot),
+        prepared_actor_witness: OnceLock::new(),
     })
 }
 
@@ -1385,6 +1388,62 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutorTurnFinalizationBoundaryHandl
 impl<B: SessionAgentBuilder + 'static> CoreExecutorPostStopCleanupHandle
     for PersistentRuntimePostStopCleanupHandle<B>
 {
+    fn durability_reload_cleanup_capability(
+        &self,
+    ) -> meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability {
+        meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability::ProcessLocalNonTerminal
+    }
+
+    async fn prepare_durability_reload_cleanup(&self) -> Result<(), CoreExecutorError> {
+        let witness = match self.actor_witness_slot.as_ref() {
+            Some(slot) => slot.witness(),
+            None => {
+                self.service
+                    .live_session_actor_witness(&self.session_id)
+                    .await
+            }
+        };
+        if let Some(witness) = witness.as_ref()
+            && witness.session_id() != &self.session_id
+        {
+            return Err(CoreExecutorError::control_failed_runtime(format!(
+                "durability-reload cleanup actor witness for session {} cannot bind session {}",
+                witness.session_id(),
+                self.session_id
+            )));
+        }
+        self.prepared_actor_witness.set(witness).map_err(|_| {
+            CoreExecutorError::control_failed_runtime(format!(
+                "durability-reload cleanup authority for session {} was prepared more than once",
+                self.session_id
+            ))
+        })
+    }
+
+    async fn cleanup_after_durability_reload_required(&self) -> Result<(), CoreExecutorError> {
+        let witness = self
+            .prepared_actor_witness
+            .get()
+            .ok_or_else(|| {
+                CoreExecutorError::control_failed_runtime(format!(
+                    "reload-required cleanup for session {} was not prepared at registration",
+                    self.session_id
+                ))
+            })?
+            .as_ref()
+            .ok_or_else(|| {
+                CoreExecutorError::control_failed_runtime(format!(
+                    "reload-required cleanup for session {} has no exact actor witness",
+                    self.session_id
+                ))
+            })?;
+        self.service
+            .discard_live_session_actor_after_durability_reload_required(witness)
+            .await
+            .map(|_| ())
+            .map_err(|error| CoreExecutorError::control_failed_runtime(error.to_string()))
+    }
+
     async fn cleanup_after_runtime_stop_terminalized(&self) -> Result<(), CoreExecutorError> {
         if let Some(actor_witness_slot) = self.actor_witness_slot.as_ref() {
             let Some(witness) = actor_witness_slot.witness() else {
@@ -2585,6 +2644,129 @@ mod tests {
         )
         .await;
         expect_unregister_completion(&adapter, &result.session_id).await;
+    }
+
+    #[tokio::test]
+    async fn persistent_cleanup_capability_discards_live_actor_without_terminalizing_runtime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, adapter) = build_test_service(&temp).await;
+        let result = Box::pin(materialize_session(
+            &service,
+            &adapter,
+            Session::new(),
+            make_request(SessionBuildOptions::default()),
+            {
+                let service = Arc::clone(&service);
+                let adapter = Arc::clone(&adapter);
+                move |session_id| default_persistent_executor(service, adapter, session_id)
+            },
+        ))
+        .await
+        .expect("materialize runtime-backed cleanup fixture");
+        let runtime_state_before = adapter
+            .runtime_state(&result.session_id)
+            .await
+            .expect("runtime state before degraded cleanup");
+        let cleanup = persistent_runtime_post_stop_cleanup_handle(
+            Arc::clone(&service),
+            result.session_id.clone(),
+        );
+        assert_eq!(
+            cleanup.durability_reload_cleanup_capability(),
+            meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability::ProcessLocalNonTerminal
+        );
+        cleanup
+            .prepare_durability_reload_cleanup()
+            .await
+            .expect("bind exact runtime-backed cleanup witness");
+
+        cleanup
+            .cleanup_after_durability_reload_required()
+            .await
+            .expect("degraded cleanup discards process-local actor");
+
+        assert!(
+            service
+                .live_session_actor_witness(&result.session_id)
+                .await
+                .is_none(),
+            "degraded cleanup must remove the live actor"
+        );
+        assert_eq!(
+            adapter
+                .runtime_state(&result.session_id)
+                .await
+                .expect("runtime state after degraded cleanup"),
+            runtime_state_before,
+            "degraded cleanup must not publish a terminal runtime lifecycle"
+        );
+        adapter
+            .unregister_session(&result.session_id)
+            .await
+            .expect("cleanup runtime registration");
+    }
+
+    #[tokio::test]
+    async fn stale_persistent_cleanup_handle_cannot_discard_replacement_actor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, _adapter) = build_test_service(&temp).await;
+        let first = service
+            .create_session(make_request(SessionBuildOptions::default()))
+            .await
+            .expect("materialize actor A");
+        let session_id = first.session_id;
+        let actor_a = service
+            .live_session_actor_witness(&session_id)
+            .await
+            .expect("actor A witness");
+        let cleanup =
+            persistent_runtime_post_stop_cleanup_handle(Arc::clone(&service), session_id.clone());
+        cleanup
+            .prepare_durability_reload_cleanup()
+            .await
+            .expect("bind cleanup to actor A");
+        service
+            .discard_live_session_actor_after_durability_reload_required(&actor_a)
+            .await
+            .expect("remove actor A");
+
+        let durable = service
+            .load_authoritative_session(&session_id)
+            .await
+            .expect("load durable actor snapshot")
+            .expect("durable actor snapshot exists");
+        let recovered = build_recovered_session(
+            durable,
+            &SurfaceSessionRecoveryOverrides::default(),
+            SurfaceSessionRecoveryContext::default(),
+        )
+        .expect("build actor B recovery request")
+        .into_deferred_create_request();
+        let actor_b = service
+            .create_session(recovered)
+            .await
+            .expect("materialize same-ID actor B");
+        assert_eq!(actor_b.session_id, session_id);
+        let actor_b_witness = service
+            .live_session_actor_witness(&session_id)
+            .await
+            .expect("actor B witness");
+        assert_ne!(actor_a, actor_b_witness);
+
+        let error = cleanup
+            .cleanup_after_durability_reload_required()
+            .await
+            .expect_err("stale cleanup must reject replacement actor B");
+        assert!(error.to_string().contains("replacement live actor"));
+        assert_eq!(
+            service.live_session_actor_witness(&session_id).await,
+            Some(actor_b_witness),
+            "stale actor-A cleanup must not remove actor B"
+        );
+        service
+            .discard_live_session(&session_id)
+            .await
+            .expect("clean actor B fixture");
     }
 
     #[tokio::test]

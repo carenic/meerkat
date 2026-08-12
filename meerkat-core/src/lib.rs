@@ -269,9 +269,9 @@ pub use ops::{
 };
 pub use ops_lifecycle::{
     OperationCompletionWatch, OperationCompletionWatchError, OperationKind,
-    OperationLifecycleSnapshot, OperationPeerHandle, OperationProgressUpdate, OperationStatus,
-    OperationTerminalOutcome, OpsLifecycleError, OpsLifecycleRegistry, WaitAllResult,
-    WaitAllSatisfied,
+    OperationLifecycleSnapshot, OperationPeerHandle, OperationProgressUpdate,
+    OperationRetentionRequest, OperationStatus, OperationTerminalOutcome, OpsLifecycleError,
+    OpsLifecycleRegistry, WaitAllResult, WaitAllSatisfied,
 };
 pub use peer_correlation::{
     InboundPeerRequestState, InteractionStreamAbandonReason, InteractionStreamState,

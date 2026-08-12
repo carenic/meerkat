@@ -1147,6 +1147,8 @@ enum CommittedEffectDispatchFailure {
 
 type UnregisterTeardownResult = Result<(), RuntimeDriverError>;
 type RuntimeStopCleanupResult = Result<(), RuntimeDriverError>;
+type ReloadRequiredDiscardResult =
+    Result<ReloadRequiredRegistrationDisposition, RuntimeDriverError>;
 
 /// Joinable result channel for the one owned unregister saga of an epoch.
 #[derive(Clone)]
@@ -1234,6 +1236,18 @@ struct RuntimeStopCleanupCoordinator {
     coordinator_id: uuid::Uuid,
     teardown_slot: Option<Arc<crate::runtime_loop::RuntimeLoopTeardownSlot>>,
     result_rx: crate::tokio::sync::watch::Receiver<Option<RuntimeStopCleanupResult>>,
+}
+
+/// Process-owned cleanup of one exact durability-degraded registration.
+///
+/// This is deliberately distinct from unregister and ordinary stop: it owns
+/// no generated lifecycle transition and may only discard process-local
+/// material before a later cold registration reloads durable authority.
+#[derive(Clone)]
+struct ReloadRequiredDiscardCoordinator {
+    epoch_id: meerkat_core::RuntimeEpochId,
+    coordinator_id: uuid::Uuid,
+    result_rx: crate::tokio::sync::watch::Receiver<Option<ReloadRequiredDiscardResult>>,
 }
 
 #[derive(Clone)]
@@ -1388,6 +1402,8 @@ struct RuntimeSessionEntry {
     /// Current epoch's single ordinary-stop cleanup owner. Unlike unregister,
     /// its successful terminal leaves this registration in generated Stopped.
     runtime_stop_cleanup_coordinator: Option<RuntimeStopCleanupCoordinator>,
+    /// Exact process-owned disposal of a `ReloadRequired` registration.
+    reload_required_discard_coordinator: Option<ReloadRequiredDiscardCoordinator>,
     /// A missing-live materialization normalized stale executor authority but
     /// has not yet committed its replacement attachment. The next exact
     /// attachment commit owns the matching durable lifecycle publication.
@@ -1466,6 +1482,11 @@ struct PreparedArchiveSessionRegistration {
     runtime_id: LogicalRuntimeId,
     entry: RuntimeSessionEntry,
     cold_recovered_generated_draining: bool,
+    ops_lifecycle_persistence_receiver: Option<
+        crate::tokio::sync::mpsc::UnboundedReceiver<
+            crate::ops_lifecycle::OpsLifecyclePersistenceRequest,
+        >,
+    >,
 }
 
 #[derive(Clone)]
@@ -1585,6 +1606,18 @@ pub struct MachineSessionArchiveLease {
     /// through the durable archive/retire marker.
     _live_lifecycle_lease: Option<crate::member_live::MemberLiveLifecycleLease>,
     _mutation_guard: crate::tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+pub trait MachineSessionArchivePostCommitHook: Send + Sync {
+    /// Run only after the runtime lifecycle is durably Retired and before the
+    /// exact recovered archive registration is removed. The hook must be
+    /// idempotent: failure or cancellation retains that registration, and an
+    /// `AlreadyArchived` retry invokes the same obligation again. Higher
+    /// layers may persist a typed receipt in their hook state and return `Ok`
+    /// only once that receipt makes a repeated invocation convergent.
+    async fn after_runtime_retire_commit(&self) -> Result<(), RuntimeControlPlaneError>;
 }
 
 /// Selects whether local materialization preserves ordinary authority or
@@ -1864,6 +1897,22 @@ impl PartialEq for RuntimeSessionRegistrationWitness {
 }
 
 impl Eq for RuntimeSessionRegistrationWitness {}
+
+/// Result of exact cleanup for one durability-degraded runtime registration.
+///
+/// This classification is registration-incarnation scoped. `NotCurrent`
+/// includes an absent registration, a same-session replacement, and a witness
+/// minted by another machine. None of those observations authorizes mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadRequiredRegistrationDisposition {
+    /// The witness no longer names this machine's exact current registration.
+    NotCurrent,
+    /// The exact registration remains durability-ready and was left untouched.
+    NotDegraded,
+    /// The exact ReloadRequired process shell was quiesced and atomically
+    /// replaced by a recovered cold registration from durable authority.
+    Discarded,
+}
 
 /// Exact durable lifecycle observation for one session registration target.
 ///
@@ -4853,6 +4902,108 @@ impl MeerkatMachine {
         }
     }
 
+    /// Pause one exact ReloadRequired discard after its cold successor is
+    /// current but before the detached coordinator acknowledges success.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_reload_required_discard_after_successor_publication_test_hook(
+        &self,
+        session_id: SessionId,
+    ) -> (
+        crate::tokio::sync::oneshot::Receiver<()>,
+        crate::tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = crate::tokio::sync::oneshot::channel();
+        let mut hook = self
+            .test_reload_required_discard_after_successor_publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            hook.is_none(),
+            "ReloadRequired successor-publication test hook already armed"
+        );
+        *hook = Some((session_id, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    /// Force one persistent session's shared durability gate into
+    /// ReloadRequired without fabricating a store outcome. Test-only callers
+    /// use this to exercise cancellation around the real disposal coordinator.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn force_session_durability_reload_required_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> bool {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(session_id)
+            .and_then(|entry| entry.durability_health.as_ref())
+            .is_some_and(|health| {
+                health.mark_reload_required(
+                    "test_reload_required_discard",
+                    "deterministic test fault",
+                )
+            })
+    }
+
+    /// Persist the exact current operation registry using the registration's
+    /// own durable epoch and cursor authority. This is a deterministic fault
+    /// fixture seam: cancellation tests snapshot the real pre-fault authority
+    /// before injecting ReloadRequired, so cold recovery cannot be vacuous.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn persist_current_ops_lifecycle_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), String> {
+        let (store, runtime_id, snapshot) = {
+            let store = self
+                .store
+                .clone()
+                .ok_or_else(|| "runtime has no durable store".to_string())?;
+            let sessions = self.sessions.read().await;
+            let entry = sessions
+                .get(session_id)
+                .ok_or_else(|| format!("session {session_id} is not registered"))?;
+            let snapshot = entry
+                .ops_lifecycle
+                .capture_persistence_snapshot(entry.epoch_id.clone(), &entry.cursor_state)
+                .map_err(|error| error.to_string())?;
+            (store, entry.runtime_id.clone(), snapshot)
+        };
+        store
+            .persist_ops_lifecycle(&runtime_id, &snapshot)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    async fn run_reload_required_discard_after_successor_publication_test_hook(
+        &self,
+        session_id: &SessionId,
+    ) {
+        let armed = {
+            let mut hook = self
+                .test_reload_required_discard_after_successor_publication
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook
+                .as_ref()
+                .is_some_and(|(armed_session_id, _, _)| armed_session_id == session_id)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered_tx, release_rx)) = armed {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+        }
+    }
+
     #[cfg(test)]
     fn arm_control_command_after_logical_lookup_test_hook(
         &self,
@@ -6352,6 +6503,19 @@ pub struct MeerkatMachineShared {
             crate::tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    /// One-shot deterministic gate after a ReloadRequired discard publishes
+    /// its exact cold successor but before the detached coordinator reports
+    /// completion to its original waiter. Cross-crate recovery tests cancel
+    /// that waiter here and prove a retry reconstructs the registry handoff
+    /// from the already-current successor.
+    #[cfg(any(test, feature = "test-support"))]
+    test_reload_required_discard_after_successor_publication: StdMutex<
+        Option<(
+            SessionId,
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     /// One-shot deterministic gate after a logical control command resolves
     /// its SessionId but before it acquires the current entry's mutation gate.
     /// Tests replace A with B in this window to prove the command captures no
@@ -7634,6 +7798,8 @@ impl MeerkatMachine {
                 test_fail_post_stop_unregister_after_fence: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_queue_authority: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_reload_required_discard_after_successor_publication: StdMutex::new(None),
                 #[cfg(test)]
                 test_control_command_after_logical_lookup: StdMutex::new(None),
             }),
@@ -7697,6 +7863,8 @@ impl MeerkatMachine {
                 test_fail_post_stop_unregister_after_fence: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_queue_authority: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_reload_required_discard_after_successor_publication: StdMutex::new(None),
                 #[cfg(test)]
                 test_control_command_after_logical_lookup: StdMutex::new(None),
             }),
@@ -7760,6 +7928,8 @@ impl MeerkatMachine {
                 test_fail_post_stop_unregister_after_fence: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_queue_authority: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_reload_required_discard_after_successor_publication: StdMutex::new(None),
                 #[cfg(test)]
                 test_control_command_after_logical_lookup: StdMutex::new(None),
             }),

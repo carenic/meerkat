@@ -2254,6 +2254,53 @@ struct McpSessionRuntimePostStopCleanupHandle {
 
 #[async_trait]
 impl CoreExecutorPostStopCleanupHandle for McpSessionRuntimePostStopCleanupHandle {
+    fn durability_reload_cleanup_capability(
+        &self,
+    ) -> meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability {
+        meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability::ProcessLocalNonTerminal
+    }
+
+    async fn prepare_durability_reload_cleanup(&self) -> Result<(), CoreExecutorError> {
+        self.actor_witness_slot
+            .as_ref()
+            .and_then(meerkat::LiveSessionActorWitnessSlot::witness)
+            .ok_or_else(|| {
+                CoreExecutorError::control_failed_runtime(format!(
+                    "reload-required cleanup for MCP session {} has no exact actor witness",
+                    self.session_id
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn cleanup_after_durability_reload_required(&self) -> Result<(), CoreExecutorError> {
+        let actor_witness = self
+            .actor_witness_slot
+            .as_ref()
+            .and_then(meerkat::LiveSessionActorWitnessSlot::witness)
+            .ok_or_else(|| {
+                CoreExecutorError::control_failed_runtime(format!(
+                    "reload-required cleanup for MCP session {} has no exact actor witness",
+                    self.session_id
+                ))
+            })?;
+        let retirement_guard = self.attachment.begin_retirement().await;
+        self.context
+            .service
+            .discard_live_session_actor_after_durability_reload_required(&actor_witness)
+            .await
+            .map(|_| ())
+            .map_err(|error| CoreExecutorError::control_failed_runtime(error.to_string()))?;
+        self.context
+            .clear_session_after_runtime_stop_terminalized(
+                &self.session_id,
+                &self.attachment,
+                retirement_guard,
+            )
+            .await;
+        Ok(())
+    }
+
     async fn cleanup_after_runtime_stop_terminalized(&self) -> Result<(), CoreExecutorError> {
         // Canonical order is service turn-finalization boundary B before the
         // attachment-local operation gate. Live router/config paths use the
@@ -3310,6 +3357,75 @@ mod tests {
                 .await
                 .expect("test cleanup unregisters any retained machine attachment");
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_degraded_cleanup_is_exact_and_non_terminalizing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let context = build_test_context_with_capacity(&temp, 2).await;
+        let router = Arc::new(McpRouterAdapter::new(meerkat_mcp::McpRouter::new()));
+        let (created, attachment) = create_session_with_test_mcp_config(
+            &context,
+            "MCP degraded cleanup",
+            meerkat_core::service::InitialTurnPolicy::Defer,
+            router,
+            None,
+        )
+        .await
+        .expect("materialize exact MCP cleanup fixture");
+        let session_id = created.session_id;
+        let actor_witness = attachment
+            .actor_witness
+            .get()
+            .cloned()
+            .expect("MCP attachment retains exact actor witness");
+        let slot = meerkat::LiveSessionActorWitnessSlot::default();
+        slot.publish(actor_witness)
+            .expect("fresh MCP cleanup slot accepts witness");
+        let runtime_state_before = context
+            .runtime_adapter
+            .runtime_state(&session_id)
+            .await
+            .expect("runtime state before degraded cleanup");
+        let cleanup = McpSessionRuntimePostStopCleanupHandle {
+            context: context.clone(),
+            session_id: session_id.clone(),
+            attachment,
+            actor_witness_slot: Some(slot),
+        };
+        assert_eq!(
+            cleanup.durability_reload_cleanup_capability(),
+            meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability::ProcessLocalNonTerminal
+        );
+
+        cleanup
+            .cleanup_after_durability_reload_required()
+            .await
+            .expect("MCP degraded cleanup discards exact actor and sidecar");
+
+        assert!(
+            context
+                .service
+                .live_session_actor_witness(&session_id)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            context
+                .runtime_adapter
+                .runtime_state(&session_id)
+                .await
+                .expect("runtime state after degraded cleanup"),
+            runtime_state_before,
+            "MCP degraded cleanup must not publish terminal lifecycle state"
+        );
+        assert!(
+            context
+                .current_attachment_witness(&session_id)
+                .await
+                .is_none(),
+            "MCP degraded cleanup must retire the exact surface attachment"
+        );
     }
 
     #[tokio::test]

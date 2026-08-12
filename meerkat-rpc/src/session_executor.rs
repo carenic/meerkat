@@ -85,6 +85,7 @@ impl CoreExecutorPublicationHandle for RpcRuntimePublicationHandle {
 pub struct SessionRuntimeExecutor {
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
+    actor_witness_slot: meerkat::LiveSessionActorWitnessSlot,
     publication_handle: RpcRuntimePublicationHandle,
 }
 
@@ -130,11 +131,16 @@ impl SessionRuntimeExecutor {
     /// The notification sink is NOT captured here — the executor reads the
     /// current sink from the runtime at apply time so reconnected TCP clients
     /// always get events routed to the live transport.
+    #[allow(clippy::expect_used)]
     pub fn new(
         runtime: Arc<SessionRuntime>,
         actor_witness: meerkat::LiveSessionActorWitness,
     ) -> Self {
         let session_id = actor_witness.session_id().clone();
+        let actor_witness_slot = meerkat::LiveSessionActorWitnessSlot::default();
+        actor_witness_slot
+            .publish(actor_witness.clone())
+            .expect("a fresh RPC actor witness slot accepts its first witness");
         let publication_handle = RpcRuntimePublicationHandle::new(
             meerkat::surface::persistent_runtime_publication_handle(
                 runtime.persistent_service(),
@@ -144,6 +150,7 @@ impl SessionRuntimeExecutor {
         Self {
             runtime,
             session_id,
+            actor_witness_slot,
             publication_handle,
         }
     }
@@ -160,12 +167,13 @@ impl SessionRuntimeExecutor {
             meerkat::surface::persistent_runtime_publication_handle_for_actor_slot(
                 runtime.persistent_service(),
                 session_id.clone(),
-                actor_witness_slot,
+                actor_witness_slot.clone(),
             ),
         );
         Self {
             runtime,
             session_id,
+            actor_witness_slot,
             publication_handle,
         }
     }
@@ -223,10 +231,42 @@ struct SessionRuntimeInterruptHandle {
 struct SessionRuntimePostStopCleanupHandle {
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
+    actor_witness_slot: meerkat::LiveSessionActorWitnessSlot,
 }
 
 #[async_trait::async_trait]
 impl CoreExecutorPostStopCleanupHandle for SessionRuntimePostStopCleanupHandle {
+    fn durability_reload_cleanup_capability(
+        &self,
+    ) -> meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability {
+        meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability::ProcessLocalNonTerminal
+    }
+
+    async fn prepare_durability_reload_cleanup(&self) -> Result<(), CoreExecutorError> {
+        self.actor_witness_slot.witness().ok_or_else(|| {
+            CoreExecutorError::control_failed_runtime(format!(
+                "reload-required cleanup for session {} has no exact actor witness",
+                self.session_id
+            ))
+        })?;
+        Ok(())
+    }
+
+    async fn cleanup_after_durability_reload_required(&self) -> Result<(), CoreExecutorError> {
+        let witness = self.actor_witness_slot.witness().ok_or_else(|| {
+            CoreExecutorError::control_failed_runtime(format!(
+                "reload-required cleanup for session {} has no exact actor witness",
+                self.session_id
+            ))
+        })?;
+        self.runtime
+            .persistent_service()
+            .discard_live_session_actor_after_durability_reload_required(&witness)
+            .await
+            .map(|_| ())
+            .map_err(|err| CoreExecutorError::control_failed_runtime(err.to_string()))
+    }
+
     async fn cleanup_after_runtime_stop_terminalized(&self) -> Result<(), CoreExecutorError> {
         self.runtime
             .discard_live_session_after_runtime_stop_terminalized(&self.session_id)
@@ -637,6 +677,7 @@ impl CoreExecutor for SessionRuntimeExecutor {
         Some(Arc::new(SessionRuntimePostStopCleanupHandle {
             runtime: Arc::clone(&self.runtime),
             session_id: self.session_id.clone(),
+            actor_witness_slot: self.actor_witness_slot.clone(),
         }))
     }
 
@@ -825,9 +866,96 @@ impl CoreExecutor for SessionRuntimeExecutor {
         SessionRuntimePostStopCleanupHandle {
             runtime: Arc::clone(&self.runtime),
             session_id: self.session_id.clone(),
+            actor_witness_slot: self.actor_witness_slot.clone(),
         }
         .cleanup_after_runtime_stop_terminalized()
         .await
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod persistent_cleanup_tests {
+    use super::*;
+    use meerkat::{AgentFactory, Config, PersistenceBundle};
+    use meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability;
+    use meerkat_core::service::{CreateSessionRequest, InitialTurnPolicy, SessionService};
+    use meerkat_core::{ContentInput, SessionBuildOptions, SystemPromptOverride};
+
+    #[tokio::test]
+    async fn rpc_degraded_cleanup_is_exact_and_non_terminalizing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let blob_store: Arc<dyn meerkat_core::BlobStore> =
+            Arc::new(meerkat_store::MemoryBlobStore::new());
+        let runtime = Arc::new(SessionRuntime::new(
+            AgentFactory::new(temp.path().join("sessions")),
+            Config::default(),
+            2,
+            PersistenceBundle::new(session_store, runtime_store, blob_store),
+            NotificationSink::noop(),
+        ));
+        let service = runtime.persistent_service();
+        let slot = meerkat::LiveSessionActorWitnessSlot::default();
+        let admission = service
+            .reserve_create_session_admission()
+            .await
+            .expect("reserve actor admission");
+        let result = service
+            .create_session_with_reserved_admission_and_actor_witness(
+                CreateSessionRequest {
+                    injected_context: Vec::new(),
+                    model: "claude-sonnet-4-5".to_string(),
+                    prompt: ContentInput::Text(String::new()),
+                    system_prompt: SystemPromptOverride::Inherit,
+                    max_tokens: None,
+                    event_tx: None,
+                    initial_turn: InitialTurnPolicy::Defer,
+                    deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                    build: Some(SessionBuildOptions::default()),
+                    labels: None,
+                },
+                admission,
+                &slot,
+            )
+            .await
+            .expect("materialize RPC actor fixture");
+        let durable_before = service
+            .load_authoritative_session(&result.session_id)
+            .await
+            .expect("durable RPC session before cleanup")
+            .expect("durable RPC session exists");
+        let cleanup = SessionRuntimePostStopCleanupHandle {
+            runtime,
+            session_id: result.session_id.clone(),
+            actor_witness_slot: slot.clone(),
+        };
+        assert_eq!(
+            cleanup.durability_reload_cleanup_capability(),
+            CoreDurabilityReloadCleanupCapability::ProcessLocalNonTerminal
+        );
+        cleanup
+            .cleanup_after_durability_reload_required()
+            .await
+            .expect("RPC degraded cleanup");
+        assert!(
+            service
+                .live_session_actor_witness(&result.session_id)
+                .await
+                .is_none()
+        );
+        let durable_after = service
+            .load_authoritative_session(&result.session_id)
+            .await
+            .expect("durable RPC session after cleanup")
+            .expect("degraded cleanup retains durable RPC session");
+        assert_eq!(
+            serde_json::to_value(durable_after).expect("serialize durable RPC session after"),
+            serde_json::to_value(durable_before).expect("serialize durable RPC session before"),
+            "RPC degraded cleanup must not persist terminal session state"
+        );
     }
 }
 

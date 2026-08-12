@@ -66,6 +66,47 @@ pub enum OperationSource {
     },
 }
 
+/// Exact durable operation authority retained across a supported cold runtime
+/// recovery.
+///
+/// Ordinary cold recovery discards most non-terminal operations. A caller
+/// that owns an independently retryable operation may request retention only
+/// by presenting its exact identity, kind, and generated source. Recovery
+/// validates all three against durable authority and fails closed on absence
+/// or drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationRetentionRequest {
+    operation_id: OperationId,
+    expected_kind: OperationKind,
+    expected_source: OperationSource,
+}
+
+impl OperationRetentionRequest {
+    pub fn new(
+        operation_id: OperationId,
+        expected_kind: OperationKind,
+        expected_source: OperationSource,
+    ) -> Self {
+        Self {
+            operation_id,
+            expected_kind,
+            expected_source,
+        }
+    }
+
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub fn expected_kind(&self) -> OperationKind {
+        self.expected_kind
+    }
+
+    pub fn expected_source(&self) -> &OperationSource {
+        &self.expected_source
+    }
+}
+
 impl OperationSource {
     pub fn session_child(session_id: SessionId) -> Self {
         Self::SessionChild { session_id }

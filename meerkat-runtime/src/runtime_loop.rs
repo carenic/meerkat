@@ -2438,7 +2438,7 @@ enum OwnedCommitCleanupState {
     RejectedAbortPending { run_id: RunId },
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum OwnedTerminalizationState {
     InFlight { run_id: RunId },
     PersistedDirectedDrainPending { run_id: RunId },
@@ -2854,6 +2854,119 @@ impl RuntimeLoopTeardownSlot {
                 return;
             }
             changed.await;
+        }
+    }
+
+    /// Consume the exact executor handoff after its registration loses durable
+    /// authority, without publishing an ordinary stop or unregister terminal.
+    ///
+    /// A rejected boundary may still own an invisible live projection. That
+    /// projection is mechanically aborted before the executor is dropped.
+    /// Any carrier whose durable outcome is ambiguous remains a hard refusal:
+    /// only cold recovery may interpret durable truth after `ReloadRequired`.
+    pub(crate) async fn discard_after_reload_required(
+        &self,
+    ) -> Result<(), crate::RuntimeDriverError> {
+        enum DiscardClaim {
+            Handoff(RuntimeLoopExitHandoff),
+            AlreadyCleaned,
+            Wait,
+        }
+
+        loop {
+            let mut changed = std::pin::pin!(self.changed.notified());
+            changed.as_mut().enable();
+            let claim = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match std::mem::replace(&mut *state, RuntimeLoopTeardownState::Cleaning) {
+                    RuntimeLoopTeardownState::Ready(handoff) => DiscardClaim::Handoff(handoff),
+                    RuntimeLoopTeardownState::Cleaned(receipt) => {
+                        *state = RuntimeLoopTeardownState::Cleaned(receipt);
+                        DiscardClaim::AlreadyCleaned
+                    }
+                    RuntimeLoopTeardownState::Pending => {
+                        *state = RuntimeLoopTeardownState::Pending;
+                        DiscardClaim::Wait
+                    }
+                    RuntimeLoopTeardownState::Cleaning => {
+                        *state = RuntimeLoopTeardownState::Cleaning;
+                        DiscardClaim::Wait
+                    }
+                }
+            };
+            let handoff = match claim {
+                DiscardClaim::Handoff(handoff) => handoff,
+                DiscardClaim::AlreadyCleaned => return Ok(()),
+                DiscardClaim::Wait => {
+                    changed.await;
+                    continue;
+                }
+            };
+
+            let mut cleanup_guard = RuntimeLoopCleanupGuard::new(self, handoff);
+            match self.owned_commit_cleanup_state() {
+                Some(OwnedCommitCleanupState::RejectedAbortPending { run_id }) => {
+                    cleanup_guard
+                        .handoff_mut()?
+                        .executor
+                        .abort_rejected_run_projections()
+                        .await
+                        .map_err(|error| {
+                            crate::RuntimeDriverError::Internal(format!(
+                                "failed to abort rejected runtime projections before durability-reload discard: {error}"
+                            ))
+                        })?;
+                    self.complete_rejected_commit_abort(&run_id);
+                }
+                Some(OwnedCommitCleanupState::InFlight { run_id }) => {
+                    return Err(crate::RuntimeDriverError::RecoveryCorruption {
+                        reason: format!(
+                            "durability-reload discard observed commit {run_id} before its owned outcome"
+                        ),
+                    });
+                }
+                None => {}
+            }
+            if let Some(state) = self.owned_terminalization_state() {
+                return Err(crate::RuntimeDriverError::RecoveryCorruption {
+                    reason: format!(
+                        "durability-reload discard observed ambiguous terminalization carrier: {state:?}"
+                    ),
+                });
+            }
+            if let Some(pending) = self.pending_nondirected_run_terminal() {
+                return Err(crate::RuntimeDriverError::RecoveryCorruption {
+                    reason: format!(
+                        "durability-reload discard observed ambiguous non-directed terminal carrier for run {}",
+                        pending.run_id
+                    ),
+                });
+            }
+
+            cleanup_guard.fail_stop_completion(
+                crate::RuntimeDriverError::RecoveryRepairBlocked {
+                    evidence_digest: None,
+                    reason:
+                        "runtime registration discarded after durability reload became required"
+                            .to_string(),
+                },
+            )?;
+            let handoff = cleanup_guard.complete()?;
+            // Dropping the exact executor handoff releases any mutation fence
+            // retained by machine-managed post-stop decoration. This must
+            // happen before publishing Cleaned so a recovery worker awakened
+            // by that state can safely acquire M.
+            drop(handoff);
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                RuntimeLoopTeardownState::Cleaned(None);
+            self.changed.notify_waiters();
+            return Ok(());
         }
     }
 
