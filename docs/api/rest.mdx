@@ -129,6 +129,13 @@ This overview follows the generated OpenAPI artifact at
 | `PATCH` | `/config` | Merge-patch config (RFC 7396) |
 | `POST` | `/requests/{request_id}/cancel` | Cancel an uncommitted in-flight request |
 
+Helper requests (`/mob/{id}/spawn-helper`, `/mob/{id}/fork-helper`) require
+`result_label` and `max_text_bytes`. Spawn and fork responses are
+exact-operation results with required `output`, `tokens_used`,
+`agent_identity`, `member_ref`, `bounded_result`, `session_id`, `usage`,
+`turns`, and `tool_calls`; `retirement_error` is present only when cleanup
+debt remains after the certified result was captured.
+
 <Note>
 Schedule endpoints return the same flattened public `Schedule` contract as
 JSON-RPC. Planning, labels, and created/updated timestamps are top-level;

@@ -3409,6 +3409,8 @@ class MeerkatClient:
         mob_id: str,
         prompt: str,
         *,
+        result_label: str,
+        max_text_bytes: int,
         agent_identity: str | None = None,
         role_name: str | None = None,
         model_override: str | None = None,
@@ -3421,6 +3423,8 @@ class MeerkatClient:
             {
                 "mob_id": mob_id,
                 "prompt": prompt,
+                "result_label": result_label,
+                "max_text_bytes": max_text_bytes,
                 "agent_identity": agent_identity,
                 "role_name": role_name,
                 "model_override": model_override,
@@ -3429,39 +3433,10 @@ class MeerkatClient:
                 "backend": backend,
             },
         )
-        member_ref = result.get("member_ref")
-        if not isinstance(member_ref, str) or not member_ref:
-            raise MeerkatError(
-                "INVALID_RESPONSE",
-                "Invalid mob/spawn_helper response: missing member_ref",
-            )
-        resolved_identity = result.get("agent_identity")
-        if not isinstance(resolved_identity, str) or not resolved_identity:
-            raise MeerkatError(
-                "INVALID_RESPONSE",
-                "Invalid mob/spawn_helper response: missing agent_identity",
-            )
-        bounded_result = self._parse_bounded_helper_result(
-            result.get("bounded_result"),
+        return self._parse_mob_helper_result(
+            result,
             "Invalid mob/spawn_helper response",
         )
-        return {
-            "output": str(result["output"])
-            if result.get("output") is not None
-            else None,
-            "tokens_used": self._require_non_negative_integer_field(
-                result,
-                "tokens_used",
-                "Invalid mob/spawn_helper response",
-            ),
-            "agent_identity": resolved_identity,
-            "member_ref": member_ref,
-            **(
-                {"bounded_result": bounded_result}
-                if bounded_result is not None
-                else {}
-            ),
-        }
 
     async def fork_mob_helper(
         self,
@@ -3469,6 +3444,8 @@ class MeerkatClient:
         source_member_id: str,
         prompt: str,
         *,
+        result_label: str,
+        max_text_bytes: int,
         agent_identity: str | None = None,
         role_name: str | None = None,
         model_override: str | None = None,
@@ -3483,6 +3460,8 @@ class MeerkatClient:
                 "mob_id": mob_id,
                 "source_member_id": source_member_id,
                 "prompt": prompt,
+                "result_label": result_label,
+                "max_text_bytes": max_text_bytes,
                 "agent_identity": agent_identity,
                 "role_name": role_name,
                 "model_override": model_override,
@@ -3492,39 +3471,10 @@ class MeerkatClient:
                 "backend": backend,
             },
         )
-        member_ref = result.get("member_ref")
-        if not isinstance(member_ref, str) or not member_ref:
-            raise MeerkatError(
-                "INVALID_RESPONSE",
-                "Invalid mob/fork_helper response: missing member_ref",
-            )
-        resolved_identity = result.get("agent_identity")
-        if not isinstance(resolved_identity, str) or not resolved_identity:
-            raise MeerkatError(
-                "INVALID_RESPONSE",
-                "Invalid mob/fork_helper response: missing agent_identity",
-            )
-        bounded_result = self._parse_bounded_helper_result(
-            result.get("bounded_result"),
+        return self._parse_mob_helper_result(
+            result,
             "Invalid mob/fork_helper response",
         )
-        return {
-            "output": str(result["output"])
-            if result.get("output") is not None
-            else None,
-            "tokens_used": self._require_non_negative_integer_field(
-                result,
-                "tokens_used",
-                "Invalid mob/fork_helper response",
-            ),
-            "agent_identity": resolved_identity,
-            "member_ref": member_ref,
-            **(
-                {"bounded_result": bounded_result}
-                if bounded_result is not None
-                else {}
-            ),
-        }
 
     async def create_mob_profile(
         self, name: str, profile: MobProfile
@@ -6584,9 +6534,7 @@ class MeerkatClient:
     def _parse_bounded_helper_result(
         raw: Any,
         context: str,
-    ) -> MobBoundedHelperResult | None:
-        if raw is None:
-            return None
+    ) -> MobBoundedHelperResult:
         value = MeerkatClient._require_dict(raw, "bounded_result", context)
         label = MeerkatClient._require_string_field(value, "label", context)
         status = MeerkatClient._require_string_field(value, "status", context)
@@ -6609,6 +6557,95 @@ class MeerkatClient:
         return cast(
             MobBoundedHelperResult,
             {"label": label, "status": status, "text": text},
+        )
+
+    @staticmethod
+    def _parse_mob_helper_result(
+        result: dict[str, Any],
+        context: str,
+    ) -> MobHelperResult:
+        output = MeerkatClient._require_present_string_field(
+            result, "output", context
+        )
+        tokens_used = MeerkatClient._require_non_negative_integer_field(
+            result, "tokens_used", context
+        )
+        agent_identity = MeerkatClient._require_string_field(
+            result, "agent_identity", context
+        )
+        member_ref = MeerkatClient._require_string_field(
+            result, "member_ref", context
+        )
+        bounded_result = MeerkatClient._parse_bounded_helper_result(
+            result.get("bounded_result"), context
+        )
+        session_id = MeerkatClient._require_string_field(
+            result, "session_id", context
+        )
+        usage_raw = MeerkatClient._require_dict(
+            result.get("usage"), "usage", context
+        )
+        usage = Usage(
+            input_tokens=MeerkatClient._require_non_negative_integer_field(
+                usage_raw,
+                "input_tokens",
+                context,
+                "usage.input_tokens",
+            ),
+            output_tokens=MeerkatClient._require_non_negative_integer_field(
+                usage_raw,
+                "output_tokens",
+                context,
+                "usage.output_tokens",
+            ),
+            cache_creation_tokens=(
+                MeerkatClient._require_non_negative_integer_field(
+                    usage_raw,
+                    "cache_creation_tokens",
+                    context,
+                    "usage.cache_creation_tokens",
+                )
+                if usage_raw.get("cache_creation_tokens") is not None
+                else None
+            ),
+            cache_read_tokens=(
+                MeerkatClient._require_non_negative_integer_field(
+                    usage_raw,
+                    "cache_read_tokens",
+                    context,
+                    "usage.cache_read_tokens",
+                )
+                if usage_raw.get("cache_read_tokens") is not None
+                else None
+            ),
+        )
+        retirement_error: str | None = None
+        if result.get("retirement_error") is not None:
+            retirement_error = MeerkatClient._require_present_string_field(
+                result, "retirement_error", context
+            )
+        return cast(
+            MobHelperResult,
+            {
+                "output": output,
+                "tokens_used": tokens_used,
+                "agent_identity": agent_identity,
+                "member_ref": member_ref,
+                "bounded_result": bounded_result,
+                "session_id": session_id,
+                "usage": usage,
+                "turns": MeerkatClient._require_non_negative_integer_field(
+                    result, "turns", context
+                ),
+                "tool_calls": MeerkatClient._require_non_negative_integer_field(
+                    result, "tool_calls", context
+                ),
+                **(
+                    {"retirement_error": retirement_error}
+                    if retirement_error is not None
+                    else {}
+                ),
+            },
         )
 
     @staticmethod

@@ -3003,6 +3003,12 @@ enum MobCommands {
         /// Auth binding to use (REALM:BINDING[:PROFILE]).
         #[arg(long)]
         auth_binding: Option<String>,
+        /// Label attached to the certified bounded result.
+        #[arg(long)]
+        result_label: String,
+        /// Maximum UTF-8 bytes retained in the certified result text.
+        #[arg(long)]
+        max_text_bytes: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -3028,6 +3034,12 @@ enum MobCommands {
         /// Auth binding to use (REALM:BINDING[:PROFILE]).
         #[arg(long)]
         auth_binding: Option<String>,
+        /// Label attached to the certified bounded result.
+        #[arg(long)]
+        result_label: String,
+        /// Maximum UTF-8 bytes retained in the certified result text.
+        #[arg(long)]
+        max_text_bytes: usize,
         /// Fork context type (full-history or last-messages)
         #[arg(long, default_value = "full-history")]
         fork_context: String,
@@ -14433,33 +14445,32 @@ fn render_flow_status_json(run: Option<meerkat_mob::MobRun>) -> anyhow::Result<S
 #[cfg(feature = "mob")]
 fn helper_result_json_value(
     mob_id: &str,
-    output: &Option<String>,
-    tokens_used: u64,
-    agent_identity: &meerkat_mob::AgentIdentity,
-) -> serde_json::Value {
-    serde_json::json!({
-        "output": output,
-        "tokens_used": tokens_used,
-        "agent_identity": agent_identity.as_str(),
-        "member_ref": meerkat_contracts::WireMemberRef::encode(
-            mob_id,
-            agent_identity.as_str(),
-        ),
-    })
+    outcome: &meerkat_mob::BoundedHelperRunOutcome,
+) -> meerkat_contracts::MobHelperResult {
+    let helper = &outcome.helper;
+    let turn = outcome.turn.result();
+    let agent_identity = helper.agent_identity.to_string();
+    meerkat_contracts::MobHelperResult {
+        output: helper.output.clone(),
+        tokens_used: helper.tokens_used,
+        agent_identity: agent_identity.clone(),
+        member_ref: meerkat_contracts::WireMemberRef::encode(mob_id, &agent_identity),
+        bounded_result: helper.bounded_result.to_wire(),
+        session_id: turn.session_id().to_string(),
+        usage: turn.usage().clone(),
+        turns: turn.turns(),
+        tool_calls: turn.tool_calls(),
+        retirement_error: outcome.retirement_error.clone(),
+    }
 }
 
 #[cfg(feature = "mob")]
 fn render_helper_result_json(
     mob_id: &str,
-    result: &meerkat_mob::HelperResult,
+    result: &meerkat_mob::BoundedHelperRunOutcome,
 ) -> anyhow::Result<String> {
-    serde_json::to_string_pretty(&helper_result_json_value(
-        mob_id,
-        &result.output,
-        result.tokens_used,
-        &result.agent_identity,
-    ))
-    .map_err(|e| anyhow::anyhow!("failed to encode helper result: {e}"))
+    serde_json::to_string_pretty(&helper_result_json_value(mob_id, result))
+        .map_err(|e| anyhow::anyhow!("failed to encode helper result: {e}"))
 }
 
 /// Preserve the typed mob error for the single exit mapper (§17.4,
@@ -15379,6 +15390,8 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
             profile,
             model,
             auth_binding,
+            result_label,
+            max_text_bytes,
             json,
         } => {
             // #115: the surface must not mint mob-member identity; clap
@@ -15400,13 +15413,15 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
                     mid,
                     prompt,
                     options,
+                    result_label,
+                    max_text_bytes,
                 )
                 .await
                 .map_err(mob_anyhow)?;
             if json {
                 println!("{}", render_helper_result_json(&mob_id, &result)?);
-            } else if let Some(output) = &result.output {
-                println!("{output}");
+            } else {
+                println!("{}", result.helper.output);
             }
             Ok(())
         }
@@ -15418,6 +15433,8 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
             profile,
             model,
             auth_binding,
+            result_label,
+            max_text_bytes,
             fork_context,
             last_messages,
             json,
@@ -15451,13 +15468,15 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
                     prompt,
                     ctx,
                     options,
+                    result_label,
+                    max_text_bytes,
                 )
                 .await
                 .map_err(mob_anyhow)?;
             if json {
                 println!("{}", render_helper_result_json(&mob_id, &result)?);
-            } else if let Some(output) = &result.output {
-                println!("{output}");
+            } else {
+                println!("{}", result.helper.output);
             }
             Ok(())
         }
@@ -21857,6 +21876,10 @@ default_model = "gemma"
             "inspect",
             "--agent-identity",
             "reviewer",
+            "--result-label",
+            "review-result",
+            "--max-text-bytes",
+            "4096",
             "--model",
             "openai/gpt-5.4",
         ])
@@ -21877,6 +21900,10 @@ default_model = "gemma"
             "inspect",
             "--agent-identity",
             "reviewer",
+            "--result-label",
+            "review-result",
+            "--max-text-bytes",
+            "4096",
             "--model",
             "anthropic/claude-opus-4-6",
         ])
@@ -21887,6 +21914,27 @@ default_model = "gemma"
             }) => assert_eq!(model.as_deref(), Some("anthropic/claude-opus-4-6")),
             _ => unreachable!("expected mob fork-helper command"),
         }
+    }
+
+    #[cfg(feature = "mob")]
+    #[test]
+    fn test_mob_helper_exact_result_flags_are_required() {
+        let parsed = Cli::try_parse_from([
+            "rkat",
+            "mob",
+            "spawn-helper",
+            "mob-1",
+            "inspect",
+            "--agent-identity",
+            "reviewer",
+        ]);
+        let error = match parsed {
+            Ok(_) => panic!("spawn-helper must require exact result flags"),
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("--result-label"));
+        assert!(rendered.contains("--max-text-bytes"));
     }
 
     #[cfg(feature = "mob")]
@@ -25402,14 +25450,32 @@ default_model = "gpt-5.4"
 
     #[cfg(feature = "mob")]
     #[test]
-    fn test_helper_json_uses_member_ref_not_binding_atoms() {
-        let identity = meerkat_mob::AgentIdentity::from("helper-json");
-        let output = Some("done".to_string());
-        let value = helper_result_json_value("mob-json", &output, 7, &identity);
+    fn test_helper_json_contract_uses_exact_result_carrier() {
+        let result = meerkat_contracts::MobHelperResult {
+            output: "done".to_string(),
+            tokens_used: 7,
+            agent_identity: "helper-json".to_string(),
+            member_ref: meerkat_contracts::WireMemberRef::encode("mob-json", "helper-json"),
+            bounded_result: meerkat_contracts::MobBoundedHelperResult {
+                label: "cli-result".to_string(),
+                status: meerkat_contracts::MobBoundedHelperResultStatus::Completed,
+                text: "done".to_string(),
+            },
+            session_id: "session-json".to_string(),
+            usage: meerkat_core::Usage::default(),
+            turns: 1,
+            tool_calls: 0,
+            retirement_error: None,
+        };
+        let value = serde_json::to_value(result).expect("helper result serializes");
 
         assert_eq!(value["agent_identity"], "helper-json");
         assert_eq!(value["tokens_used"], 7);
         assert_eq!(value["output"], "done");
+        assert_eq!(value["bounded_result"]["label"], "cli-result");
+        assert_eq!(value["session_id"], "session-json");
+        assert_eq!(value["turns"], 1);
+        assert_eq!(value["tool_calls"], 0);
         assert!(value.get("agent_runtime_id").is_none());
         assert!(value.get("fence_token").is_none());
         let member_ref = value["member_ref"]

@@ -45,6 +45,23 @@ function makeMemberRef(mobId, agentIdentity) {
     .replace(/=+$/, "");
 }
 
+function helperWireResult(agentIdentity = "generated-helper", overrides = {}) {
+  return {
+    output: "ok",
+    tokens_used: 1,
+    agent_identity: agentIdentity,
+    member_ref: makeMemberRef("mob-1", agentIdentity),
+    bounded_result: { label: "summary", status: "completed", text: "ok" },
+    session_id: `session-${agentIdentity}`,
+    usage: { input_tokens: 2, output_tokens: 1 },
+    turns: 1,
+    tool_calls: 0,
+    ...overrides,
+  };
+}
+
+const helperOptions = { resultLabel: "summary", maxTextBytes: 4096 };
+
 // ---------------------------------------------------------------------------
 // Contract version
 // ---------------------------------------------------------------------------
@@ -3612,27 +3629,26 @@ describe("Parity wrappers", () => {
     client.request = async (method, params) => {
       calls.push({ method, params });
       const agentIdentity = params.agent_identity ?? "generated-helper";
-      return {
-        output: "ok",
-        tokens_used: 1,
-        agent_identity: agentIdentity,
-        member_ref: makeMemberRef("mob-1", agentIdentity),
-      };
+      return helperWireResult(agentIdentity);
     };
 
     const spawnByRole = await client.spawnMobHelper("mob-1", "help", {
+      ...helperOptions,
       roleName: "worker",
       modelOverride: "gpt-5.6-sol",
     });
-    const spawnByProfile = await client.spawnMobHelper("mob-1", "help", { profileName: "legacy-worker" });
+    const spawnByProfile = await client.spawnMobHelper("mob-1", "help", { ...helperOptions, profileName: "legacy-worker" });
     const forkByRole = await client.forkMobHelper("mob-1", "a", "help", {
+      ...helperOptions,
       roleName: "worker",
       modelOverride: "claude-opus-4-8",
     });
-    const forkByProfile = await client.forkMobHelper("mob-1", "a", "help", { profileName: "legacy-worker" });
+    const forkByProfile = await client.forkMobHelper("mob-1", "a", "help", { ...helperOptions, profileName: "legacy-worker" });
 
     assert.equal(calls[0].params.role_name, "worker");
     assert.equal(calls[0].params.model_override, "gpt-5.6-sol");
+    assert.equal(calls[0].params.result_label, "summary");
+    assert.equal(calls[0].params.max_text_bytes, 4096);
     assert.equal(calls[1].params.role_name, "legacy-worker");
     assert.equal(calls[2].params.role_name, "worker");
     assert.equal(calls[2].params.model_override, "claude-opus-4-8");
@@ -3643,6 +3659,17 @@ describe("Parity wrappers", () => {
     assert.equal(spawnByProfile.memberRef, expectedRef);
     assert.equal(forkByRole.memberRef, expectedRef);
     assert.equal(forkByProfile.memberRef, expectedRef);
+    assert.deepEqual(spawnByRole.boundedResult, {
+      label: "summary",
+      status: "completed",
+      text: "ok",
+    });
+    assert.equal(spawnByRole.output, "ok");
+    assert.equal(spawnByRole.sessionId, "session-generated-helper");
+    assert.deepEqual(spawnByRole.usage, { inputTokens: 2, outputTokens: 1 });
+    assert.equal(spawnByRole.turns, 1);
+    assert.equal(spawnByRole.toolCalls, 0);
+    assert.equal(spawnByRole.retirementError, undefined);
     assert.equal(spawnByRole.agentRuntimeId, undefined);
     assert.equal(spawnByRole.fenceToken, undefined);
     assert.equal(forkByRole.agentRuntimeId, undefined);
@@ -3658,14 +3685,14 @@ describe("Parity wrappers", () => {
     });
 
     await assert.rejects(
-      () => client.spawnMobHelper("mob-1", "help", { agentIdentity: "caller-requested" }),
+      () => client.spawnMobHelper("mob-1", "help", { ...helperOptions, agentIdentity: "caller-requested" }),
       (error) =>
         error instanceof MeerkatError &&
         error.code === "INVALID_RESPONSE" &&
         String(error.message).includes("missing agent_identity"),
     );
     await assert.rejects(
-      () => client.forkMobHelper("mob-1", "source", "help", { agentIdentity: "caller-requested" }),
+      () => client.forkMobHelper("mob-1", "source", "help", { ...helperOptions, agentIdentity: "caller-requested" }),
       (error) =>
         error instanceof MeerkatError &&
         error.code === "INVALID_RESPONSE" &&
@@ -3682,19 +3709,48 @@ describe("Parity wrappers", () => {
     });
 
     await assert.rejects(
-      () => client.spawnMobHelper("mob-1", "help"),
+      () => client.spawnMobHelper("mob-1", "help", helperOptions),
       (error) =>
         error instanceof MeerkatError &&
         error.code === "INVALID_RESPONSE" &&
         /missing tokens_used/.test(String(error.message)),
     );
     await assert.rejects(
-      () => client.forkMobHelper("mob-1", "source", "help"),
+      () => client.forkMobHelper("mob-1", "source", "help", helperOptions),
       (error) =>
         error instanceof MeerkatError &&
         error.code === "INVALID_RESPONSE" &&
         /missing tokens_used/.test(String(error.message)),
     );
+  });
+
+  it("requires every exact helper-result field while keeping retirement_error optional", async () => {
+    const client = new MeerkatClient();
+    for (const field of [
+      "output",
+      "bounded_result",
+      "session_id",
+      "usage",
+      "turns",
+      "tool_calls",
+    ]) {
+      client.request = async () => {
+        const result = helperWireResult();
+        delete result[field];
+        return result;
+      };
+      await assert.rejects(
+        () => client.spawnMobHelper("mob-1", "help", helperOptions),
+        (error) => error instanceof MeerkatError && error.code === "INVALID_RESPONSE",
+        `${field} must be required`,
+      );
+    }
+
+    client.request = async () => helperWireResult("generated-helper", {
+      retirement_error: "retirement delayed",
+    });
+    const result = await client.spawnMobHelper("mob-1", "help", helperOptions);
+    assert.equal(result.retirementError, "retirement delayed");
   });
 
   it("rejects helper receipts with a fractional/negative tokens_used (wire u64)", async () => {
@@ -3707,14 +3763,14 @@ describe("Parity wrappers", () => {
     });
 
     await assert.rejects(
-      () => client.spawnMobHelper("mob-1", "help"),
+      () => client.spawnMobHelper("mob-1", "help", helperOptions),
       (error) =>
         error instanceof MeerkatError &&
         error.code === "INVALID_RESPONSE" &&
         /tokens_used must be a non-negative integer/.test(String(error.message)),
     );
     await assert.rejects(
-      () => client.forkMobHelper("mob-1", "source", "help"),
+      () => client.forkMobHelper("mob-1", "source", "help", helperOptions),
       (error) =>
         error instanceof MeerkatError &&
         error.code === "INVALID_RESPONSE" &&
@@ -3725,19 +3781,14 @@ describe("Parity wrappers", () => {
   it("accepts the largest lossless u64 projection and rejects the first unsafe integer", async () => {
     const client = new MeerkatClient();
     let tokensUsed = Number.MAX_SAFE_INTEGER;
-    client.request = async () => ({
-      output: "ok",
-      tokens_used: tokensUsed,
-      agent_identity: "helper-1",
-      member_ref: makeMemberRef("mob-1", "helper-1"),
-    });
+    client.request = async () => helperWireResult("helper-1", { tokens_used: tokensUsed });
 
-    const result = await client.spawnMobHelper("mob-1", "help");
+    const result = await client.spawnMobHelper("mob-1", "help", helperOptions);
     assert.equal(result.tokensUsed, Number.MAX_SAFE_INTEGER);
 
     tokensUsed = 2 ** 53;
     await assert.rejects(
-      () => client.spawnMobHelper("mob-1", "help"),
+      () => client.spawnMobHelper("mob-1", "help", helperOptions),
       (error) =>
         error instanceof MeerkatError &&
         error.code === "INVALID_RESPONSE" &&

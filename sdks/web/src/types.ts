@@ -1,5 +1,6 @@
 import { KNOWN_AGENT_EVENT_TYPES } from './generated/events.js';
-import type { AgentEvent, SkillKey } from './generated/events.js';
+import type { AgentEvent, SkillKey, Usage } from './generated/events.js';
+import type { AuthBindingRef } from './generated/runtime.js';
 import type {
   WireHostRef,
   WireMemberLifecycleCapabilities,
@@ -434,11 +435,48 @@ export interface MobMemberSnapshot {
 }
 
 /** Result envelope for helper-style mob flows. */
+export type MobBoundedHelperResultStatus =
+  | 'completed'
+  | 'completed_truncated'
+  | 'failed'
+  | 'failed_truncated'
+  | 'in_progress'
+  | 'in_progress_truncated'
+  | 'unavailable'
+  | 'unavailable_truncated';
+
+export interface MobBoundedHelperResult {
+  label: string;
+  status: MobBoundedHelperResultStatus;
+  text: string;
+}
+
 export interface MobHelperResult {
-  output?: string;
+  output: string;
   tokens_used: number;
   agent_identity: string;
   member_ref: MobMemberRef;
+  bounded_result: MobBoundedHelperResult;
+  session_id: string;
+  usage: Usage;
+  turns: number;
+  tool_calls: number;
+  retirement_error?: string;
+}
+
+export interface MobHelperOptions {
+  agentIdentity: string;
+  resultLabel: string;
+  maxTextBytes: number;
+  profileName?: string;
+  modelOverride?: string;
+  authBinding?: AuthBindingRef;
+  runtimeMode?: string;
+  backend?: string;
+}
+
+export interface MobForkHelperOptions extends MobHelperOptions {
+  forkContext?: Record<string, unknown>;
 }
 
 // ─── Event types (matches meerkat-core AgentEvent serde) ────────

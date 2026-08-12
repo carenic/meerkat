@@ -380,8 +380,8 @@ rkat run --tools full --resume <session_id> "retire worker-2 and add worker-4"
 Where needed, the current helper-oriented CLI mob surface is:
 
 ```bash
-rkat mob spawn-helper <mob_id> <prompt> --agent-identity <id> [--profile <profile>] [--json]
-rkat mob fork-helper <mob_id> <source_member> <prompt> --agent-identity <id> [--profile <profile>] [--fork-context full-history|last-messages] [--last-messages N] [--json]
+rkat mob spawn-helper <mob_id> <prompt> --agent-identity <id> --result-label <label> --max-text-bytes <n> [--profile <profile>] [--json]
+rkat mob fork-helper <mob_id> <source_member> <prompt> --agent-identity <id> --result-label <label> --max-text-bytes <n> [--profile <profile>] [--fork-context full-history|last-messages] [--last-messages N] [--json]
 rkat mob member-status <mob_id> <agent_identity> [--json]
 rkat mob force-cancel <mob_id> <agent_identity>
 rkat mob respawn <mob_id> <agent_identity> [--initial-message <msg>]
@@ -643,7 +643,7 @@ git diff | rkat run "Review these changes" --tools safe
 cat data.csv | rkat run "Extract entities" | rkat run "Write a story about them"
 # Live streaming: --keep-alive --stdin reads stdin line-by-line as events
 tail -f app.log | rkat run --keep-alive --stdin lines "Monitor and alert on anomalies"
-rkat mob spawn-helper coding-swarm "Join as lead-1 and summarize the current plan." --profile lead --agent-identity lead-1
+rkat mob spawn-helper coding-swarm "Join as lead-1 and summarize the current plan." --profile lead --agent-identity lead-1 --result-label plan-summary --max-text-bytes 4096
 rkat mob run-flow coding-swarm --flow triage --params '{"severity":"high"}'
 ```
 
@@ -966,7 +966,7 @@ Hosts that inject per-turn ambient context (e.g. memory recall blocks) attach it
 
 ### Delegated work
 
-Use mobs for all multi-agent orchestration. Mobs support `MemberLaunchMode::Fork` for seeding a member from a source member's conversation (the mob fork lane renders source history into the new member's initial prompt; CoW `Session::fork()`/`fork_at` is the library-level primitive), `spawn_helper()`/`fork_helper()` for one-call convenience, `force_cancel_member()` for cancelling in-flight turns, and `member_status()`/`wait_one()`/`wait_all()`/`collect_completed()` for monitoring.
+Use mobs for all multi-agent orchestration. Mobs support `MemberLaunchMode::Fork` for seeding a member from a source member's conversation (the mob fork lane renders source history into the new member's initial prompt; CoW `Session::fork()`/`fork_at` is the library-level primitive), `spawn_helper()`/`fork_helper()` for one-call convenience (both require `result_label` and `max_text_bytes` and return a `BoundedHelperRunOutcome` with the certified bounded result), `force_cancel_member()` for cancelling in-flight turns, and `member_status()`/`wait_one()`/`wait_all()`/`collect_completed()` for monitoring.
 
 Force-cancel semantics (0.8.4+): force-cancelling a running member is legal
 from `Running` — it interrupts the in-flight work without retiring the member

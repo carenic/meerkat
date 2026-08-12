@@ -1,6 +1,7 @@
 import { EventSubscription } from './events.js';
 import { MeerkatError, serializePromptContentInput } from './session.js';
 import { isKnownEvent } from './types.js';
+import type { ProviderTokenAccounting } from './generated/events.js';
 import { MOB_SPAWN_MANY_FAILURE_CAUSES } from './generated/mob.js';
 import type {
   AuthBindingRef,
@@ -28,6 +29,8 @@ import type {
   MobUnreachablePeer,
   ResolvedModelCapabilities,
   MobHelperResult,
+  MobHelperOptions,
+  MobForkHelperOptions,
   EventEnvelope,
   EventSourceIdentity,
   AgentRuntimeId,
@@ -157,6 +160,18 @@ function optionalStringField(
   if (raw == null) {
     return undefined;
   }
+  if (typeof raw !== 'string') {
+    throw new Error(message);
+  }
+  return raw;
+}
+
+function requirePresentStringField(
+  value: Record<string, unknown>,
+  field: string,
+  message: string,
+): string {
+  const raw = value[field];
   if (typeof raw !== 'string') {
     throw new Error(message);
   }
@@ -1067,19 +1082,161 @@ function parseMobHelperResult(raw: unknown, context: string): MobHelperResult {
     WireMobHelperResult
   > &
     Record<string, unknown>;
+  const output = requirePresentStringField(result, 'output', `${context}: output must be string`);
+  const tokensUsed = requireNonNegativeIntegerField(
+    result,
+    'tokens_used',
+    `${context}: tokens_used must be number`,
+  );
+  const agentIdentity = requireStringField(
+    result,
+    'agent_identity',
+    `${context}: missing agent_identity`,
+  );
+  const memberRef = requireStringField(result, 'member_ref', `${context}: missing member_ref`);
+  const boundedResult = requireRecord(
+    result.bounded_result,
+    `${context}: bounded_result must be object`,
+  );
+  const status = requireStringField(
+    boundedResult,
+    'status',
+    `${context}: bounded_result missing status`,
+  );
+  const statuses = new Set([
+    'completed',
+    'completed_truncated',
+    'failed',
+    'failed_truncated',
+    'in_progress',
+    'in_progress_truncated',
+    'unavailable',
+    'unavailable_truncated',
+  ]);
+  if (!statuses.has(status)) {
+    throw new Error(`${context}: unsupported bounded_result status ${status}`);
+  }
+  const usage = requireRecord(result.usage, `${context}: usage must be object`);
+  const providerAccounting = usage.provider_accounting == null
+    ? undefined
+    : (() => {
+        const accounting = requireRecord(
+          usage.provider_accounting,
+          `${context}: usage.provider_accounting must be object`,
+        );
+        const provider = requireStringField(
+          accounting,
+          'provider',
+          `${context}: usage.provider_accounting missing provider`,
+        );
+        const convention = requireStringField(
+          accounting,
+          'convention',
+          `${context}: usage.provider_accounting missing convention`,
+        );
+        const aggregation = requireStringField(
+          accounting,
+          'aggregation',
+          `${context}: usage.provider_accounting missing aggregation`,
+        );
+        if (!['anthropic', 'openai', 'gemini', 'self_hosted', 'other'].includes(provider)) {
+          throw new Error(`${context}: unsupported usage.provider_accounting provider ${provider}`);
+        }
+        if (![
+          'anthropic_disjoint_input_components',
+          'open_ai_input_includes_cached_subset',
+          'gemini_prompt_includes_cached_subset',
+          'open_ai_compatible_prompt_includes_cache_details',
+          'host_declared_inclusive_input_total',
+        ].includes(convention)) {
+          throw new Error(`${context}: unsupported usage.provider_accounting convention ${convention}`);
+        }
+        if (![
+          'sum_disjoint_provider_components',
+          'provider_inclusive_input_total',
+        ].includes(aggregation)) {
+          throw new Error(`${context}: unsupported usage.provider_accounting aggregation ${aggregation}`);
+        }
+        return {
+          provider,
+          model: requireStringField(
+            accounting,
+            'model',
+            `${context}: usage.provider_accounting missing model`,
+          ),
+          presented_tokens: requireNonNegativeIntegerField(
+            accounting,
+            'presented_tokens',
+            `${context}: usage.provider_accounting.presented_tokens must be number`,
+          ),
+          convention,
+          aggregation,
+        } as ProviderTokenAccounting;
+      })();
+  const retirementError = optionalStringField(
+    result,
+    'retirement_error',
+    `${context}: retirement_error must be string`,
+  );
   return {
-    output: optionalStringField(result, 'output', `${context}: output must be string`),
-    tokens_used: requireNonNegativeIntegerField(
+    output,
+    tokens_used: tokensUsed,
+    agent_identity: agentIdentity,
+    member_ref: memberRef,
+    bounded_result: {
+      label: requireStringField(
+        boundedResult,
+        'label',
+        `${context}: bounded_result missing label`,
+      ),
+      status: status as MobHelperResult['bounded_result']['status'],
+      text: requirePresentStringField(
+        boundedResult,
+        'text',
+        `${context}: bounded_result missing text`,
+      ),
+    },
+    session_id: requireStringField(result, 'session_id', `${context}: missing session_id`),
+    usage: {
+      input_tokens: requireNonNegativeIntegerField(
+        usage,
+        'input_tokens',
+        `${context}: usage.input_tokens must be number`,
+      ),
+      output_tokens: requireNonNegativeIntegerField(
+        usage,
+        'output_tokens',
+        `${context}: usage.output_tokens must be number`,
+      ),
+      ...(usage.cache_creation_tokens != null
+        ? {
+            cache_creation_tokens: requireNonNegativeIntegerField(
+              usage,
+              'cache_creation_tokens',
+              `${context}: usage.cache_creation_tokens must be number`,
+            ),
+          }
+        : {}),
+      ...(usage.cache_read_tokens != null
+        ? {
+            cache_read_tokens: requireNonNegativeIntegerField(
+              usage,
+              'cache_read_tokens',
+              `${context}: usage.cache_read_tokens must be number`,
+            ),
+          }
+        : {}),
+      ...(providerAccounting !== undefined
+        ? { provider_accounting: providerAccounting }
+        : {}),
+    },
+    turns: requireNonNegativeIntegerField(result, 'turns', `${context}: turns must be number`),
+    tool_calls: requireNonNegativeIntegerField(
       result,
-      'tokens_used',
-      `${context}: tokens_used must be number`,
+      'tool_calls',
+      `${context}: tool_calls must be number`,
     ),
-    agent_identity: requireStringField(
-      result,
-      'agent_identity',
-      `${context}: missing agent_identity`,
-    ),
-    member_ref: requireStringField(result, 'member_ref', `${context}: missing member_ref`),
+    ...(retirementError !== undefined ? { retirement_error: retirementError } : {}),
   };
 }
 
@@ -1350,14 +1507,7 @@ export class Mob {
    */
   async spawnHelper(
     prompt: string,
-    options: {
-      agentIdentity: string;
-      profileName?: string;
-      modelOverride?: string;
-      authBinding?: AuthBindingRef;
-      runtimeMode?: string;
-      backend?: string;
-    },
+    options: MobHelperOptions,
   ): Promise<MobHelperResult> {
     let json: string;
     try {
@@ -1365,6 +1515,8 @@ export class Mob {
         this.mobId,
         JSON.stringify({
           prompt,
+          result_label: options.resultLabel,
+          max_text_bytes: options.maxTextBytes,
           agent_identity: options.agentIdentity,
           // Canonical wire field is `role_name` (the WASM helper structs +
           // TS/Python SDKs all consume `role_name`); serializing `profile_name`
@@ -1395,15 +1547,7 @@ export class Mob {
   async forkHelper(
     sourceMemberId: string,
     prompt: string,
-    options: {
-      agentIdentity: string;
-      profileName?: string;
-      modelOverride?: string;
-      authBinding?: AuthBindingRef;
-      forkContext?: Record<string, unknown>;
-      runtimeMode?: string;
-      backend?: string;
-    },
+    options: MobForkHelperOptions,
   ): Promise<MobHelperResult> {
     let json: string;
     try {
@@ -1412,6 +1556,8 @@ export class Mob {
         JSON.stringify({
           source_member_id: sourceMemberId,
           prompt,
+          result_label: options.resultLabel,
+          max_text_bytes: options.maxTextBytes,
           agent_identity: options.agentIdentity,
           // Canonical wire field is `role_name` (the WASM helper structs +
           // TS/Python SDKs all consume `role_name`); serializing `profile_name`

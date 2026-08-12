@@ -239,7 +239,9 @@ import {
   type MemberSendOptions,
   type MobBoundedHelperResult,
   type MobHandlingMode,
+  type MobForkHelperOptions,
   type MobHelperResult,
+  type MobHelperOptions,
   type MobKickoffMemberSnapshot,
   type MobKickoffWaitOptions,
   type MobMemberSnapshot,
@@ -3001,20 +3003,14 @@ export class MeerkatClient {
   async spawnMobHelper(
     mobId: string,
     prompt: string,
-    options?: {
-      agentIdentity?: string;
-      roleName?: string;
-      profileName?: string;
-      modelOverride?: string;
-      authBinding?: WireAuthBindingRef;
-      runtimeMode?: string;
-      backend?: string;
-    },
+    options: MobHelperOptions,
   ): Promise<MobHelperResult> {
     const roleName = options?.roleName ?? options?.profileName;
     const result = await this.request("mob/spawn_helper", {
       mob_id: mobId,
       prompt,
+      result_label: options.resultLabel,
+      max_text_bytes: options.maxTextBytes,
       agent_identity: options?.agentIdentity,
       role_name: roleName,
       model_override: options?.modelOverride,
@@ -3022,56 +3018,25 @@ export class MeerkatClient {
       runtime_mode: options?.runtimeMode,
       backend: options?.backend,
     });
-    const resultIdentity = MeerkatClient.parseRequiredString(
-      result.agent_identity,
-      "Invalid mob/spawn_helper response: missing agent_identity",
+    return MeerkatClient.parseMobHelperResult(
+      result,
+      "Invalid mob/spawn_helper response",
     );
-    const memberRef =
-      typeof result.member_ref === "string" && result.member_ref.length > 0
-        ? result.member_ref
-        : undefined;
-    if (!memberRef) {
-      throw new MeerkatError(
-        "INVALID_RESPONSE",
-        "Invalid mob/spawn_helper response: missing member_ref",
-      );
-    }
-    return {
-      output: result.output != null ? String(result.output) : undefined,
-      tokensUsed: MeerkatClient.requireNonNegativeIntegerField(
-        result,
-        "tokens_used",
-        "Invalid mob/spawn_helper response",
-      ),
-      agentIdentity: resultIdentity,
-      memberRef,
-      boundedResult: MeerkatClient.parseBoundedHelperResult(
-        result.bounded_result,
-        "Invalid mob/spawn_helper response",
-      ),
-    };
   }
 
   async forkMobHelper(
     mobId: string,
     sourceMemberId: string,
     prompt: string,
-    options?: {
-      agentIdentity?: string;
-      roleName?: string;
-      profileName?: string;
-      modelOverride?: string;
-      authBinding?: WireAuthBindingRef;
-      forkContext?: Record<string, unknown>;
-      runtimeMode?: string;
-      backend?: string;
-    },
+    options: MobForkHelperOptions,
   ): Promise<MobHelperResult> {
     const roleName = options?.roleName ?? options?.profileName;
     const result = await this.request("mob/fork_helper", {
       mob_id: mobId,
       source_member_id: sourceMemberId,
       prompt,
+      result_label: options.resultLabel,
+      max_text_bytes: options.maxTextBytes,
       agent_identity: options?.agentIdentity,
       role_name: roleName,
       model_override: options?.modelOverride,
@@ -3080,34 +3045,10 @@ export class MeerkatClient {
       runtime_mode: options?.runtimeMode,
       backend: options?.backend,
     });
-    const resultIdentity = MeerkatClient.parseRequiredString(
-      result.agent_identity,
-      "Invalid mob/fork_helper response: missing agent_identity",
+    return MeerkatClient.parseMobHelperResult(
+      result,
+      "Invalid mob/fork_helper response",
     );
-    const memberRef =
-      typeof result.member_ref === "string" && result.member_ref.length > 0
-        ? result.member_ref
-        : undefined;
-    if (!memberRef) {
-      throw new MeerkatError(
-        "INVALID_RESPONSE",
-        "Invalid mob/fork_helper response: missing member_ref",
-      );
-    }
-    return {
-      output: result.output != null ? String(result.output) : undefined,
-      tokensUsed: MeerkatClient.requireNonNegativeIntegerField(
-        result,
-        "tokens_used",
-        "Invalid mob/fork_helper response",
-      ),
-      agentIdentity: resultIdentity,
-      memberRef,
-      boundedResult: MeerkatClient.parseBoundedHelperResult(
-        result.bounded_result,
-        "Invalid mob/fork_helper response",
-      ),
-    };
   }
 
   async wireMobMembers(mobId: string, member: string, peer: MobPeerTarget): Promise<void> {
@@ -3377,10 +3318,7 @@ export class MeerkatClient {
   private static parseBoundedHelperResult(
     raw: unknown,
     context: string,
-  ): MobBoundedHelperResult | undefined {
-    if (raw == null) {
-      return undefined;
-    }
+  ): MobBoundedHelperResult {
     const record = MeerkatClient.requireRecord(raw, "bounded_result", context);
     const status = MeerkatClient.requireStringField(record, "status", context);
     const allowedStatuses = new Set([
@@ -3403,6 +3341,81 @@ export class MeerkatClient {
       label: MeerkatClient.requireStringField(record, "label", context),
       status: status as MobBoundedHelperResult["status"],
       text: MeerkatClient.requirePresentStringField(record, "text", context),
+    };
+  }
+
+  private static parseMobHelperResult(
+    result: Record<string, unknown>,
+    context: string,
+  ): MobHelperResult {
+    const output = MeerkatClient.requirePresentStringField(result, "output", context);
+    const tokensUsed = MeerkatClient.requireNonNegativeIntegerField(
+      result,
+      "tokens_used",
+      context,
+    );
+    const agentIdentity = MeerkatClient.requireStringField(
+      result,
+      "agent_identity",
+      context,
+    );
+    const memberRef = MeerkatClient.requireStringField(result, "member_ref", context);
+    const boundedResult = MeerkatClient.parseBoundedHelperResult(
+      result.bounded_result,
+      context,
+    );
+    const sessionId = MeerkatClient.requireStringField(result, "session_id", context);
+    const usageRaw = MeerkatClient.requireRecord(result.usage, "usage", context);
+    const usage: Usage = {
+      inputTokens: MeerkatClient.requireNonNegativeIntegerField(
+        usageRaw,
+        "input_tokens",
+        context,
+        "usage.input_tokens",
+      ),
+      outputTokens: MeerkatClient.requireNonNegativeIntegerField(
+        usageRaw,
+        "output_tokens",
+        context,
+        "usage.output_tokens",
+      ),
+      ...(usageRaw.cache_creation_tokens != null
+        ? {
+            cacheCreationTokens: MeerkatClient.requireNonNegativeIntegerField(
+              usageRaw,
+              "cache_creation_tokens",
+              context,
+              "usage.cache_creation_tokens",
+            ),
+          }
+        : {}),
+      ...(usageRaw.cache_read_tokens != null
+        ? {
+            cacheReadTokens: MeerkatClient.requireNonNegativeIntegerField(
+              usageRaw,
+              "cache_read_tokens",
+              context,
+              "usage.cache_read_tokens",
+            ),
+          }
+        : {}),
+    };
+    const retirementError = MeerkatClient.optionalStringField(
+      result,
+      "retirement_error",
+      context,
+    );
+    return {
+      output,
+      tokensUsed,
+      agentIdentity,
+      memberRef,
+      boundedResult,
+      sessionId,
+      usage,
+      turns: MeerkatClient.requireNonNegativeIntegerField(result, "turns", context),
+      toolCalls: MeerkatClient.requireNonNegativeIntegerField(result, "tool_calls", context),
+      ...(retirementError !== undefined ? { retirementError } : {}),
     };
   }
 

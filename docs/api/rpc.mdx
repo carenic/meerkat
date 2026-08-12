@@ -242,6 +242,13 @@ subset.
 | `realm/list` | Realm | — | `WireRealmList` | List realm summaries |
 | `realm/get` | Realm | `RealmIdParams` | `WireRealmConnectionSet` | Get full realm connection set |
 
+Both helper parameter types (`MobSpawnHelperParams`, `MobForkHelperParams`)
+require `result_label` and `max_text_bytes`. `MobHelperResult` is the exact
+operation carrier: `output`, `tokens_used`, `agent_identity`, `member_ref`,
+`bounded_result`, `session_id`, `usage`, `turns`, and `tool_calls` are
+required, while `retirement_error` reports post-result cleanup debt when
+present.
+
 <Note>
 Every `Schedule` result is one flattened public object. Configuration fields
 including `planning_horizon_days`, `planning_horizon_occurrences`, `labels`,

@@ -48,8 +48,8 @@ directly — a composition over the legacy optional reads can never produce
 
 ## Helper Convenience
 
-- `MobHandle::spawn_helper(prompt, opts)` — synthesize ephemeral mob, spawn, wait, return result, teardown
-- `MobHandle::fork_helper(source_id, prompt, opts)` — same but with Fork launch mode
+- `MobHandle::spawn_helper(identity, task, opts, result_label, max_text_bytes)` - spawn, wait for the exact admitted turn, return `BoundedHelperRunOutcome` (certified bounded result + exact turn result + optional `retirement_error`), teardown
+- `MobHandle::fork_helper(source_identity, identity, task, fork_context, opts, result_label, max_text_bytes)` - same but with Fork launch mode
 
 Profile source rule: agent-internal surfaces inherit from caller config. Non-agent surfaces (REST/RPC/CLI/MCP) require explicit config source — never silent defaults.
 

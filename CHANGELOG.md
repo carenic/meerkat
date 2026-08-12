@@ -90,8 +90,16 @@ via cargo-semver-checks against the published baselines).
 - `PeerIngressRuntimeSnapshot::submission_queue_len` is removed. Consumers use
   `queue.queue_depth()` plus claim and handoff counters.
 - `ProviderRequestPressure` gains lowered-request provenance,
-  `MobHelperResult`/`HelperResult` gains optional `bounded_result`, and the
-  associated public enums gain variants that exhaustive consumers must handle.
+  and the associated public enums gain variants that exhaustive consumers must
+  handle.
+- Helper execution is a full-operation exact-result redesign with no
+  compatibility shim. Rust `MobHandle::{spawn_helper,fork_helper}` and
+  `MobMcpState::{mob_spawn_helper,mob_fork_helper}` require `result_label` and
+  `max_text_bytes` and return `BoundedHelperRunOutcome` instead of a helper
+  snapshot. RPC, REST, CLI, WASM, Python, TypeScript, and Web requests require
+  the same projection inputs. Their result carrier requires `output`,
+  `tokens_used`, `agent_identity`, `member_ref`, `bounded_result`, `session_id`,
+  `usage`, `turns`, and `tool_calls`, with optional `retirement_error`.
 
 ### Added
 
@@ -186,9 +194,10 @@ via cargo-semver-checks against the published baselines).
 - `MobHandle::fork_member` currently resolves the child profile, provider, and
   model after durable commit, so it conservatively reports cache inheritance
   unavailable instead of installing unproved evidence.
-- `spawn_helper` and `fork_helper` are non-blocking snapshot conveniences and
-  initially return no certified bounded result. Callers must await terminality
-  and call `bounded_terminal_member_result`.
+- Helper and fork-helper operations wait for the exact admitted turn and return
+  its receiver-bounded certified result. Bare `fork_member` remains
+  provisioning-only; callers that want fork plus execution use the explicit
+  fork-and-turn operation.
 - Meerkat contains the Schedule lease contract, but removing MobKit's
   process-local firing-host gate remains paired downstream release work.
 - The compatible MobKit release is not yet named. Do not retain the previous

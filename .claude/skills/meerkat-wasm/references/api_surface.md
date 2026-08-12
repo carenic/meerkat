@@ -59,8 +59,8 @@ resolver source, the registered resolver is invoked (see auth section).
 | `mob_append_system_context` | mob_id, agent_identity, request JSON | result JSON | async, append context to a member's system prompt |
 | `mob_wire` / `mob_unwire` | mob_id, a, b | `()` | async, identity-keyed wiring |
 | `mob_wire_peer` / `mob_unwire_peer` | mob_id, member, peer JSON | `()` | async, canonical member/peer wiring (structured peer descriptor). There are no `mob_wire_target` / `wire_cross_mob` exports. |
-| `mob_spawn_helper` | mob_id, request JSON | result JSON | async, helper spawn with auto-wait |
-| `mob_fork_helper` | mob_id, request JSON | result JSON | async, fork-from-source helper spawn |
+| `mob_spawn_helper` | mob_id, request JSON (requires `result_label`, `max_text_bytes`) | result JSON | async, helper spawn with auto-wait |
+| `mob_fork_helper` | mob_id, request JSON (requires `result_label`, `max_text_bytes`) | result JSON | async, fork-from-source helper spawn |
 | `mob_run_flow` | mob_id, flow_id, params JSON | run_id string | async |
 | `mob_flow_status` | mob_id, run_id | MobRun JSON | async |
 | `mob_cancel_flow` | mob_id, run_id | `()` | async |
@@ -232,8 +232,12 @@ mob operations create sessions through that same service, but runtime-owned surf
 
 `runtime_mode`: `"turn_driven"` or `"autonomous_host"`.
 
-Helper spawn/fork request JSON (`mob_spawn_helper`, `mob_fork_helper`) may carry
-`auth_binding`; regular batch `mob_spawn` specs do not.
+Helper spawn/fork request JSON (`mob_spawn_helper`, `mob_fork_helper`) requires
+`result_label` and `max_text_bytes` and may carry `auth_binding`; regular batch
+`mob_spawn` specs carry neither. The helper result JSON requires `output`,
+`tokens_used`, `agent_identity`, `member_ref`, `bounded_result`
+(`label`/`status`/`text`), `session_id`, `usage`, `turns`, and `tool_calls`,
+with optional `retirement_error`.
 
 ## MobDefinition JSON Format
 

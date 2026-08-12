@@ -4,7 +4,7 @@ import asyncio
 
 import base64
 import json
-from dataclasses import replace
+from dataclasses import MISSING, replace
 from pathlib import Path
 from typing import Literal, get_args, get_origin, get_type_hints
 
@@ -24,6 +24,35 @@ def _make_member_ref(mob_id: str, agent_identity: str) -> str:
     return (
         base64.urlsafe_b64encode(payload.encode("utf-8")).rstrip(b"=").decode("ascii")
     )
+
+
+def _exact_helper_result(
+    mob_id: str,
+    agent_identity: str,
+    *,
+    output: str = "ok",
+    tokens_used: int = 1,
+    result_label: str = "helper_result",
+    retirement_error: str | None = None,
+) -> dict:
+    result = {
+        "output": output,
+        "tokens_used": tokens_used,
+        "agent_identity": agent_identity,
+        "member_ref": _make_member_ref(mob_id, agent_identity),
+        "bounded_result": {
+            "label": result_label,
+            "status": "completed",
+            "text": output,
+        },
+        "session_id": f"session-{agent_identity}",
+        "usage": {"input_tokens": 3, "output_tokens": tokens_used},
+        "turns": 1,
+        "tool_calls": 0,
+    }
+    if retirement_error is not None:
+        result["retirement_error"] = retirement_error
+    return result
 
 
 def _agent_event_envelope(
@@ -5379,18 +5408,24 @@ async def test_mob_helper_wrappers_reject_missing_tokens_used():
     client = MeerkatClient()
 
     async def fake_request(_method, _params):
-        return {
-            "output": "ok",
-            "agent_identity": "helper-a",
-            "member_ref": _make_member_ref("mob-1", "helper-a"),
-        }
+        result = _exact_helper_result("mob-1", "helper-a")
+        del result["tokens_used"]
+        return result
 
     client._request = fake_request  # type: ignore[method-assign]
 
     with pytest.raises(MeerkatError, match="missing tokens_used"):
-        await client.spawn_mob_helper("mob-1", "help")
+        await client.spawn_mob_helper(
+            "mob-1", "help", result_label="result", max_text_bytes=4096
+        )
     with pytest.raises(MeerkatError, match="missing tokens_used"):
-        await client.fork_mob_helper("mob-1", "agent-a", "help")
+        await client.fork_mob_helper(
+            "mob-1",
+            "agent-a",
+            "help",
+            result_label="result",
+            max_text_bytes=4096,
+        )
 
 
 @pytest.mark.asyncio
@@ -5401,23 +5436,255 @@ async def test_mob_helper_wrappers_reject_fractional_negative_tokens_used():
         # tokens_used is a wire u64: a fractional/negative number can never be
         # a valid value, so the SDK fails closed instead of accepting any
         # finite number.
-        return {
-            "output": "ok",
-            "tokens_used": -3.5,
-            "agent_identity": "helper-a",
-            "member_ref": _make_member_ref("mob-1", "helper-a"),
-        }
+        return _exact_helper_result("mob-1", "helper-a", tokens_used=-3.5)
 
     client._request = fake_request  # type: ignore[method-assign]
 
     with pytest.raises(
         MeerkatError, match="tokens_used must be a non-negative integer"
     ):
-        await client.spawn_mob_helper("mob-1", "help")
+        await client.spawn_mob_helper(
+            "mob-1", "help", result_label="result", max_text_bytes=4096
+        )
     with pytest.raises(
         MeerkatError, match="tokens_used must be a non-negative integer"
     ):
-        await client.fork_mob_helper("mob-1", "agent-a", "help")
+        await client.fork_mob_helper(
+            "mob-1",
+            "agent-a",
+            "help",
+            result_label="result",
+            max_text_bytes=4096,
+        )
+
+
+@pytest.mark.asyncio
+async def test_mob_helper_exact_result_contract_and_bounds() -> None:
+    client = MeerkatClient()
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_request(method, params):
+        calls.append((method, params))
+        identity = "spawn-a" if method == "mob/spawn_helper" else "fork-a"
+        result = _exact_helper_result(
+            params["mob_id"],
+            identity,
+            output="exact output",
+            tokens_used=7,
+            result_label=params["result_label"],
+            retirement_error="retirement deferred",
+        )
+        result["usage"].update(
+            {"cache_creation_tokens": 2, "cache_read_tokens": 1}
+        )
+        result["turns"] = 3
+        result["tool_calls"] = 2
+        return result
+
+    client._request = fake_request  # type: ignore[method-assign]
+    spawned = await client.spawn_mob_helper(
+        "mob-1",
+        "help",
+        result_label="spawn_result",
+        max_text_bytes=4096,
+        agent_identity="spawn-a",
+    )
+    forked = await client.fork_mob_helper(
+        "mob-1",
+        "source-a",
+        "review",
+        result_label="fork_result",
+        max_text_bytes=2048,
+        agent_identity="fork-a",
+    )
+
+    for result, label, identity in (
+        (spawned, "spawn_result", "spawn-a"),
+        (forked, "fork_result", "fork-a"),
+    ):
+        assert result == {
+            "output": "exact output",
+            "tokens_used": 7,
+            "agent_identity": identity,
+            "member_ref": _make_member_ref("mob-1", identity),
+            "bounded_result": {
+                "label": label,
+                "status": "completed",
+                "text": "exact output",
+            },
+            "session_id": f"session-{identity}",
+            "usage": Usage(
+                input_tokens=3,
+                output_tokens=7,
+                cache_creation_tokens=2,
+                cache_read_tokens=1,
+            ),
+            "turns": 3,
+            "tool_calls": 2,
+            "retirement_error": "retirement deferred",
+        }
+
+    assert calls[0][1]["result_label"] == "spawn_result"
+    assert calls[0][1]["max_text_bytes"] == 4096
+    assert calls[1][1]["result_label"] == "fork_result"
+    assert calls[1][1]["max_text_bytes"] == 2048
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "output",
+        "tokens_used",
+        "agent_identity",
+        "member_ref",
+        "bounded_result",
+        "session_id",
+        "usage",
+        "turns",
+        "tool_calls",
+    ],
+)
+async def test_mob_helper_results_require_every_exact_field(
+    missing_field: str,
+) -> None:
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        result = _exact_helper_result("mob-1", "helper-a")
+        del result[missing_field]
+        return result
+
+    client._request = fake_request  # type: ignore[method-assign]
+    with pytest.raises(MeerkatError) as excinfo:
+        await client.spawn_mob_helper(
+            "mob-1",
+            "help",
+            result_label="helper_result",
+            max_text_bytes=4096,
+        )
+    assert excinfo.value.code == "INVALID_RESPONSE"
+    assert missing_field in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutate", "error_match"),
+    [
+        (lambda value: value.__setitem__("output", None), "missing output"),
+        (
+            lambda value: value.__setitem__("bounded_result", "legacy text"),
+            "missing bounded_result",
+        ),
+        (
+            lambda value: value["bounded_result"].__setitem__("status", "done"),
+            "unsupported bounded_result status",
+        ),
+        (
+            lambda value: value["bounded_result"].__setitem__("text", None),
+            "missing text",
+        ),
+        (lambda value: value.__setitem__("session_id", ""), "missing session_id"),
+        (
+            lambda value: value["usage"].__setitem__("input_tokens", 1.5),
+            "usage.input_tokens must be a non-negative integer",
+        ),
+        (
+            lambda value: value.__setitem__("turns", -1),
+            "turns must be a non-negative integer",
+        ),
+        (
+            lambda value: value.__setitem__("tool_calls", True),
+            "tool_calls must be number",
+        ),
+        (
+            lambda value: value.__setitem__("retirement_error", 7),
+            "missing retirement_error",
+        ),
+    ],
+)
+async def test_mob_helper_results_reject_malformed_exact_fields(
+    mutate,
+    error_match: str,
+) -> None:
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        result = _exact_helper_result("mob-1", "helper-a")
+        mutate(result)
+        return result
+
+    client._request = fake_request  # type: ignore[method-assign]
+    with pytest.raises(MeerkatError, match=error_match) as excinfo:
+        await client.fork_mob_helper(
+            "mob-1",
+            "source-a",
+            "help",
+            result_label="helper_result",
+            max_text_bytes=4096,
+        )
+    assert excinfo.value.code == "INVALID_RESPONSE"
+
+
+def test_mob_helper_types_require_exact_contract_fields() -> None:
+    from meerkat.generated.types import (
+        MobForkHelperParams,
+        MobHelperResult as GeneratedMobHelperResult,
+        MobSpawnHelperParams,
+    )
+    from meerkat.mob import (
+        MobBoundedHelperResult as PublicMobBoundedHelperResult,
+        MobHelperResult as PublicMobHelperResult,
+    )
+
+    spawn_fields = MobSpawnHelperParams.__dataclass_fields__
+    fork_fields = MobForkHelperParams.__dataclass_fields__
+    generated_fields = GeneratedMobHelperResult.__dataclass_fields__
+    assert {"result_label", "max_text_bytes"} <= spawn_fields.keys()
+    assert {"result_label", "max_text_bytes"} <= fork_fields.keys()
+    assert spawn_fields["result_label"].default is MISSING
+    assert spawn_fields["max_text_bytes"].default is MISSING
+    assert fork_fields["result_label"].default is MISSING
+    assert fork_fields["max_text_bytes"].default is MISSING
+    required_result_fields = {
+        "output",
+        "tokens_used",
+        "agent_identity",
+        "member_ref",
+        "bounded_result",
+        "session_id",
+        "usage",
+        "turns",
+        "tool_calls",
+    }
+    assert required_result_fields <= generated_fields.keys()
+    assert all(
+        generated_fields[name].default is MISSING
+        for name in required_result_fields
+    )
+    assert "retirement_error" in generated_fields
+    assert generated_fields["retirement_error"].default is None
+    assert get_type_hints(PublicMobBoundedHelperResult) == {
+        "label": str,
+        "status": Literal[
+            "completed",
+            "completed_truncated",
+            "failed",
+            "failed_truncated",
+            "in_progress",
+            "in_progress_truncated",
+            "unavailable",
+            "unavailable_truncated",
+        ],
+        "text": str,
+    }
+    assert PublicMobBoundedHelperResult.__required_keys__ == {
+        "label",
+        "status",
+        "text",
+    }
+    assert PublicMobHelperResult.__required_keys__ == required_result_fields
+    assert PublicMobHelperResult.__optional_keys__ == {"retirement_error"}
 
 
 @pytest.mark.asyncio
@@ -5606,19 +5873,17 @@ async def test_mob_helper_and_respawn_paths_use_identity_native_receipts() -> No
     async def fake_request(method: str, params: dict[str, object]) -> dict[str, object]:
         calls.append((method, params))
         if method == "mob/spawn_helper":
-            return {
-                "output": "ok",
-                "tokens_used": 1,
-                "agent_identity": "helper-a",
-                "member_ref": _make_member_ref("mob-1", "helper-a"),
-            }
+            return _exact_helper_result(
+                "mob-1", "helper-a", result_label="spawn_result"
+            )
         if method == "mob/fork_helper":
-            return {
-                "output": "forked",
-                "tokens_used": 2,
-                "agent_identity": "fork-a",
-                "member_ref": _make_member_ref("mob-1", "fork-a"),
-            }
+            return _exact_helper_result(
+                "mob-1",
+                "fork-a",
+                output="forked",
+                tokens_used=2,
+                result_label="fork_result",
+            )
         if method == "mob/respawn":
             return {
                 "status": "completed",
@@ -5631,9 +5896,20 @@ async def test_mob_helper_and_respawn_paths_use_identity_native_receipts() -> No
 
     client._request = fake_request  # type: ignore[method-assign]
 
-    helper = await client.spawn_mob_helper("mob-1", "help", role_name="worker")
+    helper = await client.spawn_mob_helper(
+        "mob-1",
+        "help",
+        result_label="spawn_result",
+        max_text_bytes=4096,
+        role_name="worker",
+    )
     forked = await client.fork_mob_helper(
-        "mob-1", "agent-a", "help", role_name="worker"
+        "mob-1",
+        "agent-a",
+        "help",
+        result_label="fork_result",
+        max_text_bytes=2048,
+        role_name="worker",
     )
     respawned = await client.respawn_mob_member("mob-1", "agent-a")
 
@@ -7148,10 +7424,9 @@ async def test_mob_helper_results_require_canonical_agent_identity() -> None:
 
     async def missing_spawn_identity(method, _params):
         if method == "mob/spawn_helper":
-            return {
-                "tokens_used": 1,
-                "member_ref": _make_member_ref("mob-1", "helper-a"),
-            }
+            result = _exact_helper_result("mob-1", "helper-a")
+            del result["agent_identity"]
+            return result
         raise AssertionError(f"unexpected method {method}")
 
     client._request = missing_spawn_identity  # type: ignore[method-assign]
@@ -7159,6 +7434,8 @@ async def test_mob_helper_results_require_canonical_agent_identity() -> None:
         await client.spawn_mob_helper(
             "mob-1",
             "help",
+            result_label="result",
+            max_text_bytes=4096,
             agent_identity="helper-a",
             role_name="worker",
         )
@@ -7166,10 +7443,9 @@ async def test_mob_helper_results_require_canonical_agent_identity() -> None:
 
     async def missing_fork_identity(method, _params):
         if method == "mob/fork_helper":
-            return {
-                "tokens_used": 1,
-                "member_ref": _make_member_ref("mob-1", "fork-a"),
-            }
+            result = _exact_helper_result("mob-1", "fork-a")
+            del result["agent_identity"]
+            return result
         raise AssertionError(f"unexpected method {method}")
 
     client._request = missing_fork_identity  # type: ignore[method-assign]
@@ -7178,6 +7454,8 @@ async def test_mob_helper_results_require_canonical_agent_identity() -> None:
             "mob-1",
             "agent-a",
             "help",
+            result_label="result",
+            max_text_bytes=4096,
             agent_identity="fork-a",
             role_name="worker",
         )
@@ -7193,28 +7471,36 @@ async def test_helper_wrappers_forward_canonical_model_override() -> None:
 
     async def helper_result(method, params):
         calls.append((method, params))
-        return {
-            "tokens_used": 1,
-            "agent_identity": params.get("agent_identity") or "helper-a",
-            "member_ref": _make_member_ref(
-                params["mob_id"], params.get("agent_identity") or "helper-a"
-            ),
-        }
+        return _exact_helper_result(
+            params["mob_id"],
+            params.get("agent_identity") or "helper-a",
+            result_label=params["result_label"],
+        )
 
     client._request = helper_result  # type: ignore[method-assign]
     mob = Mob(client, "mob-1")
     await mob.spawn_helper(
-        "help", agent_identity="helper-a", model_override="gpt-5.6-sol"
+        "help",
+        result_label="spawn_result",
+        max_text_bytes=4096,
+        agent_identity="helper-a",
+        model_override="gpt-5.6-sol",
     )
     await mob.fork_helper(
         "source-a",
         "review",
+        result_label="fork_result",
+        max_text_bytes=2048,
         agent_identity="fork-a",
         model_override="claude-opus-4-8",
     )
 
     assert calls[0][1]["model_override"] == "gpt-5.6-sol"
     assert calls[1][1]["model_override"] == "claude-opus-4-8"
+    assert calls[0][1]["result_label"] == "spawn_result"
+    assert calls[0][1]["max_text_bytes"] == 4096
+    assert calls[1][1]["result_label"] == "fork_result"
+    assert calls[1][1]["max_text_bytes"] == 2048
 
 
 @pytest.mark.asyncio

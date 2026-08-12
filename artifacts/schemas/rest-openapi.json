@@ -12452,6 +12452,11 @@
               }
             ]
           },
+          "max_text_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
           "model_override": {
             "type": [
               "string",
@@ -12459,6 +12464,9 @@
             ]
           },
           "prompt": {
+            "type": "string"
+          },
+          "result_label": {
             "type": "string"
           },
           "role_name": {
@@ -12483,7 +12491,9 @@
         },
         "required": [
           "source_member_id",
-          "prompt"
+          "prompt",
+          "result_label",
+          "max_text_bytes"
         ],
         "title": "RestMobForkHelperRequest",
         "type": "object"
@@ -12517,6 +12527,11 @@
               }
             ]
           },
+          "max_text_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
           "model_override": {
             "type": [
               "string",
@@ -12524,6 +12539,9 @@
             ]
           },
           "prompt": {
+            "type": "string"
+          },
+          "result_label": {
             "type": "string"
           },
           "role_name": {
@@ -12544,7 +12562,9 @@
           }
         },
         "required": [
-          "prompt"
+          "prompt",
+          "result_label",
+          "max_text_bytes"
         ],
         "title": "RestMobHelperRequest",
         "type": "object"

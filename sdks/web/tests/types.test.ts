@@ -504,12 +504,14 @@ const memberSendResult: Promise<MemberDeliveryReceipt> = mob.member('worker-1').
 const memberStatusResult: Promise<MobMemberSnapshot> = mob.memberStatus('worker-1');
 const helperResult: Promise<MobHelperResult> = mob.spawnHelper(
   'Summarize the latest findings.',
-  { agentIdentity: 'helper-1' },
+  { agentIdentity: 'helper-1', resultLabel: 'summary', maxTextBytes: 4096 },
 );
 const helperWithConnectionResult: Promise<MobHelperResult> = mob.spawnHelper(
   'Summarize using the OpenAI binding.',
   {
     agentIdentity: 'helper-2',
+    resultLabel: 'summary',
+    maxTextBytes: 4096,
     modelOverride: 'gpt-5.4',
     authBinding: { realm: 'default', binding: 'openai', profile: 'work' },
   },
@@ -519,6 +521,8 @@ const forkedHelperResult: Promise<MobHelperResult> = mob.forkHelper(
   'Review the draft and suggest one improvement.',
   {
     agentIdentity: 'fork-1',
+    resultLabel: 'review',
+    maxTextBytes: 4096,
     modelOverride: 'claude-sonnet-4-6',
     authBinding: { realm: 'default', binding: 'anthropic' },
   },
