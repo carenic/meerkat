@@ -35,6 +35,7 @@ pub mod error;
 pub mod event;
 pub mod event_injector;
 pub mod event_tap;
+pub mod exact_operation;
 pub mod gateway;
 pub mod generated;
 pub mod handles;
@@ -189,6 +190,12 @@ pub use event::{
 pub use event_injector::{EventInjector, EventInjectorError};
 pub use event_tap::{
     EventTap, EventTapState, new_event_tap, tap_emit, tap_send_terminal, tap_try_send,
+};
+pub use exact_operation::{
+    CleanupReceipt, ExactOperationIdentity, OperationAcceptClass, OperationAdmissionReceipt,
+    OperationAttributionError, OperationCompletion, OperationCompletionAttributionError,
+    OperationTerminal, OperationTerminalIdentity, OperationWaitError, ProjectedTerminalText,
+    ResultProjectionValidationError, TerminalReceipt, ValidatedResultProjectionSpec,
 };
 pub use gateway::{DynamicToolComposite, ToolGateway, ToolGatewayBuilder};
 pub use handles::{
