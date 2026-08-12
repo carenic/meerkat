@@ -58,6 +58,7 @@ pub use ledger::{
     Migration, SchemaDomain, SchemaObject, SchemaObjectKind, SchemaPredecessor,
     apply_domain_migrations, bridge_unledgered_domain, domain_version,
     preflight_schema_eligibility, verify_released_schema_fingerprint,
+    verify_released_schema_structure,
 };
 pub use profile::{
     ConnectionProfile, OpenOptions, SHARED_BUSY_TIMEOUT, WriteContact, begin_immediate, open,

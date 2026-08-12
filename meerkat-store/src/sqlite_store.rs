@@ -1066,6 +1066,27 @@ fn build_released_0_8_10_session_schema(tx: &Transaction<'_>) -> Result<(), rusq
     migration_0002_strand_links(tx)
 }
 
+/// Frozen physical DDL of the pre-ledger session store: the plain-CREATE
+/// text that released binaries executed before the schema ledger existed.
+/// Kept verbatim as the frozen source oracle; never used for new schema.
+const RELEASED_PRE_FLOOR_SESSIONS_TABLE_SQL: &str = "CREATE TABLE sessions (
+    session_id TEXT PRIMARY KEY,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    message_count INTEGER NOT NULL,
+    total_tokens INTEGER NOT NULL,
+    metadata_json TEXT NOT NULL,
+    session_json BLOB NOT NULL
+)";
+
+const RELEASED_PRE_FLOOR_SESSIONS_UPDATED_INDEX_SQL: &str = "CREATE INDEX sessions_updated_idx
+ON sessions(updated_at_ms DESC, session_id ASC)";
+
+fn build_released_pre_floor_session_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    tx.execute_batch(RELEASED_PRE_FLOOR_SESSIONS_TABLE_SQL)?;
+    tx.execute_batch(RELEASED_PRE_FLOOR_SESSIONS_UPDATED_INDEX_SQL)
+}
+
 fn build_released_v3_session_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     migration_0001_session_schema(tx)?;
     migration_0002_strand_links(tx)?;
@@ -1182,6 +1203,66 @@ const RELEASED_V3_SESSION_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
     },
 ];
 
+const RELEASED_PRE_FLOOR_SESSION_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "sessions",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "sessions_updated_idx",
+    },
+];
+
+/// Frozen source verifier for schema version 1: the pre-ledger catalog
+/// (blob-only `sessions` table plus its update index, nothing else).
+///
+/// Pre-ledger binaries re-issued this DDL idempotently across releases, so
+/// the stored CREATE text is not release-stable evidence. The physical
+/// shape is verified exactly instead: column names, declared types,
+/// constraints, primary-key positions, and the full index shape.
+fn verify_released_pre_floor_session_schema(conn: &Connection) -> Result<(), String> {
+    meerkat_sqlite::verify_released_schema_structure(
+        conn,
+        &SESSION_STORE_DOMAIN,
+        RELEASED_PRE_FLOOR_SESSION_OBJECTS,
+        build_released_pre_floor_session_schema,
+    )
+}
+
+/// Maintenance-prepare callback for the explicit pre-0.8.10 session bridge.
+///
+/// When the transaction's catalog is exactly the released pre-ledger
+/// plain-CREATE shape ([`verify_released_pre_floor_session_schema`]), the two
+/// legacy objects are rebuilt from the current migration-1 constants (the
+/// post-migration convergence fingerprint compares the stored CREATE text)
+/// and the remaining migration-1 objects are planted, so migrations
+/// 2..=target run over a physical catalog identical to migration 1's output.
+/// Every other catalog - a ledgered predecessor, the exact migration-1
+/// shape, or the current schema - is left untouched.
+pub fn prepare_pre_0_8_10_session_base_schema(
+    tx: &Transaction<'_>,
+) -> Result<meerkat_sqlite::MaintenancePrepareReport, rusqlite::Error> {
+    if verify_released_pre_floor_session_schema(tx).is_err() {
+        return Ok(meerkat_sqlite::MaintenancePrepareReport::default());
+    }
+    tx.execute_batch(
+        "DROP INDEX sessions_updated_idx;
+         ALTER TABLE sessions RENAME TO pre_floor_sessions_import;",
+    )?;
+    migration_0001_session_schema(tx)?;
+    let changed = tx.execute(
+        "INSERT INTO sessions (session_id, created_at_ms, updated_at_ms, message_count,
+             total_tokens, metadata_json, session_json)
+         SELECT session_id, created_at_ms, updated_at_ms, message_count,
+             total_tokens, metadata_json, session_json
+         FROM pre_floor_sessions_import",
+        [],
+    )?;
+    tx.execute_batch("DROP TABLE pre_floor_sessions_import")?;
+    Ok(meerkat_sqlite::MaintenancePrepareReport { changed })
+}
+
 fn verify_released_0_8_10_session_schema(conn: &Connection) -> Result<(), String> {
     meerkat_sqlite::verify_released_schema_fingerprint(
         conn,
@@ -1226,8 +1307,12 @@ pub const SESSION_STORE_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::S
         },
     ],
     initialize_current: initialize_current_session_schema,
-    allowed_existing_versions: &[2, 3, 4],
+    allowed_existing_versions: &[1, 2, 3, 4],
     released_predecessors: &[
+        meerkat_sqlite::SchemaPredecessor {
+            version: 1,
+            verify: verify_released_pre_floor_session_schema,
+        },
         meerkat_sqlite::SchemaPredecessor {
             version: 2,
             verify: verify_released_0_8_10_session_schema,
@@ -1428,6 +1513,143 @@ mod schema_floor_tests {
             .expect("upgrade");
         assert_eq!(report.from_version, 2);
         assert_eq!(report.to_version, 4);
+    }
+
+    /// The exact catalog of a realm created before the schema ledger: the
+    /// two plain-CREATE session objects, nothing else, and no ledger table.
+    const PRE_FLOOR_PLAIN_CREATE_FIXTURE_SQL: &str = "CREATE TABLE sessions (
+         session_id TEXT PRIMARY KEY,
+         created_at_ms INTEGER NOT NULL,
+         updated_at_ms INTEGER NOT NULL,
+         message_count INTEGER NOT NULL,
+         total_tokens INTEGER NOT NULL,
+         metadata_json TEXT NOT NULL,
+         session_json BLOB NOT NULL
+     );
+     CREATE INDEX sessions_updated_idx
+     ON sessions(updated_at_ms DESC, session_id ASC);";
+
+    fn pre_floor_fixture_conn(fixture_sql: &str) -> Connection {
+        let conn = Connection::open_in_memory().expect("open pre-floor fixture");
+        conn.execute_batch(fixture_sql).expect("pre-floor ddl");
+        conn
+    }
+
+    fn released_v2_session_row() -> (String, String, Vec<u8>) {
+        let mut session = Session::new();
+        session.push(Message::User(meerkat_core::UserMessage::text(
+            "pre-floor plain-create fixture",
+        )));
+        let session_id = session.id().to_string();
+        let mut document = serde_json::to_value(&session).expect("session document");
+        document["version"] = serde_json::json!(2);
+        let source = serde_json::to_vec(&document).expect("serialize session document");
+        let _released_session = meerkat_core::import_released_0810_session(&source)
+            .expect("fixture must be an exact released-v2 session document");
+        let metadata = serde_json::to_string(session.metadata()).expect("metadata");
+        (session_id, metadata, source)
+    }
+
+    fn bridge_pre_floor(
+        conn: &mut Connection,
+    ) -> Result<meerkat_sqlite::MaintenanceBridgeReport, meerkat_sqlite::SqliteStoreError> {
+        meerkat_core::with_pre_floor_provider_image_metadata_import(|| {
+            meerkat_sqlite::bridge_unledgered_domain(
+                conn,
+                &SESSION_STORE_DOMAIN,
+                SESSION_STORE_DOMAIN.supported_version(),
+                &[1],
+                Some(prepare_pre_0_8_10_session_base_schema),
+            )
+        })
+    }
+
+    #[test]
+    fn pre_floor_plain_create_catalog_bridges_to_current() {
+        let mut conn = pre_floor_fixture_conn(PRE_FLOOR_PLAIN_CREATE_FIXTURE_SQL);
+        let (session_id, metadata, source) = released_v2_session_row();
+        conn.execute(
+            "INSERT INTO sessions VALUES (?1, 0, 0, 1, 0, ?2, ?3)",
+            params![session_id, metadata, source],
+        )
+        .expect("legacy session row");
+
+        let report = bridge_pre_floor(&mut conn).expect("plain-create pre-floor catalog bridges");
+        assert_eq!(report.from_version, 1);
+        assert_eq!(report.to_version, SESSION_STORE_DOMAIN.supported_version());
+        assert_eq!(report.prepared, 1, "one legacy session row is rebuilt");
+
+        // Usable through the current version chain: ordinary migration
+        // application is a fingerprint-verified no-op and the row survived.
+        let ledger = meerkat_sqlite::apply_domain_migrations(&mut conn, &SESSION_STORE_DOMAIN)
+            .expect("current chain accepts the bridged catalog");
+        assert!(!ledger.migrated());
+        let stored: String = conn
+            .query_row("SELECT session_id FROM sessions", [], |row| row.get(0))
+            .expect("bridged session row");
+        assert_eq!(stored, session_id);
+    }
+
+    #[track_caller]
+    fn assert_pre_floor_refused(fixture_sql: &str) {
+        let mut conn = pre_floor_fixture_conn(fixture_sql);
+        let error = bridge_pre_floor(&mut conn).expect_err("structural deviation must refuse");
+        assert!(
+            matches!(
+                error,
+                meerkat_sqlite::SqliteStoreError::UnledgeredSchemaNoMatch { .. }
+            ),
+            "expected UnledgeredSchemaNoMatch, found {error:?}"
+        );
+    }
+
+    #[test]
+    fn pre_floor_catalog_with_wrong_column_type_stays_refused() {
+        assert_pre_floor_refused(
+            "CREATE TABLE sessions (
+                 session_id TEXT PRIMARY KEY,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 message_count INTEGER NOT NULL,
+                 total_tokens TEXT NOT NULL,
+                 metadata_json TEXT NOT NULL,
+                 session_json BLOB NOT NULL
+             );
+             CREATE INDEX sessions_updated_idx
+             ON sessions(updated_at_ms DESC, session_id ASC);",
+        );
+    }
+
+    #[test]
+    fn pre_floor_catalog_missing_index_stays_refused() {
+        assert_pre_floor_refused(
+            "CREATE TABLE sessions (
+                 session_id TEXT PRIMARY KEY,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 message_count INTEGER NOT NULL,
+                 total_tokens INTEGER NOT NULL,
+                 metadata_json TEXT NOT NULL,
+                 session_json BLOB NOT NULL
+             );",
+        );
+    }
+
+    #[test]
+    fn pre_floor_catalog_with_wrong_index_shape_stays_refused() {
+        assert_pre_floor_refused(
+            "CREATE TABLE sessions (
+                 session_id TEXT PRIMARY KEY,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 message_count INTEGER NOT NULL,
+                 total_tokens INTEGER NOT NULL,
+                 metadata_json TEXT NOT NULL,
+                 session_json BLOB NOT NULL
+             );
+             CREATE INDEX sessions_updated_idx
+             ON sessions(updated_at_ms ASC, session_id ASC);",
+        );
     }
 
     #[test]

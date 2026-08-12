@@ -1098,6 +1098,62 @@ pub fn verify_released_schema_fingerprint(
     released_objects: &[SchemaObject],
     build_released: fn(&Transaction<'_>) -> Result<(), rusqlite::Error>,
 ) -> Result<(), String> {
+    verify_released_schema(
+        actual,
+        domain,
+        released_objects,
+        build_released,
+        ReleasedSchemaComparison::ExactText,
+    )
+}
+
+/// Verify an on-disk predecessor against a frozen released schema builder by
+/// exact physical structure, ignoring the stored CREATE text.
+///
+/// Same authority boundary as [`verify_released_schema_fingerprint`] (private
+/// in-memory builder, exact owned object names/kinds, foreign co-tenant
+/// objects ignored), but the normalized `sqlite_schema` SQL is deliberately
+/// excluded from the comparison. Pre-ledger binaries re-issued their DDL
+/// across releases, so lexical drift the whitespace normalizer keeps (for
+/// example identifier quoting) is not release-stable evidence for those
+/// catalogs.
+/// Everything PRAGMA-visible remains exact: table xinfo (column order, names,
+/// declared types, NOT NULL, defaults, primary-key positions), foreign keys,
+/// and explicit-index uniqueness/partiality plus xinfo (column order,
+/// direction, collation). Text-only clauses such as CHECK constraints are
+/// invisible here; register this verifier only for released schemas that had
+/// none.
+pub fn verify_released_schema_structure(
+    actual: &Connection,
+    domain: &SchemaDomain,
+    released_objects: &[SchemaObject],
+    build_released: fn(&Transaction<'_>) -> Result<(), rusqlite::Error>,
+) -> Result<(), String> {
+    verify_released_schema(
+        actual,
+        domain,
+        released_objects,
+        build_released,
+        ReleasedSchemaComparison::StructureOnly,
+    )
+}
+
+/// How a frozen released catalog is compared against an on-disk one.
+#[derive(Clone, Copy)]
+enum ReleasedSchemaComparison {
+    /// Structure plus the normalized `sqlite_schema` CREATE text.
+    ExactText,
+    /// Structure only; the stored CREATE text is not evidence.
+    StructureOnly,
+}
+
+fn verify_released_schema(
+    actual: &Connection,
+    domain: &SchemaDomain,
+    released_objects: &[SchemaObject],
+    build_released: fn(&Transaction<'_>) -> Result<(), rusqlite::Error>,
+    comparison: ReleasedSchemaComparison,
+) -> Result<(), String> {
     let mut expected = Connection::open_in_memory()
         .map_err(|error| format!("open fingerprint oracle: {error}"))?;
     let tx = expected
@@ -1134,10 +1190,14 @@ pub fn verify_released_schema_fingerprint(
     }
 
     for object in released_objects {
-        let wanted = catalog_fingerprint(&expected, object)
+        let mut wanted = catalog_fingerprint(&expected, object)
             .map_err(|error| format!("fingerprint oracle {}: {error}", object.name))?;
-        let found = catalog_fingerprint(actual, object)
+        let mut found = catalog_fingerprint(actual, object)
             .map_err(|error| format!("fingerprint actual {}: {error}", object.name))?;
+        if matches!(comparison, ReleasedSchemaComparison::StructureOnly) {
+            wanted.normalized_sql = None;
+            found.normalized_sql = None;
+        }
         if found != wanted {
             return Err(format!(
                 "object `{}` differs: expected {wanted:?}, found {found:?}",
@@ -1772,6 +1832,99 @@ mod tests {
 
     fn temp_conn(dir: &tempfile::TempDir) -> Connection {
         open(&dir.path().join("db.sqlite3"), ConnectionProfile::PRIMARY).expect("open")
+    }
+
+    #[test]
+    fn structure_verifier_ignores_create_text_but_rejects_shape_drift() {
+        const STRUCTURE_OBJECTS: &[SchemaObject] = &[
+            SchemaObject {
+                kind: SchemaObjectKind::Table,
+                name: "t1",
+            },
+            SchemaObject {
+                kind: SchemaObjectKind::Index,
+                name: "t1_idx",
+            },
+        ];
+        fn build_frozen(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS t1 (x INTEGER NOT NULL);
+                 CREATE INDEX IF NOT EXISTS t1_idx ON t1(x DESC);",
+            )
+        }
+        const STRUCTURE_DOMAIN: SchemaDomain = SchemaDomain {
+            name: "structure-domain",
+            migrations: &[Migration {
+                version: 1,
+                name: "base",
+                apply: build_frozen,
+            }],
+            initialize_current: build_frozen,
+            allowed_existing_versions: &[1],
+            released_predecessors: &[],
+            owned_objects: STRUCTURE_OBJECTS,
+            retired_objects: &[],
+        };
+        let make = |ddl: &str| {
+            let conn = Connection::open_in_memory().expect("in-memory fixture");
+            conn.execute_batch(ddl).expect("fixture ddl");
+            conn
+        };
+
+        // Identifier quoting survives in the stored CREATE text (unlike the
+        // IF NOT EXISTS clause, which SQLite strips before storing), so this
+        // catalog is lexically distinct but structurally identical.
+        let quoted = make(
+            "CREATE TABLE \"t1\" (x INTEGER NOT NULL);
+             CREATE INDEX t1_idx ON t1(x DESC);",
+        );
+        verify_released_schema_structure(
+            &quoted,
+            &STRUCTURE_DOMAIN,
+            STRUCTURE_OBJECTS,
+            build_frozen,
+        )
+        .expect("CREATE-text drift alone must pass the structural verifier");
+        verify_released_schema_fingerprint(
+            &quoted,
+            &STRUCTURE_DOMAIN,
+            STRUCTURE_OBJECTS,
+            build_frozen,
+        )
+        .expect_err("the exact-text verifier must still reject the same catalog");
+
+        let wrong_type = make(
+            "CREATE TABLE t1 (x TEXT NOT NULL);
+             CREATE INDEX t1_idx ON t1(x DESC);",
+        );
+        verify_released_schema_structure(
+            &wrong_type,
+            &STRUCTURE_DOMAIN,
+            STRUCTURE_OBJECTS,
+            build_frozen,
+        )
+        .expect_err("column type drift must fail structurally");
+
+        let wrong_index = make(
+            "CREATE TABLE t1 (x INTEGER NOT NULL);
+             CREATE INDEX t1_idx ON t1(x ASC);",
+        );
+        verify_released_schema_structure(
+            &wrong_index,
+            &STRUCTURE_DOMAIN,
+            STRUCTURE_OBJECTS,
+            build_frozen,
+        )
+        .expect_err("index direction drift must fail structurally");
+
+        let missing_index = make("CREATE TABLE t1 (x INTEGER NOT NULL);");
+        verify_released_schema_structure(
+            &missing_index,
+            &STRUCTURE_DOMAIN,
+            STRUCTURE_OBJECTS,
+            build_frozen,
+        )
+        .expect_err("a missing owned index must fail the object-set check");
     }
 
     #[test]
