@@ -56,21 +56,12 @@ type TurnEventTx = tokio::sync::mpsc::Sender<meerkat_core::EventEnvelope<meerkat
 
 #[cfg(not(target_arch = "wasm32"))]
 type ArchiveDisposalFuture<'a> = std::pin::Pin<
-    Box<
-        dyn std::future::Future<
-                Output = Result<crate::machines::mob_machine::MemberSessionDisposal, SessionError>,
-            > + Send
-            + 'a,
-    >,
+    Box<dyn std::future::Future<Output = Result<ArchiveDisposalOutcome, SessionError>> + Send + 'a>,
 >;
 
 #[cfg(target_arch = "wasm32")]
 type ArchiveDisposalFuture<'a> = std::pin::Pin<
-    Box<
-        dyn std::future::Future<
-                Output = Result<crate::machines::mob_machine::MemberSessionDisposal, SessionError>,
-            > + 'a,
-    >,
+    Box<dyn std::future::Future<Output = Result<ArchiveDisposalOutcome, SessionError>> + 'a>,
 >;
 
 #[cfg(feature = "runtime-adapter")]
@@ -753,6 +744,7 @@ pub(crate) struct PlacedTurnDeliveryContext {
     /// (if still present) resolves only after durable machine convergence and
     /// before ACK eligibility.
     pub outcome_tracking: Option<super::bridge_protocol::BridgeOutcomeTracking>,
+    pub bounded_result_spec: Option<super::bridge_protocol::BridgeBoundedResultSpec>,
 }
 
 /// Exact attachment-local authority carried from a successful resume until
@@ -1258,12 +1250,86 @@ fn stamp_eager_session_owned_initial_turn_metadata(req: &mut CreateSessionReques
 pub enum MemberSessionDisposalVerdict {
     /// Fresh durable archive through the mob lifecycle authority.
     Archived,
+    /// Fresh durable archive whose reload-recovered MobOps operation was
+    /// terminalized before the successor registry was unregistered.
+    ArchivedWithRecoveredOpsRetired,
     /// The archive authority already holds the terminal (or never had a
     /// record and no live runtime remained) — idempotent success.
     AlreadyArchived,
     /// The session's durable record belongs to another host; only the
     /// runtime session and its binding were released.
     RuntimeReleasedOnlyHostOwned,
+}
+
+#[cfg(feature = "runtime-adapter")]
+struct ArchiveDisposalOutcome {
+    disposal: crate::machines::mob_machine::MemberSessionDisposal,
+    recovered_ops_retired: bool,
+}
+
+#[cfg(feature = "runtime-adapter")]
+struct RecoveredSessionOpsRebind {
+    session_id: SessionId,
+    machine: Arc<MeerkatMachine>,
+    ops_adapter: Arc<super::ops_adapter::MobOpsAdapter>,
+    successor: RuntimeSessionRegistrationWitness,
+    binding: super::ops_adapter::ReloadRequiredSessionOpsBindingWitness,
+    registry: Arc<meerkat_runtime::RuntimeOpsLifecycleRegistry>,
+    retired: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "runtime-adapter")]
+struct QuiescentRuntimeTurnFinalizationBoundary {
+    boundary: RuntimeTurnFinalizationBoundaryLease,
+    recovered_ops_rebind: Option<Arc<RecoveredSessionOpsRebind>>,
+}
+
+#[cfg(test)]
+fn recovered_ops_after_hook_test_gates()
+-> &'static std::sync::Mutex<HashMap<SessionId, (oneshot::Sender<()>, oneshot::Receiver<()>)>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<SessionId, (oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[async_trait::async_trait]
+impl meerkat_runtime::MachineSessionArchivePostCommitHook for RecoveredSessionOpsRebind {
+    async fn after_runtime_retire_commit(
+        &self,
+    ) -> Result<(), meerkat_runtime::RuntimeControlPlaneError> {
+        let current_registry = self
+            .machine
+            .ops_lifecycle_registry_if_current_registration(&self.successor)
+            .await
+            .ok_or_else(|| {
+                meerkat_runtime::RuntimeControlPlaneError::Internal(format!(
+                    "recovered operation handoff for {} changed before terminalization",
+                    self.session_id
+                ))
+            })?;
+        if !Arc::ptr_eq(&current_registry, &self.registry) {
+            return Err(meerkat_runtime::RuntimeControlPlaneError::Internal(
+                format!(
+                    "recovered operation registry for {} changed before terminalization",
+                    self.session_id
+                ),
+            ));
+        }
+        self.ops_adapter
+            .mark_recovered_session_binding_retired_exact(
+                &self.session_id,
+                &self.binding,
+                &(Arc::clone(&self.registry) as Arc<dyn OpsLifecycleRegistry>),
+            )
+            .map_err(|error| {
+                meerkat_runtime::RuntimeControlPlaneError::Internal(error.to_string())
+            })?;
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
 }
 
 /// The reusable quiesce → ownership-discriminated archive → runtime
@@ -1278,6 +1344,10 @@ pub enum MemberSessionDisposalVerdict {
 pub struct MemberSessionDisposalArc {
     session_service: Arc<dyn MobSessionService>,
     runtime_adapter: Option<Arc<MeerkatMachine>>,
+    /// Present for the in-process SessionBackend, whose session-operation
+    /// binding must follow a recovered cold registration. Host materializers
+    /// do not own this adapter-local binding map.
+    ops_adapter: Option<Arc<super::ops_adapter::MobOpsAdapter>>,
     /// Capability index for runtime bridge sidecars (never lifecycle truth).
     /// `SessionBackend` shares its own map; the host materializer shares its
     /// executor-residency sidecar map (ADJ-23) so disposal clears the same
@@ -1327,6 +1397,36 @@ enum RuntimeSessionDisposalTarget {
 
 #[cfg(feature = "runtime-adapter")]
 impl MemberSessionDisposalArc {
+    #[cfg(test)]
+    fn arm_recovered_ops_after_hook_test_gate(
+        &self,
+        session_id: SessionId,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let replaced = recovered_ops_after_hook_test_gates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id, (entered_tx, release_rx));
+        assert!(
+            replaced.is_none(),
+            "recovered-ops hook test gate already armed"
+        );
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    async fn run_recovered_ops_after_hook_test_gate(&self, session_id: &SessionId) {
+        let gate = recovered_ops_after_hook_test_gates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        if let Some((entered_tx, release_rx)) = gate {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+        }
+    }
+
     pub fn new(
         session_service: Arc<dyn MobSessionService>,
         runtime_adapter: Option<Arc<MeerkatMachine>>,
@@ -1334,6 +1434,7 @@ impl MemberSessionDisposalArc {
         Self {
             session_service,
             runtime_adapter,
+            ops_adapter: None,
             runtime_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -1346,6 +1447,21 @@ impl MemberSessionDisposalArc {
         Self {
             session_service,
             runtime_adapter,
+            ops_adapter: None,
+            runtime_sessions,
+        }
+    }
+
+    fn with_runtime_sessions_and_ops_adapter(
+        session_service: Arc<dyn MobSessionService>,
+        runtime_adapter: Option<Arc<MeerkatMachine>>,
+        runtime_sessions: Arc<RwLock<HashMap<SessionId, Arc<RuntimeSessionState>>>>,
+        ops_adapter: Arc<super::ops_adapter::MobOpsAdapter>,
+    ) -> Self {
+        Self {
+            session_service,
+            runtime_adapter,
+            ops_adapter: Some(ops_adapter),
             runtime_sessions,
         }
     }
@@ -1373,18 +1489,27 @@ impl MemberSessionDisposalArc {
             .archive_with_authority_then_unregister_until(session_id, deadline)
             .await
         {
-            Ok(crate::machines::mob_machine::MemberSessionDisposal::Archived) => {
-                Ok(MemberSessionDisposalVerdict::Archived)
+            Ok(ArchiveDisposalOutcome {
+                disposal: crate::machines::mob_machine::MemberSessionDisposal::Archived,
+                recovered_ops_retired,
+            }) => {
+                Ok(if recovered_ops_retired {
+                    MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired
+                } else {
+                    MemberSessionDisposalVerdict::Archived
+                })
             }
-            Ok(
-                crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned,
-            ) => Ok(MemberSessionDisposalVerdict::RuntimeReleasedOnlyHostOwned),
+            Ok(ArchiveDisposalOutcome {
+                disposal: crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned,
+                ..
+            }) => Ok(MemberSessionDisposalVerdict::RuntimeReleasedOnlyHostOwned),
             // The archive walk never reports the non-persistent-backend
             // disposal (that is `release_runtime_only`'s arm); reaching it
             // here is an invariant fault, surfaced typed.
-            Ok(
-                crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyNoDurableSessions,
-            ) => Err(Self::runtime_archive_error(format!(
+            Ok(ArchiveDisposalOutcome {
+                disposal: crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyNoDurableSessions,
+                ..
+            }) => Err(Self::runtime_archive_error(format!(
                 "member session disposal for {session_id} reported a non-persistent-backend \
                  verdict from the durable archive walk"
             ))),
@@ -1406,9 +1531,15 @@ impl MemberSessionDisposalArc {
         session_id: &SessionId,
         deadline: Instant,
     ) -> Result<(), SessionError> {
-        let boundary = self
+        let quiescent = self
             .acquire_quiescent_runtime_turn_finalization_boundary(session_id, deadline)
             .await?;
+        if quiescent.recovered_ops_rebind.is_some() {
+            return Err(Self::runtime_archive_error(format!(
+                "runtime-only release for {session_id} cannot consume a durable reload-recovery operation handoff"
+            )));
+        }
+        let boundary = quiescent.boundary;
         let remaining =
             Self::retirement_remaining(session_id, deadline, "runtime_binding_unregister")?;
         let cleanup_spawner = meerkat_runtime::RuntimeCleanupTaskSpawner::acquire()
@@ -2012,26 +2143,211 @@ impl MemberSessionDisposalArc {
         }
     }
 
+    /// Map the typed binding capture to the optional recovery witness that
+    /// retirement flows may rebind. Never-bound and operation-free bindings
+    /// carry no recovered operation identity, so retirement proceeds through
+    /// normal archive disposal. This never masks a dropped recovered
+    /// operation: an intentionally retired recovered binding stays observable
+    /// as a terminal-operation receipt until its successor registration is
+    /// unregistered, so retry always recaptures it as `Witnessed`.
+    fn recoverable_ops_binding_witness(
+        ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
+        session_id: &SessionId,
+    ) -> Result<Option<super::ops_adapter::ReloadRequiredSessionOpsBindingWitness>, SessionError>
+    {
+        let Some(ops_adapter) = ops_adapter else {
+            return Ok(None);
+        };
+        match ops_adapter
+            .capture_reload_required_session_binding_witness(session_id)
+            .map_err(|error| Self::runtime_archive_error(error.to_string()))?
+        {
+            super::ops_adapter::ReloadRequiredSessionBindingCapture::Witnessed(witness) => {
+                Ok(Some(witness))
+            }
+            super::ops_adapter::ReloadRequiredSessionBindingCapture::NeverBound
+            | super::ops_adapter::ReloadRequiredSessionBindingCapture::OperationFree => Ok(None),
+        }
+    }
+
     async fn acquire_quiescent_runtime_turn_finalization_boundary(
         &self,
         session_id: &SessionId,
         deadline: Instant,
-    ) -> Result<RuntimeTurnFinalizationBoundaryLease, SessionError> {
+    ) -> Result<QuiescentRuntimeTurnFinalizationBoundary, SessionError> {
         loop {
-            self.cancel_active_runtime_turn_before_retire_until(session_id, deadline)
-                .await?;
+            let mut recovered_cold_successor = None;
+            if let Some(adapter) = &self.runtime_adapter
+                && let Some(registration) = adapter
+                    .current_session_registration_witness(session_id)
+                    .await
+            {
+                if adapter
+                    .registration_is_current_without_runtime_owner(&registration)
+                    .await
+                {
+                    let existing_ops_binding = Self::recoverable_ops_binding_witness(
+                        self.ops_adapter.as_ref(),
+                        session_id,
+                    )?;
+                    recovered_cold_successor = Some((registration, existing_ops_binding));
+                } else {
+                    let prior_ops_binding = Self::recoverable_ops_binding_witness(
+                        self.ops_adapter.as_ref(),
+                        session_id,
+                    )?;
+                    let remaining = Self::retirement_remaining(
+                        session_id,
+                        deadline,
+                        "durability_reload_discard",
+                    )?;
+                    let disposition = tokio::time::timeout(
+                        remaining,
+                        adapter.recover_or_discard_reload_required_registration_with_operation_if_current(
+                            &registration,
+                            prior_ops_binding
+                                .as_ref()
+                                .map(|witness| witness.retention_request()),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        Self::runtime_retirement_in_progress(
+                            session_id,
+                            "durability_reload_discard",
+                        )
+                    })?
+                    .map_err(|error| {
+                        Self::runtime_archive_error(format!(
+                            "durability-reload disposal failed for {session_id}: {error}"
+                        ))
+                    })?;
+                    if matches!(
+                        disposition,
+                        meerkat_runtime::ReloadRequiredRegistrationDisposition::Discarded
+                    ) {
+                        recovered_cold_successor = Some((
+                            adapter
+                                .current_session_registration_witness(session_id)
+                                .await
+                                .ok_or_else(|| {
+                                    Self::runtime_archive_error(format!(
+                                        "durability-reload cold successor registration for {session_id} published no exact registration witness"
+                                    ))
+                                })?,
+                            prior_ops_binding,
+                        ));
+                    }
+                }
+            }
+            if recovered_cold_successor.is_none() {
+                self.cancel_active_runtime_turn_before_retire_until(session_id, deadline)
+                    .await?;
+            }
             let boundary = self
                 .acquire_runtime_turn_finalization_boundary_until(session_id, deadline)
                 .await?;
             let Some(adapter) = &self.runtime_adapter else {
-                return Ok(boundary);
+                return Ok(QuiescentRuntimeTurnFinalizationBoundary {
+                    boundary,
+                    recovered_ops_rebind: None,
+                });
             };
+            if let Some((expected_successor, prior_ops_binding)) = recovered_cold_successor.as_ref()
+            {
+                if let Some(prior_ops_binding) = prior_ops_binding {
+                    let successor_registry = adapter
+                        .ops_lifecycle_registry_if_current_registration(expected_successor)
+                        .await
+                        .ok_or_else(|| {
+                            Self::runtime_archive_error(format!(
+                                "durability-reload cold successor registration for {session_id} changed before its operation registry could be rebound"
+                            ))
+                        })?;
+                    let successor_registry_dyn: Arc<dyn OpsLifecycleRegistry> =
+                        successor_registry.clone();
+                    let prepared_ops_rebind = self
+                        .ops_adapter
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Self::runtime_archive_error(format!(
+                                "durability-reload runtime for {session_id} lost its MobOps binding owner"
+                            ))
+                        })?
+                        .prepare_session_registry_rebind_after_reload_discard(
+                            session_id,
+                            prior_ops_binding,
+                            successor_registry_dyn,
+                        )
+                        .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
+                    if adapter
+                        .current_session_registration_witness(session_id)
+                        .await
+                        .as_ref()
+                        != Some(expected_successor)
+                    {
+                        return Err(Self::runtime_archive_error(format!(
+                            "durability-reload cold successor registration for {session_id} changed during operation-registry rebinding"
+                        )));
+                    }
+                    prepared_ops_rebind.commit();
+                    let exact_successor_has_no_runtime_owner = adapter
+                        .registration_is_current_without_runtime_owner(expected_successor)
+                        .await;
+                    if exact_successor_has_no_runtime_owner {
+                        return Ok(QuiescentRuntimeTurnFinalizationBoundary {
+                            boundary,
+                            recovered_ops_rebind: Some(Arc::new(RecoveredSessionOpsRebind {
+                                session_id: session_id.clone(),
+                                machine: Arc::clone(adapter),
+                                ops_adapter: Arc::clone(self.ops_adapter.as_ref().ok_or_else(|| {
+                                    Self::runtime_archive_error(format!(
+                                        "durability-reload runtime for {session_id} lost its MobOps owner"
+                                    ))
+                                })?),
+                                successor: expected_successor.clone(),
+                                binding: prior_ops_binding.clone(),
+                                registry: successor_registry,
+                                retired: std::sync::atomic::AtomicBool::new(false),
+                            })),
+                        });
+                    }
+                    drop(boundary);
+                    continue;
+                }
+                let exact_successor_has_no_runtime_owner = adapter
+                    .registration_is_current_without_runtime_owner(expected_successor)
+                    .await;
+                if exact_successor_has_no_runtime_owner {
+                    // The exact degraded actor, loop, and sidecar were already
+                    // disposed before this cold registration. Its recovered run
+                    // binding is durable diagnostic authority, not a live owner
+                    // that can acknowledge cancel. B now fences session-service
+                    // replacement, so normal retirement may publish Retired and
+                    // archive without routing through an impossible attachment
+                    // callback.
+                    return Ok(QuiescentRuntimeTurnFinalizationBoundary {
+                        boundary,
+                        recovered_ops_rebind: None,
+                    });
+                }
+
+                // A replacement registration or attachment raced the cold
+                // successor before B was acquired. Do not transfer the
+                // no-owner exemption to that incarnation. Release B and retry
+                // through the ordinary active-run cancellation path.
+                drop(boundary);
+                continue;
+            }
             let active_run = adapter
                 .meerkat_machine_archive_snapshot(session_id)
                 .await
                 .is_some_and(|snapshot| Self::runtime_run_bound(&snapshot));
             if !active_run {
-                return Ok(boundary);
+                return Ok(QuiescentRuntimeTurnFinalizationBoundary {
+                    boundary,
+                    recovered_ops_rebind: None,
+                });
             }
 
             // A queued retire-drain run may bind after the pre-boundary
@@ -2066,6 +2382,7 @@ impl MemberSessionDisposalArc {
     ) -> Result<(), SessionError> {
         Self::cancel_active_runtime_turn_before_retire_with_adapter_until(
             self.runtime_adapter.as_ref(),
+            self.ops_adapter.as_ref(),
             session_id,
             deadline,
         )
@@ -2074,10 +2391,12 @@ impl MemberSessionDisposalArc {
 
     pub(super) async fn cancel_active_runtime_turn_before_retire_with_adapter(
         runtime_adapter: Option<&Arc<MeerkatMachine>>,
+        ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
         session_id: &SessionId,
     ) -> Result<(), SessionError> {
         Self::cancel_active_runtime_turn_before_retire_with_adapter_until(
             runtime_adapter,
+            ops_adapter,
             session_id,
             Instant::now() + MEMBER_RETIRE_TOTAL_TIMEOUT,
         )
@@ -2086,12 +2405,69 @@ impl MemberSessionDisposalArc {
 
     pub(super) async fn cancel_active_runtime_turn_before_retire_with_adapter_until(
         runtime_adapter: Option<&Arc<MeerkatMachine>>,
+        ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
         session_id: &SessionId,
         deadline: Instant,
     ) -> Result<(), SessionError> {
         let Some(adapter) = runtime_adapter else {
             return Ok(());
         };
+        if let Some(registration) = adapter
+            .current_session_registration_witness(session_id)
+            .await
+        {
+            if adapter
+                .registration_is_current_without_runtime_owner(&registration)
+                .await
+            {
+                return Ok(());
+            }
+            // A reload-required discard atomically replaces the registration
+            // with a cold successor. The exact bound operation identity must
+            // ride that replacement as a durable retention request so the
+            // later finalization-boundary rebind finds it in the successor
+            // registry instead of failing closed on a stripped operation.
+            let prior_ops_binding = Self::recoverable_ops_binding_witness(ops_adapter, session_id)?;
+            let remaining =
+                Self::retirement_remaining(session_id, deadline, "durability_reload_discard")?;
+            let disposition = tokio::time::timeout(
+                remaining,
+                adapter.recover_or_discard_reload_required_registration_with_operation_if_current(
+                    &registration,
+                    prior_ops_binding
+                        .as_ref()
+                        .map(|witness| witness.retention_request()),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                Self::runtime_retirement_in_progress(session_id, "durability_reload_discard")
+            })?
+            .map_err(|error| {
+                Self::runtime_archive_error(format!(
+                    "durability-reload disposal failed for {session_id}: {error}"
+                ))
+            })?;
+            if matches!(
+                disposition,
+                meerkat_runtime::ReloadRequiredRegistrationDisposition::Discarded
+            ) {
+                let successor = adapter
+                    .current_session_registration_witness(session_id)
+                    .await
+                    .ok_or_else(|| {
+                        Self::runtime_archive_error(format!(
+                            "durability-reload replacement for {session_id} published no exact successor witness"
+                        ))
+                    })?;
+                if adapter
+                    .registration_is_current_without_runtime_owner(&successor)
+                    .await
+                {
+                    return Ok(());
+                }
+            }
+        }
         let cleanup_spawner = meerkat_runtime::RuntimeCleanupTaskSpawner::acquire()
             .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
         // Cooperative grace: a boundary cancel ends well-behaved turns; a
@@ -2434,9 +2810,11 @@ impl MemberSessionDisposalArc {
         deadline: Instant,
     ) -> ArchiveDisposalFuture<'a> {
         Box::pin(async move {
-            let boundary = self
+            let quiescent = self
                 .acquire_quiescent_runtime_turn_finalization_boundary(session_id, deadline)
                 .await?;
+            let boundary = quiescent.boundary;
+            let recovered_ops_rebind = quiescent.recovered_ops_rebind;
             let remaining =
                 Self::retirement_remaining(session_id, deadline, "session_archive_and_unregister")?;
             let cleanup_spawner = meerkat_runtime::RuntimeCleanupTaskSpawner::acquire()
@@ -2450,6 +2828,7 @@ impl MemberSessionDisposalArc {
                         &task_session_id,
                         deadline,
                         boundary,
+                        recovered_ops_rebind,
                     ),
                 )
                 .catch_unwind()
@@ -2482,6 +2861,7 @@ impl MemberSessionDisposalArc {
         session_id: &'a SessionId,
         deadline: Instant,
         boundary: RuntimeTurnFinalizationBoundaryLease,
+        recovered_ops_rebind: Option<Arc<RecoveredSessionOpsRebind>>,
     ) -> ArchiveDisposalFuture<'a> {
         Box::pin(async move {
             tracing::info!(
@@ -2519,6 +2899,11 @@ impl MemberSessionDisposalArc {
                 && let Some(adapter) = &self.runtime_adapter
                 && adapter.contains_session(session_id).await
             {
+                if recovered_ops_rebind.is_some() {
+                    return Err(Self::runtime_archive_error(format!(
+                        "durability-reload operation handoff for {session_id} cannot be downgraded to host-owned disposal"
+                    )));
+                }
                 tracing::info!(
                     session_id = %session_id,
                     "mob archive authority does not own this session's durable record; completing host-owned disposal (runtime retire + binding release)"
@@ -2528,9 +2913,10 @@ impl MemberSessionDisposalArc {
                     .await?;
                 self.unregister_runtime_session_binding(session_id, &expected_state, boundary)
                     .await?;
-                return Ok(
-                    crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned,
-                );
+                return Ok(ArchiveDisposalOutcome {
+                    disposal: crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned,
+                    recovered_ops_retired: false,
+                });
             }
 
             tracing::info!(
@@ -2543,25 +2929,67 @@ impl MemberSessionDisposalArc {
             // protocol, but do not pre-retire the owned session here: doing so
             // destroys the very snapshot that protocol must archive and lets
             // an in-flight RunCompleted race a Retired machine.
-            match self
-                .session_service
-                .archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
-                    session_id, deadline,
-                )
-                .await
-            {
+            // Only a recovered operation handoff rides the hook-bearing
+            // archive lane; ordinary retirement keeps the plain boundary
+            // protocol, whose retry classification already tolerates a
+            // Draining/retired retry anchor left by failed cleanup.
+            let archive_result = match recovered_ops_rebind.as_ref() {
+                Some(hook) => {
+                    let post_commit_hook = Arc::clone(hook)
+                        as Arc<dyn meerkat_runtime::MachineSessionArchivePostCommitHook>;
+                    self.session_service
+                        .archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_and_hook_before(
+                            session_id,
+                            deadline,
+                            Some(post_commit_hook),
+                        )
+                        .await
+                }
+                None => {
+                    self.session_service
+                        .archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+                            session_id, deadline,
+                        )
+                        .await
+                }
+            };
+            match archive_result {
                 Ok(()) => {
+                    let recovered_ops_retired = recovered_ops_rebind.as_ref().is_some_and(|hook| {
+                        hook.retired.load(std::sync::atomic::Ordering::Acquire)
+                    });
+                    if recovered_ops_rebind.is_some() && !recovered_ops_retired {
+                        return Err(Self::runtime_archive_error(format!(
+                            "archive for {session_id} skipped its recovered operation pre-retire hook"
+                        )));
+                    }
+                    #[cfg(test)]
+                    self.run_recovered_ops_after_hook_test_gate(session_id)
+                        .await;
                     tracing::info!(
                         session_id = %session_id,
                         "SessionBackend::archive_with_authority_then_unregister unregistering runtime binding"
                     );
                     self.unregister_runtime_session_binding(session_id, &expected_state, boundary)
                         .await?;
+                    if let Some(receipt) = recovered_ops_rebind.as_ref() {
+                        receipt
+                            .ops_adapter
+                            .clear_recovered_session_binding_retired_receipt_exact(
+                                session_id,
+                                &receipt.binding,
+                                &(Arc::clone(&receipt.registry) as Arc<dyn OpsLifecycleRegistry>),
+                            )
+                            .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
+                    }
                     tracing::info!(
                         session_id = %session_id,
                         "SessionBackend::archive_with_authority_then_unregister complete"
                     );
-                    Ok(crate::machines::mob_machine::MemberSessionDisposal::Archived)
+                    Ok(ArchiveDisposalOutcome {
+                        disposal: crate::machines::mob_machine::MemberSessionDisposal::Archived,
+                        recovered_ops_retired,
+                    })
                 }
                 Err(SessionError::NotFound { id }) => {
                     if let Some(adapter) = &self.runtime_adapter
@@ -2606,6 +3034,19 @@ impl MemberSessionDisposalArc {
                                 boundary,
                             )
                             .await?;
+                            if let Some(receipt) = recovered_ops_rebind.as_ref() {
+                                receipt
+                                    .ops_adapter
+                                    .clear_recovered_session_binding_retired_receipt_exact(
+                                        session_id,
+                                        &receipt.binding,
+                                        &(Arc::clone(&receipt.registry)
+                                            as Arc<dyn OpsLifecycleRegistry>),
+                                    )
+                                    .map_err(|error| {
+                                        Self::runtime_archive_error(error.to_string())
+                                    })?;
+                            }
                             if archive_authority_owned {
                                 // Owned AlreadyArchived is represented by the
                                 // service's public NotFound contract. Preserve
@@ -2618,9 +3059,10 @@ impl MemberSessionDisposalArc {
                             // NotFound'd): the durable session belongs to its
                             // host — the same host-owned disposal fact as the
                             // pre-archive ownership-probe arm above.
-                            return Ok(
-                                crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned,
-                            );
+                            return Ok(ArchiveDisposalOutcome {
+                                disposal: crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned,
+                                recovered_ops_retired: false,
+                            });
                         }
                         return Err(SessionError::Agent(
                             meerkat_core::error::AgentError::InternalError(format!(
@@ -2630,6 +3072,16 @@ impl MemberSessionDisposalArc {
                     }
                     self.unregister_runtime_session_binding(session_id, &expected_state, boundary)
                         .await?;
+                    if let Some(receipt) = recovered_ops_rebind.as_ref() {
+                        receipt
+                            .ops_adapter
+                            .clear_recovered_session_binding_retired_receipt_exact(
+                                session_id,
+                                &receipt.binding,
+                                &(Arc::clone(&receipt.registry) as Arc<dyn OpsLifecycleRegistry>),
+                            )
+                            .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
+                    }
                     if archive_authority_owned {
                         // Preserve the owned authority's public NotFound
                         // contract. `dispose` maps it to the idempotent
@@ -2642,9 +3094,10 @@ impl MemberSessionDisposalArc {
                         // runtime-only verdict instead of laundering the retry
                         // into AlreadyArchived merely because cleanup already
                         // removed the adapter binding.
-                        Ok(
-                            crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned,
-                        )
+                        Ok(ArchiveDisposalOutcome {
+                            disposal: crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned,
+                            recovered_ops_retired: false,
+                        })
                     }
                 }
                 Err(error) => Err(error),
@@ -3080,20 +3533,80 @@ impl SessionBackend {
         workgraph_service: Option<meerkat::WorkGraphService>,
     ) -> Self {
         let runtime_sessions = Arc::new(RwLock::new(HashMap::new()));
-        let disposal = MemberSessionDisposalArc::with_runtime_sessions(
+        let ops_adapter = Arc::new(super::ops_adapter::MobOpsAdapter::new());
+        let disposal = MemberSessionDisposalArc::with_runtime_sessions_and_ops_adapter(
             Arc::clone(&session_service),
             runtime_adapter.clone(),
             Arc::clone(&runtime_sessions),
+            Arc::clone(&ops_adapter),
         );
         Self {
             session_service,
             runtime_adapter,
             workgraph_service,
-            ops_adapter: Arc::new(super::ops_adapter::MobOpsAdapter::new()),
+            ops_adapter,
             runtime_sessions,
             explicit_resume_retirements: Arc::new(StdMutex::new(HashMap::new())),
             disposal,
         }
+    }
+
+    /// Share the session-operation binding authority with the actor's
+    /// pre-retire runtime quiesce path. Capability plumbing only, never
+    /// lifecycle truth.
+    pub(super) fn session_ops_adapter(&self) -> Arc<super::ops_adapter::MobOpsAdapter> {
+        Arc::clone(&self.ops_adapter)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn dispose_inline_for_recovery_test(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        let deadline = Instant::now() + MEMBER_RETIRE_TOTAL_TIMEOUT;
+        let quiescent = self
+            .disposal
+            .acquire_quiescent_runtime_turn_finalization_boundary(session_id, deadline)
+            .await?;
+        self.disposal
+            .archive_with_authority_then_unregister_under_boundary(
+                session_id,
+                deadline,
+                quiescent.boundary,
+                quiescent.recovered_ops_rebind,
+            )
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(super) fn arm_recovered_ops_after_hook_test_gate(
+        &self,
+        session_id: SessionId,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        self.disposal
+            .arm_recovered_ops_after_hook_test_gate(session_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn ops_binding_present_for_test(&self, session_id: &SessionId) -> bool {
+        self.ops_adapter.has_session_binding_for_test(session_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn ops_binding_registry_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<Arc<dyn OpsLifecycleRegistry>> {
+        self.ops_adapter.binding_registry_for_test(session_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn ops_binding_operation_id_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<meerkat_core::ops_lifecycle::OperationId> {
+        self.ops_adapter.reload_operation_id_for_test(session_id)
     }
 
     fn require_session(
@@ -7055,6 +7568,19 @@ impl MobPreparedSessionActorCleanupHandle {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl CoreExecutorPostStopCleanupHandle for MobPreparedSessionActorCleanupHandle {
+    fn durability_reload_cleanup_capability(
+        &self,
+    ) -> meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability {
+        meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability::ProcessLocalNonTerminal
+    }
+
+    async fn prepare_durability_reload_cleanup(&self) -> Result<(), CoreExecutorError> {
+        // Degraded cleanup for a prepared materialization is deliberately a
+        // no-op (the machine has already fenced it), so there is no
+        // service-local identity to bind before publication.
+        Ok(())
+    }
+
     async fn cleanup_after_runtime_stop_terminalized(&self) -> Result<(), CoreExecutorError> {
         self.cleanup(false).await
     }
@@ -7063,6 +7589,15 @@ impl CoreExecutorPostStopCleanupHandle for MobPreparedSessionActorCleanupHandle 
         &self,
     ) -> Result<(), CoreExecutorError> {
         self.cleanup(true).await
+    }
+
+    async fn cleanup_after_durability_reload_required(&self) -> Result<(), CoreExecutorError> {
+        // The actor that owns retirement may itself be awaiting this machine
+        // coordinator. Degraded cleanup therefore cannot acquire B or
+        // synchronously discard that actor. The machine has already fenced
+        // the prepared materialization; the actor's normal retirement path
+        // owns its subsequent lifecycle cleanup.
+        Ok(())
     }
 }
 
@@ -7106,7 +7641,11 @@ impl MobSessionRuntimePostStopCleanupHandle {
         }
     }
 
-    async fn cleanup(&self, under_turn_boundary: bool) -> Result<(), CoreExecutorError> {
+    async fn cleanup(
+        &self,
+        under_turn_boundary: bool,
+        mark_terminalized: bool,
+    ) -> Result<(), CoreExecutorError> {
         let _turn_finalization_guard = if under_turn_boundary {
             None
         } else {
@@ -7150,7 +7689,9 @@ impl MobSessionRuntimePostStopCleanupHandle {
         }
         drop(runtime_sessions);
         self.state.clear_queued_turns().await;
-        self.state.mark_retired();
+        if mark_terminalized {
+            self.state.mark_retired();
+        }
         Ok(())
     }
 }
@@ -7159,14 +7700,47 @@ impl MobSessionRuntimePostStopCleanupHandle {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl CoreExecutorPostStopCleanupHandle for MobSessionRuntimePostStopCleanupHandle {
+    fn durability_reload_cleanup_capability(
+        &self,
+    ) -> meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability {
+        meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability::ProcessLocalNonTerminal
+    }
+
+    async fn prepare_durability_reload_cleanup(&self) -> Result<(), CoreExecutorError> {
+        // Degraded cleanup retires only this attachment's process-local
+        // sidecar custody through state the handle already owns; no
+        // service-local identity needs binding before publication.
+        Ok(())
+    }
+
     async fn cleanup_after_runtime_stop_terminalized(&self) -> Result<(), CoreExecutorError> {
-        self.cleanup(false).await
+        self.cleanup(false, true).await
     }
 
     async fn cleanup_after_runtime_stop_terminalized_under_turn_finalization_boundary(
         &self,
     ) -> Result<(), CoreExecutorError> {
-        self.cleanup(true).await
+        self.cleanup(true, true).await
+    }
+
+    async fn cleanup_after_durability_reload_required(&self) -> Result<(), CoreExecutorError> {
+        // Degraded runtime disposal is process-shell cleanup, not actor
+        // retirement. The retirement actor may be the caller awaiting this
+        // exact machine coordinator, so acquiring B or discarding it here
+        // would self-deadlock. Mechanically retire only this attachment's
+        // sidecar custody; the actor continues ordinary detach/archive after
+        // the machine installs the recovered cold successor.
+        let _ = self.state.mark_cleanup_scheduled();
+        let mut runtime_sessions = self.runtime_sessions.write().await;
+        if runtime_sessions
+            .get(&self.bridge_session_id)
+            .is_some_and(|current| same_runtime_attachment(current, &self.state))
+        {
+            runtime_sessions.remove(&self.bridge_session_id);
+        }
+        drop(runtime_sessions);
+        self.state.clear_queued_turns().await;
+        Ok(())
     }
 }
 
@@ -8268,11 +8842,17 @@ impl MobProvisioner for SessionBackend {
                 ));
             }
         };
-        self.ops_adapter
-            .mark_member_retired_after_disposal(member_ref, disposal)
-            .await?;
+        if !matches!(
+            disposal,
+            MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired
+        ) {
+            self.ops_adapter
+                .mark_member_retired_after_disposal(member_ref, disposal)
+                .await?;
+        }
         Ok(match disposal {
             MemberSessionDisposalVerdict::Archived
+            | MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired
             | MemberSessionDisposalVerdict::AlreadyArchived => {
                 crate::machines::mob_machine::MemberSessionDisposal::Archived
             }
@@ -8833,6 +9413,14 @@ impl MultiBackendProvisioner {
         self.session
             .retire_exact_attachment_for_explicit_resume(session_id, deadline, None)
             .await
+    }
+
+    /// The exact session-operation binding authority owned by this
+    /// provisioner's session backend. The actor's pre-retire runtime quiesce
+    /// path consults it so a durability-reload discard retains the exact
+    /// bound operation identity.
+    pub(super) fn session_ops_adapter(&self) -> Arc<super::ops_adapter::MobOpsAdapter> {
+        self.session.session_ops_adapter()
     }
 
     pub fn with_binding_persistence(
@@ -11448,6 +12036,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                         None,
                         None,
                         None,
+                        None,
                         &req,
                     ),
                 );
@@ -11574,6 +12163,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                 placed.transcript_interaction_id.clone(),
                 Some(placed.expected_member.clone()),
                 placed.outcome_tracking,
+                placed.bounded_result_spec.clone(),
                 &req,
             ));
         // First response loss is ambiguous: resend the byte-identical command
@@ -11701,6 +12291,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                 transient_turn_context: None,
                 turn: Some(request.directive.clone()),
                 outcome_tracking: None,
+                bounded_result_spec: None,
             },
         );
         // ADJ-4 resend class: exactly ONE resend, only on send-timeout /
@@ -12624,6 +13215,7 @@ mod bridge_rejection_tests {
                     generation: expected_member.generation,
                     fence_token: expected_member.fence_token,
                     terminal_seq: 9,
+                    bounded_result: None,
                     outcome:
                         super::super::bridge_protocol::WireFlowTurnOutcome::InteractionComplete,
                 },
@@ -12650,6 +13242,7 @@ mod bridge_rejection_tests {
                     generation: expected_member.generation,
                     fence_token: expected_member.fence_token,
                     terminal_seq: 9,
+                    bounded_result: None,
                     outcome:
                         super::super::bridge_protocol::WireFlowTurnOutcome::InteractionComplete,
                 },
@@ -12682,6 +13275,7 @@ mod bridge_rejection_tests {
             outcome_tracking: Some(
                 super::super::bridge_protocol::BridgeOutcomeTracking::Interaction,
             ),
+            bounded_result_spec: None,
         };
         let request = meerkat_core::service::StartTurnRequest {
             injected_context: Vec::new(),
@@ -12713,6 +13307,7 @@ mod bridge_rejection_tests {
             placed.transcript_interaction_id.clone(),
             Some(expected_member.clone()),
             placed.outcome_tracking,
+            None,
             &request,
         );
 
@@ -12753,6 +13348,7 @@ mod bridge_rejection_tests {
             outcome_tracking: Some(
                 super::super::bridge_protocol::BridgeOutcomeTracking::Interaction,
             ),
+            bounded_result_spec: None,
         };
         validate_placed_delivery_context_ids(&base).expect("exact tracked identity validates");
 
@@ -12790,6 +13386,7 @@ fn plain_delivery_payload(
     transcript_interaction_id: Option<String>,
     expected_member: Option<super::bridge_protocol::BridgeMemberIncarnation>,
     outcome_tracking: Option<super::bridge_protocol::BridgeOutcomeTracking>,
+    bounded_result_spec: Option<super::bridge_protocol::BridgeBoundedResultSpec>,
     req: &StartTurnRequest,
 ) -> super::bridge_protocol::BridgeDeliveryPayload {
     super::bridge_protocol::BridgeDeliveryPayload {
@@ -12811,6 +13408,7 @@ fn plain_delivery_payload(
             .and_then(|metadata| metadata.transient_turn_context.clone()),
         turn: None,
         outcome_tracking,
+        bounded_result_spec,
     }
 }
 

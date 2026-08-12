@@ -1966,6 +1966,8 @@ pub struct MobFlowCancelResult {
 pub struct MobSpawnHelperParams {
     pub mob_id: String,
     pub prompt: String,
+    pub result_label: String,
+    pub max_text_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1988,6 +1990,8 @@ pub struct MobForkHelperParams {
     pub mob_id: String,
     pub source_member_id: String,
     pub prompt: String,
+    pub result_label: String,
+    pub max_text_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2032,13 +2036,18 @@ pub struct MobBoundedHelperResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MobHelperResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<String>,
+    pub output: String,
     pub tokens_used: u64,
     pub agent_identity: String,
     pub member_ref: WireMemberRef,
+    /// Exact receiver-bounded result for this helper operation.
+    pub bounded_result: MobBoundedHelperResult,
+    pub session_id: String,
+    pub usage: meerkat_core::Usage,
+    pub turns: u32,
+    pub tool_calls: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bounded_result: Option<MobBoundedHelperResult>,
+    pub retirement_error: Option<String>,
 }
 
 /// Response payload for `mob/force_cancel`.
@@ -3128,6 +3137,8 @@ mod tests {
         let parsed: MobSpawnHelperParams = serde_json::from_value(serde_json::json!({
             "mob_id": "mob-1",
             "prompt": "help",
+            "result_label": "helper_result",
+            "max_text_bytes": 4096,
             "agent_identity": "helper",
             "auth_binding": {
                 "realm": "dev",
@@ -3151,6 +3162,8 @@ mod tests {
             "mob_id": "mob-1",
             "source_member_id": "source",
             "prompt": "help",
+            "result_label": "helper_result",
+            "max_text_bytes": 4096,
             "agent_identity": "helper",
             "auth_binding": {
                 "realm": "dev",

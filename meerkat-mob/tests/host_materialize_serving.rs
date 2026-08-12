@@ -2167,6 +2167,7 @@ async fn durable_uncertainty_fail_stop_guards_every_internal_journal_mutation_la
             fence_token: 1,
             input_id: "committed-before-ack-loss".to_string(),
             fresh_window_start: Some(1),
+            bounded_result_spec: None,
             reply,
         })
         .await
@@ -2192,6 +2193,7 @@ async fn durable_uncertainty_fail_stop_guards_every_internal_journal_mutation_la
             fence_token: 1,
             input_id: "blocked-reserve".to_string(),
             fresh_window_start: Some(2),
+            bounded_result_spec: None,
             reply,
         })
         .await
@@ -2225,6 +2227,7 @@ async fn durable_uncertainty_fail_stop_guards_every_internal_journal_mutation_la
                 fence_token: 1,
                 terminal_seq: 1,
                 outcome: WireFlowTurnOutcome::RunCompleted,
+                bounded_result: None,
             },
             reply,
         })

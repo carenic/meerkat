@@ -4748,6 +4748,7 @@ impl MeerkatMachine {
             rotation_slot,
             persistence_worker,
             post_stop_cleanup_attachment_id,
+            sealed_ops_snapshot,
         ) = {
             let mut sessions = self.sessions.write().await;
             let Some(entry) = sessions.get_mut(witness.session_id()) else {
@@ -4784,6 +4785,29 @@ impl MeerkatMachine {
                         witness.session_id()
                     ))
                 })?;
+            // Non-terminal operations persist only on terminal transitions,
+            // so the exact operation named by a retention request may exist
+            // solely in the sealed process registry. Capture its final state
+            // now; it is written to the durable store below (after the
+            // persistence worker drains) so the typed preservation check in
+            // the cold successor reads real durable authority.
+            let sealed_ops_snapshot = match operation_preservation.as_ref() {
+                Some(_) => Some(
+                    entry
+                        .ops_lifecycle
+                        .capture_persistence_snapshot(
+                            entry.epoch_id.clone(),
+                            &entry.cursor_state,
+                        )
+                        .map_err(|error| {
+                            RuntimeDriverError::Internal(format!(
+                                "failed to capture sealed ops-lifecycle snapshot for session {}: {error}",
+                                witness.session_id()
+                            ))
+                        })?,
+                ),
+                None => None,
+            };
             (
                 entry.take_runtime_loop_attachment(),
                 entry.runtime_loop_teardown.clone(),
@@ -4791,6 +4815,7 @@ impl MeerkatMachine {
                 Arc::clone(&entry.supervisor_rotation_task),
                 entry.ops_lifecycle_persistence_worker.take(),
                 entry.post_stop_cleanup_attachment_id,
+                sealed_ops_snapshot,
             )
         };
         drop(mutation_guard);
@@ -4848,6 +4873,29 @@ impl MeerkatMachine {
         }
         if let Some(persistence_worker) = persistence_worker {
             join_ops_lifecycle_persistence_worker(persistence_worker).await?;
+        }
+        if let Some(sealed_ops_snapshot) = sealed_ops_snapshot.as_ref() {
+            // Written after the drained worker so this exact sealed snapshot
+            // is the durable state the retention-validating successor loads.
+            // A failed write fails the discard closed; retry re-seals and
+            // re-captures the same registry.
+            let store = self.store.as_ref().ok_or_else(|| {
+                RuntimeDriverError::Internal(
+                    "ReloadRequired operation preservation requires a durable store".to_string(),
+                )
+            })?;
+            store
+                .persist_ops_lifecycle(
+                    &Self::logical_runtime_id(witness.session_id()),
+                    sealed_ops_snapshot,
+                )
+                .await
+                .map_err(|error| {
+                    RuntimeDriverError::Internal(format!(
+                        "failed to persist sealed ops-lifecycle snapshot for session {}: {error}",
+                        witness.session_id()
+                    ))
+                })?;
         }
 
         // From this point every non-clone process owner is settled. The exact

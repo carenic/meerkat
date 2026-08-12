@@ -290,6 +290,7 @@ rust_test(
         "//meerkat-live:meerkat_live",
         "//meerkat-machine-kernels:meerkat_machine_kernels",
         "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-runtime:meerkat_runtime_test_support",
         "//meerkat-sqlite:meerkat_sqlite",
         "//meerkat-store:meerkat_store",
     ] + all_crate_deps(

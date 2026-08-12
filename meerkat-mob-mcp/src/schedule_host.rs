@@ -243,9 +243,17 @@ impl ScheduleMobRuntime for MobMcpState {
         prompt: String,
         options: HelperOptions,
     ) -> Result<(), MobError> {
-        self.mob_spawn_helper(mob_id, identity, prompt, options)
-            .await
-            .map(|_| ())
+        self.mob_spawn_helper(
+            mob_id,
+            identity,
+            prompt,
+            options,
+            "scheduled_spawn_helper_result",
+            meerkat_mob::DEFAULT_BOUNDED_HELPER_RESULT_BYTES,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| MobError::Internal(error.to_string()))
     }
 
     async fn fork_helper(
@@ -264,9 +272,12 @@ impl ScheduleMobRuntime for MobMcpState {
             prompt,
             fork_context,
             options,
+            "scheduled_fork_helper_result",
+            meerkat_mob::DEFAULT_BOUNDED_HELPER_RESULT_BYTES,
         )
         .await
         .map(|_| ())
+        .map_err(|error| MobError::Internal(error.to_string()))
     }
 }
 

@@ -157,10 +157,15 @@ export interface MobRunResult {
 
 export interface MobHelperResult {
   agent_identity: string;
-  bounded_result?: Record<string, unknown> | null;
+  bounded_result: Record<string, unknown>;
   member_ref: WireMemberRef;
-  output?: string | null;
+  output: string;
+  retirement_error?: string | null;
+  session_id: string;
   tokens_used: number;
+  tool_calls: number;
+  turns: number;
+  usage: Record<string, unknown>;
 }
 
 export interface WireResolvedModelCapabilities {

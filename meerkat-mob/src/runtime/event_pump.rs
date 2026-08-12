@@ -388,6 +388,7 @@ impl RemoteTurnOutcomeSink for RemoteFlowTicketRegistry {
 #[derive(Debug, Clone)]
 pub(crate) enum RemoteInteractionTerminal {
     Complete,
+    BoundedComplete(super::bridge_protocol::BridgeBoundedTurnResult),
     CallbackPending {
         tool_name: Option<String>,
     },
@@ -703,7 +704,10 @@ fn interaction_terminal_from_record(
 ) -> Result<Option<(InteractionId, RemoteInteractionTerminal)>, MobError> {
     let terminal = match &record.outcome {
         super::bridge_protocol::WireFlowTurnOutcome::InteractionComplete => {
-            RemoteInteractionTerminal::Complete
+            match &record.bounded_result {
+                Some(result) => RemoteInteractionTerminal::BoundedComplete(result.clone()),
+                None => RemoteInteractionTerminal::Complete,
+            }
         }
         super::bridge_protocol::WireFlowTurnOutcome::InteractionCallbackPending => {
             RemoteInteractionTerminal::CallbackPending { tool_name: None }
@@ -2979,6 +2983,7 @@ mod tests {
             generation: member.generation,
             fence_token: member.fence_token,
             terminal_seq,
+            bounded_result: None,
             outcome: super::super::bridge_protocol::WireFlowTurnOutcome::InteractionComplete,
         }
     }
@@ -3693,6 +3698,7 @@ mod tests {
             generation: expected_member.generation,
             fence_token: expected_member.fence_token,
             terminal_seq: 11,
+            bounded_result: None,
             outcome: super::super::bridge_protocol::WireFlowTurnOutcome::InteractionComplete,
         };
 
@@ -3722,6 +3728,7 @@ mod tests {
             generation: expected_member.generation,
             fence_token: expected_member.fence_token,
             terminal_seq: 12,
+            bounded_result: None,
             outcome: super::super::bridge_protocol::WireFlowTurnOutcome::InteractionFailed {
                 detail: meerkat_contracts::wire::supervisor_bridge::WireFlowFailureDetail {
                     text: "provider exploded".to_string(),
@@ -3753,6 +3760,7 @@ mod tests {
             generation: expected_member.generation,
             fence_token: expected_member.fence_token,
             terminal_seq: 13,
+            bounded_result: None,
             outcome: super::super::bridge_protocol::WireFlowTurnOutcome::InteractionComplete,
         };
 
@@ -3783,6 +3791,7 @@ mod tests {
             generation: expected_member.generation,
             fence_token: expected_member.fence_token,
             terminal_seq: 14,
+            bounded_result: None,
             outcome: super::super::bridge_protocol::WireFlowTurnOutcome::InteractionComplete,
         };
         resolve_interaction_waiter_from_record(&manager.waiters, &expected_member, &record)
@@ -4881,6 +4890,7 @@ mod tests {
             generation: old_member.generation,
             fence_token: old_member.fence_token,
             terminal_seq: 5,
+            bounded_result: None,
             outcome: super::super::bridge_protocol::WireFlowTurnOutcome::RunCompleted,
         };
         assert_eq!(

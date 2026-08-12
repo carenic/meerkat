@@ -9,8 +9,9 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 pub use meerkat_contracts::wire::supervisor_bridge::{
-    BridgeAck, BridgeBindPayload, BridgeBindResponse, BridgeBootstrapToken, BridgeCapabilities,
-    BridgeCommand, BridgeCommandDecodeError, BridgeDeliveryOutcome, BridgeDeliveryPayload,
+    BridgeAck, BridgeBindPayload, BridgeBindResponse, BridgeBootstrapToken,
+    BridgeBoundedResultSpec, BridgeBoundedTurnResult, BridgeCapabilities, BridgeCommand,
+    BridgeCommandDecodeError, BridgeDeliveryOutcome, BridgeDeliveryPayload,
     BridgeDeliveryRejectionCause, BridgeDeliveryResponse, BridgeDestroyResponse,
     BridgeDirectMemberFence, BridgeDirectMemberFenceEvidence, BridgeDirectMemberIncarnation,
     BridgeDirectRuntimeSessionToken, BridgeEventCursor, BridgeHardCancelPayload,

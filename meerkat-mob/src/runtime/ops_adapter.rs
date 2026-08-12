@@ -97,6 +97,72 @@ pub(crate) struct SessionOpsBindingWitness {
     binding_id: uuid::Uuid,
 }
 
+/// Exact authority for migrating one session binding away from a discarded
+/// ReloadRequired runtime registry. The registry Arc is part of the witness:
+/// a same-session replacement binding can never inherit this capability.
+#[cfg(feature = "runtime-adapter")]
+#[derive(Clone)]
+pub(crate) struct ReloadRequiredSessionOpsBindingWitness {
+    binding_id: uuid::Uuid,
+    owner_bridge_session_id: SessionId,
+    registry: Arc<dyn OpsLifecycleRegistry>,
+    operation_id: OperationId,
+    /// The exact source the witnessed binding registered its operations
+    /// under (the child-session source, independent of the owner bridge
+    /// session). Retention must present this same identity or the durable
+    /// preservation check refuses the reload.
+    operation_source: OperationSource,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl ReloadRequiredSessionOpsBindingWitness {
+    pub(crate) fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub(crate) fn retention_request(&self) -> meerkat_core::OperationRetentionRequest {
+        meerkat_core::OperationRetentionRequest::new(
+            self.operation_id.clone(),
+            OperationKind::MobMemberChild,
+            self.operation_source.clone(),
+        )
+    }
+}
+
+/// Typed observation of one adapter-local session binding ahead of a
+/// durability-reload discard or cold-successor retirement.
+///
+/// Absence is typed instead of collapsed into "no witness". An intentionally
+/// retired recovered binding stays observable as a terminal-operation receipt
+/// until `clear_recovered_session_binding_retired_receipt_exact` removes it
+/// together with its unregistered successor, so a current registration
+/// observed as `NeverBound` means this process never owned the binding (cold
+/// replay, peer-only, or pre-adapter members), never that a recovered
+/// operation was silently dropped mid-retirement.
+#[cfg(feature = "runtime-adapter")]
+pub(crate) enum ReloadRequiredSessionBindingCapture {
+    /// One exact binding incarnation with its pinned recovered operation.
+    Witnessed(ReloadRequiredSessionOpsBindingWitness),
+    /// No binding entry exists in this process.
+    NeverBound,
+    /// The binding exists but owns no operation record yet, so there is no
+    /// operation identity to pin across a reload discard.
+    OperationFree,
+}
+
+/// Prepared exact registry handoff for one stable session binding
+/// incarnation. Until committed, drop restores the registry observed before
+/// the handoff if no later binding or claim has replaced it.
+#[cfg(feature = "runtime-adapter")]
+pub(crate) struct PreparedSessionRegistryRebind {
+    member_bindings: Arc<Mutex<HashMap<MemberOpsKey, MemberOpsBinding>>>,
+    member_key: MemberOpsKey,
+    binding_id: uuid::Uuid,
+    prior_registry: Arc<dyn OpsLifecycleRegistry>,
+    installed_registry: Arc<dyn OpsLifecycleRegistry>,
+    armed: bool,
+}
+
 /// Exact, cancellation-safe claim over one session member operation while it
 /// is still Provisioning (or an exact Running replay). Drop aborts only the
 /// operation/binding incarnation carrying this claim.
@@ -200,6 +266,39 @@ impl MobOpsAdapter {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_session_binding_for_test(&self, child_session_id: &SessionId) -> bool {
+        self.member_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&MemberOpsKey::Session(child_session_id.clone()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn binding_registry_for_test(
+        &self,
+        child_session_id: &SessionId,
+    ) -> Option<Arc<dyn OpsLifecycleRegistry>> {
+        self.member_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&MemberOpsKey::Session(child_session_id.clone()))
+            .map(|binding| Arc::clone(&binding.registry))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reload_operation_id_for_test(
+        &self,
+        child_session_id: &SessionId,
+    ) -> Option<OperationId> {
+        match self.capture_reload_required_session_binding_witness(child_session_id) {
+            Ok(ReloadRequiredSessionBindingCapture::Witnessed(witness)) => {
+                Some(witness.operation_id)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn bind_session_registry(
         &self,
         child_session_id: SessionId,
@@ -253,6 +352,116 @@ impl MobOpsAdapter {
             .map(|binding| SessionOpsBindingWitness {
                 binding_id: binding.binding_id,
             })
+    }
+
+    pub(crate) fn capture_reload_required_session_binding_witness(
+        &self,
+        child_session_id: &SessionId,
+    ) -> Result<ReloadRequiredSessionBindingCapture, MobError> {
+        let bindings = self
+            .member_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let member_key = MemberOpsKey::Session(child_session_id.clone());
+        let Some(binding) = bindings.get(&member_key) else {
+            return Ok(ReloadRequiredSessionBindingCapture::NeverBound);
+        };
+        let snapshots = Self::matching_operations_for_binding(&member_key, binding)?;
+        let active_ids = Self::active_operation_ids(&snapshots);
+        let operation_id = match active_ids.as_slice() {
+            [operation_id] => operation_id.clone(),
+            [] => match Self::newest_operation_snapshot(&snapshots) {
+                Some(newest) if Self::snapshot_is_terminal(newest) => newest.id.clone(),
+                Some(newest) => {
+                    return Err(MobError::Internal(format!(
+                        "operation-registry binding for session '{child_session_id}' holds non-terminal operation '{}' outside active classification",
+                        newest.id
+                    )));
+                }
+                None => return Ok(ReloadRequiredSessionBindingCapture::OperationFree),
+            },
+            _ => {
+                return Err(MobError::Internal(format!(
+                    "operation-registry binding for session '{child_session_id}' has multiple active operations; refusing to pin a recovery witness"
+                )));
+            }
+        };
+        Ok(ReloadRequiredSessionBindingCapture::Witnessed(
+            ReloadRequiredSessionOpsBindingWitness {
+                binding_id: binding.binding_id,
+                owner_bridge_session_id: binding.owner_bridge_session_id.clone(),
+                registry: Arc::clone(&binding.registry),
+                operation_id,
+                operation_source: binding.operation_source.clone(),
+            },
+        ))
+    }
+
+    /// Compare-and-rebind the exact session binding observed before a
+    /// reload-required runtime discard. The binding incarnation and all of
+    /// its operation identity remain unchanged; only its machine-owned
+    /// registry follows the exact cold successor. An absent, replaced, or
+    /// claimed binding fails closed.
+    pub(crate) fn prepare_session_registry_rebind_after_reload_discard(
+        &self,
+        child_session_id: &SessionId,
+        expected: &ReloadRequiredSessionOpsBindingWitness,
+        successor_registry: Arc<dyn OpsLifecycleRegistry>,
+    ) -> Result<PreparedSessionRegistryRebind, MobError> {
+        let member_key = MemberOpsKey::Session(child_session_id.clone());
+        let mut bindings = self
+            .member_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = bindings.get_mut(&member_key).ok_or_else(|| {
+            MobError::Internal(format!(
+                "operation-registry binding for session '{child_session_id}' disappeared during durability-reload recovery"
+            ))
+        })?;
+        if current.binding_id != expected.binding_id
+            || current.owner_bridge_session_id != expected.owner_bridge_session_id
+            || !Arc::ptr_eq(&current.registry, &expected.registry)
+            || current.display_name.is_some()
+            || current.operation_source != OperationSource::session_child(child_session_id.clone())
+            || current.exact_operation_id.is_some()
+        {
+            return Err(MobError::Internal(format!(
+                "operation-registry binding for session '{child_session_id}' changed during durability-reload recovery"
+            )));
+        }
+        if current.provision_claim.is_some() {
+            return Err(MobError::Internal(format!(
+                "operation-registry binding for session '{child_session_id}' still has an exact provision claim during durability-reload recovery"
+            )));
+        }
+        let successor_operations = successor_registry
+            .list_operations()
+            .map_err(|error| MobError::Internal(error.to_string()))?;
+        let exact_operation_present = successor_operations
+            .iter()
+            .any(|snapshot| snapshot.id == expected.operation_id);
+        let competing_active = successor_operations.iter().any(|snapshot| {
+            snapshot.id != expected.operation_id
+                && snapshot.kind == OperationKind::MobMemberChild
+                && snapshot.operation_source
+                    == Some(OperationSource::session_child(child_session_id.clone()))
+                && !Self::snapshot_is_terminal(snapshot)
+        });
+        if !exact_operation_present || competing_active {
+            return Err(MobError::Internal(format!(
+                "operation-registry successor for session '{child_session_id}' does not preserve the exact recovered operation identity"
+            )));
+        }
+        let prior_registry = Arc::clone(&current.registry);
+        current.registry = Arc::clone(&successor_registry);
+        Ok(PreparedSessionRegistryRebind {
+            member_bindings: Arc::clone(&self.member_bindings),
+            member_key,
+            binding_id: expected.binding_id,
+            prior_registry,
+            installed_registry: successor_registry,
+            armed: true,
+        })
     }
 
     /// Compare-and-remove only the binding observed before exact attachment
@@ -2124,6 +2333,136 @@ impl MobOpsAdapter {
         result
     }
 
+    /// Terminalize only the exact session binding rebound to a recovered cold
+    /// successor. The exact terminal operation remains bound as a
+    /// retry-recognizable receipt until successor unregister succeeds. The
+    /// binding lock spans validation and the
+    /// synchronous generated-authority transitions, so no replacement or
+    /// provision claim can interleave with the terminalization.
+    pub(crate) fn mark_recovered_session_binding_retired_exact(
+        &self,
+        child_session_id: &SessionId,
+        expected: &ReloadRequiredSessionOpsBindingWitness,
+        expected_registry: &Arc<dyn OpsLifecycleRegistry>,
+    ) -> Result<(), MobError> {
+        let member_key = MemberOpsKey::Session(child_session_id.clone());
+        let bindings = self
+            .member_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let binding = bindings.get(&member_key).ok_or_else(|| {
+            MobError::Internal(format!(
+                "recovered operation-registry binding for session '{child_session_id}' disappeared before retirement"
+            ))
+        })?;
+        if binding.binding_id != expected.binding_id
+            || binding.owner_bridge_session_id != expected.owner_bridge_session_id
+            || !Arc::ptr_eq(&binding.registry, expected_registry)
+            || binding.display_name.is_some()
+            || binding.operation_source != OperationSource::session_child(child_session_id.clone())
+            || binding.exact_operation_id.is_some()
+        {
+            return Err(MobError::Internal(format!(
+                "recovered operation-registry binding for session '{child_session_id}' changed before retirement"
+            )));
+        }
+        if binding.provision_claim.is_some() {
+            return Err(MobError::Internal(format!(
+                "recovered operation-registry binding for session '{child_session_id}' has an exact provision claim during retirement"
+            )));
+        }
+        let snapshots = Self::matching_operations_for_binding(&member_key, binding)?;
+        let exact = snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == expected.operation_id)
+            .ok_or_else(|| {
+                MobError::Internal(format!(
+                    "recovered operation-registry binding for session '{child_session_id}' lost its exact operation receipt"
+                ))
+            })?;
+        if snapshots.iter().any(|snapshot| {
+            snapshot.id != expected.operation_id && !Self::snapshot_is_terminal(snapshot)
+        }) {
+            return Err(MobError::Internal(format!(
+                "recovered operation-registry binding for session '{child_session_id}' gained a competing active operation"
+            )));
+        }
+        if Self::snapshot_is_terminal(exact) {
+            return Ok(());
+        }
+        let operation_id = expected.operation_id.clone();
+        match binding.registry.request_retire(&operation_id) {
+            Ok(()) => {}
+            Err(error)
+                if Self::invalid_transition_is_idempotent(
+                    &binding.registry,
+                    OperationLifecycleAction::RetireRequested,
+                    &error,
+                )? => {}
+            Err(error) => return Err(MobError::Internal(error.to_string())),
+        }
+        match binding.registry.mark_retired(&operation_id) {
+            Ok(()) => {}
+            Err(error)
+                if Self::invalid_transition_is_idempotent(
+                    &binding.registry,
+                    OperationLifecycleAction::RetireCompleted,
+                    &error,
+                )? => {}
+            Err(error) => return Err(MobError::Internal(error.to_string())),
+        }
+        Ok(())
+    }
+
+    /// Clear the exact recovered-op retirement receipt only after the cold
+    /// successor has been unregistered. Absence, replacement, a provision
+    /// claim, or a non-terminal/multiple operation fails closed.
+    pub(crate) fn clear_recovered_session_binding_retired_receipt_exact(
+        &self,
+        child_session_id: &SessionId,
+        expected: &ReloadRequiredSessionOpsBindingWitness,
+        expected_registry: &Arc<dyn OpsLifecycleRegistry>,
+    ) -> Result<(), MobError> {
+        let member_key = MemberOpsKey::Session(child_session_id.clone());
+        let mut bindings = self
+            .member_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let binding = bindings.get(&member_key).ok_or_else(|| {
+            MobError::Internal(format!(
+                "recovered operation-retirement receipt for session '{child_session_id}' disappeared before unregister completion"
+            ))
+        })?;
+        if binding.binding_id != expected.binding_id
+            || binding.owner_bridge_session_id != expected.owner_bridge_session_id
+            || !Arc::ptr_eq(&binding.registry, expected_registry)
+            || binding.display_name.is_some()
+            || binding.operation_source != OperationSource::session_child(child_session_id.clone())
+            || binding.exact_operation_id.is_some()
+            || binding.provision_claim.is_some()
+        {
+            return Err(MobError::Internal(format!(
+                "recovered operation-retirement receipt for session '{child_session_id}' changed before unregister completion"
+            )));
+        }
+        let snapshots = Self::matching_operations_for_binding(&member_key, binding)?;
+        if snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == expected.operation_id)
+            .is_some_and(Self::snapshot_is_terminal)
+            && snapshots.iter().all(|snapshot| {
+                snapshot.id == expected.operation_id || Self::snapshot_is_terminal(snapshot)
+            })
+        {
+            bindings.remove(&member_key);
+            Ok(())
+        } else {
+            Err(MobError::Internal(format!(
+                "recovered operation-retirement receipt for session '{child_session_id}' is not an exact terminal operation"
+            )))
+        }
+    }
+
     /// Project retirement into an operation binding when this process owns
     /// one. Peer-only bindings are intentionally process-local; cold Mob
     /// replay can therefore have durable member authority without a volatile
@@ -2254,6 +2593,34 @@ impl MobOpsAdapter {
                 }
             }
         }
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl PreparedSessionRegistryRebind {
+    pub(crate) fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl Drop for PreparedSessionRegistryRebind {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut bindings = self
+            .member_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(current) = bindings.get_mut(&self.member_key)
+            && current.binding_id == self.binding_id
+            && current.provision_claim.is_none()
+            && Arc::ptr_eq(&current.registry, &self.installed_registry)
+        {
+            current.registry = Arc::clone(&self.prior_registry);
+        }
+        self.armed = false;
     }
 }
 
@@ -2630,6 +2997,73 @@ mod tests {
             adapter.capture_session_binding_witness(&session_id),
             Some(replacement),
             "replacement binding remains installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_rebind_rejects_replacement_and_claimed_binding() {
+        let adapter = MobOpsAdapter::new();
+        let session_id = SessionId::new();
+        let owner_session_id = SessionId::new();
+        let old_registry = Arc::new(RuntimeOpsLifecycleRegistry::new());
+        adapter
+            .bind_session_registry(
+                session_id.clone(),
+                owner_session_id.clone(),
+                Arc::clone(&old_registry) as Arc<dyn OpsLifecycleRegistry>,
+            )
+            .expect("bind old registry");
+        adapter
+            .mark_member_provisioned(&session_id, "mob/member/claimed")
+            .await
+            .expect("publish exact operation before reload witness capture");
+        let ReloadRequiredSessionBindingCapture::Witnessed(stale) = adapter
+            .capture_reload_required_session_binding_witness(&session_id)
+            .expect("capture reload witness")
+        else {
+            panic!("expected pinned reload witness for bound operation");
+        };
+        let prepared = adapter
+            .prepare_member_provision_operation(&session_id, "mob/member/claimed")
+            .await
+            .expect("claim exact operation");
+        let replacement_registry = Arc::new(RuntimeOpsLifecycleRegistry::new());
+        let claimed_error = adapter
+            .prepare_session_registry_rebind_after_reload_discard(
+                &session_id,
+                &stale,
+                Arc::clone(&replacement_registry) as Arc<dyn OpsLifecycleRegistry>,
+            )
+            .err()
+            .expect("claimed binding must reject reload rebind");
+        assert!(claimed_error.to_string().contains("exact provision claim"));
+        drop(prepared);
+
+        adapter
+            .clear_session_binding_for_explicit_resume(
+                &session_id,
+                adapter.capture_session_binding_witness(&session_id),
+            )
+            .expect("clear exact old binding");
+        adapter
+            .bind_session_registry(
+                session_id.clone(),
+                owner_session_id,
+                Arc::new(RuntimeOpsLifecycleRegistry::new()) as Arc<dyn OpsLifecycleRegistry>,
+            )
+            .expect("bind replacement incarnation");
+        let replacement_error = adapter
+            .prepare_session_registry_rebind_after_reload_discard(
+                &session_id,
+                &stale,
+                replacement_registry as Arc<dyn OpsLifecycleRegistry>,
+            )
+            .err()
+            .expect("stale witness must reject replacement incarnation");
+        assert!(
+            replacement_error
+                .to_string()
+                .contains("changed during durability-reload")
         );
     }
 

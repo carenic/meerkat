@@ -1489,6 +1489,8 @@ pub async fn handle_flow_cancel(
 pub struct MobSpawnHelperParams {
     pub mob_id: String,
     pub prompt: String,
+    pub result_label: String,
+    pub max_text_bytes: usize,
     #[serde(default)]
     pub agent_identity: Option<String>,
     #[serde(default)]
@@ -1539,30 +1541,53 @@ pub async fn handle_spawn_helper(
     options.runtime_mode = params.runtime_mode;
     options.backend = params.backend;
     match state
-        .mob_spawn_helper(&mob_id, agent_identity, params.prompt, options)
+        .mob_spawn_helper(
+            &mob_id,
+            agent_identity,
+            params.prompt,
+            options,
+            params.result_label,
+            params.max_text_bytes,
+        )
         .await
     {
         Ok(result) => {
-            let identity_str = result.agent_identity.to_string();
-            let bounded_result = result
-                .bounded_result
-                .as_ref()
-                .map(meerkat_mob::BoundedHelperResult::to_wire);
+            let identity_str = result.helper.agent_identity.to_string();
             RpcResponse::success(
                 id,
                 MobHelperResult {
-                    output: result.output,
-                    tokens_used: result.tokens_used,
+                    output: result.helper.output,
+                    tokens_used: result.helper.tokens_used,
                     agent_identity: identity_str.clone(),
                     member_ref: meerkat_contracts::WireMemberRef::encode(
                         mob_id.as_str(),
                         &identity_str,
                     ),
-                    bounded_result,
+                    bounded_result: result.helper.bounded_result.to_wire(),
+                    session_id: result.turn.result().session_id().to_string(),
+                    usage: result.turn.result().usage().clone(),
+                    turns: result.turn.result().turns(),
+                    tool_calls: result.turn.result().tool_calls(),
+                    retirement_error: result.retirement_error,
                 },
             )
         }
-        Err(err) => mob_call_error(id, &err),
+        Err(err) => bounded_member_run_error_response(id, err),
+    }
+}
+
+/// Surface a bounded helper failure with its typed wire identity preserved.
+/// Admission failures ARE mob errors and keep their stable `error_code`;
+/// post-admission turn/cleanup failures have no wire-detail vocabulary yet
+/// and map to a typed internal cause rather than silently flattening the
+/// admission tier too.
+fn bounded_member_run_error_response(
+    id: Option<RpcId>,
+    err: meerkat_mob::BoundedMemberRunError,
+) -> RpcResponse {
+    match err {
+        meerkat_mob::BoundedMemberRunError::Admission(mob_error) => mob_call_error(id, &mob_error),
+        other => mob_call_error(id, &MobError::Internal(other.to_string())),
     }
 }
 
@@ -1575,6 +1600,8 @@ pub struct MobForkHelperParams {
     pub mob_id: String,
     pub source_member_id: String,
     pub prompt: String,
+    pub result_label: String,
+    pub max_text_bytes: usize,
     #[serde(default)]
     pub agent_identity: Option<String>,
     #[serde(default)]
@@ -1637,30 +1664,33 @@ pub async fn handle_fork_helper(
             params.prompt,
             fork_context,
             options,
+            params.result_label,
+            params.max_text_bytes,
         )
         .await
     {
         Ok(result) => {
-            let identity_str = result.agent_identity.to_string();
-            let bounded_result = result
-                .bounded_result
-                .as_ref()
-                .map(meerkat_mob::BoundedHelperResult::to_wire);
+            let identity_str = result.helper.agent_identity.to_string();
             RpcResponse::success(
                 id,
                 MobHelperResult {
-                    output: result.output,
-                    tokens_used: result.tokens_used,
+                    output: result.helper.output,
+                    tokens_used: result.helper.tokens_used,
                     agent_identity: identity_str.clone(),
                     member_ref: meerkat_contracts::WireMemberRef::encode(
                         mob_id.as_str(),
                         &identity_str,
                     ),
-                    bounded_result,
+                    bounded_result: result.helper.bounded_result.to_wire(),
+                    session_id: result.turn.result().session_id().to_string(),
+                    usage: result.turn.result().usage().clone(),
+                    turns: result.turn.result().turns(),
+                    tool_calls: result.turn.result().tool_calls(),
+                    retirement_error: result.retirement_error,
                 },
             )
         }
-        Err(err) => mob_call_error(id, &err),
+        Err(err) => bounded_member_run_error_response(id, err),
     }
 }
 
@@ -3232,6 +3262,8 @@ mod tests {
         let params = serde_json::json!({
             "mob_id": mob_id.as_str(),
             "prompt": "do the thing",
+            "result_label": "helper_result",
+            "max_text_bytes": 4096,
         });
         let raw = serde_json::value::RawValue::from_string(params.to_string())
             .expect("serialize spawn_helper params");
@@ -3258,6 +3290,8 @@ mod tests {
             "mob_id": mob_id.as_str(),
             "source_member_id": "worker",
             "prompt": "do the thing",
+            "result_label": "helper_result",
+            "max_text_bytes": 4096,
         });
         let raw = serde_json::value::RawValue::from_string(params.to_string())
             .expect("serialize fork_helper params");

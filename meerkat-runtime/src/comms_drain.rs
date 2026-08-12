@@ -1402,6 +1402,14 @@ fn validate_delivery_tracking_request(payload: &BridgeDeliveryPayload) -> Result
     if payload.outcome_tracking.is_some() && payload.expected_member.is_none() {
         return Err("outcome_tracking requires an exact placed-member incarnation".to_string());
     }
+    if let Some(spec) = &payload.bounded_result_spec {
+        if !delivery_requests_tracked_interaction(payload) || payload.turn.is_some() {
+            return Err(
+                "bounded_result_spec requires plain interaction outcome tracking".to_string(),
+            );
+        }
+        spec.validate()?;
+    }
     if let Some(transcript_id) = payload.transcript_interaction_id.as_deref() {
         if !payload.protocol_version.supports_multi_host() {
             return Err(
@@ -6379,7 +6387,7 @@ where
     Fut: std::future::Future<Output = T>,
 {
     let window = observation
-        .open_directed_turn_window(session_id, expected_member, input_id)
+        .open_directed_turn_window(session_id, expected_member, input_id, None)
         .await?;
     Ok((window, accept().await))
 }
@@ -6431,6 +6439,7 @@ async fn serve_tracked_member_delivery(
     payload: BridgeDeliveryPayload,
 ) {
     let request_input_id = payload.input_id.clone();
+    let bounded_result_spec = payload.bounded_result_spec.clone();
     let reject = |detail: String| BridgeDeliveryResponse {
         input_id: request_input_id.clone(),
         canonical_input_id: None,
@@ -6569,7 +6578,12 @@ async fn serve_tracked_member_delivery(
     // first would deadlock against a concurrent materialize/release command
     // that already owns the actor and is waiting for the same slot.
     let window = match observation
-        .open_directed_turn_window(session_id, &expected_member, &request_input_id)
+        .open_directed_turn_window(
+            session_id,
+            &expected_member,
+            &request_input_id,
+            bounded_result_spec.as_ref(),
+        )
         .await
     {
         Ok(window) => window,
@@ -7168,6 +7182,9 @@ mod tests {
             _session: &SessionId,
             _expected_member: &BridgeMemberIncarnation,
             _input_id: &str,
+            _bounded_result_spec: Option<
+                &meerkat_contracts::wire::supervisor_bridge::BridgeBoundedResultSpec,
+            >,
         ) -> Result<
             crate::member_observation::DirectedTurnWindow,
             crate::member_observation::DirectedTurnReject,
@@ -7241,6 +7258,7 @@ mod tests {
             generation: expected_member.generation,
             fence_token: expected_member.fence_token,
             input_id: input_id.clone(),
+            bounded_result_spec: None,
             tracking: DirectedTurnTracking::TerminalReplay,
         };
         let accept_calls = std::sync::atomic::AtomicUsize::new(0);
@@ -7290,6 +7308,7 @@ mod tests {
             generation: expected_member.generation,
             fence_token: expected_member.fence_token,
             input_id: Uuid::new_v4().to_string(),
+            bounded_result_spec: None,
             tracking: DirectedTurnTracking::TerminalReplay,
         };
         assert!(
@@ -7408,6 +7427,7 @@ mod tests {
                     generation: 1,
                     fence_token: 1,
                     terminal_seq: index,
+                    bounded_result: None,
                     outcome: meerkat_contracts::wire::supervisor_bridge::WireFlowTurnOutcome::RunFailed {
                         detail: meerkat_contracts::wire::supervisor_bridge::WireFlowFailureDetail::complete(
                             "x".repeat(60_000),
@@ -11232,6 +11252,7 @@ mod tests {
                 expected_member: None,
                 turn: None,
                 outcome_tracking: None,
+                bounded_result_spec: None,
             },
         )
         .expect("UUID payload input id lowers");
@@ -11295,6 +11316,7 @@ mod tests {
                 expected_member: None,
                 turn: None,
                 outcome_tracking: None,
+                bounded_result_spec: None,
             },
         )
         .expect("transient-context bridge delivery lowers");
@@ -11362,6 +11384,7 @@ mod tests {
             }),
             turn: None,
             outcome_tracking: Some(BridgeOutcomeTracking::Interaction),
+            bounded_result_spec: None,
         };
         assert!(delivery_requires_tracked_turn_custody(&payload));
         let input = peer_input_from_delivery_payload(
@@ -11433,6 +11456,7 @@ mod tests {
             }),
             turn: None,
             outcome_tracking: None,
+            bounded_result_spec: None,
         };
         assert!(!delivery_requires_tracked_turn_custody(&payload));
         validate_delivery_tracking_request(&payload)
@@ -11513,6 +11537,7 @@ mod tests {
                 }),
                 turn: None,
                 outcome_tracking: None,
+                bounded_result_spec: None,
             },
         )
         .expect("ordinary placed payload lowers");
@@ -11555,6 +11580,7 @@ mod tests {
             }),
             turn: None,
             outcome_tracking: Some(BridgeOutcomeTracking::Interaction),
+            bounded_result_spec: None,
         };
         payload.transcript_interaction_id = Some(payload.input_id.clone());
         validate_delivery_tracking_request(&payload).expect("valid tracked interaction");
@@ -11671,6 +11697,7 @@ mod tests {
                 }),
                 turn: None,
                 outcome_tracking: Some(BridgeOutcomeTracking::Interaction),
+                bounded_result_spec: None,
             },
         )
         .expect("placed UUID payload lowers");
@@ -11703,6 +11730,7 @@ mod tests {
                 expected_member: None,
                 turn: None,
                 outcome_tracking: None,
+                bounded_result_spec: None,
             },
         );
         assert!(lowered.is_err());
@@ -11736,6 +11764,7 @@ mod tests {
                 expected_member: None,
                 turn: None,
                 outcome_tracking: None,
+                bounded_result_spec: None,
             },
         )
         .expect("UUID payload input id lowers");

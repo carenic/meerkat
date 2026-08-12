@@ -20,9 +20,9 @@
 use std::sync::Arc;
 
 use meerkat_contracts::wire::supervisor_bridge::{
-    BridgeDeliveryRejectionCause, BridgeHostRuntimeIncarnation, BridgeMemberIncarnation,
-    BridgeTrackedInputCancelOutcome, BridgeTurnOutcomeAck, BridgeTurnOutcomeRecord,
-    WireFlowTurnOutcome,
+    BridgeBoundedResultSpec, BridgeBoundedTurnResult, BridgeDeliveryRejectionCause,
+    BridgeHostRuntimeIncarnation, BridgeMemberIncarnation, BridgeTrackedInputCancelOutcome,
+    BridgeTurnOutcomeAck, BridgeTurnOutcomeRecord, WireFlowTurnOutcome,
 };
 use meerkat_core::event::{AgentEvent, EventEnvelope};
 use meerkat_core::service::SessionHistoryPage;
@@ -161,6 +161,8 @@ pub struct DirectedTurnWindow {
     pub fence_token: u64,
     /// Exact directed-turn input id reserved before runtime acceptance.
     pub input_id: String,
+    /// Receiver-owned result bound durably reserved with this exact key.
+    pub bounded_result_spec: Option<BridgeBoundedResultSpec>,
     /// Whether the host persisted/replayed Pending or found an already
     /// terminal exact key. Terminal replay needs no watcher.
     pub tracking: DirectedTurnTracking,
@@ -182,6 +184,7 @@ pub struct DirectedTurnAdmissionRequest {
     pub fence_token: u64,
     /// Exact directed-turn input id reserved before runtime acceptance.
     pub input_id: String,
+    pub bounded_result_spec: Option<BridgeBoundedResultSpec>,
 }
 
 impl DirectedTurnWindow {
@@ -196,6 +199,7 @@ impl DirectedTurnWindow {
             generation: self.generation,
             fence_token: self.fence_token,
             input_id: self.input_id.clone(),
+            bounded_result_spec: self.bounded_result_spec.clone(),
         }
     }
 }
@@ -361,6 +365,7 @@ pub trait MemberObservationHost: Send + Sync {
         session: &SessionId,
         expected_member: &BridgeMemberIncarnation,
         input_id: &str,
+        bounded_result_spec: Option<&BridgeBoundedResultSpec>,
     ) -> Result<DirectedTurnWindow, DirectedTurnReject>;
 
     /// Cancel Pending only when the caller has proven the runtime did not
@@ -448,6 +453,7 @@ pub struct TrackedTurnOutcomeRecord {
     /// never a watermark approximation, never a `CompletionFeed` seq).
     pub terminal_seq: u64,
     pub outcome: WireFlowTurnOutcome,
+    pub bounded_result: Option<BridgeBoundedTurnResult>,
 }
 
 /// Per-session tracked-turn journal seam (DEC-P6F-9's registration

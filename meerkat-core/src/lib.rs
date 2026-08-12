@@ -194,8 +194,9 @@ pub use event_tap::{
 pub use exact_operation::{
     CleanupReceipt, ExactOperationIdentity, OperationAcceptClass, OperationAdmissionReceipt,
     OperationAttributionError, OperationCompletion, OperationCompletionAttributionError,
-    OperationTerminal, OperationTerminalIdentity, OperationWaitError, ProjectedTerminalText,
-    ResultProjectionValidationError, TerminalReceipt, ValidatedResultProjectionSpec,
+    OperationExecutionScope, OperationTerminal, OperationTerminalIdentity, OperationTerminalScope,
+    OperationWaitError, ProjectedTerminalText, ResultProjectionValidationError, TerminalReceipt,
+    ValidatedResultProjectionSpec,
 };
 pub use gateway::{DynamicToolComposite, ToolGateway, ToolGatewayBuilder};
 pub use handles::{

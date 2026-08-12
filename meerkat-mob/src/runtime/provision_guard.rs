@@ -321,7 +321,7 @@ mod tests {
             let session_id = member_ref
                 .bridge_session_id()
                 .cloned()
-                .unwrap_or_else(|| SessionId::new());
+                .unwrap_or_else(SessionId::new);
             let _ = completion_tx.send(Ok(crate::runtime::handle::ExactTurnCompletion {
                 session_id,
                 terminal: crate::runtime::handle::ExactTurnTerminal::Runtime(
@@ -429,6 +429,7 @@ mod tests {
                     outcome_tracking: Some(
                         crate::runtime::bridge_protocol::BridgeOutcomeTracking::Interaction,
                     ),
+                    bounded_result_spec: None,
                 }),
             )
             .await

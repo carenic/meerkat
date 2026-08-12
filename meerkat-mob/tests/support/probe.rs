@@ -696,6 +696,7 @@ pub fn raw_deliver_member_input_command(
         transient_turn_context: None,
         turn,
         outcome_tracking: None,
+        bounded_result_spec: None,
     })
 }
 

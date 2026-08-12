@@ -311,12 +311,14 @@ pub use handle::{
     AdaptiveLayerResultDigest, AdaptiveLayerRetention, AdaptiveLayerRunStart,
     AdaptiveLayerSetupFault, AdaptiveLayerSetupFaultObservation, AdaptiveLayerSnapshot,
     AdaptivePlanningDecisionKind, AdaptiveRunLimits, AdaptiveRunPhaseView, AdaptiveRunSnapshot,
-    AdaptiveStopReasonView, BoundedHelperResult, BoundedHelperResultStatus, BoundedResultSpec,
-    BoundedTurnFailure, BoundedTurnResult, BoundedTurnWaitError, CurrentMobAdmission,
+    AdaptiveStopReasonView, BoundedFlowResult, BoundedHelperResult, BoundedHelperResultStatus,
+    BoundedHelperRunOutcome, BoundedMemberRunError, BoundedResultSpec, BoundedTurnFailure,
+    BoundedTurnResult, BoundedTurnWaitError, CurrentMobAdmission,
     DEFAULT_BOUNDED_HELPER_RESULT_BYTES, ExternalMemberBindingMode,
     ExternalMemberForwardingHookRef, ExternalMemberForwardingHooks, ExternalMemberForwardingStatus,
     ExternalMemberObservationSnapshot, ExternalMemberOwnerRef, ExternalMemberReachability,
-    ExternalMemberRebindStatus, ExternalPeerBindingSpec, FlowTargetProvisioner, ForkMemberResult,
+    ExternalMemberRebindStatus, ExternalPeerBindingSpec, FlowRunHandle, FlowRunWaitError,
+    FlowTargetProvisioner, ForkMemberBoundedRunOutcome, ForkMemberResult,
     HELPER_RESULT_TRUNCATION_MARKER, HelperOptions, HelperResult, HostBindReport, HostBindRequest,
     HostCapabilityReport, HostRevokeReport, InitializeAdaptiveRunRequest, MemberBoundedTurnResult,
     MemberDeliveryReceipt, MemberHandle, MemberRespawnReceipt, MemberTurnEventSender,
@@ -330,7 +332,9 @@ pub use handle::{
     SpawnToolAdmission, SupervisorRotationReport, WorkBoundedTurnResult, WorkDeliveryReceipt,
     WorkTurnHandle, mob_error_wire_code, profile_to_wire, stored_realm_profile_to_wire,
 };
-pub(crate) use handle::{CanonicalOpsOwnerContext, ExactTurnCompletionSender, MemberSpawnReceipt};
+pub(crate) use handle::{
+    CanonicalOpsOwnerContext, ExactTurnCompletionSender, FlowOperationCustody, MemberSpawnReceipt,
+};
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 pub use host_schedule::HostObservationScheduleMobHost;
 pub use identity_local_services::{

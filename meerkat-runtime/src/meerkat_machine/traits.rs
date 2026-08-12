@@ -1728,6 +1728,28 @@ impl MeerkatMachine {
             .await
     }
 
+    /// Archive sibling combining an owned stored-session publisher with a
+    /// post-commit hook. A recovered quiescent registration has no attached
+    /// executor, so its runless terminal publication needs the supplied
+    /// handle while the hook still owes its terminalization under the exact
+    /// retire commit. The lease-retained live publisher always wins when
+    /// present.
+    pub async fn retire_session_with_archive_lease_publication_handle_and_post_commit_hook_before(
+        &self,
+        lease: super::MachineSessionArchiveLease,
+        publication_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+        post_commit_hook: Arc<dyn super::MachineSessionArchivePostCommitHook>,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<RetireReport, RuntimeControlPlaneError> {
+        self.realize_retire_with_archive_lease(
+            lease,
+            Some(publication_handle),
+            Some(deadline),
+            Some(post_commit_hook),
+        )
+        .await
+    }
+
     /// Observe whether an archive lease owns a committed runless terminal
     /// carrier that must cross publication before the document verdict.
     ///

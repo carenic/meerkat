@@ -320,7 +320,7 @@ mod tests {
         accept_class: OperationAcceptClass,
     ) -> OperationAdmissionReceipt<u64> {
         OperationAdmissionReceipt::new(
-            ExactOperationIdentity::new(
+            ExactOperationIdentity::for_runtime_input(
                 OperationId::new(),
                 SessionId::new(),
                 RuntimeEpochId::new(),
@@ -399,14 +399,19 @@ mod tests {
         custody.fail_observation(CompletionWaitError::ChannelClosed);
         let failure = observer.wait().await.expect_err("mechanical failure");
         assert_eq!(failure.admission(), &admission);
-        assert_eq!(
-            failure.admission().identity().submitted_input_id(),
-            &submitted
-        );
-        assert_eq!(
-            failure.admission().identity().canonical_input_id(),
-            &canonical
-        );
+        match failure.admission().identity().execution_scope() {
+            meerkat_core::OperationExecutionScope::RuntimeInput {
+                submitted_input_id,
+                canonical_input_id,
+                ..
+            } => {
+                assert_eq!(submitted_input_id, &submitted);
+                assert_eq!(canonical_input_id, &canonical);
+            }
+            meerkat_core::OperationExecutionScope::Domain => {
+                panic!("runtime admission lost its runtime input coordinates")
+            }
+        }
         let subsequent = custody
             .observe()
             .wait()

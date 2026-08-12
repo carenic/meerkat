@@ -48,6 +48,10 @@ sqlite-store = ["dep:rusqlite", "dep:meerkat-sqlite", "dep:meerkat-store", "meer
 test-support = []
 
 [dev-dependencies]
+# Path-only self-dependency (no version, stripped at publish): this crate's
+# own integration tests need the test-support hooks without relying on
+# feature unification from sibling crates in the same build graph.
+meerkat-runtime = { path = ".", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tempfile = { workspace = true }

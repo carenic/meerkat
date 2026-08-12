@@ -1679,6 +1679,7 @@ mod tests {
             generation,
             fence_token: 7,
             terminal_seq,
+            bounded_result: None,
             outcome: WireFlowTurnOutcome::RunCompleted,
         }
     }
@@ -1762,6 +1763,7 @@ mod tests {
             generation: expected_member.generation,
             fence_token: expected_member.fence_token,
             terminal_seq: 5,
+            bounded_result: None,
             outcome: WireFlowTurnOutcome::InteractionComplete,
         };
 
@@ -1809,6 +1811,7 @@ mod tests {
             generation: expected_member.generation,
             fence_token: expected_member.fence_token,
             terminal_seq: 5,
+            bounded_result: None,
             outcome: WireFlowTurnOutcome::InteractionComplete,
         };
 
@@ -1839,6 +1842,7 @@ mod tests {
             generation: expected_member.generation,
             fence_token: expected_member.fence_token,
             terminal_seq: 9,
+            bounded_result: None,
             outcome: WireFlowTurnOutcome::InteractionFailed {
                 detail: meerkat_contracts::wire::supervisor_bridge::WireFlowFailureDetail::complete(
                     "provider failed".to_string(),
@@ -1869,6 +1873,7 @@ mod tests {
             generation: expected_member.generation,
             fence_token: expected_member.fence_token,
             terminal_seq: 6,
+            bounded_result: None,
             outcome: WireFlowTurnOutcome::InteractionComplete,
         };
 
@@ -1949,6 +1954,7 @@ mod tests {
             generation: 1,
             fence_token: 7,
             terminal_seq: 5,
+            bounded_result: None,
             outcome: WireFlowTurnOutcome::InteractionFailed {
                 detail: meerkat_contracts::wire::supervisor_bridge::WireFlowFailureDetail::complete(
                     rendered.clone(),
@@ -2018,6 +2024,7 @@ mod tests {
             generation: 1,
             fence_token: 7,
             terminal_seq: 5,
+            bounded_result: None,
             outcome: WireFlowTurnOutcome::InteractionFailed {
                 detail: meerkat_contracts::wire::supervisor_bridge::WireFlowFailureDetail::complete(
                     "structured output extraction failed after 2 attempt(s): invalid schema; last_output=\"raw\""
@@ -2312,6 +2319,7 @@ mod tests {
                     generation: 1,
                     fence_token: 7,
                     terminal_seq: 5,
+                    bounded_result: None,
                     outcome: WireFlowTurnOutcome::RunFailed {
                         detail: meerkat_contracts::wire::supervisor_bridge::WireFlowFailureDetail {
                             text: "provider exploded".to_string(),
@@ -2363,6 +2371,7 @@ mod tests {
                     generation: 1,
                     fence_token: 7,
                     terminal_seq: 9,
+                    bounded_result: None,
                     outcome: WireFlowTurnOutcome::ExtractionSucceeded,
                 },
             )
@@ -2397,6 +2406,7 @@ mod tests {
                 generation: 1,
                 fence_token: 7,
                 terminal_seq: 5,
+                bounded_result: None,
                 outcome: WireFlowTurnOutcome::RunFailed {
                     detail: meerkat_contracts::wire::supervisor_bridge::WireFlowFailureDetail::complete(
                         "journal disagrees".to_string(),
@@ -2789,6 +2799,7 @@ mod tests {
                     generation: 1,
                     fence_token: 7,
                     terminal_seq: 0,
+                    bounded_result: None,
                     outcome: WireFlowTurnOutcome::ChannelClosed,
                 },
             )

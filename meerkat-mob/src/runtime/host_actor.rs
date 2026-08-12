@@ -609,6 +609,8 @@ pub struct TurnOutcomeRow {
     /// Durable `StoredEvent.seq` of the turn's terminal event (gotcha 8).
     pub terminal_seq: u64,
     pub outcome: WireFlowTurnOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_result: Option<super::bridge_protocol::BridgeBoundedTurnResult>,
 }
 
 /// Compact durable proof that the controller consumed one exact terminal.
@@ -655,6 +657,8 @@ pub struct TurnOutcomePendingRow {
     pub generation: u64,
     pub fence_token: u64,
     pub window_start: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_result_spec: Option<super::bridge_protocol::BridgeBoundedResultSpec>,
 }
 
 impl TurnOutcomeRow {
@@ -666,6 +670,7 @@ impl TurnOutcomeRow {
             fence_token: self.fence_token,
             terminal_seq: self.terminal_seq,
             outcome: self.outcome.clone(),
+            bounded_result: self.bounded_result.clone(),
         }
     }
 
@@ -3964,6 +3969,7 @@ async fn reserve_turn_outcome_pending_with_mode(
                             && pending.fence_token == row.fence_token
                             && pending.input_id == row.input_id
                             && pending.window_start == *window_start
+                            && pending.bounded_result_spec == row.bounded_result_spec
                     })
                 });
             if !replay_matches {
@@ -3989,6 +3995,14 @@ async fn reserve_turn_outcome_pending_with_mode(
                     terminal.generation == row.generation
                         && terminal.fence_token == row.fence_token
                         && terminal.input_id == row.input_id
+                        && match (&row.bounded_result_spec, &terminal.bounded_result) {
+                            (None, None) => true,
+                            (Some(spec), Some(result)) => {
+                                result.result.label == spec.label
+                                    && result.max_text_bytes == spec.max_text_bytes
+                            }
+                            _ => false,
+                        }
                 })
             });
             let acknowledged_matches = durable
@@ -5487,7 +5501,7 @@ impl MobHostActor {
             return;
         };
         let adapter = Arc::clone(&materializer.substrate().runtime_adapter);
-        let state = self.binding_authority.state();
+        let state = self.binding_authority.state().clone();
         let durable_members: BTreeSet<(String, String)> = state
             .materialized_sessions
             .keys()
@@ -5498,6 +5512,17 @@ impl MobHostActor {
                 )
             })
             .collect();
+        let mut durable_records = BTreeMap::new();
+        for mob_id in state
+            .materialized_sessions
+            .keys()
+            .map(|key| key.mob_id.0.clone())
+            .collect::<BTreeSet<_>>()
+        {
+            if let Ok(Some(record)) = self.persistence.load(&mob_id).await {
+                durable_records.insert(mob_id, record);
+            }
+        }
         let mut sessions = BTreeMap::new();
         let mut current: HashMap<
             meerkat_core::types::SessionId,
@@ -5561,6 +5586,19 @@ impl MobHostActor {
                     generation: turn_key.generation.0,
                     fence_token: turn_key.fence_token.0,
                     window_start: *window_start,
+                    bounded_result_spec: durable_records
+                        .get(&turn_key.mob_id.0)
+                        .and_then(|record| {
+                            record.turn_outcome_pending.get(&turn_key.agent_identity.0)
+                        })
+                        .and_then(|rows| {
+                            rows.iter().find(|row| {
+                                row.input_id == turn_key.input_id.0
+                                    && row.generation == turn_key.generation.0
+                                    && row.fence_token == turn_key.fence_token.0
+                            })
+                        })
+                        .and_then(|row| row.bounded_result_spec.clone()),
                 })
                 .collect();
             let incarnation = meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation {
@@ -5694,6 +5732,7 @@ impl MobHostActor {
                 generation,
                 fence_token,
                 input_id,
+                bounded_result_spec,
                 fresh_window_start,
                 reply,
             } => {
@@ -5719,6 +5758,7 @@ impl MobHostActor {
                     // MAX is an inert probe value: a fresh transition is
                     // discarded before persistence/authority commit below.
                     window_start: fresh_window_start.unwrap_or(u64::MAX),
+                    bounded_result_spec,
                 };
                 let result = reserve_turn_outcome_pending_with_mode(
                     &mut self.binding_authority,
@@ -5988,6 +6028,7 @@ impl MobHostActor {
             fence_token: request.record.fence_token,
             terminal_seq: request.record.terminal_seq,
             outcome: request.record.outcome.clone(),
+            bounded_result: request.record.bounded_result.clone(),
         };
         if row.generation != request.expected_member.generation
             || row.fence_token != request.expected_member.fence_token
@@ -7377,6 +7418,12 @@ impl MobHostActor {
                 // distinction; the machine/durable fact folds it to
                 // Archived (both mean the durable terminal holds).
                 Ok(crate::runtime::provisioner::MemberSessionDisposalVerdict::Archived) => (
+                    MachineMemberSessionDisposal::Archived,
+                    WireMemberSessionDisposal::Archived,
+                ),
+                Ok(
+                    crate::runtime::provisioner::MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired,
+                ) => (
                     MachineMemberSessionDisposal::Archived,
                     WireMemberSessionDisposal::Archived,
                 ),
@@ -9900,6 +9947,7 @@ mod tests {
                     generation: expected.generation,
                     fence_token: expected.fence_token,
                     window_start: 41,
+                    bounded_result_spec: None,
                 }],
             )]),
             turn_outcomes: BTreeMap::new(),
@@ -10369,6 +10417,7 @@ mod tests {
                         fence_token: 9,
                         terminal_seq: 41,
                         outcome: WireFlowTurnOutcome::RunCompleted,
+                        bounded_result: None,
                     }],
                 )]),
                 turn_outcome_acknowledged: BTreeMap::new(),

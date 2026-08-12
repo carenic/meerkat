@@ -10,6 +10,35 @@ use sha2::{Digest, Sha256};
 use crate::ops::OperationId;
 use crate::{InputId, RuntimeEpochId, SessionId};
 
+/// Execution coordinates required to attribute one admitted operation.
+///
+/// Runtime inputs carry generated session, epoch, and input identities.
+/// Domain operations such as Flow runs already carry exact identity in their
+/// typed domain correlation and must not fabricate runtime coordinates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum OperationExecutionScope {
+    RuntimeInput {
+        owner_session_id: SessionId,
+        runtime_epoch_id: RuntimeEpochId,
+        submitted_input_id: InputId,
+        canonical_input_id: InputId,
+    },
+    Domain,
+}
+
+/// Terminal-facing execution coordinates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum OperationTerminalScope {
+    RuntimeInput {
+        owner_session_id: SessionId,
+        runtime_epoch_id: RuntimeEpochId,
+        canonical_input_id: InputId,
+    },
+    Domain,
+}
+
 /// Runtime classification of the input named by an admission receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,15 +56,12 @@ pub enum OperationAcceptClass {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExactOperationIdentity<D> {
     operation_id: OperationId,
-    owner_session_id: SessionId,
-    runtime_epoch_id: RuntimeEpochId,
-    submitted_input_id: InputId,
-    canonical_input_id: InputId,
+    execution_scope: OperationExecutionScope,
     domain_correlation: D,
 }
 
 impl<D> ExactOperationIdentity<D> {
-    pub fn new(
+    pub fn for_runtime_input(
         operation_id: OperationId,
         owner_session_id: SessionId,
         runtime_epoch_id: RuntimeEpochId,
@@ -45,10 +71,20 @@ impl<D> ExactOperationIdentity<D> {
     ) -> Self {
         Self {
             operation_id,
-            owner_session_id,
-            runtime_epoch_id,
-            submitted_input_id,
-            canonical_input_id,
+            execution_scope: OperationExecutionScope::RuntimeInput {
+                owner_session_id,
+                runtime_epoch_id,
+                submitted_input_id,
+                canonical_input_id,
+            },
+            domain_correlation,
+        }
+    }
+
+    pub fn for_domain(operation_id: OperationId, domain_correlation: D) -> Self {
+        Self {
+            operation_id,
+            execution_scope: OperationExecutionScope::Domain,
             domain_correlation,
         }
     }
@@ -57,20 +93,8 @@ impl<D> ExactOperationIdentity<D> {
         &self.operation_id
     }
 
-    pub fn owner_session_id(&self) -> &SessionId {
-        &self.owner_session_id
-    }
-
-    pub fn runtime_epoch_id(&self) -> &RuntimeEpochId {
-        &self.runtime_epoch_id
-    }
-
-    pub fn submitted_input_id(&self) -> &InputId {
-        &self.submitted_input_id
-    }
-
-    pub fn canonical_input_id(&self) -> &InputId {
-        &self.canonical_input_id
+    pub fn execution_scope(&self) -> &OperationExecutionScope {
+        &self.execution_scope
     }
 
     pub fn domain_correlation(&self) -> &D {
@@ -121,14 +145,12 @@ impl<D> OperationAdmissionReceipt<D> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationTerminalIdentity<D> {
     operation_id: OperationId,
-    owner_session_id: SessionId,
-    runtime_epoch_id: RuntimeEpochId,
-    canonical_input_id: InputId,
+    execution_scope: OperationTerminalScope,
     domain_correlation: D,
 }
 
 impl<D> OperationTerminalIdentity<D> {
-    pub fn new(
+    pub fn for_runtime_input(
         operation_id: OperationId,
         owner_session_id: SessionId,
         runtime_epoch_id: RuntimeEpochId,
@@ -137,9 +159,19 @@ impl<D> OperationTerminalIdentity<D> {
     ) -> Self {
         Self {
             operation_id,
-            owner_session_id,
-            runtime_epoch_id,
-            canonical_input_id,
+            execution_scope: OperationTerminalScope::RuntimeInput {
+                owner_session_id,
+                runtime_epoch_id,
+                canonical_input_id,
+            },
+            domain_correlation,
+        }
+    }
+
+    pub fn for_domain(operation_id: OperationId, domain_correlation: D) -> Self {
+        Self {
+            operation_id,
+            execution_scope: OperationTerminalScope::Domain,
             domain_correlation,
         }
     }
@@ -148,16 +180,8 @@ impl<D> OperationTerminalIdentity<D> {
         &self.operation_id
     }
 
-    pub fn owner_session_id(&self) -> &SessionId {
-        &self.owner_session_id
-    }
-
-    pub fn runtime_epoch_id(&self) -> &RuntimeEpochId {
-        &self.runtime_epoch_id
-    }
-
-    pub fn canonical_input_id(&self) -> &InputId {
-        &self.canonical_input_id
+    pub fn execution_scope(&self) -> &OperationTerminalScope {
+        &self.execution_scope
     }
 
     pub fn domain_correlation(&self) -> &D {
@@ -167,11 +191,22 @@ impl<D> OperationTerminalIdentity<D> {
 
 impl<D: Clone> From<&ExactOperationIdentity<D>> for OperationTerminalIdentity<D> {
     fn from(identity: &ExactOperationIdentity<D>) -> Self {
+        let execution_scope = match &identity.execution_scope {
+            OperationExecutionScope::RuntimeInput {
+                owner_session_id,
+                runtime_epoch_id,
+                canonical_input_id,
+                ..
+            } => OperationTerminalScope::RuntimeInput {
+                owner_session_id: owner_session_id.clone(),
+                runtime_epoch_id: runtime_epoch_id.clone(),
+                canonical_input_id: canonical_input_id.clone(),
+            },
+            OperationExecutionScope::Domain => OperationTerminalScope::Domain,
+        };
         Self {
             operation_id: identity.operation_id.clone(),
-            owner_session_id: identity.owner_session_id.clone(),
-            runtime_epoch_id: identity.runtime_epoch_id.clone(),
-            canonical_input_id: identity.canonical_input_id.clone(),
+            execution_scope,
             domain_correlation: identity.domain_correlation.clone(),
         }
     }
@@ -195,12 +230,8 @@ impl<D, T> OperationTerminal<D, T> {
 pub enum OperationAttributionError {
     #[error("terminal operation id does not match the admitted operation")]
     OperationMismatch,
-    #[error("terminal owner session does not match the admitted operation")]
-    OwnerSessionMismatch,
-    #[error("terminal runtime epoch does not match the admitted operation")]
-    RuntimeEpochMismatch,
-    #[error("terminal canonical input does not match the admitted operation")]
-    CanonicalInputMismatch,
+    #[error("terminal execution scope does not match the admitted operation")]
+    ExecutionScopeMismatch,
     #[error("terminal domain correlation does not match the admitted operation")]
     DomainCorrelationMismatch,
     #[error("terminal payload could not be encoded for exact receipt custody")]
@@ -226,14 +257,8 @@ impl<D: Clone + PartialEq, T: Serialize> TerminalReceipt<D, T> {
         if actual.operation_id != expected.operation_id {
             return Err(OperationAttributionError::OperationMismatch);
         }
-        if actual.owner_session_id != expected.owner_session_id {
-            return Err(OperationAttributionError::OwnerSessionMismatch);
-        }
-        if actual.runtime_epoch_id != expected.runtime_epoch_id {
-            return Err(OperationAttributionError::RuntimeEpochMismatch);
-        }
-        if actual.canonical_input_id != expected.canonical_input_id {
-            return Err(OperationAttributionError::CanonicalInputMismatch);
+        if actual.execution_scope != OperationTerminalIdentity::from(expected).execution_scope {
+            return Err(OperationAttributionError::ExecutionScopeMismatch);
         }
         if actual.domain_correlation != expected.domain_correlation {
             return Err(OperationAttributionError::DomainCorrelationMismatch);
@@ -523,7 +548,7 @@ mod tests {
 
     fn identity(domain_correlation: u64) -> ExactOperationIdentity<u64> {
         let canonical = InputId::new();
-        ExactOperationIdentity::new(
+        ExactOperationIdentity::for_runtime_input(
             OperationId::new(),
             SessionId::new(),
             RuntimeEpochId::new(),
@@ -604,17 +629,14 @@ mod tests {
         wrong.operation_id = OperationId::new();
         cases.push((wrong, OperationAttributionError::OperationMismatch));
 
-        let mut wrong = OperationTerminalIdentity::from(expected.identity());
-        wrong.owner_session_id = SessionId::new();
-        cases.push((wrong, OperationAttributionError::OwnerSessionMismatch));
-
-        let mut wrong = OperationTerminalIdentity::from(expected.identity());
-        wrong.runtime_epoch_id = RuntimeEpochId::new();
-        cases.push((wrong, OperationAttributionError::RuntimeEpochMismatch));
-
-        let mut wrong = OperationTerminalIdentity::from(expected.identity());
-        wrong.canonical_input_id = InputId::new();
-        cases.push((wrong, OperationAttributionError::CanonicalInputMismatch));
+        let wrong = OperationTerminalIdentity::for_runtime_input(
+            expected.identity().operation_id().clone(),
+            SessionId::new(),
+            RuntimeEpochId::new(),
+            InputId::new(),
+            *expected.identity().domain_correlation(),
+        );
+        cases.push((wrong, OperationAttributionError::ExecutionScopeMismatch));
 
         let mut wrong = OperationTerminalIdentity::from(expected.identity());
         wrong.domain_correlation = 8;
@@ -629,6 +651,22 @@ mod tests {
                 Err(expected_error),
             );
         }
+
+        let domain_admission = OperationAdmissionReceipt::new(
+            ExactOperationIdentity::for_domain(OperationId::new(), 33),
+            OperationAcceptClass::Fresh,
+            None,
+        );
+        let domain_terminal = OperationTerminal::new(
+            OperationTerminalIdentity::from(domain_admission.identity()),
+            "domain-done",
+        );
+        assert_eq!(
+            TerminalReceipt::try_from_terminal(domain_admission, domain_terminal)
+                .expect("domain terminal needs no fabricated runtime identity")
+                .terminal(),
+            &"domain-done"
+        );
     }
 
     #[test]

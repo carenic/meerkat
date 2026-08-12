@@ -1481,6 +1481,8 @@ enum SubmitWorkDispatchCompletion {
     AwaitTurnCompletion {
         member_ref: MemberRef,
         req: Box<meerkat_core::service::StartTurnRequest>,
+        completion_tx: Option<super::handle::ExactTurnCompletionSender>,
+        bounded_result_spec: Option<super::handle::BoundedResultSpec>,
         /// See [`Self::AwaitTurnAdmission::placed_identity`].
         placed_identity: Option<AgentIdentity>,
         /// Exact MobMachine-owned incarnation for the placed completion
@@ -1530,6 +1532,7 @@ struct SubmitWorkDispatchRequest {
     event_tx:
         Option<tokio::sync::mpsc::Sender<meerkat_core::EventEnvelope<meerkat_core::AgentEvent>>>,
     completion_tx: Option<super::handle::ExactTurnCompletionSender>,
+    bounded_result_spec: Option<super::handle::BoundedResultSpec>,
     llm_identity_applied_tx: Option<super::handle::MemberTurnLlmIdentityAppliedSender>,
     ack_mode: crate::mob_machine::SubmitWorkAckMode,
     operation_id: Option<meerkat_core::ops::OperationId>,
@@ -4978,6 +4981,13 @@ pub(super) struct MobActor {
     pub(super) placed_completion_durable_index: Arc<std::sync::Mutex<PlacedCompletionDurableIndex>>,
     pub(super) run_store: Arc<dyn MobRunStore>,
     pub(super) provisioner: Arc<dyn MobProvisioner>,
+    /// Session-operation binding authority shared with the provisioner's
+    /// session backend (capability plumbing only, never lifecycle truth).
+    /// The pre-retire runtime quiesce path consults it so a durability-reload
+    /// discard retains the exact bound operation identity for the later
+    /// finalization-boundary rebind.
+    #[cfg(feature = "runtime-adapter")]
+    pub(super) session_ops_adapter: Arc<super::ops_adapter::MobOpsAdapter>,
     pub(super) flow_engine: FlowEngine,
     /// Whether this mob's definition declares an orchestrator.
     /// Gates orchestrator-specific transitions and notification fan-out.
@@ -5002,6 +5012,9 @@ pub(super) struct MobActor {
     /// is the `#[cfg(test)]`-gated `machine_active_run_count` snapshot.
     pub(super) run_tasks: BTreeMap<RunId, tokio::task::JoinHandle<()>>,
     pub(super) run_cancel_tokens: BTreeMap<RunId, (tokio_util::sync::CancellationToken, FlowId)>,
+    /// Owner-scoped exact terminal custody for active Flow admissions.
+    /// MobRun and MobMachine remain the durable lifecycle authorities.
+    pub(super) flow_exact_operations: BTreeMap<RunId, super::handle::FlowOperationCustody>,
     pub(super) flow_streams:
         Arc<tokio::sync::Mutex<BTreeMap<RunId, mpsc::Sender<meerkat_core::ScopedAgentEvent>>>>,
     pub(super) command_tx: mpsc::Sender<RoutedMobCommand>,
@@ -12825,6 +12838,7 @@ impl MobActor {
                                 transcript_interaction_id: None,
                                 expected_member,
                                 outcome_tracking: None,
+                                bounded_result_spec: None,
                             }),
                         )
                         .await
@@ -20296,6 +20310,8 @@ impl MobActor {
                         Ok(SubmitWorkDispatchCompletion::AwaitTurnCompletion {
                             member_ref,
                             req,
+                            completion_tx,
+                            bounded_result_spec,
                             placed_identity,
                             placed_incarnation,
                             placed_input_id,
@@ -20396,6 +20412,8 @@ impl MobActor {
                                 self.provisioner.clone(),
                                 member_ref,
                                 req,
+                                completion_tx,
+                                bounded_result_spec,
                                 reply_tx,
                                 placed_identity.map(|identity| (self.command_tx.clone(), identity)),
                                 remote,
@@ -20457,6 +20475,7 @@ impl MobActor {
                     activation_params,
                     external_delivery_intent,
                     scoped_event_tx,
+                    exact_operation,
                     reply_tx,
                 } => {
                     let result = self
@@ -20466,6 +20485,7 @@ impl MobActor {
                             activation_params,
                             external_delivery_intent,
                             scoped_event_tx,
+                            exact_operation,
                         )
                         .await;
                     let _ = reply_tx.send(result);
@@ -36530,6 +36550,7 @@ impl MobActor {
         if cleanup_retry && let Some(session_id) = entry.member_ref.bridge_session_id() {
             super::provisioner::MemberSessionDisposalArc::cancel_active_runtime_turn_before_retire_with_adapter_until(
                 self.runtime_adapter.as_ref(),
+                Some(&self.session_ops_adapter),
                 session_id,
                 retirement_deadline,
             )
@@ -36685,6 +36706,7 @@ impl MobActor {
         if let Some(session_id) = entry.member_ref.bridge_session_id() {
             super::provisioner::MemberSessionDisposalArc::cancel_active_runtime_turn_before_retire_with_adapter_until(
                 self.runtime_adapter.as_ref(),
+                Some(&self.session_ops_adapter),
                 session_id,
                 retirement_deadline,
             )
@@ -46436,8 +46458,9 @@ impl MobActor {
             turn_metadata,
             event_tx,
             completion_tx,
+            bounded_result_spec,
             llm_identity_applied_tx,
-            ack_mode,
+            mut ack_mode,
         } = *payload;
         tracing::debug!(
             agent_identity = %runtime_id.identity,
@@ -46620,6 +46643,15 @@ impl MobActor {
         let turn_metadata = submit_work_turn_metadata(turn_metadata, interaction_id, objective_id)?;
         let remotely_hosted =
             super::member_runtime_is_host_owned(self.dsl_authority.state(), &entry.agent_identity);
+        if remotely_hosted && bounded_result_spec.is_some() {
+            if completion_tx.is_none() {
+                return Err(MobError::Internal(
+                    "placed bounded result requested without an exact completion receiver"
+                        .to_string(),
+                ));
+            }
+            ack_mode = crate::mob_machine::SubmitWorkAckMode::TurnCompleted;
+        }
         if remotely_hosted
             && !injected_context.is_empty()
             && turn_metadata
@@ -46883,6 +46915,7 @@ impl MobActor {
                     turn_metadata,
                     event_tx,
                     completion_tx,
+                    bounded_result_spec,
                     llm_identity_applied_tx,
                     ack_mode,
                     operation_id: None,
@@ -47088,11 +47121,14 @@ impl MobActor {
         error
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_turn_completed_reply(
         &mut self,
         provisioner: Arc<dyn MobProvisioner>,
         member_ref: MemberRef,
         req: Box<meerkat_core::service::StartTurnRequest>,
+        completion_tx: Option<super::handle::ExactTurnCompletionSender>,
+        bounded_result_spec: Option<super::handle::BoundedResultSpec>,
         mut reply_tx: oneshot::Sender<Result<(), MobError>>,
         revival: Option<(mpsc::Sender<RoutedMobCommand>, AgentIdentity)>,
         remote: Option<PreparedPlacedCompletionWait>,
@@ -47120,6 +47156,13 @@ impl MobActor {
                             outcome_tracking: Some(
                                 super::bridge_protocol::BridgeOutcomeTracking::Interaction,
                             ),
+                            bounded_result_spec: bounded_result_spec.as_ref().map(|spec| {
+                                super::bridge_protocol::BridgeBoundedResultSpec {
+                                    label: spec.label().to_string(),
+                                    max_text_bytes: u64::try_from(spec.max_text_bytes())
+                                        .unwrap_or(u64::MAX),
+                                }
+                            }),
                         }),
                         Some((
                             handle,
@@ -47259,10 +47302,39 @@ impl MobActor {
                         }
                         Ok(terminal) => {
                             match terminal {
-                                    super::event_pump::RemoteInteractionTerminal::Complete
-                                    | super::event_pump::RemoteInteractionTerminal::CallbackPending {
-                                        ..
-                                    } => Ok(()),
+                                super::event_pump::RemoteInteractionTerminal::Complete
+                                    if bounded_result_spec.is_some() => Err(MobError::Internal(
+                                        "placed bounded turn reached an ordinary terminal without its exact result sidecar"
+                                            .to_string(),
+                                    )),
+                                super::event_pump::RemoteInteractionTerminal::Complete
+                                | super::event_pump::RemoteInteractionTerminal::CallbackPending {
+                                    ..
+                                } => Ok(()),
+                                super::event_pump::RemoteInteractionTerminal::BoundedComplete(
+                                    bounded,
+                                ) => {
+                                    if let Some(completion_tx) = completion_tx {
+                                        match SessionId::parse(&bounded.session_id) {
+                                            Ok(session_id) => {
+                                                let _ = completion_tx.send(Ok(
+                                                    super::handle::ExactTurnCompletion {
+                                                        session_id,
+                                                        terminal: super::handle::ExactTurnTerminal::PlacedBounded(
+                                                            bounded,
+                                                        ),
+                                                    },
+                                                ));
+                                                Ok(())
+                                            }
+                                            Err(error) => Err(MobError::Internal(format!(
+                                                    "placed bounded result carried invalid session id: {error}"
+                                                ))),
+                                        }
+                                    } else {
+                                        Ok(())
+                                    }
+                                }
                                     super::event_pump::RemoteInteractionTerminal::Failed {
                                         reason,
                                     } => Err(MobError::Internal(format!(
@@ -47334,6 +47406,7 @@ impl MobActor {
                                         // IngressAccepted carries no retained
                                         // terminal-publication custody.
                                         outcome_tracking: None,
+                                        bounded_result_spec: None,
                                     }),
                                 )
                                 .await
@@ -47465,6 +47538,7 @@ impl MobActor {
                     turn_metadata: None,
                     event_tx: None,
                     completion_tx: None,
+                    bounded_result_spec: None,
                     llm_identity_applied_tx: None,
                     ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
                     operation_id: Some(operation_id.clone()),
@@ -47607,6 +47681,7 @@ impl MobActor {
                                 transcript_interaction_id,
                                 expected_member,
                                 outcome_tracking: None,
+                                bounded_result_spec: None,
                             }),
                         )
                         .await
@@ -47645,6 +47720,7 @@ impl MobActor {
                 placed_input_id: _,
                 placed_completion_obligation: _,
                 placed_completion_context: _,
+                ..
             } => {
                 tracing::debug!(
                     member_ref = ?member_ref,
@@ -47719,6 +47795,7 @@ impl MobActor {
             turn_metadata,
             event_tx,
             completion_tx,
+            bounded_result_spec,
             llm_identity_applied_tx,
             ack_mode,
             operation_id,
@@ -47897,6 +47974,8 @@ impl MobActor {
                     Ok(SubmitWorkDispatchCompletion::AwaitTurnCompletion {
                         member_ref: machine_member_ref,
                         req: Box::new(req),
+                        completion_tx,
+                        bounded_result_spec,
                         placed_identity,
                         placed_incarnation,
                         placed_input_id,
@@ -48106,6 +48185,8 @@ impl MobActor {
                         Ok(SubmitWorkDispatchCompletion::AwaitTurnCompletion {
                             member_ref: machine_member_ref,
                             req,
+                            completion_tx,
+                            bounded_result_spec,
                             placed_identity,
                             placed_incarnation,
                             placed_input_id,
@@ -48616,11 +48697,23 @@ impl MobActor {
         activation_params: serde_json::Value,
         external_delivery_intent: Option<crate::store::MobExternalDeliveryIntent>,
         scoped_event_tx: Option<mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
+        exact_operation: Option<super::handle::FlowOperationCustody>,
     ) -> Result<RunId, MobError> {
         self.ensure_pending_spawn_alignment("handle_run_flow preflight")?;
         self.ensure_flow_tracker_alignment("handle_run_flow preflight")
             .await?;
         let run_id = requested_run_id.unwrap_or_default();
+        if let Some(custody) = exact_operation.as_ref() {
+            let correlation = custody.admission().identity().domain_correlation().clone();
+            if correlation.mob_id != self.definition.id
+                || correlation.run_id != run_id
+                || correlation.flow_id != flow_id
+            {
+                return Err(MobError::Internal(
+                    "exact Flow admission correlation did not match mob, run, and flow".to_string(),
+                ));
+            }
+        }
         if let Some(existing) = self.run_store.get_run(&run_id).await? {
             if existing.mob_id != self.definition.id
                 || existing.flow_id != flow_id
@@ -48928,6 +49021,9 @@ impl MobActor {
                 .await
                 .insert(run_id.clone(), scoped_event_tx);
         }
+        if let Some(custody) = exact_operation {
+            self.flow_exact_operations.insert(run_id.clone(), custody);
+        }
 
         let engine = self.flow_engine.clone();
         let cleanup_tx = self.command_tx.clone();
@@ -49201,6 +49297,8 @@ impl MobActor {
         }
 
         if !has_task && !has_token && !has_stream {
+            self.resolve_flow_exact_operation(&run_id).await;
+            self.flow_exact_operations.remove(&run_id);
             tracing::debug!(
                 run_id = %run_id,
                 context = context,
@@ -49215,6 +49313,8 @@ impl MobActor {
         let _ = self.run_tasks.remove(&run_id);
         let _ = self.run_cancel_tokens.remove(&run_id);
         let _ = self.flow_streams.lock().await.remove(&run_id);
+        self.resolve_flow_exact_operation(&run_id).await;
+        self.flow_exact_operations.remove(&run_id);
         self.ensure_flow_tracker_alignment("handle_flow_cleanup completion")
             .await?;
         Ok(())
@@ -49268,6 +49368,8 @@ impl MobActor {
                     ))
                 })?;
             let _ = self.run_cancel_tokens.remove(&run_id);
+            self.resolve_flow_exact_operation(&run_id).await;
+            self.flow_exact_operations.remove(&run_id);
             self.ensure_flow_tracker_alignment("handle_cancel_flow no-task cleanup")
                 .await?;
             return Ok(());
@@ -49970,10 +50072,46 @@ impl MobActor {
             self.apply_dsl_signal(mob_dsl::MobMachineSignal::FinishRun, "cancel_all_flow")?;
 
             let _ = self.run_cancel_tokens.remove(&run_id);
+            self.resolve_flow_exact_operation(&run_id).await;
+            self.flow_exact_operations.remove(&run_id);
         }
         self.ensure_flow_tracker_alignment("cancel_all_flow_tasks completion")
             .await?;
         Ok(())
+    }
+
+    async fn resolve_flow_exact_operation(&self, run_id: &RunId) {
+        let Some(custody) = self.flow_exact_operations.get(run_id) else {
+            return;
+        };
+        let terminal = match self.run_store.get_run(run_id).await {
+            Ok(Some(run)) => {
+                match crate::run::mob_machine_run_status_is_terminal(&run.run_id, &run.status) {
+                    Ok(true) => Ok(run),
+                    Ok(false) => return,
+                    Err(error) => Err(super::handle::FlowRunTerminalUnavailable::new(
+                        error.to_string(),
+                    )),
+                }
+            }
+            Ok(None) => Err(super::handle::FlowRunTerminalUnavailable::new(
+                "terminal Flow run was absent after cleanup admission",
+            )),
+            Err(error) => Err(super::handle::FlowRunTerminalUnavailable::new(
+                error.to_string(),
+            )),
+        };
+        let identity =
+            meerkat_core::OperationTerminalIdentity::from(custody.admission().identity());
+        if let Err(error) =
+            custody.resolve_terminal(meerkat_core::OperationTerminal::new(identity, terminal))
+        {
+            tracing::error!(
+                run_id = %run_id,
+                error = %error,
+                "exact Flow terminal receipt resolution failed"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

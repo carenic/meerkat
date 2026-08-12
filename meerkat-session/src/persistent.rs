@@ -2831,11 +2831,15 @@ impl<'a> MachineSessionArchiveProtocol<'a> {
             )))
         })?;
         let retire = match (stored_only_publication_handle, post_commit_hook) {
-            (Some(_), Some(_)) => Err(meerkat_runtime::RuntimeControlPlaneError::Internal(
-                format!(
-                    "machine archive for session {id} cannot combine publication and post-commit hooks"
-                ),
-            )),
+            (Some(publication_handle), Some(post_commit_hook)) => self
+                .runtime_adapter
+                .retire_session_with_archive_lease_publication_handle_and_post_commit_hook_before(
+                    lease,
+                    publication_handle,
+                    post_commit_hook,
+                    deadline,
+                )
+                .await,
             (Some(publication_handle), None) => {
                 self.runtime_adapter
                     .retire_session_with_archive_lease_and_publication_handle_before(
@@ -9601,7 +9605,17 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             // RuntimeStore owns the absorbing lifecycle terminal. Session
             // bodies and SessionStore projections remain content only and are
             // never rewritten to carry archive authority.
-            if retire_runtime {
+            //
+            // A machine-owned retire may already have committed the quiescent
+            // runtime terminal before this archive observed it (the mob
+            // lifecycle drives RequestRuntimeRetire ahead of disposal). A
+            // caller-supplied post-commit hook still owes its terminalization
+            // under this exact retained lease, so the idempotent retire
+            // commit is driven for it even when no lifecycle transition
+            // remains.
+            let drive_runtime_retire =
+                retire_runtime || (post_commit_hook.is_some() && archive_lease.is_some());
+            if drive_runtime_retire {
                 // The runtime process task must run without either M or R.
                 // M moves into retire_session and is released before its
                 // callback starts; release R here, then reacquire it only

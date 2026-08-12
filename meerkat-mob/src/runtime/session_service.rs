@@ -1335,6 +1335,24 @@ pub trait MobSessionService:
         )))
     }
 
+    #[cfg(feature = "runtime-adapter")]
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_and_hook_before(
+        &self,
+        session_id: &SessionId,
+        deadline: meerkat_core::time_compat::Instant,
+        post_commit_hook: Option<Arc<dyn meerkat_runtime::MachineSessionArchivePostCommitHook>>,
+    ) -> Result<(), SessionError> {
+        if post_commit_hook.is_some() {
+            return Err(SessionError::Unsupported(format!(
+                "session service cannot run a pre-retire archive hook for session {session_id}"
+            )));
+        }
+        self.archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+            session_id, deadline,
+        )
+        .await
+    }
+
     async fn apply_runtime_turn(
         &self,
         _session_id: &SessionId,
@@ -1470,6 +1488,21 @@ pub trait MobSessionService:
     ) -> Result<bool, SessionError> {
         Err(SessionError::Unsupported(format!(
             "session service cannot discard exact live actor for {}",
+            witness.session_id()
+        )))
+    }
+
+    /// Discard only process-local material for one exact actor after the
+    /// runtime store lost durable write authority. The machine's exact
+    /// degraded-registration coordinator owns the caller, so implementations
+    /// must not acquire the turn-finalization boundary or persist terminal
+    /// session or runtime state.
+    async fn discard_live_session_actor_after_durability_reload_required(
+        &self,
+        witness: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<bool, SessionError> {
+        Err(SessionError::Unsupported(format!(
+            "session service cannot run durability-reload actor discard for {}",
             witness.session_id()
         )))
     }
@@ -1870,6 +1903,17 @@ where
         &self,
         witness: &meerkat_session::LiveSessionActorWitness,
     ) -> Result<bool, SessionError> {
+        meerkat_session::EphemeralSessionService::<B>::discard_live_session_actor(self, witness)
+            .await
+    }
+
+    async fn discard_live_session_actor_after_durability_reload_required(
+        &self,
+        witness: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<bool, SessionError> {
+        // Ephemeral actors are process-local by construction and have no
+        // checkpointer sidecars; the exact compare-and-remove is the whole
+        // degraded cleanup and persists nothing.
         meerkat_session::EphemeralSessionService::<B>::discard_live_session_actor(self, witness)
             .await
     }
@@ -2376,6 +2420,33 @@ where
         <Self as SessionService>::archive(self, session_id).await
     }
 
+    #[cfg(feature = "runtime-adapter")]
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_and_hook_before(
+        &self,
+        session_id: &SessionId,
+        deadline: meerkat_core::time_compat::Instant,
+        post_commit_hook: Option<Arc<dyn meerkat_runtime::MachineSessionArchivePostCommitHook>>,
+    ) -> Result<(), SessionError> {
+        if let Some(runtime_adapter) = self.runtime_adapter() {
+            return meerkat_session::PersistentSessionService::<B>::archive_with_machine_protocol_under_runtime_turn_boundary_and_hook_before(
+                self,
+                session_id,
+                meerkat_session::MachineSessionArchiveProtocol::from_machine(
+                    runtime_adapter.as_ref(),
+                ),
+                deadline,
+                post_commit_hook,
+            )
+            .await;
+        }
+        if post_commit_hook.is_some() {
+            return Err(SessionError::Unsupported(format!(
+                "non-runtime persistent session {session_id} cannot run a pre-retire archive hook"
+            )));
+        }
+        <Self as SessionService>::archive(self, session_id).await
+    }
+
     async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary(
         &self,
         session_id: &SessionId,
@@ -2655,6 +2726,16 @@ where
         witness: &meerkat_session::LiveSessionActorWitness,
     ) -> Result<bool, SessionError> {
         meerkat_session::PersistentSessionService::<B>::discard_live_session_actor_under_runtime_turn_boundary(
+            self, witness,
+        )
+        .await
+    }
+
+    async fn discard_live_session_actor_after_durability_reload_required(
+        &self,
+        witness: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<bool, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::discard_live_session_actor_after_durability_reload_required(
             self, witness,
         )
         .await

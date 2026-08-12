@@ -7902,6 +7902,25 @@
         "description": "One-time bootstrap proof exchanged between a mob supervisor and a\nmember runtime on initial bind.\n\nTransparent over the wire (`#[serde(transparent)]` — a bare JSON string),\nbut carries a redacting `Debug` impl and has no `Display` impl so the\nraw secret cannot accidentally land in logs or panic messages. Treat it\nlike an API key: read `as_str()` only at the comms/transport boundary.",
         "type": "string"
       },
+      "BridgeBoundedResultSpec": {
+        "additionalProperties": false,
+        "description": "Pre-admission receiver-owned bound for one exact placed turn result.",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "max_text_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "label",
+          "max_text_bytes"
+        ],
+        "type": "object"
+      },
       "BridgeDirectMemberFence": {
         "additionalProperties": false,
         "description": "Exact controller-member authority minted and stored by the receiving\npeer-only runtime during `BindMember`.\n\n`runtime_session_token` is opaque to the controller. It identifies the\nexact runtime epoch serving `member_session_id`; callers cannot reconstruct\nit from the session id or the Mob semantic incarnation. Retirement must\npresent this complete value byte-for-byte.",
@@ -10851,6 +10870,17 @@
         "additionalProperties": false,
         "description": "Deliver one logical input to a member.",
         "properties": {
+          "bounded_result_spec": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/BridgeBoundedResultSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Receiver-owned result bound validated before tracked admission.\nRequires `outcome_tracking: interaction` and is retained durably with\nthe exact input's terminal sidecar."
+          },
           "command": {
             "const": "deliver_member_input",
             "type": "string"
@@ -12359,6 +12389,25 @@
         "description": "Canonical realm-local blob identifier.\n\nThe identifier is content-addressed, but storage and GC semantics remain\nrealm-scoped.",
         "type": "string"
       },
+      "BridgeBoundedResultSpec": {
+        "additionalProperties": false,
+        "description": "Pre-admission receiver-owned bound for one exact placed turn result.",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "max_text_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "label",
+          "max_text_bytes"
+        ],
+        "type": "object"
+      },
       "BridgeMemberIncarnation": {
         "additionalProperties": false,
         "description": "Exact cross-host member residency addressed by one directed delivery.",
@@ -12794,6 +12843,17 @@
     "additionalProperties": false,
     "description": "Deliver one logical input to a member.",
     "properties": {
+      "bounded_result_spec": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/BridgeBoundedResultSpec"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Receiver-owned result bound validated before tracked admission.\nRequires `outcome_tracking: interaction` and is retained durably with\nthe exact input's terminal sidecar."
+      },
       "content": {
         "$ref": "#/$defs/ContentInput"
       },
@@ -19315,6 +19375,46 @@
         ],
         "type": "object"
       },
+      "BridgeBoundedTurnResult": {
+        "additionalProperties": false,
+        "description": "Durable exact bounded result retained with one tracked input terminal.",
+        "properties": {
+          "max_text_bytes": {
+            "description": "Exact pre-admission byte cap that produced `result`.\n\nRetaining the cap prevents a replay with the same label but a different\nbound from accepting a result computed under another operation contract.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "result": {
+            "$ref": "#/$defs/MobBoundedHelperResult"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "tool_calls": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "turns": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "usage": {
+            "$ref": "#/$defs/Usage"
+          }
+        },
+        "required": [
+          "result",
+          "max_text_bytes",
+          "session_id",
+          "usage",
+          "turns",
+          "tool_calls"
+        ],
+        "type": "object"
+      },
       "BridgeHostRuntimeIncarnation": {
         "description": "Per-process incarnation reported by a member host.\n\nThe host mints this once per actor boot. It is an authenticated observation\ntrigger, not a host-owned authority fact: a controller that observes a new\nvalue re-realizes its own durable routing intent because member peer-trust\nrows are process-local.",
         "type": "string"
@@ -19323,6 +19423,17 @@
         "additionalProperties": false,
         "description": "Terminal outcome record for a directed turn, delivered as a sidecar on\n`MemberEventsPage` (the event envelope rows themselves stay unchanged —\n§7 envelope freeze).",
         "properties": {
+          "bounded_result": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/BridgeBoundedTurnResult"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Receiver-bounded exact result for a tracked plain interaction.\n\nPresent only when the delivery supplied `bounded_result_spec` before\nadmission and the exact terminal carried a committed `RunResult`."
+          },
           "fence_token": {
             "description": "Materialization fence paired with `generation`. A same-generation\nhigher-fence residency must not accept an older watcher's terminal.",
             "format": "uint64",
@@ -20258,6 +20369,40 @@
           "plan"
         ],
         "type": "object"
+      },
+      "MobBoundedHelperResult": {
+        "description": "Receiver-bounded helper payload with explicit truncation state.",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/$defs/MobBoundedHelperResultStatus"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "status",
+          "text"
+        ],
+        "type": "object"
+      },
+      "MobBoundedHelperResultStatus": {
+        "description": "Typed terminal/truncation state for a bounded helper projection.",
+        "enum": [
+          "completed",
+          "completed_truncated",
+          "failed",
+          "failed_truncated",
+          "in_progress",
+          "in_progress_truncated",
+          "unavailable",
+          "unavailable_truncated"
+        ],
+        "type": "string"
       },
       "OpenAiImageMetadata": {
         "properties": {
@@ -27944,6 +28089,46 @@
         ],
         "type": "object"
       },
+      "BridgeBoundedTurnResult": {
+        "additionalProperties": false,
+        "description": "Durable exact bounded result retained with one tracked input terminal.",
+        "properties": {
+          "max_text_bytes": {
+            "description": "Exact pre-admission byte cap that produced `result`.\n\nRetaining the cap prevents a replay with the same label but a different\nbound from accepting a result computed under another operation contract.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "result": {
+            "$ref": "#/$defs/MobBoundedHelperResult"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "tool_calls": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "turns": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "usage": {
+            "$ref": "#/$defs/Usage"
+          }
+        },
+        "required": [
+          "result",
+          "max_text_bytes",
+          "session_id",
+          "usage",
+          "turns",
+          "tool_calls"
+        ],
+        "type": "object"
+      },
       "BridgeCapabilities": {
         "additionalProperties": false,
         "description": "Capabilities advertised by a member runtime on bind.",
@@ -29360,6 +29545,17 @@
         "additionalProperties": false,
         "description": "Terminal outcome record for a directed turn, delivered as a sidecar on\n`MemberEventsPage` (the event envelope rows themselves stay unchanged —\n§7 envelope freeze).",
         "properties": {
+          "bounded_result": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/BridgeBoundedTurnResult"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Receiver-bounded exact result for a tracked plain interaction.\n\nPresent only when the delivery supplied `bounded_result_spec` before\nadmission and the exact terminal carried a committed `RunResult`."
+          },
           "fence_token": {
             "description": "Materialization fence paired with `generation`. A same-generation\nhigher-fence residency must not accept an older watcher's terminal.",
             "format": "uint64",
@@ -30608,6 +30804,40 @@
             "type": "object"
           }
         ]
+      },
+      "MobBoundedHelperResult": {
+        "description": "Receiver-bounded helper payload with explicit truncation state.",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/$defs/MobBoundedHelperResultStatus"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "status",
+          "text"
+        ],
+        "type": "object"
+      },
+      "MobBoundedHelperResultStatus": {
+        "description": "Typed terminal/truncation state for a bounded helper projection.",
+        "enum": [
+          "completed",
+          "completed_truncated",
+          "failed",
+          "failed_truncated",
+          "in_progress",
+          "in_progress_truncated",
+          "unavailable",
+          "unavailable_truncated"
+        ],
+        "type": "string"
       },
       "OpenAiImageMetadata": {
         "properties": {
@@ -36263,6 +36493,215 @@
   },
   "BridgeTurnOutcomeRecord": {
     "$defs": {
+      "BridgeBoundedTurnResult": {
+        "additionalProperties": false,
+        "description": "Durable exact bounded result retained with one tracked input terminal.",
+        "properties": {
+          "max_text_bytes": {
+            "description": "Exact pre-admission byte cap that produced `result`.\n\nRetaining the cap prevents a replay with the same label but a different\nbound from accepting a result computed under another operation contract.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "result": {
+            "$ref": "#/$defs/MobBoundedHelperResult"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "tool_calls": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "turns": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "usage": {
+            "$ref": "#/$defs/Usage"
+          }
+        },
+        "required": [
+          "result",
+          "max_text_bytes",
+          "session_id",
+          "usage",
+          "turns",
+          "tool_calls"
+        ],
+        "type": "object"
+      },
+      "MobBoundedHelperResult": {
+        "description": "Receiver-bounded helper payload with explicit truncation state.",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/$defs/MobBoundedHelperResultStatus"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "status",
+          "text"
+        ],
+        "type": "object"
+      },
+      "MobBoundedHelperResultStatus": {
+        "description": "Typed terminal/truncation state for a bounded helper projection.",
+        "enum": [
+          "completed",
+          "completed_truncated",
+          "failed",
+          "failed_truncated",
+          "in_progress",
+          "in_progress_truncated",
+          "unavailable",
+          "unavailable_truncated"
+        ],
+        "type": "string"
+      },
+      "PresentedTokenConvention": {
+        "description": "Provider-native convention used to normalize tokens presented to a model.",
+        "oneOf": [
+          {
+            "const": "anthropic_disjoint_input_components",
+            "description": "Anthropic reports uncached, cache-write, and cache-read input as\ndisjoint components. The normalized total is their saturating sum.",
+            "type": "string"
+          },
+          {
+            "const": "open_ai_input_includes_cached_subset",
+            "description": "OpenAI prompt/input tokens already include the cached-token subset.",
+            "type": "string"
+          },
+          {
+            "const": "gemini_prompt_includes_cached_subset",
+            "description": "Gemini prompt tokens already include the cached-content subset.",
+            "type": "string"
+          },
+          {
+            "const": "open_ai_compatible_prompt_includes_cache_details",
+            "description": "OpenAI-compatible prompt tokens are treated as the provider's inclusive\nprompt total; cache detail fields are observational subsets only.",
+            "type": "string"
+          },
+          {
+            "const": "host_declared_inclusive_input_total",
+            "description": "A custom/embedded client explicitly declares its `input_tokens` field\nas an inclusive presented-input total. This is never inferred from\ncache detail fields.",
+            "type": "string"
+          }
+        ]
+      },
+      "Provider": {
+        "description": "Supported LLM providers.\n\n`JsonSchema` is derived unconditionally (schemars is a non-optional\nmeerkat-core dependency): config-owned types such as\n[`crate::config::CustomModelConfig`] embed the typed provider directly and\nderive their schemas without the `schema` feature.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "gemini",
+          "self_hosted",
+          "other"
+        ],
+        "type": "string"
+      },
+      "ProviderTokenAccounting": {
+        "additionalProperties": false,
+        "description": "One provider adapter's normalized accounting for a single model turn.",
+        "properties": {
+          "aggregation": {
+            "$ref": "#/$defs/TokenAggregationProvenance"
+          },
+          "convention": {
+            "$ref": "#/$defs/PresentedTokenConvention"
+          },
+          "model": {
+            "type": "string"
+          },
+          "presented_tokens": {
+            "description": "Tokens presented to the model for this request. Output tokens are not\nincluded.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "presented_tokens",
+          "convention",
+          "aggregation"
+        ],
+        "type": "object"
+      },
+      "TokenAggregationProvenance": {
+        "description": "How the provider adapter obtained the normalized presented-token total.",
+        "oneOf": [
+          {
+            "const": "sum_disjoint_provider_components",
+            "description": "Sum of provider-documented disjoint input components.",
+            "type": "string"
+          },
+          {
+            "const": "provider_inclusive_input_total",
+            "description": "Provider-issued inclusive prompt/input total copied without adding\ncache detail fields.",
+            "type": "string"
+          }
+        ]
+      },
+      "Usage": {
+        "description": "Token usage statistics",
+        "properties": {
+          "cache_creation_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cache_read_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider_accounting": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProviderTokenAccounting"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider-authored normalized input accounting for one model turn.\n\nCumulative usage intentionally leaves this `None`: an aggregate may\nspan providers and models and therefore cannot truthfully carry one\nper-turn convention. Shared policy reads [`Usage::presented_tokens`]\non turn usage and never interprets cache detail fields directly."
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens"
+        ],
+        "type": "object"
+      },
       "WireFlowFailureDetail": {
         "additionalProperties": false,
         "description": "Presentation detail for a failed directed turn.\n\n`original_utf8_bytes` always names the byte length of the complete source\nstring. When `truncated` is true, `text` is the largest UTF-8 prefix the\nmember host could retain while keeping the complete\n[`BridgeTurnOutcomeRecord`] within the durable protocol bound.",
@@ -36366,6 +36805,17 @@
     "additionalProperties": false,
     "description": "Terminal outcome record for a directed turn, delivered as a sidecar on\n`MemberEventsPage` (the event envelope rows themselves stay unchanged —\n§7 envelope freeze).",
     "properties": {
+      "bounded_result": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/BridgeBoundedTurnResult"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Receiver-bounded exact result for a tracked plain interaction.\n\nPresent only when the delivery supplied `bounded_result_spec` before\nadmission and the exact terminal carried a committed `RunResult`."
+      },
       "fence_token": {
         "description": "Materialization fence paired with `generation`. A same-generation\nhigher-fence residency must not accept an older watcher's terminal.",
         "format": "uint64",
@@ -38347,6 +38797,65 @@
         "description": "One-time bootstrap proof exchanged between a mob supervisor and a\nmember runtime on initial bind.\n\nTransparent over the wire (`#[serde(transparent)]` — a bare JSON string),\nbut carries a redacting `Debug` impl and has no `Display` impl so the\nraw secret cannot accidentally land in logs or panic messages. Treat it\nlike an API key: read `as_str()` only at the comms/transport boundary.",
         "type": "string"
       },
+      "BridgeBoundedResultSpec": {
+        "additionalProperties": false,
+        "description": "Pre-admission receiver-owned bound for one exact placed turn result.",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "max_text_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "label",
+          "max_text_bytes"
+        ],
+        "type": "object"
+      },
+      "BridgeBoundedTurnResult": {
+        "additionalProperties": false,
+        "description": "Durable exact bounded result retained with one tracked input terminal.",
+        "properties": {
+          "max_text_bytes": {
+            "description": "Exact pre-admission byte cap that produced `result`.\n\nRetaining the cap prevents a replay with the same label but a different\nbound from accepting a result computed under another operation contract.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "result": {
+            "$ref": "#/$defs/MobBoundedHelperResult"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "tool_calls": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "turns": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "usage": {
+            "$ref": "#/$defs/Usage"
+          }
+        },
+        "required": [
+          "result",
+          "max_text_bytes",
+          "session_id",
+          "usage",
+          "turns",
+          "tool_calls"
+        ],
+        "type": "object"
+      },
       "BridgeCapabilities": {
         "additionalProperties": false,
         "description": "Capabilities advertised by a member runtime on bind.",
@@ -38553,6 +39062,17 @@
             "additionalProperties": false,
             "description": "Deliver one logical input to a member.",
             "properties": {
+              "bounded_result_spec": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/BridgeBoundedResultSpec"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Receiver-owned result bound validated before tracked admission.\nRequires `outcome_tracking: interaction` and is retained durably with\nthe exact input's terminal sidecar."
+              },
               "command": {
                 "const": "deliver_member_input",
                 "type": "string"
@@ -42065,6 +42585,17 @@
         "additionalProperties": false,
         "description": "Terminal outcome record for a directed turn, delivered as a sidecar on\n`MemberEventsPage` (the event envelope rows themselves stay unchanged —\n§7 envelope freeze).",
         "properties": {
+          "bounded_result": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/BridgeBoundedTurnResult"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Receiver-bounded exact result for a tracked plain interaction.\n\nPresent only when the delivery supplied `bounded_result_spec` before\nadmission and the exact terminal carried a committed `RunResult`."
+          },
           "fence_token": {
             "description": "Materialization fence paired with `generation`. A same-generation\nhigher-fence residency must not accept an older watcher's terminal.",
             "format": "uint64",
@@ -43984,6 +44515,40 @@
             "type": "object"
           }
         ]
+      },
+      "MobBoundedHelperResult": {
+        "description": "Receiver-bounded helper payload with explicit truncation state.",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/$defs/MobBoundedHelperResultStatus"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "status",
+          "text"
+        ],
+        "type": "object"
+      },
+      "MobBoundedHelperResultStatus": {
+        "description": "Typed terminal/truncation state for a bounded helper projection.",
+        "enum": [
+          "completed",
+          "completed_truncated",
+          "failed",
+          "failed_truncated",
+          "in_progress",
+          "in_progress_truncated",
+          "unavailable",
+          "unavailable_truncated"
+        ],
+        "type": "string"
       },
       "ObjectiveId": {
         "description": "Durable correlation identity for one delegated objective.",
@@ -49251,6 +49816,25 @@
         "description": "One-time bootstrap proof exchanged between a mob supervisor and a\nmember runtime on initial bind.\n\nTransparent over the wire (`#[serde(transparent)]` — a bare JSON string),\nbut carries a redacting `Debug` impl and has no `Display` impl so the\nraw secret cannot accidentally land in logs or panic messages. Treat it\nlike an API key: read `as_str()` only at the comms/transport boundary.",
         "type": "string"
       },
+      "BridgeBoundedResultSpec": {
+        "additionalProperties": false,
+        "description": "Pre-admission receiver-owned bound for one exact placed turn result.",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "max_text_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "label",
+          "max_text_bytes"
+        ],
+        "type": "object"
+      },
       "BridgeCommand": {
         "description": "A typed command sent from a supervisor to a member runtime, a mob host\ndaemon (host-addressed family), or — for exactly one family\n(`MemberOperatorRequest`) — from a member host to the controlling host.\n\nThe full `PartialEq + Eq` chain is load-bearing: the comms envelope\nenums (`CommsPeerRequestParams` et al.) derive `Eq` over this type.\nOpaque JSON in payloads therefore rides [`WireOpaqueJson`], never a\nbare `serde_json::Value`.",
         "oneOf": [
@@ -49360,6 +49944,17 @@
             "additionalProperties": false,
             "description": "Deliver one logical input to a member.",
             "properties": {
+              "bounded_result_spec": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/BridgeBoundedResultSpec"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Receiver-owned result bound validated before tracked admission.\nRequires `outcome_tracking: interaction` and is retained durably with\nthe exact input's terminal sidecar."
+              },
               "command": {
                 "const": "deliver_member_input",
                 "type": "string"
@@ -54905,6 +55500,46 @@
         ],
         "type": "object"
       },
+      "BridgeBoundedTurnResult": {
+        "additionalProperties": false,
+        "description": "Durable exact bounded result retained with one tracked input terminal.",
+        "properties": {
+          "max_text_bytes": {
+            "description": "Exact pre-admission byte cap that produced `result`.\n\nRetaining the cap prevents a replay with the same label but a different\nbound from accepting a result computed under another operation contract.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "result": {
+            "$ref": "#/$defs/MobBoundedHelperResult"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "tool_calls": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "turns": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "usage": {
+            "$ref": "#/$defs/Usage"
+          }
+        },
+        "required": [
+          "result",
+          "max_text_bytes",
+          "session_id",
+          "usage",
+          "turns",
+          "tool_calls"
+        ],
+        "type": "object"
+      },
       "BridgeCapabilities": {
         "additionalProperties": false,
         "description": "Capabilities advertised by a member runtime on bind.",
@@ -57001,6 +57636,17 @@
         "additionalProperties": false,
         "description": "Terminal outcome record for a directed turn, delivered as a sidecar on\n`MemberEventsPage` (the event envelope rows themselves stay unchanged —\n§7 envelope freeze).",
         "properties": {
+          "bounded_result": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/BridgeBoundedTurnResult"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Receiver-bounded exact result for a tracked plain interaction.\n\nPresent only when the delivery supplied `bounded_result_spec` before\nadmission and the exact terminal carried a committed `RunResult`."
+          },
           "fence_token": {
             "description": "Materialization fence paired with `generation`. A same-generation\nhigher-fence residency must not accept an older watcher's terminal.",
             "format": "uint64",
@@ -58277,6 +58923,40 @@
             "type": "object"
           }
         ]
+      },
+      "MobBoundedHelperResult": {
+        "description": "Receiver-bounded helper payload with explicit truncation state.",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/$defs/MobBoundedHelperResultStatus"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "status",
+          "text"
+        ],
+        "type": "object"
+      },
+      "MobBoundedHelperResultStatus": {
+        "description": "Typed terminal/truncation state for a bounded helper projection.",
+        "enum": [
+          "completed",
+          "completed_truncated",
+          "failed",
+          "failed_truncated",
+          "in_progress",
+          "in_progress_truncated",
+          "unavailable",
+          "unavailable_truncated"
+        ],
+        "type": "string"
       },
       "OpenAiImageMetadata": {
         "properties": {
@@ -81269,6 +81949,141 @@
         ],
         "type": "string"
       },
+      "PresentedTokenConvention": {
+        "description": "Provider-native convention used to normalize tokens presented to a model.",
+        "oneOf": [
+          {
+            "const": "anthropic_disjoint_input_components",
+            "description": "Anthropic reports uncached, cache-write, and cache-read input as\ndisjoint components. The normalized total is their saturating sum.",
+            "type": "string"
+          },
+          {
+            "const": "open_ai_input_includes_cached_subset",
+            "description": "OpenAI prompt/input tokens already include the cached-token subset.",
+            "type": "string"
+          },
+          {
+            "const": "gemini_prompt_includes_cached_subset",
+            "description": "Gemini prompt tokens already include the cached-content subset.",
+            "type": "string"
+          },
+          {
+            "const": "open_ai_compatible_prompt_includes_cache_details",
+            "description": "OpenAI-compatible prompt tokens are treated as the provider's inclusive\nprompt total; cache detail fields are observational subsets only.",
+            "type": "string"
+          },
+          {
+            "const": "host_declared_inclusive_input_total",
+            "description": "A custom/embedded client explicitly declares its `input_tokens` field\nas an inclusive presented-input total. This is never inferred from\ncache detail fields.",
+            "type": "string"
+          }
+        ]
+      },
+      "Provider": {
+        "description": "Supported LLM providers.\n\n`JsonSchema` is derived unconditionally (schemars is a non-optional\nmeerkat-core dependency): config-owned types such as\n[`crate::config::CustomModelConfig`] embed the typed provider directly and\nderive their schemas without the `schema` feature.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "gemini",
+          "self_hosted",
+          "other"
+        ],
+        "type": "string"
+      },
+      "ProviderTokenAccounting": {
+        "additionalProperties": false,
+        "description": "One provider adapter's normalized accounting for a single model turn.",
+        "properties": {
+          "aggregation": {
+            "$ref": "#/$defs/TokenAggregationProvenance"
+          },
+          "convention": {
+            "$ref": "#/$defs/PresentedTokenConvention"
+          },
+          "model": {
+            "type": "string"
+          },
+          "presented_tokens": {
+            "description": "Tokens presented to the model for this request. Output tokens are not\nincluded.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "presented_tokens",
+          "convention",
+          "aggregation"
+        ],
+        "type": "object"
+      },
+      "TokenAggregationProvenance": {
+        "description": "How the provider adapter obtained the normalized presented-token total.",
+        "oneOf": [
+          {
+            "const": "sum_disjoint_provider_components",
+            "description": "Sum of provider-documented disjoint input components.",
+            "type": "string"
+          },
+          {
+            "const": "provider_inclusive_input_total",
+            "description": "Provider-issued inclusive prompt/input total copied without adding\ncache detail fields.",
+            "type": "string"
+          }
+        ]
+      },
+      "Usage": {
+        "description": "Token usage statistics",
+        "properties": {
+          "cache_creation_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cache_read_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider_accounting": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProviderTokenAccounting"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider-authored normalized input accounting for one model turn.\n\nCumulative usage intentionally leaves this `None`: an aggregate may\nspan providers and models and therefore cannot truthfully carry one\nper-turn convention. Shared policy reads [`Usage::presented_tokens`]\non turn usage and never interprets cache detail fields directly."
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens"
+        ],
+        "type": "object"
+      },
       "WireMemberRef": {
         "description": "Server-resolved opaque handle for a mob member.\n\nEncodes `{mob_id, agent_identity}` as a single base64url-encoded token\nthat callers treat as opaque. The server resolves the current\n`AgentRuntimeId` and fence token against the live mob roster on every\ndispatch — clients never reason about `generation` or `fence_token`\ndirectly.\n\nUse [`WireMemberRef::encode`] to produce a token and\n[`WireMemberRef::decode`] inside an RPC handler to recover the\n`(mob_id, agent_identity)` pair before resolving against the runtime.",
         "type": "string"
@@ -81281,34 +82096,53 @@
         "type": "string"
       },
       "bounded_result": {
-        "anyOf": [
-          {
-            "$ref": "#/$defs/MobBoundedHelperResult"
-          },
-          {
-            "type": "null"
-          }
-        ]
+        "$ref": "#/$defs/MobBoundedHelperResult",
+        "description": "Exact receiver-bounded result for this helper operation."
       },
       "member_ref": {
         "$ref": "#/$defs/WireMemberRef"
       },
       "output": {
+        "type": "string"
+      },
+      "retirement_error": {
         "type": [
           "string",
           "null"
         ]
       },
+      "session_id": {
+        "type": "string"
+      },
       "tokens_used": {
         "format": "uint64",
         "minimum": 0,
         "type": "integer"
+      },
+      "tool_calls": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "turns": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "usage": {
+        "$ref": "#/$defs/Usage"
       }
     },
     "required": [
+      "output",
       "tokens_used",
       "agent_identity",
-      "member_ref"
+      "member_ref",
+      "bounded_result",
+      "session_id",
+      "usage",
+      "turns",
+      "tool_calls"
     ],
     "title": "MobHelperResult",
     "type": "object"

@@ -1481,6 +1481,17 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         .await
     }
 
+    async fn discard_live_session_actor_after_durability_reload_required(
+        &self,
+        witness: &meerkat::LiveSessionActorWitness,
+    ) -> Result<bool, SessionError> {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::discard_live_session_actor_after_durability_reload_required(
+            &self.service,
+            witness,
+        )
+        .await
+    }
+
     async fn await_event_projection_drain(
         &self,
         session_id: &SessionId,

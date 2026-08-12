@@ -397,6 +397,7 @@ pub(super) struct SubmitWorkPayload {
         Option<tokio::sync::mpsc::Sender<meerkat_core::EventEnvelope<meerkat_core::AgentEvent>>>,
     /// Optional committed-completion result channel for a tracked turn.
     pub completion_tx: Option<super::handle::ExactTurnCompletionSender>,
+    pub bounded_result_spec: Option<super::handle::BoundedResultSpec>,
     /// Executor-bound acknowledgement for a host-requested LLM identity.
     pub llm_identity_applied_tx: Option<super::handle::MemberTurnLlmIdentityAppliedSender>,
     pub ack_mode: crate::mob_machine::SubmitWorkAckMode,
@@ -623,6 +624,7 @@ pub(super) enum MobCommand {
         activation_params: serde_json::Value,
         external_delivery_intent: Option<crate::store::MobExternalDeliveryIntent>,
         scoped_event_tx: Option<tokio::sync::mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
+        exact_operation: Option<super::handle::FlowOperationCustody>,
         reply_tx: oneshot::Sender<Result<RunId, MobError>>,
     },
     PreviewRunFlowAdmission {

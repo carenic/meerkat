@@ -699,6 +699,7 @@ impl PlacedKickoffReconciler {
                     outcome_tracking: Some(
                         super::bridge_protocol::BridgeOutcomeTracking::Interaction,
                     ),
+                    bounded_result_spec: None,
                 }),
             )
             .await
