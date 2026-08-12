@@ -638,6 +638,7 @@ test_suite(
     tests = [
         "//meerkat-cli:e2e_system_cli_capabilities_and_config_bazel_test",
         "//meerkat-cli:e2e_system_cli_init_snapshot_bazel_test",
+        "//meerkat-cli:e2e_system_cli_mcp_pending_resume_bazel_test",
         "//meerkat-cli:e2e_system_cli_mobpack_pack_inspect_validate_bazel_test",
         "//meerkat-cli:e2e_system_cli_resume_tools_bazel_test",
         "//meerkat-cli:e2e_system_cli_wasm_forbidden_capability_bazel_test",

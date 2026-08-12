@@ -27,6 +27,11 @@ path = "tests/system_cli_resume.rs"
 required-features = ["integration-real-tests"]
 
 [[test]]
+name = "system_cli_mcp_pending"
+path = "tests/system_cli_mcp_pending.rs"
+required-features = ["integration-real-tests"]
+
+[[test]]
 name = "live_smoke_cli"
 path = "tests/live_smoke_cli.rs"
 required-features = ["integration-real-tests"]

@@ -572,6 +572,12 @@ const nativeE2eSystemTests = [
   },
   {
     packageKey: "meerkat-cli",
+    cargoTestTarget: "system_cli_mcp_pending",
+    name: "e2e_system_cli_mcp_pending_resume_bazel_test",
+    testName: "integration_real_cli_mcp_pending_resume_journey",
+  },
+  {
+    packageKey: "meerkat-cli",
     cargoTestTarget: "system_mob_host_daemon",
     name: "e2e_system_mob_host_daemon_lifecycle_bazel_test",
     testName: "integration_real_mob_host_daemon_lifecycle",

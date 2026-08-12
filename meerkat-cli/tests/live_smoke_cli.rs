@@ -1126,3 +1126,150 @@ async fn inner_e2e_cli_shorthand_prompt() -> Result<(), Box<dyn std::error::Erro
 
     Ok(())
 }
+
+// ===========================================================================
+// Scenario 95: CLI resume journey across a pending-MCP committed boundary
+// ===========================================================================
+
+/// Live variant of the 0.8.21 resume-wedge journey: turn one runs beside a
+/// slow-connecting MCP server so the synthetic `[MCP_PENDING]` notice is
+/// committed inside the boundary prefix, then two resumes (server still
+/// pending, server removed) must complete with clean exits and none of the
+/// intra-turn checkpoint wedge markers.
+const SCENARIO_95_WEDGE_MARKERS: &[&str] = &[
+    "Internal error",
+    "failed to prepare the preflighted head-canonical intra-turn checkpoint route",
+    "live actor reload required",
+    "does not retain the committed boundary row prefix",
+];
+
+fn scenario_95_assert_clean(step: &str, output: &std::process::Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{step} failed (exit {:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status.code()
+    );
+    for marker in SCENARIO_95_WEDGE_MARKERS {
+        assert!(
+            !stdout.contains(marker) && !stderr.contains(marker),
+            "{step} surfaced the checkpoint wedge marker '{marker}'\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "lane:e2e-smoke"]
+async fn e2e_scenario_95_cli_slow_mcp_resume_journey() -> Result<(), Box<dyn std::error::Error>> {
+    if cfg!(windows) {
+        eprintln!("Skipping: the slow-MCP stub uses /bin/sh");
+        return Ok(());
+    }
+    if skip_if_no_api_prereqs() {
+        return Ok(());
+    }
+
+    if std::env::var("RUN_TEST_E2E_S95_INNER").is_ok() {
+        return inner_e2e_cli_slow_mcp_resume_journey().await;
+    }
+
+    let temp_dir = TempDir::new()?;
+    let project_dir = temp_dir.path().join("project");
+    tokio::fs::create_dir_all(project_dir.join(".rkat")).await?;
+    let data_dir = temp_dir.path().join("data");
+    tokio::fs::create_dir_all(&data_dir).await?;
+    let rkat = rkat_binary_path().ok_or("rkat binary not found")?;
+
+    let status = Command::new(std::env::current_exe()?)
+        .arg("e2e_scenario_95_cli_slow_mcp_resume_journey")
+        .arg("--ignored")
+        .env("RUN_TEST_E2E_S95_INNER", "1")
+        .env("CARGO_BIN_EXE_rkat", &rkat)
+        .env("HOME", temp_dir.path())
+        .env("XDG_DATA_HOME", &data_dir)
+        .env("TEST_PROJECT_DIR", &project_dir)
+        .status()
+        .await?;
+
+    assert!(status.success(), "inner test failed");
+    Ok(())
+}
+
+async fn inner_e2e_cli_slow_mcp_resume_journey() -> Result<(), Box<dyn std::error::Error>> {
+    let project_dir = PathBuf::from(std::env::var("TEST_PROJECT_DIR")?);
+    std::env::set_current_dir(&project_dir)?;
+    write_smoke_config(&project_dir).await?;
+
+    // A stub MCP server that never finishes its handshake inside the connect
+    // budget keeps turn one deterministically in the pending state. The
+    // stderr detach is load-bearing: the spawned stub inherits rkat's stderr,
+    // and a held pipe keeps the test's `.output()` from seeing EOF after
+    // rkat exits.
+    let stub_path = project_dir.join("slow-mcp-server.sh");
+    tokio::fs::write(&stub_path, "#!/bin/sh\nexec 2>/dev/null\nsleep 60\n").await?;
+    let mcp_toml = format!(
+        "[[servers]]\nname = \"king-search\"\ncommand = \"/bin/sh\"\nargs = [\"{}\"]\nconnect_timeout_secs = 2\n",
+        stub_path.display()
+    );
+    tokio::fs::write(project_dir.join(".rkat/mcp.toml"), mcp_toml).await?;
+
+    let rkat = rkat_binary_path().ok_or("rkat binary not found")?;
+
+    // --- Turn one beside the pending server ---
+    let output = timeout(
+        Duration::from_secs(120),
+        Command::new(&rkat)
+            .current_dir(&project_dir)
+            .args([
+                "run",
+                "Say the word ok and nothing else.",
+                "--output",
+                "json",
+            ])
+            .output(),
+    )
+    .await??;
+    scenario_95_assert_clean("turn one (run with pending MCP server)", &output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|error| format!("failed to parse turn-one JSON output: {error}\n{stdout}"))?;
+    let session_id = parsed["session_id"]
+        .as_str()
+        .ok_or("session_id missing in turn-one response")?
+        .to_string();
+
+    // --- Turn two: resume while the server is still pending ---
+    let output = timeout(
+        Duration::from_secs(120),
+        Command::new(&rkat)
+            .current_dir(&project_dir)
+            .args(["run", "--resume", &session_id, "Reply with the word ok."])
+            .output(),
+    )
+    .await??;
+    scenario_95_assert_clean("turn two (resume with server still pending)", &output);
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "turn two must produce an assistant response"
+    );
+
+    // --- Turn three: resume after the slow server is gone ---
+    tokio::fs::remove_file(project_dir.join(".rkat/mcp.toml")).await?;
+    let output = timeout(
+        Duration::from_secs(120),
+        Command::new(&rkat)
+            .current_dir(&project_dir)
+            .args(["run", "--resume", &session_id, "Reply with the word ok."])
+            .output(),
+    )
+    .await??;
+    scenario_95_assert_clean("turn three (resume with server removed)", &output);
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "turn three must produce an assistant response"
+    );
+
+    Ok(())
+}
