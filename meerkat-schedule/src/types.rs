@@ -1192,12 +1192,20 @@ impl TargetBinding {
     pub fn validate_public_api(&self) -> Result<(), String> {
         match self {
             Self::Session(_) => Ok(()),
-            Self::Identity(_) => Ok(()),
+            Self::Identity(binding) => binding.validate_public_api(),
             Self::Mob(binding) => binding.validate_public_api(),
             Self::HostRunnable(_) => Ok(()),
         }
     }
 }
+
+/// Reserved identity-target namespace for mob-member schedule identities.
+///
+/// The payload schema behind the prefix is minted and parsed by the meerkat
+/// facade (`mob_member_schedule_identity`); this crate owns only the
+/// namespace so create-time validation can classify member targets without
+/// parsing the payload.
+pub const MOB_MEMBER_IDENTITY_TARGET_PREFIX: &str = "mob_member:";
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1302,6 +1310,45 @@ impl IdentityTargetBinding {
     pub fn action(&self) -> &ScheduledSessionAction {
         match self {
             Self::ResumableIdentity { action, .. } => action,
+        }
+    }
+
+    /// Reject mob-member identity targets whose action can never be
+    /// delivered.
+    ///
+    /// These are the exact constraints the mob delivery surface enforces at
+    /// fire time (same refusal texts); checking them here moves the failure
+    /// from every occurrence's `delivery_failed` to a typed create/update
+    /// error. Identities outside the reserved mob-member namespace are not
+    /// judged here.
+    pub fn validate_public_api(&self) -> Result<(), String> {
+        if !self
+            .identity()
+            .starts_with(MOB_MEMBER_IDENTITY_TARGET_PREFIX)
+        {
+            return Ok(());
+        }
+        match self.action() {
+            ScheduledSessionAction::Prompt {
+                system_prompt,
+                skill_refs,
+                additional_instructions,
+                ..
+            } => {
+                if system_prompt.is_some()
+                    || !skill_refs.is_empty()
+                    || !additional_instructions.is_empty()
+                {
+                    return Err(
+                        "scheduled mob-member identity targets do not support session-only prompt overrides"
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            ScheduledSessionAction::Event { .. } => {
+                Err("scheduled mob-member identity targets only support prompt actions".to_string())
+            }
         }
     }
 }

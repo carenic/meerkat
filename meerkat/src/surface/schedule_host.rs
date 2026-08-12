@@ -191,7 +191,10 @@ pub fn mob_member_schedule_identity(binding: &meerkat_core::MobMemberBinding) ->
             binding.mob_id, binding.member
         )
     });
-    format!("mob_member:{json}")
+    format!(
+        "{}{json}",
+        meerkat_schedule::MOB_MEMBER_IDENTITY_TARGET_PREFIX
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -226,7 +229,7 @@ impl meerkat_schedule::CurrentSessionScheduleTargetResolver
 
 #[allow(dead_code)]
 pub fn parse_mob_member_schedule_identity(identity: &str) -> Option<MobMemberScheduleIdentity> {
-    let json = identity.strip_prefix("mob_member:")?;
+    let json = identity.strip_prefix(meerkat_schedule::MOB_MEMBER_IDENTITY_TARGET_PREFIX)?;
     let key: OwnedMobMemberScheduleIdentityKey = serde_json::from_str(json).ok()?;
     match key.schema.as_str() {
         "meerkat.schedule.mob_member_identity.v2" => Some(MobMemberScheduleIdentity {
@@ -439,12 +442,58 @@ pub struct SharedScheduleTargetAdapter {
     runnable_host: Option<Arc<dyn ScheduleRunnableHost>>,
 }
 
+/// Create-time identity-target deliverability judgment composed from the
+/// same host pair the fire-time probe consults.
+///
+/// A mob host that recognizes the identity form vouches for the class even
+/// when the member is currently absent: Ready, Busy, and Missing are all
+/// fire-time conditions governed by `missing_target_policy`. Only an
+/// identity no host recognizes (mob host disclaims it and the session host
+/// probes Missing) is refused as never deliverable.
+struct SurfaceIdentityTargetProbe {
+    session_host: Arc<dyn SurfaceScheduleSessionHost>,
+    mob_host: Arc<dyn SurfaceScheduleMobHost>,
+}
+
+#[async_trait]
+impl meerkat_schedule::ScheduleIdentityTargetProbe for SurfaceIdentityTargetProbe {
+    async fn probe_identity_target(
+        &self,
+        binding: &IdentityTargetBinding,
+    ) -> Result<meerkat_schedule::IdentityTargetDeliverability, ScheduleDomainError> {
+        if self
+            .mob_host
+            .probe_identity_target(binding)
+            .await?
+            .is_some()
+        {
+            return Ok(meerkat_schedule::IdentityTargetDeliverability::Deliverable);
+        }
+        match self.session_host.probe_identity_target(binding).await? {
+            TargetProbeOutcome::Ready | TargetProbeOutcome::Busy { .. } => {
+                Ok(meerkat_schedule::IdentityTargetDeliverability::Deliverable)
+            }
+            TargetProbeOutcome::Missing { detail } => {
+                Ok(meerkat_schedule::IdentityTargetDeliverability::NeverDeliverable { detail })
+            }
+        }
+    }
+}
+
 impl SharedScheduleTargetAdapter {
     pub fn new(
         schedule_service: ScheduleService,
         session_host: Arc<dyn SurfaceScheduleSessionHost>,
         mob_host: Arc<dyn SurfaceScheduleMobHost>,
     ) -> Self {
+        // Constructing the delivery adapter is the surface's declaration of
+        // its host capabilities; attach them as the service's create-time
+        // deliverability authority so `schedule_create` fails closed instead
+        // of persisting schedules whose every occurrence would misfire.
+        schedule_service.attach_identity_target_probe(Arc::new(SurfaceIdentityTargetProbe {
+            session_host: Arc::clone(&session_host),
+            mob_host: Arc::clone(&mob_host),
+        }));
         Self {
             schedule_service,
             session_host,
@@ -3284,6 +3333,246 @@ mod tests {
                 additional_instructions: Vec::new(),
             },
         ))
+    }
+
+    fn identity_create_request(identity: &str) -> meerkat_schedule::CreateScheduleRequest {
+        meerkat_schedule::CreateScheduleRequest {
+            name: Some("identity-target".to_string()),
+            description: None,
+            trigger: meerkat_schedule::TriggerSpec::Once {
+                due_at_utc: chrono::Utc::now() + ChronoDuration::days(1),
+            },
+            target: TargetBinding::identity(IdentityTargetBinding::resumable(
+                identity,
+                ScheduledSessionAction::Prompt {
+                    prompt: ContentInput::Text("check in".to_string()),
+                    system_prompt: None,
+                    render_metadata: None,
+                    skill_refs: Vec::new(),
+                    additional_instructions: Vec::new(),
+                },
+            )),
+            misfire_policy: meerkat_schedule::MisfirePolicy::Skip,
+            overlap_policy: meerkat_schedule::OverlapPolicy::SkipIfRunning,
+            missing_target_policy: meerkat_schedule::MissingTargetPolicy::MarkMisfired,
+            labels: BTreeMap::new(),
+            planning_horizon_days: Some(1),
+            planning_horizon_occurrences: Some(1),
+        }
+    }
+
+    fn probe_attached_service() -> ScheduleService {
+        let store =
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store);
+        let session_host: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(PanicOnMaterializeHost {
+            materialize_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let mob_host: Arc<dyn SurfaceScheduleMobHost> = Arc::new(NoopScheduleMobHost::new(
+            "mob targets unsupported in this test",
+        ));
+        let _adapter = SharedScheduleTargetAdapter::new(service.clone(), session_host, mob_host);
+        service
+    }
+
+    /// GAP 2 regression: an identity target no host on the surface
+    /// recognizes could previously be created and then misfire
+    /// `target_missing` on every occurrence forever. Constructing the
+    /// delivery adapter attaches a create-time deliverability probe.
+    #[tokio::test]
+    async fn create_refuses_identity_target_no_surface_host_recognizes() {
+        let service = probe_attached_service();
+        let error = service
+            .create(identity_create_request("domain:security"))
+            .await
+            .expect_err("a bare identity no host recognizes must fail at create");
+        assert!(
+            matches!(
+                &error,
+                meerkat_schedule::ScheduleDomainError::InvalidSchedule(reason)
+                    if reason.contains("not deliverable")
+                        // The refusal must carry the exact detail the fire
+                        // path would have reported on every misfire.
+                        && reason.contains(
+                            "scheduled identity targets are not supported by this session host"
+                        )
+            ),
+            "expected a create-time deliverability refusal carrying the fire-path detail, found {error:?}"
+        );
+    }
+
+    /// The agent-facing `current_session` shortcut keeps resolving with the
+    /// create-time probe attached: for a mob member the resolver rewrites it
+    /// to the member's identity form, which the mob host recognizes.
+    #[tokio::test]
+    async fn current_session_shortcut_still_resolves_with_probe_attached() {
+        use meerkat_core::AgentToolDispatcher;
+
+        struct MemberRecognizingMobHost;
+
+        #[async_trait]
+        impl SurfaceScheduleMobHost for MemberRecognizingMobHost {
+            async fn probe_mob_target(
+                &self,
+                _binding: &MobTargetBinding,
+            ) -> Result<TargetProbeOutcome, ScheduleDomainError> {
+                Ok(TargetProbeOutcome::Missing { detail: None })
+            }
+
+            async fn deliver_mob_target(
+                &self,
+                _occurrence: &Occurrence,
+                _identity: &ScheduleDeliveryIdentity,
+                _binding: &MobTargetBinding,
+            ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+                Err(ScheduleDomainError::Internal(
+                    "delivery is out of scope for this test".to_string(),
+                ))
+            }
+
+            async fn probe_identity_target(
+                &self,
+                binding: &IdentityTargetBinding,
+            ) -> Result<Option<TargetProbeOutcome>, ScheduleDomainError> {
+                Ok(parse_mob_member_schedule_identity(binding.identity())
+                    .map(|_| TargetProbeOutcome::Ready))
+            }
+        }
+
+        let store =
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store);
+        let session_host: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(PanicOnMaterializeHost {
+            materialize_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let mob_host: Arc<dyn SurfaceScheduleMobHost> = Arc::new(MemberRecognizingMobHost);
+        let _adapter = SharedScheduleTargetAdapter::new(service.clone(), session_host, mob_host);
+
+        let binding = meerkat_core::MobMemberBinding {
+            mob_id: "ops".to_string(),
+            role: "watcher".to_string(),
+            member: "watcher".to_string(),
+        };
+        let dispatcher = meerkat_schedule::CurrentSessionScheduleToolDispatcher::new_with_resolver(
+            Arc::new(meerkat_schedule::ScheduleToolDispatcher::new(
+                service.clone(),
+            )),
+            SessionId::new(),
+            Arc::new(MobMemberCurrentSessionScheduleResolver::new(
+                binding.clone(),
+            )),
+        );
+
+        let request = serde_json::json!({
+            "name": "self-followup",
+            "trigger": {
+                "type": "once",
+                "due_at_utc": (chrono::Utc::now() + ChronoDuration::days(1)).to_rfc3339(),
+            },
+            "target": {
+                "target_kind": "session",
+                "type": "current_session",
+                "action": { "type": "prompt", "prompt": "check in" }
+            },
+            "misfire_policy": { "type": "skip" },
+            "overlap_policy": "skip_if_running",
+            "missing_target_policy": "mark_misfired",
+            "planning_horizon_occurrences": 1
+        });
+        let raw = serde_json::value::RawValue::from_string(request.to_string())
+            .expect("encode tool arguments");
+        let outcome = dispatcher
+            .dispatch(meerkat_core::ToolCallView {
+                id: "sched-current-session-probe",
+                name: "meerkat_schedule_create",
+                args: raw.as_ref(),
+            })
+            .await
+            .expect("current_session must keep resolving with the probe attached");
+        let created: serde_json::Value =
+            serde_json::from_str(&outcome.result.text_content()).expect("decode created schedule");
+        assert_eq!(created["target"]["target_kind"].as_str(), Some("identity"));
+        assert_eq!(
+            created["target"]["identity"].as_str(),
+            Some(mob_member_schedule_identity(&binding).as_str()),
+            "the shortcut must persist the member's identity form"
+        );
+    }
+
+    /// The recognized-but-currently-absent member class stays creatable:
+    /// absence at fire time is governed by `missing_target_policy`, and the
+    /// member may exist by the first occurrence.
+    #[tokio::test]
+    async fn create_accepts_recognized_identity_target_with_currently_missing_member() {
+        struct RecognizingMobHost;
+
+        #[async_trait]
+        impl SurfaceScheduleMobHost for RecognizingMobHost {
+            async fn probe_mob_target(
+                &self,
+                _binding: &MobTargetBinding,
+            ) -> Result<TargetProbeOutcome, ScheduleDomainError> {
+                Ok(TargetProbeOutcome::Missing { detail: None })
+            }
+
+            async fn deliver_mob_target(
+                &self,
+                _occurrence: &Occurrence,
+                _identity: &ScheduleDeliveryIdentity,
+                _binding: &MobTargetBinding,
+            ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+                Err(ScheduleDomainError::Internal(
+                    "delivery is out of scope for this test".to_string(),
+                ))
+            }
+
+            async fn probe_identity_target(
+                &self,
+                _binding: &IdentityTargetBinding,
+            ) -> Result<Option<TargetProbeOutcome>, ScheduleDomainError> {
+                Ok(Some(TargetProbeOutcome::Missing {
+                    detail: Some("mob member not found: watcher".to_string()),
+                }))
+            }
+        }
+
+        let store =
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store);
+        let session_host: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(PanicOnMaterializeHost {
+            materialize_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let mob_host: Arc<dyn SurfaceScheduleMobHost> = Arc::new(RecognizingMobHost);
+        let _adapter = SharedScheduleTargetAdapter::new(service.clone(), session_host, mob_host);
+
+        service
+            .create(identity_create_request(
+                r#"mob_member:{"schema":"meerkat.schedule.mob_member_identity.v2","mob_id":"ops","member":"watcher"}"#,
+            ))
+            .await
+            .expect("a recognized identity form must keep creating even while the member is absent");
+    }
+
+    #[tokio::test]
+    async fn create_keeps_accepting_session_targets_with_probe_attached() {
+        let service = probe_attached_service();
+        service
+            .create(meerkat_schedule::CreateScheduleRequest {
+                name: Some("session-target".to_string()),
+                description: None,
+                trigger: meerkat_schedule::TriggerSpec::Once {
+                    due_at_utc: chrono::Utc::now() + ChronoDuration::days(1),
+                },
+                target: materialize_on_demand_target(),
+                misfire_policy: meerkat_schedule::MisfirePolicy::Skip,
+                overlap_policy: meerkat_schedule::OverlapPolicy::SkipIfRunning,
+                missing_target_policy: meerkat_schedule::MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await
+            .expect("session targets are never probed at create");
     }
 
     #[tokio::test]

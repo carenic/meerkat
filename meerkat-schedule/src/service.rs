@@ -1,3 +1,4 @@
+use crate::driver::{IdentityTargetDeliverability, ScheduleIdentityTargetProbe};
 use crate::error::{ScheduleDomainError, ScheduleStoreError};
 use crate::lifecycle::{
     AuthorizedOccurrenceWrite, OccurrenceLifecycleEffect, ScheduleLifecycleEffect,
@@ -10,12 +11,12 @@ use crate::store::{
 use crate::trigger::{next_due_after, occurrences_for_horizon};
 use crate::types::{
     CreateScheduleRequest, Occurrence, OccurrencePhase, Schedule, ScheduleId, SchedulePhase,
-    UpdateScheduleRequest,
+    TargetBinding, UpdateScheduleRequest,
 };
 use chrono::{Duration, Utc};
 use meerkat_core::SessionId;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(target_arch = "wasm32")]
 use crate::tokio::sync::{Mutex, watch};
@@ -27,6 +28,10 @@ pub struct ScheduleService {
     store: Arc<dyn ScheduleStore>,
     planning_lock: Arc<Mutex<()>>,
     mutation_generation: watch::Sender<u64>,
+    /// Surface-attached create-time identity-target probe, shared across all
+    /// clones of this service (the tool dispatcher and the delivery host
+    /// hold clones of the same instance).
+    identity_target_probe: Arc<OnceLock<Arc<dyn ScheduleIdentityTargetProbe>>>,
 }
 
 struct ExpectedScheduleTransition {
@@ -200,6 +205,46 @@ impl ScheduleService {
             store,
             planning_lock: Arc::new(Mutex::new(())),
             mutation_generation,
+            identity_target_probe: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Attach the surface's create-time identity-target deliverability probe.
+    ///
+    /// The first attach wins across every clone of this service; later
+    /// attaches are ignored so a replacement host cannot silently swap the
+    /// deliverability authority mid-flight. Without an attached probe the
+    /// service cannot judge identity deliverability and keeps accepting
+    /// identity targets (the fire-time probe and `missing_target_policy`
+    /// remain the delivery-time authority).
+    pub fn attach_identity_target_probe(&self, probe: Arc<dyn ScheduleIdentityTargetProbe>) {
+        let _ = self.identity_target_probe.set(probe);
+    }
+
+    /// Fail closed at create/update when the composed surface hosts declare
+    /// an identity target permanently undeliverable.
+    async fn refuse_undeliverable_identity_target(
+        &self,
+        target: &TargetBinding,
+    ) -> Result<(), ScheduleDomainError> {
+        let TargetBinding::Identity(binding) = target else {
+            return Ok(());
+        };
+        let Some(probe) = self.identity_target_probe.get() else {
+            return Ok(());
+        };
+        match probe.probe_identity_target(binding).await? {
+            IdentityTargetDeliverability::Deliverable => Ok(()),
+            IdentityTargetDeliverability::NeverDeliverable { detail } => {
+                let detail = detail
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default();
+                Err(ScheduleDomainError::InvalidSchedule(format!(
+                    "identity target '{}' is not deliverable by any schedule host on this \
+                     surface{detail}; every occurrence would misfire as target_missing",
+                    binding.identity(),
+                )))
+            }
         }
     }
 
@@ -243,6 +288,8 @@ impl ScheduleService {
         request
             .validate_public_api()
             .map_err(ScheduleDomainError::InvalidSchedule)?;
+        self.refuse_undeliverable_identity_target(&request.target)
+            .await?;
         let _planning_guard = self.planning_lock.lock().await;
         let mut mutator = Schedule::apply(None, ScheduleLifecycleInput::Create(request))
             .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
@@ -317,6 +364,9 @@ impl ScheduleService {
         request
             .validate_public_api()
             .map_err(ScheduleDomainError::InvalidSchedule)?;
+        if let Some(target) = &request.target {
+            self.refuse_undeliverable_identity_target(target).await?;
+        }
         let _planning_guard = self.planning_lock.lock().await;
         let current = self.get(schedule_id).await?;
         let store_now = self.store.get_store_time_utc().await?;
@@ -958,6 +1008,159 @@ mod tests {
                 )
                 .await
         }
+    }
+
+    /// A mob-member schedule identity in the exact wire form minted by the
+    /// meerkat facade's `mob_member_schedule_identity`.
+    const MOB_MEMBER_FIXTURE_IDENTITY: &str = r#"mob_member:{"schema":"meerkat.schedule.mob_member_identity.v2","mob_id":"ops","member":"watcher"}"#;
+
+    fn identity_create_request(
+        identity: &str,
+        action: ScheduledSessionAction,
+    ) -> CreateScheduleRequest {
+        CreateScheduleRequest {
+            name: Some("identity-target".into()),
+            description: None,
+            trigger: TriggerSpec::Once {
+                due_at_utc: Utc::now() + Duration::days(1),
+            },
+            target: TargetBinding::identity(crate::IdentityTargetBinding::resumable(
+                identity, action,
+            )),
+            misfire_policy: MisfirePolicy::Skip,
+            overlap_policy: OverlapPolicy::SkipIfRunning,
+            missing_target_policy: crate::MissingTargetPolicy::MarkMisfired,
+            labels: BTreeMap::new(),
+            planning_horizon_days: Some(1),
+            planning_horizon_occurrences: Some(1),
+        }
+    }
+
+    fn plain_prompt_action() -> ScheduledSessionAction {
+        ScheduledSessionAction::Prompt {
+            prompt: ContentInput::Text("member check-in".into()),
+            system_prompt: None,
+            render_metadata: None,
+            skill_refs: Vec::new(),
+            additional_instructions: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_refuses_mob_member_identity_target_with_session_only_overrides() {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::new()));
+        let action = ScheduledSessionAction::Prompt {
+            prompt: ContentInput::Text("member check-in".into()),
+            system_prompt: Some("session-only override".into()),
+            render_metadata: None,
+            skill_refs: Vec::new(),
+            additional_instructions: Vec::new(),
+        };
+        let error = service
+            .create(identity_create_request(MOB_MEMBER_FIXTURE_IDENTITY, action))
+            .await
+            .expect_err(
+                "session-only overrides on a mob-member identity target must fail at create",
+            );
+        assert!(
+            matches!(
+                &error,
+                ScheduleDomainError::InvalidSchedule(reason)
+                    if reason.contains("scheduled mob-member identity targets do not support session-only prompt overrides")
+            ),
+            "expected the fire-time refusal text at create, found {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_refuses_mob_member_identity_target_with_event_action() {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::new()));
+        let action = ScheduledSessionAction::Event {
+            event_type: "tick".into(),
+            payload: serde_json::json!({}),
+            render_metadata: None,
+        };
+        let error = service
+            .create(identity_create_request(MOB_MEMBER_FIXTURE_IDENTITY, action))
+            .await
+            .expect_err("event actions on a mob-member identity target must fail at create");
+        assert!(
+            matches!(
+                &error,
+                ScheduleDomainError::InvalidSchedule(reason)
+                    if reason.contains("scheduled mob-member identity targets only support prompt actions")
+            ),
+            "expected the fire-time refusal text at create, found {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_accepts_mob_member_identity_target_without_overrides() {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::new()));
+        service
+            .create(identity_create_request(
+                MOB_MEMBER_FIXTURE_IDENTITY,
+                plain_prompt_action(),
+            ))
+            .await
+            .expect("a plain prompt on a mob-member identity target must keep creating");
+    }
+
+    #[tokio::test]
+    async fn update_refuses_mob_member_identity_target_with_session_only_overrides() {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::new()));
+        let schedule = service
+            .create(identity_create_request(
+                MOB_MEMBER_FIXTURE_IDENTITY,
+                plain_prompt_action(),
+            ))
+            .await
+            .expect("baseline schedule");
+        let error = service
+            .update(
+                &schedule.schedule_id,
+                UpdateScheduleRequest {
+                    target: Some(TargetBinding::identity(
+                        crate::IdentityTargetBinding::resumable(
+                            MOB_MEMBER_FIXTURE_IDENTITY,
+                            ScheduledSessionAction::Prompt {
+                                prompt: ContentInput::Text("member check-in".into()),
+                                system_prompt: None,
+                                render_metadata: None,
+                                skill_refs: vec![],
+                                additional_instructions: vec!["late override".into()],
+                            },
+                        ),
+                    )),
+                    ..UpdateScheduleRequest::default()
+                },
+            )
+            .await
+            .expect_err("session-only overrides must also fail closed at update");
+        assert!(
+            matches!(
+                &error,
+                ScheduleDomainError::InvalidSchedule(reason)
+                    if reason.contains("scheduled mob-member identity targets do not support session-only prompt overrides")
+            ),
+            "expected the fire-time refusal text at update, found {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_without_identity_probe_accepts_bare_identity_targets() {
+        // Conservative boundary: a service with no attached surface probe
+        // cannot judge deliverability and keeps accepting; surfaces that
+        // construct a delivery adapter get create-time refusal instead
+        // (covered by the facade schedule-host tests).
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::new()));
+        service
+            .create(identity_create_request(
+                "domain:security",
+                plain_prompt_action(),
+            ))
+            .await
+            .expect("a probe-less service must keep accepting identity targets");
     }
 
     #[tokio::test]

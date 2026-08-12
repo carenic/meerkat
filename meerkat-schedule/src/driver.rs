@@ -11,8 +11,8 @@ use crate::store::{
 };
 use crate::types::{
     DeliveryAdmissionOutcome, DeliveryCompletionFailureReason, DeliveryFailureReason,
-    DeliveryReceipt, Occurrence, OccurrenceId, OccurrencePhase, OccurrenceTargetProbeOutcome,
-    RuntimeCompletionOutcome, RuntimeDeliveryOutcome,
+    DeliveryReceipt, IdentityTargetBinding, Occurrence, OccurrenceId, OccurrencePhase,
+    OccurrenceTargetProbeOutcome, RuntimeCompletionOutcome, RuntimeDeliveryOutcome,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -130,6 +130,33 @@ pub trait ScheduleTargetProbe: Send + Sync {
         &self,
         occurrence: &Occurrence,
     ) -> Result<TargetProbeOutcome, ScheduleDomainError>;
+}
+
+/// Create-time deliverability classification of an identity target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityTargetDeliverability {
+    /// Some host on this surface recognizes the identity form. Current
+    /// absence (for example a not-yet-spawned mob member) stays a fire-time
+    /// condition governed by the schedule's `missing_target_policy`.
+    Deliverable,
+    /// No host on this surface recognizes the identity; occurrences could
+    /// only ever misfire as `target_missing`.
+    NeverDeliverable { detail: Option<String> },
+}
+
+/// Surface-composed create-time probe for identity targets.
+///
+/// Unlike [`ScheduleTargetProbe`] this is binding-level (no occurrence
+/// exists yet): it judges whether the identity form is deliverable at all on
+/// this surface, not whether the target is ready right now. Attached to a
+/// [`crate::ScheduleService`] via `attach_identity_target_probe`, it lets
+/// create/update refuse schedules whose every occurrence would misfire.
+#[async_trait]
+pub trait ScheduleIdentityTargetProbe: Send + Sync {
+    async fn probe_identity_target(
+        &self,
+        binding: &IdentityTargetBinding,
+    ) -> Result<IdentityTargetDeliverability, ScheduleDomainError>;
 }
 
 #[async_trait]
