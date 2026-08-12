@@ -5851,6 +5851,16 @@ def generate_web_auth_types(schemas: dict, output_dir: Path) -> None:
 def generate_web_mob_types(schemas: dict, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     wire_schema = _schema_root_with_nested_defs(schemas.get("wire-types", {}))
+    # The helper spawn/fork request contracts live in params.json, and the
+    # bounded-result/usage carriers are schema-local $defs on MobHelperResult;
+    # look those up through their owning roots so nested refs stay resolvable.
+    params_schema = _schema_root_with_nested_defs(schemas.get("params", {}))
+    spawn_helper_context = _schema_root_with_local_defs(
+        params_schema, _lookup_named_schema(params_schema, "MobSpawnHelperParams")
+    )
+    helper_result_context = _schema_root_with_local_defs(
+        wire_schema, _lookup_named_schema(wire_schema, "MobHelperResult")
+    )
     emitted: set[str] = set()
     lines: list[str] = [
         "// Generated mob wire types for @rkat/web",
@@ -5858,10 +5868,11 @@ def generate_web_mob_types(schemas: dict, output_dir: Path) -> None:
         "",
     ]
 
-    def append_interface(name: str) -> None:
+    def append_interface(name: str, *, root: dict[str, Any] | None = None) -> None:
         if name in emitted:
             return
-        schema = _lookup_named_schema(wire_schema, name)
+        source_root = wire_schema if root is None else root
+        schema = _lookup_named_schema(source_root, name)
         if not schema:
             raise KeyError(f"schema for generated web mob type {name} not found")
         properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
@@ -5871,7 +5882,12 @@ def generate_web_mob_types(schemas: dict, output_dir: Path) -> None:
             if isinstance(schema, dict)
             else set()
         )
-        schema_root = _schema_root_with_local_defs(wire_schema, schema)
+        if root is not None:
+            # Names extracted from an owning context resolve refs against that
+            # context's $defs; unemitted siblings must widen instead of
+            # dangling as named references in the emitted module.
+            local_defs |= set(source_root.get("$defs", {}).keys()) - emitted
+        schema_root = _schema_root_with_local_defs(source_root, schema)
         lines.append(f"export interface {name} {{")
         for field_name, field_schema in properties.items():
             field_type, optional_by_type = _typescript_type_from_schema(
@@ -5885,10 +5901,11 @@ def generate_web_mob_types(schemas: dict, output_dir: Path) -> None:
         lines.append("")
         emitted.add(name)
 
-    def append_alias(name: str) -> None:
+    def append_alias(name: str, *, root: dict[str, Any] | None = None) -> None:
         if name in emitted:
             return
-        schema = _lookup_named_schema(wire_schema, name)
+        source_root = wire_schema if root is None else root
+        schema = _lookup_named_schema(source_root, name)
         if not schema:
             raise KeyError(f"schema for generated web mob alias {name} not found")
         local_defs = (
@@ -5896,7 +5913,9 @@ def generate_web_mob_types(schemas: dict, output_dir: Path) -> None:
             if isinstance(schema, dict)
             else set()
         )
-        schema_root = _schema_root_with_local_defs(wire_schema, schema)
+        if root is not None:
+            local_defs |= set(source_root.get("$defs", {}).keys()) - emitted
+        schema_root = _schema_root_with_local_defs(source_root, schema)
         typed_variants = _one_of_typed_dict_variants(schema_root, schema)
         if typed_variants is not None:
             variant_names: list[str] = []
@@ -5991,6 +6010,14 @@ def generate_web_mob_types(schemas: dict, output_dir: Path) -> None:
     append_interface("WireWorkGraphFlowExecutionBinding")
     append_interface("MobFlowStatusResult")
     append_interface("MobRunResult")
+    append_interface("WireAuthBindingRef", root=spawn_helper_context)
+    append_alias("WireMobBackendKind", root=spawn_helper_context)
+    append_alias("WireMobRuntimeMode", root=spawn_helper_context)
+    append_interface("MobSpawnHelperParams", root=params_schema)
+    append_interface("MobForkHelperParams", root=params_schema)
+    append_alias("MobBoundedHelperResultStatus")
+    append_interface("MobBoundedHelperResult")
+    append_interface("Usage", root=helper_result_context)
     append_interface("MobHelperResult")
     append_interface("WireResolvedModelCapabilities")
     append_interface("MobMemberStatusResult")

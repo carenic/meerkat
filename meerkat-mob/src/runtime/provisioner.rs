@@ -1294,7 +1294,8 @@ fn recovered_ops_after_hook_test_gates()
 }
 
 #[cfg(feature = "runtime-adapter")]
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl meerkat_runtime::MachineSessionArchivePostCommitHook for RecoveredSessionOpsRebind {
     async fn after_runtime_retire_commit(
         &self,

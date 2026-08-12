@@ -155,9 +155,63 @@ export interface MobRunResult {
   run?: Record<string, unknown> | null;
 }
 
+export interface WireAuthBindingRef {
+  binding: string;
+  profile?: string | null;
+  realm: string;
+}
+
+export type WireMobBackendKind = "session" | "external";
+
+export type WireMobRuntimeMode = "autonomous_host" | "turn_driven";
+
+export interface MobSpawnHelperParams {
+  agent_identity?: string | null;
+  auth_binding?: WireAuthBindingRef | null;
+  backend?: WireMobBackendKind | null;
+  max_text_bytes: number;
+  mob_id: string;
+  model_override?: string | null;
+  prompt: string;
+  result_label: string;
+  role_name?: string | null;
+  runtime_mode?: WireMobRuntimeMode | null;
+}
+
+export interface MobForkHelperParams {
+  agent_identity?: string | null;
+  auth_binding?: WireAuthBindingRef | null;
+  backend?: WireMobBackendKind | null;
+  fork_context?: unknown;
+  max_text_bytes: number;
+  mob_id: string;
+  model_override?: string | null;
+  prompt: string;
+  result_label: string;
+  role_name?: string | null;
+  runtime_mode?: WireMobRuntimeMode | null;
+  source_member_id: string;
+}
+
+export type MobBoundedHelperResultStatus = "completed" | "completed_truncated" | "failed" | "failed_truncated" | "in_progress" | "in_progress_truncated" | "unavailable" | "unavailable_truncated";
+
+export interface MobBoundedHelperResult {
+  label: string;
+  status: MobBoundedHelperResultStatus;
+  text: string;
+}
+
+export interface Usage {
+  cache_creation_tokens?: number | null;
+  cache_read_tokens?: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  provider_accounting?: Record<string, unknown> | null;
+}
+
 export interface MobHelperResult {
   agent_identity: string;
-  bounded_result: Record<string, unknown>;
+  bounded_result: MobBoundedHelperResult;
   member_ref: WireMemberRef;
   output: string;
   retirement_error?: string | null;
@@ -165,7 +219,7 @@ export interface MobHelperResult {
   tokens_used: number;
   tool_calls: number;
   turns: number;
-  usage: Record<string, unknown>;
+  usage: Usage;
 }
 
 export interface WireResolvedModelCapabilities {
