@@ -4551,6 +4551,29 @@ impl Session {
             .acknowledge(projection, &self.metadata)
     }
 
+    /// Adopt one store-committed sticky-fallback control transition as this
+    /// actor's HeadCanonical preparation baseline.
+    ///
+    /// The durable coordinator applied the identical typed control delta
+    /// (LLM identity + tool visibility) to the identical committed parent, so
+    /// this actor's live values for exactly those keys, applied to its
+    /// current baseline, must hash to the committed boundary identity; any
+    /// divergence fails closed. Mid-turn mutation intent for every other key
+    /// is retained, so the next boundary preparation extends the committed
+    /// control boundary instead of its superseded predecessor.
+    pub fn acknowledge_head_canonical_control_metadata(
+        &mut self,
+        committed: &SessionHeadMetadataIdentity,
+    ) -> Result<(), String> {
+        self.history_caches
+            .head_canonical_metadata
+            .rebase_control_commit_baseline(
+                &[SESSION_METADATA_KEY, SESSION_TOOL_VISIBILITY_STATE_KEY],
+                &self.metadata,
+                committed,
+            )
+    }
+
     pub(crate) fn validate_head_canonical_metadata_acknowledgement(
         &self,
         projection: &Arc<SessionHeadMetadataProjection>,

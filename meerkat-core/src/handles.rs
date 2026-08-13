@@ -182,6 +182,24 @@ impl StickyModelFallbackControlDelta {
         }
     }
 
+    /// Test-only constructor for driving a durable commit coordinator
+    /// directly against a store fixture. Production deltas are minted only by
+    /// the core agent loop from a machine-accepted activation.
+    #[doc(hidden)]
+    pub fn from_control_states_for_test(
+        previous_identity: crate::SessionLlmIdentity,
+        target_identity: crate::SessionLlmIdentity,
+        persisted_visibility_parent: crate::SessionToolVisibilityState,
+        target_visibility_state: crate::SessionToolVisibilityState,
+    ) -> Self {
+        Self {
+            previous_identity,
+            target_identity,
+            persisted_visibility_parent,
+            target_visibility_state,
+        }
+    }
+
     pub fn previous_identity(&self) -> &crate::SessionLlmIdentity {
         &self.previous_identity
     }
@@ -242,6 +260,22 @@ impl StickyModelFallbackControlDelta {
                 StickyModelFallbackControlDeltaError::InvalidVisibilityMetadata(error.to_string())
             })?;
         Ok(())
+    }
+
+    /// Exact inverse control transition.
+    ///
+    /// A durable coordinator that persisted the target state and then saw
+    /// generated authority reject the staged fallback compensates by applying
+    /// this inverse to the committed target, restoring the exact persisted
+    /// predecessor control state.
+    #[must_use]
+    pub fn inverted(&self) -> Self {
+        Self {
+            previous_identity: self.target_identity.clone(),
+            target_identity: self.previous_identity.clone(),
+            persisted_visibility_parent: self.target_visibility_state.clone(),
+            target_visibility_state: self.persisted_visibility_parent.clone(),
+        }
     }
 }
 
@@ -510,6 +544,49 @@ mod sticky_model_fallback_control_delta_tests {
         assert_eq!(
             session.tool_visibility_state().unwrap(),
             Some(target_visibility)
+        );
+    }
+
+    #[test]
+    fn inverted_control_delta_restores_the_exact_persisted_predecessor() {
+        let previous = identity("primary");
+        let target = identity("backup");
+        let previous_visibility = crate::SessionToolVisibilityState::default();
+        let mut target_visibility = previous_visibility.clone();
+        target_visibility.capability_base_filter = ToolFilter::Deny(
+            [crate::VIEW_IMAGE_TOOL_NAME.to_string()]
+                .into_iter()
+                .collect(),
+        );
+        target_visibility.active_revision = 1;
+        target_visibility.staged_revision = 1;
+        let plan = StickyModelFallbackVisibilityPlan {
+            previous_state: previous_visibility.clone(),
+            next_state: target_visibility.clone(),
+            view_image_tool_available: true,
+            previous_view_image_visible: true,
+            next_view_image_visible: false,
+            committed_visible_set_changed: true,
+            revision_bumped: true,
+        };
+        let delta = StickyModelFallbackControlDelta::new(
+            previous.clone(),
+            target.clone(),
+            &plan,
+            previous_visibility.clone(),
+        );
+        let mut session = session_with_control_state(&previous, &previous_visibility);
+
+        delta.validate_and_apply(&mut session).unwrap();
+        let inverse = delta.inverted();
+        assert_eq!(inverse.previous_identity(), &target);
+        assert_eq!(inverse.target_identity(), &previous);
+        inverse.validate_and_apply(&mut session).unwrap();
+
+        assert_eq!(session.session_metadata().unwrap().llm_identity(), previous);
+        assert_eq!(
+            session.tool_visibility_state().unwrap(),
+            Some(previous_visibility)
         );
     }
 }

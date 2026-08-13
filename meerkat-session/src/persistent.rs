@@ -2011,6 +2011,7 @@ impl StoreCheckpointer {
 impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
     async fn acknowledge_control_commit(
         &self,
+        session: &mut Session,
         receipt: &meerkat_core::SessionControlCommitReceipt,
     ) -> Result<(), AgentError> {
         let guard = self.gate.cancelled.lock().await;
@@ -2020,52 +2021,114 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
                 receipt.session_id()
             )));
         }
-        if self.runtime_store.session_persistence_profile()
-            != RuntimeSessionPersistenceProfile::WholeBlobV1
-        {
-            return Err(AgentError::InternalError(format!(
-                "WholeBlob control commit receipt cannot rebind a non-WholeBlob actor for session {}",
-                receipt.session_id()
-            )));
-        }
         if self.latest_run_checkpoint_receipt.lock().await.is_some() {
             return Err(AgentError::InternalError(format!(
                 "control commit for session {} cannot bypass an actor-carried provisional tail",
                 receipt.session_id()
             )));
         }
-        let authority = self
-            .runtime_store
-            .load_whole_blob_store_authority(&LogicalRuntimeId::for_session(receipt.session_id()))
-            .await
-            .map_err(|error| {
-                AgentError::InternalError(format!(
-                    "failed to confirm control commit authority for session {}: {error}",
-                    receipt.session_id()
-                ))
-            })?
-            .ok_or_else(|| {
-                AgentError::InternalError(format!(
-                    "control commit authority disappeared for session {}",
-                    receipt.session_id()
-                ))
-            })?;
-        if authority.session_id() != receipt.session_id()
-            || authority.store_revision() != receipt.store_revision()
-            || authority.blob_sha256() != receipt.authority_token()
-        {
+        if session.id() != receipt.session_id() {
             return Err(AgentError::InternalError(format!(
-                "control commit receipt no longer matches store authority for session {}",
-                receipt.session_id()
+                "control commit receipt for session {} was acknowledged on live session {}",
+                receipt.session_id(),
+                session.id()
             )));
         }
-        *self.whole_blob_base_authority.lock().map_err(|_| {
-            AgentError::InternalError(format!(
-                "WholeBlob actor base authority lock is poisoned for session {}",
+        match self.runtime_store.session_persistence_profile() {
+            RuntimeSessionPersistenceProfile::WholeBlobV1 => {
+                let authority = self
+                    .runtime_store
+                    .load_whole_blob_store_authority(&LogicalRuntimeId::for_session(
+                        receipt.session_id(),
+                    ))
+                    .await
+                    .map_err(|error| {
+                        AgentError::InternalError(format!(
+                            "failed to confirm control commit authority for session {}: {error}",
+                            receipt.session_id()
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        AgentError::InternalError(format!(
+                            "control commit authority disappeared for session {}",
+                            receipt.session_id()
+                        ))
+                    })?;
+                if authority.session_id() != receipt.session_id()
+                    || authority.store_revision() != receipt.store_revision()
+                    || authority.blob_sha256() != receipt.authority_token()
+                {
+                    return Err(AgentError::InternalError(format!(
+                        "control commit receipt no longer matches store authority for session {}",
+                        receipt.session_id()
+                    )));
+                }
+                *self.whole_blob_base_authority.lock().map_err(|_| {
+                    AgentError::InternalError(format!(
+                        "WholeBlob actor base authority lock is poisoned for session {}",
+                        receipt.session_id()
+                    ))
+                })? = Some(authority);
+                Ok(())
+            }
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1 => {
+                let authority = self
+                    .runtime_store
+                    .load_session_boundary_authority(&LogicalRuntimeId::for_session(
+                        receipt.session_id(),
+                    ))
+                    .await
+                    .map_err(|error| {
+                        AgentError::InternalError(format!(
+                            "failed to confirm control commit authority for session {}: {error}",
+                            receipt.session_id()
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        AgentError::InternalError(format!(
+                            "control commit authority disappeared for session {}",
+                            receipt.session_id()
+                        ))
+                    })?;
+                let committed = authority.head_canonical().ok_or_else(|| {
+                    AgentError::InternalError(format!(
+                        "HeadCanonical control commit loaded WholeBlob authority for session {}",
+                        receipt.session_id()
+                    ))
+                })?;
+                if committed.session_id() != receipt.session_id()
+                    || committed.store_revision() != receipt.store_revision()
+                    || committed.committed_head_token() != receipt.authority_token()
+                {
+                    return Err(AgentError::InternalError(format!(
+                        "control commit receipt no longer matches store authority for session {}",
+                        receipt.session_id()
+                    )));
+                }
+                let committed_metadata_identity = committed
+                    .boundary_head()
+                    .metadata_identity()
+                    .cloned()
+                    .ok_or_else(|| {
+                        AgentError::InternalError(format!(
+                            "HeadCanonical control commit boundary carries no metadata identity for session {}",
+                            receipt.session_id()
+                        ))
+                    })?;
+                session
+                    .acknowledge_head_canonical_control_metadata(&committed_metadata_identity)
+                    .map_err(|error| {
+                        AgentError::InternalError(format!(
+                            "durable control commit could not become the actor metadata baseline for session {}: {error}; live actor reload required",
+                            receipt.session_id()
+                        ))
+                    })
+            }
+            profile => Err(AgentError::InternalError(format!(
+                "control commit acknowledgement is unsupported under runtime persistence profile {profile:?} for session {}",
                 receipt.session_id()
-            ))
-        })? = Some(authority);
-        Ok(())
+            ))),
+        }
     }
 
     async fn checkpoint_run(
@@ -11532,6 +11595,7 @@ mod tests {
         assert!(
             meerkat_core::SessionCheckpointer::acknowledge_control_commit(
                 &checkpointer,
+                &mut successor,
                 &stale_receipt,
             )
             .await
@@ -11556,6 +11620,7 @@ mod tests {
         .expect("construct exact receipt");
         meerkat_core::SessionCheckpointer::acknowledge_control_commit(
             &checkpointer,
+            &mut successor,
             &exact_receipt,
         )
         .await

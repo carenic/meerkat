@@ -138,6 +138,17 @@ type AppliedModelFallbackSwitch = (
     crate::SessionToolVisibilityState,
 );
 
+/// Loop-level outcome of one machine-accepted sticky-fallback activation.
+enum ModelFallbackSwitchOutcome {
+    /// The fallback switch was fully applied (durably where required).
+    Applied(AppliedModelFallbackSwitch),
+    /// The durable coordinator refused the switch without requiring teardown
+    /// and every live client/auth mutation was rolled back. Fallback is
+    /// optional resilience, so the machine-accepted same-model retry proceeds
+    /// instead of terminalizing the turn.
+    SkippedNonDurable { reason: String },
+}
+
 /// Live publication retained while the runtime-owned durability coordinator
 /// settles the preauthorized sticky-fallback transaction. The operation is
 /// cancellation-safe; keeping the rest of the saga on `Agent` lets the
@@ -634,14 +645,24 @@ where
         receipt: Option<crate::SessionControlCommitReceipt>,
     ) -> Result<(), AgentError> {
         if let Some(receipt) = receipt.as_ref() {
-            let checkpointer = self.checkpointer.as_ref().ok_or_else(|| {
+            let checkpointer = self.checkpointer.clone().ok_or_else(|| {
                 AgentError::StickyModelFallbackAuthorityUnknown {
                     message: "durable sticky fallback committed without a session checkpointer"
                         .to_string(),
                 }
             })?;
+            // Acknowledge on the not-yet-published live successor so a failed
+            // acknowledgement leaves the pending publication (and its retry
+            // authority) intact.
+            let pending = self
+                .pending_sticky_model_fallback_activation
+                .as_mut()
+                .ok_or_else(|| AgentError::StickyModelFallbackAuthorityUnknown {
+                    message: "durable sticky fallback committed without a pending live publication"
+                        .to_string(),
+                })?;
             checkpointer
-                .acknowledge_control_commit(receipt)
+                .acknowledge_control_commit(&mut pending.next_session, receipt)
                 .await
                 .map_err(|error| AgentError::StickyModelFallbackAuthorityUnknown {
                     message: format!(
@@ -656,15 +677,50 @@ where
         &mut self,
         commit_error: crate::handles::StickyModelFallbackCommitError,
     ) -> AgentError {
+        match self.skip_pending_sticky_model_fallback(commit_error) {
+            Ok(reason) => AgentError::ConfigError(format!(
+                "durable sticky fallback commit rejected before publication: {reason}"
+            )),
+            Err(error) => error,
+        }
+    }
+
+    /// Take the pending live publication and compensate its client/auth
+    /// mutations. `Ok(reason)` means the refusal does not require teardown and
+    /// every live rollback succeeded; the turn may continue on the previous
+    /// model.
+    fn skip_pending_sticky_model_fallback(
+        &mut self,
+        commit_error: crate::handles::StickyModelFallbackCommitError,
+    ) -> Result<String, AgentError> {
         let Some(pending) = self.pending_sticky_model_fallback_activation.take() else {
-            return AgentError::StickyModelFallbackAuthorityUnknown {
+            return Err(AgentError::StickyModelFallbackAuthorityUnknown {
                 message: format!("{commit_error}; live fallback compensation state was missing"),
-            };
+            });
         };
+        self.compensate_refused_sticky_model_fallback(
+            commit_error,
+            &pending.previous_identity,
+            &pending.target_identity,
+            pending.auth_rotation,
+        )
+    }
+
+    /// Roll back the staged client and auth-lease mutations after a durable
+    /// coordinator refusal. `Ok(reason)` classifies the refusal as skippable:
+    /// no teardown required and both rollbacks succeeded. Everything else is
+    /// an authority-unknown fatal error.
+    fn compensate_refused_sticky_model_fallback(
+        &mut self,
+        commit_error: crate::handles::StickyModelFallbackCommitError,
+        previous_identity: &crate::SessionLlmIdentity,
+        target_identity: &crate::SessionLlmIdentity,
+        auth_rotation: super::runner::StagedAuthLeaseRotation,
+    ) -> Result<String, AgentError> {
         let requires_teardown = commit_error.requires_teardown();
-        let auth_rollback = pending.auth_rotation.rollback();
-        let client_rollback = self
-            .restore_model_fallback_client(&pending.previous_identity, &pending.target_identity);
+        let auth_rollback = auth_rotation.rollback();
+        let client_rollback =
+            self.restore_model_fallback_client(previous_identity, target_identity);
         let mut failures = Vec::new();
         if let Err(error) = auth_rollback {
             failures.push(format!(
@@ -682,14 +738,11 @@ where
             } else {
                 format!("; {}", failures.join("; "))
             };
-            AgentError::StickyModelFallbackAuthorityUnknown {
+            return Err(AgentError::StickyModelFallbackAuthorityUnknown {
                 message: format!("{commit_error}{suffix}"),
-            }
-        } else {
-            AgentError::ConfigError(format!(
-                "durable sticky fallback commit rejected before publication: {commit_error}"
-            ))
+            });
         }
+        Ok(commit_error.to_string())
     }
 
     /// Settle a supervised sticky-fallback transaction whose await was
@@ -721,7 +774,7 @@ where
         previous_tools: &[Arc<ToolDef>],
         extraction_output_schema: Option<&crate::types::OutputSchema>,
         durable_visibility_parent: Option<&crate::SessionToolVisibilityState>,
-    ) -> Result<AppliedModelFallbackSwitch, AgentError> {
+    ) -> Result<ModelFallbackSwitchOutcome, AgentError> {
         let MachineAcceptedModelFallbackActivation { switch, proof } = activation;
         let retry_attempt = proof.retry_attempt();
         let capability_base_filter = crate::capability_base_filter_for_image_tool_results(
@@ -970,36 +1023,13 @@ where
             let operation = match coordinator.begin(machine_commit, control_delta) {
                 Ok(operation) => operation,
                 Err(commit_error) => {
-                    let requires_teardown = commit_error.requires_teardown();
-                    let auth_rollback = auth_rotation.rollback();
-                    let client_rollback = self.restore_model_fallback_client(
+                    let reason = self.compensate_refused_sticky_model_fallback(
+                        commit_error,
                         &switch.previous_identity,
                         &switch.new_identity,
-                    );
-                    let mut failures = Vec::new();
-                    if let Err(error) = auth_rollback {
-                        failures.push(format!(
-                            "failed to restore the previous auth lease: {error}"
-                        ));
-                    }
-                    if let Err(error) = client_rollback {
-                        failures.push(format!(
-                            "failed to restore the previous fallback client: {error}"
-                        ));
-                    }
-                    if requires_teardown || !failures.is_empty() {
-                        let suffix = if failures.is_empty() {
-                            String::new()
-                        } else {
-                            format!("; {}", failures.join("; "))
-                        };
-                        return Err(AgentError::StickyModelFallbackAuthorityUnknown {
-                            message: format!("{commit_error}{suffix}"),
-                        });
-                    }
-                    return Err(AgentError::ConfigError(format!(
-                        "durable sticky fallback could not start: {commit_error}"
-                    )));
+                        auth_rotation,
+                    )?;
+                    return Ok(ModelFallbackSwitchOutcome::SkippedNonDurable { reason });
                 }
             };
             self.pending_sticky_model_fallback_activation =
@@ -1017,7 +1047,10 @@ where
                     self.publish_store_confirmed_sticky_model_fallback(receipt)
                         .await?;
                 }
-                Err(error) => return Err(self.reject_pending_sticky_model_fallback(error)),
+                Err(error) => {
+                    let reason = self.skip_pending_sticky_model_fallback(error)?;
+                    return Ok(ModelFallbackSwitchOutcome::SkippedNonDurable { reason });
+                }
             }
         } else {
             if let Err(machine_error) = machine_commit.commit() {
@@ -1044,13 +1077,13 @@ where
             self.session = next_session;
         }
 
-        Ok((
+        Ok(ModelFallbackSwitchOutcome::Applied((
             next_tools,
             provider_params,
             max_tokens,
             notice,
             visibility_plan.next_state,
-        ))
+        )))
     }
 
     fn active_model_fallback_identity(
@@ -1696,13 +1729,7 @@ where
                                     &retry_schedule,
                                     self.effective_model_registry.as_deref(),
                                 )?;
-                                let (
-                                    next_tools,
-                                    next_params,
-                                    next_max_tokens,
-                                    notice,
-                                    next_durable_visibility_parent,
-                                ) = self
+                                match self
                                     .apply_model_fallback_switch(
                                         activation,
                                         &error,
@@ -1710,13 +1737,32 @@ where
                                         extraction_output_schema.as_ref(),
                                         durable_visibility_parent.as_ref(),
                                     )
-                                    .await?;
-                                current_tools = next_tools;
-                                current_provider_params = next_params;
-                                current_max_tokens = next_max_tokens;
-                                current_messages.push(notice);
-                                *durable_visibility_parent = Some(next_durable_visibility_parent);
-                                fallback_request_pressure_recheck = true;
+                                    .await?
+                                {
+                                    ModelFallbackSwitchOutcome::Applied((
+                                        next_tools,
+                                        next_params,
+                                        next_max_tokens,
+                                        notice,
+                                        next_durable_visibility_parent,
+                                    )) => {
+                                        current_tools = next_tools;
+                                        current_provider_params = next_params;
+                                        current_max_tokens = next_max_tokens;
+                                        current_messages.push(notice);
+                                        *durable_visibility_parent =
+                                            Some(next_durable_visibility_parent);
+                                        fallback_request_pressure_recheck = true;
+                                    }
+                                    ModelFallbackSwitchOutcome::SkippedNonDurable { reason } => {
+                                        tracing::warn!(
+                                            %reason,
+                                            "sticky model fallback skipped without teardown; \
+                                             continuing the machine-accepted retry on the \
+                                             previous model"
+                                        );
+                                    }
+                                }
                             }
                             self.execute_turn_effects(&recover, turn_count, event_tx)
                                 .await?;
@@ -1802,13 +1848,7 @@ where
                                 &retry_schedule,
                                 self.effective_model_registry.as_deref(),
                             )?;
-                            let (
-                                next_tools,
-                                next_params,
-                                next_max_tokens,
-                                notice,
-                                next_durable_visibility_parent,
-                            ) = self
+                            match self
                                 .apply_model_fallback_switch(
                                     activation,
                                     &e,
@@ -1816,13 +1856,32 @@ where
                                     extraction_output_schema.as_ref(),
                                     durable_visibility_parent.as_ref(),
                                 )
-                                .await?;
-                            current_tools = next_tools;
-                            current_provider_params = next_params;
-                            current_max_tokens = next_max_tokens;
-                            current_messages.push(notice);
-                            *durable_visibility_parent = Some(next_durable_visibility_parent);
-                            fallback_request_pressure_recheck = true;
+                                .await?
+                            {
+                                ModelFallbackSwitchOutcome::Applied((
+                                    next_tools,
+                                    next_params,
+                                    next_max_tokens,
+                                    notice,
+                                    next_durable_visibility_parent,
+                                )) => {
+                                    current_tools = next_tools;
+                                    current_provider_params = next_params;
+                                    current_max_tokens = next_max_tokens;
+                                    current_messages.push(notice);
+                                    *durable_visibility_parent =
+                                        Some(next_durable_visibility_parent);
+                                    fallback_request_pressure_recheck = true;
+                                }
+                                ModelFallbackSwitchOutcome::SkippedNonDurable { reason } => {
+                                    tracing::warn!(
+                                        %reason,
+                                        "sticky model fallback skipped without teardown; \
+                                         continuing the machine-accepted retry on the previous \
+                                         model"
+                                    );
+                                }
+                            }
                         }
                         self.execute_turn_effects(&recover, turn_count, event_tx)
                             .await?;
@@ -16053,6 +16112,193 @@ mod tests {
         }
     }
 
+    struct WaitFailingStickyFallbackOperation {
+        error: crate::handles::StickyModelFallbackCommitError,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl crate::handles::StickyModelFallbackCommitOperation for WaitFailingStickyFallbackOperation {
+        async fn wait(
+            &self,
+        ) -> Result<
+            Option<crate::SessionControlCommitReceipt>,
+            crate::handles::StickyModelFallbackCommitError,
+        > {
+            Err(self.error.clone())
+        }
+    }
+
+    struct WaitFailingStickyFallbackCoordinator {
+        error: crate::handles::StickyModelFallbackCommitError,
+    }
+
+    impl crate::handles::StickyModelFallbackCommitCoordinator for WaitFailingStickyFallbackCoordinator {
+        fn begin(
+            &self,
+            machine_commit: Box<dyn crate::handles::StickyModelFallbackMachineCommit>,
+            _control_delta: crate::handles::StickyModelFallbackControlDelta,
+        ) -> Result<
+            Arc<dyn crate::handles::StickyModelFallbackCommitOperation>,
+            crate::handles::StickyModelFallbackCommitError,
+        > {
+            // The durable CAS fails before generated-machine realization: the
+            // staged one-shot is dropped unconsumed, exactly like the runtime
+            // coordinator's pre-machine-commit store failure.
+            drop(machine_commit);
+            Ok(Arc::new(WaitFailingStickyFallbackOperation {
+                error: self.error.clone(),
+            }))
+        }
+    }
+
+    /// Fails exactly one call on the primary model, proposes a backup
+    /// fallback, and succeeds on any later call regardless of the active
+    /// candidate. This isolates skip-and-retry behavior from target health.
+    struct FallbackSkipProbeClient {
+        registry: Arc<crate::ModelRegistry>,
+        calls: std::sync::atomic::AtomicUsize,
+        active: std::sync::atomic::AtomicUsize,
+        commits: Mutex<Vec<(String, String)>>,
+        models_at_call: Mutex<Vec<String>>,
+    }
+
+    impl FallbackSkipProbeClient {
+        fn new() -> Self {
+            Self {
+                registry: fallback_activation_test_registry(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                active: std::sync::atomic::AtomicUsize::new(0),
+                commits: Mutex::new(Vec::new()),
+                models_at_call: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn registry(&self) -> Arc<crate::ModelRegistry> {
+            Arc::clone(&self.registry)
+        }
+
+        fn commits(&self) -> Vec<(String, String)> {
+            self.commits.lock().unwrap().clone()
+        }
+
+        fn models_at_call(&self) -> Vec<String> {
+            self.models_at_call.lock().unwrap().clone()
+        }
+
+        fn identity_for(model: &str) -> crate::SessionLlmIdentity {
+            crate::SessionLlmIdentity {
+                model: model.to_string(),
+                provider: crate::provider::Provider::OpenAI,
+                self_hosted_server_id: None,
+                provider_params: None,
+                auth_binding: None,
+            }
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentLlmClient for FallbackSkipProbeClient {
+        async fn stream_response(
+            &self,
+            _messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.models_at_call
+                .lock()
+                .unwrap()
+                .push(self.model().to_string());
+            if call == 0 {
+                return Err(AgentError::llm(
+                    "mock",
+                    crate::error::LlmFailureReason::ProviderError(
+                        crate::error::LlmProviderError::retryable(
+                            crate::error::LlmProviderErrorKind::ServerOverloaded,
+                            serde_json::json!({"message": "busy once"}),
+                        ),
+                    ),
+                    "mock overloaded once",
+                ));
+            }
+            Ok(super::LlmStreamResult::new(
+                vec![AssistantBlock::Text {
+                    text: "ok on previous model".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+                normalized_test_usage(self, Usage::default()),
+            ))
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::OpenAI
+        }
+
+        fn model(&self) -> &'static str {
+            if self.active.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                "primary"
+            } else {
+                "backup"
+            }
+        }
+
+        fn prepare_model_fallback(
+            &self,
+            _failure: &AgentError,
+        ) -> Option<crate::AgentLlmFallbackSwitch> {
+            if self.active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                return None;
+            }
+            Some(crate::AgentLlmFallbackSwitch {
+                previous_identity: Self::identity_for("primary"),
+                new_identity: Self::identity_for("backup"),
+                target_profile: self
+                    .registry
+                    .profile_witness_for_provider(crate::Provider::OpenAI, "backup")
+                    .expect("registered backup profile"),
+                request_policy: crate::SessionLlmRequestPolicy {
+                    model: "backup".to_string(),
+                    provider_params: None,
+                    provider_tool_defaults: None,
+                },
+                skipped_targets: Vec::new(),
+            })
+        }
+
+        fn commit_model_fallback(
+            &self,
+            previous_identity: &crate::SessionLlmIdentity,
+            target_identity: &crate::SessionLlmIdentity,
+        ) -> Result<(), AgentError> {
+            let expected_previous = self
+                .active_model_fallback_identity()
+                .ok_or_else(|| AgentError::ConfigError("missing active identity".to_string()))?;
+            if expected_previous != *previous_identity {
+                return Err(AgentError::ConfigError(
+                    "skip-probe client previous identity mismatch".to_string(),
+                ));
+            }
+            self.commits.lock().unwrap().push((
+                previous_identity.model.clone(),
+                target_identity.model.clone(),
+            ));
+            self.active.store(
+                usize::from(target_identity.model == "backup"),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Ok(())
+        }
+
+        fn active_model_fallback_identity(&self) -> Option<crate::SessionLlmIdentity> {
+            Some(Self::identity_for(self.model()))
+        }
+    }
+
     #[derive(Default)]
     struct RecordingFallbackVisibilityOwner {
         state: std::sync::RwLock<crate::SessionToolVisibilityState>,
@@ -16853,6 +17099,194 @@ mod tests {
         );
     }
 
+    fn assert_sticky_fallback_was_skipped_cleanly(
+        session: &crate::Session,
+        client: &FallbackSkipProbeClient,
+        model_routing: &RecordingModelRoutingHandle,
+    ) {
+        assert_eq!(
+            client.models_at_call(),
+            vec!["primary".to_string(), "primary".to_string()],
+            "the machine-accepted retry must run on the previous model"
+        );
+        assert_eq!(
+            client.commits(),
+            vec![
+                ("primary".to_string(), "backup".to_string()),
+                ("backup".to_string(), "primary".to_string()),
+            ],
+            "the staged client activation must be rolled back exactly once"
+        );
+        assert!(
+            model_routing.commits().is_empty(),
+            "generated authority must not realize a skipped fallback"
+        );
+        let identity = session
+            .session_metadata()
+            .expect("session metadata")
+            .llm_identity();
+        assert_eq!(
+            identity.model, "primary",
+            "a skipped fallback must not change the durable LLM identity"
+        );
+        assert!(
+            !session.messages().iter().any(|message| matches!(
+                message,
+                Message::SystemNotice(notice) if notice.blocks.iter().any(|block| matches!(
+                    block,
+                    crate::types::SystemNoticeBlock::RuntimeNotice { category, .. }
+                        if category == "model_fallback"
+                ))
+            )),
+            "a skipped fallback must not publish a model_fallback notice"
+        );
+    }
+
+    /// A non-teardown durable refusal at coordinator `begin` must skip the
+    /// fallback (with full live compensation) and let the machine-accepted
+    /// same-model retry proceed, instead of terminalizing the turn as a
+    /// ConfigError.
+    #[tokio::test]
+    async fn non_teardown_begin_refusal_skips_fallback_and_retries_previous_model() {
+        use crate::retry::RetryPolicy;
+
+        let client = Arc::new(FallbackSkipProbeClient::new());
+        let visibility_owner: Arc<dyn crate::ToolVisibilityOwner> =
+            Arc::new(RecordingFallbackVisibilityOwner::default());
+        let generated_visibility_owner =
+            crate::tool_scope::generated_test_tool_visibility_owner_from(Arc::clone(
+                &visibility_owner,
+            ));
+        let model_routing = Arc::new(RecordingModelRoutingHandle::new(visibility_owner));
+        let coordinator = Arc::new(RejectingStickyFallbackCoordinator {
+            error: crate::handles::StickyModelFallbackCommitError::Store(
+                "synthetic durable store refusal".to_string(),
+            ),
+        });
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new(),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_effective_model_registry(client.registry())
+        .with_tool_visibility_owner(generated_visibility_owner)
+        .with_model_routing_handle(model_routing.clone())
+        .with_sticky_model_fallback_commit_coordinator(coordinator)
+        .retry_policy(RetryPolicy {
+            max_retries: 1,
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            multiplier: 1.0,
+            call_timeout: None,
+            stream_inactivity_timeout: None,
+        })
+        .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+        .await;
+
+        let result = agent
+            .run("skip the durable fallback".to_string().into())
+            .await
+            .expect("a non-teardown durable refusal must not terminalize the turn");
+
+        assert_eq!(result.text, "ok on previous model");
+        assert_sticky_fallback_was_skipped_cleanly(&agent.session, &client, &model_routing);
+    }
+
+    /// The same skip semantics when the durable refusal surfaces from the
+    /// supervised operation `wait` instead of `begin`.
+    #[tokio::test]
+    async fn non_teardown_wait_refusal_skips_fallback_and_retries_previous_model() {
+        use crate::retry::RetryPolicy;
+
+        let client = Arc::new(FallbackSkipProbeClient::new());
+        let visibility_owner: Arc<dyn crate::ToolVisibilityOwner> =
+            Arc::new(RecordingFallbackVisibilityOwner::default());
+        let generated_visibility_owner =
+            crate::tool_scope::generated_test_tool_visibility_owner_from(Arc::clone(
+                &visibility_owner,
+            ));
+        let model_routing = Arc::new(RecordingModelRoutingHandle::new(visibility_owner));
+        let coordinator = Arc::new(WaitFailingStickyFallbackCoordinator {
+            error: crate::handles::StickyModelFallbackCommitError::Store(
+                "synthetic durable wait refusal".to_string(),
+            ),
+        });
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new(),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_effective_model_registry(client.registry())
+        .with_tool_visibility_owner(generated_visibility_owner)
+        .with_model_routing_handle(model_routing.clone())
+        .with_sticky_model_fallback_commit_coordinator(coordinator)
+        .retry_policy(RetryPolicy {
+            max_retries: 1,
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            multiplier: 1.0,
+            call_timeout: None,
+            stream_inactivity_timeout: None,
+        })
+        .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+        .await;
+
+        let result = agent
+            .run("skip the durable fallback at wait".to_string().into())
+            .await
+            .expect("a non-teardown wait refusal must not terminalize the turn");
+
+        assert_eq!(result.text, "ok on previous model");
+        assert_sticky_fallback_was_skipped_cleanly(&agent.session, &client, &model_routing);
+    }
+
+    /// Teardown-class refusals must remain fatal: the coordinator could not
+    /// prove a single authoritative durable parent.
+    #[tokio::test]
+    async fn teardown_class_begin_refusal_remains_fatal() {
+        use crate::retry::RetryPolicy;
+
+        let client = Arc::new(FallbackSkipProbeClient::new());
+        let visibility_owner: Arc<dyn crate::ToolVisibilityOwner> =
+            Arc::new(RecordingFallbackVisibilityOwner::default());
+        let generated_visibility_owner =
+            crate::tool_scope::generated_test_tool_visibility_owner_from(Arc::clone(
+                &visibility_owner,
+            ));
+        let model_routing = Arc::new(RecordingModelRoutingHandle::new(visibility_owner));
+        let coordinator = Arc::new(RejectingStickyFallbackCoordinator {
+            error: crate::handles::StickyModelFallbackCommitError::SnapshotConflict,
+        });
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new(),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_effective_model_registry(client.registry())
+        .with_tool_visibility_owner(generated_visibility_owner)
+        .with_model_routing_handle(model_routing)
+        .with_sticky_model_fallback_commit_coordinator(coordinator)
+        .retry_policy(RetryPolicy {
+            max_retries: 1,
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            multiplier: 1.0,
+            call_timeout: None,
+            stream_inactivity_timeout: None,
+        })
+        .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+        .await;
+
+        let error = agent
+            .run("teardown-class refusal".to_string().into())
+            .await
+            .expect_err("a teardown-class durable refusal must remain fatal");
+        assert!(
+            matches!(
+                error,
+                AgentError::StickyModelFallbackAuthorityUnknown { .. }
+            ),
+            "unexpected teardown-class result: {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn terminal_fallback_retry_keeps_the_accepted_target_sticky() {
         use crate::retry::RetryPolicy;
@@ -16924,6 +17358,9 @@ mod tests {
         );
     }
 
+    /// A non-teardown coordinator rejection skips the fallback; the turn then
+    /// terminalizes through the machine-owned retry budget on the still-failing
+    /// primary provider, with the client compensated before every next run.
     #[tokio::test]
     async fn rejected_fallback_coordinator_terminalizes_error_recovery_for_next_run() {
         use crate::retry::RetryPolicy;
@@ -16961,11 +17398,20 @@ mod tests {
         .await;
 
         for prompt in ["first rejected fallback", "second rejected fallback"] {
-            let error = agent
-                .run(prompt.to_string().into())
-                .await
-                .expect_err("coordinator rejection must fail the turn");
-            assert!(error.to_string().contains("pre-commit store rejection"));
+            let error = agent.run(prompt.to_string().into()).await.expect_err(
+                "with the fallback skipped, the failing primary must exhaust the retry budget",
+            );
+            match &error {
+                AgentError::TerminalFailure {
+                    outcome,
+                    cause_kind,
+                    ..
+                } => {
+                    assert_eq!(*outcome, TurnTerminalOutcome::Failed);
+                    assert_eq!(*cause_kind, crate::TurnTerminalCauseKind::RetryExhausted);
+                }
+                other => panic!("expected retry-exhausted terminal failure, got {other:?}"),
+            }
             let snapshot = agent
                 .execution_snapshot()
                 .expect("turn snapshot")

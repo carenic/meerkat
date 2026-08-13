@@ -954,6 +954,68 @@ impl SessionHeadMetadataTracker {
         Ok(())
     }
 
+    /// Adopt a store-committed control-only transition as this actor's new
+    /// preparation baseline without erasing unrelated coalesced mutation
+    /// intent.
+    ///
+    /// The committed transition wrote exactly `control_keys`, and their
+    /// committed values are the live map's current values: the durable
+    /// coordinator applied the identical typed control delta to the identical
+    /// committed parent. Applying those cells to the current baseline must
+    /// reproduce the committed identity or the adoption fails closed. Dirty
+    /// intent for every other key is retained; those keys still differ from
+    /// the new baseline exactly as they differed from the old one.
+    pub(crate) fn rebase_control_commit_baseline(
+        &mut self,
+        control_keys: &[&str],
+        metadata: &serde_json::Map<String, serde_json::Value>,
+        committed: &SessionHeadMetadataIdentity,
+    ) -> Result<(), String> {
+        if self.invalid {
+            return Err(
+                "HeadCanonical metadata mutation epoch overflowed or was poisoned".to_string(),
+            );
+        }
+        if self.baseline_identity.is_none() {
+            return Err(
+                "control-commit rebase requires an acknowledged HeadCanonical baseline".to_string(),
+            );
+        }
+        let mut tree = self.baseline_tree.clone();
+        for key in control_keys {
+            if !super::head_canonical_metadata_cell_carries_key(key) {
+                return Err(format!(
+                    "control key `{key}` is not carried by HeadCanonical metadata cells"
+                ));
+            }
+            let successor = metadata
+                .get(*key)
+                .map(|value| {
+                    SessionHeadMetadataCell::from_value(key, value)
+                        .map(|cell| cell.identity().clone())
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()?;
+            let expected = tree.cell_identity(key)?;
+            let (next, _proof) = tree.apply(key, expected.as_ref(), successor.as_ref())?;
+            tree = next;
+        }
+        if !tree.verify_identity(committed) {
+            return Err(
+                "live control values applied to the actor baseline do not hash to the \
+                 committed boundary identity"
+                    .to_string(),
+            );
+        }
+        self.baseline_identity = Some(committed.clone());
+        self.baseline_tree = tree;
+        for key in control_keys {
+            self.dirty_keys.remove(*key);
+        }
+        self.prepared = OnceLock::new();
+        Ok(())
+    }
+
     pub(crate) fn validate_acknowledgement(
         &self,
         projection: &Arc<SessionHeadMetadataProjection>,
