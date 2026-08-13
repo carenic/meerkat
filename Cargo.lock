@@ -3588,6 +3588,7 @@ dependencies = [
  "meerkat-contracts",
  "meerkat-core",
  "meerkat-live",
+ "meerkat-llm-core",
  "meerkat-mcp",
  "meerkat-mob",
  "meerkat-mob-mcp",

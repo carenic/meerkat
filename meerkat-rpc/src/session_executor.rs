@@ -941,7 +941,14 @@ mod persistent_cleanup_tests {
                     event_tx: None,
                     initial_turn: InitialTurnPolicy::Defer,
                     deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
-                    build: Some(SessionBuildOptions::default()),
+                    build: Some(SessionBuildOptions {
+                        // CI runs keyless: override the client so the build
+                        // never resolves a real provider identity.
+                        llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
+                            Arc::new(meerkat_llm_core::TestClient::default()),
+                        )),
+                        ..SessionBuildOptions::default()
+                    }),
                     labels: None,
                 },
                 admission,
@@ -1266,7 +1273,12 @@ mod tests {
                     event_tx: None,
                     initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
                     deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
-                    build: Some(meerkat_core::SessionBuildOptions::default()),
+                    build: Some(meerkat_core::SessionBuildOptions {
+                        llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
+                            Arc::new(meerkat_llm_core::TestClient::default()),
+                        )),
+                        ..meerkat_core::SessionBuildOptions::default()
+                    }),
                     labels: None,
                 },
                 admission,

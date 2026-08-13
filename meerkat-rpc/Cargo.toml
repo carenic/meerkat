@@ -64,6 +64,7 @@ workgraph = ["meerkat/workgraph"]
 live-webrtc = ["meerkat-live/webrtc", "meerkat/live-webrtc"]
 
 [dev-dependencies]
+meerkat-llm-core = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 futures = { workspace = true }
 async-stream = { workspace = true }
