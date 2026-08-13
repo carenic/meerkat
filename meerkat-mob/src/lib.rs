@@ -118,7 +118,9 @@ pub use error::{
     FlowStepDispatchRejectKind, ForkSourceUnavailableCause, MemberProvisionFailureCause, MobError,
     MobFailureClass, RuntimeEffectKind,
 };
-pub use event::{AttributedEvent, MemberWireEdge, MobEvent, MobEventKind, NewMobEvent};
+pub use event::{
+    AttributedEvent, FlowCancelClass, MemberWireEdge, MobEvent, MobEventKind, NewMobEvent,
+};
 pub use identity::{
     DesiredExecution, DesiredExternalAddress, DesiredIdentityEdge, DesiredInitialDelivery,
     DesiredLocalCallbackTool, DesiredMemberMaterial, DesiredMemberOverlay, DesiredMemberSpec,

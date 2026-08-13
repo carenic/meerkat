@@ -68,7 +68,9 @@ pub(crate) fn terminal_event_identity(kind: &MobEventKind) -> Option<(&RunId, &F
         | MobEventKind::FlowFailed {
             run_id, flow_id, ..
         }
-        | MobEventKind::FlowCanceled { run_id, flow_id } => Some((run_id, flow_id)),
+        | MobEventKind::FlowCanceled {
+            run_id, flow_id, ..
+        } => Some((run_id, flow_id)),
         _ => None,
     }
 }

@@ -5207,7 +5207,9 @@ async fn seed_mob_authority_sync_from_flow_runs(
                         }
                     }
                     crate::run::MobRunStatus::Canceled => {
-                        super::terminalization::TerminalizationTarget::Canceled
+                        // The original cancellation origin is not
+                        // reconstructable from a bare terminal run snapshot.
+                        super::terminalization::TerminalizationTarget::Canceled { cause: None }
                     }
                     crate::run::MobRunStatus::Pending | crate::run::MobRunStatus::Running => {
                         unreachable!("run terminality was checked above")
@@ -6832,7 +6834,10 @@ pub(super) async fn converge_recovered_active_flow_run(
     )? {
         // Terminal status and terminal event commit through the store's
         // combined seam (single SQLite transaction on durable storage) so
-        // recovery cannot split terminal truth either.
+        // recovery cannot split terminal truth either. This convergence runs
+        // only for a replayed-active run with no surviving execution custody
+        // (the process that was executing it is gone), so the terminal event
+        // carries that typed cause instead of posing as an ordinary cancel.
         let _ = commit_recovered_flow_run_command(
             authority,
             run_store.clone(),
@@ -6841,7 +6846,9 @@ pub(super) async fn converge_recovered_active_flow_run(
             Some(MobRunStatus::Canceled),
             Some((
                 terminalization,
-                super::terminalization::TerminalizationTarget::Canceled,
+                super::terminalization::TerminalizationTarget::Canceled {
+                    cause: Some(crate::event::FlowCancelClass::ExecutionCustodyLost),
+                },
                 before_terminal.flow_id.clone(),
             )),
             "resume_recovered_flow_terminalize_canceled",

@@ -49872,7 +49872,7 @@ impl MobActor {
         if crate::run::mob_machine_run_status_is_terminal(&run.run_id, &run.status)?
             && !matches!(
                 (&target, &run.status),
-                (TerminalizationTarget::Canceled, MobRunStatus::Failed)
+                (TerminalizationTarget::Canceled { .. }, MobRunStatus::Failed)
             )
         {
             let repaired = self
@@ -50008,7 +50008,9 @@ impl MobActor {
             .commit_flow_terminalization_in_actor(
                 run_id,
                 flow_id,
-                TerminalizationTarget::Canceled,
+                TerminalizationTarget::Canceled {
+                    cause: Some(crate::event::FlowCancelClass::CancelRequested),
+                },
                 MobMachineFlowRunCommand::TerminalizeCanceled(
                     flow_run::inputs::TerminalizeCanceled {},
                 ),

@@ -14850,6 +14850,140 @@ mod mob_typed_exit_tests {
     }
 }
 
+/// Bounded window between a shutdown-signal-driven `cancel_flow` and the
+/// run's durable Canceled terminal. Expiry does not lose the run: the durable
+/// state converges on the next mob hydration.
+#[cfg(feature = "mob")]
+const PACK_RUN_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Which future finished first while a foreground pack flow run waited for
+/// its terminal state.
+#[cfg(feature = "mob")]
+enum PackRunWaitFirst {
+    Terminal(anyhow::Result<meerkat_mob::MobRun>),
+    ShutdownSignal(anyhow::Result<()>),
+}
+
+/// Race the flow terminal wait against the process shutdown signal. Split out
+/// as an injection seam so the signal race is unit-testable without sending
+/// real signals.
+#[cfg(feature = "mob")]
+async fn select_pack_flow_terminal_or_shutdown<W, S>(
+    terminal_wait: W,
+    shutdown: S,
+) -> PackRunWaitFirst
+where
+    W: std::future::Future<Output = anyhow::Result<meerkat_mob::MobRun>>,
+    S: std::future::Future<Output = anyhow::Result<()>>,
+{
+    tokio::pin!(terminal_wait);
+    tokio::pin!(shutdown);
+    tokio::select! {
+        run = &mut terminal_wait => PackRunWaitFirst::Terminal(run),
+        signal = &mut shutdown => PackRunWaitFirst::ShutdownSignal(signal),
+    }
+}
+
+/// Run one pack flow in the foreground on the realm's durable mob custody and
+/// wait for its terminal. When SIGINT/SIGTERM arrives mid-flow, the run is
+/// converged to its durable Canceled terminal within a bounded grace window,
+/// the honest terminal envelope is printed, and a typed error propagates the
+/// nonzero exit so scripted callers observe the interruption.
+#[cfg(feature = "mob")]
+async fn run_pack_flow_foreground(
+    state: &meerkat_mob_mcp::MobMcpState,
+    mob_id: &meerkat_mob::MobId,
+    flow_id: FlowId,
+    params: serde_json::Value,
+    json: bool,
+    warnings: &[String],
+) -> anyhow::Result<String> {
+    let run_id = state
+        .mob_run_flow(mob_id, flow_id, params)
+        .await
+        .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+    match select_pack_flow_terminal_or_shutdown(
+        wait_for_terminal_flow_run(state, mob_id.as_str(), &run_id),
+        mob_host::wait_for_shutdown_signal(),
+    )
+    .await
+    {
+        PackRunWaitFirst::Terminal(run) => render_mob_run_envelope(&run?, json),
+        PackRunWaitFirst::ShutdownSignal(signal) => {
+            signal?;
+            state
+                .mob_cancel_flow(mob_id, run_id.clone())
+                .await
+                .map_err(mob_anyhow)?;
+            let run = tokio::time::timeout(
+                PACK_RUN_CANCEL_GRACE,
+                wait_for_terminal_flow_run(state, mob_id.as_str(), &run_id),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "mob run interrupted: flow run '{run_id}' did not reach its Canceled terminal within {}s; the run is durable and converges on the next mob hydration",
+                    PACK_RUN_CANCEL_GRACE.as_secs()
+                )
+            })??;
+            println!(
+                "{}",
+                render_mob_run_pack_with_warnings(
+                    render_mob_run_envelope(&run, json)?,
+                    warnings.to_vec()
+                )?
+            );
+            Err(anyhow::anyhow!(
+                "mob run interrupted: shutdown signal received; flow run '{run_id}' terminalized as '{}'",
+                mob_run_status_text(&run.status)
+            ))
+        }
+    }
+}
+
+/// Honest custody statement for `--detach`: flow execution stays inside this
+/// exiting CLI process; only the durable run state survives, and the next mob
+/// hydration converges an unfinished run to canceled (execution custody lost).
+#[cfg(feature = "mob")]
+fn detach_execution_custody_warning(run_id: &RunId) -> String {
+    format!(
+        "mob run --detach does not transfer flow execution to a surviving process: run '{run_id}' executes only while this CLI process lives, and the next mob hydration converges an unfinished run to canceled (execution custody lost)"
+    )
+}
+
+#[cfg(all(test, feature = "mob"))]
+mod pack_run_shutdown_seam_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pack_flow_wait_admits_shutdown_signal_while_terminal_wait_pends() {
+        let first = select_pack_flow_terminal_or_shutdown(
+            std::future::pending::<anyhow::Result<meerkat_mob::MobRun>>(),
+            std::future::ready(Ok(())),
+        )
+        .await;
+        assert!(matches!(first, PackRunWaitFirst::ShutdownSignal(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn pack_flow_wait_prefers_reached_terminal_over_pending_shutdown() {
+        let first = select_pack_flow_terminal_or_shutdown(
+            std::future::ready(Err(anyhow::anyhow!("terminal-first"))),
+            std::future::pending::<anyhow::Result<()>>(),
+        )
+        .await;
+        match first {
+            PackRunWaitFirst::Terminal(result) => {
+                let error = result.expect_err("injected terminal error");
+                assert_eq!(error.to_string(), "terminal-first");
+            }
+            PackRunWaitFirst::ShutdownSignal(_) => {
+                panic!("terminal-first run must not report a shutdown signal")
+            }
+        }
+    }
+}
+
 #[cfg(feature = "mob")]
 async fn wait_for_terminal_flow_run(
     state: &meerkat_mob_mcp::MobMcpState,
@@ -15038,25 +15172,6 @@ fn render_mob_events(events: Vec<meerkat_mob::MobEvent>, json: bool) -> anyhow::
         ));
     }
     Ok(lines.join("\n"))
-}
-
-#[cfg(feature = "mob")]
-async fn await_pack_flow_terminal(
-    mob: &meerkat_mob::MobHandle,
-    run_id: RunId,
-) -> anyhow::Result<meerkat_mob::MobRun> {
-    loop {
-        if let Some(run) = mob
-            .flow_status(run_id.clone())
-            .await
-            .map_err(|err| anyhow::anyhow!("{err}"))?
-            && mob_machine_run_status_is_terminal(&run_id, &run.status)
-                .map_err(|err| anyhow::anyhow!("{err}"))?
-        {
-            return Ok(run);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
 }
 
 #[cfg(feature = "mob")]
@@ -15311,6 +15426,7 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
                         flow_id.as_str()
                     );
                 }
+                eprintln!("warning\t{}", detach_execution_custody_warning(&run_id));
             } else {
                 let run = wait_for_terminal_flow_run(state.as_ref(), &target, &run_id).await?;
                 println!("{}", render_mob_run_envelope(&run, json)?);
@@ -16280,6 +16396,44 @@ async fn execute_mob_run_pack(
         DeploySurfaceArg::Cli,
     )?;
     let flow_id = choose_mobpack_flow(&archive, invocation.flow)?;
+    if invocation.detach && flow_id.is_none() {
+        // Refuse before the durable mob-create side effect below.
+        return Err(anyhow::anyhow!(
+            "mob run --detach requires a mobpack with a callable flow"
+        ));
+    }
+
+    // Detached AND foreground pack runs execute on the realm's durable mob
+    // custody (the same persistent surface the installed-mob verbs and
+    // --detach already used): the mob, its run rows, and its frame snapshots
+    // survive this process and stay listable via `rkat mob runs`. A process
+    // death mid-run therefore converges to an honest Canceled terminal on the
+    // next hydration instead of vanishing with an in-memory shadow authority.
+    let (manifest, persistence) = create_persistence_bundle(scope).await?;
+    let surface = get_or_create_cli_persistent_surface_from_bundle(
+        scope,
+        effective_config,
+        manifest,
+        persistence,
+    )
+    .await?;
+    let state = hydrate_cli_mob_state_cached(
+        scope,
+        Arc::clone(&surface.service),
+        Arc::clone(&surface.runtime_adapter),
+        Arc::clone(&surface.mob_state_cache),
+    )
+    .await?;
+    let source_identity =
+        meerkat_mob::MobDefinitionSourceIdentity::mobpack(digest.to_string(), warnings.clone());
+    let mob_id = state
+        .mob_create_from_mobpack(
+            archive.definition.clone(),
+            archive.skills.clone(),
+            source_identity,
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
 
     if invocation.detach {
         let Some(flow_id) = flow_id else {
@@ -16287,31 +16441,6 @@ async fn execute_mob_run_pack(
                 "mob run --detach requires a mobpack with a callable flow"
             ));
         };
-        let (manifest, persistence) = create_persistence_bundle(scope).await?;
-        let surface = get_or_create_cli_persistent_surface_from_bundle(
-            scope,
-            effective_config,
-            manifest,
-            persistence,
-        )
-        .await?;
-        let state = hydrate_cli_mob_state_cached(
-            scope,
-            Arc::clone(&surface.service),
-            Arc::clone(&surface.runtime_adapter),
-            Arc::clone(&surface.mob_state_cache),
-        )
-        .await?;
-        let source_identity =
-            meerkat_mob::MobDefinitionSourceIdentity::mobpack(digest.to_string(), warnings.clone());
-        let mob_id = state
-            .mob_create_from_mobpack(
-                archive.definition.clone(),
-                archive.skills.clone(),
-                source_identity,
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
         let run_id = state
             .mob_run_flow(&mob_id, flow_id.clone(), params)
             .await
@@ -16330,58 +16459,41 @@ async fn execute_mob_run_pack(
                 flow_id.as_str()
             )
         };
+        let mut warnings = warnings;
+        warnings.push(detach_execution_custody_warning(&run_id));
         return render_mob_run_pack_with_warnings(rendered, warnings);
     }
 
-    // ADJ-2: remote (placed) spawns of skill-less profiles resolve their
-    // base prompt from the controlling host's factory chain.
-    let spawn_base_prompt_source = Arc::new(meerkat_mob::FactoryChainSpawnBasePromptSource::new(
-        Arc::new(effective_config.clone()),
-        scope.context_root.clone(),
-    ));
-    let session_service = build_deploy_mob_session_service(scope, effective_config.clone()).await?;
-    let run_spec = archive.mob_run_spec();
-    let controlling_acceptor =
-        controlling_acceptor_from_config(&effective_config, Arc::clone(&session_service))?;
-    let mut builder = meerkat_mob::MobBuilder::from_mobpack(
-        run_spec.definition().clone(),
-        run_spec.packed_skills().clone(),
-        meerkat_mob::MobStorage::in_memory(),
-    )
-    .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?
-    .with_session_service(session_service.clone())
-    .with_spawn_base_prompt_source(spawn_base_prompt_source)
-    .with_workgraph_service(Some(open_workgraph_service(scope).await?));
-    if let Some(adapter) = session_service.runtime_adapter() {
-        builder = builder.with_runtime_adapter(adapter);
-    }
-    if let Some(acceptor) = controlling_acceptor {
-        builder = builder.with_controlling_acceptor(acceptor);
-    }
-    let handle = builder
-        .create()
-        .await
-        .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
-
     let rendered = if let Some(flow_id) = flow_id {
-        let run_id = handle
-            .run_flow(flow_id, params)
-            .await
-            .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
-        let run = await_pack_flow_terminal(&handle, run_id)
-            .await
-            .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
-        render_mob_run_envelope(&run, invocation.json)?
+        run_pack_flow_foreground(
+            state.as_ref(),
+            &mob_id,
+            flow_id,
+            params,
+            invocation.json,
+            &warnings,
+        )
+        .await?
     } else {
         let objective = invocation
             .prompt
             .map(str::to_string)
             .unwrap_or_else(|| params.to_string());
+        let run_spec = archive.mob_run_spec();
         if run_spec.is_callable() {
+            let handle = state
+                .mob_handles_snapshot()
+                .await
+                .map_err(mob_anyhow)?
+                .into_iter()
+                .find_map(|(id, handle)| (id == mob_id).then_some(handle))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("mob run failed: mob '{mob_id}' vanished after creation")
+                })?;
             let outcome = meerkat_mob::run_mobpack_callable(
                 &run_spec,
                 handle,
-                session_service.clone(),
+                state.session_service(),
                 &objective,
             )
             .await
@@ -16411,14 +16523,15 @@ async fn execute_mob_run_pack(
                 .next()
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("mob run failed: pack has no callable flow"))?;
-            let run_id = handle
-                .run_flow(flow_id, params)
-                .await
-                .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
-            let run = await_pack_flow_terminal(&handle, run_id)
-                .await
-                .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
-            render_mob_run_envelope(&run, invocation.json)?
+            run_pack_flow_foreground(
+                state.as_ref(),
+                &mob_id,
+                flow_id,
+                params,
+                invocation.json,
+                &warnings,
+            )
+            .await?
         } else {
             return Err(anyhow::anyhow!(
                 "mob run failed: pack has no unambiguous callable flow; pass --flow"

@@ -42165,6 +42165,86 @@ async fn test_flow_canceled_append_failure_does_not_write_raw_failure_ledger_ent
     );
 }
 
+/// Finding 10 (0.8.22 field report): a replayed-active run whose executing
+/// process died must not converge to a BARE Canceled on resume. The terminal
+/// FlowCanceled carrier must say why: execution custody was lost.
+#[tokio::test]
+async fn test_resume_convergence_carries_execution_custody_lost_cause() {
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let (handle, service, runs, specs, runtime_metadata, identity, identity_status) =
+        create_test_mob_with_recoverable_fault_events(
+            sample_definition_with_single_step_flow(60_000, 8),
+            events.clone(),
+        )
+        .await;
+    handle
+        .spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-1"),
+            None,
+        )
+        .await
+        .expect("spawn worker");
+    service.set_flow_turn_never_terminal(true);
+
+    let run_id = handle
+        .run_flow(FlowId::from("demo"), serde_json::json!({}))
+        .await
+        .expect("run flow");
+    let running_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let run = runs.get_run(&run_id).await.expect("read run row");
+        if run.as_ref().map(|run| &run.status) == Some(&MobRunStatus::Running) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < running_deadline,
+            "flow run never reached Running before simulated process death"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Simulated process death: drop the handle mid-flight with no cancel
+    // command; only the durable stores survive into the resume.
+    drop(handle);
+
+    let resumed = cold_resume_after_terminal_append_fail_stop(
+        events.clone(),
+        runs,
+        specs,
+        runtime_metadata,
+        identity,
+        identity_status,
+        service,
+    )
+    .await;
+    let recovered_run = resumed
+        .flow_status(run_id.clone())
+        .await
+        .expect("query converged run after resume")
+        .expect("orphaned run must remain queryable after resume");
+    assert_eq!(
+        recovered_run.status,
+        MobRunStatus::Canceled,
+        "resume must converge the orphaned active run to Canceled"
+    );
+    let replayed = events.replay_all().await.expect("replay events");
+    let cancel_cause = replayed
+        .iter()
+        .find_map(|event| match &event.kind {
+            MobEventKind::FlowCanceled {
+                run_id: id, cause, ..
+            } if id == &run_id => Some(*cause),
+            _ => None,
+        })
+        .expect("converged run must have a FlowCanceled terminal carrier");
+    assert_eq!(
+        cancel_cause,
+        Some(crate::event::FlowCancelClass::ExecutionCustodyLost),
+        "resume convergence must carry the typed custody-lost cause, never a bare Canceled"
+    );
+}
+
 #[tokio::test]
 async fn test_topology_strict_denial_fails_before_dispatch() {
     let (handle, _service) = create_test_mob(sample_definition_with_strict_topology_deny()).await;

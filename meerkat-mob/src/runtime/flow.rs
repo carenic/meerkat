@@ -1909,8 +1909,14 @@ impl FlowEngine {
         run_id: RunId,
         flow_id: FlowId,
     ) -> Result<TerminalizationOutcome, MobError> {
-        self.terminalize(run_id, flow_id, TerminalizationTarget::Canceled)
-            .await
+        self.terminalize(
+            run_id,
+            flow_id,
+            TerminalizationTarget::Canceled {
+                cause: Some(crate::event::FlowCancelClass::CancelRequested),
+            },
+        )
+        .await
     }
 
     pub(super) async fn terminalize_canceled_with_machine_state(
@@ -1927,7 +1933,9 @@ impl FlowEngine {
         self.terminalize_with_machine_state(
             run_id,
             flow_id,
-            TerminalizationTarget::Canceled,
+            TerminalizationTarget::Canceled {
+                cause: Some(crate::event::FlowCancelClass::CancelRequested),
+            },
             input,
             machine_state,
             authority,
@@ -1951,9 +1959,11 @@ impl FlowEngine {
             TerminalizationTarget::Failed { .. } => {
                 MobMachineFlowRunCommand::TerminalizeFailed(flow_run::inputs::TerminalizeFailed {})
             }
-            TerminalizationTarget::Canceled => MobMachineFlowRunCommand::TerminalizeCanceled(
-                flow_run::inputs::TerminalizeCanceled {},
-            ),
+            TerminalizationTarget::Canceled { .. } => {
+                MobMachineFlowRunCommand::TerminalizeCanceled(
+                    flow_run::inputs::TerminalizeCanceled {},
+                )
+            }
         };
         self.handle
             .commit_flow_terminalization(run_id, flow_id, target, input, "flow_terminalize")
@@ -1988,7 +1998,7 @@ impl FlowEngine {
             if mob_machine_run_status_is_terminal(&run_id, &run.status)?
                 && !matches!(
                     (&target, &run.status),
-                    (TerminalizationTarget::Canceled, MobRunStatus::Failed)
+                    (TerminalizationTarget::Canceled { .. }, MobRunStatus::Failed)
                 )
             {
                 return self

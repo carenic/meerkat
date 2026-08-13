@@ -243,6 +243,23 @@ pub enum FlowFailureClass {
     Internal,
 }
 
+/// Typed classification of why a flow run terminated in `Canceled`, persisted
+/// on [`MobEventKind::FlowCanceled`].
+///
+/// The class is derived ONCE at terminalization time; consumers reason about
+/// the cancellation origin through this enum. Events persisted before the
+/// class existed carry no value, so the wire field stays optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowCancelClass {
+    /// An explicit cancel command requested this terminal.
+    CancelRequested,
+    /// Recovery converged a replayed-active run with no surviving execution
+    /// custody: the process that was executing the run is gone, and no live
+    /// claim could continue it.
+    ExecutionCustodyLost,
+}
+
 /// Exact controller-side correlation for one remote directed turn. This is
 /// the durable recovery carrier for the MobMachine obligation; generation
 /// and fence together identify the member authority incarnation.
@@ -629,7 +646,14 @@ pub enum MobEventKind {
         reason: String,
     },
     /// Flow run canceled.
-    FlowCanceled { run_id: RunId, flow_id: FlowId },
+    FlowCanceled {
+        run_id: RunId,
+        flow_id: FlowId,
+        /// Typed classification of the cancellation origin. Absent on events
+        /// persisted before the class existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<FlowCancelClass>,
+    },
     /// Per-target step dispatch event.
     StepDispatched {
         run_id: RunId,
@@ -1714,6 +1738,7 @@ mod tests {
         roundtrip(&MobEventKind::FlowCanceled {
             run_id: run_id.clone(),
             flow_id: flow_id.clone(),
+            cause: Some(FlowCancelClass::ExecutionCustodyLost),
         });
         roundtrip(&MobEventKind::StepDispatched {
             run_id: run_id.clone(),

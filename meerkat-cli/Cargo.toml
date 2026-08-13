@@ -51,6 +51,11 @@ name = "system_mob_cli_verbs"
 path = "tests/system_mob_cli_verbs.rs"
 required-features = ["integration-real-tests", "mob", "comms"]
 
+[[test]]
+name = "system_mob_run_custody"
+path = "tests/system_mob_run_custody.rs"
+required-features = ["integration-real-tests", "mob"]
+
 [dependencies]
 meerkat = { workspace = true }
 meerkat-auth-core = { workspace = true }

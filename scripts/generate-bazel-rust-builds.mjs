@@ -590,6 +590,18 @@ const nativeE2eSystemTests = [
   },
   {
     packageKey: "meerkat-cli",
+    cargoTestTarget: "system_mob_run_custody",
+    name: "e2e_system_mob_run_pack_sigterm_custody_bazel_test",
+    testName: "integration_real_mob_run_pack_sigterm_converges_to_durable_canceled",
+  },
+  {
+    packageKey: "meerkat-cli",
+    cargoTestTarget: "system_mob_run_custody",
+    name: "e2e_system_mob_run_detach_custody_lost_bazel_test",
+    testName: "integration_real_mob_run_detach_converges_execution_custody_lost",
+  },
+  {
+    packageKey: "meerkat-cli",
     cargoTestTarget: "cli_mobpack_live_smoke",
     name: "e2e_system_cli_mobpack_pack_inspect_validate_bazel_test",
     testName: "e2e_smoke_mobpack_pack_inspect_validate",

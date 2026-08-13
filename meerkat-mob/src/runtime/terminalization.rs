@@ -1,5 +1,5 @@
 use crate::error::MobError;
-use crate::event::{FlowFailureClass, MobEventKind, NewMobEvent};
+use crate::event::{FlowCancelClass, FlowFailureClass, MobEventKind, NewMobEvent};
 use crate::ids::{FlowId, MobId, RunId};
 use crate::run::{MobRun, MobRunStatus, mob_machine_run_status_is_terminal};
 use crate::store::{MobEventStore, MobRunStore, authority_validating_mob_run_store};
@@ -70,9 +70,18 @@ impl FlowFailureCause {
 
 #[derive(Debug, Clone)]
 pub(super) enum TerminalizationTarget {
-    Completed { structured_output: Option<Value> },
-    Failed { cause: FlowFailureCause },
-    Canceled,
+    Completed {
+        structured_output: Option<Value>,
+    },
+    Failed {
+        cause: FlowFailureCause,
+    },
+    /// `cause` is `None` only for repair of a run already persisted as
+    /// `Canceled` whose original cancellation origin is no longer
+    /// reconstructable; live terminalization always carries a typed class.
+    Canceled {
+        cause: Option<FlowCancelClass>,
+    },
 }
 
 impl TerminalizationTarget {
@@ -80,7 +89,7 @@ impl TerminalizationTarget {
         match self {
             Self::Completed { .. } => MobRunStatus::Completed,
             Self::Failed { .. } => MobRunStatus::Failed,
-            Self::Canceled => MobRunStatus::Canceled,
+            Self::Canceled { .. } => MobRunStatus::Canceled,
         }
     }
 
@@ -88,7 +97,7 @@ impl TerminalizationTarget {
         match self {
             Self::Completed { .. } => "FlowCompleted",
             Self::Failed { .. } => "FlowFailed",
-            Self::Canceled => "FlowCanceled",
+            Self::Canceled { .. } => "FlowCanceled",
         }
     }
 
@@ -105,7 +114,11 @@ impl TerminalizationTarget {
                 cause: cause.class(),
                 reason: cause.reason(),
             },
-            Self::Canceled => MobEventKind::FlowCanceled { run_id, flow_id },
+            Self::Canceled { cause } => MobEventKind::FlowCanceled {
+                run_id,
+                flow_id,
+                cause,
+            },
         }
     }
 }
@@ -235,7 +248,13 @@ impl FlowTerminalizationAuthority {
                 };
                 TerminalizationTarget::Failed { cause }
             }
-            MobRunStatus::Canceled => TerminalizationTarget::Canceled,
+            MobRunStatus::Canceled => {
+                let cause = match requested {
+                    TerminalizationTarget::Canceled { cause } => cause,
+                    _ => None,
+                };
+                TerminalizationTarget::Canceled { cause }
+            }
             MobRunStatus::Pending | MobRunStatus::Running => requested,
         }
     }
@@ -288,7 +307,7 @@ mod tests {
         FlowFailureCause, FlowTerminalizationAuthority, TerminalizationOutcome,
         TerminalizationTarget,
     };
-    use crate::event::{FlowFailureClass, MobEvent, MobEventKind, NewMobEvent};
+    use crate::event::{FlowCancelClass, FlowFailureClass, MobEvent, MobEventKind, NewMobEvent};
     use crate::ids::{FlowId, LoopId, MobId, RunId, StepId};
     use crate::run::{MobRun, MobRunProvenanceAuthority, MobRunStatus, StepLedgerEntry};
     use crate::store::{
@@ -914,7 +933,9 @@ mod tests {
             .commit_terminalization_with_snapshot(
                 &run_id,
                 FlowId::from("flow"),
-                TerminalizationTarget::Canceled,
+                TerminalizationTarget::Canceled {
+                    cause: Some(FlowCancelClass::CancelRequested),
+                },
                 MobRunStatus::Running,
                 &expected_flow_state,
                 &next_flow_state,
@@ -933,7 +954,13 @@ mod tests {
         assert_mixed_terminal_fold(&run.flow_state);
         let emitted = events.replay_all().await.expect("replay events");
         assert_eq!(emitted.len(), 1);
-        assert!(matches!(emitted[0].kind, MobEventKind::FlowCanceled { .. }));
+        assert!(matches!(
+            emitted[0].kind,
+            MobEventKind::FlowCanceled {
+                cause: Some(FlowCancelClass::CancelRequested),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -964,7 +991,9 @@ mod tests {
             .commit_terminalization_with_snapshot(
                 &run_id,
                 FlowId::from("flow"),
-                TerminalizationTarget::Canceled,
+                TerminalizationTarget::Canceled {
+                    cause: Some(FlowCancelClass::CancelRequested),
+                },
                 MobRunStatus::Pending,
                 &stale_flow_state,
                 &next_flow_state,
