@@ -218,6 +218,25 @@ impl ShellConfig {
         }
     }
 
+    /// Project the config-layer shell vocabulary into a tool config.
+    ///
+    /// This is the single seam through which a loaded `[shell]` section
+    /// (program, security mode, security patterns) reaches the shell tool;
+    /// [`ShellConfig::default`] only sees the embedded template defaults.
+    /// `timeout_secs` is deliberately not mapped here: the per-call default
+    /// timeout is owned by `ToolTimeoutPolicy` / `config.tools`, and mapping
+    /// it again would create a second owner.
+    pub fn from_defaults(defaults: &ShellDefaults, project_root: PathBuf) -> Self {
+        Self {
+            enabled: true,
+            shell: defaults.program.clone(),
+            security_mode: defaults.security_mode,
+            security_patterns: defaults.security_patterns.clone(),
+            project_root,
+            ..Default::default()
+        }
+    }
+
     /// Check if a command is allowed by the security policy.
     ///
     /// Returns `Ok(CommandInvocation)` if the command is allowed, or `Err(ShellError::BlockedCommand)`
@@ -492,6 +511,39 @@ mod tests {
         assert_eq!(
             config.security_patterns,
             vec!["echo".to_string(), "cat".to_string()]
+        );
+    }
+
+    // ==================== from_defaults Projection Test ====================
+
+    #[test]
+    fn from_defaults_projects_config_shell_vocabulary_without_timeout() {
+        let defaults = ShellDefaults {
+            program: "sh".to_string(),
+            timeout_secs: 999,
+            security_mode: SecurityMode::AllowList,
+            security_patterns: vec!["echo *".to_string()],
+        };
+
+        let config = ShellConfig::from_defaults(&defaults, PathBuf::from("/tmp/project"));
+
+        assert!(config.enabled, "from_defaults must enable the shell tool");
+        assert_eq!(config.shell, "sh", "configured program must be projected");
+        assert_eq!(
+            config.security_mode,
+            SecurityMode::AllowList,
+            "configured security mode must be projected"
+        );
+        assert_eq!(
+            config.security_patterns,
+            vec!["echo *".to_string()],
+            "configured security patterns must be projected"
+        );
+        assert_eq!(config.project_root, PathBuf::from("/tmp/project"));
+        assert_eq!(
+            config.default_timeout_secs,
+            crate::timeout::ToolTimeoutPolicy::default().default_timeout_secs(),
+            "timeout stays owned by ToolTimeoutPolicy, not the [shell] section"
         );
     }
 

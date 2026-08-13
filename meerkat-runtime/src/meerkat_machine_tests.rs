@@ -32243,6 +32243,51 @@ async fn machine_owned_turn_overlay_routes_through_generated_authority() {
 }
 
 #[tokio::test]
+async fn machine_owned_turn_overlay_admits_deny_of_absent_tool() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let bindings = adapter
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    let visible_tool = runtime_deferred_tool("visible", "test");
+    seed_deferred_tool_authority_catalog(&bindings, vec![Arc::clone(&visible_tool)], &[]);
+
+    let accepted = bindings
+        .tool_visibility_owner()
+        .set_turn_overlay(None, BTreeSet::from(["missing".into()]))
+        .expect("denying an absent tool is a pure subtraction and must be admitted");
+    assert!(
+        accepted.deny.contains("missing"),
+        "owner projection should mirror the admitted deny overlay"
+    );
+
+    {
+        let sessions = adapter.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("session should exist");
+        let authority = entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            authority
+                .state()
+                .turn_tool_overlay_deny_names
+                .contains("missing"),
+            "generated state should own the admitted turn overlay deny fact"
+        );
+    }
+
+    // A standing deny of an absent tool must not wedge later catalog
+    // replacement: deny names cannot orphan visibility, so the replacement
+    // guard only covers allow-side overlay names.
+    bindings
+        .tool_visibility_owner()
+        .replace_filter_tool_authority_catalog(BTreeMap::new())
+        .expect("catalog replacement must admit a standing deny of an absent tool");
+}
+
+#[tokio::test]
 async fn replace_visibility_state_rejects_deferred_names_without_authority() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
     let session_id = SessionId::new();

@@ -13993,6 +13993,75 @@ mod tests {
             "shell-only builtin composition must expose exactly four shell tools while preserving the external dispatcher unchanged"
         );
     }
+
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn factory_shell_tool_honors_configured_shell_program() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("workspace");
+        tokio::fs::create_dir_all(&project_root).await.unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions")).project_root(&project_root);
+        let ops_lifecycle: Arc<dyn OpsLifecycleRegistry> =
+            Arc::new(RuntimeOpsLifecycleRegistry::new());
+
+        let mut effective_config = Config::default();
+        effective_config.shell.program = "sh".to_string();
+
+        let (dispatcher, _) = factory
+            .build_tool_dispatcher_for_agent_with_overrides(
+                &effective_config,
+                None,
+                false,
+                true,
+                None,
+                None,
+                SessionId::new().to_string(),
+                ops_lifecycle,
+                None,
+                None,
+                None,
+                None,
+                ToolCategoryOverride::Inherit,
+                None,
+                ToolCategoryOverride::Inherit,
+                None,
+            )
+            .await
+            .expect("shell-only composition should succeed");
+
+        // `echo $0` prints the invoked shell under POSIX sh and is a parse
+        // error under the template-default nu, so the observed program name
+        // proves the loaded config (not the embedded template) reached the
+        // composed shell tool.
+        let call_json =
+            serde_json::value::RawValue::from_string(r#"{"command":"echo $0"}"#.to_string())
+                .unwrap();
+        let call = ToolCallView {
+            id: "shell-program-probe",
+            name: "shell",
+            args: &call_json,
+        };
+        let outcome = dispatcher
+            .dispatch(call)
+            .await
+            .expect("shell dispatch should succeed");
+        let payload: serde_json::Value =
+            serde_json::from_str(&outcome.result.text_content()).unwrap();
+        assert_eq!(
+            payload["exit_code"],
+            serde_json::json!(0),
+            "probe must run under a POSIX shell: {payload}"
+        );
+        let stdout_program = payload["stdout"].as_str().unwrap_or_default().trim();
+        let stdout_basename = std::path::Path::new(stdout_program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert_eq!(
+            stdout_basename, "sh",
+            "configured [shell] program must reach the composed shell tool (stdout {stdout_program:?})"
+        );
+    }
 }
 
 impl AgentFactory {
@@ -14004,7 +14073,7 @@ impl AgentFactory {
     #[allow(clippy::too_many_arguments)]
     async fn build_tool_dispatcher_for_agent_with_overrides(
         &self,
-        _config: &Config,
+        config: &Config,
         external: Option<Arc<dyn AgentToolDispatcher>>,
         effective_builtins: bool,
         effective_shell: bool,
@@ -14051,14 +14120,17 @@ impl AgentFactory {
             None => Arc::new(MemoryTaskStore::new()),
         };
 
-        // Create shell config if shell is enabled
+        // Create shell config if shell is enabled. The loaded config's
+        // `[shell]` vocabulary (program, security mode/patterns) is projected
+        // through `ShellConfig::from_defaults`; `ShellConfig::default` only
+        // ever sees the embedded template defaults.
         let shell_config = if effective_shell {
             let project_root = self.shell_project_root();
-            let mut config = ShellConfig::with_project_root(project_root);
+            let mut shell_tool_config = ShellConfig::from_defaults(&config.shell, project_root);
             if let Some(env) = shell_env {
-                config.env_vars = env;
+                shell_tool_config.env_vars = env;
             }
-            Some(config)
+            Some(shell_tool_config)
         } else {
             None
         };

@@ -2363,6 +2363,37 @@ impl ToolScopeHandle {
             // exact-catalog surface is wrapped by a conservative non-exact
             // dispatcher, even though the definition is already visible.
             let catalog = base_tool_authority_catalog(&state.base_tools);
+            // Diagnostic pre-check only: the generated guard stays the
+            // authority for allow-name admission; this converts its generic
+            // refusal into a typed error naming the offending tools. The
+            // catalog mirror must match the guard's
+            // `filter_visibility_authority_catalog` projection (base tools
+            // extended with filter-witnessed names), or the pre-check would
+            // refuse names the guard admits. Deny names are deliberately not
+            // checked: deny only subtracts, so denying an absent tool is an
+            // admitted no-op.
+            if let Some(allow_names) = allow.as_ref() {
+                let visibility_state = self.visibility_owner.visibility_state().map_err(|err| {
+                    ToolScopeStageError::Owner {
+                        message: err.to_string(),
+                    }
+                })?;
+                let mut turn_allow_catalog = catalog.clone();
+                extend_filter_authority_catalog_from_visibility_state(
+                    &mut turn_allow_catalog,
+                    &visibility_state,
+                );
+                let mut unknown: Vec<ToolName> = allow_names
+                    .iter()
+                    .filter(|name| !turn_allow_catalog.contains_key(name.as_str()))
+                    .cloned()
+                    .collect();
+                if !unknown.is_empty() {
+                    unknown.sort_unstable();
+                    unknown.dedup();
+                    return Err(ToolScopeStageError::UnknownTools { names: unknown });
+                }
+            }
             let mut activated = ToolNameSet::new();
             let mut invalid = Vec::new();
             for authority in authorities {
@@ -2423,6 +2454,12 @@ fn tool_name_set_to_btree(names: &ToolNameSet) -> BTreeSet<ToolName> {
     names.iter().cloned().collect()
 }
 
+// Persistent filters (including `ToolFilter::Deny`) intentionally keep the
+// all-names-must-be-known rule: a durable filter naming an absent tool is a
+// standing configuration error worth a typed refusal, and this path names the
+// tools. The ephemeral turn overlay diverges by design: its deny names are
+// admitted unchecked because a per-turn deny of an absent tool is a no-op
+// (see `set_turn_overlay_with_deferred_authorities`).
 fn validate_filter(
     filter: &ToolFilter,
     known_base_names: &ToolNameSet,
@@ -3857,6 +3894,49 @@ mod tests {
                 .map(|t| t.name.to_string())
                 .collect::<Vec<_>>(),
             vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn turn_overlay_deny_of_absent_tool_is_admitted_no_op() {
+        let scope = scope_with_generated_visibility(tools(&["a", "b"]));
+        let handle = scope.handle();
+
+        handle
+            .set_turn_overlay(None, raw_set(&["no_such_tool"]))
+            .expect("denying an absent tool is a pure subtraction and must be admitted");
+
+        assert_eq!(
+            scope
+                .visible_tools()
+                .iter()
+                .map(|t| t.name.to_string())
+                .collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string()],
+            "denying an absent tool must leave the visible set unchanged"
+        );
+        let snapshot = scope.snapshot().expect("snapshot should be available");
+        assert_eq!(
+            snapshot.active_turn_deny,
+            vec!["no_such_tool".to_string()],
+            "the admitted deny must be recorded in the active turn overlay"
+        );
+    }
+
+    #[test]
+    fn turn_overlay_allow_of_unknown_tool_is_refused_with_typed_names() {
+        let scope = scope_with_generated_visibility(tools(&["a", "b"]));
+        let handle = scope.handle();
+
+        let err = handle
+            .set_turn_overlay(Some(raw_set(&["no_such_tool"])), raw_set(&[]))
+            .expect_err("allowing an unknown tool grants visibility and must be refused");
+        assert_eq!(
+            err,
+            ToolScopeStageError::UnknownTools {
+                names: vec!["no_such_tool".into()],
+            },
+            "the refusal must name exactly the unknown allow tools"
         );
     }
 
