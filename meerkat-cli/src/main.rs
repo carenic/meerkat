@@ -14934,13 +14934,15 @@ async fn run_pack_flow_foreground(
                     PACK_RUN_CANCEL_GRACE.as_secs()
                 )
             })??;
-            println!(
-                "{}",
-                render_mob_run_pack_with_warnings(
-                    render_mob_run_envelope(&run, json)?,
-                    warnings.to_vec()
-                )?
+            let (stdout_render, stderr_warnings) = render_mob_run_pack_with_warnings(
+                render_mob_run_envelope(&run, json)?,
+                warnings.to_vec(),
+                json,
             );
+            for warning in &stderr_warnings {
+                eprintln!("warning\t{warning}");
+            }
+            println!("{stdout_render}");
             Err(anyhow::anyhow!(
                 "mob run interrupted: shutdown signal received; flow run '{run_id}' terminalized as '{}'",
                 mob_run_status_text(&run.status)
