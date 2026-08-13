@@ -3803,6 +3803,7 @@ dependencies = [
  "meerkat-contracts",
  "meerkat-core",
  "meerkat-hooks",
+ "meerkat-llm-core",
  "meerkat-mob",
  "meerkat-mob-mcp",
  "meerkat-mob-pack",

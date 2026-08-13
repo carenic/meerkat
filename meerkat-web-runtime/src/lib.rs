@@ -525,6 +525,18 @@ fn build_service_infrastructure(
     config: Config,
     max_sessions: usize,
 ) -> Result<(Arc<WasmStandaloneSessionService>, Arc<MobMcpState>), JsValue> {
+    build_service_infrastructure_with_default_llm_client(config, max_sessions, None)
+}
+
+/// Same wiring as [`build_service_infrastructure`] with an explicit default
+/// LLM client. Production callers pass `None` (build_agent resolves the
+/// provider per-model from realm config bindings); tests inject a
+/// deterministic client so member turns complete without live credentials.
+fn build_service_infrastructure_with_default_llm_client(
+    config: Config,
+    max_sessions: usize,
+    default_llm_client: Option<Arc<dyn meerkat::LlmClient>>,
+) -> Result<(Arc<WasmStandaloneSessionService>, Arc<MobMcpState>), JsValue> {
     // Plan §4d.wasm.1 closure — wire the JS external-auth callback into
     // the provider runtime registry. The resolver itself handles the
     // "no callback registered" case by returning `MissingSecret`; we
@@ -540,9 +552,11 @@ fn build_service_infrastructure(
     let factory = meerkat::AgentFactory::minimal();
     let mut builder = meerkat::FactoryAgentBuilder::new(factory, config);
 
-    // NO default_llm_client — build_agent() resolves the correct provider per-model
-    // from realm config bindings. This is architecturally correct: per-agent
-    // provider agnosticity works the same way on WASM as on all other surfaces.
+    // NO default_llm_client in production - build_agent() resolves the correct
+    // provider per-model from realm config bindings. This is architecturally
+    // correct: per-agent provider agnosticity works the same way on WASM as on
+    // all other surfaces. Tests may inject a deterministic default client.
+    builder.default_llm_client = default_llm_client;
 
     let tools = build_wasm_tool_dispatcher().map_err(|e| err_str("tool_error", e))?;
     builder.default_tool_dispatcher = Some(tools);
@@ -3011,8 +3025,9 @@ mod tests {
     };
     #[cfg(not(target_arch = "wasm32"))]
     use super::{
-        build_service_infrastructure, destroy_session_with_services, mob_destroy_error_value,
-        mob_error_value, populate_realm_from_api_keys,
+        build_service_infrastructure, build_service_infrastructure_with_default_llm_client,
+        destroy_session_with_services, mob_destroy_error_value, mob_error_value,
+        populate_realm_from_api_keys,
     };
     #[cfg(not(target_arch = "wasm32"))]
     use super::{helper_result_payload, spawn_member_result_payload};
@@ -3617,8 +3632,17 @@ capabilities = [{capability_values}]
             &HashMap::from([("anthropic".to_string(), "sk-test".to_string())]),
             None,
         );
-        let (_service, mob_state) =
-            build_service_infrastructure(config, 8).expect("build runtime services");
+        // spawn_helper awaits one exact committed model turn, so the harness
+        // needs a deterministic LLM client: without it the fake key fails the
+        // turn fatally and the bounded wait observes RuntimeTerminated.
+        let (_service, mob_state) = build_service_infrastructure_with_default_llm_client(
+            config,
+            8,
+            Some(Arc::new(meerkat_llm_core::TestClient::for_provider(
+                meerkat_core::Provider::Anthropic,
+            ))),
+        )
+        .expect("build runtime services");
 
         let definition: meerkat_mob::MobDefinition = serde_json::from_value(json!({
             "id": "mob-web-helper-payload",
