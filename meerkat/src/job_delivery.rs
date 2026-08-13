@@ -371,9 +371,18 @@ impl JobOutboxProjector {
         runtime_inbox: RuntimeDeliveryInbox,
         realm_id: impl Into<String>,
     ) -> Self {
-        let mut projector = Self::new(job_store, runtime_inbox);
-        projector.realm_id = Some(realm_id.into());
-        projector
+        Self::new(job_store, runtime_inbox).bound_to_realm(realm_id)
+    }
+
+    /// Rebind projection authority to `realm_id`, replacing any prior binding.
+    ///
+    /// Used at per-session build time so the projector realm is always the
+    /// realm the session actually builds under (mob members build under
+    /// `mob.<mob_id>`, not the persistence manifest realm).
+    #[must_use]
+    pub fn bound_to_realm(mut self, realm_id: impl Into<String>) -> Self {
+        self.realm_id = Some(realm_id.into());
+        self
     }
 
     fn owns_job(&self, job: &meerkat_jobs::StoredJob) -> bool {

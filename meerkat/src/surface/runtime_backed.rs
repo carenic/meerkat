@@ -99,16 +99,17 @@ pub fn build_runtime_backed_service_with_capacities(
     builder.default_blob_store = Some(blob_store.clone());
     #[cfg(not(target_arch = "wasm32"))]
     {
-        builder.default_realm_id = default_realm_id.clone();
+        builder.default_realm_id = default_realm_id;
         builder.default_detached_job_store = Some(detached_job_store.clone());
-        builder.default_shell_job_delivery_projector = Some(Arc::new(match default_realm_id {
-            Some(realm_id) => crate::JobOutboxProjector::new_for_realm(
-                detached_job_store,
-                runtime_delivery_inbox,
-                realm_id.to_string(),
-            ),
-            None => crate::JobOutboxProjector::new(detached_job_store, runtime_delivery_inbox),
-        }));
+        // Stored unbound: FactoryAgentBuilder::build_agent binds the projector
+        // to the per-session build realm, which is the same realm handed to
+        // DurableShellJobRuntime. Pre-binding to the manifest realm here would
+        // strand terminal delivery for sessions built under another realm
+        // (mob members build under `mob.<mob_id>`).
+        builder.default_shell_job_delivery_projector = Some(crate::JobOutboxProjector::new(
+            detached_job_store,
+            runtime_delivery_inbox,
+        ));
     }
     let mut service = PersistentSessionService::new_with_capacities(
         builder,

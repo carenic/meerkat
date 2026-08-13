@@ -136,7 +136,19 @@ async fn realm_scoped_projection_leaves_other_realm_outbox_pending() {
 }
 
 async fn completed_job(jobs: &DetachedJobService, session_id: SessionId, key: &str) -> JobId {
-    let receipt = jobs.submit(spec(key, session_id)).await.expect("submit");
+    completed_job_in_realm(jobs, "default", session_id, key).await
+}
+
+async fn completed_job_in_realm(
+    jobs: &DetachedJobService,
+    realm_id: &str,
+    session_id: SessionId,
+    key: &str,
+) -> JobId {
+    let receipt = jobs
+        .submit(spec_for_realm(realm_id, key, session_id))
+        .await
+        .expect("submit");
     let claim = jobs
         .claim_attempt(
             &receipt.job_id,
@@ -158,6 +170,75 @@ async fn completed_job(jobs: &DetachedJobService, session_id: SessionId, key: &s
     .await
     .expect("complete");
     receipt.job_id
+}
+
+/// Per-session builds bind the shared default projector to the session's
+/// build realm via `bound_to_realm` (mob members build under `mob.<mob_id>`).
+/// The bound projector must deliver terminal shell projections for its own
+/// realm and keep failing closed on jobs stamped with a foreign realm.
+#[tokio::test]
+async fn build_realm_bound_shell_projection_delivers_own_realm_and_fails_closed_on_foreign() {
+    let job_store = Arc::new(MemoryDetachedJobStore::new());
+    let jobs = DetachedJobService::new(job_store.clone());
+    let session_id = SessionId::new();
+
+    let mob_job =
+        completed_job_in_realm(&jobs, "mob.test-mob", session_id.clone(), "mob-local").await;
+    let foreign_job =
+        completed_job_in_realm(&jobs, "other.realm", session_id.clone(), "foreign").await;
+
+    let inbox = RuntimeDeliveryInbox::new(Arc::new(InMemoryRuntimeStore::new()));
+    let projector =
+        JobOutboxProjector::new(job_store.clone(), inbox.clone()).bound_to_realm("mob.test-mob");
+
+    ShellJobDeliveryProjector::project_job(&projector, mob_job.as_str())
+        .await
+        .expect("project own-realm terminal delivery");
+    let delivered = job_store
+        .get(&mob_job)
+        .await
+        .expect("load mob job")
+        .expect("mob job");
+    assert!(
+        !delivered.outbox.is_empty() && delivered.outbox.iter().all(|entry| entry.applied),
+        "own-realm terminal outbox must be fully applied"
+    );
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let pending = inbox
+        .list_pending(&runtime_id, usize::MAX)
+        .await
+        .expect("list pending deliveries");
+    assert!(
+        pending
+            .iter()
+            .any(|record| record.submission.delivery_id().as_str() == mob_job.as_str()),
+        "own-realm JobTerminal delivery must reach the origin session inbox"
+    );
+
+    let error = ShellJobDeliveryProjector::project_job(&projector, foreign_job.as_str())
+        .await
+        .expect_err("foreign-realm projection must fail closed");
+    assert!(
+        error.contains("outside projector realm"),
+        "unexpected projection error: {error}"
+    );
+    let ack_error =
+        ShellJobDeliveryProjector::acknowledge_applied(&projector, foreign_job.as_str())
+            .await
+            .expect_err("foreign-realm acknowledgement must fail closed");
+    assert!(
+        ack_error.contains("outside projector realm"),
+        "unexpected acknowledgement error: {ack_error}"
+    );
+    let foreign = job_store
+        .get(&foreign_job)
+        .await
+        .expect("load foreign job")
+        .expect("foreign job");
+    assert!(
+        foreign.outbox.iter().any(|entry| !entry.applied),
+        "foreign-realm outbox must stay pending"
+    );
 }
 
 async fn notified_job(jobs: &DetachedJobService, session_id: SessionId, key: &str) -> JobId {

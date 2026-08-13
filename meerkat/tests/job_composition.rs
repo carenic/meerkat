@@ -844,3 +844,258 @@ async fn terminal_delivery_after_wait_owner_termination_applies_cleanly() {
     );
     assert_eq!(*downstream.applications.lock().await, 1);
 }
+
+/// End-to-end regression for the mob-realm terminal-delivery strand: a
+/// runtime-backed service whose persistence manifest realm is `default`
+/// builds a session under `mob.<mob_id>` (exactly what meerkat-mob's member
+/// build produces). A background shell job submitted from that session must
+/// terminalize with its outbox applied, deliver the JobTerminal submission to
+/// the origin session's runtime inbox, and stay readable through shell job
+/// recovery - not wedge on a service-lifetime projector bound to the manifest
+/// realm ("belongs to realm mob.<id>, outside projector realm default").
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+mod mob_realm_shell_delivery {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use meerkat::surface::{
+        build_runtime_backed_service, default_persistent_executor, materialize_session,
+    };
+    use meerkat::{
+        AgentFactory, Config, CreateSessionRequest, FactoryAgentBuilder, PersistentSessionService,
+        Session,
+    };
+    use meerkat_client::types::LlmStream;
+    use meerkat_client::{LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest};
+    use meerkat_core::{Message, SessionBuildOptions};
+    use meerkat_runtime::completion::CompletionOutcome;
+    use meerkat_runtime::{Input, LogicalRuntimeId, MeerkatMachine, PromptInput};
+    use meerkat_tools::builtin::shell::{
+        DurableShellJobRuntime, JobId as ShellJobId, JobManager, JobStatus, ShellConfig,
+        ShellJobDeliveryProjector,
+    };
+    use tokio::time::Duration;
+
+    /// Scripted LLM: the first call spawns a background shell job; every
+    /// later call ends its turn with plain text.
+    struct BackgroundShellScript {
+        llm_calls: AtomicUsize,
+    }
+
+    impl BackgroundShellScript {
+        fn new() -> Self {
+            Self {
+                llm_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for BackgroundShellScript {
+        fn project_replay_messages(&self, messages: &[Message]) -> Result<Vec<Message>, LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
+            let usage = LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    meerkat_core::Provider::OpenAI,
+                    &request.model,
+                    meerkat_core::Usage::default(),
+                ),
+            };
+            let events = if self.llm_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![
+                    LlmEvent::ToolCallComplete {
+                        id: "toolu_bg_shell".to_string(),
+                        name: "shell".to_string(),
+                        args: serde_json::json!({
+                            "command": "printf mob-realm-delivery",
+                            "background": true,
+                        }),
+                        meta: None,
+                    },
+                    usage,
+                    LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Success {
+                            stop_reason: meerkat_core::StopReason::ToolUse,
+                        },
+                    },
+                ]
+            } else {
+                vec![
+                    LlmEvent::TextDelta {
+                        delta: "ok".to_string(),
+                        meta: None,
+                    },
+                    usage,
+                    LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Success {
+                            stop_reason: meerkat_core::StopReason::EndTurn,
+                        },
+                    },
+                ]
+            };
+            Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Other
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    async fn run_prompt(
+        adapter: &Arc<MeerkatMachine>,
+        session_id: &meerkat::SessionId,
+        prompt: &str,
+    ) {
+        let (_outcome, handle) = adapter
+            .accept_input_with_completion(session_id, Input::Prompt(PromptInput::new(prompt, None)))
+            .await
+            .expect("accept prompt input");
+        let handle = handle.expect("completion handle");
+        let outcome = tokio::time::timeout(Duration::from_secs(30), handle.wait())
+            .await
+            .expect("prompt should complete in time")
+            .expect("completion waiter should resolve");
+        assert!(
+            matches!(outcome, CompletionOutcome::Completed(_)),
+            "unexpected completion outcome: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mob_realm_session_background_shell_terminal_delivery_is_not_stranded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_manifest, persistence) = meerkat::open_realm_persistence_in(
+            temp.path(),
+            "default",
+            Some(meerkat_store::RealmBackend::Sqlite),
+            Some(meerkat_store::RealmOrigin::Explicit),
+        )
+        .await
+        .expect("open realm persistence");
+        let job_store = persistence.job_store();
+        let blob_store = persistence.blob_store();
+        let runtime_inbox = meerkat_runtime::RuntimeDeliveryInbox::new(persistence.runtime_store());
+
+        let factory = AgentFactory::new(temp.path().join("sessions")).shell(true);
+        let mut builder = FactoryAgentBuilder::new(factory, Config::default());
+        builder.default_llm_client = Some(Arc::new(BackgroundShellScript::new()));
+        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence);
+        let service: Arc<PersistentSessionService<FactoryAgentBuilder>> = Arc::new(service);
+
+        let mob_realm = meerkat_core::mob_realm_id("test-mob").expect("mob realm id");
+        let session = Session::new();
+        let session_id = session.id().clone();
+        let build = SessionBuildOptions {
+            realm_id: Some(mob_realm.clone()),
+            ..SessionBuildOptions::default()
+        };
+        let request = CreateSessionRequest {
+            injected_context: Vec::new(),
+            model: "gpt-5.4".to_string(),
+            prompt: meerkat_core::ContentInput::Text(String::new()),
+            system_prompt: meerkat::SystemPromptOverride::Set(
+                "mob realm shell delivery".to_string(),
+            ),
+            max_tokens: None,
+            event_tx: None,
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            build: Some(build),
+            labels: None,
+        };
+        let service_for_executor = Arc::clone(&service);
+        let adapter_for_executor = Arc::clone(&adapter);
+        materialize_session(&service, &adapter, session, request, move |session_id| {
+            default_persistent_executor(service_for_executor, adapter_for_executor, session_id)
+        })
+        .await
+        .expect("materialize session");
+
+        run_prompt(&adapter, &session_id, "run the background job").await;
+
+        // (a) The job terminalizes under the mob realm and its terminal outbox
+        // entry is applied. Pre-fix this never converges: the projector is
+        // bound to the manifest realm and refuses the mob-realm job, so the
+        // entry stays pending forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let stored = loop {
+            let jobs = job_store.list_all(16).await.expect("list jobs");
+            let candidate = jobs
+                .iter()
+                .find(|job| job.spec.realm_id == mob_realm.as_str())
+                .cloned();
+            if let Some(job) = candidate
+                && job.terminal_result.is_some()
+                && !job.outbox.is_empty()
+                && job.outbox.iter().all(|entry| entry.applied)
+            {
+                break job;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background shell job never terminalized with applied outbox: {jobs:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(stored.spec.origin_session_id, session_id);
+
+        // (b) The JobTerminal delivery reached the origin session's runtime
+        // inbox: still pending, or already acknowledged past the cursor.
+        let runtime_id = LogicalRuntimeId::for_session(&session_id);
+        let pending = runtime_inbox
+            .list_pending(&runtime_id, usize::MAX)
+            .await
+            .expect("list pending deliveries");
+        let delivered_pending = pending
+            .iter()
+            .any(|record| record.submission.delivery_id().as_str() == stored.job_id.as_str());
+        let applied_cursor = runtime_inbox
+            .applied_cursor(&runtime_id)
+            .await
+            .expect("applied cursor");
+        assert!(
+            delivered_pending || applied_cursor >= 1,
+            "JobTerminal delivery never reached the origin session runtime inbox"
+        );
+
+        // (c) A restarted shell JobManager over the same durable stores - the
+        // recovery path that previously hard-errored with "job delivery
+        // recovery failed ... outside projector realm" - returns the terminal
+        // status.
+        let recovery_projector: Arc<dyn ShellJobDeliveryProjector> = Arc::new(
+            meerkat::JobOutboxProjector::new(job_store.clone(), runtime_inbox.clone())
+                .bound_to_realm(mob_realm.to_string()),
+        );
+        let recovery_runtime = DurableShellJobRuntime::new(
+            mob_realm.as_str(),
+            session_id.clone(),
+            job_store.clone(),
+            blob_store,
+            recovery_projector,
+        )
+        .expect("recovery durable shell runtime");
+        let recovery_manager =
+            JobManager::new(ShellConfig::with_project_root(temp.path().to_path_buf()))
+                .with_durable_job_runtime(recovery_runtime);
+        let restored = recovery_manager
+            .get_status(&ShellJobId::from_string(stored.job_id.as_str()))
+            .await
+            .expect("recovered shell job status must not realm-mismatch")
+            .expect("recovered shell job present");
+        assert!(
+            matches!(
+                restored.status,
+                JobStatus::Completed { ref stdout, .. } if stdout == "mob-realm-delivery"
+            ),
+            "unexpected recovered status: {:?}",
+            restored.status
+        );
+    }
+}
