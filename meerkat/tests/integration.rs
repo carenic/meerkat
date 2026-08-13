@@ -84,6 +84,10 @@ mod llm_normalization {
                 Ok(LlmEvent::ServerToolContent { .. }) => {
                     // Provider-executed tool evidence is a valid side-channel event.
                 }
+                Ok(LlmEvent::WireLiveness) => {
+                    // Transport liveness carries no content; it only re-arms
+                    // the stream inactivity watchdog.
+                }
                 Err(e) => panic!("Unexpected error: {e:?}"),
             }
         }
