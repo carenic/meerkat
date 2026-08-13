@@ -613,6 +613,13 @@ export interface EventsSnapshotResult {
   snapshot: Record<string, unknown>;
 }
 
+export interface ExportAtifParams {
+  agent_name?: string | null;
+  agent_version?: string | null;
+  model_name?: string | null;
+  session_id: string;
+}
+
 export interface ForkSessionAtParams {
   message_index: number;
   running_behavior?: "reject";

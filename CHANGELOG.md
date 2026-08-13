@@ -129,6 +129,14 @@ via cargo-semver-checks against the published baselines).
 - Added read-only peer ingress observability for queue depth, outstanding claim
   age, handoff and durable-admission counts, terminal outcomes, handover state,
   and delivery correlation. These projections cannot authorize mutation.
+- Added ATIF trajectory export: the new `meerkat-atif` crate converts a
+  session's committed event log into an ATIF-v1.7 trajectory document,
+  exposed via `rkat session export-atif <session> [--output FILE]`, the
+  JSON-RPC `session/export_atif` method (bounded durable-event pagination),
+  and opt-in automatic trajectory persistence via `--export-atif` on
+  `rkat run` (including `--resume`), which writes
+  `trajectories/<session>.json` under the realm root after the turn
+  terminalizes.
 
 ### Changed
 

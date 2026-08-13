@@ -21,6 +21,7 @@ ENTRIES=(
   "meerkat-machine-schema=${ROOT}/meerkat-machine-schema"
   "meerkat-machine-kernels=${ROOT}/meerkat-machine-kernels"
   "meerkat-core=${ROOT}/meerkat-core"
+  "meerkat-atif=${ROOT}/meerkat-atif"
   "meerkat-models=${ROOT}/meerkat-models"
   "meerkat-capabilities=${ROOT}/meerkat-capabilities"
   "meerkat-llm-core=${ROOT}/meerkat-llm-core"

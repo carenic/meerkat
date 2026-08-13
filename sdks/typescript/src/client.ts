@@ -207,6 +207,7 @@ import type {
   WireHostBindingDescriptor as RpcWireHostBindingDescriptor,
   WireHostCapabilityFlags as RpcWireHostCapabilityFlags,
   WireRouteInstallObligation as RpcWireRouteInstallObligation,
+  ExportAtifParams as RpcExportAtifParams,
   ProvisionApiKeyParams as RpcProvisionApiKeyParams,
   ReadSessionHistoryParams as RpcReadSessionHistoryParams,
   ReadSessionParams as RpcReadSessionParams,
@@ -1197,6 +1198,25 @@ export class MeerkatClient {
     }
     const raw = await this.request("session/history", params);
     return MeerkatClient.parseSessionHistory(raw);
+  }
+
+  /** Export the session's durable event log as an ATIF trajectory. */
+  async exportSessionAtif(
+    sessionId: string,
+    options?: { agentName?: string; agentVersion?: string; modelName?: string },
+  ): Promise<Record<string, unknown>> {
+    type _RpcSignature = [RpcExportAtifParams];
+    const params: Record<string, unknown> = { session_id: sessionId };
+    if (options?.agentName !== undefined) {
+      params.agent_name = options.agentName;
+    }
+    if (options?.agentVersion !== undefined) {
+      params.agent_version = options.agentVersion;
+    }
+    if (options?.modelName !== undefined) {
+      params.model_name = options.modelName;
+    }
+    return await this.request("session/export_atif", params);
   }
 
   async readSessionTranscriptRevision(

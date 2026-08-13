@@ -123,6 +123,7 @@ rkat run --yolo --param temperature=0.2 "take the gloves off"
 - `-s, --stream`
 - `--no-stream`
 - `--no-web-search`
+- `--export-atif` (write an ATIF trajectory to the realm `trajectories/` directory after the turn; default off)
 - `--resume[=<SESSION>]`
 - `--skill <PATH_OR_ID>` repeatable
 - `-d, --max-duration <DURATION>`
@@ -266,6 +267,7 @@ rkat run --resume -m gemma-4-31b "Continue with the local model"
 ```bash
 rkat session list [--limit <N>] [--offset <N>] [--label <KEY=VALUE>]
 rkat session show <SESSION_ID>
+rkat session export-atif <SESSION_ID> [--output <FILE>]
 rkat session delete <SESSION_ID>
 rkat session interrupt <SESSION_ID>
 ```

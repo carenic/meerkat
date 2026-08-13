@@ -154,6 +154,7 @@ pub use wire::{
     EventsSnapshotBody,
     EventsSnapshotParams,
     EventsSnapshotResult,
+    ExportAtifParams,
     ForkSessionAtParams,
     ForkSessionReplaceParams,
     GrantAction,

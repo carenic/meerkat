@@ -32,6 +32,11 @@ path = "tests/system_cli_mcp_pending.rs"
 required-features = ["integration-real-tests"]
 
 [[test]]
+name = "system_cli_export_atif"
+path = "tests/system_cli_export_atif.rs"
+required-features = ["integration-real-tests"]
+
+[[test]]
 name = "live_smoke_cli"
 path = "tests/live_smoke_cli.rs"
 required-features = ["integration-real-tests"]
@@ -58,6 +63,7 @@ required-features = ["integration-real-tests", "mob"]
 
 [dependencies]
 meerkat = { workspace = true }
+meerkat-atif = { workspace = true }
 meerkat-auth-core = { workspace = true }
 meerkat-core = { workspace = true }
 meerkat-models = { workspace = true }

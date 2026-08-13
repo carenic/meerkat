@@ -118,6 +118,7 @@ Advanced options:
 --param <KEY=VALUE>             # repeatable
 --params-json <JSON>
 --schema <SCHEMA_OR_PATH>
+--export-atif                   # opt-in: write an ATIF trajectory after the turn (run and --resume)
 --allow-tool <TOOL>             # repeatable first-turn allow overlay
 --block-tool <TOOL>             # repeatable first-turn block overlay
 --label <KEY=VALUE>             # repeatable
@@ -199,6 +200,7 @@ the blob id. Do not use `rkat sessions show --json`, `rkat rpc blob/get`, or
 ```bash
 rkat session list [--limit N] [--offset N] [--label KEY=VALUE]
 rkat session show <ID>
+rkat session export-atif <ID> [--output <FILE>]
 rkat session delete <ID>
 rkat session interrupt <ID>
 ```

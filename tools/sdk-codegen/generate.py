@@ -347,6 +347,7 @@ PUBLIC_RPC_CATALOG_OBJECT_TYPES = [
     "EventsListSinceResult",
     "EventsSnapshotParams",
     "EventsSnapshotResult",
+    "ExportAtifParams",
     "ForkSessionAtParams",
     "ForkSessionReplaceParams",
     "HelpRequest",

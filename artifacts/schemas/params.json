@@ -15567,6 +15567,38 @@
     "title": "EventsSnapshotParams",
     "type": "object"
   },
+  "ExportAtifParams": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Parameters for `session/export_atif`.\n\nThe result is the ATIF trajectory document itself; its schema authority is\nthe ATIF interchange format (owned by `meerkat-atif`), so it is carried as\nan untyped `Value` on the wire.",
+    "properties": {
+      "agent_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "agent_version": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "model_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "session_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "session_id"
+    ],
+    "title": "ExportAtifParams",
+    "type": "object"
+  },
   "ForkSessionAtParams": {
     "$defs": {
       "TranscriptEditRunningBehavior": {

@@ -1660,6 +1660,15 @@ enum Commands {
         #[arg(long, help_heading = "Common options")]
         no_web_search: bool,
 
+        /// Export an ATIF trajectory to the realm trajectory directory when
+        /// the turn completes.
+        #[arg(
+            long = "export-atif",
+            hide_short_help = true,
+            help_heading = "Advanced options"
+        )]
+        export_atif: bool,
+
         /// Provider-specific parameter (KEY=VALUE). Can be repeated.
         #[arg(
             long = "param",
@@ -2410,6 +2419,15 @@ enum SessionCommands {
     Show {
         /// Session ID
         id: String,
+    },
+
+    /// Export a persisted session as an ATIF trajectory.
+    ExportAtif {
+        /// Session ID, short handle, or realm-qualified session reference.
+        id: String,
+        /// Destination path. Defaults to the realm trajectory directory.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
 
     /// Delete a session
@@ -3519,6 +3537,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             stream,
             no_stream,
             no_web_search,
+            export_atif,
             params,
             provider_params_json,
             output_schema,
@@ -3593,6 +3612,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 stream,
                 no_stream,
                 no_web_search,
+                export_atif,
                 params,
                 provider_params_json,
                 output_schema,
@@ -3669,6 +3689,11 @@ async fn main() -> anyhow::Result<ExitCode> {
                 labels,
             } => list_sessions(limit, offset, labels, &cli_scope).await,
             SessionCommands::Show { id } => show_session(&id, &cli_scope).await,
+            SessionCommands::ExportAtif { id, output } => {
+                let destination = export_session_atif(&id, output, &cli_scope).await?;
+                println!("Wrote ATIF trajectory to {}", destination.display());
+                Ok(())
+            }
             SessionCommands::Delete { session_id } => delete_session(&session_id, &cli_scope).await,
             SessionCommands::Interrupt { session_id } => {
                 interrupt_session(&session_id, &cli_scope).await
@@ -3796,6 +3821,7 @@ async fn handle_help_command(
         stream,
         no_stream,
         false,
+        false,
         Vec::new(),
         None,
         None,
@@ -3850,6 +3876,7 @@ async fn handle_run_command(
     stream: bool,
     no_stream: bool,
     no_web_search: bool,
+    export_atif: bool,
     params: Vec<String>,
     provider_params_json: Option<String>,
     output_schema: Option<String>,
@@ -3950,6 +3977,7 @@ async fn handle_run_command(
             params,
             provider_params_json,
             no_web_search,
+            export_atif,
             stream,
             no_stream,
             stdin,
@@ -4052,6 +4080,7 @@ async fn handle_run_command(
                 stream_policy.clone(),
                 merged_provider_params,
                 no_web_search,
+                export_atif,
                 parsed_output_schema,
                 None,
                 comms_overrides,
@@ -10715,6 +10744,7 @@ async fn run_agent(
     stream_policy: Option<stream_renderer::StreamRenderPolicy>,
     provider_params: Option<meerkat_core::lifecycle::run_primitive::ProviderParamsOverride>,
     no_web_search: bool,
+    export_atif: bool,
     output_schema: Option<OutputSchema>,
     structured_output_retries: Option<u32>,
     comms_overrides: CommsOverrides,
@@ -10760,6 +10790,7 @@ async fn run_agent(
             stream_policy,
             provider_params,
             no_web_search,
+            export_atif,
             output_schema,
             structured_output_retries,
             comms_overrides,
@@ -11255,7 +11286,11 @@ async fn run_agent(
             },
         ))
         .await?;
-
+        if export_atif
+            && let Err(error) = export_session_atif(&session_id.to_string(), None, scope).await
+        {
+            eprintln!("Warning: failed to persist ATIF trajectory: {error}");
+        }
         // Output the result
         match result {
             CliRuntimeTurnResult::Completed(result) => {
@@ -11299,6 +11334,7 @@ async fn resume_session(
     params: Vec<String>,
     provider_params_json: Option<String>,
     no_web_search: bool,
+    export_atif: bool,
     stream: bool,
     no_stream: bool,
     stdin: StdinMode,
@@ -11343,6 +11379,7 @@ async fn resume_session(
         params,
         provider_params_json,
         no_web_search,
+        export_atif,
         stream,
         no_stream,
         stdin,
@@ -11383,6 +11420,7 @@ async fn resume_session_with_llm_override(
     params: Vec<String>,
     provider_params_json: Option<String>,
     no_web_search: bool,
+    export_atif: bool,
     stream: bool,
     no_stream: bool,
     stdin: StdinMode,
@@ -11421,6 +11459,7 @@ async fn resume_session_with_llm_override(
             params,
             provider_params_json,
             no_web_search,
+            export_atif,
             stream,
             no_stream,
             stdin,
@@ -11940,7 +11979,11 @@ async fn resume_session_with_llm_override(
             },
         ))
         .await?;
-
+        if export_atif
+            && let Err(error) = export_session_atif(&session_id.to_string(), None, scope).await
+        {
+            eprintln!("Warning: failed to persist ATIF trajectory: {error}");
+        }
         // Output the result
         log_stage("print_result");
         match result {
@@ -13481,6 +13524,96 @@ async fn list_sessions(
 
         Ok(())
     }
+}
+
+/// Export a persisted session's durable event log as an ATIF trajectory.
+///
+/// Returns the destination path; callers own all user-facing output so the
+/// post-turn auto-export never writes to stdout (stdout stays pure under
+/// `--output json`).
+#[cfg(feature = "session-store")]
+async fn export_session_atif(
+    raw_id: &str,
+    output: Option<PathBuf>,
+    scope: &RuntimeScope,
+) -> anyhow::Result<PathBuf> {
+    let (config, _) = load_config(scope).await?;
+    let session_id = resolve_flexible_session_id(raw_id, scope, &config).await?;
+    let service = build_cli_persistent_service(scope, config).await?.0;
+    let mut events = Vec::new();
+    let mut from_seq = 1u64;
+    const PAGE_SIZE: usize = 512;
+    loop {
+        let page = service
+            .event_log_read_page(&session_id, from_seq, PAGE_SIZE)
+            .await
+            .map_err(session_err_to_anyhow)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("event projection unavailable for session {session_id}")
+            })?;
+        let page_len = page.len();
+        for stored in page {
+            let mut envelope = EventEnvelope::new_with_source(
+                stored.source,
+                stored.stream_seq.max(stored.seq),
+                stored.mob_id,
+                stored.event,
+            );
+            envelope.seq = stored.seq;
+            envelope.timestamp_ms = stored
+                .timestamp
+                .duration_since(meerkat_core::time_compat::SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            events.push(envelope);
+        }
+        if page_len < PAGE_SIZE {
+            break;
+        }
+        from_seq = events
+            .last()
+            .map(|event| event.seq.saturating_add(1))
+            .ok_or_else(|| anyhow::anyhow!("event replay made no progress"))?;
+    }
+    let trajectory = meerkat_atif::trajectory_from_events(
+        &events,
+        meerkat_atif::Agent {
+            name: "meerkat".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            model_name: None,
+            tool_definitions: None,
+            extra: None,
+        },
+    )?;
+    let destination = output.unwrap_or_else(|| {
+        meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
+            .root
+            .join("trajectories")
+            .join(format!("{session_id}.json"))
+    });
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = destination.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4()));
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .await?;
+    file.write_all(trajectory.to_json()?.as_bytes()).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&temporary, &destination).await?;
+    Ok(destination)
+}
+
+#[cfg(not(feature = "session-store"))]
+async fn export_session_atif(
+    _raw_id: &str,
+    _output: Option<PathBuf>,
+    _scope: &RuntimeScope,
+) -> anyhow::Result<PathBuf> {
+    anyhow::bail!("ATIF export requires session-store support")
 }
 
 /// Show session details from the realm-scoped persistent backend.
@@ -20511,6 +20644,7 @@ default_model = "gemma"
             None,
             false,
             true,
+            false,
             false,
             Vec::new(),
             None,

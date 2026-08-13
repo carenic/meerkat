@@ -210,6 +210,7 @@ from .generated.types import (
     ListSessionsResult as RpcListSessionsResult,
     LoginCompleteParams as RpcLoginCompleteParams,
     LoginStartParams as RpcLoginStartParams,
+    ExportAtifParams as RpcExportAtifParams,
     ProvisionApiKeyParams as RpcProvisionApiKeyParams,
     ReadSessionHistoryParams as RpcReadSessionHistoryParams,
     ReadSessionParams as RpcReadSessionParams,
@@ -1437,6 +1438,25 @@ class MeerkatClient:
             params["limit"] = limit
         raw = await self._request("session/history", params)
         return self._parse_session_history(raw)
+
+    async def export_session_atif(
+        self,
+        session_id: str,
+        *,
+        agent_name: str | None = None,
+        agent_version: str | None = None,
+        model_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Export the session's durable event log as an ATIF trajectory."""
+        _rpc_signature: RpcExportAtifParams
+        params: dict[str, Any] = {"session_id": session_id}
+        if agent_name is not None:
+            params["agent_name"] = agent_name
+        if agent_version is not None:
+            params["agent_version"] = agent_version
+        if model_name is not None:
+            params["model_name"] = model_name
+        return await self._request("session/export_atif", params)
 
     async def read_session_transcript_revision(
         self,

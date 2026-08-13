@@ -785,6 +785,19 @@ class EventsSnapshotResult:
 
 
 @dataclass
+class ExportAtifParams:
+    """Parameters for `session/export_atif`.
+
+The result is the ATIF trajectory document itself; its schema authority is
+the ATIF interchange format (owned by `meerkat-atif`), so it is carried as
+an untyped `Value` on the wire."""
+    session_id: str
+    agent_name: Optional[str] = None
+    agent_version: Optional[str] = None
+    model_name: Optional[str] = None
+
+
+@dataclass
 class ForkSessionAtParams:
     """Request payload for `session/fork_at`."""
     message_index: int

@@ -105,6 +105,7 @@ subset.
 | `session/list` | Session | `ListSessionsParams` | `ListSessionsResult` | List active sessions |
 | `session/read` | Session | `ReadSessionParams` | `WireSessionInfo` | Get session state |
 | `session/history` | Session | `ReadSessionHistoryParams` | `WireSessionHistory` | Get committed session transcript messages |
+| `session/export_atif` | Session | `ExportAtifParams` | `Value` | Export the complete durable session event log as an ATIF trajectory |
 | `session/update_system_prompt` | Session | `UpdateSystemPromptParams` | `SystemPromptUpdateResult` | Explicitly replace one durable versioned system-prompt key |
 | `session/rewrite_transcript` | Session | `RewriteSessionTranscriptParams` | `SessionTranscriptRewriteResult` | Commit a same-session transcript rewrite |
 | `session/transcript_revision` | Session | `ReadSessionTranscriptRevisionParams` | `WireSessionTranscriptRevision` | Read a transcript revision by id |
@@ -583,6 +584,30 @@ Returns oldest-to-newest committed messages plus pagination metadata. This metho
 When `limit` is omitted, the server returns at most 100 messages. The maximum
 accepted `limit` is 1,000 and the maximum `offset` is 1,000,000; larger values
 fail with `INVALID_PARAMS` before the session store is queried.
+
+### session/export_atif
+
+Export the complete durable session event log as an ATIF (Agent Trajectory
+Interchange Format) v1.7 trajectory document.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "session/export_atif",
+  "params": {
+    "session_id": "01936f8a-7b2c-7000-8000-000000000001",
+    "agent_name": "meerkat",
+    "agent_version": "0.8.22",
+    "model_name": "claude-opus-5"
+  }
+}
+```
+
+`agent_name`, `agent_version`, and `model_name` are optional overrides for the
+trajectory's `agent` block; when `model_name` is omitted the session's model is
+used. The export replays the durable event log, so it requires a persistent
+session backend; exports are rejected past a 100,000-event replay bound.
 
 ### session/rewrite_transcript
 

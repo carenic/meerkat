@@ -107,6 +107,7 @@ filegroup(
     ) + [
         "//meerkat-agent-build-authority:package_runfiles",
         "//meerkat-anthropic:package_runfiles",
+        "//meerkat-atif:package_runfiles",
         "//meerkat-auth-core:package_runfiles",
         "//meerkat-capabilities:package_runfiles",
         "//meerkat-cli:package_runfiles",
@@ -386,6 +387,7 @@ test_suite(
         "//meerkat-agent-build-authority:meerkat_agent_build_authority_unit_test",
         "//meerkat-anthropic:meerkat_anthropic_unit_test",
         "//meerkat-anthropic:oauth_resolve_test",
+        "//meerkat-atif:meerkat_atif_unit_test",
         "//meerkat-auth-core:aws_sts_authorizer_test",
         "//meerkat-auth-core:azure_ad_authorizer_test",
         "//meerkat-auth-core:google_auth_authorizer_test",
@@ -637,6 +639,7 @@ test_suite(
     name = "e2e_system_tests",
     tests = [
         "//meerkat-cli:e2e_system_cli_capabilities_and_config_bazel_test",
+        "//meerkat-cli:e2e_system_cli_export_atif_bazel_test",
         "//meerkat-cli:e2e_system_cli_init_snapshot_bazel_test",
         "//meerkat-cli:e2e_system_cli_mcp_pending_resume_bazel_test",
         "//meerkat-cli:e2e_system_cli_mobpack_pack_inspect_validate_bazel_test",

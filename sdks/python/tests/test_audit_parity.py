@@ -46,6 +46,7 @@ RPC_PUBLIC_WRAPPERS: dict[str, tuple[type, str]] = {
     "session/list": (MeerkatClient, "list_sessions"),
     "session/read": (MeerkatClient, "read_session"),
     "session/history": (MeerkatClient, "read_session_history"),
+    "session/export_atif": (MeerkatClient, "export_session_atif"),
     "session/fork_at": (MeerkatClient, "fork_session_at"),
     "session/fork_replace": (MeerkatClient, "fork_session_replace"),
     "session/rewrite_transcript": (MeerkatClient, "rewrite_session_transcript"),

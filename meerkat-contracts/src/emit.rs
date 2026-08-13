@@ -626,6 +626,7 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "ListSessionsParams": schema_for!(crate::wire::ListSessionsParams),
         "ReadSessionParams": schema_for!(crate::wire::ReadSessionParams),
         "ReadSessionHistoryParams": schema_for!(crate::wire::ReadSessionHistoryParams),
+        "ExportAtifParams": schema_for!(crate::wire::ExportAtifParams),
         "ArchiveSessionParams": schema_for!(crate::wire::ArchiveSessionParams),
         "InjectSystemContextParams": schema_for!(crate::wire::InjectSystemContextParams),
         "SessionInputStateSelector": schema_for!(crate::wire::SessionInputStateSelector),

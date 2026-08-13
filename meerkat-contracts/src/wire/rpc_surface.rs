@@ -60,6 +60,23 @@ pub struct ReadSessionHistoryParams {
     pub limit: Option<usize>,
 }
 
+/// Parameters for `session/export_atif`.
+///
+/// The result is the ATIF trajectory document itself; its schema authority is
+/// the ATIF interchange format (owned by `meerkat-atif`), so it is carried as
+/// an untyped `Value` on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ExportAtifParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+}
+
 /// Parameters for `session/archive`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
