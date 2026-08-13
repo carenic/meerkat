@@ -1582,6 +1582,7 @@ enum Commands {
         /// Optional per-request system prompt override.
         #[arg(
             long = "system",
+            allow_hyphen_values = true,
             hide_short_help = true,
             help_heading = "Advanced options"
         )]
@@ -1721,6 +1722,7 @@ enum Commands {
         #[arg(
             long = "instructions",
             value_name = "TEXT",
+            allow_hyphen_values = true,
             hide_short_help = true,
             help_heading = "Advanced options"
         )]
@@ -1852,6 +1854,7 @@ enum Commands {
         #[arg(
             long = "agent-description",
             value_name = "TEXT",
+            allow_hyphen_values = true,
             hide_short_help = true,
             help_heading = "Advanced options"
         )]
@@ -1909,7 +1912,12 @@ enum Commands {
         question: String,
 
         /// Inert prompt payload for future execution-oriented help
-        #[arg(long, value_name = "PROMPT", help_heading = "Common options")]
+        #[arg(
+            long,
+            value_name = "PROMPT",
+            allow_hyphen_values = true,
+            help_heading = "Common options"
+        )]
         prompt: Option<String>,
 
         /// Plan future execution without executing anything
@@ -2646,7 +2654,7 @@ enum WorkGraphCommands {
         title: String,
         #[arg(long)]
         namespace: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         description: Option<String>,
         #[arg(long, value_enum, default_value = "pursue")]
         mode: WorkAttentionModeArg,
@@ -2918,7 +2926,7 @@ enum MobCommands {
         #[arg(long = "param")]
         params: Vec<String>,
         /// Sugar for --param prompt=<text>.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         prompt: Option<String>,
         /// Return immediately with the run id instead of waiting for the result.
         #[arg(long)]
@@ -3114,7 +3122,7 @@ enum MobCommands {
         /// Agent identity to respawn
         agent_identity: String,
         /// Initial message for the respawned member
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         initial_message: Option<String>,
     },
     /// Wait for autonomous kickoff turns to complete.
@@ -16461,7 +16469,12 @@ async fn execute_mob_run_pack(
         };
         let mut warnings = warnings;
         warnings.push(detach_execution_custody_warning(&run_id));
-        return render_mob_run_pack_with_warnings(rendered, warnings);
+        let (stdout_render, stderr_warnings) =
+            render_mob_run_pack_with_warnings(rendered, warnings, invocation.json);
+        for warning in &stderr_warnings {
+            eprintln!("warning\t{warning}");
+        }
+        return Ok(stdout_render);
     }
 
     let rendered = if let Some(flow_id) = flow_id {
@@ -16539,23 +16552,32 @@ async fn execute_mob_run_pack(
         }
     };
 
-    render_mob_run_pack_with_warnings(rendered, warnings)
+    let (stdout_render, stderr_warnings) =
+        render_mob_run_pack_with_warnings(rendered, warnings, invocation.json);
+    for warning in &stderr_warnings {
+        eprintln!("warning\t{warning}");
+    }
+    Ok(stdout_render)
 }
 
+/// Splits the mob run pack output between the two channels: under --json,
+/// stdout must stay a single machine-readable JSON document, so warnings are
+/// returned separately for the caller to route to stderr; in text mode they
+/// stay appended to the stdout render.
 #[cfg(feature = "mob")]
 fn render_mob_run_pack_with_warnings(
     rendered: String,
     warnings: Vec<String>,
-) -> anyhow::Result<String> {
-    if warnings.is_empty() {
-        Ok(rendered)
-    } else {
-        let mut out = rendered;
-        for warning in warnings {
-            out.push_str(&format!("\nwarning\t{warning}"));
-        }
-        Ok(out)
+    json: bool,
+) -> (String, Vec<String>) {
+    if json {
+        return (rendered, warnings);
     }
+    let mut out = rendered;
+    for warning in &warnings {
+        out.push_str(&format!("\nwarning\t{warning}"));
+    }
+    (out, Vec::new())
 }
 
 #[cfg(all(feature = "mob", feature = "rpc-surface"))]
@@ -21412,6 +21434,146 @@ default_model = "gemma"
             }
             _ => unreachable!("expected help command"),
         }
+    }
+
+    #[test]
+    fn test_free_text_options_accept_leading_hyphen_values() {
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "run",
+            "hello",
+            "--system",
+            "- leading system text",
+            "--instructions",
+            "- leading instruction",
+            "--agent-description",
+            "- leading description",
+        ])
+        .expect("run free-text options should accept leading-hyphen values");
+        match cli.command.expect("test invocation parses a subcommand") {
+            Commands::Run {
+                system_prompt,
+                instructions,
+                agent_description,
+                ..
+            } => {
+                assert_eq!(system_prompt.as_deref(), Some("- leading system text"));
+                assert_eq!(instructions, vec!["- leading instruction"]);
+                assert_eq!(agent_description.as_deref(), Some("- leading description"));
+            }
+            _ => unreachable!("expected run command"),
+        }
+
+        let cli = Cli::try_parse_from(["rkat", "help", "question", "--prompt", "- leading prompt"])
+            .expect("help --prompt should accept leading-hyphen values");
+        match cli.command.expect("test invocation parses a subcommand") {
+            Commands::Help { prompt, .. } => {
+                assert_eq!(prompt.as_deref(), Some("- leading prompt"));
+            }
+            _ => unreachable!("expected help command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "workgraph",
+            "goal-create",
+            "019e63c2-0000-7000-8000-000000000030",
+            "goal title",
+            "--description",
+            "- leading goal description",
+        ])
+        .expect("goal-create --description should accept leading-hyphen values");
+        match cli.command.expect("test invocation parses a subcommand") {
+            Commands::WorkGraph {
+                command: WorkGraphCommands::GoalCreate { description, .. },
+            } => {
+                assert_eq!(description.as_deref(), Some("- leading goal description"));
+            }
+            _ => unreachable!("expected workgraph goal-create command"),
+        }
+
+        // Positional prompts stay strict: hyphen-leading values go through the
+        // standard `--` terminator, so mistyped flags still error loudly.
+        let cli = Cli::try_parse_from(["rkat", "run", "--", "-starts-with-hyphen"])
+            .expect("run positional prompt should accept hyphen values after --");
+        match cli.command.expect("test invocation parses a subcommand") {
+            Commands::Run { prompt, .. } => {
+                assert_eq!(prompt, "-starts-with-hyphen");
+            }
+            _ => unreachable!("expected run command"),
+        }
+    }
+
+    #[cfg(feature = "mob")]
+    #[test]
+    fn test_mob_free_text_options_accept_leading_hyphen_values() {
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "mob",
+            "run",
+            "pack.mobpack",
+            "--prompt",
+            "- leading text",
+        ])
+        .expect("mob run --prompt should accept leading-hyphen values");
+        match cli.command {
+            Some(Commands::Mob {
+                command: MobCommands::Run { prompt, .. },
+            }) => {
+                assert_eq!(prompt.as_deref(), Some("- leading text"));
+            }
+            _ => unreachable!("expected mob run command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "mob",
+            "respawn",
+            "mob-1",
+            "agent-1",
+            "--initial-message",
+            "- leading message",
+        ])
+        .expect("mob respawn --initial-message should accept leading-hyphen values");
+        match cli.command {
+            Some(Commands::Mob {
+                command:
+                    MobCommands::Respawn {
+                        initial_message, ..
+                    },
+            }) => {
+                assert_eq!(initial_message.as_deref(), Some("- leading message"));
+            }
+            _ => unreachable!("expected mob respawn command"),
+        }
+    }
+
+    #[cfg(feature = "mob")]
+    #[test]
+    fn test_mob_run_pack_warnings_route_off_stdout_under_json() {
+        let warnings = vec!["unsigned pack accepted in permissive mode".to_string()];
+
+        let (stdout_render, stderr_warnings) = render_mob_run_pack_with_warnings(
+            serde_json::json!({"status": "completed"}).to_string(),
+            warnings.clone(),
+            true,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&stdout_render)
+            .expect("--json stdout must stay a single strict JSON document");
+        assert_eq!(parsed["status"], "completed");
+        assert!(
+            !stdout_render.contains("warning\t"),
+            "--json stdout must carry no warning lines: {stdout_render}"
+        );
+        assert_eq!(stderr_warnings, warnings);
+
+        let (text_render, deferred) =
+            render_mob_run_pack_with_warnings("run\tmob=demo".to_string(), warnings, false);
+        assert_eq!(
+            text_render,
+            "run\tmob=demo\nwarning\tunsigned pack accepted in permissive mode"
+        );
+        assert!(deferred.is_empty());
     }
 
     #[test]
