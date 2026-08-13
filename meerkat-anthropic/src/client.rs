@@ -1490,6 +1490,12 @@ impl LlmClient for AnthropicClient {
             let mut last_stop_reason: Option<StopReason> = None;
             let mut usage = Usage::default();
             let mut saw_done = false;
+            // Set by handle_event!/handle_line! at every yield; reset per
+            // chunk so a chunk whose lines produced no semantic event can be
+            // surfaced as wire liveness. `Cell` because the macros mark yields
+            // from expansion sites where a `&mut` flag would be a dead store
+            // on early-return paths.
+            let chunk_yielded = std::cell::Cell::new(false);
 
             macro_rules! handle_event {
                 ($event:expr) => {
@@ -1499,12 +1505,14 @@ impl LlmClient for AnthropicClient {
                                 match delta.delta_type.as_str() {
                                     "text_delta" => {
                                         if let Some(text) = delta.text {
+                                            chunk_yielded.set(true);
                                             yield LlmEvent::TextDelta { delta: text, meta: None };
                                         }
                                     }
                                     "thinking_delta" => {
                                         // Emit incremental thinking content
                                         if let Some(text) = delta.thinking {
+                                            chunk_yielded.set(true);
                                             yield LlmEvent::ReasoningDelta { delta: text };
                                         }
                                     }
@@ -1520,6 +1528,7 @@ impl LlmClient for AnthropicClient {
                                                 accumulated_server_tool_input.push_str(&partial_json);
                                             } else {
                                                 accumulated_tool_args.push_str(&partial_json);
+                                                chunk_yielded.set(true);
                                                 yield LlmEvent::ToolCallDelta {
                                                     id: current_tool_id.clone().unwrap_or_default(),
                                                     name: None,
@@ -1531,6 +1540,7 @@ impl LlmClient for AnthropicClient {
                                     "compaction_delta" => {
                                         // Compaction summary arrives as single delta — emit as Reasoning with compaction meta
                                         if let Some(content) = delta.content {
+                                            chunk_yielded.set(true);
                                             yield LlmEvent::ReasoningComplete {
                                                 text: String::new(),
                                                 meta: Some(Box::new(meerkat_core::ProviderMeta::AnthropicCompaction { content })),
@@ -1547,6 +1557,7 @@ impl LlmClient for AnthropicClient {
                                 match content_block.block_type.as_str() {
                                     "text" => {
                                         if let Some(citations) = content_block.extra.get("citations") {
+                                            chunk_yielded.set(true);
                                             yield LlmEvent::ServerToolContent {
                                                 id: None,
                                                 kind: ServerToolKind::WebSearch,
@@ -1566,6 +1577,7 @@ impl LlmClient for AnthropicClient {
                                     "redacted_thinking" => {
                                         // Redacted by safety systems — emit as Reasoning with redacted meta
                                         if let Some(data) = content_block.data {
+                                            chunk_yielded.set(true);
                                             yield LlmEvent::ReasoningComplete {
                                                 text: String::new(),
                                                 meta: Some(Box::new(meerkat_core::ProviderMeta::AnthropicRedacted { data })),
@@ -1580,6 +1592,7 @@ impl LlmClient for AnthropicClient {
                                         current_tool_id = Some(id.clone());
                                         current_tool_name = content_block.name.clone();
                                         accumulated_tool_args.clear();
+                                        chunk_yielded.set(true);
                                         yield LlmEvent::ToolCallDelta {
                                             id,
                                             name: content_block.name,
@@ -1592,6 +1605,7 @@ impl LlmClient for AnthropicClient {
                                         accumulated_server_tool_input.clear();
                                     }
                                     "web_search_tool_result" => {
+                                        chunk_yielded.set(true);
                                         yield LlmEvent::ServerToolContent {
                                             id: content_block.tool_use_id.clone(),
                                             kind: ServerToolKind::WebSearch,
@@ -1611,6 +1625,7 @@ impl LlmClient for AnthropicClient {
                                     let meta = current_thinking_signature
                                         .take()
                                         .map(|sig| Box::new(meerkat_core::ProviderMeta::Anthropic { signature: sig }));
+                                    chunk_yielded.set(true);
                                     yield LlmEvent::ReasoningComplete {
                                         text: String::new(), // Text was already streamed via deltas
                                         meta,
@@ -1632,6 +1647,7 @@ impl LlmClient for AnthropicClient {
                                             tool_id,
                                         ) {
                                             Ok(args_val) => {
+                                                chunk_yielded.set(true);
                                                 yield LlmEvent::ToolCallComplete {
                                                     id: tool_id.clone(),
                                                     name: current_tool_name.take().unwrap_or_default(),
@@ -1641,6 +1657,7 @@ impl LlmClient for AnthropicClient {
                                             }
                                             Err(error) => {
                                                 if !saw_done {
+                                                    chunk_yielded.set(true);
                                                     yield LlmEvent::Done {
                                                         outcome: LlmDoneOutcome::Error { error },
                                                     };
@@ -1673,6 +1690,7 @@ impl LlmClient for AnthropicClient {
                                         _ => ServerToolKind::ProviderNative { name },
                                     };
                                     accumulated_server_tool_input.clear();
+                                    chunk_yielded.set(true);
                                     yield LlmEvent::ServerToolContent {
                                         id,
                                         kind,
@@ -1691,6 +1709,7 @@ impl LlmClient for AnthropicClient {
                             if let Some(usage_update) = $event.usage {
                                 merge_usage(&mut usage, &usage_update);
                                 attach_normalized_usage(&request.model, &mut usage);
+                                chunk_yielded.set(true);
                                 yield LlmEvent::UsageUpdate {
                                     usage: meerkat_core::TurnUsage::try_from_usage(usage.clone())
                                         .map_err(|error| LlmError::Unknown {
@@ -1702,6 +1721,7 @@ impl LlmClient for AnthropicClient {
                                 let reason = Self::map_stop_reason(finish_reason.as_str());
                                 last_stop_reason = Some(reason);
                                 if !saw_done {
+                                    chunk_yielded.set(true);
                                     yield LlmEvent::Done {
                                         outcome: LlmDoneOutcome::Success { stop_reason: reason },
                                     };
@@ -1713,6 +1733,7 @@ impl LlmClient for AnthropicClient {
                             if let Some(usage_update) = $event.message.and_then(|m| m.usage) {
                                 merge_usage(&mut usage, &usage_update);
                                 attach_normalized_usage(&request.model, &mut usage);
+                                chunk_yielded.set(true);
                                 yield LlmEvent::UsageUpdate {
                                     usage: meerkat_core::TurnUsage::try_from_usage(usage.clone())
                                         .map_err(|error| LlmError::Unknown {
@@ -1730,6 +1751,7 @@ impl LlmClient for AnthropicClient {
                                     .or(last_stop_reason)
                                     .unwrap_or(StopReason::EndTurn);
                                 last_stop_reason = Some(reason);
+                                chunk_yielded.set(true);
                                 yield LlmEvent::Done {
                                     outcome: LlmDoneOutcome::Success { stop_reason: reason },
                                 };
@@ -1786,6 +1808,7 @@ impl LlmClient for AnthropicClient {
                             };
 
                             if !saw_done {
+                                chunk_yielded.set(true);
                                 yield LlmEvent::Done {
                                     outcome: LlmDoneOutcome::Error { error },
                                 };
@@ -1805,6 +1828,7 @@ impl LlmClient for AnthropicClient {
                                 if !saw_done {
                                     let reason =
                                         last_stop_reason.unwrap_or(StopReason::EndTurn);
+                                    chunk_yielded.set(true);
                                     yield LlmEvent::Done {
                                         outcome: LlmDoneOutcome::Success { stop_reason: reason },
                                     };
@@ -1816,6 +1840,7 @@ impl LlmClient for AnthropicClient {
                                     Ok(None) => {}
                                     Err(error) => {
                                         if !saw_done {
+                                            chunk_yielded.set(true);
                                             yield LlmEvent::Done {
                                                 outcome: LlmDoneOutcome::Error { error },
                                             };
@@ -1833,17 +1858,33 @@ impl LlmClient for AnthropicClient {
                 let chunk = chunk.map_err(|_| LlmError::ConnectionReset)?;
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
+                chunk_yielded.set(false);
+                let mut chunk_consumed_line = false;
                 while let Some(newline_pos) = buffer.find('\n') {
+                    chunk_consumed_line = true;
                     let line = buffer[..newline_pos].trim();
                     handle_line!(line);
                     buffer.drain(..=newline_pos);
                 }
+                // A chunk whose lines produced no semantic event is still wire
+                // liveness (keepalive comments, `event:` lines, ping/bookkeeping
+                // events); surface it so the stream-inactivity watchdog re-arms.
+                // Bytes that never complete a line intentionally do not count.
+                if chunk_consumed_line && !chunk_yielded.get() {
+                    yield LlmEvent::WireLiveness;
+                }
             }
 
             if !buffer.is_empty() {
+                chunk_yielded.set(false);
+                let mut trailing_consumed_line = false;
                 for line in buffer.lines() {
+                    trailing_consumed_line = true;
                     let line = line.trim();
                     handle_line!(line);
+                }
+                if trailing_consumed_line && !chunk_yielded.get() {
+                    yield LlmEvent::WireLiveness;
                 }
             }
 
@@ -3620,6 +3661,91 @@ mod tests {
             axum::serve(listener, app).await.expect("serve test server");
         });
         (format!("http://{addr}"), handle)
+    }
+
+    /// Serves each element of `chunks` as a separate paced HTTP body chunk so
+    /// tests can pin per-chunk wire behavior (keepalive-only chunks etc.).
+    async fn paced_sse(State(chunks): State<Vec<String>>) -> impl IntoResponse {
+        let body_stream = async_stream::stream! {
+            for chunk in chunks {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(chunk));
+            }
+        };
+        (
+            [("content-type", "text/event-stream")],
+            axum::body::Body::from_stream(body_stream),
+        )
+    }
+
+    async fn spawn_anthropic_paced_sse_server(
+        chunks: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/v1/messages", post(paced_sse))
+            .with_state(chunks);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Watchdog liveness regression: SSE keepalive comments and `ping` events
+    /// are real wire traffic that yields no semantic event. A chunk made only
+    /// of them must surface as `WireLiveness` so the stream-inactivity
+    /// watchdog re-arms instead of aborting a healthy call.
+    #[tokio::test]
+    async fn stream_emits_wire_liveness_for_keepalive_only_chunks() {
+        let chunks = vec![
+            concat!(
+                "data: {\"type\":\"message_start\",",
+                "\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n"
+            )
+            .to_string(),
+            // A chunk of pure keepalives: comment lines and ping data events.
+            ": keepalive\n\n: keepalive\n\ndata: {\"type\":\"ping\"}\n\n".to_string(),
+            concat!(
+                "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1},",
+                "\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            )
+            .to_string(),
+        ];
+        let (base_url, server) = spawn_anthropic_paced_sse_server(chunks).await;
+        let client = AnthropicClient::builder("test-key".to_string())
+            .base_url(base_url)
+            .build()
+            .unwrap();
+        let request = LlmRequest::new(
+            "claude-sonnet-4-5",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut liveness_before_done = 0usize;
+        let mut saw_done = false;
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::WireLiveness => {
+                    if !saw_done {
+                        liveness_before_done += 1;
+                    }
+                }
+                LlmEvent::Done { .. } => saw_done = true,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert!(saw_done, "stream must still terminate with Done");
+        assert!(
+            liveness_before_done >= 1,
+            "a keepalive-only chunk must surface wire liveness before the terminal event"
+        );
     }
 
     #[tokio::test]

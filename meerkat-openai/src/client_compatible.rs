@@ -650,7 +650,10 @@ impl LlmClient for OpenAiCompatibleClient {
                         let chunk = chunk.map_err(|_| LlmError::ConnectionReset)?;
                         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
+                        let chunk_yielded = std::cell::Cell::new(false);
+                        let mut chunk_consumed_line = false;
                         while let Some(newline_pos) = buffer.find('\n') {
+                            chunk_consumed_line = true;
                             let line = buffer[..newline_pos].trim();
                             let should_process = !line.is_empty() && !line.starts_with(':');
                             let parsed = if should_process {
@@ -680,6 +683,7 @@ impl LlmClient for OpenAiCompatibleClient {
                                             ),
                                         ),
                                     };
+                                    chunk_yielded.set(true);
                                     yield LlmEvent::UsageUpdate {
                                         usage: meerkat_core::TurnUsage::try_from_usage(usage)
                                             .map_err(|error| LlmError::Unknown {
@@ -693,6 +697,7 @@ impl LlmClient for OpenAiCompatibleClient {
                                         if let Some(content) = delta.content
                                             && !content.is_empty()
                                         {
+                                            chunk_yielded.set(true);
                                             yield LlmEvent::TextDelta {
                                                 delta: content,
                                                 meta: None,
@@ -707,6 +712,7 @@ impl LlmClient for OpenAiCompatibleClient {
                                             && !reasoning.is_empty()
                                         {
                                             reasoning_text.push_str(reasoning);
+                                            chunk_yielded.set(true);
                                             yield LlmEvent::ReasoningDelta {
                                                 delta: reasoning.clone(),
                                             };
@@ -735,6 +741,7 @@ impl LlmClient for OpenAiCompatibleClient {
                                                         && !arguments.is_empty()
                                                     {
                                                         buffer.push_args(&arguments);
+                                                        chunk_yielded.set(true);
                                                         yield LlmEvent::ToolCallDelta {
                                                             id: buffer.id.clone(),
                                                             name: buffer.name.clone(),
@@ -756,6 +763,7 @@ impl LlmClient for OpenAiCompatibleClient {
                                         if matches!(stop_reason, StopReason::ToolUse) {
                                             for buffer in tool_buffers.values() {
                                                 if let Some(tool_call) = buffer.try_complete()? {
+                                                    chunk_yielded.set(true);
                                                     yield LlmEvent::ToolCallComplete {
                                                         id: tool_call.id,
                                                         name: tool_call.name,
@@ -766,6 +774,7 @@ impl LlmClient for OpenAiCompatibleClient {
                                             }
                                         }
                                         if !reasoning_text.is_empty() {
+                                            chunk_yielded.set(true);
                                             yield LlmEvent::ReasoningComplete {
                                                 text: std::mem::take(&mut reasoning_text),
                                                 meta: None,
@@ -773,6 +782,7 @@ impl LlmClient for OpenAiCompatibleClient {
                                         }
                                         if !done_emitted {
                                             done_emitted = true;
+                                            chunk_yielded.set(true);
                                             yield LlmEvent::Done {
                                                 outcome: LlmDoneOutcome::Success { stop_reason },
                                             };
@@ -780,6 +790,14 @@ impl LlmClient for OpenAiCompatibleClient {
                                     }
                                 }
                             }
+                        }
+                        // A chunk whose lines produced no semantic event is
+                        // still wire liveness (keepalive comments, unhandled
+                        // bookkeeping); surface it so the stream-inactivity
+                        // watchdog re-arms. Bytes that never complete a line
+                        // intentionally do not count.
+                        if chunk_consumed_line && !chunk_yielded.get() {
+                            yield LlmEvent::WireLiveness;
                         }
                     }
 

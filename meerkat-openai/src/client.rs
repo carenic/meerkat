@@ -2225,7 +2225,10 @@ impl LlmClient for OpenAiClient {
                 let chunk = chunk.map_err(|_| LlmError::ConnectionReset)?;
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
+                let chunk_yielded = std::cell::Cell::new(false);
+                let mut chunk_consumed_line = false;
                 while let Some(newline_pos) = buffer.find('\n') {
+                    chunk_consumed_line = true;
                     let line = buffer[..newline_pos].trim();
                     if line == "data: [DONE]" {
                         buffer.drain(..=newline_pos);
@@ -2236,6 +2239,7 @@ impl LlmClient for OpenAiClient {
                             } else {
                                 StopReason::ToolUse
                             };
+                            chunk_yielded.set(true);
                             yield LlmEvent::Done {
                                 outcome: LlmDoneOutcome::Success { stop_reason },
                             };
@@ -2272,6 +2276,7 @@ impl LlmClient for OpenAiClient {
                             }
                             if event.response.is_none() {
                                 done_emitted = true;
+                                chunk_yielded.set(true);
                                 yield LlmEvent::Done {
                                     outcome: missing_terminal_response_outcome(&event.event_type),
                                 };
@@ -2283,6 +2288,7 @@ impl LlmClient for OpenAiClient {
                                     response_obj,
                                 ) {
                                     done_emitted = true;
+                                    chunk_yielded.set(true);
                                     yield LlmEvent::Done {
                                         outcome: LlmDoneOutcome::Error { error },
                                     };
@@ -2304,6 +2310,7 @@ impl LlmClient for OpenAiClient {
                                                                             .get("annotations")
                                                                             .and_then(web_search_message_annotations)
                                                                         {
+                                                                            chunk_yielded.set(true);
                                                                             yield LlmEvent::ServerToolContent {
                                                                                 id: item.get("id")
                                                                                     .and_then(|v| v.as_str())
@@ -2322,6 +2329,7 @@ impl LlmClient for OpenAiClient {
                                                                             let meta = openai_response_meta(active_response_id.as_deref());
                                                                             saw_terminal_fallback_output = true;
                                                                             assembler.on_text_delta(text, meta.clone());
+                                                                            chunk_yielded.set(true);
                                                                             yield LlmEvent::TextDelta { delta: text.to_string(), meta };
                                                                         }
                                                                     }
@@ -2332,6 +2340,7 @@ impl LlmClient for OpenAiClient {
                                                                             let meta = openai_response_meta(active_response_id.as_deref());
                                                                             saw_terminal_fallback_output = true;
                                                                             assembler.on_text_delta(refusal, meta.clone());
+                                                                            chunk_yielded.set(true);
                                                                             yield LlmEvent::TextDelta { delta: refusal.to_string(), meta };
                                                                         }
                                                                     }
@@ -2388,6 +2397,7 @@ impl LlmClient for OpenAiClient {
                                                     }
                                                     assembler.on_reasoning_complete(meta.clone());
 
+                                                    chunk_yielded.set(true);
                                                     yield LlmEvent::ReasoningComplete {
                                                         text: summary_text,
                                                         meta,
@@ -2427,6 +2437,7 @@ impl LlmClient for OpenAiClient {
                                                         openai_response_meta(active_response_id.as_deref()),
                                                     );
 
+                                                    chunk_yielded.set(true);
                                                     yield LlmEvent::ToolCallComplete {
                                                         id: call_id.to_string(),
                                                         name: name.into(),
@@ -2443,6 +2454,7 @@ impl LlmClient for OpenAiClient {
                                                     // Sub-event discriminator (`web_search_call`
                                                     // vs `web_search_result`) is preserved in
                                                     // `content["type"]`; the semantic kind is web search.
+                                                    chunk_yielded.set(true);
                                                     yield LlmEvent::ServerToolContent {
                                                         id,
                                                         kind: ServerToolKind::WebSearch,
@@ -2459,6 +2471,7 @@ impl LlmClient for OpenAiClient {
                                 // Extract usage
                                 if let Some(usage_obj) = response_obj.get("usage") {
                                     apply_responses_usage(&mut usage, usage_obj, &request.model);
+                                    chunk_yielded.set(true);
                                     yield LlmEvent::UsageUpdate {
                                         usage: meerkat_core::TurnUsage::try_from_usage(usage.clone())
                                             .map_err(|error| LlmError::Unknown {
@@ -2468,6 +2481,7 @@ impl LlmClient for OpenAiClient {
                                 }
 
                                 done_emitted = true;
+                                chunk_yielded.set(true);
                                 yield LlmEvent::Done {
                                     outcome: responses_terminal_outcome(
                                         &event.event_type,
@@ -2498,6 +2512,7 @@ impl LlmClient for OpenAiClient {
                                 saw_terminal_fallback_output = true;
                                 let meta = openai_response_meta(active_response_id.as_deref());
                                 assembler.on_text_delta(delta, meta.clone());
+                                chunk_yielded.set(true);
                                 yield LlmEvent::TextDelta { delta: delta.clone(), meta };
                             }
                         }
@@ -2506,6 +2521,7 @@ impl LlmClient for OpenAiClient {
                                 if !delta.trim().is_empty() {
                                     saw_terminal_fallback_output = true;
                                 }
+                                chunk_yielded.set(true);
                                 yield LlmEvent::ReasoningDelta { delta: delta.clone() };
                             }
                         }
@@ -2526,6 +2542,7 @@ impl LlmClient for OpenAiClient {
                                     .name
                                     .clone()
                                     .or_else(|| item_lookup.map(|(_, name)| name.clone()));
+                                chunk_yielded.set(true);
                                 yield LlmEvent::ToolCallDelta {
                                     id: call_id.clone(),
                                     name,
@@ -2564,6 +2581,7 @@ impl LlmClient for OpenAiClient {
 
                                 streamed_tool_ids.insert(call_id.clone());
                                 saw_terminal_fallback_output = true;
+                                chunk_yielded.set(true);
                                 yield LlmEvent::ToolCallComplete {
                                     id: call_id.clone(),
                                     name,
@@ -2608,6 +2626,7 @@ impl LlmClient for OpenAiClient {
 
                                 streamed_tool_ids.insert(call_id.to_string());
                                 saw_terminal_fallback_output = true;
+                                chunk_yielded.set(true);
                                 yield LlmEvent::ToolCallComplete {
                                     id: call_id.to_string(),
                                     name: name.to_string(),
@@ -2662,6 +2681,7 @@ impl LlmClient for OpenAiClient {
                                 if !summary_text.trim().is_empty() || meta.is_some() {
                                     saw_terminal_fallback_output = true;
                                 }
+                                chunk_yielded.set(true);
                                 yield LlmEvent::ReasoningComplete {
                                     text: summary_text,
                                     meta,
@@ -2680,6 +2700,7 @@ impl LlmClient for OpenAiClient {
                             if let Some(sequence_number) = event.sequence_number {
                                 content.insert("sequence_number".to_string(), Value::from(sequence_number));
                             }
+                            chunk_yielded.set(true);
                             yield LlmEvent::ServerToolContent {
                                 id: event.item_id.clone(),
                                 kind: ServerToolKind::WebSearch,
@@ -2691,6 +2712,7 @@ impl LlmClient for OpenAiClient {
                             // Final done event — always update usage
                             if event.response.is_none() {
                                 done_emitted = true;
+                                chunk_yielded.set(true);
                                 yield LlmEvent::Done {
                                     outcome: missing_terminal_response_outcome(&event.event_type),
                                 };
@@ -2702,6 +2724,7 @@ impl LlmClient for OpenAiClient {
                                     response_obj,
                                 ) {
                                     done_emitted = true;
+                                    chunk_yielded.set(true);
                                     yield LlmEvent::Done {
                                         outcome: LlmDoneOutcome::Error { error },
                                     };
@@ -2709,6 +2732,7 @@ impl LlmClient for OpenAiClient {
                                 }
                                 if let Some(usage_obj) = response_obj.get("usage") {
                                     apply_responses_usage(&mut usage, usage_obj, &request.model);
+                                    chunk_yielded.set(true);
                                     yield LlmEvent::UsageUpdate {
                                         usage: meerkat_core::TurnUsage::try_from_usage(usage.clone())
                                             .map_err(|error| LlmError::Unknown {
@@ -2719,6 +2743,7 @@ impl LlmClient for OpenAiClient {
 
                                 if !done_emitted {
                                     done_emitted = true;
+                                    chunk_yielded.set(true);
                                     yield LlmEvent::Done {
                                         outcome: responses_terminal_outcome(
                                             &event.event_type,
@@ -2777,6 +2802,7 @@ impl LlmClient for OpenAiClient {
                             };
 
                             done_emitted = true;
+                            chunk_yielded.set(true);
                             yield LlmEvent::Done {
                                 outcome: LlmDoneOutcome::Error { error },
                             };
@@ -2823,11 +2849,19 @@ impl LlmClient for OpenAiClient {
                             };
 
                             done_emitted = true;
+                            chunk_yielded.set(true);
                             yield LlmEvent::Done {
                                 outcome: LlmDoneOutcome::Error { error },
                             };
                         }
                     }
+                }
+                // A chunk whose lines produced no semantic event is still wire
+                // liveness (keepalive comments, lifecycle bookkeeping); surface
+                // it so the stream-inactivity watchdog re-arms. Bytes that never
+                // complete a line intentionally do not count.
+                if chunk_consumed_line && !chunk_yielded.get() {
+                    yield LlmEvent::WireLiveness;
                 }
             }
         });
@@ -3475,6 +3509,37 @@ mod tests {
         let app = Router::new()
             .route("/v1/responses", post(responses_sse))
             .with_state(payload);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Serves each element of `chunks` as a separate paced HTTP body chunk so
+    /// tests can pin per-chunk wire behavior (lifecycle-only chunks etc.).
+    async fn paced_responses_sse(State(chunks): State<Vec<String>>) -> impl IntoResponse {
+        let body_stream = async_stream::stream! {
+            for chunk in chunks {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(chunk));
+            }
+        };
+        (
+            [("content-type", "text/event-stream")],
+            axum::body::Body::from_stream(body_stream),
+        )
+    }
+
+    async fn spawn_openai_paced_sse_server(
+        chunks: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/v1/responses", post(paced_responses_sse))
+            .with_state(chunks);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");
@@ -6078,6 +6143,61 @@ mod tests {
         server.abort();
 
         assert_eq!(deltas, vec!["Hello"]);
+    }
+
+    /// Watchdog liveness regression: Responses lifecycle events with no
+    /// yielding handler (response.created, response.in_progress,
+    /// response.output_item.added) plus SSE keepalive comments are real wire
+    /// traffic. A chunk made only of them must surface as `WireLiveness` so a
+    /// long reasoning-only stretch does not trip the inactivity watchdog.
+    #[tokio::test]
+    async fn stream_emits_wire_liveness_for_lifecycle_only_chunks() {
+        let chunks = vec![
+            concat!(
+                "data: {\"type\":\"response.created\",",
+                "\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+                "data: {\"type\":\"response.in_progress\",",
+                "\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
+                "\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
+                ": keepalive\n\n"
+            )
+            .to_string(),
+            concat!(
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+                "\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string(),
+        ];
+        let (base_url, server) = spawn_openai_paced_sse_server(chunks).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5.6-terra",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut liveness_before_done = 0usize;
+        let mut saw_done = false;
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::WireLiveness => {
+                    if !saw_done {
+                        liveness_before_done += 1;
+                    }
+                }
+                LlmEvent::Done { .. } => saw_done = true,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert!(saw_done, "stream must still terminate with Done");
+        assert!(
+            liveness_before_done >= 1,
+            "a lifecycle-only chunk must surface wire liveness before the terminal event"
+        );
     }
 
     #[tokio::test]

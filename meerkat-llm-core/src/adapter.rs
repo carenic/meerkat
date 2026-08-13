@@ -471,6 +471,11 @@ impl AgentLlmClient for LlmClientAdapter {
                     LlmEvent::UsageUpdate { usage: u } => {
                         usage = self.project_wildcard_host_declared_usage(u).into_inner();
                     }
+                    LlmEvent::WireLiveness => {
+                        // Liveness is already recorded by the per-item activity
+                        // bump above; it is not output and must not reach the
+                        // assembler, taps, or visible-output observation.
+                    }
                     LlmEvent::Done { outcome } => match outcome {
                         LlmDoneOutcome::Success { stop_reason: sr } => {
                             stop_reason = sr;
@@ -1043,6 +1048,58 @@ mod tests {
             .ok_or_else(|| "adapter must report stream liveness".to_string())?;
 
         assert_eq!(after - before, 3, "each raw event bumps the counter once");
+        Ok(())
+    }
+
+    /// Wire liveness is a watchdog signal only: it must bump the activity
+    /// counter (the agent loop re-arms the stall window from it) while
+    /// producing no blocks and no visible stream output.
+    #[tokio::test]
+    async fn adapter_counts_wire_liveness_as_activity_without_output() -> Result<(), String> {
+        let adapter = LlmClientAdapter::new(
+            Arc::new(ScriptedClient {
+                events: vec![
+                    Ok(LlmEvent::WireLiveness),
+                    Ok(LlmEvent::WireLiveness),
+                    Ok(LlmEvent::WireLiveness),
+                    Ok(LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Success {
+                            stop_reason: StopReason::EndTurn,
+                        },
+                    }),
+                ],
+            }),
+            "scripted-model".to_string(),
+        );
+
+        let before = adapter
+            .stream_activity_count()
+            .ok_or_else(|| "adapter must report stream liveness".to_string())?;
+        adapter.begin_stream_output_observation();
+        let result = adapter
+            .stream_response(
+                &[Message::User(UserMessage::text("keepalives only"))],
+                &[],
+                1024,
+                None,
+                None,
+            )
+            .await
+            .map_err(|err| format!("stream response failed: {err}"))?;
+        let after = adapter
+            .stream_activity_count()
+            .ok_or_else(|| "adapter must report stream liveness".to_string())?;
+
+        assert_eq!(
+            after - before,
+            4,
+            "every WireLiveness item re-arms the watchdog counter"
+        );
+        assert!(result.blocks().is_empty(), "liveness is not output");
+        assert!(
+            !adapter.stream_output_observed(),
+            "liveness must not count as visible stream output"
+        );
         Ok(())
     }
 

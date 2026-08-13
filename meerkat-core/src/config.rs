@@ -509,6 +509,10 @@ impl Config {
         if other.call_timeout_override != defaults.call_timeout_override {
             self.retry.call_timeout_override = other.call_timeout_override.clone();
         }
+        if other.stream_inactivity_timeout_override != defaults.stream_inactivity_timeout_override {
+            self.retry.stream_inactivity_timeout_override =
+                other.stream_inactivity_timeout_override.clone();
+        }
     }
 
     fn merge_tools(&mut self, other: &ToolsConfig) {
@@ -614,6 +618,10 @@ impl Config {
         }
         if retry.contains_key("call_timeout") {
             self.retry.call_timeout_override = layer.call_timeout_override.clone();
+        }
+        if retry.contains_key("stream_inactivity_timeout") {
+            self.retry.stream_inactivity_timeout_override =
+                layer.stream_inactivity_timeout_override.clone();
         }
     }
 
@@ -2135,7 +2143,7 @@ impl JsonSchema for SystemPromptOverride {
 }
 
 /// Retry configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts
@@ -4303,6 +4311,68 @@ call_timeout = "30s"
             config.retry.call_timeout_override,
             CallTimeoutOverride::Value(Duration::from_secs(30))
         );
+    }
+
+    /// A layered `[retry] stream_inactivity_timeout` must survive the file
+    /// merge path (`merge_toml_str`), not just direct deserialization, and
+    /// resolve into the effective `RetryPolicy`.
+    #[test]
+    fn config_merge_toml_str_applies_stream_inactivity_timeout() {
+        let mut config = Config::default();
+        config
+            .merge_toml_str("[retry]\nstream_inactivity_timeout = \"disabled\"\n")
+            .unwrap();
+        assert_eq!(
+            config.retry.stream_inactivity_timeout_override,
+            CallTimeoutOverride::Disabled
+        );
+        let policy: crate::retry::RetryPolicy = config.retry.into();
+        assert_eq!(policy.stream_inactivity_timeout, None);
+    }
+
+    #[test]
+    fn config_merge_preserves_stream_inactivity_timeout_override() {
+        let toml_base = r"
+[retry]
+max_retries = 2
+";
+        let toml_overlay = r#"
+[retry]
+stream_inactivity_timeout = "2m"
+"#;
+        let mut config: Config = toml::from_str(toml_base).unwrap();
+        let overlay: Config = toml::from_str(toml_overlay).unwrap();
+        let overlay_parsed: toml::Value = toml::from_str(toml_overlay).unwrap();
+        config.merge_retry_from_toml_presence(&overlay_parsed, &overlay.retry);
+        assert_eq!(config.retry.max_retries, 2); // Not overridden
+        assert_eq!(
+            config.retry.stream_inactivity_timeout_override,
+            CallTimeoutOverride::Value(Duration::from_secs(120))
+        );
+    }
+
+    /// Pins the whole class of forgotten-field retry merges: every
+    /// `RetryConfig` field is set to a non-default value with no
+    /// `..Default::default()`, so adding a field forces this constructor to
+    /// name it, and a merge seam that drops the field fails the round-trip
+    /// equality below.
+    #[test]
+    fn retry_config_full_overlay_survives_merge_toml_str() {
+        let overlay = RetryConfig {
+            max_retries: 9,
+            initial_delay: Duration::from_millis(123),
+            max_delay: Duration::from_secs(77),
+            multiplier: 3.5,
+            call_timeout_override: CallTimeoutOverride::Value(Duration::from_secs(31)),
+            stream_inactivity_timeout_override: CallTimeoutOverride::Value(Duration::from_secs(41)),
+        };
+        let overlay_toml = format!(
+            "[retry]\n{}",
+            toml::to_string(&overlay).expect("retry config serializes")
+        );
+        let mut merged = Config::default();
+        merged.merge_toml_str(&overlay_toml).unwrap();
+        assert_eq!(merged.retry, overlay);
     }
 
     // ---- Provider tools config tests ----

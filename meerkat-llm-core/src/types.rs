@@ -400,6 +400,14 @@ pub enum LlmEvent {
     /// Token usage update
     UsageUpdate { usage: meerkat_core::TurnUsage },
 
+    /// Wire-level liveness: the provider connection delivered at least one
+    /// complete line that produced no other event (SSE keepalive comments,
+    /// `event:` lines, ping/lifecycle bookkeeping). Carries no content; its
+    /// only effect is bumping the adapter's stream-activity counter so the
+    /// inactivity watchdog does not classify a working wire as stalled.
+    /// Providers emit at most one per received HTTP chunk.
+    WireLiveness,
+
     /// Stream completed with stop reason
     Done {
         #[serde(flatten)]
