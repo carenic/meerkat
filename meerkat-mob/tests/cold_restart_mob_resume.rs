@@ -19,6 +19,7 @@ use meerkat::{
     AgentFactory, Config, FactoryAgentBuilder, SessionHistoryQuery, SessionServiceControlExt,
     SessionStore,
 };
+#[cfg(feature = "test-support")]
 use meerkat_core::session_store::IncrementalSessionStore as _;
 use meerkat_core::types::HandlingMode;
 use meerkat_core::{CommsCommand, PeerRoute, SendReceipt};
@@ -38,6 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::time::{Duration, Instant, sleep};
 
+#[cfg(feature = "test-support")]
 use support::FailingOnceSessionService;
 
 fn openai_test_client() -> Arc<meerkat_client::TestClient> {
@@ -1055,6 +1057,7 @@ struct PowerCutRuntimeStore {
     cut: std::sync::atomic::AtomicBool,
     prepared_boundary_commit_rejections: std::sync::atomic::AtomicUsize,
     legacy_boundary_commit_rejections: std::sync::atomic::AtomicUsize,
+    prepared_boundary_commit_rejected: tokio::sync::Notify,
 }
 
 impl PowerCutRuntimeStore {
@@ -1065,6 +1068,7 @@ impl PowerCutRuntimeStore {
             cut: std::sync::atomic::AtomicBool::new(false),
             prepared_boundary_commit_rejections: std::sync::atomic::AtomicUsize::new(0),
             legacy_boundary_commit_rejections: std::sync::atomic::AtomicUsize::new(0),
+            prepared_boundary_commit_rejected: tokio::sync::Notify::new(),
         }
     }
 
@@ -1081,6 +1085,7 @@ impl PowerCutRuntimeStore {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    #[cfg(feature = "test-support")]
     fn legacy_boundary_commit_rejections(&self) -> usize {
         self.legacy_boundary_commit_rejections
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -1089,6 +1094,17 @@ impl PowerCutRuntimeStore {
     fn record_prepared_boundary_commit_rejection(&self) {
         self.prepared_boundary_commit_rejections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.prepared_boundary_commit_rejected.notify_waiters();
+    }
+
+    async fn wait_for_prepared_boundary_commit_rejection(&self) {
+        loop {
+            let notified = self.prepared_boundary_commit_rejected.notified();
+            if self.prepared_boundary_commit_rejections() > 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn record_legacy_boundary_commit_rejection(&self) {
@@ -1789,6 +1805,7 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
     }
 }
 
+#[cfg(feature = "test-support")]
 async fn wait_for_row_contains(
     store: &dyn SessionStore,
     session_id: &meerkat::SessionId,
@@ -1816,6 +1833,7 @@ async fn wait_for_row_contains(
     }
 }
 
+#[cfg(feature = "test-support")]
 async fn wait_for_head_canonical_authority_convergence(
     store: &SqliteSessionStore,
     runtime_store: &dyn meerkat_runtime::RuntimeStore,
@@ -2174,4 +2192,146 @@ async fn mob_cold_restart_resume_after_kill_between_commit_points() {
         "durable tail must remain ordered before fresh post-restart work: {w1_final}"
     );
     assert_member_active(&member_entry(&handle_2, "w-1").await, "kill-window-final");
+}
+
+/// A completed-boundary store failure leaves the live runtime shell in
+/// ReloadRequired with its exact run still bound. Ordinary Mob retirement must
+/// dispose only that degraded shell, cold-register durable authority, and then
+/// execute the normal Retired/archive/unregister protocol. Routing this case
+/// through ready-gated cancel reproduces the production retirement wedge.
+#[tokio::test(flavor = "multi_thread")]
+async fn mob_retirement_recovers_reload_required_runtime_before_normal_archive() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+    let (service, _session_store) =
+        persistent_head_canonical_service(&paths, runtime_store.clone());
+    let storage = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage)
+        .with_session_service(service.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+
+    let identity = AgentIdentity::from("reload-required-worker");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("worker", identity.clone()))
+        .await
+        .expect("spawn reload-required worker");
+    let session_id = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("reload-required worker session id");
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+    let adapter = service
+        .runtime_adapter()
+        .expect("persistent session service exposes its runtime adapter");
+    let old_registration = adapter
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("spawned member has an exact runtime registration");
+
+    send_and_wait(
+        &handle,
+        service.as_ref(),
+        identity.as_str(),
+        "PRE_DEGRADED_RETIREMENT token-alpha",
+        "reload-required-retirement-baseline",
+    )
+    .await;
+
+    power_store.set_cut(true);
+    let member = handle
+        .member(&identity)
+        .await
+        .expect("reload-required member handle");
+    let failed_turn = tokio::spawn(async move {
+        member
+            .send(
+                "FAILED_BOUNDARY_RETIREMENT token-omega".to_string(),
+                HandlingMode::Queue,
+            )
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        power_store.wait_for_prepared_boundary_commit_rejection(),
+    )
+    .await
+    .expect("real prepared boundary failure must occur before retirement");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if !adapter
+                .session_has_live_executor_attachment(&session_id)
+                .await
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed boundary runtime loop must quiesce before retirement");
+    tokio::time::timeout(Duration::from_secs(30), failed_turn)
+        .await
+        .expect("faulted turn admission task must finish")
+        .expect("faulted turn admission task must not panic")
+        .expect("the fault must occur after exact turn admission");
+    let degraded = adapter
+        .meerkat_machine_archive_snapshot(&session_id)
+        .await
+        .expect("ReloadRequired shell remains registered before retirement");
+    assert!(
+        degraded.control.current_run_id.is_some(),
+        "the regression must retain the exact stale run that ready-gated cancel cannot clear"
+    );
+
+    power_store.set_cut(false);
+    tokio::time::timeout(Duration::from_secs(30), handle.retire(identity.clone()))
+        .await
+        .expect("ReloadRequired retirement must not wedge at actor_retirement_saga")
+        .expect("ReloadRequired retirement must converge through normal archive");
+
+    assert!(
+        handle
+            .list_members_including_retiring()
+            .await
+            .into_iter()
+            .all(|entry| entry.agent_identity != identity.as_str()),
+        "normal retirement must remove the member from the roster"
+    );
+    assert!(
+        !adapter.contains_session(&session_id).await,
+        "normal retirement must unregister the cold successor after durable Retired"
+    );
+    assert_eq!(
+        adapter
+            .recover_or_discard_reload_required_registration_if_current(&old_registration)
+            .await
+            .expect("stale degraded witness is an idempotent observation"),
+        meerkat_runtime::ReloadRequiredRegistrationDisposition::NotCurrent,
+        "the old degraded witness must not touch the retired successor"
+    );
+    assert_eq!(
+        meerkat_runtime::store::load_runtime_state(runtime_store.as_ref(), &runtime_id)
+            .await
+            .expect("load durable runtime state after recovery retirement"),
+        Some(meerkat_runtime::RuntimeState::Retired),
+        "Discarded is not retirement: the cold successor must publish durable Retired"
+    );
+    let archived = service
+        .load_revivable_retired_session(&session_id)
+        .await
+        .expect("read explicitly revivable retired session")
+        .expect("normal archive must retain the retired session");
+    let history = to_string(archived.messages()).expect("serialize retired transcript");
+    for token in ["PRE_DEGRADED_RETIREMENT", "FAILED_BOUNDARY_RETIREMENT"] {
+        assert_eq!(
+            history.matches(token).count(),
+            1,
+            "durable recovery and retirement must retain exactly one '{token}': {history}"
+        );
+    }
 }

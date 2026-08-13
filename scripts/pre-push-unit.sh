@@ -51,6 +51,10 @@ require_exact_clean_head() {
     echo "Push the checked-out branch alone, or validate the other ref from its own clean checkout." >&2
     return 1
   fi
+  # Earlier push-stage hooks may rewrite generated files byte-identical,
+  # leaving a stale index stat entry; refresh so the clean gate judges
+  # content, not mtimes.
+  "$GIT_BIN" update-index -q --refresh || true
   if ! worktree_status="$("$GIT_BIN" status --porcelain=v1 --untracked-files=all)"; then
     echo "Failed to determine whether the exact pushed worktree is clean." >&2
     return 1

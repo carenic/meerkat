@@ -3584,6 +3584,15 @@ impl Session {
     /// and the typed [`TranscriptEditError`] propagates — callers must not
     /// re-implement the strip-then-push pair (the swallowed-strip variant
     /// leaves a stale notice beside a fresh one: a divergence window).
+    ///
+    /// A synthetic notice bound into a store-witnessed exact durable-row
+    /// boundary is durable: incremental HeadCanonical persistence can only
+    /// append after that boundary, so stripping inside it would make the live
+    /// transcript unrepresentable and wedge the next intra-turn checkpoint
+    /// with a continuity error. Such notices are retained in place; the
+    /// refresh strips and appends only at or beyond the boundary. Sessions
+    /// without a boundary witness keep the full strip, which whole-document
+    /// save guards accept through the synthetic-refresh relaxation.
     pub fn replace_synthetic_notices(
         &mut self,
         kind: crate::types::SystemNoticeKind,
@@ -3646,16 +3655,60 @@ impl Session {
             return Ok(());
         }
 
-        let lowest_mutated_index = self
+        // Committed-boundary durability: rows below the live store-witnessed
+        // exact durable-row boundary are retained even when they are synthetic
+        // refresh projections (see the method doc). Only rows at or beyond the
+        // boundary participate in the strip.
+        let committed_boundary_len = self
             .messages
+            .committed_row_prefix_count()
+            .map(|count| usize::try_from(count).unwrap_or(usize::MAX))
+            .unwrap_or(0)
+            .min(self.messages.len());
+        let lowest_mutated_index = self.messages[committed_boundary_len..]
             .iter()
             .position(&is_refresh_notice)
-            .unwrap_or(self.messages.len());
+            .map_or(self.messages.len(), |offset| {
+                committed_boundary_len + offset
+            });
+        if lowest_mutated_index == self.messages.len() && replacements.is_empty() {
+            // Every notice of the kind (if any) sits inside the committed
+            // boundary and nothing is appended: retention is a no-op.
+            return Ok(());
+        }
+        if lowest_mutated_index == self.messages.len() {
+            // Nothing is strippable, so an append is the only candidate
+            // mutation. When the most recent retained notices of the kind
+            // already state exactly the replacement facts, appending
+            // canonical duplicates once per refresh would grow the transcript
+            // without new signal; treat that as a no-op too.
+            let mut retained_matching = self
+                .messages
+                .iter()
+                .filter(|message| is_refresh_notice(message))
+                .rev()
+                .take(replacements.len())
+                .collect::<Vec<_>>();
+            retained_matching.reverse();
+            if retained_matching.len() == replacements.len()
+                && retained_matching.iter().zip(replacements.iter()).all(
+                    |(existing, replacement)| {
+                        canonicalize_message_for_digest(existing)
+                            == canonicalize_message_for_digest(replacement)
+                    },
+                )
+            {
+                return Ok(());
+            }
+        }
         let mut refreshed = self
             .messages
             .iter()
-            .filter(|message| !is_refresh_notice(message))
-            .cloned()
+            .enumerate()
+            .filter(|(index, message)| {
+                *index < committed_boundary_len || !is_refresh_notice(message)
+            })
+            .map(|(_, message)| message.clone())
             .collect::<Vec<_>>();
         refreshed.extend(replacements);
         let realtime_rebase = self.prepare_realtime_transcript_rebase_after_rewrite(
@@ -3687,7 +3740,8 @@ impl Session {
         }
         let updated_at = SystemTime::now();
         if lowest_mutated_index == self.messages.len() {
-            // No prior notice existed: this is an exact append, so preserve
+            // No strippable notice existed (none at all, or only retained
+            // committed-boundary ones): this is an exact append, so preserve
             // the live digest and row-lineage accumulators as an append.
             let appended = refreshed.split_off(lowest_mutated_index);
             self.messages.extend_batch(appended);
@@ -4495,6 +4549,29 @@ impl Session {
         self.history_caches
             .head_canonical_metadata
             .acknowledge(projection, &self.metadata)
+    }
+
+    /// Adopt one store-committed sticky-fallback control transition as this
+    /// actor's HeadCanonical preparation baseline.
+    ///
+    /// The durable coordinator applied the identical typed control delta
+    /// (LLM identity + tool visibility) to the identical committed parent, so
+    /// this actor's live values for exactly those keys, applied to its
+    /// current baseline, must hash to the committed boundary identity; any
+    /// divergence fails closed. Mid-turn mutation intent for every other key
+    /// is retained, so the next boundary preparation extends the committed
+    /// control boundary instead of its superseded predecessor.
+    pub fn acknowledge_head_canonical_control_metadata(
+        &mut self,
+        committed: &SessionHeadMetadataIdentity,
+    ) -> Result<(), String> {
+        self.history_caches
+            .head_canonical_metadata
+            .rebase_control_commit_baseline(
+                &[SESSION_METADATA_KEY, SESSION_TOOL_VISIBILITY_STATE_KEY],
+                &self.metadata,
+                committed,
+            )
     }
 
     pub(crate) fn validate_head_canonical_metadata_acknowledgement(
@@ -8926,6 +9003,107 @@ mod tests {
             .expect("synthetic refresh beside durable fact");
 
         assert_eq!(session.messages(), &[durable, fresh]);
+    }
+
+    #[test]
+    fn replace_synthetic_notices_retains_notices_inside_committed_row_boundary() {
+        use crate::types::{SystemNoticeKind, SystemNoticeMessage};
+
+        let stale = Message::SystemNotice(SystemNoticeMessage::new(
+            SystemNoticeKind::McpPending,
+            "stale inside boundary",
+        ));
+        let fresh = Message::SystemNotice(SystemNoticeMessage::new(
+            SystemNoticeKind::McpPending,
+            "fresh projection",
+        ));
+
+        // With a store-witnessed committed boundary covering the notice, the
+        // refresh retains it and appends only the replacement.
+        let mut committed = Session::new();
+        committed.push(Message::User(UserMessage::text("before".to_string())));
+        committed.push(stale.clone());
+        committed.push(Message::User(UserMessage::text("after".to_string())));
+        let boundary =
+            crate::SessionMessageRowPrefixAccumulator::from_messages(committed.messages())
+                .expect("boundary prefix");
+        assert!(committed.install_exact_message_row_prefix(boundary));
+        committed
+            .replace_synthetic_notices(SystemNoticeKind::McpPending, Vec::new())
+            .expect("empty refresh over a committed notice");
+        assert_eq!(
+            committed.messages().len(),
+            3,
+            "empty refresh retains the committed notice untouched"
+        );
+        assert!(
+            committed.exact_message_row_prefix_at(3).is_some(),
+            "the committed boundary witness survives the retention no-op"
+        );
+        committed
+            .replace_synthetic_notices(SystemNoticeKind::McpPending, vec![fresh.clone()])
+            .expect("refresh with replacement");
+        assert_eq!(committed.messages().len(), 4);
+        assert_eq!(&committed.messages()[1], &stale);
+        assert_eq!(&committed.messages()[3], &fresh);
+        assert!(
+            committed.exact_message_row_prefix_at(3).is_some(),
+            "the committed boundary witness survives the tail append"
+        );
+
+        // Commit the tail notice too, then re-state the same fact: canonical
+        // duplicate appends are suppressed, and clearing is a no-op.
+        let extended =
+            crate::SessionMessageRowPrefixAccumulator::from_messages(committed.messages())
+                .expect("extended boundary prefix");
+        assert!(committed.install_exact_message_row_prefix(extended));
+        committed
+            .replace_synthetic_notices(
+                SystemNoticeKind::McpPending,
+                vec![Message::SystemNotice(SystemNoticeMessage::new(
+                    SystemNoticeKind::McpPending,
+                    "fresh projection",
+                ))],
+            )
+            .expect("re-stated fact over a fully committed transcript");
+        assert_eq!(
+            committed.messages().len(),
+            4,
+            "a canonical duplicate of the retained fact must not append"
+        );
+        committed
+            .replace_synthetic_notices(SystemNoticeKind::McpPending, Vec::new())
+            .expect("clearing refresh over fully committed notices");
+        assert_eq!(committed.messages().len(), 4);
+        committed
+            .replace_synthetic_notices(
+                SystemNoticeKind::McpPending,
+                vec![Message::SystemNotice(SystemNoticeMessage::new(
+                    SystemNoticeKind::McpPending,
+                    "changed fact",
+                ))],
+            )
+            .expect("changed fact over a fully committed transcript");
+        assert_eq!(
+            committed.messages().len(),
+            5,
+            "a genuinely new fact still appends at the tail"
+        );
+
+        // Without a committed boundary witness the strip keeps today's shape.
+        let mut plain = Session::new();
+        plain.push(Message::User(UserMessage::text("before".to_string())));
+        plain.push(stale);
+        plain.push(Message::User(UserMessage::text("after".to_string())));
+        plain
+            .replace_synthetic_notices(SystemNoticeKind::McpPending, vec![fresh.clone()])
+            .expect("refresh without a committed boundary witness");
+        assert_eq!(plain.messages().len(), 3);
+        assert!(
+            !matches!(&plain.messages()[1], Message::SystemNotice(_)),
+            "without a committed witness the stale notice is stripped"
+        );
+        assert_eq!(&plain.messages()[2], &fresh);
     }
 
     #[test]

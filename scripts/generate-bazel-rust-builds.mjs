@@ -572,6 +572,18 @@ const nativeE2eSystemTests = [
   },
   {
     packageKey: "meerkat-cli",
+    cargoTestTarget: "system_cli_mcp_pending",
+    name: "e2e_system_cli_mcp_pending_resume_bazel_test",
+    testName: "integration_real_cli_mcp_pending_resume_journey",
+  },
+  {
+    packageKey: "meerkat-cli",
+    cargoTestTarget: "system_cli_export_atif",
+    name: "e2e_system_cli_export_atif_bazel_test",
+    testName: "integration_real_cli_export_atif",
+  },
+  {
+    packageKey: "meerkat-cli",
     cargoTestTarget: "system_mob_host_daemon",
     name: "e2e_system_mob_host_daemon_lifecycle_bazel_test",
     testName: "integration_real_mob_host_daemon_lifecycle",
@@ -581,6 +593,18 @@ const nativeE2eSystemTests = [
     cargoTestTarget: "system_mob_cli_verbs",
     name: "e2e_system_mob_cli_verbs_over_tcp_bazel_test",
     testName: "integration_real_mob_cli_verbs_over_tcp",
+  },
+  {
+    packageKey: "meerkat-cli",
+    cargoTestTarget: "system_mob_run_custody",
+    name: "e2e_system_mob_run_pack_sigterm_custody_bazel_test",
+    testName: "integration_real_mob_run_pack_sigterm_converges_to_durable_canceled",
+  },
+  {
+    packageKey: "meerkat-cli",
+    cargoTestTarget: "system_mob_run_custody",
+    name: "e2e_system_mob_run_detach_custody_lost_bazel_test",
+    testName: "integration_real_mob_run_detach_converges_execution_custody_lost",
   },
   {
     packageKey: "meerkat-cli",

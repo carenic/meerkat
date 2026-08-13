@@ -4111,6 +4111,7 @@ async fn handle_meerkat_run(
                 custom_models: std::collections::BTreeMap::new(),
                 image_generation_provider: None,
                 auto_compact_threshold_override: None,
+                compaction_curator_override: None,
                 provider: Some(model_resolution.provider),
                 override_comms: Default::default(),
                 self_hosted_server_id: None,
@@ -4531,6 +4532,7 @@ async fn handle_meerkat_resume(
             custom_models: std::collections::BTreeMap::new(),
             image_generation_provider: None,
             auto_compact_threshold_override: None,
+            compaction_curator_override: None,
             provider: llm_binding.provider,
             override_comms: Default::default(),
             self_hosted_server_id: llm_binding.self_hosted_server_id.clone(),
@@ -8141,6 +8143,7 @@ mod tests {
                         custom_models: std::collections::BTreeMap::new(),
                         image_generation_provider: None,
                         auto_compact_threshold_override: None,
+                        compaction_curator_override: None,
                         resume_session: Some(pre_session),
                         external_tools: Some(router_tools),
                         llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
@@ -8281,6 +8284,7 @@ mod tests {
                         custom_models: std::collections::BTreeMap::new(),
                         image_generation_provider: None,
                         auto_compact_threshold_override: None,
+                        compaction_curator_override: None,
                         resume_session: Some(pre_session),
                         external_tools: Some(router_tools),
                         llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
@@ -9063,6 +9067,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
                         Arc::new(TestClient::default()),
                     )),

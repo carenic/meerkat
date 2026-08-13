@@ -849,6 +849,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `placed_kickoff_custody_requires_exact_current_placement`
 - `remote_turn_custody_sequences_are_bounded_and_injective`
 - `placed_completion_sequences_are_bounded`
+- `failed_or_canceled_runs_have_only_terminal_steps`
 
 ## Transitions
 ### `ClassifyFlowRunTerminalityTerminalRunning`

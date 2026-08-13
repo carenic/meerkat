@@ -19287,7 +19287,6 @@ ReplaceFilterToolAuthorityCatalogIdle(catalog) ==
     /\ meerkat_tool_visibility_filter_has_catalog_witnesses(active_filter, catalog, catalog)
     /\ meerkat_tool_visibility_filter_has_catalog_witnesses(staged_filter, catalog, catalog)
     /\ meerkat_tool_visibility_names_are_catalog_backed(turn_tool_overlay_allow_names, catalog)
-    /\ meerkat_tool_visibility_names_are_catalog_backed(turn_tool_overlay_deny_names, catalog)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
     /\ filter_visibility_authority_catalog' = catalog
@@ -19303,7 +19302,6 @@ ReplaceFilterToolAuthorityCatalogAttached(catalog) ==
     /\ meerkat_tool_visibility_filter_has_catalog_witnesses(active_filter, catalog, catalog)
     /\ meerkat_tool_visibility_filter_has_catalog_witnesses(staged_filter, catalog, catalog)
     /\ meerkat_tool_visibility_names_are_catalog_backed(turn_tool_overlay_allow_names, catalog)
-    /\ meerkat_tool_visibility_names_are_catalog_backed(turn_tool_overlay_deny_names, catalog)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ filter_visibility_authority_catalog' = catalog
@@ -19319,7 +19317,6 @@ ReplaceFilterToolAuthorityCatalogRunning(catalog) ==
     /\ meerkat_tool_visibility_filter_has_catalog_witnesses(active_filter, catalog, catalog)
     /\ meerkat_tool_visibility_filter_has_catalog_witnesses(staged_filter, catalog, catalog)
     /\ meerkat_tool_visibility_names_are_catalog_backed(turn_tool_overlay_allow_names, catalog)
-    /\ meerkat_tool_visibility_names_are_catalog_backed(turn_tool_overlay_deny_names, catalog)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ filter_visibility_authority_catalog' = catalog
@@ -19335,7 +19332,6 @@ ReplaceFilterToolAuthorityCatalogRetired(catalog) ==
     /\ meerkat_tool_visibility_filter_has_catalog_witnesses(active_filter, catalog, catalog)
     /\ meerkat_tool_visibility_filter_has_catalog_witnesses(staged_filter, catalog, catalog)
     /\ meerkat_tool_visibility_names_are_catalog_backed(turn_tool_overlay_allow_names, catalog)
-    /\ meerkat_tool_visibility_names_are_catalog_backed(turn_tool_overlay_deny_names, catalog)
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ filter_visibility_authority_catalog' = catalog
@@ -19351,7 +19347,6 @@ ReplaceFilterToolAuthorityCatalogStopped(catalog) ==
     /\ meerkat_tool_visibility_filter_has_catalog_witnesses(active_filter, catalog, catalog)
     /\ meerkat_tool_visibility_filter_has_catalog_witnesses(staged_filter, catalog, catalog)
     /\ meerkat_tool_visibility_names_are_catalog_backed(turn_tool_overlay_allow_names, catalog)
-    /\ meerkat_tool_visibility_names_are_catalog_backed(turn_tool_overlay_deny_names, catalog)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ filter_visibility_authority_catalog' = catalog
@@ -19628,7 +19623,6 @@ SetTurnToolOverlayIdle(allow_active, allow_names, deny_names) ==
     /\ (session_id # None)
     /\ (IF (allow_active = TRUE) THEN TRUE ELSE (allow_names = {}))
     /\ meerkat_tool_visibility_names_are_catalog_backed(allow_names, filter_visibility_authority_catalog)
-    /\ meerkat_tool_visibility_names_are_catalog_backed(deny_names, filter_visibility_authority_catalog)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
     /\ turn_tool_overlay_allow_active' = allow_active
@@ -19642,7 +19636,6 @@ SetTurnToolOverlayAttached(allow_active, allow_names, deny_names) ==
     /\ (session_id # None)
     /\ (IF (allow_active = TRUE) THEN TRUE ELSE (allow_names = {}))
     /\ meerkat_tool_visibility_names_are_catalog_backed(allow_names, filter_visibility_authority_catalog)
-    /\ meerkat_tool_visibility_names_are_catalog_backed(deny_names, filter_visibility_authority_catalog)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ turn_tool_overlay_allow_active' = allow_active
@@ -19656,7 +19649,6 @@ SetTurnToolOverlayRunning(allow_active, allow_names, deny_names) ==
     /\ (session_id # None)
     /\ (IF (allow_active = TRUE) THEN TRUE ELSE (allow_names = {}))
     /\ meerkat_tool_visibility_names_are_catalog_backed(allow_names, filter_visibility_authority_catalog)
-    /\ meerkat_tool_visibility_names_are_catalog_backed(deny_names, filter_visibility_authority_catalog)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ turn_tool_overlay_allow_active' = allow_active
@@ -19670,7 +19662,6 @@ SetTurnToolOverlayRetired(allow_active, allow_names, deny_names) ==
     /\ (session_id # None)
     /\ (IF (allow_active = TRUE) THEN TRUE ELSE (allow_names = {}))
     /\ meerkat_tool_visibility_names_are_catalog_backed(allow_names, filter_visibility_authority_catalog)
-    /\ meerkat_tool_visibility_names_are_catalog_backed(deny_names, filter_visibility_authority_catalog)
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ turn_tool_overlay_allow_active' = allow_active
@@ -19684,7 +19675,6 @@ SetTurnToolOverlayStopped(allow_active, allow_names, deny_names) ==
     /\ (session_id # None)
     /\ (IF (allow_active = TRUE) THEN TRUE ELSE (allow_names = {}))
     /\ meerkat_tool_visibility_names_are_catalog_backed(allow_names, filter_visibility_authority_catalog)
-    /\ meerkat_tool_visibility_names_are_catalog_backed(deny_names, filter_visibility_authority_catalog)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ turn_tool_overlay_allow_active' = allow_active

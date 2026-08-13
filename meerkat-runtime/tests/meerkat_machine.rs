@@ -130,7 +130,9 @@ async fn wait_for_runtime_state(
 
 struct HarnessRuntimeStore {
     inner: meerkat_runtime::store::InMemoryRuntimeStore,
-    fail_atomic_apply: bool,
+    fail_atomic_apply: AtomicBool,
+    fail_recovery_read: AtomicBool,
+    fail_durable_tail_recovery_source: AtomicBool,
     fail_commit_machine_lifecycle_now: AtomicBool,
     /// Fail commit_machine_lifecycle after N successful calls (None = never fail).
     fail_commit_machine_lifecycle_after: Option<usize>,
@@ -148,7 +150,9 @@ impl HarnessRuntimeStore {
     fn new() -> Self {
         Self {
             inner: meerkat_runtime::store::InMemoryRuntimeStore::new(),
-            fail_atomic_apply: false,
+            fail_atomic_apply: AtomicBool::new(false),
+            fail_recovery_read: AtomicBool::new(false),
+            fail_durable_tail_recovery_source: AtomicBool::new(false),
             fail_commit_machine_lifecycle_now: AtomicBool::new(false),
             fail_commit_machine_lifecycle_after: None,
             delay_commit_machine_lifecycle_after: None,
@@ -163,9 +167,22 @@ impl HarnessRuntimeStore {
 
     fn failing_atomic_apply() -> Self {
         Self {
-            fail_atomic_apply: true,
+            fail_atomic_apply: AtomicBool::new(true),
             ..Self::new()
         }
+    }
+
+    fn set_fail_atomic_apply(&self, fail: bool) {
+        self.fail_atomic_apply.store(fail, Ordering::SeqCst);
+    }
+
+    fn set_fail_recovery_read(&self, fail: bool) {
+        self.fail_recovery_read.store(fail, Ordering::SeqCst);
+    }
+
+    fn set_fail_durable_tail_recovery_source(&self, fail: bool) {
+        self.fail_durable_tail_recovery_source
+            .store(fail, Ordering::SeqCst);
     }
 
     fn delayed_recover(delay: Duration) -> Self {
@@ -250,6 +267,42 @@ impl HarnessRuntimeStore {
     }
 }
 
+struct CountingArchiveHook {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl meerkat_runtime::MachineSessionArchivePostCommitHook for CountingArchiveHook {
+    async fn after_runtime_retire_commit(
+        &self,
+    ) -> Result<(), meerkat_runtime::RuntimeControlPlaneError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct GatedArchiveHook {
+    attempts: AtomicUsize,
+    completions: AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl meerkat_runtime::MachineSessionArchivePostCommitHook for GatedArchiveHook {
+    async fn after_runtime_retire_commit(
+        &self,
+    ) -> Result<(), meerkat_runtime::RuntimeControlPlaneError> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            self.entered.notify_waiters();
+            self.release.notified().await;
+        }
+        self.completions.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl RuntimeStore for HarnessRuntimeStore {
     fn session_authority_ops(&self) -> &dyn meerkat_runtime::store::RuntimeSessionAuthorityOps {
@@ -259,7 +312,32 @@ impl RuntimeStore for HarnessRuntimeStore {
     fn session_persistence_profile(
         &self,
     ) -> meerkat_runtime::store::RuntimeSessionPersistenceProfile {
-        RuntimeStore::session_persistence_profile(&self.inner)
+        if self
+            .fail_durable_tail_recovery_source
+            .load(Ordering::SeqCst)
+        {
+            meerkat_runtime::store::RuntimeSessionPersistenceProfile::HeadCanonicalV1
+        } else {
+            RuntimeStore::session_persistence_profile(&self.inner)
+        }
+    }
+
+    async fn load_durable_tail_recovery_source(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+    ) -> Result<Option<meerkat_runtime::store::PreparedDurableTailRecoverySource>, RuntimeStoreError>
+    {
+        if self
+            .fail_durable_tail_recovery_source
+            .load(Ordering::SeqCst)
+        {
+            return Err(RuntimeStoreError::ReadFailed(
+                "synthetic durable-tail recovery source failure".to_string(),
+            ));
+        }
+        self.inner
+            .load_durable_tail_recovery_source(runtime_id)
+            .await
     }
 
     fn supports_compaction_projection_outbox(&self) -> bool {
@@ -279,7 +357,7 @@ impl RuntimeStore for HarnessRuntimeStore {
     ) -> Result<meerkat_runtime::store::PreparedRuntimeSessionCommitResult, RuntimeStoreError> {
         use meerkat_runtime::store::PreparedRuntimeSessionCommitKind;
 
-        if self.fail_atomic_apply {
+        if self.fail_atomic_apply.load(Ordering::SeqCst) {
             return Err(RuntimeStoreError::WriteFailed(
                 "synthetic atomic service-turn commit failure".to_string(),
             ));
@@ -352,7 +430,7 @@ impl RuntimeStore for HarnessRuntimeStore {
         input_updates: Vec<InputStatePersistenceRecord>,
         session_store_key: Option<meerkat_core::types::SessionId>,
     ) -> Result<(), RuntimeStoreError> {
-        if self.fail_atomic_apply {
+        if self.fail_atomic_apply.load(Ordering::SeqCst) {
             return Err(RuntimeStoreError::WriteFailed(
                 "synthetic atomic_apply failure".to_string(),
             ));
@@ -377,7 +455,7 @@ impl RuntimeStore for HarnessRuntimeStore {
         input_updates: Vec<InputStatePersistenceRecord>,
         session_store_key: meerkat_core::types::SessionId,
     ) -> Result<(), RuntimeStoreError> {
-        if self.fail_atomic_apply
+        if self.fail_atomic_apply.load(Ordering::SeqCst)
             || self
                 .fail_commit_machine_lifecycle_now
                 .load(Ordering::SeqCst)
@@ -412,6 +490,11 @@ impl RuntimeStore for HarnessRuntimeStore {
         &self,
         runtime_id: &meerkat_runtime::identifiers::LogicalRuntimeId,
     ) -> Result<meerkat_runtime::store::PreparedRecoveryInputSnapshot, RuntimeStoreError> {
+        if self.fail_recovery_read.load(Ordering::SeqCst) {
+            return Err(RuntimeStoreError::ReadFailed(
+                "synthetic cold recovery read failure".to_string(),
+            ));
+        }
         self.inner.load_input_states_with_versions(runtime_id).await
     }
 
@@ -779,6 +862,130 @@ async fn lifecycle_commit_failure_restores_pre_retire_authority() {
         Some(RuntimeState::Retired),
         "failed retire must not claim durable retired truth when persistence rejected it",
     );
+}
+
+#[tokio::test]
+async fn archive_post_commit_hook_does_not_run_before_failed_retire_commit() {
+    let store = Arc::new(HarnessRuntimeStore::new());
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        store.clone() as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let sid = SessionId::new();
+    adapter
+        .register_session(sid.clone())
+        .await
+        .expect("register hook failure fixture");
+    let hook = Arc::new(CountingArchiveHook {
+        calls: AtomicUsize::new(0),
+    });
+    store.set_fail_commit_machine_lifecycle_now(true);
+    let failed_lease = adapter
+        .prepare_session_archive_lease(&sid)
+        .await
+        .expect("prepare failed retire lease")
+        .expect("registered runtime has archive lease");
+    let error = adapter
+        .retire_session_with_archive_lease_and_post_commit_hook_before(
+            failed_lease,
+            hook.clone(),
+            meerkat_core::time_compat::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect_err("durable retire commit failure must surface");
+    assert!(
+        error
+            .to_string()
+            .contains("synthetic commit_machine_lifecycle failure")
+    );
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
+
+    store.set_fail_commit_machine_lifecycle_now(false);
+    let retry_adapter = Arc::new(MeerkatMachine::persistent(
+        store.clone() as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    retry_adapter
+        .register_session(sid.clone())
+        .await
+        .expect("cold retry reconstructs failed retire registration");
+    let retry_lease = retry_adapter
+        .prepare_session_archive_lease(&sid)
+        .await
+        .expect("prepare retry lease")
+        .expect("failed commit retains registration");
+    retry_adapter
+        .retire_session_with_archive_lease_and_post_commit_hook_before(
+            retry_lease,
+            hook.clone(),
+            meerkat_core::time_compat::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("retry commits then invokes exact hook");
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancelled_archive_post_commit_hook_retries_after_durable_retired() {
+    let store = Arc::new(HarnessRuntimeStore::new());
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        store.clone() as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let sid = SessionId::new();
+    let runtime_id = LogicalRuntimeId::for_session(&sid);
+    adapter
+        .register_session(sid.clone())
+        .await
+        .expect("register cancellation fixture");
+    let hook = Arc::new(GatedArchiveHook {
+        attempts: AtomicUsize::new(0),
+        completions: AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let lease = adapter
+        .prepare_session_archive_lease(&sid)
+        .await
+        .expect("prepare gated lease")
+        .expect("registered runtime has archive lease");
+    let task_adapter = Arc::clone(&adapter);
+    let task_hook = Arc::clone(&hook);
+    let task = tokio::spawn(async move {
+        task_adapter
+            .retire_session_with_archive_lease_and_post_commit_hook_before(
+                lease,
+                task_hook,
+                meerkat_core::time_compat::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+    });
+    hook.entered.notified().await;
+    assert_eq!(
+        load_runtime_state(store.as_ref(), &runtime_id)
+            .await
+            .unwrap(),
+        Some(RuntimeState::Retired),
+        "hook must begin only after durable Retired"
+    );
+    task.abort();
+    let _ = task.await;
+    assert_eq!(hook.completions.load(Ordering::SeqCst), 0);
+    let retry_lease = adapter
+        .prepare_session_archive_lease(&sid)
+        .await
+        .expect("prepare retry after cancellation")
+        .expect("cancelled hook retains registration");
+    adapter
+        .retire_session_with_archive_lease_and_post_commit_hook_before(
+            retry_lease,
+            hook.clone(),
+            meerkat_core::time_compat::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("Retired retry invokes outstanding hook");
+    assert_eq!(hook.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(hook.completions.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -3358,7 +3565,11 @@ async fn completed_boundary_commit_failure_stops_executor_without_false_durable_
     }
 
     let store = Arc::new(HarnessRuntimeStore::failing_atomic_apply());
-    let adapter = Arc::new(MeerkatMachine::persistent(store, memory_blob_store()));
+    let runtime_store: Arc<dyn RuntimeStore> = store.clone();
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        runtime_store,
+        memory_blob_store(),
+    ));
     let sid = SessionId::new();
     let stop_called = Arc::new(AtomicBool::new(false));
     adapter
@@ -3370,6 +3581,11 @@ async fn completed_boundary_commit_failure_stops_executor_without_false_durable_
         )
         .await
         .expect("runtime executor registration should succeed");
+
+    let degraded_registration = adapter
+        .current_session_registration_witness(&sid)
+        .await
+        .expect("registered runtime should expose an exact registration witness");
 
     let input = make_prompt("loop boundary failure");
     let input_id = input.id().clone();
@@ -3390,6 +3606,197 @@ async fn completed_boundary_commit_failure_stops_executor_without_false_durable_
         state.seed.phase,
         InputLifecycleState::Abandoned,
         "an uncertain boundary commit must not publish a false input terminal"
+    );
+
+    // The original boundary fault has ended, but the first supported cold
+    // recovery proof is independently unavailable. Disposal must preserve the
+    // degraded process shell until that exact recovery read succeeds.
+    store.set_fail_atomic_apply(false);
+    store.set_fail_recovery_read(true);
+    let repair_blocked = tokio::time::timeout(
+        Duration::from_secs(2),
+        adapter.recover_or_discard_reload_required_registration_if_current(&degraded_registration),
+    )
+    .await
+    .expect("failed durable recovery proof should return without a timing-dependent retry")
+    .expect_err("degraded disposal must not remove a shell before cold recovery succeeds");
+    assert!(
+        adapter.contains_session(&sid).await,
+        "failed durable recovery proof must retain the exact degraded registration"
+    );
+    assert!(
+        repair_blocked
+            .to_string()
+            .contains("synthetic cold recovery read failure"),
+        "the supported cold recovery failure must remain observable: {repair_blocked}"
+    );
+
+    store.set_fail_recovery_read(false);
+    store.set_fail_durable_tail_recovery_source(true);
+    let tail_repair_blocked = tokio::time::timeout(
+        Duration::from_secs(2),
+        adapter.recover_or_discard_reload_required_registration_if_current(&degraded_registration),
+    )
+    .await
+    .expect("durable-tail recovery failure should return without timing-dependent retry")
+    .expect_err("cold successor publication must wait for exact durable-tail reconciliation");
+    assert!(
+        tail_repair_blocked
+            .to_string()
+            .contains("synthetic durable-tail recovery source failure"),
+        "durable-tail failure must remain observable: {tail_repair_blocked}"
+    );
+    assert!(
+        adapter.contains_session(&sid).await,
+        "failed durable-tail recovery must retain the degraded registration"
+    );
+
+    store.set_fail_durable_tail_recovery_source(false);
+    let (successor_published, release_discard_owner) =
+        adapter.arm_reload_required_discard_after_successor_publication_test_hook(sid.clone());
+    let cancelled_adapter = Arc::clone(&adapter);
+    let cancelled_witness = degraded_registration.clone();
+    let cancelled_waiter = tokio::spawn(async move {
+        cancelled_adapter
+            .recover_or_discard_reload_required_registration_if_current(&cancelled_witness)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), successor_published)
+        .await
+        .expect("owned recovery worker should publish its cold successor")
+        .expect("successor-publication test hook should remain live");
+    cancelled_waiter.abort();
+    let _ = cancelled_waiter.await;
+    release_discard_owner
+        .send(())
+        .expect("release owned recovery worker after waiter cancellation");
+
+    let disposition = tokio::time::timeout(
+        Duration::from_secs(2),
+        adapter.recover_or_discard_reload_required_registration_if_current(&degraded_registration),
+    )
+    .await
+    .expect("retry should observe the owned worker's completed replacement")
+    .expect("cancelled-waiter retry should preserve durable authority");
+    assert_eq!(
+        disposition,
+        meerkat_runtime::ReloadRequiredRegistrationDisposition::NotCurrent,
+        "the detached owner must finish replacement after its first waiter is cancelled"
+    );
+    assert!(
+        adapter.contains_session(&sid).await,
+        "exact disposal must atomically publish the recovered cold successor"
+    );
+    let cold_successor = adapter
+        .current_session_registration_witness(&sid)
+        .await
+        .expect("exact disposal publishes a cold successor witness");
+    assert_ne!(
+        cold_successor, degraded_registration,
+        "the degraded witness must not identify the recovered successor"
+    );
+    assert!(
+        adapter
+            .registration_is_current_without_runtime_owner(&cold_successor)
+            .await,
+        "the recovered successor must retain no process-local runtime owner"
+    );
+
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(SuccessExecutor {
+                stop_called: Arc::new(AtomicBool::new(false)),
+            }),
+        )
+        .await
+        .expect("the recovered cold successor should accept a new executor");
+    assert_eq!(
+        adapter
+            .recover_or_discard_reload_required_registration_if_current(&degraded_registration,)
+            .await
+            .expect("stale degraded witness should be an idempotent observation"),
+        meerkat_runtime::ReloadRequiredRegistrationDisposition::NotCurrent,
+        "an old witness must not remove a same-session successor"
+    );
+    assert!(
+        adapter.contains_session(&sid).await,
+        "stale degraded cleanup must leave the successor registered"
+    );
+}
+
+#[tokio::test]
+async fn persistent_machine_rejects_missing_durability_reload_cleanup_capability_before_publish() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError, CoreExecutorPostStopCleanupHandle,
+    };
+    use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+
+    struct UnsupportedCleanupHandle;
+
+    #[async_trait::async_trait]
+    impl CoreExecutorPostStopCleanupHandle for UnsupportedCleanupHandle {
+        async fn cleanup_after_runtime_stop_terminalized(&self) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    struct UnsupportedPersistentExecutor;
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for UnsupportedPersistentExecutor {
+        fn machine_managed_post_stop_unregister(&self) -> bool {
+            true
+        }
+
+        fn post_stop_cleanup_handle(&self) -> Option<Arc<dyn CoreExecutorPostStopCleanupHandle>> {
+            Some(Arc::new(UnsupportedCleanupHandle))
+        }
+
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            unreachable!("unsupported persistent executor must not publish")
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            unreachable!("unsupported persistent executor must not publish")
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            unreachable!("unsupported persistent executor must not publish")
+        }
+    }
+
+    let store = Arc::new(HarnessRuntimeStore::new());
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        store as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let sid = SessionId::new();
+    let error = adapter
+        .register_session_with_executor(sid.clone(), Box::new(UnsupportedPersistentExecutor))
+        .await
+        .expect_err("persistent attachment without degraded cleanup capability must fail");
+    assert!(matches!(
+        error,
+        RuntimeDriverError::ValidationFailed { ref reason }
+            if reason.contains("explicit non-terminal durability-reload cleanup capability")
+    ));
+    assert!(
+        !adapter
+            .session_has_executor(&sid)
+            .await
+            .expect("rejected registration has no executor"),
+        "capability rejection must happen before executor publication"
     );
 }
 

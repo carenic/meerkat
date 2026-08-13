@@ -217,6 +217,7 @@ macro_rules! e2e_smoke_lane_entries {
             scenario(e2e_smoke_s92_remote_mob_live_placed_overlay_roundtrip, 92);
             scenario(e2e_smoke_s93_remote_mob_two_host_constellation_join, 93);
             scenario(e2e_smoke_s94_cli_shorthand_prompt, 94);
+            scenario(e2e_smoke_s95_cli_slow_mcp_resume_journey, 95);
             suite(e2e_smoke_rpc_dynamic_tool_pickup, "rpc-dynamic-tool-pickup");
             suite(e2e_smoke_rpc_deferred_catalog_session, "rpc-deferred-catalog-session");
             suite(e2e_smoke_cli_background_job_active_turn, "cli-background-job-active-turn");
@@ -4041,6 +4042,25 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
                 all_features: false,
             },
         }),
+        95 => Some(&Spec {
+            id: Some(95),
+            lane: Lane::Smoke,
+            title: "CLI slow-MCP resume journey",
+            timeout_secs: 900,
+            required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &["rkat"],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "live_smoke_cli",
+                test_name: "e2e_scenario_95_cli_slow_mcp_resume_journey",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
         73 => Some(&Spec {
             id: Some(73),
             lane: Lane::Smoke,
@@ -4689,6 +4709,25 @@ fn suite_spec(name: &str) -> Option<&'static Spec> {
                 all_features: false,
             },
         }),
+        "cli-mob-run-custody" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "rkat mob run custody: SIGTERM convergence + detach custody-lost cause",
+            timeout_secs: 900,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_mob_run_custody",
+                test_name: "integration_real_mob_run_",
+                features: &["integration-real-tests", "mob"],
+                all_features: false,
+            },
+        }),
         "cli-resume-tools" => Some(&Spec {
             id: None,
             lane: Lane::System,
@@ -4710,6 +4749,44 @@ fn suite_spec(name: &str) -> Option<&'static Spec> {
                 // `memory should be recorded for yolo` assertion degrades to
                 // Disable and fails.
                 features: &["integration-real-tests", "memory-store-session"],
+                all_features: false,
+            },
+        }),
+        "cli-export-atif" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI ATIF trajectory export",
+            timeout_secs: 300,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_export_atif",
+                test_name: "integration_real_cli_export_atif",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "cli-mcp-pending-resume" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI resume journey across a pending-MCP committed boundary",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_mcp_pending",
+                test_name: "integration_real_cli_mcp_pending_resume_journey",
+                features: &["integration-real-tests"],
                 all_features: false,
             },
         }),

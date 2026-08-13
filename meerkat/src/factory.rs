@@ -867,6 +867,7 @@ impl AgentBuildConfig {
         self.custom_models = build.custom_models.clone();
         self.image_generation_provider = build.image_generation_provider;
         self.auto_compact_threshold_override = build.auto_compact_threshold_override;
+        self.compaction_curator_override = build.compaction_curator_override.clone();
         self.output_schema = build.output_schema.clone();
         self.structured_output_retries = build.structured_output_retries;
         self.hooks_override = build.hooks_override.clone();
@@ -941,6 +942,7 @@ impl AgentBuildConfig {
             custom_models: self.custom_models.clone(),
             image_generation_provider: self.image_generation_provider,
             auto_compact_threshold_override: self.auto_compact_threshold_override,
+            compaction_curator_override: self.compaction_curator_override.clone(),
             output_schema: self.output_schema.clone(),
             structured_output_retries: self.structured_output_retries,
             hooks_override: self.hooks_override.clone(),
@@ -9303,6 +9305,142 @@ mod tests {
         );
     }
 
+    /// P0 regression: the default persistent realm backend (sqlite) serves
+    /// sessions through a HeadCanonicalV1 runtime store. A recoverable
+    /// primary failure with a configured fallback chain must durably commit
+    /// the sticky fallback there too. Before the fix the runtime coordinator
+    /// refused with "durable sticky model fallback requires WholeBlobV1" and
+    /// the machine-accepted recoverable failure terminalized the whole turn.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn runtime_backed_sticky_fallback_commits_on_head_canonical_sqlite_realm() {
+        use meerkat_core::service::SessionService as _;
+        use meerkat_runtime::RuntimeStore as _;
+        use meerkat_runtime::completion::CompletionOutcome;
+
+        const PRIMARY_MODEL: &str = "claude-sonnet-4-5";
+        const BACKUP_MODEL: &str = "custom-text-only-backup";
+        const EXTERNAL_TOOL: &str = "known_external_tool";
+        const ORIGINAL_PROMPT: &str = "persist this exact user prompt";
+
+        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
+        let config = sticky_fallback_test_config(BACKUP_MODEL, backup_binding.clone());
+        let temp = tempfile::tempdir().expect("head-canonical fallback tempdir");
+        let sqlite_path = temp.path().join("sessions.sqlite3");
+        let sqlite_store = Arc::new(
+            meerkat_store::SqliteSessionStore::open(sqlite_path.clone())
+                .expect("open sqlite session store"),
+        );
+        // Production sqlite-realm wiring: the HeadCanonicalV1 runtime
+        // authority shares the session-store file (meerkat/src/persistence.rs).
+        let runtime_store = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(sqlite_path)
+                .expect("open head-canonical runtime store"),
+        );
+        let blob_store = Arc::new(meerkat_store::MemoryBlobStore::new());
+        let external_filter = ToolFilter::Deny([EXTERNAL_TOOL.to_string()].into_iter().collect());
+
+        let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory = scripted_sticky_fallback_factory(
+            temp.path().join("factory-sessions"),
+            Arc::clone(&primary_calls),
+            Arc::clone(&backup_calls),
+        );
+        let builder = crate::FactoryAgentBuilder::new(factory, config);
+        let persistence = crate::PersistenceBundle::new(
+            Arc::clone(&sqlite_store) as Arc<dyn SessionStore>,
+            Arc::clone(&runtime_store) as Arc<dyn meerkat_runtime::RuntimeStore>,
+            Arc::clone(&blob_store) as Arc<dyn BlobStore>,
+        );
+        let (service, adapter) =
+            crate::surface::build_runtime_backed_service(builder, 4, persistence);
+        let service = Arc::new(service);
+        let session = Session::new();
+        let session_id = session.id().clone();
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+        let request = sticky_fallback_runtime_request(
+            PRIMARY_MODEL,
+            sticky_fallback_visibility_dispatcher(EXTERNAL_TOOL),
+        );
+        let result = Box::pin(crate::surface::materialize_session(
+            &service,
+            &adapter,
+            session,
+            request,
+            {
+                let service = Arc::clone(&service);
+                let adapter = Arc::clone(&adapter);
+                move |session_id| {
+                    crate::surface::default_persistent_executor(service, adapter, session_id)
+                }
+            },
+        ))
+        .await
+        .expect("materialize head-canonical runtime-backed fallback session");
+        assert_eq!(result.session_id, session_id);
+
+        service
+            .set_session_tool_filter(&session_id, external_filter.clone())
+            .await
+            .expect("stage known external visibility filter");
+
+        let (_accept, completion) = adapter
+            .accept_input_with_completion(
+                &session_id,
+                meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                    ORIGINAL_PROMPT,
+                    None,
+                )),
+            )
+            .await
+            .expect("accept head-canonical runtime prompt");
+        let completion = completion.expect("runtime prompt should provide a completion handle");
+        let completion =
+            tokio::time::timeout(std::time::Duration::from_secs(10), completion.wait())
+                .await
+                .expect("runtime prompt should complete before timeout")
+                .expect("runtime completion waiter should resolve");
+        assert!(
+            matches!(
+                completion,
+                CompletionOutcome::Completed(ref run) if run.text == "backup success"
+            ),
+            "unexpected head-canonical fallback completion: {completion:?}"
+        );
+        assert_eq!(primary_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(backup_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let live_identity = service
+            .live_session_llm_identity(&session_id)
+            .await
+            .expect("read live identity watch");
+        assert_eq!(live_identity.model, BACKUP_MODEL);
+        assert_eq!(live_identity.provider, Provider::OpenAI);
+
+        let authoritative = service
+            .load_authoritative_session(&session_id)
+            .await
+            .expect("load durable authoritative fallback session")
+            .expect("durable authoritative fallback session should exist");
+        assert_persisted_sticky_fallback_state(
+            &authoritative,
+            BACKUP_MODEL,
+            &backup_binding,
+            &external_filter,
+            ORIGINAL_PROMPT,
+        );
+        let boundary_authority = runtime_store
+            .load_session_boundary_authority(&runtime_id)
+            .await
+            .expect("load head-canonical boundary authority")
+            .expect("head-canonical boundary authority must exist");
+        assert!(
+            boundary_authority.head_canonical().is_some(),
+            "the durable fallback must be owned by HeadCanonical runtime authority"
+        );
+    }
+
     fn openai_realm_with_bindings(bindings: &[(&str, &str)]) -> RealmConfigSection {
         let mut section = RealmConfigSection::default();
         section.backend.insert(
@@ -13855,6 +13993,75 @@ mod tests {
             "shell-only builtin composition must expose exactly four shell tools while preserving the external dispatcher unchanged"
         );
     }
+
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn factory_shell_tool_honors_configured_shell_program() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("workspace");
+        tokio::fs::create_dir_all(&project_root).await.unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions")).project_root(&project_root);
+        let ops_lifecycle: Arc<dyn OpsLifecycleRegistry> =
+            Arc::new(RuntimeOpsLifecycleRegistry::new());
+
+        let mut effective_config = Config::default();
+        effective_config.shell.program = "sh".to_string();
+
+        let (dispatcher, _) = factory
+            .build_tool_dispatcher_for_agent_with_overrides(
+                &effective_config,
+                None,
+                false,
+                true,
+                None,
+                None,
+                SessionId::new().to_string(),
+                ops_lifecycle,
+                None,
+                None,
+                None,
+                None,
+                ToolCategoryOverride::Inherit,
+                None,
+                ToolCategoryOverride::Inherit,
+                None,
+            )
+            .await
+            .expect("shell-only composition should succeed");
+
+        // `echo $0` prints the invoked shell under POSIX sh and is a parse
+        // error under the template-default nu, so the observed program name
+        // proves the loaded config (not the embedded template) reached the
+        // composed shell tool.
+        let call_json =
+            serde_json::value::RawValue::from_string(r#"{"command":"echo $0"}"#.to_string())
+                .unwrap();
+        let call = ToolCallView {
+            id: "shell-program-probe",
+            name: "shell",
+            args: &call_json,
+        };
+        let outcome = dispatcher
+            .dispatch(call)
+            .await
+            .expect("shell dispatch should succeed");
+        let payload: serde_json::Value =
+            serde_json::from_str(&outcome.result.text_content()).unwrap();
+        assert_eq!(
+            payload["exit_code"],
+            serde_json::json!(0),
+            "probe must run under a POSIX shell: {payload}"
+        );
+        let stdout_program = payload["stdout"].as_str().unwrap_or_default().trim();
+        let stdout_basename = std::path::Path::new(stdout_program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert_eq!(
+            stdout_basename, "sh",
+            "configured [shell] program must reach the composed shell tool (stdout {stdout_program:?})"
+        );
+    }
 }
 
 impl AgentFactory {
@@ -13866,7 +14073,7 @@ impl AgentFactory {
     #[allow(clippy::too_many_arguments)]
     async fn build_tool_dispatcher_for_agent_with_overrides(
         &self,
-        _config: &Config,
+        config: &Config,
         external: Option<Arc<dyn AgentToolDispatcher>>,
         effective_builtins: bool,
         effective_shell: bool,
@@ -13913,14 +14120,17 @@ impl AgentFactory {
             None => Arc::new(MemoryTaskStore::new()),
         };
 
-        // Create shell config if shell is enabled
+        // Create shell config if shell is enabled. The loaded config's
+        // `[shell]` vocabulary (program, security mode/patterns) is projected
+        // through `ShellConfig::from_defaults`; `ShellConfig::default` only
+        // ever sees the embedded template defaults.
         let shell_config = if effective_shell {
             let project_root = self.shell_project_root();
-            let mut config = ShellConfig::with_project_root(project_root);
+            let mut shell_tool_config = ShellConfig::from_defaults(&config.shell, project_root);
             if let Some(env) = shell_env {
-                config.env_vars = env;
+                shell_tool_config.env_vars = env;
             }
-            Some(config)
+            Some(shell_tool_config)
         } else {
             None
         };

@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use meerkat_core::lifecycle::InputId;
 #[cfg(test)]
@@ -316,14 +317,35 @@ pub struct CompletionRegistrySnapshot {
 /// Handle for awaiting the completion of an accepted input.
 #[derive(Debug)]
 pub struct CompletionHandle {
-    rx: oneshot::Receiver<Result<CompletionDelivery, CompletionWaitError>>,
+    rx: Option<oneshot::Receiver<Result<CompletionDelivery, CompletionWaitError>>>,
+    waiter_token: Option<CompletionWaiterToken>,
+}
+
+#[derive(Debug)]
+struct CompletionWaiterToken {
+    registry: Weak<StdMutex<CompletionWaiterMap>>,
+    input_id: InputId,
+    waiter_id: uuid::Uuid,
 }
 
 impl CompletionHandle {
-    async fn try_wait_delivery(self) -> Result<CompletionDelivery, CompletionWaitError> {
-        self.rx
-            .await
-            .unwrap_or(Err(CompletionWaitError::ChannelClosed))
+    #[cfg(test)]
+    pub(crate) fn pending_for_test() -> PendingCompletionForTest {
+        let (tx, rx) = oneshot::channel();
+        PendingCompletionForTest {
+            handle: Some(Self {
+                rx: Some(rx),
+                waiter_token: None,
+            }),
+            tx,
+        }
+    }
+
+    async fn try_wait_delivery(mut self) -> Result<CompletionDelivery, CompletionWaitError> {
+        let Some(rx) = self.rx.take() else {
+            return Err(CompletionWaitError::ChannelClosed);
+        };
+        rx.await.unwrap_or(Err(CompletionWaitError::ChannelClosed))
     }
 
     /// Wait for the generated execution result or report mechanical waiter failure.
@@ -369,7 +391,10 @@ impl CompletionHandle {
             cleanup().await;
             let _ = tx.send(outcome);
         });
-        Self { rx }
+        Self {
+            rx: Some(rx),
+            waiter_token: None,
+        }
     }
 
     /// Relay completion through a cleanup future that can inspect the outcome.
@@ -392,7 +417,10 @@ impl CompletionHandle {
             };
             let _ = tx.send(outcome);
         });
-        Self { rx }
+        Self {
+            rx: Some(rx),
+            waiter_token: None,
+        }
     }
 
     /// Relay completion through cleanup that can observe either generated
@@ -413,7 +441,10 @@ impl CompletionHandle {
             }
             let _ = tx.send(outcome);
         });
-        Self { rx }
+        Self {
+            rx: Some(rx),
+            waiter_token: None,
+        }
     }
 
     /// Relay completion through required, fallible cleanup before publishing
@@ -446,7 +477,10 @@ impl CompletionHandle {
             };
             let _ = tx.send(gated);
         });
-        Self { rx }
+        Self {
+            rx: Some(rx),
+            waiter_token: None,
+        }
     }
 
     #[cfg(test)]
@@ -459,7 +493,10 @@ impl CompletionHandle {
             outcome,
             cleanup_observation: CompletionCleanupObservation::from_realized_result(realized),
         }));
-        Self { rx }
+        Self {
+            rx: Some(rx),
+            waiter_token: None,
+        }
     }
 
     #[cfg(test)]
@@ -544,6 +581,43 @@ impl CompletionHandle {
             crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::CallbackPending,
             crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
         )
+    }
+}
+
+impl Drop for CompletionHandle {
+    fn drop(&mut self) {
+        if let Some(token) = self.waiter_token.take()
+            && let Some(registry) = token.registry.upgrade()
+        {
+            let mut waiters = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(input_waiters) = waiters.get_mut(&token.input_id) {
+                input_waiters.remove(&token.waiter_id);
+                if input_waiters.is_empty() {
+                    waiters.remove(&token.input_id);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct PendingCompletionForTest {
+    handle: Option<CompletionHandle>,
+    tx: oneshot::Sender<Result<CompletionDelivery, CompletionWaitError>>,
+}
+
+#[cfg(test)]
+impl PendingCompletionForTest {
+    pub(crate) fn take_handle(&mut self) -> CompletionHandle {
+        self.handle
+            .take()
+            .expect("test pending completion handle is taken only once")
+    }
+
+    pub(crate) fn sender_is_closed(&self) -> bool {
+        self.tx.is_closed()
     }
 }
 
@@ -881,9 +955,13 @@ pub(crate) fn authorized_interaction_terminal_events(
 /// (e.g. dedup of in-flight input registers a second waiter for the same InputId).
 #[derive(Default)]
 pub(crate) struct CompletionRegistry {
-    waiters:
-        HashMap<InputId, Vec<oneshot::Sender<Result<CompletionDelivery, CompletionWaitError>>>>,
+    waiters: Arc<StdMutex<CompletionWaiterMap>>,
 }
+
+type CompletionWaiterMap = HashMap<
+    InputId,
+    HashMap<uuid::Uuid, oneshot::Sender<Result<CompletionDelivery, CompletionWaitError>>>,
+>;
 
 impl CompletionRegistry {
     pub(crate) fn new() -> Self {
@@ -891,10 +969,14 @@ impl CompletionRegistry {
     }
 
     fn take_waiters(
-        &mut self,
+        &self,
         input_id: &InputId,
     ) -> Option<Vec<oneshot::Sender<Result<CompletionDelivery, CompletionWaitError>>>> {
-        self.waiters.remove(input_id)
+        self.waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(input_id)
+            .map(|waiters| waiters.into_values().collect())
     }
 
     fn send_outcome(
@@ -972,8 +1054,21 @@ impl CompletionRegistry {
     /// the same generated execution result.
     pub(crate) fn register(&mut self, input_id: InputId) -> CompletionHandle {
         let (tx, rx) = oneshot::channel();
-        self.waiters.entry(input_id).or_default().push(tx);
-        CompletionHandle { rx }
+        let waiter_id = meerkat_core::time_compat::new_uuid_v7();
+        self.waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(input_id.clone())
+            .or_default()
+            .insert(waiter_id, tx);
+        CompletionHandle {
+            rx: Some(rx),
+            waiter_token: Some(CompletionWaiterToken {
+                registry: Arc::downgrade(&self.waiters),
+                input_id,
+                waiter_id,
+            }),
+        }
     }
 
     /// Resolve all waiters for a completed input.
@@ -1030,10 +1125,12 @@ impl CompletionRegistry {
         I: IntoIterator<Item = InputId>,
     {
         let input_ids: Vec<InputId> = input_ids.into_iter().collect();
-        if !input_ids
-            .iter()
-            .any(|input_id| self.waiters.contains_key(input_id))
-        {
+        if !input_ids.iter().any(|input_id| {
+            self.waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(input_id)
+        }) {
             let attempt = authority.begin_surface_resolution();
             attempt.abandon();
             return;
@@ -1276,9 +1373,15 @@ impl CompletionRegistry {
             return;
         }
         let cleanup_observation = Self::cleanup_from_realized_attempt(attempt);
-        for (_, senders) in self.waiters.drain() {
+        let all_waiters = std::mem::take(
+            &mut *self
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (_, senders) in all_waiters {
             Self::send_outcome(
-                senders,
+                senders.into_values().collect(),
                 CompletionOutcome::runtime_terminated(reason),
                 cleanup_observation.clone(),
             );
@@ -1314,8 +1417,14 @@ impl CompletionRegistry {
     }
 
     pub(crate) fn fail_all_waiters(&mut self, error: CompletionWaitError) {
-        for (_, senders) in self.waiters.drain() {
-            Self::send_error(senders, error.clone());
+        let all_waiters = std::mem::take(
+            &mut *self
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (_, senders) in all_waiters {
+            Self::send_error(senders.into_values().collect(), error.clone());
         }
     }
 
@@ -1342,19 +1451,28 @@ impl CompletionRegistry {
     ) where
         F: FnMut(&InputId) -> bool,
     {
-        self.waiters.retain(|input_id, senders| {
-            if is_still_pending(input_id) {
-                return true;
-            }
-            Self::send_error(std::mem::take(senders), error.clone());
-            false
-        });
+        self.waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|input_id, senders| {
+                if is_still_pending(input_id) {
+                    return true;
+                }
+                Self::send_error(
+                    std::mem::take(senders).into_values().collect(),
+                    error.clone(),
+                );
+                false
+            });
     }
 
     /// Snapshot the current waiter carrier without mutating it.
     pub(crate) fn diagnostic_snapshot(&self) -> CompletionRegistrySnapshot {
-        let mut waiting_inputs: Vec<_> = self
+        let waiters = self
             .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut waiting_inputs: Vec<_> = waiters
             .iter()
             .map(|(input_id, senders)| CompletionWaiterEntrySnapshot {
                 input_id: input_id.clone(),
@@ -1377,7 +1495,11 @@ impl CompletionRegistry {
     /// waiter plumbing rather than semantic runtime truth.
     #[cfg(test)]
     pub fn debug_has_waiters(&self) -> bool {
-        !self.waiters.is_empty()
+        !self
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     }
 
     /// Number of pending waiters (total across all InputIds).
@@ -1386,7 +1508,12 @@ impl CompletionRegistry {
     /// waiter plumbing rather than semantic runtime truth.
     #[cfg(test)]
     pub fn debug_waiter_count(&self) -> usize {
-        self.waiters.values().map(Vec::len).sum()
+        self.waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(HashMap::len)
+            .sum()
     }
 }
 
@@ -2028,16 +2155,19 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         drop(tx);
-        let handle =
-            CompletionHandle { rx }.with_resultful_completion_cleanup(|completion| async move {
-                assert!(matches!(
-                    completion,
-                    Err(CompletionWaitError::ChannelClosed)
-                ));
-                Err(CompletionWaitError::AuthorityUnavailable(
-                    "cleanup authority failed".to_string(),
-                ))
-            });
+        let handle = CompletionHandle {
+            rx: Some(rx),
+            waiter_token: None,
+        }
+        .with_resultful_completion_cleanup(|completion| async move {
+            assert!(matches!(
+                completion,
+                Err(CompletionWaitError::ChannelClosed)
+            ));
+            Err(CompletionWaitError::AuthorityUnavailable(
+                "cleanup authority failed".to_string(),
+            ))
+        });
         let error = handle
             .wait()
             .await

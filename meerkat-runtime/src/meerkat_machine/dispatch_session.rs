@@ -96,17 +96,6 @@ impl meerkat_core::handles::StickyModelFallbackCommitCoordinator
                 result_rx,
             }));
         };
-        if store.session_persistence_profile()
-            != crate::store::RuntimeSessionPersistenceProfile::WholeBlobV1
-        {
-            return Err(
-                meerkat_core::handles::StickyModelFallbackCommitError::Store(
-                    "durable sticky model fallback requires WholeBlobV1; \
-                     HeadCanonicalV1 has no typed control-metadata mutation seam"
-                        .to_string(),
-                ),
-            );
-        }
         let session_id = self.session_id.clone();
         let (result_tx, result_rx) = crate::tokio::sync::watch::channel(None);
         crate::tokio::spawn(async move {
@@ -122,6 +111,37 @@ impl meerkat_core::handles::StickyModelFallbackCommitCoordinator
 }
 
 async fn run_sticky_model_fallback_commit(
+    session_id: SessionId,
+    store: Arc<dyn crate::store::RuntimeStore>,
+    machine_commit: Box<dyn meerkat_core::handles::StickyModelFallbackMachineCommit>,
+    control_delta: meerkat_core::handles::StickyModelFallbackControlDelta,
+) -> Result<
+    Option<meerkat_core::SessionControlCommitReceipt>,
+    meerkat_core::handles::StickyModelFallbackCommitError,
+> {
+    match store.session_persistence_profile() {
+        crate::store::RuntimeSessionPersistenceProfile::WholeBlobV1 => {
+            run_sticky_model_fallback_whole_blob_commit(
+                session_id,
+                store,
+                machine_commit,
+                control_delta,
+            )
+            .await
+        }
+        crate::store::RuntimeSessionPersistenceProfile::HeadCanonicalV1 => {
+            run_sticky_model_fallback_head_canonical_commit(
+                session_id,
+                store,
+                machine_commit,
+                control_delta,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_sticky_model_fallback_whole_blob_commit(
     session_id: SessionId,
     store: Arc<dyn crate::store::RuntimeStore>,
     machine_commit: Box<dyn meerkat_core::handles::StickyModelFallbackMachineCommit>,
@@ -279,6 +299,213 @@ async fn run_sticky_model_fallback_commit(
         )
         .map(Some)
         .map_err(CommitError::SnapshotOutcomeUnknown)
+    }
+}
+
+/// HeadCanonical durable sticky-fallback commit.
+///
+/// The control delta mutates only head-owned control metadata (LLM identity
+/// and typed tool visibility), so the durable form is an ordinary receiptless
+/// snapshot boundary with an empty message suffix: an O(delta) head-metadata
+/// CAS parented on the exact committed boundary head, never an O(document)
+/// materialized rewrite.
+async fn run_sticky_model_fallback_head_canonical_commit(
+    session_id: SessionId,
+    store: Arc<dyn crate::store::RuntimeStore>,
+    machine_commit: Box<dyn meerkat_core::handles::StickyModelFallbackMachineCommit>,
+    control_delta: meerkat_core::handles::StickyModelFallbackControlDelta,
+) -> Result<
+    Option<meerkat_core::SessionControlCommitReceipt>,
+    meerkat_core::handles::StickyModelFallbackCommitError,
+> {
+    use meerkat_core::handles::StickyModelFallbackCommitError as CommitError;
+
+    let runtime_id = crate::identifiers::LogicalRuntimeId::for_session(&session_id);
+    let source = store
+        .load_durable_tail_recovery_source(&runtime_id)
+        .await
+        .map_err(|error| CommitError::Store(error.to_string()))?
+        .ok_or_else(|| CommitError::SnapshotMissing {
+            session_id: session_id.clone(),
+        })?;
+    if source.committed_session().id() != &session_id {
+        return Err(CommitError::SessionMismatch {
+            expected: session_id,
+            actual: source.committed_session().id().clone(),
+        });
+    }
+    let previous_authority = source.runtime_authority().clone();
+    let committed_authority = previous_authority.head_canonical().ok_or_else(|| {
+        CommitError::Store(format!(
+            "HeadCanonical runtime store returned a non-HeadCanonical session authority for {session_id}"
+        ))
+    })?;
+    // Mirror the WholeBlob refusal: a control-only CAS parented on the
+    // committed boundary must not bypass a store-owned in-run provisional
+    // physical tail.
+    if source.provisional_authority().is_some()
+        || source.physical_head() != committed_authority.boundary_head()
+    {
+        return Err(CommitError::Store(
+            "durable sticky fallback cannot bypass a store-owned HeadCanonical \
+             provisional physical tail"
+                .to_string(),
+        ));
+    }
+    let boundary_head = committed_authority.boundary_head().clone();
+    let mut target_session = source.committed_session().as_ref().clone();
+    control_delta
+        .validate_and_apply(&mut target_session)
+        .map_err(CommitError::InvalidControlDelta)?;
+    let target_mutation = meerkat_core::session_store::PreparedHeadCanonicalMutation::prepare(
+        &target_session,
+        Some(boundary_head),
+    )
+    .map_err(|error| CommitError::SnapshotInvalid(error.to_string()))?;
+    let target_head_token = target_mutation.successor_head_token().to_string();
+    let target_boundary =
+        meerkat_core::lifecycle::core_executor::BoundSessionCommit::head_canonical_from_session(
+            &target_session,
+            target_mutation.clone(),
+        )
+        .map_err(|error| CommitError::SnapshotInvalid(error.to_string()))?;
+
+    let target_authority = commit_head_canonical_control_snapshot(
+        store.as_ref(),
+        &runtime_id,
+        target_boundary,
+        &target_head_token,
+        Some(&previous_authority),
+    )
+    .await?;
+
+    if let Err(machine_error) = machine_commit.commit() {
+        let compensation_failed =
+            |detail: String| CommitError::CompensationFailed(format!("{machine_error}; {detail}"));
+        let mut rollback_session = target_session;
+        target_mutation
+            .acknowledge_session(&mut rollback_session, &target_head_token)
+            .map_err(|error| {
+                compensation_failed(format!(
+                    "failed to adopt the durable target before compensation: {error}"
+                ))
+            })?;
+        control_delta
+            .inverted()
+            .validate_and_apply(&mut rollback_session)
+            .map_err(|error| {
+                compensation_failed(format!(
+                    "failed to derive the durable predecessor control state: {error}"
+                ))
+            })?;
+        let rollback_mutation =
+            meerkat_core::session_store::PreparedHeadCanonicalMutation::prepare(
+                &rollback_session,
+                Some(target_mutation.successor_head().clone()),
+            )
+            .map_err(|error| {
+                compensation_failed(format!(
+                    "failed to prepare the durable predecessor: {error}"
+                ))
+            })?;
+        let rollback_head_token = rollback_mutation.successor_head_token().to_string();
+        let rollback_boundary =
+            meerkat_core::lifecycle::core_executor::BoundSessionCommit::head_canonical_from_session(
+                &rollback_session,
+                rollback_mutation,
+            )
+            .map_err(|error| {
+                compensation_failed(format!("failed to seal the durable predecessor: {error}"))
+            })?;
+        match commit_head_canonical_control_snapshot(
+            store.as_ref(),
+            &runtime_id,
+            rollback_boundary,
+            &rollback_head_token,
+            Some(&target_authority),
+        )
+        .await
+        {
+            Ok(_) => Err(CommitError::MachineRejected(machine_error)),
+            Err(rollback_error) => Err(compensation_failed(rollback_error.to_string())),
+        }
+    } else {
+        let committed = target_authority.head_canonical().ok_or_else(|| {
+            CommitError::SnapshotOutcomeUnknown(
+                "HeadCanonical control commit acknowledged a non-HeadCanonical authority"
+                    .to_string(),
+            )
+        })?;
+        meerkat_core::SessionControlCommitReceipt::new(
+            committed.session_id().clone(),
+            committed.store_revision(),
+            committed.committed_head_token(),
+        )
+        .map(Some)
+        .map_err(CommitError::SnapshotOutcomeUnknown)
+    }
+}
+
+/// Commit one receiptless HeadCanonical control snapshot and reconcile a
+/// store-reported failure against the bounded committed authority, using the
+/// same vocabulary as the WholeBlob CAS: converged-to-target is success, an
+/// unchanged expected predecessor is an ordinary [`CommitError::Store`]
+/// refusal, anything else is an unknown outcome.
+async fn commit_head_canonical_control_snapshot(
+    store: &dyn crate::store::RuntimeStore,
+    runtime_id: &crate::identifiers::LogicalRuntimeId,
+    boundary: meerkat_core::lifecycle::core_executor::BoundSessionCommit,
+    successor_head_token: &str,
+    expected_previous: Option<&crate::store::RuntimeSessionAuthority>,
+) -> Result<
+    crate::store::RuntimeSessionAuthority,
+    meerkat_core::handles::StickyModelFallbackCommitError,
+> {
+    use meerkat_core::handles::StickyModelFallbackCommitError as CommitError;
+
+    let request = crate::store::PreparedRuntimeSessionCommit::snapshot_only(boundary);
+    let committed_token_matches = |authority: &crate::store::RuntimeSessionAuthority| {
+        authority
+            .head_canonical()
+            .is_some_and(|committed| committed.committed_head_token() == successor_head_token)
+    };
+    match store
+        .commit_prepared_session_boundary(runtime_id, request)
+        .await
+    {
+        Ok(result) => {
+            let authority = result.authority().cloned().ok_or_else(|| {
+                CommitError::SnapshotOutcomeUnknown(
+                    "HeadCanonical control snapshot commit returned no session authority"
+                        .to_string(),
+                )
+            })?;
+            if !committed_token_matches(&authority) {
+                return Err(CommitError::SnapshotOutcomeUnknown(format!(
+                    "HeadCanonical control snapshot acknowledged unexpected authority revision {}",
+                    authority.store_revision(),
+                )));
+            }
+            Ok(authority)
+        }
+        Err(cas_error) => {
+            let observed = store
+                .load_session_boundary_authority(runtime_id)
+                .await
+                .map_err(|read_error| {
+                    CommitError::SnapshotOutcomeUnknown(format!(
+                        "control snapshot commit failed with '{cas_error}' and bounded \
+                         authority reconciliation failed with '{read_error}'"
+                    ))
+                })?;
+            match observed {
+                Some(observed) if committed_token_matches(&observed) => Ok(observed),
+                Some(observed) if Some(&observed) == expected_previous => {
+                    Err(CommitError::Store(cas_error.to_string()))
+                }
+                _ => Err(CommitError::SnapshotOutcomeUnknown(cas_error.to_string())),
+            }
+        }
     }
 }
 
@@ -458,6 +685,342 @@ mod compaction_coordinator_tests {
         assert!(
             coordinator.authorize_projection(&projection).is_err(),
             "a coordinator from the torn-down epoch must fail closed"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "sqlite-store"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod sticky_model_fallback_commit_tests {
+    use super::*;
+    use crate::store::{RuntimeSessionAuthority, RuntimeStore, SerializedSessionSnapshot};
+    use meerkat_core::handles::{
+        StickyModelFallbackCommitCoordinator as _, StickyModelFallbackCommitError,
+        StickyModelFallbackControlDelta, StickyModelFallbackControlDeltaError,
+    };
+    use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
+    use meerkat_core::session_store::PreparedHeadCanonicalMutation;
+    use meerkat_core::{
+        Message, Provider, SESSION_METADATA_SCHEMA_VERSION, Session, SessionLlmIdentity,
+        SessionMetadata, SessionToolVisibilityState, SessionTooling, ToolFilter, UserMessage,
+        VIEW_IMAGE_TOOL_NAME,
+    };
+    use tempfile::TempDir;
+
+    struct AcceptingMachineCommit;
+
+    impl meerkat_core::handles::StickyModelFallbackMachineCommit for AcceptingMachineCommit {
+        fn commit(self: Box<Self>) -> Result<(), meerkat_core::handles::DslTransitionError> {
+            Ok(())
+        }
+    }
+
+    struct RejectingMachineCommit;
+
+    impl meerkat_core::handles::StickyModelFallbackMachineCommit for RejectingMachineCommit {
+        fn commit(self: Box<Self>) -> Result<(), meerkat_core::handles::DslTransitionError> {
+            Err(meerkat_core::handles::DslTransitionError::no_matching(
+                "sticky_model_fallback_commit_tests",
+                "synthetic generated-authority rejection",
+            ))
+        }
+    }
+
+    fn identity(model: &str) -> SessionLlmIdentity {
+        SessionLlmIdentity {
+            model: model.to_string(),
+            provider: Provider::OpenAI,
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding: None,
+        }
+    }
+
+    fn target_visibility() -> SessionToolVisibilityState {
+        SessionToolVisibilityState {
+            capability_base_filter: ToolFilter::Deny(
+                [VIEW_IMAGE_TOOL_NAME.to_string()].into_iter().collect(),
+            ),
+            active_revision: 1,
+            staged_revision: 1,
+            ..Default::default()
+        }
+    }
+
+    fn control_delta() -> StickyModelFallbackControlDelta {
+        StickyModelFallbackControlDelta::from_control_states_for_test(
+            identity("primary"),
+            identity("backup"),
+            SessionToolVisibilityState::default(),
+            target_visibility(),
+        )
+    }
+
+    fn session_with_control_state(model: &str) -> Session {
+        let mut session = Session::new();
+        session
+            .set_session_metadata(SessionMetadata {
+                schema_version: SESSION_METADATA_SCHEMA_VERSION,
+                model: model.to_string(),
+                max_tokens: 4096,
+                structured_output_retries: 2,
+                provider: Provider::OpenAI,
+                self_hosted_server_id: None,
+                provider_params: None,
+                tooling: SessionTooling::default(),
+                keep_alive: true,
+                comms_name: None,
+                peer_meta: None,
+                realm_id: None,
+                instance_id: None,
+                backend: None,
+                config_generation: Some(7),
+                auth_binding: None,
+                mob_member_binding: None,
+            })
+            .expect("control-state session metadata");
+        session.push(Message::User(UserMessage::text("committed user turn")));
+        // A persisted session carries its generated-authority visibility
+        // projection as ordinary durable metadata. Model that exact persisted
+        // representation; the sealed live constructor is core-private.
+        let mut value = serde_json::to_value(&session).expect("serialize control-state session");
+        value["metadata"][meerkat_core::SESSION_TOOL_VISIBILITY_STATE_KEY] =
+            serde_json::to_value(SessionToolVisibilityState::default())
+                .expect("serialize visibility state");
+        serde_json::from_value(value).expect("deserialize control-state session")
+    }
+
+    fn coordinator_for(
+        session_id: &SessionId,
+        store: Arc<dyn RuntimeStore>,
+    ) -> RuntimeStickyModelFallbackCommitCoordinator {
+        RuntimeStickyModelFallbackCommitCoordinator {
+            session_id: session_id.clone(),
+            store: Some(store),
+        }
+    }
+
+    async fn commit_head_canonical_root(
+        store: &dyn RuntimeStore,
+        runtime_id: &crate::identifiers::LogicalRuntimeId,
+        session: &Session,
+    ) -> crate::store::HeadCanonicalStoreAuthority {
+        let mutation =
+            PreparedHeadCanonicalMutation::prepare(session, None).expect("root mutation");
+        let boundary = BoundSessionCommit::head_canonical_from_session(session, mutation)
+            .expect("root boundary");
+        store
+            .commit_prepared_session_boundary(
+                runtime_id,
+                crate::store::PreparedRuntimeSessionCommit::snapshot_only(boundary),
+            )
+            .await
+            .expect("root head-canonical commit")
+            .authority()
+            .and_then(RuntimeSessionAuthority::head_canonical)
+            .expect("root HeadCanonical authority")
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn head_canonical_sticky_fallback_commit_persists_control_metadata() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("sticky-head-canonical.sqlite3");
+        let store: Arc<dyn RuntimeStore> =
+            Arc::new(crate::store::SqliteRuntimeStore::new_head_canonical(&path).expect("store"));
+        let session = session_with_control_state("primary");
+        let session_id = session.id().clone();
+        let runtime_id = crate::identifiers::LogicalRuntimeId::for_session(&session_id);
+        let root = commit_head_canonical_root(store.as_ref(), &runtime_id, &session).await;
+
+        let coordinator = coordinator_for(&session_id, Arc::clone(&store));
+        let operation = coordinator
+            .begin(Box::new(AcceptingMachineCommit), control_delta())
+            .expect("begin durable sticky fallback");
+        let receipt = operation
+            .wait()
+            .await
+            .expect("durable sticky fallback commit")
+            .expect("durable control commit receipt");
+
+        assert_eq!(receipt.session_id(), &session_id);
+        assert_eq!(receipt.store_revision(), root.store_revision() + 1);
+        assert_ne!(receipt.authority_token(), root.committed_head_token());
+
+        let source = store
+            .load_durable_tail_recovery_source(&runtime_id)
+            .await
+            .expect("reload committed source")
+            .expect("committed source exists");
+        let committed_authority = source
+            .runtime_authority()
+            .head_canonical()
+            .expect("HeadCanonical committed authority")
+            .clone();
+        assert_eq!(
+            committed_authority.committed_head_token(),
+            receipt.authority_token()
+        );
+        let committed = source.committed_session();
+        assert_eq!(
+            committed
+                .session_metadata()
+                .expect("committed metadata")
+                .llm_identity(),
+            identity("backup"),
+            "durable head metadata must carry the fallback LLM identity"
+        );
+        assert_eq!(
+            committed
+                .try_tool_visibility_state()
+                .expect("committed visibility decodes"),
+            Some(target_visibility()),
+            "durable head metadata must carry the fallback visibility state"
+        );
+        assert_eq!(
+            committed.messages().len(),
+            1,
+            "the control commit must not touch transcript rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn head_canonical_sticky_fallback_rejects_a_stale_control_parent() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("sticky-head-canonical-stale.sqlite3");
+        let store: Arc<dyn RuntimeStore> =
+            Arc::new(crate::store::SqliteRuntimeStore::new_head_canonical(&path).expect("store"));
+        let session = session_with_control_state("primary");
+        let session_id = session.id().clone();
+        let runtime_id = crate::identifiers::LogicalRuntimeId::for_session(&session_id);
+        commit_head_canonical_root(store.as_ref(), &runtime_id, &session).await;
+
+        let coordinator = coordinator_for(&session_id, Arc::clone(&store));
+        coordinator
+            .begin(Box::new(AcceptingMachineCommit), control_delta())
+            .expect("begin first durable sticky fallback")
+            .wait()
+            .await
+            .expect("first durable sticky fallback commit");
+
+        // The same delta is now parented on superseded control state.
+        let stale = coordinator
+            .begin(Box::new(AcceptingMachineCommit), control_delta())
+            .expect("begin stale durable sticky fallback")
+            .wait()
+            .await
+            .expect_err("a stale control parent must be refused");
+        assert!(
+            matches!(
+                stale,
+                StickyModelFallbackCommitError::InvalidControlDelta(
+                    StickyModelFallbackControlDeltaError::IdentityParentMismatch { .. }
+                )
+            ),
+            "unexpected stale-parent refusal: {stale:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn head_canonical_machine_rejection_compensates_the_durable_target() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("sticky-head-canonical-rollback.sqlite3");
+        let store: Arc<dyn RuntimeStore> =
+            Arc::new(crate::store::SqliteRuntimeStore::new_head_canonical(&path).expect("store"));
+        let session = session_with_control_state("primary");
+        let session_id = session.id().clone();
+        let runtime_id = crate::identifiers::LogicalRuntimeId::for_session(&session_id);
+        let root = commit_head_canonical_root(store.as_ref(), &runtime_id, &session).await;
+
+        let coordinator = coordinator_for(&session_id, Arc::clone(&store));
+        let error = coordinator
+            .begin(Box::new(RejectingMachineCommit), control_delta())
+            .expect("begin durable sticky fallback")
+            .wait()
+            .await
+            .expect_err("generated-authority rejection must not commit the fallback");
+        assert!(
+            matches!(error, StickyModelFallbackCommitError::MachineRejected(_)),
+            "unexpected machine-rejection result: {error:?}"
+        );
+
+        let source = store
+            .load_durable_tail_recovery_source(&runtime_id)
+            .await
+            .expect("reload committed source")
+            .expect("committed source exists");
+        let committed_authority = source
+            .runtime_authority()
+            .head_canonical()
+            .expect("HeadCanonical committed authority")
+            .clone();
+        assert_eq!(
+            committed_authority.store_revision(),
+            root.store_revision() + 2,
+            "compensation commits a durable predecessor successor, not an in-place erase"
+        );
+        let committed = source.committed_session();
+        assert_eq!(
+            committed
+                .session_metadata()
+                .expect("committed metadata")
+                .llm_identity(),
+            identity("primary"),
+            "compensation must restore the durable predecessor LLM identity"
+        );
+        assert_eq!(
+            committed
+                .try_tool_visibility_state()
+                .expect("committed visibility decodes"),
+            Some(SessionToolVisibilityState::default()),
+            "compensation must restore the durable predecessor visibility state"
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_blob_sticky_fallback_commit_path_is_unchanged() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("sticky-whole-blob.sqlite3");
+        let store: Arc<dyn RuntimeStore> =
+            Arc::new(crate::store::SqliteRuntimeStore::new_whole_blob(&path).expect("store"));
+        let session = session_with_control_state("primary");
+        let session_id = session.id().clone();
+        let runtime_id = crate::identifiers::LogicalRuntimeId::for_session(&session_id);
+        store
+            .commit_session_snapshot(
+                &runtime_id,
+                SerializedSessionSnapshot {
+                    session_snapshot: serde_json::to_vec(&session)
+                        .expect("serialize session")
+                        .into(),
+                },
+            )
+            .await
+            .expect("root whole-blob snapshot");
+
+        let coordinator = coordinator_for(&session_id, Arc::clone(&store));
+        let receipt = coordinator
+            .begin(Box::new(AcceptingMachineCommit), control_delta())
+            .expect("begin durable sticky fallback")
+            .wait()
+            .await
+            .expect("durable sticky fallback commit")
+            .expect("durable control commit receipt");
+        assert_eq!(receipt.session_id(), &session_id);
+
+        let committed = store
+            .load_committed_whole_blob_snapshot(&runtime_id)
+            .await
+            .expect("reload committed snapshot")
+            .expect("committed snapshot exists");
+        assert_eq!(
+            committed
+                .session()
+                .session_metadata()
+                .expect("committed metadata")
+                .llm_identity(),
+            identity("backup"),
+            "the WholeBlob control commit must keep persisting the fallback identity"
         );
     }
 }

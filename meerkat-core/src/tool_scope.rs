@@ -1413,9 +1413,8 @@ impl ToolScope {
         visibility_owner.replace_deferred_tool_authority_catalog(
             deferred_authority_catalog_for_base_tools(&base_tools, &deferred_tool_names),
         )?;
-        visibility_owner.replace_filter_tool_authority_catalog(
-            filter_authority_catalog_for_base_tools(&base_tools),
-        )?;
+        visibility_owner
+            .replace_filter_tool_authority_catalog(base_tool_authority_catalog(&base_tools))?;
 
         Ok(Self::build_with_visibility_owner(
             base_tools,
@@ -1631,7 +1630,7 @@ impl ToolScope {
         self.visibility_owner
             .replace_deferred_tool_authority_catalog(deferred_authority_catalog)?;
 
-        let mut filter_authority_catalog = filter_authority_catalog_for_base_tools(&new_base_tools);
+        let mut filter_authority_catalog = base_tool_authority_catalog(&new_base_tools);
         extend_filter_authority_catalog_from_visibility_state(
             &mut filter_authority_catalog,
             visibility_state,
@@ -1985,7 +1984,7 @@ impl ToolScope {
         self.visibility_owner
             .replace_deferred_tool_authority_catalog(deferred_authority_catalog)?;
 
-        let mut filter_authority_catalog = filter_authority_catalog_for_base_tools(&base_tools);
+        let mut filter_authority_catalog = base_tool_authority_catalog(&base_tools);
         extend_filter_authority_catalog_from_visibility_state(
             &mut filter_authority_catalog,
             &current_visibility_state,
@@ -2355,10 +2354,46 @@ impl ToolScopeHandle {
                 .state
                 .read()
                 .map_err(|_| ToolScopeStageError::LockPoisoned)?;
-            let catalog = deferred_authority_catalog_for_base_tools(
-                &state.base_tools,
-                &state.deferred_tool_names,
-            );
+            // Validate every turn authority against the immutable base
+            // catalog, including dispatchers that intentionally stay in
+            // inline mode. Only names selected into the deferred projection
+            // need ephemeral activation; a correctly witnessed inline name is
+            // an accepted no-op. Restricting validation itself to
+            // `deferred_tool_names` makes a trusted overlay fail whenever an
+            // exact-catalog surface is wrapped by a conservative non-exact
+            // dispatcher, even though the definition is already visible.
+            let catalog = base_tool_authority_catalog(&state.base_tools);
+            // Diagnostic pre-check only: the generated guard stays the
+            // authority for allow-name admission; this converts its generic
+            // refusal into a typed error naming the offending tools. The
+            // catalog mirror must match the guard's
+            // `filter_visibility_authority_catalog` projection (base tools
+            // extended with filter-witnessed names), or the pre-check would
+            // refuse names the guard admits. Deny names are deliberately not
+            // checked: deny only subtracts, so denying an absent tool is an
+            // admitted no-op.
+            if let Some(allow_names) = allow.as_ref() {
+                let visibility_state = self.visibility_owner.visibility_state().map_err(|err| {
+                    ToolScopeStageError::Owner {
+                        message: err.to_string(),
+                    }
+                })?;
+                let mut turn_allow_catalog = catalog.clone();
+                extend_filter_authority_catalog_from_visibility_state(
+                    &mut turn_allow_catalog,
+                    &visibility_state,
+                );
+                let mut unknown: Vec<ToolName> = allow_names
+                    .iter()
+                    .filter(|name| !turn_allow_catalog.contains_key(name.as_str()))
+                    .cloned()
+                    .collect();
+                if !unknown.is_empty() {
+                    unknown.sort_unstable();
+                    unknown.dedup();
+                    return Err(ToolScopeStageError::UnknownTools { names: unknown });
+                }
+            }
             let mut activated = ToolNameSet::new();
             let mut invalid = Vec::new();
             for authority in authorities {
@@ -2367,7 +2402,7 @@ impl ToolScopeHandle {
                     .is_some_and(|names| names.contains(authority.name.as_str()));
                 if !allowed || catalog.get(authority.name.as_str()) != Some(&authority.witness) {
                     invalid.push(authority.name.clone());
-                } else {
+                } else if state.deferred_tool_names.contains(authority.name.as_str()) {
                     activated.insert(authority.name.clone());
                 }
             }
@@ -2419,6 +2454,12 @@ fn tool_name_set_to_btree(names: &ToolNameSet) -> BTreeSet<ToolName> {
     names.iter().cloned().collect()
 }
 
+// Persistent filters (including `ToolFilter::Deny`) intentionally keep the
+// all-names-must-be-known rule: a durable filter naming an absent tool is a
+// standing configuration error worth a typed refusal, and this path names the
+// tools. The ephemeral turn overlay diverges by design: its deny names are
+// admitted unchecked because a per-turn deny of an absent tool is a no-op
+// (see `set_turn_overlay_with_deferred_authorities`).
 fn validate_filter(
     filter: &ToolFilter,
     known_base_names: &ToolNameSet,
@@ -2587,7 +2628,7 @@ fn deferred_authority_catalog_for_base_tools(
         .collect()
 }
 
-fn filter_authority_catalog_for_base_tools(
+fn base_tool_authority_catalog(
     base_tools: &[Arc<ToolDef>],
 ) -> std::collections::BTreeMap<ToolName, ToolVisibilityWitness> {
     base_tools
@@ -3151,6 +3192,64 @@ mod tests {
             scope.visible_tool_names().unwrap(),
             ["visible".into()].into_iter().collect(),
             "clearing the turn overlay must remove ephemeral activation"
+        );
+    }
+
+    #[test]
+    fn catalog_witnessed_turn_authority_is_inert_for_inline_tool() {
+        let inline = tool_with_provenance("inline", "attention-binding-a");
+        let scope =
+            scope_with_generated_projection_names(vec![Arc::clone(&inline)].into(), raw_set(&[]));
+        let handle = scope.handle();
+        let authority = crate::DeferredToolLoadAuthority::new(
+            "inline",
+            crate::ToolVisibilityWitness {
+                last_seen_provenance: inline.provenance.clone(),
+            },
+        );
+
+        handle
+            .set_turn_overlay_with_deferred_authorities(
+                Some(raw_set(&["inline"])),
+                raw_set(&[]),
+                &[authority],
+            )
+            .expect("an exact witness for an inline definition should be an accepted no-op");
+        assert_eq!(
+            scope.visible_tool_names().unwrap(),
+            ["inline".into()].into_iter().collect(),
+            "inline definitions stay visible without deferred activation"
+        );
+    }
+
+    #[test]
+    fn inline_turn_authority_still_rejects_forged_witness() {
+        let inline = tool_with_provenance("inline", "attention-binding-a");
+        let scope =
+            scope_with_generated_projection_names(vec![Arc::clone(&inline)].into(), raw_set(&[]));
+        let handle = scope.handle();
+        let forged = crate::DeferredToolLoadAuthority::new(
+            "inline",
+            crate::ToolVisibilityWitness {
+                last_seen_provenance: Some(ToolProvenance {
+                    kind: ToolSourceKind::Callback,
+                    source_id: "forged".into(),
+                }),
+            },
+        );
+
+        let err = handle
+            .set_turn_overlay_with_deferred_authorities(
+                Some(raw_set(&["inline"])),
+                raw_set(&[]),
+                &[forged],
+            )
+            .expect_err("an inline definition must not weaken exact witness validation");
+        assert_eq!(
+            err,
+            ToolScopeStageError::InvalidWitnesses {
+                names: vec!["inline".into()],
+            }
         );
     }
 
@@ -3795,6 +3894,49 @@ mod tests {
                 .map(|t| t.name.to_string())
                 .collect::<Vec<_>>(),
             vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn turn_overlay_deny_of_absent_tool_is_admitted_no_op() {
+        let scope = scope_with_generated_visibility(tools(&["a", "b"]));
+        let handle = scope.handle();
+
+        handle
+            .set_turn_overlay(None, raw_set(&["no_such_tool"]))
+            .expect("denying an absent tool is a pure subtraction and must be admitted");
+
+        assert_eq!(
+            scope
+                .visible_tools()
+                .iter()
+                .map(|t| t.name.to_string())
+                .collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string()],
+            "denying an absent tool must leave the visible set unchanged"
+        );
+        let snapshot = scope.snapshot().expect("snapshot should be available");
+        assert_eq!(
+            snapshot.active_turn_deny,
+            vec!["no_such_tool".to_string()],
+            "the admitted deny must be recorded in the active turn overlay"
+        );
+    }
+
+    #[test]
+    fn turn_overlay_allow_of_unknown_tool_is_refused_with_typed_names() {
+        let scope = scope_with_generated_visibility(tools(&["a", "b"]));
+        let handle = scope.handle();
+
+        let err = handle
+            .set_turn_overlay(Some(raw_set(&["no_such_tool"])), raw_set(&[]))
+            .expect_err("allowing an unknown tool grants visibility and must be refused");
+        assert_eq!(
+            err,
+            ToolScopeStageError::UnknownTools {
+                names: vec!["no_such_tool".into()],
+            },
+            "the refusal must name exactly the unknown allow tools"
         );
     }
 

@@ -5,6 +5,7 @@ members = [
     "meerkat-agent-build-authority",
     "meerkat-sqlite",
     "meerkat-core",
+    "meerkat-atif",
     "meerkat-models",
     "meerkat-capabilities",
     "meerkat-llm-core",
@@ -50,6 +51,8 @@ members = [
     "test-fixtures/machine-dsl-tests",
     "xtask",
 ]
+# Vendored [patch.crates-io] sources are not workspace members.
+exclude = ["third-party/oai-rt-rs"]
 
 [workspace.package]
 version = "0.8.22"
@@ -140,6 +143,7 @@ tempfile = "3.14"
 meerkat-agent-build-authority = { version = "0.8.22", path = "meerkat-agent-build-authority" }
 meerkat-sqlite = { version = "0.8.22", path = "meerkat-sqlite" }
 meerkat-core = { version = "0.8.22", path = "meerkat-core" }
+meerkat-atif = { version = "0.8.22", path = "meerkat-atif" }
 meerkat-models = { version = "0.8.22", path = "meerkat-models" }
 meerkat-capabilities = { version = "0.8.22", path = "meerkat-capabilities" }
 meerkat-llm-core = { version = "0.8.22", path = "meerkat-llm-core" }
@@ -275,6 +279,14 @@ type_complexity = "allow"
 multiple_crate_versions = "allow"
 cargo_common_metadata = "allow"
 redundant_feature_names = "allow"
+
+# Interim pin until an oai-rt-rs release ships reqwest with
+# default-features = false: the published 0.4.0 enables reqwest's default-tls
+# (native-tls -> openssl-sys) via feature unification, which dynamically links
+# libssl.so.3/libcrypto.so.3 into every Linux release binary and breaks
+# OpenSSL 1.1 distros (Debian Bullseye). See third-party/oai-rt-rs/Cargo.toml.
+[patch.crates-io]
+oai-rt-rs = { path = "third-party/oai-rt-rs" }
 
 [workspace.metadata.release]
 shared-version = true

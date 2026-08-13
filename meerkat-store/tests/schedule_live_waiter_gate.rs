@@ -181,7 +181,7 @@ async fn sqlite_lease_renewal_is_multi_host_and_exact_claim_authoritative() {
         expected_attempt: awaiting.attempt_count,
         claim_token: original_claim_token,
         expected_owner_id: "host-a".to_string(),
-        lease_duration: Duration::milliseconds(500),
+        lease_duration: Duration::seconds(5),
     };
     let wrong_owner = host_b
         .renew_occurrence_lease_if_current(RenewOccurrenceLeaseRequest {
@@ -224,9 +224,19 @@ async fn sqlite_lease_renewal_is_multi_host_and_exact_claim_authoritative() {
     assert!(renewed_expiry > original_expiry);
     assert_eq!(renewed.attempt_count, 1);
 
-    // Past the original expiry but before the renewed expiry, another host's
-    // claim scan must observe the durable extension and leave attempt 1 live.
-    tokio::time::sleep(std::time::Duration::from_millis(240)).await;
+    // Past the original expiry but with ample headroom before the renewed
+    // expiry, another host's claim scan must observe the durable extension and
+    // leave attempt 1 live. Derive the wait from the store-issued timestamp so
+    // hosted-runner scheduling delay cannot accidentally cross the renewed
+    // lease boundary before this assertion executes.
+    let until_past_original = original_expiry.signed_duration_since(Utc::now());
+    if let Ok(until_past_original) = until_past_original.to_std() {
+        tokio::time::sleep(until_past_original + std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        Utc::now() < renewed_expiry,
+        "fixture must retain renewed-lease headroom before the cross-host claim scan"
+    );
     let executor_lease = match host_a
         .acquire_executor_lease(meerkat_schedule::AcquireScheduleExecutorLeaseRequest {
             owner_id: "live-waiter-test-executor".into(),

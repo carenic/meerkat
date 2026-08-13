@@ -67,19 +67,6 @@ impl CanonicalMemberSnapshotMaterial {
         }
         .with_current_bridge_session_id(self.current_bridge_session_id.clone())
     }
-
-    pub(super) fn to_helper_result(&self) -> Option<HelperResult> {
-        let agent_runtime_id = self.agent_runtime_id.clone()?;
-        let fence_token = self.fence_token?;
-        Some(HelperResult {
-            output: self.output_preview.clone(),
-            tokens_used: self.tokens_used,
-            agent_identity: self.agent_identity.clone(),
-            bounded_result: None,
-            agent_runtime_id,
-            fence_token,
-        })
-    }
 }
 
 #[derive(Debug, Clone)]

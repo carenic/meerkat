@@ -30,7 +30,9 @@ export { Mob } from "./mob.js";
 export type {
   MobBoundedHelperResult,
   MobBoundedHelperResultStatus,
+  MobForkHelperOptions,
   MobHelperResult,
+  MobHelperOptions,
   MobKickoffMemberSnapshot,
   MobKickoffWaitOptions,
   MobMemberSnapshot,

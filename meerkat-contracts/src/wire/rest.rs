@@ -295,6 +295,8 @@ pub struct RestAuthBindingTestRequest {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RestMobHelperRequest {
     pub prompt: String,
+    pub result_label: String,
+    pub max_text_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -315,6 +317,8 @@ pub struct RestMobHelperRequest {
 pub struct RestMobForkHelperRequest {
     pub source_member_id: String,
     pub prompt: String,
+    pub result_label: String,
+    pub max_text_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -460,6 +464,8 @@ mod tests {
     fn mob_helper_requests_carry_structural_auth_binding() {
         let parsed: RestMobHelperRequest = serde_json::from_value(serde_json::json!({
             "prompt": "help",
+            "result_label": "helper-result",
+            "max_text_bytes": 4096,
             "agent_identity": "helper",
             "model_override": "claude-opus-4-6",
             "auth_binding": {
@@ -484,6 +490,8 @@ mod tests {
         let parsed: RestMobForkHelperRequest = serde_json::from_value(serde_json::json!({
             "source_member_id": "source",
             "prompt": "help",
+            "result_label": "fork-result",
+            "max_text_bytes": 4096,
             "agent_identity": "helper",
             "model_override": "gpt-5.4",
             "auth_binding": {
@@ -497,6 +505,25 @@ mod tests {
         assert_eq!(auth_binding.realm.as_str(), "dev");
         assert_eq!(auth_binding.binding.as_str(), "default_anthropic");
         assert!(auth_binding.profile.is_none());
+    }
+
+    #[test]
+    fn mob_helper_requests_require_exact_result_projection() {
+        let spawn_error = serde_json::from_value::<RestMobHelperRequest>(serde_json::json!({
+            "prompt": "help",
+            "agent_identity": "helper"
+        }))
+        .expect_err("spawn helper must require result_label and max_text_bytes");
+        assert!(spawn_error.to_string().contains("result_label"));
+
+        let fork_error = serde_json::from_value::<RestMobForkHelperRequest>(serde_json::json!({
+            "source_member_id": "source",
+            "prompt": "help",
+            "agent_identity": "helper",
+            "result_label": "fork-result"
+        }))
+        .expect_err("fork helper must require max_text_bytes");
+        assert!(fork_error.to_string().contains("max_text_bytes"));
     }
 
     #[test]

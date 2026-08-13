@@ -890,10 +890,13 @@ pub struct FactoryAgentBuilder {
     /// Persistent detached-job store injected into shell-capable builds.
     #[cfg(not(target_arch = "wasm32"))]
     pub default_detached_job_store: Option<Arc<dyn meerkat_jobs::DetachedJobStore>>,
-    /// Mechanical terminal-delivery projector injected into shell-capable builds.
+    /// Mechanical terminal-delivery projector injected into shell-capable
+    /// builds. Held unbound (concrete) so `build_agent` can bind it to each
+    /// session's resolved build realm; a service-lifetime realm binding would
+    /// strand terminal delivery for sessions built under another realm (mob
+    /// members build under `mob.<mob_id>`).
     #[cfg(not(target_arch = "wasm32"))]
-    pub default_shell_job_delivery_projector:
-        Option<Arc<dyn meerkat_tools::builtin::shell::ShellJobDeliveryProjector>>,
+    pub default_shell_job_delivery_projector: Option<crate::JobOutboxProjector>,
     /// Default image-generation executor injected into all builds.
     pub default_image_generation_executor:
         Option<Arc<dyn meerkat_llm_core::ImageGenerationExecutor>>,
@@ -1260,7 +1263,13 @@ impl SessionAgentBuilder for FactoryAgentBuilder {
         if build_config.shell_job_delivery_projector_override.is_none()
             && let Some(projector) = self.default_shell_job_delivery_projector.clone()
         {
-            build_config.shell_job_delivery_projector_override = Some(projector);
+            // Bind delivery authority to the session's resolved build realm so
+            // it is definitionally the realm handed to DurableShellJobRuntime.
+            let projector = match build_config.realm_id.as_ref() {
+                Some(realm_id) => projector.bound_to_realm(realm_id.to_string()),
+                None => projector,
+            };
+            build_config.shell_job_delivery_projector_override = Some(Arc::new(projector));
         }
         if build_config.image_generation_executor_override.is_none()
             && let Some(executor) = self.default_image_generation_executor.clone()

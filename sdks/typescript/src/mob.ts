@@ -42,6 +42,7 @@ import type {
   WireReachability,
 } from "./generated/types.js";
 import type { MeerkatClient, MobMemberLiveOpenOptions } from "./client.js";
+import type { Usage } from "./events.js";
 
 export type MobHandlingMode = "queue" | "steer";
 export type MobRenderClass =
@@ -185,11 +186,32 @@ export interface MobBoundedHelperResult {
 }
 
 export interface MobHelperResult {
-  output?: string;
+  output: string;
   tokensUsed: number;
   agentIdentity: string;
   memberRef: MobMemberRef;
-  boundedResult?: MobBoundedHelperResult;
+  boundedResult: MobBoundedHelperResult;
+  sessionId: string;
+  usage: Usage;
+  turns: number;
+  toolCalls: number;
+  retirementError?: string;
+}
+
+export interface MobHelperOptions {
+  resultLabel: string;
+  maxTextBytes: number;
+  agentIdentity?: string;
+  roleName?: string;
+  profileName?: string;
+  modelOverride?: string;
+  authBinding?: WireAuthBindingRef;
+  runtimeMode?: string;
+  backend?: string;
+}
+
+export interface MobForkHelperOptions extends MobHelperOptions {
+  forkContext?: Record<string, unknown>;
 }
 
 export class Member {
@@ -385,15 +407,7 @@ export class Mob {
 
   async spawnHelper(
     prompt: string,
-    options?: {
-      agentIdentity?: string;
-      roleName?: string;
-      profileName?: string;
-      modelOverride?: string;
-      authBinding?: WireAuthBindingRef;
-      runtimeMode?: string;
-      backend?: string;
-    },
+    options: MobHelperOptions,
   ): Promise<MobHelperResult> {
     return this.client.spawnMobHelper(this.mobId, prompt, options);
   }
@@ -401,16 +415,7 @@ export class Mob {
   async forkHelper(
     sourceMemberId: string,
     prompt: string,
-    options?: {
-      agentIdentity?: string;
-      roleName?: string;
-      profileName?: string;
-      modelOverride?: string;
-      authBinding?: WireAuthBindingRef;
-      forkContext?: Record<string, unknown>;
-      runtimeMode?: string;
-      backend?: string;
-    },
+    options: MobForkHelperOptions,
   ): Promise<MobHelperResult> {
     return this.client.forkMobHelper(this.mobId, sourceMemberId, prompt, options);
   }

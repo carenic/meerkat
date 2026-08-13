@@ -5072,6 +5072,7 @@ pub fn spawn_scripted_member_turn_responder(
                                         fence_token: expected_member.fence_token,
                                         terminal_seq: durable_seq,
                                         outcome: meerkat_mob::runtime::bridge_protocol::WireFlowTurnOutcome::InteractionComplete,
+                                        bounded_result: None,
                                     },
                                 );
                             }

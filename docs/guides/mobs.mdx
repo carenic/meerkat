@@ -297,7 +297,7 @@ Mobs do not use prefabs or templates. Create mobs from
   <Tab title="CLI">
     ```bash
     rkat run --tools full "Create a release-triage mob with a lead and two analysts, then report member status."
-    rkat mob spawn-helper release-triage "Investigate the latest failing check" --agent-identity analyst-3 --profile analyst --json
+    rkat mob spawn-helper release-triage "Investigate the latest failing check" --agent-identity analyst-3 --profile analyst --result-label failing-check --max-text-bytes 4096 --json
     rkat mob wait-kickoff release-triage --timeout-ms 30000 --json
     ```
   </Tab>

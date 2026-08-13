@@ -208,6 +208,7 @@ pub(super) async fn realize_orchestrator_resume_notification(
                 fence_token: fence_token.0,
             },
             outcome_tracking: None,
+            bounded_result_spec: None,
         })
     } else {
         None
@@ -5206,7 +5207,9 @@ async fn seed_mob_authority_sync_from_flow_runs(
                         }
                     }
                     crate::run::MobRunStatus::Canceled => {
-                        super::terminalization::TerminalizationTarget::Canceled
+                        // The original cancellation origin is not
+                        // reconstructable from a bare terminal run snapshot.
+                        super::terminalization::TerminalizationTarget::Canceled { cause: None }
                     }
                     crate::run::MobRunStatus::Pending | crate::run::MobRunStatus::Running => {
                         unreachable!("run terminality was checked above")
@@ -6831,7 +6834,10 @@ pub(super) async fn converge_recovered_active_flow_run(
     )? {
         // Terminal status and terminal event commit through the store's
         // combined seam (single SQLite transaction on durable storage) so
-        // recovery cannot split terminal truth either.
+        // recovery cannot split terminal truth either. This convergence runs
+        // only for a replayed-active run with no surviving execution custody
+        // (the process that was executing it is gone), so the terminal event
+        // carries that typed cause instead of posing as an ordinary cancel.
         let _ = commit_recovered_flow_run_command(
             authority,
             run_store.clone(),
@@ -6840,7 +6846,9 @@ pub(super) async fn converge_recovered_active_flow_run(
             Some(MobRunStatus::Canceled),
             Some((
                 terminalization,
-                super::terminalization::TerminalizationTarget::Canceled,
+                super::terminalization::TerminalizationTarget::Canceled {
+                    cause: Some(crate::event::FlowCancelClass::ExecutionCustodyLost),
+                },
                 before_terminal.flow_id.clone(),
             )),
             "resume_recovered_flow_terminalize_canceled",
@@ -8242,7 +8250,8 @@ impl MobBuilder {
                 storage.runs.clone(),
                 session_service,
                 runtime_adapter,
-                runtime_provisioner,
+                Arc::clone(&runtime_provisioner) as Arc<dyn MobProvisioner>,
+                runtime_provisioner.session_ops_adapter(),
                 tool_bundles,
                 default_llm_client,
                 default_external_tools_provider,
@@ -9118,6 +9127,7 @@ impl MobBuilder {
                                 restore_spec.external_tools.clone(),
                                 None,
                             )?,
+                            compaction_curator_override: None,
                             context: restore_spec.context.clone(),
                             labels: Some(restore_labels.clone()),
                             additional_instructions: restore_spec.additional_instructions.clone(),
@@ -9319,6 +9329,7 @@ impl MobBuilder {
                     restore_spec.external_tools.clone(),
                     None,
                 )?,
+                compaction_curator_override: None,
                 context: restore_spec.context.clone(),
                 labels: Some(restore_labels.clone()),
                 additional_instructions: restore_spec.additional_instructions.clone(),
@@ -9679,7 +9690,7 @@ impl MobBuilder {
             )?;
             let (machine_state_watch_tx, _machine_state_watch_rx) =
                 tokio::sync::watch::channel(dsl_authority.state().clone());
-            let provisioner: Arc<dyn MobProvisioner> = Arc::new(
+            let provisioner = Arc::new(
                 MultiBackendProvisioner::new(
                     session_service.clone(),
                     runtime_adapter.clone(),
@@ -9689,6 +9700,8 @@ impl MobBuilder {
                 )
                 .with_binding_persistence(definition.id.clone(), runtime_metadata.clone()),
             );
+            let session_ops_adapter = provisioner.session_ops_adapter();
+            let provisioner: Arc<dyn MobProvisioner> = provisioner;
             let roster = Arc::new(RwLock::new(RosterAuthority::from_roster(initial_roster)));
             let (command_tx, command_rx) = mpsc::channel(MOB_COMMAND_CHANNEL_CAPACITY);
             let restore_diagnostics = Arc::new(RwLock::new(HashMap::new()));
@@ -9720,6 +9733,7 @@ impl MobBuilder {
                 session_service,
                 runtime_adapter,
                 provisioner,
+                session_ops_adapter,
                 tool_bundles,
                 default_llm_client,
                 default_external_tools_provider,
@@ -9759,6 +9773,7 @@ impl MobBuilder {
         session_service: Arc<dyn MobSessionService>,
         runtime_adapter: RuntimeAdapterOption,
         provisioner: Arc<dyn MobProvisioner>,
+        session_ops_adapter: Arc<super::ops_adapter::MobOpsAdapter>,
         tool_bundles: BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
         default_llm_client: Option<Arc<dyn LlmClient>>,
         default_external_tools_provider: Option<crate::ExternalToolsProvider>,
@@ -9982,11 +9997,13 @@ impl MobBuilder {
                 placed_completion_durable_index,
                 run_store,
                 provisioner,
+                session_ops_adapter,
                 flow_engine,
                 has_orchestrator,
                 notify_orchestrator_on_resume,
                 run_tasks: BTreeMap::new(),
                 run_cancel_tokens: BTreeMap::new(),
+                flow_exact_operations: BTreeMap::new(),
                 flow_streams: handle.flow_streams.clone(),
                 command_tx,
                 flow_target_provisioner,

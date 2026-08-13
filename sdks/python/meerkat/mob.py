@@ -38,6 +38,7 @@ from .types import (
     MobGrantRecord,
     MobMemberLiveTransport,
     ResolvedModelCapabilities,
+    Usage,
 )
 
 MobLifecycleAction = Literal["stop", "resume", "complete", "reset", "destroy"]
@@ -232,11 +233,16 @@ MobBoundedHelperResult = TypedDict(
 MobHelperResult = TypedDict(
     "MobHelperResult",
     {
-        "output": NotRequired[str],
+        "output": str,
         "tokens_used": int,
         "agent_identity": str,
         "member_ref": MobMemberRef,
-        "bounded_result": NotRequired[MobBoundedHelperResult],
+        "bounded_result": MobBoundedHelperResult,
+        "session_id": str,
+        "usage": Usage,
+        "turns": int,
+        "tool_calls": int,
+        "retirement_error": NotRequired[str],
     },
 )
 
@@ -532,6 +538,8 @@ class Mob:
         self,
         prompt: str,
         *,
+        result_label: str,
+        max_text_bytes: int,
         agent_identity: str | None = None,
         role_name: str | None = None,
         model_override: str | None = None,
@@ -539,6 +547,8 @@ class Mob:
         return await self._client.spawn_mob_helper(
             self.id,
             prompt,
+            result_label=result_label,
+            max_text_bytes=max_text_bytes,
             agent_identity=agent_identity,
             role_name=role_name,
             model_override=model_override,
@@ -549,6 +559,8 @@ class Mob:
         source_member_id: str,
         prompt: str,
         *,
+        result_label: str,
+        max_text_bytes: int,
         agent_identity: str | None = None,
         role_name: str | None = None,
         model_override: str | None = None,
@@ -558,6 +570,8 @@ class Mob:
             self.id,
             source_member_id,
             prompt,
+            result_label=result_label,
+            max_text_bytes=max_text_bytes,
             agent_identity=agent_identity,
             role_name=role_name,
             model_override=model_override,

@@ -1582,6 +1582,7 @@ enum Commands {
         /// Optional per-request system prompt override.
         #[arg(
             long = "system",
+            allow_hyphen_values = true,
             hide_short_help = true,
             help_heading = "Advanced options"
         )]
@@ -1659,6 +1660,15 @@ enum Commands {
         #[arg(long, help_heading = "Common options")]
         no_web_search: bool,
 
+        /// Export an ATIF trajectory to the realm trajectory directory when
+        /// the turn completes.
+        #[arg(
+            long = "export-atif",
+            hide_short_help = true,
+            help_heading = "Advanced options"
+        )]
+        export_atif: bool,
+
         /// Provider-specific parameter (KEY=VALUE). Can be repeated.
         #[arg(
             long = "param",
@@ -1721,6 +1731,7 @@ enum Commands {
         #[arg(
             long = "instructions",
             value_name = "TEXT",
+            allow_hyphen_values = true,
             hide_short_help = true,
             help_heading = "Advanced options"
         )]
@@ -1852,6 +1863,7 @@ enum Commands {
         #[arg(
             long = "agent-description",
             value_name = "TEXT",
+            allow_hyphen_values = true,
             hide_short_help = true,
             help_heading = "Advanced options"
         )]
@@ -1909,7 +1921,12 @@ enum Commands {
         question: String,
 
         /// Inert prompt payload for future execution-oriented help
-        #[arg(long, value_name = "PROMPT", help_heading = "Common options")]
+        #[arg(
+            long,
+            value_name = "PROMPT",
+            allow_hyphen_values = true,
+            help_heading = "Common options"
+        )]
         prompt: Option<String>,
 
         /// Plan future execution without executing anything
@@ -2404,6 +2421,15 @@ enum SessionCommands {
         id: String,
     },
 
+    /// Export a persisted session as an ATIF trajectory.
+    ExportAtif {
+        /// Session ID, short handle, or realm-qualified session reference.
+        id: String,
+        /// Destination path. Defaults to the realm trajectory directory.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+
     /// Delete a session
     Delete {
         /// Session ID to delete
@@ -2646,7 +2672,7 @@ enum WorkGraphCommands {
         title: String,
         #[arg(long)]
         namespace: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         description: Option<String>,
         #[arg(long, value_enum, default_value = "pursue")]
         mode: WorkAttentionModeArg,
@@ -2918,7 +2944,7 @@ enum MobCommands {
         #[arg(long = "param")]
         params: Vec<String>,
         /// Sugar for --param prompt=<text>.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         prompt: Option<String>,
         /// Return immediately with the run id instead of waiting for the result.
         #[arg(long)]
@@ -3003,6 +3029,12 @@ enum MobCommands {
         /// Auth binding to use (REALM:BINDING[:PROFILE]).
         #[arg(long)]
         auth_binding: Option<String>,
+        /// Label attached to the certified bounded result.
+        #[arg(long)]
+        result_label: String,
+        /// Maximum UTF-8 bytes retained in the certified result text.
+        #[arg(long)]
+        max_text_bytes: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -3028,6 +3060,12 @@ enum MobCommands {
         /// Auth binding to use (REALM:BINDING[:PROFILE]).
         #[arg(long)]
         auth_binding: Option<String>,
+        /// Label attached to the certified bounded result.
+        #[arg(long)]
+        result_label: String,
+        /// Maximum UTF-8 bytes retained in the certified result text.
+        #[arg(long)]
+        max_text_bytes: usize,
         /// Fork context type (full-history or last-messages)
         #[arg(long, default_value = "full-history")]
         fork_context: String,
@@ -3102,7 +3140,7 @@ enum MobCommands {
         /// Agent identity to respawn
         agent_identity: String,
         /// Initial message for the respawned member
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         initial_message: Option<String>,
     },
     /// Wait for autonomous kickoff turns to complete.
@@ -3499,6 +3537,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             stream,
             no_stream,
             no_web_search,
+            export_atif,
             params,
             provider_params_json,
             output_schema,
@@ -3573,6 +3612,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 stream,
                 no_stream,
                 no_web_search,
+                export_atif,
                 params,
                 provider_params_json,
                 output_schema,
@@ -3649,6 +3689,11 @@ async fn main() -> anyhow::Result<ExitCode> {
                 labels,
             } => list_sessions(limit, offset, labels, &cli_scope).await,
             SessionCommands::Show { id } => show_session(&id, &cli_scope).await,
+            SessionCommands::ExportAtif { id, output } => {
+                let destination = export_session_atif(&id, output, &cli_scope).await?;
+                println!("Wrote ATIF trajectory to {}", destination.display());
+                Ok(())
+            }
             SessionCommands::Delete { session_id } => delete_session(&session_id, &cli_scope).await,
             SessionCommands::Interrupt { session_id } => {
                 interrupt_session(&session_id, &cli_scope).await
@@ -3776,6 +3821,7 @@ async fn handle_help_command(
         stream,
         no_stream,
         false,
+        false,
         Vec::new(),
         None,
         None,
@@ -3830,6 +3876,7 @@ async fn handle_run_command(
     stream: bool,
     no_stream: bool,
     no_web_search: bool,
+    export_atif: bool,
     params: Vec<String>,
     provider_params_json: Option<String>,
     output_schema: Option<String>,
@@ -3930,6 +3977,7 @@ async fn handle_run_command(
             params,
             provider_params_json,
             no_web_search,
+            export_atif,
             stream,
             no_stream,
             stdin,
@@ -4032,6 +4080,7 @@ async fn handle_run_command(
                 stream_policy.clone(),
                 merged_provider_params,
                 no_web_search,
+                export_atif,
                 parsed_output_schema,
                 None,
                 comms_overrides,
@@ -4804,10 +4853,10 @@ async fn handle_config_set(
     Ok(())
 }
 
-/// `rkat --default-model <MODEL>`: validate the model against the injected
-/// catalog + configured custom models, then persist `agent.model` through the
-/// same scope-resolved config runtime every other command reads (project /
-/// user / realm resolution included).
+/// `rkat --default-model <MODEL>`: validate the model against the effective
+/// model registry, then persist `agent.model` through the same scope-resolved
+/// config runtime every other command reads (project / user / realm resolution
+/// included).
 async fn handle_set_default_model(model: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
     let model = model.trim();
     if model.is_empty() {
@@ -4817,15 +4866,31 @@ async fn handle_set_default_model(model: &str, scope: &RuntimeScope) -> anyhow::
     }
     let catalog = meerkat_models::canonical();
     let (config, _) = load_config(scope).await?;
-    let provider = catalog
-        .infer_provider(model)
-        .or_else(|| config.models.custom.get(model).map(|custom| custom.provider))
+    let registry = config
+        .model_registry(catalog)
+        .map_err(|error| anyhow::anyhow!("Invalid effective model registry: {error}"))?;
+    let provider = registry
+        .entry(model)
+        .map(|entry| entry.provider)
         .ok_or_else(|| {
-            let mut known: Vec<&str> = catalog.entries.iter().map(|entry| entry.id).collect();
-            let customs: Vec<&str> = config.models.custom.keys().map(String::as_str).collect();
-            known.extend(customs.iter());
+            let mut known = Vec::new();
+            for provider in [
+                meerkat_core::Provider::Anthropic,
+                meerkat_core::Provider::OpenAI,
+                meerkat_core::Provider::Gemini,
+                meerkat_core::Provider::SelfHosted,
+                meerkat_core::Provider::Other,
+            ] {
+                known.extend(
+                    registry
+                        .entries_for_provider(provider)
+                        .map(|entry| entry.id.as_str()),
+                );
+            }
+            known.sort_unstable();
+            known.dedup();
             anyhow::anyhow!(
-                "unknown model `{model}`. Known models: {}. Custom models are added under [models.<id>] in config with a `provider`.",
+                "unknown model `{model}`. Known models: {}. Custom hosted models are added under [models.<id>] with a `provider`; self-hosted aliases are added under [self_hosted.models.<id>].",
                 known.join(", ")
             )
         })?;
@@ -10679,6 +10744,7 @@ async fn run_agent(
     stream_policy: Option<stream_renderer::StreamRenderPolicy>,
     provider_params: Option<meerkat_core::lifecycle::run_primitive::ProviderParamsOverride>,
     no_web_search: bool,
+    export_atif: bool,
     output_schema: Option<OutputSchema>,
     structured_output_retries: Option<u32>,
     comms_overrides: CommsOverrides,
@@ -10724,6 +10790,7 @@ async fn run_agent(
             stream_policy,
             provider_params,
             no_web_search,
+            export_atif,
             output_schema,
             structured_output_retries,
             comms_overrides,
@@ -10944,6 +11011,7 @@ async fn run_agent(
             custom_models: std::collections::BTreeMap::new(),
             image_generation_provider: None,
             auto_compact_threshold_override: None,
+            compaction_curator_override: None,
             provider: Some(provider.as_core()),
             override_comms: Default::default(),
             self_hosted_server_id: None,
@@ -11218,7 +11286,11 @@ async fn run_agent(
             },
         ))
         .await?;
-
+        if export_atif
+            && let Err(error) = export_session_atif(&session_id.to_string(), None, scope).await
+        {
+            eprintln!("Warning: failed to persist ATIF trajectory: {error}");
+        }
         // Output the result
         match result {
             CliRuntimeTurnResult::Completed(result) => {
@@ -11262,6 +11334,7 @@ async fn resume_session(
     params: Vec<String>,
     provider_params_json: Option<String>,
     no_web_search: bool,
+    export_atif: bool,
     stream: bool,
     no_stream: bool,
     stdin: StdinMode,
@@ -11306,6 +11379,7 @@ async fn resume_session(
         params,
         provider_params_json,
         no_web_search,
+        export_atif,
         stream,
         no_stream,
         stdin,
@@ -11346,6 +11420,7 @@ async fn resume_session_with_llm_override(
     params: Vec<String>,
     provider_params_json: Option<String>,
     no_web_search: bool,
+    export_atif: bool,
     stream: bool,
     no_stream: bool,
     stdin: StdinMode,
@@ -11384,6 +11459,7 @@ async fn resume_session_with_llm_override(
             params,
             provider_params_json,
             no_web_search,
+            export_atif,
             stream,
             no_stream,
             stdin,
@@ -11903,7 +11979,11 @@ async fn resume_session_with_llm_override(
             },
         ))
         .await?;
-
+        if export_atif
+            && let Err(error) = export_session_atif(&session_id.to_string(), None, scope).await
+        {
+            eprintln!("Warning: failed to persist ATIF trajectory: {error}");
+        }
         // Output the result
         log_stage("print_result");
         match result {
@@ -12461,6 +12541,7 @@ impl SurfaceScheduleSessionHost for CliScheduleSessionHost {
             custom_models: std::collections::BTreeMap::new(),
             image_generation_provider: None,
             auto_compact_threshold_override: None,
+            compaction_curator_override: None,
             provider: create.provider,
             output_schema: create.output_schema.clone(),
             structured_output_retries: create.structured_output_retries,
@@ -13445,6 +13526,96 @@ async fn list_sessions(
     }
 }
 
+/// Export a persisted session's durable event log as an ATIF trajectory.
+///
+/// Returns the destination path; callers own all user-facing output so the
+/// post-turn auto-export never writes to stdout (stdout stays pure under
+/// `--output json`).
+#[cfg(feature = "session-store")]
+async fn export_session_atif(
+    raw_id: &str,
+    output: Option<PathBuf>,
+    scope: &RuntimeScope,
+) -> anyhow::Result<PathBuf> {
+    let (config, _) = load_config(scope).await?;
+    let session_id = resolve_flexible_session_id(raw_id, scope, &config).await?;
+    let service = build_cli_persistent_service(scope, config).await?.0;
+    let mut events = Vec::new();
+    let mut from_seq = 1u64;
+    const PAGE_SIZE: usize = 512;
+    loop {
+        let page = service
+            .event_log_read_page(&session_id, from_seq, PAGE_SIZE)
+            .await
+            .map_err(session_err_to_anyhow)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("event projection unavailable for session {session_id}")
+            })?;
+        let page_len = page.len();
+        for stored in page {
+            let mut envelope = EventEnvelope::new_with_source(
+                stored.source,
+                stored.stream_seq.max(stored.seq),
+                stored.mob_id,
+                stored.event,
+            );
+            envelope.seq = stored.seq;
+            envelope.timestamp_ms = stored
+                .timestamp
+                .duration_since(meerkat_core::time_compat::SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            events.push(envelope);
+        }
+        if page_len < PAGE_SIZE {
+            break;
+        }
+        from_seq = events
+            .last()
+            .map(|event| event.seq.saturating_add(1))
+            .ok_or_else(|| anyhow::anyhow!("event replay made no progress"))?;
+    }
+    let trajectory = meerkat_atif::trajectory_from_events(
+        &events,
+        meerkat_atif::Agent {
+            name: "meerkat".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            model_name: None,
+            tool_definitions: None,
+            extra: None,
+        },
+    )?;
+    let destination = output.unwrap_or_else(|| {
+        meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
+            .root
+            .join("trajectories")
+            .join(format!("{session_id}.json"))
+    });
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = destination.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4()));
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .await?;
+    file.write_all(trajectory.to_json()?.as_bytes()).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&temporary, &destination).await?;
+    Ok(destination)
+}
+
+#[cfg(not(feature = "session-store"))]
+async fn export_session_atif(
+    _raw_id: &str,
+    _output: Option<PathBuf>,
+    _scope: &RuntimeScope,
+) -> anyhow::Result<PathBuf> {
+    anyhow::bail!("ATIF export requires session-store support")
+}
+
 /// Show session details from the realm-scoped persistent backend.
 async fn show_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
     #[cfg(not(feature = "session-store"))]
@@ -14415,33 +14586,32 @@ fn render_flow_status_json(run: Option<meerkat_mob::MobRun>) -> anyhow::Result<S
 #[cfg(feature = "mob")]
 fn helper_result_json_value(
     mob_id: &str,
-    output: &Option<String>,
-    tokens_used: u64,
-    agent_identity: &meerkat_mob::AgentIdentity,
-) -> serde_json::Value {
-    serde_json::json!({
-        "output": output,
-        "tokens_used": tokens_used,
-        "agent_identity": agent_identity.as_str(),
-        "member_ref": meerkat_contracts::WireMemberRef::encode(
-            mob_id,
-            agent_identity.as_str(),
-        ),
-    })
+    outcome: &meerkat_mob::BoundedHelperRunOutcome,
+) -> meerkat_contracts::MobHelperResult {
+    let helper = &outcome.helper;
+    let turn = outcome.turn.result();
+    let agent_identity = helper.agent_identity.to_string();
+    meerkat_contracts::MobHelperResult {
+        output: helper.output.clone(),
+        tokens_used: helper.tokens_used,
+        agent_identity: agent_identity.clone(),
+        member_ref: meerkat_contracts::WireMemberRef::encode(mob_id, &agent_identity),
+        bounded_result: helper.bounded_result.to_wire(),
+        session_id: turn.session_id().to_string(),
+        usage: turn.usage().clone(),
+        turns: turn.turns(),
+        tool_calls: turn.tool_calls(),
+        retirement_error: outcome.retirement_error.clone(),
+    }
 }
 
 #[cfg(feature = "mob")]
 fn render_helper_result_json(
     mob_id: &str,
-    result: &meerkat_mob::HelperResult,
+    result: &meerkat_mob::BoundedHelperRunOutcome,
 ) -> anyhow::Result<String> {
-    serde_json::to_string_pretty(&helper_result_json_value(
-        mob_id,
-        &result.output,
-        result.tokens_used,
-        &result.agent_identity,
-    ))
-    .map_err(|e| anyhow::anyhow!("failed to encode helper result: {e}"))
+    serde_json::to_string_pretty(&helper_result_json_value(mob_id, result))
+        .map_err(|e| anyhow::anyhow!("failed to encode helper result: {e}"))
 }
 
 /// Preserve the typed mob error for the single exit mapper (§17.4,
@@ -14821,6 +14991,142 @@ mod mob_typed_exit_tests {
     }
 }
 
+/// Bounded window between a shutdown-signal-driven `cancel_flow` and the
+/// run's durable Canceled terminal. Expiry does not lose the run: the durable
+/// state converges on the next mob hydration.
+#[cfg(feature = "mob")]
+const PACK_RUN_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Which future finished first while a foreground pack flow run waited for
+/// its terminal state.
+#[cfg(feature = "mob")]
+enum PackRunWaitFirst {
+    Terminal(anyhow::Result<meerkat_mob::MobRun>),
+    ShutdownSignal(anyhow::Result<()>),
+}
+
+/// Race the flow terminal wait against the process shutdown signal. Split out
+/// as an injection seam so the signal race is unit-testable without sending
+/// real signals.
+#[cfg(feature = "mob")]
+async fn select_pack_flow_terminal_or_shutdown<W, S>(
+    terminal_wait: W,
+    shutdown: S,
+) -> PackRunWaitFirst
+where
+    W: std::future::Future<Output = anyhow::Result<meerkat_mob::MobRun>>,
+    S: std::future::Future<Output = anyhow::Result<()>>,
+{
+    tokio::pin!(terminal_wait);
+    tokio::pin!(shutdown);
+    tokio::select! {
+        run = &mut terminal_wait => PackRunWaitFirst::Terminal(run),
+        signal = &mut shutdown => PackRunWaitFirst::ShutdownSignal(signal),
+    }
+}
+
+/// Run one pack flow in the foreground on the realm's durable mob custody and
+/// wait for its terminal. When SIGINT/SIGTERM arrives mid-flow, the run is
+/// converged to its durable Canceled terminal within a bounded grace window,
+/// the honest terminal envelope is printed, and a typed error propagates the
+/// nonzero exit so scripted callers observe the interruption.
+#[cfg(feature = "mob")]
+async fn run_pack_flow_foreground(
+    state: &meerkat_mob_mcp::MobMcpState,
+    mob_id: &meerkat_mob::MobId,
+    flow_id: FlowId,
+    params: serde_json::Value,
+    json: bool,
+    warnings: &[String],
+) -> anyhow::Result<String> {
+    let run_id = state
+        .mob_run_flow(mob_id, flow_id, params)
+        .await
+        .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+    match select_pack_flow_terminal_or_shutdown(
+        wait_for_terminal_flow_run(state, mob_id.as_str(), &run_id),
+        mob_host::wait_for_shutdown_signal(),
+    )
+    .await
+    {
+        PackRunWaitFirst::Terminal(run) => render_mob_run_envelope(&run?, json),
+        PackRunWaitFirst::ShutdownSignal(signal) => {
+            signal?;
+            state
+                .mob_cancel_flow(mob_id, run_id.clone())
+                .await
+                .map_err(mob_anyhow)?;
+            let run = tokio::time::timeout(
+                PACK_RUN_CANCEL_GRACE,
+                wait_for_terminal_flow_run(state, mob_id.as_str(), &run_id),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "mob run interrupted: flow run '{run_id}' did not reach its Canceled terminal within {}s; the run is durable and converges on the next mob hydration",
+                    PACK_RUN_CANCEL_GRACE.as_secs()
+                )
+            })??;
+            let (stdout_render, stderr_warnings) = render_mob_run_pack_with_warnings(
+                render_mob_run_envelope(&run, json)?,
+                warnings.to_vec(),
+                json,
+            );
+            for warning in &stderr_warnings {
+                eprintln!("warning\t{warning}");
+            }
+            println!("{stdout_render}");
+            Err(anyhow::anyhow!(
+                "mob run interrupted: shutdown signal received; flow run '{run_id}' terminalized as '{}'",
+                mob_run_status_text(&run.status)
+            ))
+        }
+    }
+}
+
+/// Honest custody statement for `--detach`: flow execution stays inside this
+/// exiting CLI process; only the durable run state survives, and the next mob
+/// hydration converges an unfinished run to canceled (execution custody lost).
+#[cfg(feature = "mob")]
+fn detach_execution_custody_warning(run_id: &RunId) -> String {
+    format!(
+        "mob run --detach does not transfer flow execution to a surviving process: run '{run_id}' executes only while this CLI process lives, and the next mob hydration converges an unfinished run to canceled (execution custody lost)"
+    )
+}
+
+#[cfg(all(test, feature = "mob"))]
+mod pack_run_shutdown_seam_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pack_flow_wait_admits_shutdown_signal_while_terminal_wait_pends() {
+        let first = select_pack_flow_terminal_or_shutdown(
+            std::future::pending::<anyhow::Result<meerkat_mob::MobRun>>(),
+            std::future::ready(Ok(())),
+        )
+        .await;
+        assert!(matches!(first, PackRunWaitFirst::ShutdownSignal(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn pack_flow_wait_prefers_reached_terminal_over_pending_shutdown() {
+        let first = select_pack_flow_terminal_or_shutdown(
+            std::future::ready(Err(anyhow::anyhow!("terminal-first"))),
+            std::future::pending::<anyhow::Result<()>>(),
+        )
+        .await;
+        match first {
+            PackRunWaitFirst::Terminal(result) => {
+                let error = result.expect_err("injected terminal error");
+                assert_eq!(error.to_string(), "terminal-first");
+            }
+            PackRunWaitFirst::ShutdownSignal(_) => {
+                panic!("terminal-first run must not report a shutdown signal")
+            }
+        }
+    }
+}
+
 #[cfg(feature = "mob")]
 async fn wait_for_terminal_flow_run(
     state: &meerkat_mob_mcp::MobMcpState,
@@ -15009,25 +15315,6 @@ fn render_mob_events(events: Vec<meerkat_mob::MobEvent>, json: bool) -> anyhow::
         ));
     }
     Ok(lines.join("\n"))
-}
-
-#[cfg(feature = "mob")]
-async fn await_pack_flow_terminal(
-    mob: &meerkat_mob::MobHandle,
-    run_id: RunId,
-) -> anyhow::Result<meerkat_mob::MobRun> {
-    loop {
-        if let Some(run) = mob
-            .flow_status(run_id.clone())
-            .await
-            .map_err(|err| anyhow::anyhow!("{err}"))?
-            && mob_machine_run_status_is_terminal(&run_id, &run.status)
-                .map_err(|err| anyhow::anyhow!("{err}"))?
-        {
-            return Ok(run);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
 }
 
 #[cfg(feature = "mob")]
@@ -15282,6 +15569,7 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
                         flow_id.as_str()
                     );
                 }
+                eprintln!("warning\t{}", detach_execution_custody_warning(&run_id));
             } else {
                 let run = wait_for_terminal_flow_run(state.as_ref(), &target, &run_id).await?;
                 println!("{}", render_mob_run_envelope(&run, json)?);
@@ -15361,6 +15649,8 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
             profile,
             model,
             auth_binding,
+            result_label,
+            max_text_bytes,
             json,
         } => {
             // #115: the surface must not mint mob-member identity; clap
@@ -15382,13 +15672,15 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
                     mid,
                     prompt,
                     options,
+                    result_label,
+                    max_text_bytes,
                 )
                 .await
                 .map_err(mob_anyhow)?;
             if json {
                 println!("{}", render_helper_result_json(&mob_id, &result)?);
-            } else if let Some(output) = &result.output {
-                println!("{output}");
+            } else {
+                println!("{}", result.helper.output);
             }
             Ok(())
         }
@@ -15400,6 +15692,8 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
             profile,
             model,
             auth_binding,
+            result_label,
+            max_text_bytes,
             fork_context,
             last_messages,
             json,
@@ -15433,13 +15727,15 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
                     prompt,
                     ctx,
                     options,
+                    result_label,
+                    max_text_bytes,
                 )
                 .await
                 .map_err(mob_anyhow)?;
             if json {
                 println!("{}", render_helper_result_json(&mob_id, &result)?);
-            } else if let Some(output) = &result.output {
-                println!("{output}");
+            } else {
+                println!("{}", result.helper.output);
             }
             Ok(())
         }
@@ -16243,6 +16539,44 @@ async fn execute_mob_run_pack(
         DeploySurfaceArg::Cli,
     )?;
     let flow_id = choose_mobpack_flow(&archive, invocation.flow)?;
+    if invocation.detach && flow_id.is_none() {
+        // Refuse before the durable mob-create side effect below.
+        return Err(anyhow::anyhow!(
+            "mob run --detach requires a mobpack with a callable flow"
+        ));
+    }
+
+    // Detached AND foreground pack runs execute on the realm's durable mob
+    // custody (the same persistent surface the installed-mob verbs and
+    // --detach already used): the mob, its run rows, and its frame snapshots
+    // survive this process and stay listable via `rkat mob runs`. A process
+    // death mid-run therefore converges to an honest Canceled terminal on the
+    // next hydration instead of vanishing with an in-memory shadow authority.
+    let (manifest, persistence) = create_persistence_bundle(scope).await?;
+    let surface = get_or_create_cli_persistent_surface_from_bundle(
+        scope,
+        effective_config,
+        manifest,
+        persistence,
+    )
+    .await?;
+    let state = hydrate_cli_mob_state_cached(
+        scope,
+        Arc::clone(&surface.service),
+        Arc::clone(&surface.runtime_adapter),
+        Arc::clone(&surface.mob_state_cache),
+    )
+    .await?;
+    let source_identity =
+        meerkat_mob::MobDefinitionSourceIdentity::mobpack(digest.to_string(), warnings.clone());
+    let mob_id = state
+        .mob_create_from_mobpack(
+            archive.definition.clone(),
+            archive.skills.clone(),
+            source_identity,
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
 
     if invocation.detach {
         let Some(flow_id) = flow_id else {
@@ -16250,31 +16584,6 @@ async fn execute_mob_run_pack(
                 "mob run --detach requires a mobpack with a callable flow"
             ));
         };
-        let (manifest, persistence) = create_persistence_bundle(scope).await?;
-        let surface = get_or_create_cli_persistent_surface_from_bundle(
-            scope,
-            effective_config,
-            manifest,
-            persistence,
-        )
-        .await?;
-        let state = hydrate_cli_mob_state_cached(
-            scope,
-            Arc::clone(&surface.service),
-            Arc::clone(&surface.runtime_adapter),
-            Arc::clone(&surface.mob_state_cache),
-        )
-        .await?;
-        let source_identity =
-            meerkat_mob::MobDefinitionSourceIdentity::mobpack(digest.to_string(), warnings.clone());
-        let mob_id = state
-            .mob_create_from_mobpack(
-                archive.definition.clone(),
-                archive.skills.clone(),
-                source_identity,
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
         let run_id = state
             .mob_run_flow(&mob_id, flow_id.clone(), params)
             .await
@@ -16293,58 +16602,46 @@ async fn execute_mob_run_pack(
                 flow_id.as_str()
             )
         };
-        return render_mob_run_pack_with_warnings(rendered, warnings);
+        let mut warnings = warnings;
+        warnings.push(detach_execution_custody_warning(&run_id));
+        let (stdout_render, stderr_warnings) =
+            render_mob_run_pack_with_warnings(rendered, warnings, invocation.json);
+        for warning in &stderr_warnings {
+            eprintln!("warning\t{warning}");
+        }
+        return Ok(stdout_render);
     }
-
-    // ADJ-2: remote (placed) spawns of skill-less profiles resolve their
-    // base prompt from the controlling host's factory chain.
-    let spawn_base_prompt_source = Arc::new(meerkat_mob::FactoryChainSpawnBasePromptSource::new(
-        Arc::new(effective_config.clone()),
-        scope.context_root.clone(),
-    ));
-    let session_service = build_deploy_mob_session_service(scope, effective_config.clone()).await?;
-    let run_spec = archive.mob_run_spec();
-    let controlling_acceptor =
-        controlling_acceptor_from_config(&effective_config, Arc::clone(&session_service))?;
-    let mut builder = meerkat_mob::MobBuilder::from_mobpack(
-        run_spec.definition().clone(),
-        run_spec.packed_skills().clone(),
-        meerkat_mob::MobStorage::in_memory(),
-    )
-    .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?
-    .with_session_service(session_service.clone())
-    .with_spawn_base_prompt_source(spawn_base_prompt_source)
-    .with_workgraph_service(Some(open_workgraph_service(scope).await?));
-    if let Some(adapter) = session_service.runtime_adapter() {
-        builder = builder.with_runtime_adapter(adapter);
-    }
-    if let Some(acceptor) = controlling_acceptor {
-        builder = builder.with_controlling_acceptor(acceptor);
-    }
-    let handle = builder
-        .create()
-        .await
-        .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
 
     let rendered = if let Some(flow_id) = flow_id {
-        let run_id = handle
-            .run_flow(flow_id, params)
-            .await
-            .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
-        let run = await_pack_flow_terminal(&handle, run_id)
-            .await
-            .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
-        render_mob_run_envelope(&run, invocation.json)?
+        run_pack_flow_foreground(
+            state.as_ref(),
+            &mob_id,
+            flow_id,
+            params,
+            invocation.json,
+            &warnings,
+        )
+        .await?
     } else {
         let objective = invocation
             .prompt
             .map(str::to_string)
             .unwrap_or_else(|| params.to_string());
+        let run_spec = archive.mob_run_spec();
         if run_spec.is_callable() {
+            let handle = state
+                .mob_handles_snapshot()
+                .await
+                .map_err(mob_anyhow)?
+                .into_iter()
+                .find_map(|(id, handle)| (id == mob_id).then_some(handle))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("mob run failed: mob '{mob_id}' vanished after creation")
+                })?;
             let outcome = meerkat_mob::run_mobpack_callable(
                 &run_spec,
                 handle,
-                session_service.clone(),
+                state.session_service(),
                 &objective,
             )
             .await
@@ -16374,14 +16671,15 @@ async fn execute_mob_run_pack(
                 .next()
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("mob run failed: pack has no callable flow"))?;
-            let run_id = handle
-                .run_flow(flow_id, params)
-                .await
-                .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
-            let run = await_pack_flow_terminal(&handle, run_id)
-                .await
-                .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
-            render_mob_run_envelope(&run, invocation.json)?
+            run_pack_flow_foreground(
+                state.as_ref(),
+                &mob_id,
+                flow_id,
+                params,
+                invocation.json,
+                &warnings,
+            )
+            .await?
         } else {
             return Err(anyhow::anyhow!(
                 "mob run failed: pack has no unambiguous callable flow; pass --flow"
@@ -16389,23 +16687,32 @@ async fn execute_mob_run_pack(
         }
     };
 
-    render_mob_run_pack_with_warnings(rendered, warnings)
+    let (stdout_render, stderr_warnings) =
+        render_mob_run_pack_with_warnings(rendered, warnings, invocation.json);
+    for warning in &stderr_warnings {
+        eprintln!("warning\t{warning}");
+    }
+    Ok(stdout_render)
 }
 
+/// Splits the mob run pack output between the two channels: under --json,
+/// stdout must stay a single machine-readable JSON document, so warnings are
+/// returned separately for the caller to route to stderr; in text mode they
+/// stay appended to the stdout render.
 #[cfg(feature = "mob")]
 fn render_mob_run_pack_with_warnings(
     rendered: String,
     warnings: Vec<String>,
-) -> anyhow::Result<String> {
-    if warnings.is_empty() {
-        Ok(rendered)
-    } else {
-        let mut out = rendered;
-        for warning in warnings {
-            out.push_str(&format!("\nwarning\t{warning}"));
-        }
-        Ok(out)
+    json: bool,
+) -> (String, Vec<String>) {
+    if json {
+        return (rendered, warnings);
     }
+    let mut out = rendered;
+    for warning in &warnings {
+        out.push_str(&format!("\nwarning\t{warning}"));
+    }
+    (out, Vec::new())
 }
 
 #[cfg(all(feature = "mob", feature = "rpc-surface"))]
@@ -20338,6 +20645,7 @@ default_model = "gemma"
             false,
             true,
             false,
+            false,
             Vec::new(),
             None,
             None,
@@ -21265,6 +21573,146 @@ default_model = "gemma"
     }
 
     #[test]
+    fn test_free_text_options_accept_leading_hyphen_values() {
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "run",
+            "hello",
+            "--system",
+            "- leading system text",
+            "--instructions",
+            "- leading instruction",
+            "--agent-description",
+            "- leading description",
+        ])
+        .expect("run free-text options should accept leading-hyphen values");
+        match cli.command.expect("test invocation parses a subcommand") {
+            Commands::Run {
+                system_prompt,
+                instructions,
+                agent_description,
+                ..
+            } => {
+                assert_eq!(system_prompt.as_deref(), Some("- leading system text"));
+                assert_eq!(instructions, vec!["- leading instruction"]);
+                assert_eq!(agent_description.as_deref(), Some("- leading description"));
+            }
+            _ => unreachable!("expected run command"),
+        }
+
+        let cli = Cli::try_parse_from(["rkat", "help", "question", "--prompt", "- leading prompt"])
+            .expect("help --prompt should accept leading-hyphen values");
+        match cli.command.expect("test invocation parses a subcommand") {
+            Commands::Help { prompt, .. } => {
+                assert_eq!(prompt.as_deref(), Some("- leading prompt"));
+            }
+            _ => unreachable!("expected help command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "workgraph",
+            "goal-create",
+            "019e63c2-0000-7000-8000-000000000030",
+            "goal title",
+            "--description",
+            "- leading goal description",
+        ])
+        .expect("goal-create --description should accept leading-hyphen values");
+        match cli.command.expect("test invocation parses a subcommand") {
+            Commands::WorkGraph {
+                command: WorkGraphCommands::GoalCreate { description, .. },
+            } => {
+                assert_eq!(description.as_deref(), Some("- leading goal description"));
+            }
+            _ => unreachable!("expected workgraph goal-create command"),
+        }
+
+        // Positional prompts stay strict: hyphen-leading values go through the
+        // standard `--` terminator, so mistyped flags still error loudly.
+        let cli = Cli::try_parse_from(["rkat", "run", "--", "-starts-with-hyphen"])
+            .expect("run positional prompt should accept hyphen values after --");
+        match cli.command.expect("test invocation parses a subcommand") {
+            Commands::Run { prompt, .. } => {
+                assert_eq!(prompt, "-starts-with-hyphen");
+            }
+            _ => unreachable!("expected run command"),
+        }
+    }
+
+    #[cfg(feature = "mob")]
+    #[test]
+    fn test_mob_free_text_options_accept_leading_hyphen_values() {
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "mob",
+            "run",
+            "pack.mobpack",
+            "--prompt",
+            "- leading text",
+        ])
+        .expect("mob run --prompt should accept leading-hyphen values");
+        match cli.command {
+            Some(Commands::Mob {
+                command: MobCommands::Run { prompt, .. },
+            }) => {
+                assert_eq!(prompt.as_deref(), Some("- leading text"));
+            }
+            _ => unreachable!("expected mob run command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "mob",
+            "respawn",
+            "mob-1",
+            "agent-1",
+            "--initial-message",
+            "- leading message",
+        ])
+        .expect("mob respawn --initial-message should accept leading-hyphen values");
+        match cli.command {
+            Some(Commands::Mob {
+                command:
+                    MobCommands::Respawn {
+                        initial_message, ..
+                    },
+            }) => {
+                assert_eq!(initial_message.as_deref(), Some("- leading message"));
+            }
+            _ => unreachable!("expected mob respawn command"),
+        }
+    }
+
+    #[cfg(feature = "mob")]
+    #[test]
+    fn test_mob_run_pack_warnings_route_off_stdout_under_json() {
+        let warnings = vec!["unsigned pack accepted in permissive mode".to_string()];
+
+        let (stdout_render, stderr_warnings) = render_mob_run_pack_with_warnings(
+            serde_json::json!({"status": "completed"}).to_string(),
+            warnings.clone(),
+            true,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&stdout_render)
+            .expect("--json stdout must stay a single strict JSON document");
+        assert_eq!(parsed["status"], "completed");
+        assert!(
+            !stdout_render.contains("warning\t"),
+            "--json stdout must carry no warning lines: {stdout_render}"
+        );
+        assert_eq!(stderr_warnings, warnings);
+
+        let (text_render, deferred) =
+            render_mob_run_pack_with_warnings("run\tmob=demo".to_string(), warnings, false);
+        assert_eq!(
+            text_render,
+            "run\tmob=demo\nwarning\tunsigned pack accepted in permissive mode"
+        );
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
     fn test_default_trace_filter_is_quiet_unless_run_verbose() {
         let cli = Cli::try_parse_from(normalize_cli_args(["rkat", "run", "hello"].map(Into::into)))
             .expect("run should parse");
@@ -21839,6 +22287,10 @@ default_model = "gemma"
             "inspect",
             "--agent-identity",
             "reviewer",
+            "--result-label",
+            "review-result",
+            "--max-text-bytes",
+            "4096",
             "--model",
             "openai/gpt-5.4",
         ])
@@ -21859,6 +22311,10 @@ default_model = "gemma"
             "inspect",
             "--agent-identity",
             "reviewer",
+            "--result-label",
+            "review-result",
+            "--max-text-bytes",
+            "4096",
             "--model",
             "anthropic/claude-opus-4-6",
         ])
@@ -21869,6 +22325,27 @@ default_model = "gemma"
             }) => assert_eq!(model.as_deref(), Some("anthropic/claude-opus-4-6")),
             _ => unreachable!("expected mob fork-helper command"),
         }
+    }
+
+    #[cfg(feature = "mob")]
+    #[test]
+    fn test_mob_helper_exact_result_flags_are_required() {
+        let parsed = Cli::try_parse_from([
+            "rkat",
+            "mob",
+            "spawn-helper",
+            "mob-1",
+            "inspect",
+            "--agent-identity",
+            "reviewer",
+        ]);
+        let error = match parsed {
+            Ok(_) => panic!("spawn-helper must require exact result flags"),
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("--result-label"));
+        assert!(rendered.contains("--max-text-bytes"));
     }
 
     #[cfg(feature = "mob")]
@@ -24248,6 +24725,7 @@ capabilities = ["rpc"]
             custom_models: std::collections::BTreeMap::new(),
             image_generation_provider: None,
             auto_compact_threshold_override: None,
+            compaction_curator_override: None,
             mob_tools: Some(mob_factory),
             llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
                 llm_override,
@@ -24537,6 +25015,7 @@ default_model = "gpt-5.4"
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
                         llm_override,
                     )),
@@ -24688,6 +25167,7 @@ default_model = "gpt-5.4"
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(session),
                     runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
                     llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
@@ -24924,6 +25404,7 @@ default_model = "gpt-5.4"
                 custom_models: std::collections::BTreeMap::new(),
                 image_generation_provider: None,
                 auto_compact_threshold_override: None,
+                compaction_curator_override: None,
                 llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
                     llm_override,
                 )),
@@ -25065,6 +25546,7 @@ default_model = "gpt-5.4"
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(session),
                     runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
                     llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
@@ -25142,6 +25624,7 @@ default_model = "gpt-5.4"
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
                         llm_override,
                     )),
@@ -25247,6 +25730,7 @@ default_model = "gpt-5.4"
                 custom_models: std::collections::BTreeMap::new(),
                 image_generation_provider: None,
                 auto_compact_threshold_override: None,
+                compaction_curator_override: None,
                 resume_session: Some(session),
                 runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
                 initial_turn_metadata: Some(meerkat_runtime::runtime_stamped_prompt_turn_metadata(
@@ -25318,6 +25802,7 @@ default_model = "gpt-5.4"
                 custom_models: std::collections::BTreeMap::new(),
                 image_generation_provider: None,
                 auto_compact_threshold_override: None,
+                compaction_curator_override: None,
                 resume_session: Some(session),
                 runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
                 initial_turn_metadata: Some(meerkat_runtime::runtime_stamped_prompt_turn_metadata(
@@ -25376,14 +25861,32 @@ default_model = "gpt-5.4"
 
     #[cfg(feature = "mob")]
     #[test]
-    fn test_helper_json_uses_member_ref_not_binding_atoms() {
-        let identity = meerkat_mob::AgentIdentity::from("helper-json");
-        let output = Some("done".to_string());
-        let value = helper_result_json_value("mob-json", &output, 7, &identity);
+    fn test_helper_json_contract_uses_exact_result_carrier() {
+        let result = meerkat_contracts::MobHelperResult {
+            output: "done".to_string(),
+            tokens_used: 7,
+            agent_identity: "helper-json".to_string(),
+            member_ref: meerkat_contracts::WireMemberRef::encode("mob-json", "helper-json"),
+            bounded_result: meerkat_contracts::MobBoundedHelperResult {
+                label: "cli-result".to_string(),
+                status: meerkat_contracts::MobBoundedHelperResultStatus::Completed,
+                text: "done".to_string(),
+            },
+            session_id: "session-json".to_string(),
+            usage: meerkat_core::Usage::default(),
+            turns: 1,
+            tool_calls: 0,
+            retirement_error: None,
+        };
+        let value = serde_json::to_value(result).expect("helper result serializes");
 
         assert_eq!(value["agent_identity"], "helper-json");
         assert_eq!(value["tokens_used"], 7);
         assert_eq!(value["output"], "done");
+        assert_eq!(value["bounded_result"]["label"], "cli-result");
+        assert_eq!(value["session_id"], "session-json");
+        assert_eq!(value["turns"], 1);
+        assert_eq!(value["tool_calls"], 0);
         assert!(value.get("agent_runtime_id").is_none());
         assert!(value.get("fence_token").is_none());
         let member_ref = value["member_ref"]
@@ -26412,6 +26915,65 @@ supports_reasoning = true
 
         let (config, _) = load_config(&scope).await.expect("reload config");
         assert_eq!(config.agent.model, "my-local-llm");
+    }
+
+    #[tokio::test]
+    async fn test_set_default_model_honors_configured_self_hosted_alias() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = test_scope_with_context(dir.path().to_path_buf());
+
+        handle_config_patch(
+            None,
+            Some(
+                serde_json::json!({
+                    "self_hosted": {
+                        "default_model": "muse-glimmer-30b",
+                        "servers": {
+                            "muse_vllm": {
+                                "transport": "openai_compatible",
+                                "base_url": "http://127.0.0.1:8000",
+                                "api_style": "chat_completions"
+                            }
+                        },
+                        "models": {
+                            "muse-glimmer-30b": {
+                                "server": "muse_vllm",
+                                "remote_model": "muse-glimmer-30b",
+                                "display_name": "Muse Glimmer 30B",
+                                "family": "muse-glimmer",
+                                "tier": "supported",
+                                "context_window": 262144,
+                                "max_output_tokens": 16384,
+                                "vision": false,
+                                "image_tool_results": false,
+                                "inline_video": false,
+                                "supports_temperature": true,
+                                "supports_thinking": true,
+                                "supports_reasoning": true,
+                                "supports_web_search": false,
+                                "call_timeout_secs": 1800
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+            None,
+            &scope,
+        )
+        .await
+        .expect("register self-hosted alias");
+
+        handle_set_default_model("muse-glimmer-30b", &scope)
+            .await
+            .expect("self-hosted alias persists");
+
+        let (config, _) = load_config(&scope).await.expect("reload config");
+        assert_eq!(config.agent.model, "muse-glimmer-30b");
+        let resolved = resolve_cli_create_session_model(&config, None, None, None)
+            .expect("omitted run model resolves through the configured agent default");
+        assert_eq!(resolved.model, "muse-glimmer-30b");
+        assert_eq!(resolved.provider, meerkat_core::Provider::SelfHosted);
     }
 
     #[tokio::test]

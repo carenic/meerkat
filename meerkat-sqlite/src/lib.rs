@@ -54,10 +54,11 @@ pub use error::{SqliteErrorClass, SqliteStoreError, classify_sqlite_error, is_bu
 pub use fence::{ExclusiveFence, OperationGuard, fence_lock_path};
 pub use json_column::JsonColumnBytes;
 pub use ledger::{
-    LedgerReport, MaintenanceBridgeReport, MaintenancePrepareReport, Migration, SchemaDomain,
-    SchemaObject, SchemaObjectKind, SchemaPredecessor, apply_domain_migrations,
-    bridge_unledgered_domain, domain_version, preflight_schema_eligibility,
-    verify_released_schema_fingerprint,
+    LedgerReport, MaintenanceBridgeReport, MaintenancePrepareFn, MaintenancePrepareReport,
+    Migration, SchemaDomain, SchemaObject, SchemaObjectKind, SchemaPredecessor,
+    apply_domain_migrations, bridge_unledgered_domain, domain_version,
+    preflight_schema_eligibility, verify_released_schema_fingerprint,
+    verify_released_schema_structure,
 };
 pub use profile::{
     ConnectionProfile, OpenOptions, SHARED_BUSY_TIMEOUT, WriteContact, begin_immediate, open,

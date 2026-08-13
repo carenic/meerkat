@@ -525,6 +525,18 @@ fn build_service_infrastructure(
     config: Config,
     max_sessions: usize,
 ) -> Result<(Arc<WasmStandaloneSessionService>, Arc<MobMcpState>), JsValue> {
+    build_service_infrastructure_with_default_llm_client(config, max_sessions, None)
+}
+
+/// Same wiring as [`build_service_infrastructure`] with an explicit default
+/// LLM client. Production callers pass `None` (build_agent resolves the
+/// provider per-model from realm config bindings); tests inject a
+/// deterministic client so member turns complete without live credentials.
+fn build_service_infrastructure_with_default_llm_client(
+    config: Config,
+    max_sessions: usize,
+    default_llm_client: Option<Arc<dyn meerkat::LlmClient>>,
+) -> Result<(Arc<WasmStandaloneSessionService>, Arc<MobMcpState>), JsValue> {
     // Plan §4d.wasm.1 closure — wire the JS external-auth callback into
     // the provider runtime registry. The resolver itself handles the
     // "no callback registered" case by returning `MissingSecret`; we
@@ -540,9 +552,11 @@ fn build_service_infrastructure(
     let factory = meerkat::AgentFactory::minimal();
     let mut builder = meerkat::FactoryAgentBuilder::new(factory, config);
 
-    // NO default_llm_client — build_agent() resolves the correct provider per-model
-    // from realm config bindings. This is architecturally correct: per-agent
-    // provider agnosticity works the same way on WASM as on all other surfaces.
+    // NO default_llm_client in production - build_agent() resolves the correct
+    // provider per-model from realm config bindings. This is architecturally
+    // correct: per-agent provider agnosticity works the same way on WASM as on
+    // all other surfaces. Tests may inject a deterministic default client.
+    builder.default_llm_client = default_llm_client;
 
     let tools = build_wasm_tool_dispatcher().map_err(|e| err_str("tool_error", e))?;
     builder.default_tool_dispatcher = Some(tools);
@@ -660,16 +674,26 @@ fn spawn_member_result_payload(
     )
 }
 
-fn helper_result_payload(mob_id: &MobId, result: &meerkat_mob::HelperResult) -> serde_json::Value {
-    let identity_str = result.agent_identity.to_string();
+fn helper_result_payload(
+    mob_id: &MobId,
+    outcome: &meerkat_mob::BoundedHelperRunOutcome,
+) -> serde_json::Value {
+    let helper = &outcome.helper;
+    let turn = outcome.turn.result();
+    let identity_str = helper.agent_identity.to_string();
     let mut payload = serde_json::json!({
-        "output": result.output,
-        "tokens_used": result.tokens_used,
-        "agent_identity": result.agent_identity,
+        "output": helper.output,
+        "tokens_used": helper.tokens_used,
+        "agent_identity": helper.agent_identity,
         "member_ref": meerkat_contracts::WireMemberRef::encode(mob_id.as_str(), &identity_str),
+        "bounded_result": helper.bounded_result.to_wire(),
+        "session_id": turn.session_id(),
+        "usage": turn.usage(),
+        "turns": turn.turns(),
+        "tool_calls": turn.tool_calls(),
     });
-    if let Some(bounded_result) = result.bounded_result.as_ref() {
-        payload["bounded_result"] = serde_json::json!(bounded_result.to_wire());
+    if let Some(error) = outcome.retirement_error.as_ref() {
+        payload["retirement_error"] = serde_json::Value::String(error.clone());
     }
     payload
 }
@@ -708,6 +732,10 @@ fn mob_error_value(error: &meerkat_mob::MobError) -> serde_json::Value {
 
 fn err_mob(e: meerkat_mob::MobError) -> JsValue {
     js_from_value(mob_error_value(&e))
+}
+
+fn err_bounded_member_run(e: meerkat_mob::BoundedMemberRunError) -> JsValue {
+    err_str("mob_helper_error", e)
 }
 
 fn mob_destroy_error_value(e: MobMcpDestroyError) -> serde_json::Value {
@@ -2390,6 +2418,8 @@ struct MobMemberSendOptions {
 #[serde(deny_unknown_fields)]
 struct MobSpawnHelperOptions {
     prompt: String,
+    result_label: String,
+    max_text_bytes: usize,
     #[serde(default)]
     agent_identity: Option<String>,
     #[serde(default)]
@@ -2409,6 +2439,8 @@ struct MobSpawnHelperOptions {
 struct MobForkHelperOptions {
     source_member_id: String,
     prompt: String,
+    result_label: String,
+    max_text_bytes: usize,
     #[serde(default)]
     agent_identity: Option<String>,
     #[serde(default)]
@@ -2580,9 +2612,16 @@ pub async fn mob_spawn_helper(mob_id: &str, request_json: &str) -> Result<JsValu
     options.runtime_mode = request.runtime_mode;
     options.backend = request.backend;
     let result = mob_state
-        .mob_spawn_helper(&id, identity, request.prompt, options)
+        .mob_spawn_helper(
+            &id,
+            identity,
+            request.prompt,
+            options,
+            request.result_label,
+            request.max_text_bytes,
+        )
         .await
-        .map_err(err_mob)?;
+        .map_err(err_bounded_member_run)?;
     let json = serde_json::to_string(&helper_result_payload(&id, &result))
         .map_err(|e| err_str("serialize", e))?;
     Ok(JsValue::from_str(&json))
@@ -2626,9 +2665,11 @@ pub async fn mob_fork_helper(mob_id: &str, request_json: &str) -> Result<JsValue
             request.prompt,
             fork_context,
             options,
+            request.result_label,
+            request.max_text_bytes,
         )
         .await
-        .map_err(err_mob)?;
+        .map_err(err_bounded_member_run)?;
     let json = serde_json::to_string(&helper_result_payload(&id, &result))
         .map_err(|e| err_str("serialize", e))?;
     Ok(JsValue::from_str(&json))
@@ -2984,8 +3025,9 @@ mod tests {
     };
     #[cfg(not(target_arch = "wasm32"))]
     use super::{
-        build_service_infrastructure, destroy_session_with_services, mob_destroy_error_value,
-        mob_error_value, populate_realm_from_api_keys,
+        build_service_infrastructure, build_service_infrastructure_with_default_llm_client,
+        destroy_session_with_services, mob_destroy_error_value, mob_error_value,
+        populate_realm_from_api_keys,
     };
     #[cfg(not(target_arch = "wasm32"))]
     use super::{helper_result_payload, spawn_member_result_payload};
@@ -3540,6 +3582,8 @@ capabilities = [{capability_values}]
     fn helper_request_options_deserialize_canonical_model_override() {
         let spawn: MobSpawnHelperOptions = serde_json::from_value(json!({
             "prompt": "help",
+            "result_label": "spawn-result",
+            "max_text_bytes": 4096,
             "agent_identity": "helper-1",
             "model_override": "gpt-5.6-sol"
         }))
@@ -3549,11 +3593,33 @@ capabilities = [{capability_values}]
         let fork: MobForkHelperOptions = serde_json::from_value(json!({
             "source_member_id": "source-1",
             "prompt": "review",
+            "result_label": "fork-result",
+            "max_text_bytes": 4096,
             "agent_identity": "fork-1",
             "model_override": "claude-opus-4-8"
         }))
         .expect("fork helper request");
         assert_eq!(fork.model_override.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn helper_request_options_require_exact_result_projection() {
+        let error = serde_json::from_value::<MobSpawnHelperOptions>(json!({
+            "prompt": "help",
+            "agent_identity": "helper-1",
+            "max_text_bytes": 4096
+        }))
+        .expect_err("result_label is required");
+        assert!(error.to_string().contains("result_label"));
+
+        let error = serde_json::from_value::<MobForkHelperOptions>(json!({
+            "source_member_id": "source-1",
+            "prompt": "review",
+            "agent_identity": "fork-1",
+            "result_label": "fork-result"
+        }))
+        .expect_err("max_text_bytes is required");
+        assert!(error.to_string().contains("max_text_bytes"));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -3566,8 +3632,17 @@ capabilities = [{capability_values}]
             &HashMap::from([("anthropic".to_string(), "sk-test".to_string())]),
             None,
         );
-        let (_service, mob_state) =
-            build_service_infrastructure(config, 8).expect("build runtime services");
+        // spawn_helper awaits one exact committed model turn, so the harness
+        // needs a deterministic LLM client: without it the fake key fails the
+        // turn fatally and the bounded wait observes RuntimeTerminated.
+        let (_service, mob_state) = build_service_infrastructure_with_default_llm_client(
+            config,
+            8,
+            Some(Arc::new(meerkat_llm_core::TestClient::for_provider(
+                meerkat_core::Provider::Anthropic,
+            ))),
+        )
+        .expect("build runtime services");
 
         let definition: meerkat_mob::MobDefinition = serde_json::from_value(json!({
             "id": "mob-web-helper-payload",
@@ -3592,6 +3667,8 @@ capabilities = [{capability_values}]
                 meerkat_mob::AgentIdentity::from("helper-1"),
                 "say hi".to_string(),
                 options,
+                "web-helper-result",
+                4096,
             )
             .await
             .expect("spawn helper");
@@ -3600,6 +3677,12 @@ capabilities = [{capability_values}]
         assert!(payload.get("output").is_some());
         assert!(payload["tokens_used"].as_u64().is_some());
         assert_eq!(payload["agent_identity"], "helper-1");
+        assert_eq!(payload["bounded_result"]["label"], "web-helper-result");
+        assert!(payload["session_id"].is_string());
+        assert!(payload["usage"].is_object());
+        assert!(payload["turns"].is_number());
+        assert!(payload["tool_calls"].is_number());
+        assert!(payload.get("retirement_error").is_none());
         assert!(
             payload.get("agent_runtime_id").is_none(),
             "binding-era agent_runtime_id must not leak to app-facing payloads"

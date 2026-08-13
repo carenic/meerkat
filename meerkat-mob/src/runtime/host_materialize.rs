@@ -2600,6 +2600,7 @@ impl HostMemberMaterializer {
             // compile — `mount_member_operator_tools` sets
             // `config.external_tools` once the runtime exists.
             external_tools: None,
+            compaction_curator_override: None,
             context: decompiled.context.clone(),
             labels: decompiled.labels.clone(),
             additional_instructions: decompiled.additional_instructions.clone(),

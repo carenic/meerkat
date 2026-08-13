@@ -1403,6 +1403,110 @@ pub struct BridgeTurnOutcomeRecord {
     /// Durable `StoredEvent.seq` of the terminal event for this turn.
     pub terminal_seq: u64,
     pub outcome: WireFlowTurnOutcome,
+    /// Receiver-bounded exact result for a tracked plain interaction.
+    ///
+    /// Present only when the delivery supplied `bounded_result_spec` before
+    /// admission and the exact terminal carried a committed `RunResult`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_result: Option<BridgeBoundedTurnResult>,
+}
+
+/// Pre-admission receiver-owned bound for one exact placed turn result.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeBoundedResultSpec {
+    pub label: String,
+    pub max_text_bytes: u64,
+}
+
+pub const BRIDGE_BOUNDED_RESULT_MAX_LABEL_BYTES: usize = 128;
+pub const BRIDGE_BOUNDED_RESULT_TRUNCATION_MARKER: &str = "\n[truncated]";
+
+impl BridgeBoundedResultSpec {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.label.is_empty() || self.label.len() > BRIDGE_BOUNDED_RESULT_MAX_LABEL_BYTES {
+            return Err(format!(
+                "bounded result label must contain 1-{BRIDGE_BOUNDED_RESULT_MAX_LABEL_BYTES} UTF-8 bytes (actual {})",
+                self.label.len()
+            ));
+        }
+        if self.max_text_bytes
+            < u64::try_from(BRIDGE_BOUNDED_RESULT_TRUNCATION_MARKER.len()).unwrap_or(u64::MAX)
+        {
+            return Err(format!(
+                "bounded result max_text_bytes must be at least {}",
+                BRIDGE_BOUNDED_RESULT_TRUNCATION_MARKER.len()
+            ));
+        }
+        usize::try_from(self.max_text_bytes)
+            .map(|_| ())
+            .map_err(|_| {
+                "bounded result max_text_bytes exceeds this host's address space".to_string()
+            })
+    }
+
+    /// Derive the largest requested text budget whose worst-case JSON string
+    /// expansion still fits one durable turn-outcome record.
+    ///
+    /// Every source byte can encode as six JSON bytes (a control character).
+    /// The empty bounded-result record supplies exact fixed framing, including
+    /// the caller label and the widest scalar metadata.
+    pub fn protocol_safe_text_ceiling_bytes(
+        &self,
+        input_id: &str,
+        generation: u64,
+        fence_token: u64,
+        record_ceiling_bytes: usize,
+    ) -> Result<usize, String> {
+        self.validate()?;
+        let empty = BridgeTurnOutcomeRecord {
+            input_id: input_id.to_string(),
+            generation,
+            fence_token,
+            terminal_seq: u64::MAX,
+            outcome: WireFlowTurnOutcome::RunCompleted,
+            bounded_result: Some(BridgeBoundedTurnResult {
+                result: crate::wire::mob::MobBoundedHelperResult {
+                    label: self.label.clone(),
+                    status: crate::wire::mob::MobBoundedHelperResultStatus::CompletedTruncated,
+                    text: String::new(),
+                },
+                max_text_bytes: self.max_text_bytes,
+                session_id: "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
+                usage: meerkat_core::Usage {
+                    input_tokens: u64::MAX,
+                    output_tokens: u64::MAX,
+                    cache_creation_tokens: Some(u64::MAX),
+                    cache_read_tokens: Some(u64::MAX),
+                    provider_accounting: None,
+                },
+                turns: u32::MAX,
+                tool_calls: u32::MAX,
+            }),
+        };
+        let framing_bytes = serde_json::to_vec(&empty)
+            .map_err(|error| format!("bounded result framing could not be encoded: {error}"))?
+            .len();
+        Ok(record_ceiling_bytes.saturating_sub(framing_bytes) / 6)
+    }
+}
+
+/// Durable exact bounded result retained with one tracked input terminal.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeBoundedTurnResult {
+    pub result: crate::wire::mob::MobBoundedHelperResult,
+    /// Exact pre-admission byte cap that produced `result`.
+    ///
+    /// Retaining the cap prevents a replay with the same label but a different
+    /// bound from accepting a result computed under another operation contract.
+    pub max_text_bytes: u64,
+    pub session_id: String,
+    pub usage: meerkat_core::Usage,
+    pub turns: u32,
+    pub tool_calls: u32,
 }
 
 /// Exact acknowledgement key for one consumed directed-turn terminal.
@@ -2928,6 +3032,11 @@ pub struct BridgeDeliveryPayload {
     /// already own tracked terminal publication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_tracking: Option<BridgeOutcomeTracking>,
+    /// Receiver-owned result bound validated before tracked admission.
+    /// Requires `outcome_tracking: interaction` and is retained durably with
+    /// the exact input's terminal sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_result_spec: Option<BridgeBoundedResultSpec>,
 }
 
 /// Requested terminal-outcome custody for a plain bridge delivery.
@@ -3846,6 +3955,7 @@ mod tests {
             transient_turn_context: None,
             turn: None,
             outcome_tracking: None,
+            bounded_result_spec: None,
         });
         assert_command_round_trip(&cmd);
     }
@@ -3954,6 +4064,7 @@ mod tests {
             transient_turn_context: None,
             turn: None,
             outcome_tracking: None,
+            bounded_result_spec: None,
         });
         assert_command_round_trip(&cmd);
     }
@@ -3975,6 +4086,7 @@ mod tests {
             transient_turn_context: None,
             turn: None,
             outcome_tracking: None,
+            bounded_result_spec: None,
         };
         let absent = serde_json::to_value(&payload).expect("serialize absent tracking marker");
         assert!(
@@ -4024,6 +4136,7 @@ mod tests {
             transient_turn_context: None,
             turn: None,
             outcome_tracking: None,
+            bounded_result_spec: None,
         };
         let value = serde_json::to_value(&payload).expect("serialize payload");
         assert!(
@@ -4076,6 +4189,7 @@ mod tests {
             transient_turn_context: None,
             turn: None,
             outcome_tracking: None,
+            bounded_result_spec: None,
         });
         let mut value = serde_json::to_value(&legacy).expect("serialize legacy delivery");
         assert_eq!(
@@ -5533,6 +5647,7 @@ mod tests {
             transient_turn_context: None,
             turn: None,
             outcome_tracking: None,
+            bounded_result_spec: None,
         }));
         commands.push(BridgeCommand::DeliverMemberInput(BridgeDeliveryPayload {
             objective_id: None,
@@ -5555,6 +5670,7 @@ mod tests {
                 tool_overlay: None,
             }),
             outcome_tracking: None,
+            bounded_result_spec: None,
         }));
 
         for command in commands {
@@ -5873,6 +5989,7 @@ mod tests {
                 }),
             }),
             outcome_tracking: None,
+            bounded_result_spec: None,
         };
         let value = serde_json::to_value(&payload).expect("serialize payload");
         assert_eq!(value["turn"]["correlation"]["run_id"], json!("run-1"));
@@ -5915,6 +6032,7 @@ mod tests {
             transient_turn_context: None,
             turn: None,
             outcome_tracking: None,
+            bounded_result_spec: None,
         })
         .expect("serialize payload");
         value["turn"] = json!({
@@ -5969,6 +6087,7 @@ mod tests {
             transient_turn_context: None,
             turn: None,
             outcome_tracking: Some(BridgeOutcomeTracking::Interaction),
+            bounded_result_spec: None,
         })
         .expect("serialize tracked interaction");
 
@@ -6389,6 +6508,7 @@ mod tests {
                     outcome: WireFlowTurnOutcome::ExtractionFailed {
                         detail: WireFlowFailureDetail::complete("schema mismatch".to_string()),
                     },
+                    bounded_result: None,
                 }],
                 outcomes_complete: true,
             }),

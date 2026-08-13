@@ -2011,6 +2011,7 @@ impl StoreCheckpointer {
 impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
     async fn acknowledge_control_commit(
         &self,
+        session: &mut Session,
         receipt: &meerkat_core::SessionControlCommitReceipt,
     ) -> Result<(), AgentError> {
         let guard = self.gate.cancelled.lock().await;
@@ -2020,52 +2021,114 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
                 receipt.session_id()
             )));
         }
-        if self.runtime_store.session_persistence_profile()
-            != RuntimeSessionPersistenceProfile::WholeBlobV1
-        {
-            return Err(AgentError::InternalError(format!(
-                "WholeBlob control commit receipt cannot rebind a non-WholeBlob actor for session {}",
-                receipt.session_id()
-            )));
-        }
         if self.latest_run_checkpoint_receipt.lock().await.is_some() {
             return Err(AgentError::InternalError(format!(
                 "control commit for session {} cannot bypass an actor-carried provisional tail",
                 receipt.session_id()
             )));
         }
-        let authority = self
-            .runtime_store
-            .load_whole_blob_store_authority(&LogicalRuntimeId::for_session(receipt.session_id()))
-            .await
-            .map_err(|error| {
-                AgentError::InternalError(format!(
-                    "failed to confirm control commit authority for session {}: {error}",
-                    receipt.session_id()
-                ))
-            })?
-            .ok_or_else(|| {
-                AgentError::InternalError(format!(
-                    "control commit authority disappeared for session {}",
-                    receipt.session_id()
-                ))
-            })?;
-        if authority.session_id() != receipt.session_id()
-            || authority.store_revision() != receipt.store_revision()
-            || authority.blob_sha256() != receipt.authority_token()
-        {
+        if session.id() != receipt.session_id() {
             return Err(AgentError::InternalError(format!(
-                "control commit receipt no longer matches store authority for session {}",
-                receipt.session_id()
+                "control commit receipt for session {} was acknowledged on live session {}",
+                receipt.session_id(),
+                session.id()
             )));
         }
-        *self.whole_blob_base_authority.lock().map_err(|_| {
-            AgentError::InternalError(format!(
-                "WholeBlob actor base authority lock is poisoned for session {}",
+        match self.runtime_store.session_persistence_profile() {
+            RuntimeSessionPersistenceProfile::WholeBlobV1 => {
+                let authority = self
+                    .runtime_store
+                    .load_whole_blob_store_authority(&LogicalRuntimeId::for_session(
+                        receipt.session_id(),
+                    ))
+                    .await
+                    .map_err(|error| {
+                        AgentError::InternalError(format!(
+                            "failed to confirm control commit authority for session {}: {error}",
+                            receipt.session_id()
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        AgentError::InternalError(format!(
+                            "control commit authority disappeared for session {}",
+                            receipt.session_id()
+                        ))
+                    })?;
+                if authority.session_id() != receipt.session_id()
+                    || authority.store_revision() != receipt.store_revision()
+                    || authority.blob_sha256() != receipt.authority_token()
+                {
+                    return Err(AgentError::InternalError(format!(
+                        "control commit receipt no longer matches store authority for session {}",
+                        receipt.session_id()
+                    )));
+                }
+                *self.whole_blob_base_authority.lock().map_err(|_| {
+                    AgentError::InternalError(format!(
+                        "WholeBlob actor base authority lock is poisoned for session {}",
+                        receipt.session_id()
+                    ))
+                })? = Some(authority);
+                Ok(())
+            }
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1 => {
+                let authority = self
+                    .runtime_store
+                    .load_session_boundary_authority(&LogicalRuntimeId::for_session(
+                        receipt.session_id(),
+                    ))
+                    .await
+                    .map_err(|error| {
+                        AgentError::InternalError(format!(
+                            "failed to confirm control commit authority for session {}: {error}",
+                            receipt.session_id()
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        AgentError::InternalError(format!(
+                            "control commit authority disappeared for session {}",
+                            receipt.session_id()
+                        ))
+                    })?;
+                let committed = authority.head_canonical().ok_or_else(|| {
+                    AgentError::InternalError(format!(
+                        "HeadCanonical control commit loaded WholeBlob authority for session {}",
+                        receipt.session_id()
+                    ))
+                })?;
+                if committed.session_id() != receipt.session_id()
+                    || committed.store_revision() != receipt.store_revision()
+                    || committed.committed_head_token() != receipt.authority_token()
+                {
+                    return Err(AgentError::InternalError(format!(
+                        "control commit receipt no longer matches store authority for session {}",
+                        receipt.session_id()
+                    )));
+                }
+                let committed_metadata_identity = committed
+                    .boundary_head()
+                    .metadata_identity()
+                    .cloned()
+                    .ok_or_else(|| {
+                        AgentError::InternalError(format!(
+                            "HeadCanonical control commit boundary carries no metadata identity for session {}",
+                            receipt.session_id()
+                        ))
+                    })?;
+                session
+                    .acknowledge_head_canonical_control_metadata(&committed_metadata_identity)
+                    .map_err(|error| {
+                        AgentError::InternalError(format!(
+                            "durable control commit could not become the actor metadata baseline for session {}: {error}; live actor reload required",
+                            receipt.session_id()
+                        ))
+                    })
+            }
+            profile => Err(AgentError::InternalError(format!(
+                "control commit acknowledgement is unsupported under runtime persistence profile {profile:?} for session {}",
                 receipt.session_id()
-            ))
-        })? = Some(authority);
-        Ok(())
+            ))),
+        }
     }
 
     async fn checkpoint_run(
@@ -2822,6 +2885,7 @@ impl<'a> MachineSessionArchiveProtocol<'a> {
         id: &SessionId,
         lease: Option<meerkat_runtime::MachineSessionArchiveLease>,
         stored_only_publication_handle: Option<Arc<dyn CoreExecutorPublicationHandle>>,
+        post_commit_hook: Option<Arc<dyn meerkat_runtime::MachineSessionArchivePostCommitHook>>,
         deadline: meerkat_core::time_compat::Instant,
     ) -> Result<(), SessionError> {
         let lease = lease.ok_or_else(|| {
@@ -2829,8 +2893,17 @@ impl<'a> MachineSessionArchiveProtocol<'a> {
                 "machine archive authorized runtime retirement for session {id} without an exact archive lease"
             )))
         })?;
-        let retire = match stored_only_publication_handle {
-            Some(publication_handle) => {
+        let retire = match (stored_only_publication_handle, post_commit_hook) {
+            (Some(publication_handle), Some(post_commit_hook)) => self
+                .runtime_adapter
+                .retire_session_with_archive_lease_publication_handle_and_post_commit_hook_before(
+                    lease,
+                    publication_handle,
+                    post_commit_hook,
+                    deadline,
+                )
+                .await,
+            (Some(publication_handle), None) => {
                 self.runtime_adapter
                     .retire_session_with_archive_lease_and_publication_handle_before(
                         lease,
@@ -2839,7 +2912,16 @@ impl<'a> MachineSessionArchiveProtocol<'a> {
                     )
                     .await
             }
-            None => {
+            (None, Some(post_commit_hook)) => {
+                self.runtime_adapter
+                    .retire_session_with_archive_lease_and_post_commit_hook_before(
+                        lease,
+                        post_commit_hook,
+                        deadline,
+                    )
+                    .await
+            }
+            (None, None) => {
                 self.runtime_adapter
                     .retire_session_with_archive_lease_before(lease, deadline)
                     .await
@@ -5207,6 +5289,37 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let recovery_gate = self.recovery_gate_for_session(id).await;
         let _guard = recovery_gate.lock_owned().await;
         self.discard_live_session_unfenced(id).await
+    }
+
+    /// Discard only process-local session material after the runtime store has
+    /// lost durable write authority.
+    ///
+    /// The caller already owns the machine's exact degraded-registration
+    /// coordinator and mutation fence. This path therefore must not acquire
+    /// the turn-finalization boundary or publish archive/stop/retire state. It
+    /// serializes only against same-session actor recovery before removing the
+    /// actor and its checkpointer sidecars.
+    pub async fn discard_live_session_actor_after_durability_reload_required(
+        &self,
+        witness: &LiveSessionActorWitness,
+    ) -> Result<bool, SessionError> {
+        let id = witness.session_id();
+        let recovery_gate = self.recovery_gate_for_session(id).await;
+        let _guard = recovery_gate.lock_owned().await;
+        let Some(current) = self.inner.live_session_actor_witness(id).await else {
+            return Ok(false);
+        };
+        if &current != witness {
+            return Err(SessionError::Agent(AgentError::InternalError(format!(
+                "reload-required cleanup for session {id} encountered a replacement live actor"
+            ))));
+        }
+        let discarded = self.inner.discard_live_session_actor(witness).await?;
+        if discarded {
+            self.checkpointer_gates.lock().await.remove(id);
+            self.live_checkpointers.lock().await.remove(id);
+        }
+        Ok(discarded)
     }
 
     /// Converge the live actor and every persistent sidecar while the caller
@@ -9294,6 +9407,22 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         machine_archive: MachineSessionArchiveProtocol<'_>,
         deadline: meerkat_core::time_compat::Instant,
     ) -> Result<(), SessionError> {
+        self.archive_with_machine_protocol_under_runtime_turn_boundary_and_hook_before(
+            id,
+            machine_archive,
+            deadline,
+            None,
+        )
+        .await
+    }
+
+    pub async fn archive_with_machine_protocol_under_runtime_turn_boundary_and_hook_before(
+        &self,
+        id: &SessionId,
+        machine_archive: MachineSessionArchiveProtocol<'_>,
+        deadline: meerkat_core::time_compat::Instant,
+        post_commit_hook: Option<Arc<dyn meerkat_runtime::MachineSessionArchivePostCommitHook>>,
+    ) -> Result<(), SessionError> {
         machine_archive.require_shared_runtime_store(id, &self.runtime_store)?;
         // The caller owns the stable outer boundary. Global inner lock order is
         // runtime mutation authority, then the session recovery/checkpointer
@@ -9497,7 +9626,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     )))
                 })?;
             if disposition == SessionArchiveDisposition::AlreadyArchived {
-                if archive_lease_has_attached_publisher && archive_lease.is_some() {
+                if (archive_lease_has_attached_publisher || post_commit_hook.is_some())
+                    && archive_lease.is_some()
+                {
                     // Retirement may invoke an arbitrary actor publication
                     // callback through the process-owned runtime dispatch.
                     // Release R before handing off the exact M-owning lease;
@@ -9509,6 +9640,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                             id,
                             archive_lease.take(),
                             stored_only_publication_handle.clone(),
+                            post_commit_hook.clone(),
                             deadline,
                         )
                         .await?;
@@ -9536,7 +9668,17 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             // RuntimeStore owns the absorbing lifecycle terminal. Session
             // bodies and SessionStore projections remain content only and are
             // never rewritten to carry archive authority.
-            if retire_runtime {
+            //
+            // A machine-owned retire may already have committed the quiescent
+            // runtime terminal before this archive observed it (the mob
+            // lifecycle drives RequestRuntimeRetire ahead of disposal). A
+            // caller-supplied post-commit hook still owes its terminalization
+            // under this exact retained lease, so the idempotent retire
+            // commit is driven for it even when no lifecycle transition
+            // remains.
+            let drive_runtime_retire =
+                retire_runtime || (post_commit_hook.is_some() && archive_lease.is_some());
+            if drive_runtime_retire {
                 // The runtime process task must run without either M or R.
                 // M moves into retire_session and is released before its
                 // callback starts; release R here, then reacquire it only
@@ -9547,6 +9689,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                         id,
                         archive_lease.take(),
                         stored_only_publication_handle.clone(),
+                        post_commit_hook.clone(),
                         deadline,
                     )
                     .await;
@@ -11452,6 +11595,7 @@ mod tests {
         assert!(
             meerkat_core::SessionCheckpointer::acknowledge_control_commit(
                 &checkpointer,
+                &mut successor,
                 &stale_receipt,
             )
             .await
@@ -11476,6 +11620,7 @@ mod tests {
         .expect("construct exact receipt");
         meerkat_core::SessionCheckpointer::acknowledge_control_commit(
             &checkpointer,
+            &mut successor,
             &exact_receipt,
         )
         .await

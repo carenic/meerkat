@@ -46,6 +46,7 @@ RPC_PUBLIC_WRAPPERS: dict[str, tuple[type, str]] = {
     "session/list": (MeerkatClient, "list_sessions"),
     "session/read": (MeerkatClient, "read_session"),
     "session/history": (MeerkatClient, "read_session_history"),
+    "session/export_atif": (MeerkatClient, "export_session_atif"),
     "session/fork_at": (MeerkatClient, "fork_session_at"),
     "session/fork_replace": (MeerkatClient, "fork_session_replace"),
     "session/rewrite_transcript": (MeerkatClient, "rewrite_session_transcript"),
@@ -604,12 +605,23 @@ async def test_role_name_is_canonical_for_helper_calls():
             "tokens_used": 1,
             "agent_identity": "helper-1",
             "member_ref": _make_member_ref("mob1", "helper-1"),
+            "bounded_result": {
+                "label": "helper_result",
+                "status": "completed",
+                "text": "ok",
+            },
+            "session_id": "session-helper-1",
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+            "turns": 1,
+            "tool_calls": 0,
         }
     )
 
     await client.spawn_mob_helper(
         "mob1",
         "hello",
+        result_label="helper_result",
+        max_text_bytes=4096,
         role_name="worker",
         model_override="gpt-helper",
     )
@@ -618,6 +630,8 @@ async def test_role_name_is_canonical_for_helper_calls():
         {
             "mob_id": "mob1",
             "prompt": "hello",
+            "result_label": "helper_result",
+            "max_text_bytes": 4096,
             "agent_identity": None,
             "role_name": "worker",
             "model_override": "gpt-helper",
@@ -633,12 +647,23 @@ async def test_role_name_is_canonical_for_helper_calls():
             "tokens_used": 1,
             "agent_identity": "fork-1",
             "member_ref": _make_member_ref("mob1", "fork-1"),
+            "bounded_result": {
+                "label": "fork_result",
+                "status": "completed",
+                "text": "ok",
+            },
+            "session_id": "session-fork-1",
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+            "turns": 1,
+            "tool_calls": 0,
         }
     )
     await client.fork_mob_helper(
         "mob1",
         "source-id",
         "hello",
+        result_label="fork_result",
+        max_text_bytes=2048,
         role_name="worker-role",
         model_override="gpt-fork",
     )
@@ -648,6 +673,8 @@ async def test_role_name_is_canonical_for_helper_calls():
             "mob_id": "mob1",
             "source_member_id": "source-id",
             "prompt": "hello",
+            "result_label": "fork_result",
+            "max_text_bytes": 2048,
             "agent_identity": None,
             "role_name": "worker-role",
             "model_override": "gpt-fork",

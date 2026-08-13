@@ -77,6 +77,18 @@ use uuid::Uuid;
 
 type TestMeerkatMachineAuthority = std::sync::Arc<meerkat_runtime::HandleDslAuthority>;
 
+struct TestCompactionCurator;
+
+#[async_trait]
+impl meerkat_core::CompactionCurator for TestCompactionCurator {
+    async fn curate_summary(
+        &self,
+        _window: meerkat_core::CompactionWindow<'_>,
+    ) -> Result<meerkat_core::CuratedCompactionSummary, meerkat_core::CompactionCuratorError> {
+        meerkat_core::CuratedCompactionSummary::new("runtime-test summary")
+    }
+}
+
 fn retirement_error_cause(mut error: &MobError) -> &MobError {
     while let MobError::SharedRetirementFailure(shared) = error {
         error = shared.as_ref();
@@ -1533,6 +1545,8 @@ struct MockSessionService {
     create_requests: RwLock<Vec<CreateSessionRecord>>,
     /// Records whether each create_session had external_tools configured.
     create_with_external_tools: RwLock<Vec<bool>>,
+    /// Records the exact host curator carried by each create_session request.
+    create_with_compaction_curators: RwLock<Vec<Option<Arc<dyn meerkat_core::CompactionCurator>>>>,
     /// Records the declarative MCP server names per create_session call,
     /// in call order.
     mcp_server_names: RwLock<Vec<(SessionId, Vec<String>)>>,
@@ -1628,6 +1642,7 @@ struct MockSessionService {
     injected_interaction_ids: Arc<std::sync::Mutex<Vec<InteractionId>>>,
     keep_alive_prompts: RwLock<Vec<(SessionId, String)>>,
     interrupt_calls: AtomicU64,
+    interrupted_session_ids: RwLock<Vec<SessionId>>,
     runtime_control_barrier: RwLock<Option<Arc<TestRuntimeControlBarrier>>>,
     turn_finalization_gate: std::sync::RwLock<Option<Arc<tokio::sync::Mutex<()>>>>,
     turn_finalization_acquire_started: AtomicU64,
@@ -1657,6 +1672,7 @@ struct MockSessionService {
     flow_turn_fail: std::sync::atomic::AtomicBool,
     flow_turn_fail_sessions: RwLock<HashSet<SessionId>>,
     flow_turn_completed_result: RwLock<String>,
+    return_exact_run_result: AtomicBool,
     flow_turn_overlays: RwLock<Vec<(SessionId, Option<meerkat_core::service::TurnToolOverlay>)>>,
     /// Number of exact actor-discard calls that should fail before mutation.
     /// Models a retryable service cleanup outage after machine unregister has
@@ -1698,6 +1714,7 @@ impl MockSessionService {
             prompts: RwLock::new(Vec::new()),
             create_requests: RwLock::new(Vec::new()),
             create_with_external_tools: RwLock::new(Vec::new()),
+            create_with_compaction_curators: RwLock::new(Vec::new()),
             mcp_server_names: RwLock::new(Vec::new()),
             external_tools_by_session: RwLock::new(HashMap::new()),
             comms_behaviors: RwLock::new(HashMap::new()),
@@ -1741,6 +1758,7 @@ impl MockSessionService {
             injected_interaction_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             keep_alive_prompts: RwLock::new(Vec::new()),
             interrupt_calls: AtomicU64::new(0),
+            interrupted_session_ids: RwLock::new(Vec::new()),
             runtime_control_barrier: RwLock::new(None),
             turn_finalization_gate: std::sync::RwLock::new(None),
             turn_finalization_acquire_started: AtomicU64::new(0),
@@ -1770,6 +1788,7 @@ impl MockSessionService {
             flow_turn_fail: std::sync::atomic::AtomicBool::new(false),
             flow_turn_fail_sessions: RwLock::new(HashSet::new()),
             flow_turn_completed_result: RwLock::new("\"Turn completed\"".to_string()),
+            return_exact_run_result: AtomicBool::new(false),
             flow_turn_overlays: RwLock::new(Vec::new()),
             discard_actor_failures_remaining: AtomicU64::new(0),
             subscribe_fail_sessions: RwLock::new(HashSet::new()),
@@ -1945,6 +1964,12 @@ impl MockSessionService {
 
     async fn recorded_external_tools_flags(&self) -> Vec<bool> {
         self.create_with_external_tools.read().await.clone()
+    }
+
+    async fn recorded_compaction_curators(
+        &self,
+    ) -> Vec<Option<Arc<dyn meerkat_core::CompactionCurator>>> {
+        self.create_with_compaction_curators.read().await.clone()
     }
 
     async fn recorded_mcp_server_names(&self) -> Vec<(SessionId, Vec<String>)> {
@@ -2241,6 +2266,15 @@ impl MockSessionService {
         self.interrupt_calls.load(Ordering::Relaxed)
     }
 
+    async fn interrupt_call_count_for(&self, session_id: &SessionId) -> usize {
+        self.interrupted_session_ids
+            .read()
+            .await
+            .iter()
+            .filter(|interrupted| *interrupted == session_id)
+            .count()
+    }
+
     fn cancel_after_boundary_call_count(&self) -> u64 {
         self.cancel_after_boundary_calls.load(Ordering::Relaxed)
     }
@@ -2325,6 +2359,11 @@ impl MockSessionService {
 
     fn set_archive_delay_ms(&self, delay_ms: u64) {
         self.archive_delay_ms.store(delay_ms, Ordering::Relaxed);
+    }
+
+    fn set_return_exact_run_result(&self, enabled: bool) {
+        self.return_exact_run_result
+            .store(enabled, Ordering::Relaxed);
     }
 
     async fn install_archive_post_commit_gate(&self) -> Arc<TestRuntimeControlBarrier> {
@@ -2831,6 +2870,12 @@ impl MockSessionService {
             .write()
             .await
             .push(external_tools.is_some());
+        self.create_with_compaction_curators.write().await.push(
+            req.build
+                .as_ref()
+                .and_then(|build| build.compaction_curator_override.as_ref())
+                .cloned(),
+        );
         if let Some(dispatcher) = external_tools {
             self.external_tools_by_session
                 .write()
@@ -3099,6 +3144,7 @@ impl SessionService for MockSessionService {
 
     async fn interrupt(&self, id: &SessionId) -> Result<(), SessionError> {
         self.interrupt_calls.fetch_add(1, Ordering::Relaxed);
+        self.interrupted_session_ids.write().await.push(id.clone());
         let sessions = self.sessions.read().await;
         if !sessions.contains_key(id) {
             return Err(SessionError::NotFound { id: id.clone() });
@@ -3634,6 +3680,77 @@ impl MobSessionService for MockSessionService {
         Ok(ResumeSessionLoad::Absent)
     }
 
+    async fn fork_persisted_session(
+        &self,
+        source_session_id: &SessionId,
+        message_count: Option<usize>,
+        tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
+        target: meerkat_core::DurableSessionForkTarget,
+    ) -> Result<meerkat_core::SessionForkResult, SessionError> {
+        if tool_access_policy
+            .is_some_and(|policy| !matches!(policy, meerkat_core::ops::ToolAccessPolicy::Inherit))
+        {
+            return Err(SessionError::Unsupported(
+                "mock durable fork supports inherited tooling only".to_string(),
+            ));
+        }
+        let source = self
+            .persisted_sessions
+            .read()
+            .await
+            .get(source_session_id)
+            .cloned()
+            .ok_or_else(|| SessionError::NotFound {
+                id: source_session_id.clone(),
+            })?;
+        let selected_count = message_count.unwrap_or_else(|| source.messages().len());
+        let forked = source
+            .fork_at_complete_boundary(selected_count)
+            .map_err(|error| SessionError::Unsupported(error.to_string()))?;
+        let mut forked = factory_policy_session(forked, "test-model".to_string(), 1_024);
+        let mut metadata = forked.session_metadata().ok_or_else(|| {
+            SessionError::Unsupported(
+                "mock durable mob fork requires canonical session metadata".to_string(),
+            )
+        })?;
+        metadata.comms_name = Some(
+            target
+                .member_binding
+                .comms_name()
+                .map_err(|error| SessionError::Unsupported(error.to_string()))?
+                .to_string(),
+        );
+        metadata.peer_meta = None;
+        metadata.keep_alive = false;
+        metadata.mob_member_binding = Some(target.member_binding);
+        forked.set_session_metadata(metadata).map_err(|error| {
+            SessionError::Unsupported(format!(
+                "mock durable fork could not apply target binding: {error}"
+            ))
+        })?;
+        let child_session_id = forked.id().clone();
+        self.persisted_sessions
+            .write()
+            .await
+            .insert(child_session_id.clone(), forked);
+        self.issue_persisted_session_revision(&child_session_id)
+            .await;
+        Ok(meerkat_core::SessionForkResult {
+            source_session_id: source_session_id.clone(),
+            session_id: child_session_id,
+            message_count: selected_count,
+            cache_inheritance: meerkat_core::ForkCacheInheritance::Unavailable {
+                message_count: selected_count,
+                reason: if target.cache_identity.is_some() {
+                    meerkat_core::ForkCacheInheritanceUnavailableReason::NoAuthoredBreakpointAtBoundary
+                } else {
+                    meerkat_core::ForkCacheInheritanceUnavailableReason::TargetIdentityUnresolved
+                },
+            },
+            session_ref: None,
+        })
+    }
+
     async fn create_session_under_runtime_turn_boundary(
         &self,
         req: CreateSessionRequest,
@@ -3844,6 +3961,47 @@ impl MobSessionService for MockSessionService {
         SessionService::archive(self, session_id).await
     }
 
+    #[cfg(feature = "runtime-adapter")]
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_and_hook_before(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+        post_commit_hook: Option<Arc<dyn meerkat_runtime::MachineSessionArchivePostCommitHook>>,
+    ) -> Result<(), SessionError> {
+        if let Some(adapter) = self.runtime_adapter() {
+            let lease = adapter
+                .prepare_session_archive_lease_before(session_id, deadline)
+                .await
+                .map_err(|error| {
+                    SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                        error.to_string(),
+                    ))
+                })?;
+            if let Some(lease) = lease {
+                match post_commit_hook {
+                    Some(hook) => {
+                        adapter
+                            .retire_session_with_archive_lease_and_post_commit_hook_before(
+                                lease, hook, deadline,
+                            )
+                            .await
+                    }
+                    None => {
+                        adapter
+                            .retire_session_with_archive_lease_before(lease, deadline)
+                            .await
+                    }
+                }
+                .map_err(|error| {
+                    SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                        error.to_string(),
+                    ))
+                })?;
+            }
+        }
+        SessionService::archive(self, session_id).await
+    }
+
     async fn session_belongs_to_mob(&self, session_id: &SessionId, mob_id: &MobId) -> bool {
         if self
             .session_comms_names
@@ -3928,20 +4086,30 @@ impl MobSessionService for MockSessionService {
         boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary,
         contributing_input_ids: Vec<meerkat_core::InputId>,
     ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, SessionError> {
+        let exact_result_text = req.prompt.text_content();
         <Self as SessionService>::start_turn(self, session_id, req).await?;
-        Ok(
-            meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
-                meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
-                    run_id,
-                    boundary,
-                    contributing_input_ids,
-                    conversation_digest: None,
-                    message_count: 0,
-                },
-                None,
-                None,
-            ),
-        )
+        let receipt = meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
+            run_id,
+            boundary,
+            contributing_input_ids,
+            conversation_digest: None,
+            message_count: 0,
+        };
+        if self.return_exact_run_result.load(Ordering::Relaxed) {
+            let mut result = mock_run_result(session_id.clone(), exact_result_text);
+            result.usage.output_tokens = result.text.len() as u64;
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_run_result(
+                    receipt, None, result,
+                ),
+            )
+        } else {
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                    receipt, None, None,
+                ),
+            )
+        }
     }
 
     async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
@@ -11508,7 +11676,7 @@ async fn test_mob_shutdown_interrupts_active_autonomous_member() {
         .resolve_bridge_session_id(&identity)
         .await
         .expect("session-backed autonomous member");
-    let baseline_interrupts = service.interrupt_call_count();
+    let baseline_target_interrupts = service.interrupt_call_count_for(&session_id).await;
 
     handle
         .shutdown()
@@ -11517,9 +11685,9 @@ async fn test_mob_shutdown_interrupts_active_autonomous_member() {
 
     assert_eq!(handle.status().await.unwrap(), MobState::Stopped);
     assert_eq!(
-        service.interrupt_call_count(),
-        baseline_interrupts,
-        "durable Retiring must not route teardown through ambient interruption"
+        service.interrupt_call_count_for(&session_id).await,
+        baseline_target_interrupts,
+        "durable Retiring must not route the target teardown through ambient interruption"
     );
     assert!(
         !adapter.contains_session(&session_id).await,
@@ -15057,6 +15225,7 @@ async fn test_rotate_supervisor_reauthorizes_live_remote_members_and_rejects_sta
             expected_member: None,
             turn: None,
             outcome_tracking: None,
+            bounded_result_spec: None,
         },
     );
     let stale_reply = old_bridge
@@ -19120,7 +19289,8 @@ async fn test_visible_mob_operator_tools_emit_identity_native_member_payloads() 
 
 #[tokio::test]
 async fn test_spawn_helper_contract_aligns_with_retired_terminal_state() {
-    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
     let helper_id = AgentIdentity::from("helper-spawn");
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(1),
@@ -19132,24 +19302,105 @@ async fn test_spawn_helper_contract_aligns_with_retired_terminal_state() {
                 runtime_mode: Some(crate::MobRuntimeMode::TurnDriven),
                 ..HelperOptions::default()
             },
+            "spawn-helper-result",
+            256,
         ),
     )
     .await
-    .expect("spawn_helper must not wait on helper terminality")
+    .expect("spawn_helper exact turn must complete within the watchdog")
     .expect("spawn_helper succeeds");
 
-    assert_eq!(result.agent_identity, helper_id);
-    assert!(
-        result.bounded_result.is_none(),
-        "non-blocking helper registration must not claim a certified terminal projection"
+    assert_eq!(result.helper.agent_identity, helper_id);
+    assert_eq!(result.helper.bounded_result.text(), "summarize this");
+    assert_eq!(
+        result.turn.receipt().runtime_id.identity,
+        result.helper.agent_identity
     );
+    assert!(result.retirement_error.is_none());
     assert!(
         handle
-            .get_member(&result.agent_identity)
+            .get_member(&result.helper.agent_identity)
             .await
             .unwrap()
             .is_none(),
         "spawn_helper must remove the helper from the active roster once it returns"
+    );
+}
+
+#[tokio::test]
+async fn test_spawn_helper_rejects_invalid_bound_before_member_admission() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let helper_id = AgentIdentity::from("invalid-bounded-helper");
+
+    let error = handle
+        .spawn_helper(
+            helper_id.clone(),
+            "must never be admitted",
+            HelperOptions {
+                role_name: Some(ProfileName::from("worker")),
+                ..HelperOptions::default()
+            },
+            "",
+            256,
+        )
+        .await
+        .expect_err("invalid result label must fail before helper admission");
+
+    assert!(matches!(
+        error,
+        crate::BoundedMemberRunError::Admission(MobError::InvalidBoundedHelperResult { .. })
+    ));
+    assert!(
+        handle.get_member(&helper_id).await.unwrap().is_none(),
+        "invalid bounds must have zero roster effects"
+    );
+}
+
+#[tokio::test]
+async fn test_spawn_helper_cleanup_failure_preserves_exact_result() {
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .and_then(|binding| binding.as_inline_mut())
+        .expect("worker profile")
+        .external_addressable = true;
+    let (handle, service) = create_test_mob(definition).await;
+    service.set_return_exact_run_result(true);
+    service
+        .set_archive_failure_for_comms_name(&test_comms_name("worker", "cleanup-debt-helper"))
+        .await;
+
+    let result = handle
+        .spawn_helper(
+            AgentIdentity::from("cleanup-debt-helper"),
+            "capture before cleanup",
+            HelperOptions {
+                role_name: Some(ProfileName::from("worker")),
+                runtime_mode: Some(crate::MobRuntimeMode::TurnDriven),
+                ..HelperOptions::default()
+            },
+            "cleanup-debt",
+            256,
+        )
+        .await
+        .expect("cleanup failure must not erase an exact helper result");
+
+    assert_eq!(
+        result.turn.result().result().text(),
+        "capture before cleanup"
+    );
+    assert_eq!(
+        result.helper.bounded_result.text(),
+        "capture before cleanup"
+    );
+    assert!(
+        result
+            .retirement_error
+            .as_deref()
+            .is_some_and(|error| error.contains("archive")),
+        "cleanup debt must remain explicit: {:?}",
+        result.retirement_error
     );
 }
 
@@ -19184,7 +19435,8 @@ async fn test_bounded_terminal_result_preserves_deferred_member_for_retry() {
 
 #[tokio::test]
 async fn test_fork_helper_contract_aligns_with_retired_terminal_state() {
-    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
     let source_id = AgentIdentity::from("fork-source");
     let source_member_identity = AgentIdentity::from("fork-source");
     let source_ref = handle
@@ -19211,20 +19463,20 @@ async fn test_fork_helper_contract_aligns_with_retired_terminal_state() {
                 runtime_mode: Some(crate::MobRuntimeMode::TurnDriven),
                 ..HelperOptions::default()
             },
+            "fork-helper-result",
+            256,
         ),
     )
     .await
-    .expect("fork_helper must not wait on helper terminality")
+    .expect("fork_helper exact turn must complete within the watchdog")
     .expect("fork_helper succeeds");
 
-    assert_eq!(result.agent_identity, helper_id);
-    assert!(
-        result.bounded_result.is_none(),
-        "non-blocking fork registration must not claim a certified terminal projection"
-    );
+    assert_eq!(result.helper.agent_identity, helper_id);
+    assert_eq!(result.helper.bounded_result.text(), "continue from source");
+    assert!(result.retirement_error.is_none());
     assert!(
         handle
-            .get_member(&result.agent_identity)
+            .get_member(&result.helper.agent_identity)
             .await
             .unwrap()
             .is_none(),
@@ -19238,6 +19490,58 @@ async fn test_fork_helper_contract_aligns_with_retired_terminal_state() {
             .unwrap()
             .and_then(|entry| entry.member_ref.bridge_session_id().cloned()),
         "fork_helper must not perturb the source member's canonical session binding"
+    );
+}
+
+#[tokio::test]
+async fn fork_member_then_run_bounded_keeps_bare_fork_provisioning_only_and_result_exact() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source_identity = AgentIdentity::from("bounded-fork-source");
+    let source = handle
+        .spawn(
+            ProfileName::from("worker"),
+            source_identity.clone(),
+            Some(ContentInput::Text("source context".to_string())),
+        )
+        .await
+        .expect("spawn bounded fork source");
+    let source_session = source
+        .bridge_session_id()
+        .expect("source bridge session")
+        .clone();
+
+    let child_identity = AgentIdentity::from("bounded-fork-child");
+    let mut child = SpawnMemberSpec::new(ProfileName::from("worker"), child_identity.clone());
+    child.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    child.initial_message = Some(ContentInput::Text("exact child task".to_string()));
+    let outcome = handle
+        .fork_member_then_run_bounded(&source_identity, child, None, "fork_child_result", 256)
+        .await
+        .expect("fork and exact child turn succeed");
+
+    assert_eq!(outcome.fork.agent_identity, child_identity);
+    assert_eq!(
+        outcome.turn.receipt().runtime_id.identity,
+        outcome.fork.agent_identity
+    );
+    assert_eq!(outcome.turn.result().result().text(), "exact child task");
+    assert_eq!(
+        handle
+            .get_member(&source_identity)
+            .await
+            .expect("source roster lookup")
+            .and_then(|member| member.member_ref.bridge_session_id().cloned()),
+        Some(source_session),
+        "fork-then-run must not perturb the source binding"
+    );
+    assert!(
+        handle
+            .get_member(&child_identity)
+            .await
+            .expect("child roster lookup")
+            .is_some(),
+        "explicit fork-then-run retains its provisioned child"
     );
 }
 
@@ -19282,7 +19586,15 @@ async fn test_spawn_spec_tool_access_policy_reaches_session_metadata() {
 /// section.
 #[tokio::test]
 async fn test_fork_helper_tool_access_policy_reaches_session_metadata() {
-    let (handle, service) = create_test_mob(sample_definition()).await;
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .and_then(|binding| binding.as_inline_mut())
+        .expect("worker profile")
+        .external_addressable = true;
+    let (handle, service) = create_test_mob(definition).await;
+    service.set_return_exact_run_result(true);
     let source_id = AgentIdentity::from("fork-gated-source");
     handle
         .spawn_with_options(
@@ -19310,6 +19622,8 @@ async fn test_fork_helper_tool_access_policy_reaches_session_metadata() {
                 tool_access_policy: Some(policy.clone()),
                 ..HelperOptions::default()
             },
+            "fork-tool-policy",
+            256,
         ),
     )
     .await
@@ -19340,7 +19654,15 @@ async fn test_fork_helper_tool_access_policy_reaches_session_metadata() {
 
 #[tokio::test]
 async fn test_spawn_helper_defaults_to_turn_driven_even_when_profile_is_autonomous() {
-    let (handle, service) = create_test_mob(sample_definition()).await;
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .and_then(|binding| binding.as_inline_mut())
+        .expect("worker profile")
+        .external_addressable = true;
+    let (handle, service) = create_test_mob(definition).await;
+    service.set_return_exact_run_result(true);
 
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(1),
@@ -19351,6 +19673,8 @@ async fn test_spawn_helper_defaults_to_turn_driven_even_when_profile_is_autonomo
                 role_name: Some(ProfileName::from("worker")),
                 ..HelperOptions::default()
             },
+            "spawn-default-mode",
+            256,
         ),
     )
     .await
@@ -24100,6 +24424,7 @@ async fn test_build_resumed_agent_config_rejects_mismatched_session_identity() {
                 profile,
                 definition: &definition,
                 external_tools: None,
+                compaction_curator_override: None,
                 context: None,
                 labels: None,
                 additional_instructions: None,
@@ -33161,6 +33486,304 @@ async fn provision_runtime_backed_disposal_fixture(
 }
 
 #[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reload_discard_cancelled_waiter_retry_rebinds_existing_cold_successor() {
+    struct FailingBoundaryExecutor;
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutor for FailingBoundaryExecutor {
+        async fn apply(
+            &mut self,
+            run_id: meerkat_core::RunId,
+            primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+        ) -> Result<
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+            meerkat_core::lifecycle::core_executor::CoreExecutorError,
+        > {
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                    meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
+                        run_id,
+                        boundary:
+                            meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                        contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                        conversation_digest: None,
+                        message_count: 0,
+                    },
+                    None,
+                    None,
+                ),
+            )
+        }
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+    }
+    let service = Arc::new(MockSessionService::new());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let adapter = Arc::new(meerkat_runtime::MeerkatMachine::persistent_without_blobs(
+        runtime_store,
+    ));
+    service.set_runtime_adapter(Arc::clone(&adapter));
+    let provisioner = Arc::new(super::provisioner::SessionBackend::new(
+        service,
+        Some(Arc::clone(&adapter)),
+        None,
+    ));
+    let session = Session::new();
+    let session_id = session.id().clone();
+    provision_runtime_backed_disposal_fixture(
+        provisioner.as_ref(),
+        session,
+        "reload-cancelled-waiter",
+    )
+    .await;
+    let old_registration = adapter
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("fixture publishes exact predecessor registration");
+    adapter
+        .ensure_session_with_executor(session_id.clone(), Box::new(FailingBoundaryExecutor))
+        .await
+        .expect("replace fixture executor");
+    let exact_operation_id = provisioner
+        .ops_binding_operation_id_for_test(&session_id)
+        .expect("fixture publishes one exact mob-child operation");
+    let current_registry = adapter
+        .ops_lifecycle_registry_if_current_registration(
+            &adapter
+                .current_session_registration_witness(&session_id)
+                .await
+                .expect("current registration before fault"),
+        )
+        .await
+        .expect("current registry before fault");
+    assert!(
+        meerkat_core::ops_lifecycle::OpsLifecycleRegistry::snapshot(
+            current_registry.as_ref(),
+            &exact_operation_id,
+        )
+        .expect("read exact operation")
+        .is_some(),
+        "the exact mob-child operation must already belong to runtime durable authority"
+    );
+    adapter
+        .persist_current_ops_lifecycle_for_test(&session_id)
+        .await
+        .expect("persist exact pre-fault mob-child operation authority");
+    assert!(
+        adapter
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await
+    );
+    meerkat_runtime::SessionServiceRuntimeExt::accept_input(
+        adapter.as_ref(),
+        &session_id,
+        meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+            "trigger degraded teardown",
+            None,
+        )),
+    )
+    .await
+    .expect_err("degraded admission must start teardown");
+    let (successor_published, release_discard) = adapter
+        .arm_reload_required_discard_after_successor_publication_test_hook(session_id.clone());
+    let first = {
+        let provisioner = Arc::clone(&provisioner);
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            provisioner
+                .dispose_inline_for_recovery_test(&session_id)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(3), successor_published)
+        .await
+        .expect("discard must publish its exact cold successor")
+        .expect("successor-publication hook sender must remain live");
+    let cold_successor = adapter
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("discard worker installs cold successor before acknowledgement");
+    assert_ne!(cold_successor, old_registration);
+    first.abort();
+    let _ = first.await;
+    release_discard.send(()).expect("release discard worker");
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        provisioner.dispose_inline_for_recovery_test(&session_id),
+    )
+    .await
+    .expect("retry must remain bounded")
+    .expect("retry must reconstruct exact registry handoff from current cold successor");
+    assert!(!adapter.contains_session(&session_id).await);
+    assert!(!provisioner.ops_binding_present_for_test(&session_id));
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reload_recovery_cancel_after_hook_reuses_terminal_receipt() {
+    struct FailingBoundaryExecutor;
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutor for FailingBoundaryExecutor {
+        async fn apply(
+            &mut self,
+            run_id: meerkat_core::RunId,
+            primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+        ) -> Result<
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+            meerkat_core::lifecycle::core_executor::CoreExecutorError,
+        > {
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                    meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
+                        run_id,
+                        boundary:
+                            meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                        contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                        conversation_digest: None,
+                        message_count: 0,
+                    },
+                    None,
+                    None,
+                ),
+            )
+        }
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+    }
+    let service = Arc::new(MockSessionService::new());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let adapter = Arc::new(meerkat_runtime::MeerkatMachine::persistent_without_blobs(
+        runtime_store,
+    ));
+    service.set_runtime_adapter(Arc::clone(&adapter));
+    let provisioner = Arc::new(super::provisioner::SessionBackend::new(
+        service,
+        Some(Arc::clone(&adapter)),
+        None,
+    ));
+    let session = Session::new();
+    let session_id = session.id().clone();
+    provision_runtime_backed_disposal_fixture(
+        provisioner.as_ref(),
+        session,
+        "reload-post-hook-cancel",
+    )
+    .await;
+    adapter
+        .ensure_session_with_executor(session_id.clone(), Box::new(FailingBoundaryExecutor))
+        .await
+        .expect("replace fixture executor");
+    let exact_operation_id = provisioner
+        .ops_binding_operation_id_for_test(&session_id)
+        .expect("fixture publishes one exact mob-child operation");
+    let current_registry = adapter
+        .ops_lifecycle_registry_if_current_registration(
+            &adapter
+                .current_session_registration_witness(&session_id)
+                .await
+                .expect("current registration before fault"),
+        )
+        .await
+        .expect("current registry before fault");
+    assert!(
+        meerkat_core::ops_lifecycle::OpsLifecycleRegistry::snapshot(
+            current_registry.as_ref(),
+            &exact_operation_id,
+        )
+        .expect("read exact operation")
+        .is_some(),
+        "the exact mob-child operation must already belong to runtime durable authority"
+    );
+    adapter
+        .persist_current_ops_lifecycle_for_test(&session_id)
+        .await
+        .expect("persist exact pre-fault mob-child operation authority");
+    assert!(
+        adapter
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await
+    );
+    meerkat_runtime::SessionServiceRuntimeExt::accept_input(
+        adapter.as_ref(),
+        &session_id,
+        meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+            "trigger degraded teardown",
+            None,
+        )),
+    )
+    .await
+    .expect_err("degraded admission must start teardown");
+    let (hook_completed, release_unregister) =
+        provisioner.arm_recovered_ops_after_hook_test_gate(session_id.clone());
+    let first = {
+        let provisioner = Arc::clone(&provisioner);
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            provisioner
+                .dispose_inline_for_recovery_test(&session_id)
+                .await
+        })
+    };
+    let hook_result = tokio::time::timeout(Duration::from_secs(3), hook_completed).await;
+    if hook_result.is_err() {
+        panic!(
+            "post-commit hook did not publish terminal receipt: first_finished={} first_result={:?} registration={:?} state={:?}",
+            first.is_finished(),
+            if first.is_finished() {
+                Some(first.await)
+            } else {
+                None
+            },
+            adapter
+                .current_session_registration_witness(&session_id)
+                .await,
+            meerkat_runtime::RuntimeControlPlane::runtime_state(
+                adapter.as_ref(),
+                &meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
+            )
+            .await,
+        );
+    }
+    assert!(provisioner.ops_binding_present_for_test(&session_id));
+    first.abort();
+    let _ = first.await;
+    drop(release_unregister);
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        provisioner.dispose_inline_for_recovery_test(&session_id),
+    )
+    .await
+    .expect("receipt retry must remain bounded")
+    .expect("retry must recognize exact terminal operation receipt and unregister");
+    assert!(!adapter.contains_session(&session_id).await);
+    assert!(!provisioner.ops_binding_present_for_test(&session_id));
+}
+
+#[cfg(feature = "runtime-adapter")]
 #[tokio::test]
 async fn test_abort_member_provision_retires_runtime_before_absent_cleanup_unregisters() {
     let service = Arc::new(MockSessionService::new());
@@ -38399,6 +39022,41 @@ async fn test_run_flow_persists_before_reply_and_is_queryable() {
 }
 
 #[tokio::test]
+async fn test_start_flow_bounded_wait_resolves_on_flow_terminalization() {
+    let (handle, _service) =
+        create_test_mob(sample_definition_with_single_step_flow(2_000, 8)).await;
+    handle
+        .spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-1"),
+            None,
+        )
+        .await
+        .expect("spawn worker");
+
+    let flow_handle = handle
+        .start_flow_bounded(
+            FlowId::from("demo"),
+            serde_json::json!({ "input": "x" }),
+            BoundedResultSpec::new("flow-root", 2_048).expect("valid bound"),
+        )
+        .await
+        .expect("bounded flow admission");
+    let run_id = flow_handle.run_id().clone();
+
+    let bounded = tokio::time::timeout(Duration::from_secs(5), flow_handle.wait_bounded())
+        .await
+        .expect("bounded flow wait must resolve once terminalization commits the run")
+        .expect("terminal flow run should project a bounded root output");
+    assert_eq!(bounded.run_id(), &run_id);
+    assert_eq!(bounded.flow_id(), &FlowId::from("demo"));
+    assert!(
+        !bounded.result().text().is_empty(),
+        "bounded flow result should carry the root step output"
+    );
+}
+
+#[tokio::test]
 async fn external_delivery_claim_failure_compensates_pending_run_and_delivery() {
     let definition = with_unique_mob_id(
         sample_definition_with_single_step_flow(2_000, 8),
@@ -41286,6 +41944,20 @@ async fn test_flow_failed_append_failure_does_not_write_raw_failure_ledger_entry
         MobRunStatus::Failed,
         "cold recovery must preserve Failed after the durable run CAS wins before terminal event append"
     );
+    assert!(
+        recovered_run
+            .step_status_snapshot()
+            .expect("recovered failed step projection")
+            .values()
+            .all(|status| matches!(
+                status,
+                StepRunStatus::Completed
+                    | StepRunStatus::Failed
+                    | StepRunStatus::Skipped
+                    | StepRunStatus::Canceled
+            )),
+        "cold recovery must preserve the machine-owned terminal fold for every failed-run step"
+    );
     let machine_state = resumed
         .query_machine_state()
         .await
@@ -41462,6 +42134,20 @@ async fn test_flow_canceled_append_failure_does_not_write_raw_failure_ledger_ent
         MobRunStatus::Canceled,
         "cold recovery must preserve Canceled after the durable run CAS wins before terminal event append"
     );
+    assert!(
+        recovered_run
+            .step_status_snapshot()
+            .expect("recovered canceled step projection")
+            .values()
+            .all(|status| matches!(
+                status,
+                StepRunStatus::Completed
+                    | StepRunStatus::Failed
+                    | StepRunStatus::Skipped
+                    | StepRunStatus::Canceled
+            )),
+        "cold recovery must preserve the machine-owned terminal fold for every canceled-run step"
+    );
     let machine_state = resumed
         .query_machine_state()
         .await
@@ -41476,6 +42162,86 @@ async fn test_flow_canceled_append_failure_does_not_write_raw_failure_ledger_ent
             |event| matches!(&event.kind, MobEventKind::FlowCanceled { run_id: id, .. } if id == &run_id)
         ),
         "cold recovery must repair the missing FlowCanceled carrier"
+    );
+}
+
+/// Finding 10 (0.8.22 field report): a replayed-active run whose executing
+/// process died must not converge to a BARE Canceled on resume. The terminal
+/// FlowCanceled carrier must say why: execution custody was lost.
+#[tokio::test]
+async fn test_resume_convergence_carries_execution_custody_lost_cause() {
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let (handle, service, runs, specs, runtime_metadata, identity, identity_status) =
+        create_test_mob_with_recoverable_fault_events(
+            sample_definition_with_single_step_flow(60_000, 8),
+            events.clone(),
+        )
+        .await;
+    handle
+        .spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-1"),
+            None,
+        )
+        .await
+        .expect("spawn worker");
+    service.set_flow_turn_never_terminal(true);
+
+    let run_id = handle
+        .run_flow(FlowId::from("demo"), serde_json::json!({}))
+        .await
+        .expect("run flow");
+    let running_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let run = runs.get_run(&run_id).await.expect("read run row");
+        if run.as_ref().map(|run| &run.status) == Some(&MobRunStatus::Running) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < running_deadline,
+            "flow run never reached Running before simulated process death"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Simulated process death: drop the handle mid-flight with no cancel
+    // command; only the durable stores survive into the resume.
+    drop(handle);
+
+    let resumed = cold_resume_after_terminal_append_fail_stop(
+        events.clone(),
+        runs,
+        specs,
+        runtime_metadata,
+        identity,
+        identity_status,
+        service,
+    )
+    .await;
+    let recovered_run = resumed
+        .flow_status(run_id.clone())
+        .await
+        .expect("query converged run after resume")
+        .expect("orphaned run must remain queryable after resume");
+    assert_eq!(
+        recovered_run.status,
+        MobRunStatus::Canceled,
+        "resume must converge the orphaned active run to Canceled"
+    );
+    let replayed = events.replay_all().await.expect("replay events");
+    let cancel_cause = replayed
+        .iter()
+        .find_map(|event| match &event.kind {
+            MobEventKind::FlowCanceled {
+                run_id: id, cause, ..
+            } if id == &run_id => Some(*cause),
+            _ => None,
+        })
+        .expect("converged run must have a FlowCanceled terminal carrier");
+    assert_eq!(
+        cancel_cause,
+        Some(crate::event::FlowCancelClass::ExecutionCustodyLost),
+        "resume convergence must carry the typed custody-lost cause, never a bare Canceled"
     );
 }
 
@@ -41939,7 +42705,7 @@ async fn test_supervisor_escalation_forces_reset_via_retire_path() {
 }
 
 #[tokio::test]
-async fn test_cleanup_fail_step_routes_generated_supervisor_escalation_effect() {
+async fn test_explicit_fail_step_routes_generated_supervisor_escalation_effect() {
     use crate::machines::mob_machine as mob_dsl;
     use crate::run::{
         MobMachineFlowAuthorityToken, MobMachineFlowRunCommand, apply_mob_machine_flow_run_command,
@@ -42029,7 +42795,7 @@ async fn test_cleanup_fail_step_routes_generated_supervisor_escalation_effect() 
         )),
     );
     let escalation_steps = engine
-        .fail_unfinished_steps(&run_id, "cleanup failure")
+        .fail_unfinished_steps_for_projection_test(&run_id, "explicit step failure")
         .await
         .expect("fail unfinished steps");
     assert_eq!(escalation_steps, vec![step_id("start")]);
@@ -42050,7 +42816,7 @@ async fn test_cleanup_fail_step_routes_generated_supervisor_escalation_effect() 
     assert_eq!(stored.step_ledger[0].status, StepRunStatus::Failed);
     assert_eq!(stored.failure_ledger.len(), 1);
     assert_eq!(stored.failure_ledger[0].step_id, step_id("start"));
-    assert_eq!(stored.failure_ledger[0].reason, "cleanup failure");
+    assert_eq!(stored.failure_ledger[0].reason, "explicit step failure");
 }
 
 #[tokio::test]
@@ -44465,6 +45231,7 @@ struct RuntimeBackedRealCommsSessionService {
     fail_runtime_turns: AtomicBool,
     fail_runtime_boundary_acknowledgement: AtomicBool,
     return_extraction_failure: AtomicBool,
+    return_exact_run_result: AtomicBool,
     runtime_turn_started: tokio::sync::Notify,
     runtime_turn_content_barriers: RwLock<HashMap<SessionId, RuntimeTurnContentBarrier>>,
     release_runtime_turns: tokio::sync::Notify,
@@ -44512,6 +45279,7 @@ impl RuntimeBackedRealCommsSessionService {
             fail_runtime_turns: AtomicBool::new(false),
             fail_runtime_boundary_acknowledgement: AtomicBool::new(false),
             return_extraction_failure: AtomicBool::new(false),
+            return_exact_run_result: AtomicBool::new(false),
             runtime_turn_started: tokio::sync::Notify::new(),
             runtime_turn_content_barriers: RwLock::new(HashMap::new()),
             release_runtime_turns: tokio::sync::Notify::new(),
@@ -44691,6 +45459,11 @@ impl RuntimeBackedRealCommsSessionService {
 
     fn set_return_extraction_failure(&self, enabled: bool) {
         self.return_extraction_failure
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    fn set_return_exact_run_result(&self, enabled: bool) {
+        self.return_exact_run_result
             .store(enabled, Ordering::Relaxed);
     }
 
@@ -45306,6 +46079,7 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
         let event_tx = req.event_tx.clone();
         let applied_turn_metadata = req.runtime.turn_metadata.clone();
         let provider_visible_prompt = provider_visible_prompt_from_start_turn_request(&req);
+        let exact_result_text = provider_visible_prompt.text_content();
         let content_barrier = self
             .runtime_turn_content_barriers
             .read()
@@ -45516,15 +46290,18 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
             message_count: 0,
         };
         let output = if self.return_extraction_failure.load(Ordering::Relaxed) {
-            let mut result = mock_run_result(
-                session_id.clone(),
-                "runtime main turn completed".to_string(),
-            );
+            let mut result = mock_run_result(session_id.clone(), exact_result_text.clone());
             result.extraction_error = Some(meerkat_core::types::ExtractionError {
                 last_output: result.text.clone(),
                 attempts: 1,
                 reason: "injected extraction failure".to_string(),
             });
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_run_result(
+                receipt, None, result,
+            )
+        } else if self.return_exact_run_result.load(Ordering::Relaxed) {
+            let mut result = mock_run_result(session_id.clone(), exact_result_text);
+            result.usage.output_tokens = result.text.len() as u64;
             meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_run_result(
                 receipt, None, result,
             )
@@ -48889,6 +49666,468 @@ async fn test_turn_completed_submission_does_not_block_actor_commands() {
     .expect("unrelated actor command should still be processed");
 
     turn_task.abort();
+}
+
+#[tokio::test]
+async fn completion_bearing_internal_work_waits_for_its_committed_turn_boundary() {
+    let _serial = lock_real_comms_tests();
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("lead"))
+        .expect("lead profile")
+        .as_inline_mut()
+        .unwrap()
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let (handle, service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+    service.set_keep_alive_turns_complete_immediately(true);
+
+    let member_id = AgentIdentity::from("completion-bearing-internal-work");
+    let session_id = handle
+        .spawn(ProfileName::from("lead"), member_id.clone(), None)
+        .await
+        .expect("spawn turn-driven member")
+        .bridge_session_id()
+        .expect("session-backed member")
+        .clone();
+    handle
+        .wait_for_ready(Some(Duration::from_secs(2)))
+        .await
+        .expect("startup should settle");
+    handle
+        .wait_for_members_kickoff_complete(
+            std::slice::from_ref(&member_id),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .expect("kickoff should resolve before the tracked turn");
+
+    let entry = handle
+        .get_member(&member_id)
+        .await
+        .expect("read member")
+        .expect("member exists");
+    let prompt = "completion-bearing internal work owns this exact turn";
+    let authored_system = "completion-bearing system append";
+    let baseline_turn_metadata = service
+        .applied_runtime_turn_metadata(&session_id)
+        .await
+        .len();
+    let apply_entered = service
+        .arm_runtime_turn_content_barrier(&session_id, prompt)
+        .await;
+    let work_ref = WorkRef::new();
+    let turn = handle
+        .start_work_with_mode(
+            entry.agent_runtime_id,
+            entry.fence_token,
+            work_ref.clone(),
+            WorkSpec::new(prompt, WorkOrigin::Internal).with_system_prompt(authored_system),
+            HandlingMode::Queue,
+        )
+        .await
+        .expect("internal work should be admitted");
+    assert_eq!(turn.receipt().work_ref, work_ref);
+
+    tokio::time::timeout(Duration::from_secs(2), apply_entered.notified())
+        .await
+        .expect("the tracked work should enter its runtime boundary");
+    let mut completion = Box::pin(turn.wait());
+    assert!(
+        matches!(
+            futures::poll!(completion.as_mut()),
+            std::task::Poll::Pending
+        ),
+        "the work handle must remain pending while its exact runtime boundary is blocked"
+    );
+
+    service
+        .clear_runtime_turn_content_barrier(&session_id)
+        .await;
+    service.release_one_runtime_turn();
+    let receipt = tokio::time::timeout(Duration::from_secs(2), completion)
+        .await
+        .expect("the exact completion should resolve after runtime release")
+        .expect("the committed internal work should succeed");
+    assert_eq!(receipt.work_ref, work_ref);
+    let applied_metadata = service.applied_runtime_turn_metadata(&session_id).await;
+    assert_eq!(
+        applied_metadata[baseline_turn_metadata..]
+            .iter()
+            .map(|metadata| {
+                metadata
+                    .as_ref()
+                    .expect("runtime-backed work carries turn metadata")
+                    .system_prompts
+                    .clone()
+            })
+            .collect::<Vec<_>>(),
+        vec![vec![authored_system.to_string()]],
+        "the completion-bearing path must preserve the exact WorkSpec system content"
+    );
+
+    service.set_fail_runtime_turns(true);
+    let failed_work_ref = WorkRef::new();
+    let failed = handle
+        .start_work_with_mode(
+            handle
+                .get_member(&member_id)
+                .await
+                .expect("read member after completed turn")
+                .expect("member remains active")
+                .agent_runtime_id,
+            entry.fence_token,
+            failed_work_ref,
+            WorkSpec::new(
+                "completion-bearing internal work propagates its exact failure",
+                WorkOrigin::Internal,
+            ),
+            HandlingMode::Queue,
+        )
+        .await
+        .expect("failing internal work should still be admitted");
+    let error = failed
+        .wait()
+        .await
+        .expect_err("the exact runtime failure must resolve the work handle as an error");
+    assert!(
+        error.to_string().contains("injected runtime turn failure"),
+        "the work handle must preserve the exact terminal error, got: {error}"
+    );
+
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn exact_turn_runtime_member_results_remain_correlated_in_reverse_completion_order() {
+    let _serial = lock_real_comms_tests();
+    let mut definition = sample_definition();
+    for profile in definition
+        .profiles
+        .values_mut()
+        .filter_map(|binding| binding.as_inline_mut())
+    {
+        profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
+        profile.external_addressable = true;
+    }
+    let (handle, service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+
+    let first_identity = AgentIdentity::from("exact-first");
+    let second_identity = AgentIdentity::from("exact-second");
+    let first_session = handle
+        .spawn(ProfileName::from("lead"), first_identity.clone(), None)
+        .await
+        .expect("spawn first runtime-backed member")
+        .bridge_session_id()
+        .expect("first bridge session")
+        .clone();
+    let second_session = handle
+        .spawn(ProfileName::from("worker"), second_identity.clone(), None)
+        .await
+        .expect("spawn second runtime-backed member")
+        .bridge_session_id()
+        .expect("second bridge session")
+        .clone();
+    service.set_return_exact_run_result(true);
+
+    let first_prompt = "first exact runtime result is held at its apply barrier";
+    let first_entered = service
+        .arm_runtime_turn_content_barrier(&first_session, first_prompt)
+        .await;
+    let first_turn = handle
+        .member(&first_identity)
+        .await
+        .expect("first member handle")
+        .start_turn(
+            ContentInput::Text(first_prompt.to_string()),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("admit first exact runtime turn");
+    first_entered.notified().await;
+
+    let second_prompt = "second exact runtime result completes first";
+    let second = handle
+        .member(&second_identity)
+        .await
+        .expect("second member handle")
+        .start_turn(
+            ContentInput::Text(second_prompt.to_string()),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("admit second exact runtime turn")
+        .wait_bounded(BoundedResultSpec::new("second", 256).expect("valid bound"))
+        .await
+        .expect("second exact runtime result");
+    assert_eq!(second.receipt().identity, second_identity);
+    assert_eq!(second.result().session_id(), &second_session);
+    assert_eq!(second.result().result().text(), second_prompt);
+    assert_eq!(
+        second.result().usage().output_tokens,
+        second_prompt.len() as u64
+    );
+
+    service
+        .clear_runtime_turn_content_barrier(&first_session)
+        .await;
+    service.release_one_runtime_turn();
+    let first = first_turn
+        .wait_bounded(BoundedResultSpec::new("first", 256).expect("valid bound"))
+        .await
+        .expect("first exact runtime result after release");
+    assert_eq!(first.receipt().identity, first_identity);
+    assert_eq!(first.result().session_id(), &first_session);
+    assert_eq!(first.result().result().text(), first_prompt);
+    assert_eq!(
+        first.result().usage().output_tokens,
+        first_prompt.len() as u64
+    );
+
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn exact_turn_runtime_work_preserves_result_and_completed_without_result_is_typed() {
+    let _serial = lock_real_comms_tests();
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("lead"))
+        .expect("lead profile")
+        .as_inline_mut()
+        .expect("inline lead profile")
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let (handle, service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+    let identity = AgentIdentity::from("exact-work-member");
+    let session_id = handle
+        .spawn(ProfileName::from("lead"), identity.clone(), None)
+        .await
+        .expect("spawn runtime-backed work member")
+        .bridge_session_id()
+        .expect("work bridge session")
+        .clone();
+    let entry = handle
+        .get_member(&identity)
+        .await
+        .expect("read work member")
+        .expect("work member exists");
+
+    service.set_return_exact_run_result(true);
+    let exact_prompt = "exact internal work result";
+    let exact_work_ref = WorkRef::new();
+    let exact = handle
+        .start_work_with_mode(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            exact_work_ref.clone(),
+            WorkSpec::new(exact_prompt, WorkOrigin::Internal),
+            HandlingMode::Queue,
+        )
+        .await
+        .expect("admit exact internal work")
+        .wait_bounded(BoundedResultSpec::new("work", 256).expect("valid bound"))
+        .await
+        .expect("exact internal work result");
+    assert_eq!(exact.receipt().work_ref, exact_work_ref);
+    assert_eq!(exact.result().session_id(), &session_id);
+    assert_eq!(exact.result().result().text(), exact_prompt);
+    assert_eq!(
+        exact.result().usage().output_tokens,
+        exact_prompt.len() as u64
+    );
+
+    service.set_return_exact_run_result(false);
+    let no_result = handle
+        .member(&identity)
+        .await
+        .expect("member handle for no-result turn")
+        .start_turn(
+            ContentInput::Text("runtime commits no result".to_string()),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("admit no-result runtime turn")
+        .wait_bounded(BoundedResultSpec::new("no-result", 256).expect("valid bound"))
+        .await
+        .expect_err("CompletedWithoutResult must not become a fabricated result");
+    assert!(matches!(
+        no_result.failure(),
+        BoundedTurnFailure::CompletedWithoutResult {
+            session_id: actual
+        } if actual == &session_id
+    ));
+
+    service.set_return_extraction_failure(true);
+    let extraction_cap = crate::HELPER_RESULT_TRUNCATION_MARKER.len() + 4;
+    let extraction = handle
+        .member(&identity)
+        .await
+        .expect("member handle for extraction turn")
+        .start_turn(
+            ContentInput::Text(format!(
+                "ab💡{}private-extraction-tail",
+                "x".repeat(crate::HELPER_RESULT_TRUNCATION_MARKER.len() + 32)
+            )),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("admit extraction runtime turn")
+        .wait_bounded(
+            BoundedResultSpec::new("extraction", extraction_cap).expect("valid extraction bound"),
+        )
+        .await
+        .expect_err("runtime extraction failure must remain a bounded failure");
+    match extraction.failure() {
+        BoundedTurnFailure::ExtractionFailed {
+            session_id: actual,
+            reason,
+            last_output,
+            attempts,
+        } => {
+            assert_eq!(actual, &session_id);
+            assert_eq!(*attempts, 1);
+            assert_eq!(reason.status(), BoundedHelperResultStatus::FailedTruncated);
+            assert!(reason.text().len() <= extraction_cap);
+            assert!(
+                reason
+                    .text()
+                    .ends_with(crate::HELPER_RESULT_TRUNCATION_MARKER)
+            );
+            assert_eq!(
+                last_output.status(),
+                BoundedHelperResultStatus::FailedTruncated
+            );
+            assert_eq!(
+                last_output.text(),
+                format!("ab{}", crate::HELPER_RESULT_TRUNCATION_MARKER)
+            );
+            assert!(last_output.text().len() <= extraction_cap);
+            assert!(!last_output.text().contains("private-extraction-tail"));
+        }
+        other => panic!("expected bounded runtime extraction failure, got {other:?}"),
+    }
+
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn exact_turn_runtime_failure_and_direct_session_failure_keep_distinct_types() {
+    let _serial = lock_real_comms_tests();
+    let mut runtime_definition = sample_definition();
+    runtime_definition
+        .profiles
+        .get_mut(&ProfileName::from("lead"))
+        .expect("lead profile")
+        .as_inline_mut()
+        .expect("inline lead profile")
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let (runtime_handle, runtime_service) =
+        create_test_mob_with_runtime_backed_real_comms(runtime_definition).await;
+    let runtime_identity = AgentIdentity::from("exact-runtime-failure");
+    let runtime_session = runtime_handle
+        .spawn(ProfileName::from("lead"), runtime_identity.clone(), None)
+        .await
+        .expect("spawn runtime failure member")
+        .bridge_session_id()
+        .expect("runtime failure bridge session")
+        .clone();
+    runtime_service.set_fail_runtime_turns(true);
+    let runtime_error = runtime_handle
+        .member(&runtime_identity)
+        .await
+        .expect("runtime failure member handle")
+        .start_turn(
+            ContentInput::Text("fail through the real runtime adapter".to_string()),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("runtime failure is post-admission")
+        .wait_bounded(BoundedResultSpec::new("runtime-failure", 256).expect("valid bound"))
+        .await
+        .expect_err("runtime machine failure must remain typed");
+    match runtime_error.failure() {
+        BoundedTurnFailure::AbandonedWithError {
+            session_id: actual,
+            error,
+            ..
+        } => {
+            assert_eq!(actual, &runtime_session);
+            assert!(
+                error
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("injected runtime turn failure")),
+                "typed runtime failure must retain its injected cause: {error:?}"
+            );
+        }
+        other => panic!("expected typed runtime machine failure, got {other:?}"),
+    }
+    runtime_handle
+        .shutdown()
+        .await
+        .expect("shutdown runtime-backed test mob");
+
+    let direct_service = Arc::new(MockSessionService::new());
+    let direct_session = direct_service
+        .create_session(CreateSessionRequest {
+            injected_context: Vec::new(),
+            model: "direct-test-model".to_string(),
+            prompt: ContentInput::Text("create direct tracked session".to_string()),
+            system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+            max_tokens: None,
+            event_tx: None,
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            build: None,
+            labels: None,
+        })
+        .await
+        .expect("create direct tracked session")
+        .session_id;
+    direct_service.set_fail_start_turn(true);
+    let direct_backend =
+        super::provisioner::SessionBackend::new(direct_service.clone(), None, None);
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    MobProvisioner::admit_tracked_turn(
+        &direct_backend,
+        &MemberRef::Session {
+            session_id: direct_session.clone(),
+        },
+        StartTurnRequest {
+            injected_context: Vec::new(),
+            prompt: ContentInput::Text("fail through direct SessionService".to_string()),
+            system_prompt: None,
+            event_tx: None,
+            runtime: meerkat_core::service::StartTurnRuntimeSemantics::default(),
+        },
+        completion_tx,
+        None,
+    )
+    .await
+    .expect("direct semantic failure is post-admission");
+    let direct_completion = completion_rx
+        .await
+        .expect("direct completion authority remains live")
+        .expect("direct semantic failure must not become completion plumbing");
+    assert_eq!(direct_completion.session_id, direct_session);
+    match direct_completion.terminal {
+        super::handle::ExactTurnTerminal::DirectSessionError(error) => {
+            assert_eq!(error.code(), "SESSION_STORE_ERROR");
+            assert!(error.to_string().contains("mock start_turn failure"));
+        }
+        other => panic!("expected typed direct SessionError carrier, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -54599,6 +55838,62 @@ async fn test_rotate_supervisor_reinstalls_private_trust_on_session_backed_membe
 }
 
 #[tokio::test]
+async fn test_spawn_threads_exact_compaction_curator_to_session_build_options() {
+    let definition = sample_definition();
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let curator: Arc<dyn meerkat_core::CompactionCurator> = Arc::new(TestCompactionCurator);
+    let mut spec = SpawnMemberSpec::new("worker", "curated-worker");
+    spec.compaction_curator_override = Some(Arc::clone(&curator));
+
+    handle.spawn_spec(spec).await.expect("spawn curated member");
+
+    let recorded = service.recorded_compaction_curators().await;
+    assert_eq!(recorded.len(), 1, "one member session should be created");
+    assert!(
+        recorded[0]
+            .as_ref()
+            .is_some_and(|actual| Arc::ptr_eq(actual, &curator)),
+        "the exact host curator Arc must reach the final session build options"
+    );
+}
+
+#[tokio::test]
+async fn test_remote_spawn_rejects_host_compaction_curator_before_submit() {
+    let definition = sample_definition();
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let mut spec = SpawnMemberSpec::new("worker", "remote-curated-worker");
+    spec.compaction_curator_override = Some(Arc::new(TestCompactionCurator));
+    spec.placement = Some(crate::machines::mob_machine::HostId::from("remote-host"));
+
+    let error = handle
+        .spawn_spec(spec)
+        .await
+        .expect_err("host curator must never enter remote placement");
+
+    assert!(matches!(
+        error,
+        MobError::WiringError(message)
+            if message.contains("cannot be submitted to a remote member host")
+    ));
+    assert!(
+        service.recorded_compaction_curators().await.is_empty(),
+        "refusal must happen before local session creation or remote submission"
+    );
+}
+
+#[tokio::test]
 async fn test_external_tools_provider_called_per_spawn() {
     let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let counter_clone = counter.clone();
@@ -55294,9 +56589,16 @@ async fn test_spawn_member_with_initial_turn_returns_before_child_turn_completio
 
 #[tokio::test]
 async fn test_default_helper_spawns_remain_ephemeral() {
-    let definition = sample_definition();
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .and_then(|binding| binding.as_inline_mut())
+        .expect("worker profile")
+        .external_addressable = true;
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
+    service.set_return_exact_run_result(true);
     let handle = MobBuilder::new(definition, MobStorage::in_memory())
         .with_session_service(service)
         .create()
@@ -55312,6 +56614,8 @@ async fn test_default_helper_spawns_remain_ephemeral() {
                 runtime_mode: Some(crate::MobRuntimeMode::TurnDriven),
                 ..HelperOptions::default()
             },
+            "ephemeral-helper",
+            256,
         )
         .await
         .expect("helper spawn");
@@ -55415,9 +56719,17 @@ impl SpawnMemberCustomizer for ResumeAddressabilityCustomizer {
 #[tokio::test]
 async fn test_spawn_member_customizer_fires_with_source_and_spawner_provenance() {
     let customizer = RecordingSpawnCustomizer::new();
-    let definition = sample_definition_with_mob_tools();
+    let mut definition = sample_definition_with_mob_tools();
+    for profile in definition
+        .profiles
+        .values_mut()
+        .filter_map(|binding| binding.as_inline_mut())
+    {
+        profile.external_addressable = true;
+    }
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
+    service.set_return_exact_run_result(true);
     let handle = MobBuilder::new(definition, MobStorage::in_memory())
         .with_session_service(service.clone())
         .with_spawn_member_customizer(Arc::new(customizer.clone()))
@@ -55462,6 +56774,8 @@ async fn test_spawn_member_customizer_fires_with_source_and_spawner_provenance()
                 runtime_mode: Some(crate::MobRuntimeMode::TurnDriven),
                 ..HelperOptions::default()
             },
+            "customized-spawn-helper",
+            256,
         )
         .await
         .expect("helper spawn");
@@ -55476,6 +56790,8 @@ async fn test_spawn_member_customizer_fires_with_source_and_spawner_provenance()
                 runtime_mode: Some(crate::MobRuntimeMode::TurnDriven),
                 ..HelperOptions::default()
             },
+            "customized-fork-helper",
+            256,
         )
         .await
         .expect("fork helper spawn");
@@ -66432,10 +67748,13 @@ async fn test_finalization_failure_suppresses_buffered_success_terminal() {
     let (handle, service) =
         create_test_mob_with_persistent_runtime_backed_real_comms(definition).await;
     let identity = AgentIdentity::from("lead-finalization-failure");
-    handle
+    let session_id = handle
         .spawn(ProfileName::from("lead"), identity.clone(), None)
         .await
-        .expect("spawn lead");
+        .expect("spawn lead")
+        .bridge_session_id()
+        .expect("finalization failure bridge session")
+        .clone();
     service.set_emit_runtime_event_before_completion(true);
     service.set_fail_runtime_boundary_acknowledgement(true);
     let llm_host = Arc::new(RecordingSessionLlmReconfigureHost::new());
@@ -66468,15 +67787,26 @@ async fn test_finalization_failure_suppresses_buffered_success_terminal() {
         .expect("identity override");
     assert_eq!(applied.model, "finalization-model");
     let error = turn
-        .wait()
+        .wait_bounded(BoundedResultSpec::new("finalization", 256).expect("valid bound"))
         .await
         .expect_err("checkpoint failure must fail tracked completion");
-    assert!(
-        error
-            .to_string()
-            .contains("runtime session checkpoint failed after commit"),
-        "unexpected finalization error: {error}"
-    );
+    match error.failure() {
+        BoundedTurnFailure::AbandonedWithError {
+            session_id: actual,
+            reason,
+            error,
+        } => {
+            assert_eq!(actual, &session_id);
+            assert!(reason.contains("runtime session checkpoint failed after commit"));
+            assert!(
+                error.detail.as_deref().is_some_and(
+                    |detail| detail.contains("runtime session checkpoint failed after commit")
+                ),
+                "typed finalization failure must retain its machine cause: {error:?}"
+            );
+        }
+        other => panic!("expected typed finalization failure, got {other:?}"),
+    }
 
     let mut saw_delta = false;
     while let Ok(Some(event)) =

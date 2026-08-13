@@ -38,6 +38,7 @@ pub(crate) enum MobMachineCommand {
         activation_params: serde_json::Value,
         external_delivery_intent: Option<crate::store::MobExternalDeliveryIntent>,
         scoped_event_tx: Option<tokio::sync::mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
+        exact_operation: Option<crate::runtime::FlowOperationCustody>,
     },
     CancelFlow {
         run_id: RunId,
@@ -210,7 +211,8 @@ pub(crate) struct SubmitWorkCommand {
     pub turn_metadata: Option<meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata>,
     pub event_tx:
         Option<tokio::sync::mpsc::Sender<meerkat_core::EventEnvelope<meerkat_core::AgentEvent>>>,
-    pub completion_tx: Option<tokio::sync::oneshot::Sender<Result<(), crate::MobError>>>,
+    pub completion_tx: Option<crate::runtime::ExactTurnCompletionSender>,
+    pub bounded_result_spec: Option<crate::runtime::BoundedResultSpec>,
     pub llm_identity_applied_tx: Option<crate::runtime::MemberTurnLlmIdentityAppliedSender>,
     pub ack_mode: SubmitWorkAckMode,
 }

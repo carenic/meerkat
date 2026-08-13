@@ -27,6 +27,16 @@ path = "tests/system_cli_resume.rs"
 required-features = ["integration-real-tests"]
 
 [[test]]
+name = "system_cli_mcp_pending"
+path = "tests/system_cli_mcp_pending.rs"
+required-features = ["integration-real-tests"]
+
+[[test]]
+name = "system_cli_export_atif"
+path = "tests/system_cli_export_atif.rs"
+required-features = ["integration-real-tests"]
+
+[[test]]
 name = "live_smoke_cli"
 path = "tests/live_smoke_cli.rs"
 required-features = ["integration-real-tests"]
@@ -46,8 +56,14 @@ name = "system_mob_cli_verbs"
 path = "tests/system_mob_cli_verbs.rs"
 required-features = ["integration-real-tests", "mob", "comms"]
 
+[[test]]
+name = "system_mob_run_custody"
+path = "tests/system_mob_run_custody.rs"
+required-features = ["integration-real-tests", "mob"]
+
 [dependencies]
 meerkat = { workspace = true }
+meerkat-atif = { workspace = true }
 meerkat-auth-core = { workspace = true }
 meerkat-core = { workspace = true }
 meerkat-models = { workspace = true }
@@ -110,7 +126,7 @@ jsonl-store = ["meerkat/jsonl-store"]
 session-store = ["meerkat/session-store"]
 session-compaction = ["meerkat/session-compaction"]
 # Enables both the memory backend capability and memory_search/session wiring.
-memory-store = ["meerkat/memory-store", "meerkat/memory-store-session"]
+memory-store = ["meerkat/memory-store", "memory-store-session"]
 memory-store-session = ["meerkat/memory-store-session"]
 
 # Subsystems

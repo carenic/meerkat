@@ -20,9 +20,10 @@ mod trigger;
 mod types;
 
 pub use driver::{
-    DeliveryCompletion, DeliveryDispatch, DeliveryTerminal, ScheduleDeliveryIdentity,
-    ScheduleDriver, ScheduleDriverConfig, ScheduleRefillFault, ScheduleTargetDelivery,
-    ScheduleTargetProbe, ScheduleTickReport, TargetProbeOutcome,
+    DeliveryCompletion, DeliveryDispatch, DeliveryTerminal, IdentityTargetDeliverability,
+    ScheduleDeliveryIdentity, ScheduleDriver, ScheduleDriverConfig, ScheduleIdentityTargetProbe,
+    ScheduleRefillFault, ScheduleTargetDelivery, ScheduleTargetProbe, ScheduleTickReport,
+    TargetProbeOutcome,
 };
 pub use error::{ScheduleDomainError, ScheduleStoreError};
 pub use lifecycle::{
@@ -65,12 +66,12 @@ pub use types::{
     DeliveryCompletionFailureReason, DeliveryFailureReason, DeliveryReceipt, DeliveryReceiptStage,
     FlowParams, FlowParamsError, ForkContextSpec, HelperOptionsSpec, HostRunnableName,
     HostRunnableNameError, HostRunnableParams, HostRunnableParamsError, HostRunnableTargetBinding,
-    IdentityTargetBinding, IntervalTriggerSpec, MisfirePolicy, MissingTargetPolicy,
-    MobTargetBinding, Occurrence, OccurrenceFailureClass, OccurrenceId, OccurrenceOrdinal,
-    OccurrencePhase, OccurrenceTargetProbeOutcome, OverlapPolicy, ResolvedSpawnSnapshot,
-    RuntimeCompletionOutcome, RuntimeDeliveryOutcome, Schedule, ScheduleConfig, ScheduleId,
-    SchedulePhase, ScheduleRevision, ScheduleSpawnTooling, ScheduledMobAction,
-    ScheduledMobBackendKind, ScheduledMobRuntimeMode, ScheduledSessionAction,
+    IdentityTargetBinding, IntervalTriggerSpec, MOB_MEMBER_IDENTITY_TARGET_PREFIX, MisfirePolicy,
+    MissingTargetPolicy, MobTargetBinding, Occurrence, OccurrenceFailureClass, OccurrenceId,
+    OccurrenceOrdinal, OccurrencePhase, OccurrenceTargetProbeOutcome, OverlapPolicy,
+    ResolvedSpawnSnapshot, RuntimeCompletionOutcome, RuntimeDeliveryOutcome, Schedule,
+    ScheduleConfig, ScheduleId, SchedulePhase, ScheduleRevision, ScheduleSpawnTooling,
+    ScheduledMobAction, ScheduledMobBackendKind, ScheduledMobRuntimeMode, ScheduledSessionAction,
     SessionMaterializationSpec, SessionTargetBinding, TargetBinding, TriggerSpec,
     UpdateScheduleRequest,
 };

@@ -730,6 +730,7 @@ fn mob_machine_native_reducer_helpers_are_formally_defined() {
         "mob_machine_remote_turn_custody_admits",
         "mob_machine_node_terminal",
         "mob_machine_run_step_status_after_set",
+        "mob_machine_run_step_status_after_cancel_unfinished",
         "mob_machine_run_step_bool_after_set",
         "mob_machine_run_step_condition_result_after_set",
         "mob_machine_run_step_u64_after_set",

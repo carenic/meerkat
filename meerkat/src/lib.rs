@@ -27,6 +27,8 @@
     )
 )]
 
+pub use meerkat_atif as atif;
+
 // On wasm32, provide tokio alias backed by tokio_with_wasm.
 #[cfg(target_arch = "wasm32")]
 pub mod tokio {
@@ -220,18 +222,19 @@ pub use meerkat_schedule::{
     HelperOptionsSpec, HostRunnable, HostRunnableError, HostRunnableInvocation, HostRunnableName,
     HostRunnableNameError, HostRunnableOutcome, HostRunnableParams, HostRunnableParamsError,
     HostRunnableRegistry, HostRunnableRegistryError, HostRunnableTargetBinding,
-    IdentityTargetBinding, IntervalTriggerSpec, MemoryScheduleStore, MisfirePolicy,
-    MissingTargetPolicy, MobTargetBinding, Occurrence, OccurrenceFailureClass, OccurrenceFilter,
-    OccurrenceId, OccurrenceOrdinal, OccurrencePhase, OverlapPolicy, ResolvedSpawnSnapshot,
-    RunnableProbe, SCHEDULE_TOOL_CAPABILITY_UNAVAILABLE, SCHEDULE_TOOL_INVALID_ARGUMENTS,
-    SCHEDULE_TOOL_NOT_FOUND, Schedule, ScheduleDeliveryIdentity, ScheduleDomainError,
-    ScheduleDriver, ScheduleDriverConfig, ScheduleFilter, ScheduleId, SchedulePhase,
-    ScheduleRevision, ScheduleRunnableHost, ScheduleService, ScheduleSpawnTooling, ScheduleStore,
-    ScheduleStoreError, ScheduleStoreKind, ScheduleStoreWakeMode, ScheduleTargetDelivery,
-    ScheduleTargetProbe, ScheduleToolDispatcher, ScheduleToolError, ScheduledMobAction,
-    ScheduledMobBackendKind, ScheduledMobRuntimeMode, ScheduledSessionAction,
-    SessionMaterializationSpec, SessionTargetBinding, TargetBinding, TargetProbeOutcome,
-    TriggerSpec, UpdateScheduleRequest, handle_schedule_tools_call, schedule_tools_list,
+    IdentityTargetBinding, IdentityTargetDeliverability, IntervalTriggerSpec,
+    MOB_MEMBER_IDENTITY_TARGET_PREFIX, MemoryScheduleStore, MisfirePolicy, MissingTargetPolicy,
+    MobTargetBinding, Occurrence, OccurrenceFailureClass, OccurrenceFilter, OccurrenceId,
+    OccurrenceOrdinal, OccurrencePhase, OverlapPolicy, ResolvedSpawnSnapshot, RunnableProbe,
+    SCHEDULE_TOOL_CAPABILITY_UNAVAILABLE, SCHEDULE_TOOL_INVALID_ARGUMENTS, SCHEDULE_TOOL_NOT_FOUND,
+    Schedule, ScheduleDeliveryIdentity, ScheduleDomainError, ScheduleDriver, ScheduleDriverConfig,
+    ScheduleFilter, ScheduleId, ScheduleIdentityTargetProbe, SchedulePhase, ScheduleRevision,
+    ScheduleRunnableHost, ScheduleService, ScheduleSpawnTooling, ScheduleStore, ScheduleStoreError,
+    ScheduleStoreKind, ScheduleStoreWakeMode, ScheduleTargetDelivery, ScheduleTargetProbe,
+    ScheduleToolDispatcher, ScheduleToolError, ScheduledMobAction, ScheduledMobBackendKind,
+    ScheduledMobRuntimeMode, ScheduledSessionAction, SessionMaterializationSpec,
+    SessionTargetBinding, TargetBinding, TargetProbeOutcome, TriggerSpec, UpdateScheduleRequest,
+    handle_schedule_tools_call, schedule_tools_list,
 };
 pub use meerkat_tools::ToolError;
 #[cfg(not(target_arch = "wasm32"))]

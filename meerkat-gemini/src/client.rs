@@ -1865,7 +1865,10 @@ impl LlmClient for GeminiClient {
                 let chunk = chunk.map_err(|_| LlmError::ConnectionReset)?;
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
+                let chunk_yielded = std::cell::Cell::new(false);
+                let mut chunk_consumed_line = false;
                 while let Some(newline_pos) = buffer.find('\n') {
+                    chunk_consumed_line = true;
                     let line = buffer[..newline_pos].trim();
                     let data = line.strip_prefix("data: ");
                     let parsed_response = if let Some(d) = data {
@@ -1878,6 +1881,7 @@ impl LlmClient for GeminiClient {
 
                     if let Some(resp) = parsed_response {
                         if let Some(usage) = resp.usage_metadata {
+                            chunk_yielded.set(true);
                             yield LlmEvent::UsageUpdate {
                                 usage: meerkat_core::TurnUsage::try_from_usage(Usage {
                                     input_tokens: usage.prompt_token_count.unwrap_or(0),
@@ -1913,6 +1917,7 @@ impl LlmClient for GeminiClient {
                                             });
 
                                             if let Some(text) = part.text {
+                                                chunk_yielded.set(true);
                                                 yield text_event_for_part(
                                                     text,
                                                     part.thought.unwrap_or(false),
@@ -1922,6 +1927,7 @@ impl LlmClient for GeminiClient {
                                             if let Some(fc) = part.function_call {
                                                 let id = format!("fc_{tool_call_index}");
                                                 tool_call_index += 1;
+                                                chunk_yielded.set(true);
                                                 yield LlmEvent::ToolCallComplete {
                                                     id,
                                                     name: fc.name,
@@ -1934,6 +1940,7 @@ impl LlmClient for GeminiClient {
                                 }
 
                                 if let Some(grounding_metadata) = cand.grounding_metadata {
+                                    chunk_yielded.set(true);
                                     yield LlmEvent::ServerToolContent {
                                         id: None,
                                         kind: ServerToolKind::GoogleSearch,
@@ -1950,6 +1957,7 @@ impl LlmClient for GeminiClient {
                                         // "STOP" and any unrecognized reason default to EndTurn
                                         _ => StopReason::EndTurn,
                                     };
+                                    chunk_yielded.set(true);
                                     yield LlmEvent::Done {
                                         outcome: LlmDoneOutcome::Success { stop_reason: stop },
                                     };
@@ -1957,6 +1965,13 @@ impl LlmClient for GeminiClient {
                             }
                         }
                     }
+                }
+                // A chunk whose lines produced no semantic event is still wire
+                // liveness (keepalive comments, non-data lines); surface it so
+                // the stream-inactivity watchdog re-arms. Bytes that never
+                // complete a line intentionally do not count.
+                if chunk_consumed_line && !chunk_yielded.get() {
+                    yield LlmEvent::WireLiveness;
                 }
             }
         });

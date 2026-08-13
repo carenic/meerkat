@@ -3426,6 +3426,18 @@ macro_rules! mob_catalog_machine_dsl {
                 obligation.dispatch_sequence <= self.placed_completion_dispatch_sequence)
         }
 
+        invariant failed_or_canceled_runs_have_only_terminal_steps {
+            for_all(run_id in self.run_status.keys(),
+                (self.run_status.get_cloned(run_id) != Some(FlowRunStatus::Failed)
+                    && self.run_status.get_cloned(run_id) != Some(FlowRunStatus::Canceled))
+                || for_all(step_id in self.run_tracked_steps.get_cloned(run_id).get("value"),
+                    self.run_step_status.get_cloned(run_id).get("value").get_cloned(step_id) == Some(Some(StepRunStatus::Completed))
+                    || self.run_step_status.get_cloned(run_id).get("value").get_cloned(step_id) == Some(Some(StepRunStatus::Failed))
+                    || self.run_step_status.get_cloned(run_id).get("value").get_cloned(step_id) == Some(Some(StepRunStatus::Skipped))
+                    || self.run_step_status.get_cloned(run_id).get("value").get_cloned(step_id) == Some(Some(StepRunStatus::Canceled)))
+            )
+        }
+
         // =====================================================================
         // Direct transitions
         // =====================================================================
@@ -17510,6 +17522,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "run_running" { self.run_status.get_cloned(run_id) == Some(FlowRunStatus::Running) }
             guard "terminal_failed_command" { command == FlowRunReducerCommandKind::TerminalizeFailed }
             update {
+                self.run_step_status = mob_machine_run_step_status_after_cancel_unfinished(self.run_step_status, run_id);
                 self.run_status.insert(run_id, FlowRunStatus::Failed);
             }
             to Running
@@ -17523,6 +17536,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "run_running" { self.run_status.get_cloned(run_id) == Some(FlowRunStatus::Running) }
             guard "terminal_canceled_command" { command == FlowRunReducerCommandKind::TerminalizeCanceled }
             update {
+                self.run_step_status = mob_machine_run_step_status_after_cancel_unfinished(self.run_step_status, run_id);
                 self.run_status.insert(run_id, FlowRunStatus::Canceled);
             }
             to Running
@@ -19898,6 +19912,24 @@ macro_rules! mob_catalog_machine_dsl {
                 .entry(run_id.clone())
                 .or_default()
                 .insert(step_id.clone(), Some(*status));
+            all_statuses
+        }
+
+        /// A failed or canceled run owns the terminal fold for work that never
+        /// reached a per-step terminal. Preserve completed, failed, skipped,
+        /// and already-canceled facts; classify only absent or dispatched work
+        /// as canceled in the same machine transition as the run terminal.
+        fn mob_machine_run_step_status_after_cancel_unfinished(
+            all_statuses: &std::collections::BTreeMap<RunId, std::collections::BTreeMap<StepId, Option<StepRunStatus>>>,
+            run_id: &RunId,
+        ) -> std::collections::BTreeMap<RunId, std::collections::BTreeMap<StepId, Option<StepRunStatus>>> {
+            let mut all_statuses = all_statuses.clone();
+            let statuses = all_statuses.entry(run_id.clone()).or_default();
+            for status in statuses.values_mut() {
+                if status.is_none() || *status == Some(StepRunStatus::Dispatched) {
+                    *status = Some(StepRunStatus::Canceled);
+                }
+            }
             all_statuses
         }
 

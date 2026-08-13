@@ -553,6 +553,12 @@ pub struct SessionBuildOptions {
     /// set, this wins over both the global config knob and model-aware
     /// context-window scaling.
     pub auto_compact_threshold_override: Option<std::num::NonZeroU64>,
+    /// Host-supplied compaction summary curator for this build.
+    ///
+    /// This is an in-process Rust carrier. It is deliberately absent from all
+    /// serialized request contracts: executable host behavior cannot be
+    /// persisted or transported across a gateway boundary.
+    pub compaction_curator_override: Option<Arc<dyn crate::CompactionCurator>>,
     pub output_schema: Option<OutputSchema>,
     /// Structured-output retry budget *intent*. `None` inherits the canonical
     /// default ([`crate::config::default_structured_output_retries`]); the
@@ -1412,6 +1418,7 @@ impl Default for SessionBuildOptions {
             custom_models: BTreeMap::new(),
             image_generation_provider: None,
             auto_compact_threshold_override: None,
+            compaction_curator_override: None,
             output_schema: None,
             structured_output_retries: None,
             hooks_override: HookRunOverrides::default(),
@@ -1478,6 +1485,10 @@ impl std::fmt::Debug for SessionBuildOptions {
             .field(
                 "auto_compact_threshold_override",
                 &self.auto_compact_threshold_override,
+            )
+            .field(
+                "compaction_curator_override",
+                &self.compaction_curator_override.is_some(),
             )
             .field("output_schema", &self.output_schema.is_some())
             .field("structured_output_retries", &self.structured_output_retries)

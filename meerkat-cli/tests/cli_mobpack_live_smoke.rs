@@ -160,13 +160,10 @@ fn output_ok_or_err(output: std::process::Output, args: &[&str]) -> Result<Strin
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn leading_json(stdout: &str) -> Result<Value, Box<dyn std::error::Error>> {
-    let json_text = stdout
-        .split("\nwarning\t")
-        .next()
-        .ok_or("missing leading JSON output")?
-        .trim();
-    Ok(serde_json::from_str(json_text)?)
+/// Under --json, stdout must be exactly one machine-readable JSON document:
+/// strict parse, no tolerance for trailing diagnostic bytes.
+fn strict_json(stdout: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    Ok(serde_json::from_str(stdout.trim())?)
 }
 
 fn signer_from_pack(pack_bytes: &[u8]) -> Result<(String, String), Box<dyn std::error::Error>> {
@@ -803,7 +800,7 @@ async fn e2e_smoke_mobpack_callable_flow_run_live() -> Result<(), Box<dyn std::e
     let run_out = run_rkat(&rkat, &project_dir, &run_refs, Some(&api_key)).await?;
     let run_stderr = String::from_utf8_lossy(&run_out.stderr).to_string();
     let run_stdout = output_ok_or_err(run_out, &run_refs).map_err(std::io::Error::other)?;
-    let envelope = leading_json(&run_stdout)?;
+    let envelope = strict_json(&run_stdout)?;
     assert_eq!(envelope["mob_id"], "callable-flow-smoke");
     assert_eq!(envelope["flow_id"], "main");
     assert_eq!(
@@ -821,8 +818,12 @@ async fn e2e_smoke_mobpack_callable_flow_run_live() -> Result<(), Box<dyn std::e
         "typed run envelope should prove --prompt was bound to params.prompt: {run_stdout}"
     );
     assert!(
-        run_stdout.contains("warning\tunsigned pack accepted in permissive mode"),
-        "permissive unsigned warning expected: {run_stdout}"
+        !run_stdout.contains("warning\t"),
+        "--json stdout must carry no warning lines: {run_stdout}"
+    );
+    assert!(
+        run_stderr.contains("warning\tunsigned pack accepted in permissive mode"),
+        "permissive unsigned warning expected on stderr: {run_stderr}"
     );
 
     Ok(())
@@ -868,8 +869,9 @@ async fn run_adaptive_finish_smoke(
     ];
     let run_refs: Vec<&str> = run_args.iter().map(String::as_str).collect();
     let run_out = run_rkat(&rkat, &project_dir, &run_refs, Some(&api_key)).await?;
+    let run_stderr = String::from_utf8_lossy(&run_out.stderr).to_string();
     let run_stdout = output_ok_or_err(run_out, &run_refs).map_err(std::io::Error::other)?;
-    let envelope = leading_json(&run_stdout)?;
+    let envelope = strict_json(&run_stdout)?;
     assert!(
         envelope["run_id"]
             .as_str()
@@ -904,8 +906,12 @@ async fn run_adaptive_finish_smoke(
         "adaptive result did not preserve prompt summary: {run_stdout}"
     );
     assert!(
-        run_stdout.contains("warning\tunsigned pack accepted in permissive mode"),
-        "permissive unsigned warning expected: {run_stdout}"
+        !run_stdout.contains("warning\t"),
+        "--json stdout must carry no warning lines: {run_stdout}"
+    );
+    assert!(
+        run_stderr.contains("warning\tunsigned pack accepted in permissive mode"),
+        "permissive unsigned warning expected on stderr: {run_stderr}"
     );
 
     Ok(())
@@ -1125,6 +1131,13 @@ capabilities = ["shell"]
     let pack_out = run_rkat(&rkat, &project_dir, &pack_refs, None).await?;
     let _ = output_ok_or_err(pack_out, &pack_refs).map_err(std::io::Error::other)?;
 
+    let wasm = project_dir.join("test_runtime_bg.wasm");
+    tokio::fs::write(&wasm, b"\0asm\x01\0\0\0").await?;
+    tokio::fs::write(
+        project_dir.join("test_runtime.js"),
+        "export default async function init() {}\n",
+    )
+    .await?;
     let wasm_args = [
         "mob".to_string(),
         "web".to_string(),
@@ -1132,6 +1145,8 @@ capabilities = ["shell"]
         pack.display().to_string(),
         "--trust-policy".to_string(),
         "permissive".to_string(),
+        "--wasm".to_string(),
+        wasm.display().to_string(),
         "-o".to_string(),
         project_dir.join("web-out").display().to_string(),
     ];

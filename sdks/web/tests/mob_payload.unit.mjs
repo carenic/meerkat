@@ -838,16 +838,16 @@ test('Mob result decoders reject missing generated truth instead of fabricating 
   const malformedHelperResults = [
     {
       method: 'spawnHelper',
-      call: (mob) => mob.spawnHelper('summarize', { agentIdentity: 'helper-1' }),
+      call: (mob) => mob.spawnHelper('summarize', { agentIdentity: 'helper-1', resultLabel: 'summary', maxTextBytes: 4096 }),
       binding: 'mob_spawn_helper',
-      response: { agent_identity: 'helper-1', member_ref: 'ref-helper-1' },
+      response: { output: 'ok', agent_identity: 'helper-1', member_ref: 'ref-helper-1' },
       pattern: /Invalid mob spawn_helper response: tokens_used must be number/,
     },
     {
       method: 'forkHelper',
-      call: (mob) => mob.forkHelper('worker-1', 'review', { agentIdentity: 'fork-1' }),
+      call: (mob) => mob.forkHelper('worker-1', 'review', { agentIdentity: 'fork-1', resultLabel: 'review', maxTextBytes: 4096 }),
       binding: 'mob_fork_helper',
-      response: { agent_identity: 'fork-1', member_ref: 'ref-fork-1' },
+      response: { output: 'ok', agent_identity: 'fork-1', member_ref: 'ref-fork-1' },
       pattern: /Invalid mob fork_helper response: tokens_used must be number/,
     },
   ];
@@ -1341,21 +1341,25 @@ test('Mob.spawnHelper / forkHelper serialize canonical role_name and model_overr
   const mob = new Mob('mob-web-unit', {
     async mob_spawn_helper(_mobId, json) {
       spawnCaptured = JSON.parse(json);
-      return JSON.stringify({ agent_identity: 'h-1', member_ref: 'ref-h-1', tokens_used: 0 });
+      return JSON.stringify({ output: 'ok', agent_identity: 'h-1', member_ref: 'ref-h-1', tokens_used: 0, bounded_result: { label: 'summary', status: 'completed', text: 'ok' }, session_id: 'session-h-1', usage: { input_tokens: 1, output_tokens: 1 }, turns: 1, tool_calls: 0 });
     },
     async mob_fork_helper(_mobId, json) {
       forkCaptured = JSON.parse(json);
-      return JSON.stringify({ agent_identity: 'h-2', member_ref: 'ref-h-2', tokens_used: 0 });
+      return JSON.stringify({ output: 'ok', agent_identity: 'h-2', member_ref: 'ref-h-2', tokens_used: 0, bounded_result: { label: 'review', status: 'completed', text: 'ok' }, session_id: 'session-h-2', usage: { input_tokens: 1, output_tokens: 1 }, turns: 1, tool_calls: 0, retirement_error: 'cleanup delayed' });
     },
   });
 
-  await mob.spawnHelper('do it', {
+  const spawnResult = await mob.spawnHelper('do it', {
     agentIdentity: 'h-1',
+    resultLabel: 'summary',
+    maxTextBytes: 4096,
     profileName: 'reviewer',
     modelOverride: 'gpt-5.6-sol',
   });
-  await mob.forkHelper('src-1', 'do it', {
+  const forkResult = await mob.forkHelper('src-1', 'do it', {
     agentIdentity: 'h-2',
+    resultLabel: 'review',
+    maxTextBytes: 2048,
     profileName: 'reviewer',
     modelOverride: 'claude-opus-4-8',
   });
@@ -1363,7 +1367,23 @@ test('Mob.spawnHelper / forkHelper serialize canonical role_name and model_overr
   assert.equal(spawnCaptured.role_name, 'reviewer');
   assert.equal(spawnCaptured.profile_name, undefined);
   assert.equal(spawnCaptured.model_override, 'gpt-5.6-sol');
+  assert.equal(spawnCaptured.result_label, 'summary');
+  assert.equal(spawnCaptured.max_text_bytes, 4096);
   assert.equal(forkCaptured.role_name, 'reviewer');
   assert.equal(forkCaptured.profile_name, undefined);
   assert.equal(forkCaptured.model_override, 'claude-opus-4-8');
+  assert.equal(forkCaptured.result_label, 'review');
+  assert.equal(forkCaptured.max_text_bytes, 2048);
+  assert.deepEqual(spawnResult, {
+    output: 'ok',
+    tokens_used: 0,
+    agent_identity: 'h-1',
+    member_ref: 'ref-h-1',
+    bounded_result: { label: 'summary', status: 'completed', text: 'ok' },
+    session_id: 'session-h-1',
+    usage: { input_tokens: 1, output_tokens: 1 },
+    turns: 1,
+    tool_calls: 0,
+  });
+  assert.equal(forkResult.retirement_error, 'cleanup delayed');
 });

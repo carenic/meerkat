@@ -1259,6 +1259,7 @@ mod tests {
     fn create_request() -> CreateSessionRequest {
         let build = SessionBuildOptions {
             auto_compact_threshold_override: std::num::NonZeroU64::new(1),
+            compaction_curator_override: None,
             ..SessionBuildOptions::default()
         };
         CreateSessionRequest {

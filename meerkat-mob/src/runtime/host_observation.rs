@@ -32,7 +32,8 @@ use futures::StreamExt as _;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use meerkat_contracts::wire::supervisor_bridge::{
-    BRIDGE_TURN_OUTCOME_ACK_MAX, BridgeDeliveryRejectionCause, BridgeHostRuntimeIncarnation,
+    BRIDGE_BOUNDED_RESULT_TRUNCATION_MARKER, BRIDGE_TURN_OUTCOME_ACK_MAX, BridgeBoundedResultSpec,
+    BridgeBoundedTurnResult, BridgeDeliveryRejectionCause, BridgeHostRuntimeIncarnation,
     BridgeMemberIncarnation, BridgeTrackedInputCancelOutcome, BridgeTurnOutcomeAck,
     BridgeTurnOutcomeRecord, WireFlowFailureDetail, WireFlowTurnOutcome,
 };
@@ -40,6 +41,8 @@ use meerkat_core::event::{AgentEvent, EventEnvelope, EventSourceIdentity};
 use meerkat_core::interaction::InteractionId;
 use meerkat_core::service::{SessionHistoryQuery, SessionServiceHistoryExt};
 use meerkat_core::types::SessionId;
+#[cfg(feature = "runtime-adapter")]
+use meerkat_runtime::SessionServiceRuntimeExt as _;
 use meerkat_runtime::member_observation::{
     DirectedTurnAdmission, DirectedTurnAdmissionDecision, DirectedTurnAdmissionPermit,
     DirectedTurnAdmissionRequest, DirectedTurnReject, DirectedTurnTracking, DirectedTurnWindow,
@@ -170,6 +173,7 @@ pub struct PendingTurnObservation {
     pub generation: u64,
     pub fence_token: u64,
     pub window_start: u64,
+    pub bounded_result_spec: Option<BridgeBoundedResultSpec>,
 }
 
 /// Watch-published observation projection (session id → facts).
@@ -218,6 +222,7 @@ pub enum HostTurnOutcomePendingRequest {
         generation: u64,
         fence_token: u64,
         input_id: String,
+        bounded_result_spec: Option<BridgeBoundedResultSpec>,
         /// `Some` permits a fresh reservation at this window. `None` is an
         /// actor-linearized replay-only probe used before every preflight.
         fresh_window_start: Option<u64>,
@@ -304,6 +309,7 @@ impl TrackedTurnJournal for HostTrackedTurnJournal {
             fence_token: record.fence_token,
             terminal_seq: record.terminal_seq,
             outcome: record.outcome.clone(),
+            bounded_result: record.bounded_result.clone(),
         })
         .map_err(|error| MemberObservationError::Internal {
             reason: format!("turn outcome size validation failed: {error}"),
@@ -411,6 +417,7 @@ fn tracked_turn_record_wire_len(record: &TrackedTurnOutcomeRecord) -> Option<usi
         fence_token: record.fence_token,
         terminal_seq: record.terminal_seq,
         outcome: record.outcome.clone(),
+        bounded_result: record.bounded_result.clone(),
     })
     .ok()
     .map(|encoded| encoded.len())
@@ -455,6 +462,7 @@ fn failed_record(
             original_utf8_bytes,
             truncated,
         }),
+        bounded_result: None,
     }
 }
 
@@ -472,6 +480,7 @@ fn compact_tracked_turn_outcome_record(
         fence_token,
         terminal_seq,
         outcome,
+        bounded_result,
     } = record;
     let (terminal, detail) = match outcome {
         WireFlowTurnOutcome::ExtractionFailed { detail } => {
@@ -488,6 +497,7 @@ fn compact_tracked_turn_outcome_record(
                 fence_token,
                 terminal_seq,
                 outcome,
+                bounded_result,
             };
         }
     };
@@ -1290,6 +1300,7 @@ impl HostMemberObservation {
                         generation: pending.generation,
                         fence_token: pending.fence_token,
                         input_id: pending.input_id,
+                        bounded_result_spec: pending.bounded_result_spec,
                         tracking: DirectedTurnTracking::PendingReplay,
                     },
                     completion_handle,
@@ -1323,6 +1334,7 @@ impl HostMemberObservation {
         &self,
         facts: &SessionObservationFacts,
         input_id: &str,
+        bounded_result_spec: Option<&BridgeBoundedResultSpec>,
         fresh_window_start: Option<u64>,
     ) -> Result<HostPendingReservationReply, DirectedTurnReject> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1332,6 +1344,7 @@ impl HostMemberObservation {
                 generation: facts.generation,
                 fence_token: facts.fence_token,
                 input_id: input_id.to_string(),
+                bounded_result_spec: bounded_result_spec.cloned(),
                 fresh_window_start,
                 reply: reply_tx,
             })
@@ -2046,6 +2059,7 @@ impl MemberObservationHost for HostMemberObservation {
         session: &SessionId,
         expected_member: &meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation,
         input_id: &str,
+        bounded_result_spec: Option<&BridgeBoundedResultSpec>,
     ) -> Result<DirectedTurnWindow, DirectedTurnReject> {
         let facts = self
             .session_facts(session)
@@ -2066,7 +2080,10 @@ impl MemberObservationHost for HostMemberObservation {
         // fresh-only preflight. A retry may arrive while its original request
         // is already accepted/running; local framing, log, or subscription
         // failure cannot be laundered into a definite no-effect rejection.
-        match self.reserve_pending(&facts, input_id, None).await? {
+        match self
+            .reserve_pending(&facts, input_id, bounded_result_spec, None)
+            .await?
+        {
             HostPendingReservationReply::Replayed { window_start } => {
                 return Ok(DirectedTurnWindow {
                     expected_member: facts.incarnation.clone(),
@@ -2075,6 +2092,7 @@ impl MemberObservationHost for HostMemberObservation {
                     generation: facts.generation,
                     fence_token: facts.fence_token,
                     input_id: input_id.to_string(),
+                    bounded_result_spec: bounded_result_spec.cloned(),
                     tracking: DirectedTurnTracking::PendingReplay,
                 });
             }
@@ -2087,6 +2105,7 @@ impl MemberObservationHost for HostMemberObservation {
                     generation: facts.generation,
                     fence_token: facts.fence_token,
                     input_id: input_id.to_string(),
+                    bounded_result_spec: bounded_result_spec.cloned(),
                     tracking: DirectedTurnTracking::TerminalReplay,
                 });
             }
@@ -2115,6 +2134,31 @@ impl MemberObservationHost for HostMemberObservation {
                 "directed-turn input id leaves no room for the bounded terminal journal framing",
             ));
         }
+        if let Some(spec) = bounded_result_spec {
+            let protocol_safe_text_ceiling = spec
+                .protocol_safe_text_ceiling_bytes(
+                    input_id,
+                    facts.generation,
+                    facts.fence_token,
+                    MAX_TURN_OUTCOME_RECORD_BYTES,
+                )
+                .map_err(DirectedTurnReject::unsupported)?;
+            let requested = usize::try_from(spec.max_text_bytes).map_err(|_| {
+                DirectedTurnReject::unsupported(
+                    "bounded result byte cap exceeds host address space",
+                )
+            })?;
+            meerkat_core::ValidatedResultProjectionSpec::new(
+                spec.label.clone(),
+                requested,
+                protocol_safe_text_ceiling,
+            )
+            .map_err(|error| {
+                DirectedTurnReject::unsupported(format!(
+                    "bounded result cannot fit the durable terminal journal: {error}"
+                ))
+            })?;
+        }
         let watermark = self
             .durable_watermark(session)
             .await
@@ -2130,7 +2174,12 @@ impl MemberObservationHost for HostMemberObservation {
         // the pre-accept window without inventing a no-effect result.
         let subscription = self.directed_turn_wake_stream(session, input_id).await;
         let reservation = self
-            .reserve_pending(&facts, input_id, Some(fresh_window_start))
+            .reserve_pending(
+                &facts,
+                input_id,
+                bounded_result_spec,
+                Some(fresh_window_start),
+            )
             .await?;
         let (tracking, window_start) = match reservation {
             HostPendingReservationReply::Reserved { window_start } => {
@@ -2167,6 +2216,7 @@ impl MemberObservationHost for HostMemberObservation {
             generation: facts.generation,
             fence_token: facts.fence_token,
             input_id: input_id.to_string(),
+            bounded_result_spec: bounded_result_spec.cloned(),
             tracking,
         })
     }
@@ -2213,7 +2263,7 @@ impl MemberObservationHost for HostMemberObservation {
             )));
         }
         match self
-            .reserve_pending(&facts, &request.input_id, None)
+            .reserve_pending(&facts, &request.input_id, None, None)
             .await?
         {
             HostPendingReservationReply::Replayed { window_start }
@@ -2676,8 +2726,7 @@ impl DirectedTurnRuntimeAttribution {
 #[derive(Debug)]
 enum CompletionTerminalExpectation {
     Completed {
-        output: String,
-        structured_output: Option<serde_json::Value>,
+        result: Box<meerkat_core::RunResult>,
     },
     Failed {
         kind: Option<meerkat_core::turn_terminal::TurnTerminalKind>,
@@ -2692,8 +2741,8 @@ impl CompletionTerminalExpectation {
 
         match outcome {
             CompletionOutcome::Completed(result) => {
-                let result = *result;
-                if let Some(extraction) = result.extraction_error {
+                let mut result = *result;
+                if let Some(extraction) = result.extraction_error.take() {
                     Self::Failed {
                         kind: Some(TurnTerminalKind::ExtractionFailed),
                         reason: format!(
@@ -2703,14 +2752,13 @@ impl CompletionTerminalExpectation {
                     }
                 } else {
                     Self::Completed {
-                        output: result.text,
-                        structured_output: result.structured_output,
+                        result: Box::new(result),
                     }
                 }
             }
-            CompletionOutcome::CompletedWithoutResult => Self::Completed {
-                output: String::new(),
-                structured_output: None,
+            CompletionOutcome::CompletedWithoutResult => Self::Failed {
+                kind: None,
+                reason: "completed without a result".to_string(),
             },
             CompletionOutcome::CallbackPending {
                 tool_name, args, ..
@@ -2750,15 +2798,12 @@ impl CompletionTerminalExpectation {
 
         match (self, &terminal.outcome) {
             (
-                Self::Completed {
-                    output: expected_output,
-                    structured_output: expected_structured,
-                },
+                Self::Completed { result },
                 TurnTerminalOutcome::Completed {
                     output,
                     structured_output,
                 },
-            ) => output == expected_output && structured_output == expected_structured,
+            ) => output == &result.text && structured_output == &result.structured_output,
             (
                 Self::Failed {
                     kind: expected_kind,
@@ -2770,6 +2815,53 @@ impl CompletionTerminalExpectation {
             }
             _ => false,
         }
+    }
+
+    fn bounded_result(
+        &self,
+        spec: Option<&BridgeBoundedResultSpec>,
+        expected_session: &SessionId,
+    ) -> Result<Option<BridgeBoundedTurnResult>, String> {
+        let Some(spec) = spec else { return Ok(None) };
+        spec.validate()?;
+        let Self::Completed { result } = self else {
+            return Ok(None);
+        };
+        if &result.session_id != expected_session {
+            return Err(format!(
+                "exact completion session '{}' differs from tracked host session '{expected_session}'",
+                result.session_id
+            ));
+        }
+        let max = usize::try_from(spec.max_text_bytes)
+            .map_err(|_| "bounded result byte cap exceeds host address space".to_string())?;
+        let marker =
+            meerkat_contracts::wire::supervisor_bridge::BRIDGE_BOUNDED_RESULT_TRUNCATION_MARKER;
+        let (text, truncated) = if result.text.len() <= max {
+            (result.text.clone(), false)
+        } else {
+            let mut end = (max - marker.len()).min(result.text.len());
+            while end > 0 && !result.text.is_char_boundary(end) {
+                end -= 1;
+            }
+            (format!("{}{marker}", &result.text[..end]), true)
+        };
+        Ok(Some(BridgeBoundedTurnResult {
+            result: meerkat_contracts::MobBoundedHelperResult {
+                label: spec.label.clone(),
+                status: if truncated {
+                    meerkat_contracts::MobBoundedHelperResultStatus::CompletedTruncated
+                } else {
+                    meerkat_contracts::MobBoundedHelperResultStatus::Completed
+                },
+                text,
+            },
+            max_text_bytes: spec.max_text_bytes,
+            session_id: result.session_id.to_string(),
+            usage: result.usage.clone(),
+            turns: result.turns,
+            tool_calls: result.tool_calls,
+        }))
     }
 }
 
@@ -3101,6 +3193,7 @@ async fn refresh_terminal_attribution(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_directed_turn_terminal(
     session: &SessionId,
     input_id: &str,
@@ -3108,6 +3201,7 @@ async fn record_directed_turn_terminal(
     fence_token: u64,
     terminal_seq: u64,
     outcome: WireFlowTurnOutcome,
+    bounded_result: Option<BridgeBoundedTurnResult>,
     journal: &Arc<dyn TrackedTurnJournal>,
 ) {
     let record = compact_tracked_turn_outcome_record(TrackedTurnOutcomeRecord {
@@ -3116,6 +3210,7 @@ async fn record_directed_turn_terminal(
         fence_token,
         terminal_seq,
         outcome,
+        bounded_result,
     });
     if let Err(error) = journal.record_turn_outcome(record).await {
         tracing::error!(
@@ -3155,6 +3250,7 @@ async fn run_directed_turn_watcher(
         generation,
         fence_token,
         input_id: reserved_input_id,
+        bounded_result_spec,
         tracking: _,
     } = window;
     if journal.member_incarnation() != &expected_member {
@@ -3267,7 +3363,30 @@ async fn run_directed_turn_watcher(
                 );
                 return;
             }
-            None
+            match adapter
+                .input_terminal_completion(&session, &attribution.runtime_input_id)
+                .await
+            {
+                Ok(Some(outcome)) => Some(CompletionTerminalExpectation::from_completion(outcome)),
+                Ok(None) if bounded_result_spec.is_none() => None,
+                Ok(None) => {
+                    tracing::warn!(
+                        session_id = %session,
+                        input_id = %input_id,
+                        "recovered bounded turn has no exact durable completion yet; retaining Pending"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        session_id = %session,
+                        input_id = %input_id,
+                        error = %error,
+                        "recovered bounded turn could not read exact durable completion; retaining Pending"
+                    );
+                    return;
+                }
+            }
         }
     };
 
@@ -3327,6 +3446,24 @@ async fn run_directed_turn_watcher(
                                 return;
                             }
                         };
+                        let bounded_result = match expectation
+                            .as_ref()
+                            .map(|expected| {
+                                expected.bounded_result(bounded_result_spec.as_ref(), &session)
+                            })
+                            .transpose()
+                        {
+                            Ok(result) => result.flatten(),
+                            Err(reason) => {
+                                tracing::error!(
+                                    session_id = %session,
+                                    input_id = %input_id,
+                                    reason,
+                                    "exact bounded result projection failed; retaining Pending"
+                                );
+                                return;
+                            }
+                        };
                         record_directed_turn_terminal(
                             &session,
                             &input_id,
@@ -3334,6 +3471,7 @@ async fn run_directed_turn_watcher(
                             fence_token,
                             candidate.terminal_seq,
                             outcome,
+                            bounded_result,
                             &journal,
                         )
                         .await;
@@ -4000,7 +4138,85 @@ mod tests {
             fence_token: 5,
             terminal_seq: 7,
             outcome: WireFlowTurnOutcome::RunCompleted,
+            bounded_result: None,
         }
+    }
+
+    fn completed_expectation(output: &str) -> CompletionTerminalExpectation {
+        completed_expectation_for(SessionId::new(), output)
+    }
+
+    fn completed_expectation_for(
+        session_id: SessionId,
+        output: &str,
+    ) -> CompletionTerminalExpectation {
+        CompletionTerminalExpectation::Completed {
+            result: Box::new(meerkat_core::RunResult {
+                text: output.to_string(),
+                session_id,
+                usage: meerkat_core::Usage::default(),
+                turns: 1,
+                tool_calls: 0,
+                terminal_cause_kind: None,
+                structured_output: None,
+                extraction_error: None,
+                schema_warnings: None,
+                skill_diagnostics: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn placed_exact_result_is_bounded_from_the_same_committed_run_result() {
+        let session_id = SessionId::new();
+        let expectation = completed_expectation_for(session_id.clone(), "🦀é中-tail");
+        let max_text_bytes = BRIDGE_BOUNDED_RESULT_TRUNCATION_MARKER.len() + 1;
+        let spec = BridgeBoundedResultSpec {
+            label: "placed_result".to_string(),
+            max_text_bytes: u64::try_from(max_text_bytes).expect("test cap fits u64"),
+        };
+
+        let bounded = expectation
+            .bounded_result(Some(&spec), &session_id)
+            .expect("exact committed result projects")
+            .expect("requested bounded result is present");
+
+        assert_eq!(bounded.result.label, "placed_result");
+        assert_eq!(bounded.max_text_bytes, spec.max_text_bytes);
+        assert_eq!(bounded.session_id, session_id.to_string());
+        assert_eq!(
+            bounded.result.status,
+            meerkat_contracts::MobBoundedHelperResultStatus::CompletedTruncated
+        );
+        assert!(
+            bounded
+                .result
+                .text
+                .ends_with(BRIDGE_BOUNDED_RESULT_TRUNCATION_MARKER)
+        );
+        assert!(bounded.result.text.len() <= max_text_bytes);
+        assert!(
+            bounded
+                .result
+                .text
+                .is_char_boundary(bounded.result.text.len())
+        );
+    }
+
+    #[test]
+    fn placed_exact_result_rejects_cross_session_attribution() {
+        let committed_session = SessionId::new();
+        let expectation = completed_expectation_for(committed_session.clone(), "exact-result");
+        let spec = BridgeBoundedResultSpec {
+            label: "placed_result".to_string(),
+            max_text_bytes: 4096,
+        };
+
+        let error = expectation
+            .bounded_result(Some(&spec), &SessionId::new())
+            .expect_err("another session cannot claim this completion");
+
+        assert!(error.contains(&committed_session.to_string()), "{error}");
     }
 
     fn ack(index: usize) -> BridgeTurnOutcomeAck {
@@ -4377,6 +4593,7 @@ mod tests {
                 &session,
                 &expected_member,
                 "input-exhausted",
+                None,
             );
             let arbitrate = async {
                 let request = pending_rx
@@ -4436,6 +4653,7 @@ mod tests {
                         generation: 7,
                         fence_token: 11,
                         window_start: 42,
+                        bounded_result_spec: None,
                     }],
                     turn_outcomes: Vec::new(),
                 },
@@ -4452,8 +4670,12 @@ mod tests {
             pending_tx,
             outcome_ack_tx,
         );
-        let open =
-            observation.open_directed_turn_window(&session, &expected_member, "existing-pending");
+        let open = observation.open_directed_turn_window(
+            &session,
+            &expected_member,
+            "existing-pending",
+            None,
+        );
         let arbitrate = async {
             let HostTurnOutcomePendingRequest::Reserve {
                 fresh_window_start,
@@ -4514,6 +4736,7 @@ mod tests {
                         generation: 7,
                         fence_token: 11,
                         window_start: 42,
+                        bounded_result_spec: None,
                     }],
                     turn_outcomes: Vec::new(),
                 },
@@ -4536,6 +4759,7 @@ mod tests {
             generation: 7,
             fence_token: 11,
             input_id: "serialized-input".to_string(),
+            bounded_result_spec: None,
             tracking: DirectedTurnTracking::PendingReplay,
         };
 
@@ -4627,8 +4851,12 @@ mod tests {
             pending_tx,
             outcome_ack_tx,
         );
-        let open =
-            observation.open_directed_turn_window(&session, &expected_member, "fresh-pending");
+        let open = observation.open_directed_turn_window(
+            &session,
+            &expected_member,
+            "fresh-pending",
+            None,
+        );
         let arbitrate = async {
             let HostTurnOutcomePendingRequest::Reserve {
                 fresh_window_start,
@@ -4745,10 +4973,7 @@ mod tests {
             matching_run_starts: 1,
             watermark: 51,
         };
-        let expectation = CompletionTerminalExpectation::Completed {
-            output: "current-result".to_string(),
-            structured_output: None,
-        };
+        let expectation = completed_expectation("current-result");
         let selected = select_completion_terminal(
             &scan,
             &expectation,
@@ -4772,10 +4997,7 @@ mod tests {
             matching_run_starts: 1,
             watermark: 51,
         };
-        let expectation = CompletionTerminalExpectation::Completed {
-            output: "current-result".to_string(),
-            structured_output: None,
-        };
+        let expectation = completed_expectation("current-result");
 
         let selected = select_completion_terminal(
             &scan,
@@ -4805,10 +5027,7 @@ mod tests {
         let cases = vec![
             (
                 "success",
-                CompletionTerminalExpectation::Completed {
-                    output: "done".to_string(),
-                    structured_output: None,
-                },
+                completed_expectation("done"),
                 K::RunCompleted,
                 ClassifiedTurnTerminal {
                     kind: K::InteractionComplete,
@@ -5043,10 +5262,7 @@ mod tests {
             .expect("scan");
         assert_eq!(scan.matching_run_starts, 2);
 
-        let expectation = CompletionTerminalExpectation::Completed {
-            output: "same-result".to_string(),
-            structured_output: None,
-        };
+        let expectation = completed_expectation("same-result");
         assert!(matches!(
             select_completion_terminal(
                 &scan,
@@ -5114,10 +5330,7 @@ mod tests {
             "A's exact receipt must not consume B's active run bracket"
         );
 
-        let expectation = CompletionTerminalExpectation::Completed {
-            output: "same-result".to_string(),
-            structured_output: None,
-        };
+        let expectation = completed_expectation("same-result");
         for selected in [
             select_completion_terminal(
                 &scan,
@@ -5176,10 +5389,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn projection_delay_beyond_two_seconds_never_becomes_channel_closed() {
         let attribution = terminal_attribution(0);
-        let expectation = CompletionTerminalExpectation::Completed {
-            output: "current-result".to_string(),
-            structured_output: None,
-        };
+        let expectation = completed_expectation("current-result");
         let mut scan = DurableTerminalScan {
             terminals: Vec::new(),
             matching_run_starts: 0,
@@ -5641,6 +5851,7 @@ mod tests {
                 fence_token: compacted.fence_token,
                 terminal_seq: compacted.terminal_seq,
                 outcome: compacted.outcome.clone(),
+                bounded_result: compacted.bounded_result.clone(),
             })
             .expect("bounded record serializes");
             assert!(
@@ -5729,6 +5940,7 @@ mod tests {
                         "x".repeat(MAX_TURN_OUTCOME_RECORD_BYTES),
                     ),
                 },
+                bounded_result: None,
             })
             .await
             .expect_err("one oversized terminal detail must be rejected");
@@ -5766,6 +5978,7 @@ mod tests {
                     fence_token: 5,
                     terminal_seq: 9,
                     outcome: WireFlowTurnOutcome::RunCompleted,
+                    bounded_result: None,
                 })
                 .await
         });

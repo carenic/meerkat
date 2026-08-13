@@ -99,6 +99,8 @@ pub struct BuildAgentConfigParams<'a> {
     pub profile: &'a Profile,
     pub definition: &'a MobDefinition,
     pub external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
+    /// In-process host override for compaction summary production.
+    pub compaction_curator_override: Option<Arc<dyn meerkat_core::CompactionCurator>>,
     pub context: Option<serde_json::Value>,
     pub labels: Option<std::collections::BTreeMap<String, String>>,
     pub additional_instructions: Option<Vec<String>>,
@@ -157,6 +159,7 @@ pub async fn build_agent_config(
         profile,
         definition,
         external_tools,
+        compaction_curator_override,
         context,
         labels,
         additional_instructions,
@@ -284,6 +287,7 @@ pub async fn build_agent_config(
 
     // External tools (mob tools, task tools, rust bundles composed externally)
     config.external_tools = external_tools;
+    config.compaction_curator_override = compaction_curator_override;
 
     // Declarative MCP servers ride the durable profile, so revival
     // recomposes them without the lossy in-process spawn overlay.
@@ -703,6 +707,29 @@ mod tests {
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
 
+    struct TestCompactionCurator;
+
+    #[async_trait]
+    impl meerkat_core::CompactionCurator for TestCompactionCurator {
+        async fn curate_summary(
+            &self,
+            _window: meerkat_core::CompactionWindow<'_>,
+        ) -> Result<meerkat_core::CuratedCompactionSummary, meerkat_core::CompactionCuratorError>
+        {
+            meerkat_core::CuratedCompactionSummary::new("host-curated summary")
+        }
+    }
+
+    fn assert_same_curator(
+        actual: Option<&Arc<dyn meerkat_core::CompactionCurator>>,
+        expected: &Arc<dyn meerkat_core::CompactionCurator>,
+    ) {
+        assert!(
+            actual.is_some_and(|actual| Arc::ptr_eq(actual, expected)),
+            "the exact host curator Arc must survive the build lowering"
+        );
+    }
+
     struct CaptureClient {
         inner: TestClient,
         seen_tools: Mutex<Vec<String>>,
@@ -1042,6 +1069,7 @@ mod tests {
             profile,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -1055,6 +1083,79 @@ mod tests {
         .expect("build_agent_config");
 
         assert!(!config.keep_alive, "keep_alive must be false for mob spawn");
+        assert!(config.compaction_curator_override.is_none());
+    }
+
+    #[tokio::test]
+    async fn compaction_curator_threads_through_fresh_and_resumed_builds_by_arc_identity() {
+        let def = sample_definition();
+        let profile_name = ProfileName::from("lead");
+        let agent_identity = AgentIdentity::from("lead-1");
+        let profile = def.profiles[&profile_name].as_inline().unwrap();
+        let curator: Arc<dyn meerkat_core::CompactionCurator> = Arc::new(TestCompactionCurator);
+
+        let fresh = build_agent_config(BuildAgentConfigParams {
+            mob_id: &def.id,
+            profile_name: &profile_name,
+            agent_identity: &agent_identity,
+            profile,
+            definition: &def,
+            external_tools: None,
+            compaction_curator_override: Some(Arc::clone(&curator)),
+            context: None,
+            labels: None,
+            additional_instructions: None,
+            shell_env: None,
+            mob_tool_authority_context: None,
+            inherited_tool_filter: None,
+            tool_access_policy: None,
+            system_prompt_override: None,
+        })
+        .await
+        .expect("fresh build");
+        assert_same_curator(fresh.compaction_curator_override.as_ref(), &curator);
+        let fresh_request = to_create_session_request(&fresh, "fresh".into());
+        assert_same_curator(
+            fresh_request
+                .build
+                .as_ref()
+                .and_then(|build| build.compaction_curator_override.as_ref()),
+            &curator,
+        );
+
+        let session_id = SessionId::new();
+        let resumed = build_resumed_agent_config(BuildResumedAgentConfigParams {
+            base: BuildAgentConfigParams {
+                mob_id: &def.id,
+                profile_name: &profile_name,
+                agent_identity: &agent_identity,
+                profile,
+                definition: &def,
+                external_tools: None,
+                compaction_curator_override: Some(Arc::clone(&curator)),
+                context: None,
+                labels: None,
+                additional_instructions: None,
+                shell_env: None,
+                mob_tool_authority_context: None,
+                inherited_tool_filter: None,
+                tool_access_policy: None,
+                system_prompt_override: None,
+            },
+            expected_session_id: &session_id,
+            resumed_session: resumed_session_with_metadata(session_id.clone()),
+        })
+        .await
+        .expect("resumed build");
+        assert_same_curator(resumed.compaction_curator_override.as_ref(), &curator);
+        let resumed_request = to_create_session_request(&resumed, "resume".into());
+        assert_same_curator(
+            resumed_request
+                .build
+                .as_ref()
+                .and_then(|build| build.compaction_curator_override.as_ref()),
+            &curator,
+        );
     }
 
     /// M2 (d): profile-declared MCP servers are DURABLE build inputs — they
@@ -1082,6 +1183,7 @@ mod tests {
             profile: &profile,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -1115,6 +1217,7 @@ mod tests {
             profile,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -1172,6 +1275,7 @@ mod tests {
             profile,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -1213,6 +1317,7 @@ mod tests {
             profile,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -1255,6 +1360,7 @@ mod tests {
             profile,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -1289,6 +1395,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -1346,6 +1453,7 @@ mod tests {
             profile: worker,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -1398,6 +1506,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -1476,6 +1585,7 @@ mod tests {
             profile: &profile,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -1530,6 +1640,7 @@ mod tests {
             profile,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -1600,6 +1711,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -1648,6 +1760,7 @@ mod tests {
                 profile: lead,
                 definition: &def,
                 external_tools: None,
+                compaction_curator_override: None,
                 context: None,
                 labels: None,
                 additional_instructions: None,
@@ -1710,6 +1823,7 @@ mod tests {
                 profile: lead,
                 definition: &def,
                 external_tools: None,
+                compaction_curator_override: None,
                 context: Some(app_context.clone()),
                 labels: None,
                 additional_instructions: Some(additional_instructions.clone()),
@@ -1770,6 +1884,7 @@ mod tests {
                 profile: lead,
                 definition: &def,
                 external_tools: None,
+                compaction_curator_override: None,
                 context: None,
                 labels: None,
                 additional_instructions: Some(vec!["persisted section".to_string()]),
@@ -1830,6 +1945,7 @@ mod tests {
                 profile: &lead,
                 definition: &def,
                 external_tools: None,
+                compaction_curator_override: None,
                 context: None,
                 labels: None,
                 additional_instructions: None,
@@ -1920,6 +2036,7 @@ mod tests {
                 profile: lead,
                 definition: &def,
                 external_tools: None,
+                compaction_curator_override: None,
                 context: None,
                 labels: None,
                 additional_instructions: None,
@@ -2019,6 +2136,7 @@ mod tests {
                 profile: lead,
                 definition: &def,
                 external_tools: None,
+                compaction_curator_override: None,
                 context: None,
                 labels: None,
                 additional_instructions: None,
@@ -2065,6 +2183,7 @@ mod tests {
             profile: worker,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2094,6 +2213,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2132,6 +2252,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2172,6 +2293,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2215,6 +2337,7 @@ mod tests {
             profile: worker,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2258,6 +2381,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2295,6 +2419,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2323,6 +2448,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2353,6 +2479,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: Some(labels),
             additional_instructions: None,
@@ -2425,6 +2552,7 @@ mod tests {
             profile: worker,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2475,6 +2603,7 @@ mod tests {
                 profile: lead,
                 definition: &def,
                 external_tools: None,
+                compaction_curator_override: None,
                 context: None,
                 labels: None,
                 additional_instructions: None,
@@ -2535,6 +2664,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2585,6 +2715,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2620,6 +2751,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: Some(ctx.clone()),
             labels: None,
             additional_instructions: None,
@@ -2652,6 +2784,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2700,6 +2833,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2796,6 +2930,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -2860,6 +2995,7 @@ mod tests {
             profile: lead,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: None,
             additional_instructions: None,
@@ -3207,6 +3343,7 @@ mod tests {
             profile: worker,
             definition: &def,
             external_tools: None,
+            compaction_curator_override: None,
             context: None,
             labels: Some(app_labels),
             additional_instructions: None,

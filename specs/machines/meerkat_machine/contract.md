@@ -15152,7 +15152,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `active_filter_matches_replacement_catalog`
   - `staged_filter_matches_replacement_catalog`
   - `turn_overlay_allow_matches_replacement_catalog`
-  - `turn_overlay_deny_matches_replacement_catalog`
 - To: `Idle`
 
 ### `ReplaceFilterToolAuthorityCatalogAttached`
@@ -15166,7 +15165,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `active_filter_matches_replacement_catalog`
   - `staged_filter_matches_replacement_catalog`
   - `turn_overlay_allow_matches_replacement_catalog`
-  - `turn_overlay_deny_matches_replacement_catalog`
 - To: `Attached`
 
 ### `ReplaceFilterToolAuthorityCatalogRunning`
@@ -15180,7 +15178,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `active_filter_matches_replacement_catalog`
   - `staged_filter_matches_replacement_catalog`
   - `turn_overlay_allow_matches_replacement_catalog`
-  - `turn_overlay_deny_matches_replacement_catalog`
 - To: `Running`
 
 ### `ReplaceFilterToolAuthorityCatalogRetired`
@@ -15194,7 +15191,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `active_filter_matches_replacement_catalog`
   - `staged_filter_matches_replacement_catalog`
   - `turn_overlay_allow_matches_replacement_catalog`
-  - `turn_overlay_deny_matches_replacement_catalog`
 - To: `Retired`
 
 ### `ReplaceFilterToolAuthorityCatalogStopped`
@@ -15208,7 +15204,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `active_filter_matches_replacement_catalog`
   - `staged_filter_matches_replacement_catalog`
   - `turn_overlay_allow_matches_replacement_catalog`
-  - `turn_overlay_deny_matches_replacement_catalog`
 - To: `Stopped`
 
 ### `CommitVisibilityFilterIdle`
@@ -15423,7 +15418,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
   - `inactive_allow_carries_no_names`
   - `allow_names_match_filter_authority_catalog`
-  - `deny_names_match_filter_authority_catalog`
 - To: `Idle`
 
 ### `SetTurnToolOverlayAttached`
@@ -15433,7 +15427,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
   - `inactive_allow_carries_no_names`
   - `allow_names_match_filter_authority_catalog`
-  - `deny_names_match_filter_authority_catalog`
 - To: `Attached`
 
 ### `SetTurnToolOverlayRunning`
@@ -15443,7 +15436,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
   - `inactive_allow_carries_no_names`
   - `allow_names_match_filter_authority_catalog`
-  - `deny_names_match_filter_authority_catalog`
 - To: `Running`
 
 ### `SetTurnToolOverlayRetired`
@@ -15453,7 +15445,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
   - `inactive_allow_carries_no_names`
   - `allow_names_match_filter_authority_catalog`
-  - `deny_names_match_filter_authority_catalog`
 - To: `Retired`
 
 ### `SetTurnToolOverlayStopped`
@@ -15463,7 +15454,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
   - `inactive_allow_carries_no_names`
   - `allow_names_match_filter_authority_catalog`
-  - `deny_names_match_filter_authority_catalog`
 - To: `Stopped`
 
 ### `ClearTurnToolOverlayIdle`

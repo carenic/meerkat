@@ -590,6 +590,11 @@ test("MeerkatRuntime forwards canonical mob status/helper methods through the wa
         tokens_used: 11,
         agent_identity: "helper-1",
         member_ref: "ref-helper-1",
+        bounded_result: { label: "summary", status: "completed", text: "helper complete" },
+        session_id: "session-helper-1",
+        usage: { input_tokens: 7, output_tokens: 4 },
+        turns: 1,
+        tool_calls: 0,
       });
     },
     async mob_fork_helper(mobId, requestJson) {
@@ -599,6 +604,11 @@ test("MeerkatRuntime forwards canonical mob status/helper methods through the wa
         tokens_used: 13,
         agent_identity: "fork-1",
         member_ref: "ref-fork-1",
+        bounded_result: { label: "review", status: "completed", text: "fork complete" },
+        session_id: "session-fork-1",
+        usage: { input_tokens: 8, output_tokens: 5 },
+        turns: 1,
+        tool_calls: 1,
       });
     },
     async mob_run_flow() {
@@ -714,21 +724,27 @@ test("MeerkatRuntime forwards canonical mob status/helper methods through the wa
 
     const helper = await mob.spawnHelper("Summarize the thread.", {
       agentIdentity: "helper-1",
+      resultLabel: "summary",
+      maxTextBytes: 4096,
       profileName: "worker",
       modelOverride: "gpt-5.6-sol",
     });
     assert.equal(helper.agent_identity, "helper-1");
     assert.equal(helper.member_ref, "ref-helper-1");
+    assert.equal(helper.bounded_result.label, "summary");
     assert.equal(helper.agent_runtime_id, undefined);
 
     const fork = await mob.forkHelper("worker-1", "Review the draft.", {
       agentIdentity: "fork-1",
+      resultLabel: "review",
+      maxTextBytes: 2048,
       profileName: "worker",
       modelOverride: "claude-opus-4-8",
       forkContext: { mode: "full_history" },
     });
     assert.equal(fork.agent_identity, "fork-1");
     assert.equal(fork.member_ref, "ref-fork-1");
+    assert.equal(fork.bounded_result.label, "review");
     assert.equal(fork.agent_runtime_id, undefined);
 
     assert.deepEqual(
@@ -748,6 +764,8 @@ test("MeerkatRuntime forwards canonical mob status/helper methods through the wa
           {
             prompt: "Summarize the thread.",
             agent_identity: "helper-1",
+            result_label: "summary",
+            max_text_bytes: 4096,
             role_name: "worker",
             model_override: "gpt-5.6-sol",
           },
@@ -759,6 +777,8 @@ test("MeerkatRuntime forwards canonical mob status/helper methods through the wa
             source_member_id: "worker-1",
             prompt: "Review the draft.",
             agent_identity: "fork-1",
+            result_label: "review",
+            max_text_bytes: 2048,
             role_name: "worker",
             model_override: "claude-opus-4-8",
             fork_context: { mode: "full_history" },

@@ -2086,13 +2086,16 @@ impl MobMcpState {
         identity: AgentIdentity,
         prompt: String,
         options: meerkat_mob::HelperOptions,
-    ) -> Result<meerkat_mob::HelperResult, MobError> {
+        result_label: impl Into<String>,
+        max_text_bytes: usize,
+    ) -> Result<meerkat_mob::BoundedHelperRunOutcome, meerkat_mob::BoundedMemberRunError> {
         self.handle_for(mob_id)
             .await?
-            .spawn_helper(identity, prompt, options)
+            .spawn_helper(identity, prompt, options, result_label, max_text_bytes)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn mob_fork_helper(
         &self,
         mob_id: &MobId,
@@ -2101,10 +2104,20 @@ impl MobMcpState {
         prompt: String,
         fork_context: meerkat_mob::ForkContext,
         options: meerkat_mob::HelperOptions,
-    ) -> Result<meerkat_mob::HelperResult, MobError> {
+        result_label: impl Into<String>,
+        max_text_bytes: usize,
+    ) -> Result<meerkat_mob::BoundedHelperRunOutcome, meerkat_mob::BoundedMemberRunError> {
         self.handle_for(mob_id)
             .await?
-            .fork_helper(source_identity, identity, prompt, fork_context, options)
+            .fork_helper(
+                source_identity,
+                identity,
+                prompt,
+                fork_context,
+                options,
+                result_label,
+                max_text_bytes,
+            )
             .await
     }
 
@@ -11153,18 +11166,21 @@ mod tests {
                 .expect_err("authorization precedes run-store projection"),
             ControlScope::List,
         );
-        assert_required_scope(
-            &viewer
-                .mob_spawn_helper(
-                    &mob_id,
-                    AgentIdentity::from("denied-helper"),
-                    "should not spawn".to_string(),
-                    meerkat_mob::HelperOptions::default(),
-                )
-                .await
-                .expect_err("authorization precedes helper mechanics"),
-            ControlScope::SendCommand,
-        );
+        let helper_error = viewer
+            .mob_spawn_helper(
+                &mob_id,
+                AgentIdentity::from("denied-helper"),
+                "should not spawn".to_string(),
+                meerkat_mob::HelperOptions::default(),
+                "denied_helper_result",
+                meerkat_mob::DEFAULT_BOUNDED_HELPER_RESULT_BYTES,
+            )
+            .await
+            .expect_err("authorization precedes helper mechanics");
+        let meerkat_mob::BoundedMemberRunError::Admission(helper_error) = helper_error else {
+            panic!("authorization must reject before helper turn admission")
+        };
+        assert_required_scope(&helper_error, ControlScope::SendCommand);
         assert_required_scope(
             &viewer
                 .mob_cancel_work(&mob_id, meerkat_mob::WorkRef::new())
@@ -11312,6 +11328,8 @@ mod tests {
                 AgentIdentity::from("helper-1"),
                 "small helper task".to_string(),
                 meerkat_mob::HelperOptions::default(),
+                "helper_result",
+                meerkat_mob::DEFAULT_BOUNDED_HELPER_RESULT_BYTES,
             )
             .await
             .expect("helper mechanics must not require List or Retire after SendCommand admission");

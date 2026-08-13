@@ -994,7 +994,7 @@ fn calendar_field_schema(description: &'static str) -> Value {
 
 fn target_binding_schema() -> Value {
     json!({
-        "description": "Where the schedule delivers. Uses target_kind to select session, identity, or mob. Session targets: exact_session (deliver to a known session_id; fails if session is gone), resumable_session (deliver to a session_id that may be idle; runtime resumes it -- best for stable long-lived sessions), materialize_on_demand_session (create a new session on first fire using a \"create\" spec, then reuse it -- use when no session exists yet). Identity targets: resumable_identity (deliver to the current materialized session for a stable agent identity; host resolves at fire time). Mob targets: member, flow, spawn_helper, fork_helper (deliver to a mob member or flow). Examples: {\"target_kind\":\"identity\",\"type\":\"resumable_identity\",\"identity\":\"domain:security\",\"action\":{\"type\":\"prompt\",\"prompt\":\"Check in\"}} | {\"target_kind\":\"session\",\"type\":\"materialize_on_demand_session\",\"action\":{\"type\":\"prompt\",\"prompt\":\"Run report\"},\"create\":{\"model\":\"claude-sonnet-4-6\"}}.",
+        "description": "Where the schedule delivers. Uses target_kind to select session, identity, or mob. Session targets: exact_session (deliver to a known session_id; fails if session is gone), resumable_session (deliver to a session_id that may be idle; runtime resumes it -- best for stable long-lived sessions), materialize_on_demand_session (create a new session on first fire using a \"create\" spec, then reuse it -- use when no session exists yet). Identity targets: resumable_identity (deliver to the current materialized session for a stable agent identity; host resolves at fire time). The identity string must be a form a schedule host on this surface can resolve, such as the mob-member form minted by the host; free-form strings are refused at create. Mob-member identity targets accept only prompt actions without session-only overrides (no system_prompt, skill_refs, or additional_instructions). Mob targets: member, flow, spawn_helper, fork_helper (deliver to a mob member or flow). Examples: schedule for yourself {\"target_kind\":\"session\",\"type\":\"current_session\",\"action\":{\"type\":\"prompt\",\"prompt\":\"Check in\"}} | mob member {\"target_kind\":\"identity\",\"type\":\"resumable_identity\",\"identity\":\"mob_member:{\\\"schema\\\":\\\"meerkat.schedule.mob_member_identity.v2\\\",\\\"mob_id\\\":\\\"ops\\\",\\\"member\\\":\\\"watcher\\\"}\",\"action\":{\"type\":\"prompt\",\"prompt\":\"Check in\"}} | {\"target_kind\":\"session\",\"type\":\"materialize_on_demand_session\",\"action\":{\"type\":\"prompt\",\"prompt\":\"Run report\"},\"create\":{\"model\":\"claude-sonnet-4-6\"}}.",
         "oneOf": [
             {
                 "type": "object",
@@ -1038,7 +1038,7 @@ fn target_binding_schema() -> Value {
                     "type": { "const": "resumable_identity" },
                     "identity": {
                         "type": "string",
-                        "description": "Stable agent identity resolved by the schedule host at occurrence delivery time."
+                        "description": "Stable agent identity resolved by the schedule host at occurrence delivery time. Must be a host-recognized form (for example mob_member:{...} as minted by the host); arbitrary strings are refused at create because no host could ever deliver them."
                     },
                     "action": scheduled_session_action_schema()
                 },

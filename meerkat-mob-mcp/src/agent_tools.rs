@@ -18,8 +18,9 @@ use meerkat_core::types::{
 use meerkat_core::{AgentToolDispatcher, ToolUnavailableReason};
 use meerkat_mob::machines::mob_machine::HostId;
 use meerkat_mob::{
-    AgentIdentity, MobBackendKind, MobDefinition, MobError, MobHandle, MobId, MobRuntimeMode,
-    ProfileName, SpawnMemberSpec, SpawnResult, runtime::MobSessionService,
+    AgentIdentity, BoundedResultSpec, MobBackendKind, MobDefinition, MobError, MobHandle, MobId,
+    MobRuntimeMode, ProfileName, SpawnMemberSpec, SpawnResult, WorkOrigin, WorkSpec,
+    runtime::MobSessionService,
 };
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
@@ -425,7 +426,7 @@ impl AgentMobToolSurface {
     pub fn usage_instructions() -> &'static str {
         "# Agent Delegation & Orchestration\n\n\
          You can delegate work to helper agents and orchestrate multi-agent mobs:\n\n\
-         - delegate: Quick helper spawn — creates an implicit mob on first use, spawns a member, auto-wires comms\n\
+         - delegate: Run one exact bounded helper task in an implicit mob, then retire the helper\n\
          - conclude_objective: Publish the final answer for the current pre-addressed kickoff objective\n\
          - mob_create: Create an explicit mob with full control over profiles, wiring, and flows\n\
          - mob_destroy: Destroy an explicit mob (cannot destroy implicit delegation mob)\n\
@@ -1052,6 +1053,8 @@ impl AgentMobToolSurface {
         let args: DelegateArgs = call
             .parse_args()
             .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
+        let result_spec = BoundedResultSpec::new(&args.result_label, args.max_text_bytes)
+            .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
 
         // Build spawn identity before any implicit-mob mutation. The tool
         // surface must not create durable mob state for a request that has not
@@ -1111,9 +1114,12 @@ impl AgentMobToolSurface {
         // path — identity allocation is the mob substrate's responsibility.
         // Implicit mob always uses the "delegate" profile.
         let mut spec = SpawnMemberSpec::new(ProfileName::from("delegate"), identity.clone());
-        spec.initial_message = Some(ContentInput::Text(args.task));
+        // Provision first, then admit the task through the exact bounded-turn
+        // carrier. An autonomous initial message has no per-admission result
+        // handle and therefore cannot implement delegate's result contract.
+        spec.initial_message = None;
         spec.objective_id = objective_id;
-        spec.runtime_mode = Some(MobRuntimeMode::AutonomousHost);
+        spec.runtime_mode = Some(MobRuntimeMode::TurnDriven);
         // Don't use auto_wire_parent — it requires an orchestrator member in the roster.
         // We wire explicitly below using PeerTarget::External.
         spec.auto_wire_parent = false;
@@ -1154,26 +1160,69 @@ impl AgentMobToolSurface {
             .wire_delegate_helper_to_creator(&mob_id, &identity)
             .await;
 
+        let handle = self
+            .bound_handle(&mob_id)
+            .await
+            .map_err(|error| Self::map_mob_error(call, error))?;
+        let mut work = WorkSpec::new(args.task, WorkOrigin::Internal);
+        if let Some(objective_id) = objective_id {
+            work = work.with_objective_id(objective_id);
+        }
+        let turn_handle = match handle
+            .start_work_for_identity_bounded(
+                identity.clone(),
+                work,
+                meerkat_core::types::HandlingMode::Queue,
+                result_spec.clone(),
+            )
+            .await
+        {
+            Ok(turn) => turn,
+            Err(error) => {
+                let retirement_error = handle.retire(identity.clone()).await.err();
+                return Err(ToolError::execution_failed(format!(
+                    "tool '{}' failed to admit delegated helper turn: {error}; retirement_error={retirement_error:?}",
+                    call.name
+                )));
+            }
+        };
+        let turn = match turn_handle.wait_bounded(result_spec).await {
+            Ok(turn) => turn,
+            Err(error) => {
+                let retirement_error = handle.retire(identity.clone()).await.err();
+                return Err(ToolError::execution_failed(format!(
+                    "tool '{}' delegated turn failed: {error}; retirement_error={retirement_error:?}",
+                    call.name
+                )));
+            }
+        };
+        let retirement_error = handle
+            .retire(identity.clone())
+            .await
+            .err()
+            .map(|error| error.to_string());
+
         let mut result = Self::spawn_result_payload(&mob_id, &spawn_result);
         result["mob_id"] = json!(mob_id);
         result["agent_identity"] = json!(identity);
         result["wired"] = json!(wired);
+        result["output"] = json!(turn.result().result().text());
+        result["tokens_used"] = json!(turn.result().usage().total_tokens());
+        result["bounded_result"] = json!(turn.result().result());
+        result["session_id"] = json!(turn.result().session_id());
+        result["usage"] = json!(turn.result().usage());
+        result["turns"] = json!(turn.result().turns());
+        result["tool_calls"] = json!(turn.result().tool_calls());
+        result["retirement_error"] = json!(retirement_error);
 
         if first_delegate {
-            let notice = if wired {
-                "Implicit delegation mob created. Helpers are wired to you via comms. \
-                 Use `send_message` to communicate. The mob persists across turns."
-            } else {
-                "Implicit delegation mob created. The mob persists across turns. \
-                 Use `mob_check_member` to poll helper status."
-            };
+            let notice = "Implicit delegation mob created. The exact helper result was captured \
+                          before retirement; the implicit mob persists across turns.";
             result["system_notice"] = json!(notice);
         }
 
-        if let Ok(handle) = self.bound_handle(&mob_id).await {
-            self.record_successful_operator_action(&handle, call.name)
-                .await;
-        }
+        self.record_successful_operator_action(&handle, call.name)
+            .await;
 
         Self::encode_result_with_effects(call, result, session_effects)
     }
@@ -2037,7 +2086,7 @@ fn build_tool_defs_with_profile_support(
              is archived. Use delegate for work you want done and reported back, not for \
              long-lived collaborators (use mob_create + mob_spawn_member for those).\n\n\
              WHEN TO USE DELEGATE vs MOB_*:\n\
-             - delegate: Quick one-off tasks. No setup needed. Fire-and-forget or poll for result.\n\
+             - delegate: Quick one-off tasks with an exact bounded result returned by the call.\n\
              - mob_create + mob_spawn_member: Multi-member teams, custom wiring/flows, reusable \
                profiles, long-lived collaborators, or when you need fine-grained control over \
                backend, runtime_mode, and topology.\n\n\
@@ -2052,15 +2101,11 @@ fn build_tool_defs_with_profile_support(
                -- use a saved realm profile for model + tool config.\n\
              - {\"mode\":\"profile\",\"source\":{\"type\":\"inline\",\"model\":\"claude-sonnet-4-5\",\
                \"tools\":{\"builtins\":true,\"shell\":true,\"comms\":true}}} -- inline profile.\n\n\
-             CHECKING STATUS:\n\
-             Helpers run asynchronously in autonomous_host mode. After delegating, continue \
-             your own work. To check if a helper finished:\n\
-             1. Call mob_check_member with the mob_id (returned in the delegate response) and \
-                the member_id you provided.\n\
-             2. Status will be 'running', 'completed', or 'failed'.\n\
-             3. If wired=true, the helper may also send you a message via comms when done.\n\
-             Avoid tight polling loops -- check after meaningful intervals or wait for a comms \
-             message.\n\n\
+             RESULT CONTRACT:\n\
+             The call returns only after the exact admitted helper turn reaches its committed \
+             terminal boundary. result_label names the returned bounded result and \
+             max_text_bytes sets its UTF-8 byte ceiling. The response includes explicit \
+             truncation state, exact session attribution, usage, and any retirement cleanup debt.\n\n\
              EXAMPLES:\n\
              1. Quick one-off: {\"task\": \"Summarize the README.md file and send me the result\"}\n\
              2. Longer task with polling: {\"task\": \"Run the full test suite and report failures\", \
@@ -2332,6 +2377,11 @@ fn build_tool_defs_with_profile_support(
 struct DelegateArgs {
     /// The task description/prompt for the helper.
     task: String,
+    /// Label attached to the exact bounded result.
+    result_label: String,
+    /// Maximum UTF-8 bytes returned in the exact result, including any
+    /// explicit truncation marker.
+    max_text_bytes: usize,
     /// Unique identifier for this helper (required; the tool surface does
     /// not allocate member identity).
     #[serde(default)]
@@ -4050,6 +4100,12 @@ mod tests {
         let delegate = defs.iter().find(|d| d.name == "delegate").unwrap();
         let required = delegate.input_schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("task")));
+        assert!(required.iter().any(|v| v.as_str() == Some("result_label")));
+        assert!(
+            required
+                .iter()
+                .any(|v| v.as_str() == Some("max_text_bytes"))
+        );
     }
 
     #[test]
@@ -4092,6 +4148,8 @@ mod tests {
         let delegate: DelegateArgs = serde_json::from_value(json!({
             "task": "review",
             "member_id": "reviewer",
+            "result_label": "review_result",
+            "max_text_bytes": 4096,
             "placement": "host-b-peer"
         }))
         .expect("delegate placement parses");
@@ -4583,7 +4641,13 @@ mod tests {
         );
 
         let delegate_args = serde_json::value::RawValue::from_string(
-            json!({ "task": "say hi", "member_id": "helper-bootstrap-test" }).to_string(),
+            json!({
+                "task": "say hi",
+                "member_id": "helper-bootstrap-test",
+                "result_label": "delegate_result",
+                "max_text_bytes": 4096
+            })
+            .to_string(),
         )
         .unwrap();
         let delegate_error = surface
@@ -5054,7 +5118,9 @@ mod tests {
         let delegate_args = serde_json::value::RawValue::from_string(
             json!({
                 "member_id": "helper-dispatch-1",
-                "task": "report back"
+                "task": "report back",
+                "result_label": "delegate_result",
+                "max_text_bytes": 4096
             })
             .to_string(),
         )
@@ -5074,6 +5140,20 @@ mod tests {
             Some(true),
             "delegate() must report wired=true when parent comms are available"
         );
+        assert_eq!(
+            parsed["output"].as_str(),
+            Some("ok"),
+            "delegate() must return the canonical result from its exact admitted turn"
+        );
+        assert_eq!(
+            parsed["bounded_result"]["text"].as_str(),
+            Some("ok"),
+            "delegate() must project the same exact turn through the bounded carrier"
+        );
+        assert!(
+            parsed["retirement_error"].as_str().is_some(),
+            "this harness cannot archive the helper, so cleanup debt must stay explicit"
+        );
 
         let mob_id = parsed["mob_id"].as_str().expect("mob id");
         let helper_name = format!("{mob_id}/delegate/helper-dispatch-1");
@@ -5083,26 +5163,6 @@ mod tests {
                 .iter()
                 .any(|entry| entry.name.as_str() == helper_name),
             "delegate() should add the helper to the parent peer directory"
-        );
-
-        let handle = state
-            .handle_for(&MobId::from(mob_id))
-            .await
-            .expect("mob handle");
-        let helper_bridge_session_id = handle
-            .resolve_bridge_session_id(&AgentIdentity::from("helper-dispatch-1"))
-            .await
-            .expect("helper bridge session id");
-        let helper_comms = service
-            .real_comms(&helper_bridge_session_id)
-            .await
-            .expect("helper comms");
-        let helper_peers = CoreCommsRuntime::peers(&*helper_comms).await;
-        assert!(
-            helper_peers
-                .iter()
-                .any(|entry| entry.name.as_str() == parent_name),
-            "delegate() should add the parent to the helper peer directory"
         );
     }
 

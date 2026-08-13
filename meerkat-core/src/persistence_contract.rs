@@ -322,8 +322,12 @@ pub trait SessionCheckpointer: Send + Sync {
     /// The receipt is minted from the store outcome that committed the
     /// control mutation. Implementations must confirm that exact authority;
     /// they must not reload or compare the accumulated Session document.
+    /// `session` is the not-yet-published live successor: incremental
+    /// (HeadCanonical) actors adopt the committed control-metadata identity
+    /// as their new preparation baseline through it.
     async fn acknowledge_control_commit(
         &self,
+        _session: &mut crate::Session,
         _receipt: &SessionControlCommitReceipt,
     ) -> Result<(), AgentError> {
         Err(AgentError::InternalError(

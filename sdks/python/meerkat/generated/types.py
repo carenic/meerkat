@@ -785,6 +785,19 @@ class EventsSnapshotResult:
 
 
 @dataclass
+class ExportAtifParams:
+    """Parameters for `session/export_atif`.
+
+The result is the ATIF trajectory document itself; its schema authority is
+the ATIF interchange format (owned by `meerkat-atif`), so it is carried as
+an untyped `Value` on the wire."""
+    session_id: str
+    agent_name: Optional[str] = None
+    agent_version: Optional[str] = None
+    model_name: Optional[str] = None
+
+
+@dataclass
 class ForkSessionAtParams:
     """Request payload for `session/fork_at`."""
     message_index: int
@@ -2072,8 +2085,10 @@ class MobFlowCancelResult:
 @dataclass
 class MobSpawnHelperParams:
     """Request payload for `mob/spawn_helper`."""
+    max_text_bytes: int
     mob_id: str
     prompt: str
+    result_label: str
     agent_identity: Optional[str] = None
     auth_binding: Optional[WireAuthBindingRef] = None
     backend: Optional[WireMobBackendKind] = None
@@ -2085,8 +2100,10 @@ class MobSpawnHelperParams:
 @dataclass
 class MobForkHelperParams:
     """Request payload for `mob/fork_helper`."""
+    max_text_bytes: int
     mob_id: str
     prompt: str
+    result_label: str
     source_member_id: str
     agent_identity: Optional[str] = None
     auth_binding: Optional[WireAuthBindingRef] = None
@@ -2101,10 +2118,15 @@ class MobForkHelperParams:
 class MobHelperResult:
     """Response payload for `mob/spawn_helper` and `mob/fork_helper`."""
     agent_identity: str
+    bounded_result: dict[str, Any]
     member_ref: WireMemberRef
+    output: str
+    session_id: str
     tokens_used: int
-    bounded_result: Optional[dict[str, Any]] = None
-    output: Optional[str] = None
+    tool_calls: int
+    turns: int
+    usage: dict[str, Any]
+    retirement_error: Optional[str] = None
 
 
 @dataclass
@@ -3397,6 +3419,7 @@ class BridgeDeliveryPayload:
     input_id: str
     protocol_version: BridgeProtocolVersion
     supervisor: BridgePeerSpec
+    bounded_result_spec: Optional[dict[str, Any]] = None
     expected_member: Optional[BridgeMemberIncarnation] = None
     injected_context: Optional[list[ContentInput]] = None
     objective_id: Optional[str] = None
@@ -3688,6 +3711,7 @@ class BridgeTurnOutcomeRecord:
     input_id: str
     outcome: WireFlowTurnOutcome
     terminal_seq: int
+    bounded_result: Optional[Any] = None
 
 
 @dataclass
@@ -6459,6 +6483,7 @@ class BridgeCommandRevokeSupervisor(TypedDict, total=False):
     supervisor: Required[BridgePeerSpec]
 
 class BridgeCommandDeliverMemberInput(TypedDict, total=False):
+    bounded_result_spec: NotRequired[Optional[dict[str, Any]]]
     command: Required[Literal['deliver_member_input']]
     content: Required[ContentInput]
     epoch: Required[int]

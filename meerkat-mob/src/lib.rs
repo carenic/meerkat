@@ -14,6 +14,7 @@
 //! - [`MobEvent`] / [`MobEventKind`] - Structural state changes
 //! - [`MobEventStore`] - Persistence trait for mob events
 //! - [`MobStorage`] - Storage bundle for a mob
+
 #![allow(
     dead_code,
     unused_imports,
@@ -37,6 +38,8 @@
         clippy::await_holding_lock
     )
 )]
+
+pub use meerkat_atif as atif;
 
 // On wasm32, use tokio_with_wasm as a drop-in replacement for tokio.
 #[cfg(target_arch = "wasm32")]
@@ -118,7 +121,9 @@ pub use error::{
     FlowStepDispatchRejectKind, ForkSourceUnavailableCause, MemberProvisionFailureCause, MobError,
     MobFailureClass, RuntimeEffectKind,
 };
-pub use event::{AttributedEvent, MemberWireEdge, MobEvent, MobEventKind, NewMobEvent};
+pub use event::{
+    AttributedEvent, FlowCancelClass, MemberWireEdge, MobEvent, MobEventKind, NewMobEvent,
+};
 pub use identity::{
     DesiredExecution, DesiredExternalAddress, DesiredIdentityEdge, DesiredInitialDelivery,
     DesiredLocalCallbackTool, DesiredMemberMaterial, DesiredMemberOverlay, DesiredMemberSpec,
@@ -221,25 +226,28 @@ pub use runtime::{
     AdaptiveLayerResultDigest, AdaptiveLayerRetention, AdaptiveLayerRunStart,
     AdaptiveLayerSetupFault, AdaptiveLayerSetupFaultObservation, AdaptiveLayerSnapshot,
     AdaptivePlanningDecisionKind, AdaptiveRunLimits, AdaptiveRunPhaseView, AdaptiveRunSnapshot,
-    AdaptiveStopReasonView, AuthorizedSessionResume, BoundedHelperResult,
-    BoundedHelperResultStatus, ControllingAcceptorConfig, CurrentMobAdmission,
-    DEFAULT_BOUNDED_HELPER_RESULT_BYTES, ExternalPeerBindingSpec, FlowTargetProvisioner,
+    AdaptiveStopReasonView, AuthorizedSessionResume, BoundedFlowResult, BoundedHelperResult,
+    BoundedHelperResultStatus, BoundedHelperRunOutcome, BoundedMemberRunError, BoundedResultSpec,
+    BoundedTurnFailure, BoundedTurnResult, BoundedTurnWaitError, ControllingAcceptorConfig,
+    CurrentMobAdmission, DEFAULT_BOUNDED_HELPER_RESULT_BYTES, ExternalPeerBindingSpec,
+    FlowRunHandle, FlowRunWaitError, FlowTargetProvisioner, ForkMemberBoundedRunOutcome,
     ForkMemberResult, HELPER_RESULT_TRUNCATION_MARKER, HelperOptions, HelperResult, HostBindReport,
     HostBindRequest, HostCapabilityReport, HostRevokeReport, IdentityLocalExternalToolsError,
     IdentityLocalExternalToolsProvider, IdentityLocalMaterializationKey,
-    InitializeAdaptiveRunRequest, MemberDeliveryReceipt, MemberHandle, MemberHistoryPageDomain,
-    MemberLiveStatusDomain, MemberRespawnReceipt, MemberTurnEventSender, MemberTurnHandle,
-    MemberTurnOptions, MobBuilder, MobDestroyError, MobDestroyReport, MobEventRouterConfig,
-    MobEventRouterHandle, MobEventsSubscription, MobEventsSubscriptionConfig, MobHandle,
-    MobMachineStateChanges, MobMemberSnapshot, MobMemberStatus, MobPeerConnectivitySnapshot,
-    MobRespawnError, MobSessionService, MobSpawnManyFailure, MobState, MobUnreachablePeer,
-    MobWireMembersBatchReport, PeerMessageReceipt, PeerTarget, PreviousMemberCleanupReport,
-    ResumeRejectionKind, ResumeSessionLoad, ResumeVerdictTerminality, SessionResumeAuthority,
-    SessionResumeLifecycle, SessionResumeMaterialization, SessionResumePreparationReceipt,
-    SessionResumeRejection, SessionResumeVerdict, SpawnContinuityIntent, SpawnCustomizationContext,
-    SpawnMemberAdmission, SpawnMemberAdmissionObservations, SpawnMemberCustomizer, SpawnMemberSpec,
-    SpawnPolicy, SpawnResult, SpawnSource, SpawnSpec, SpawnSystemPromptOverride,
-    SpawnToolAdmission, SupervisorRotationReport, WorkDeliveryReceipt,
+    InitializeAdaptiveRunRequest, MemberBoundedTurnResult, MemberDeliveryReceipt, MemberHandle,
+    MemberHistoryPageDomain, MemberLiveStatusDomain, MemberRespawnReceipt, MemberTurnEventSender,
+    MemberTurnHandle, MemberTurnOptions, MobBuilder, MobDestroyError, MobDestroyReport,
+    MobEventRouterConfig, MobEventRouterHandle, MobEventsSubscription, MobEventsSubscriptionConfig,
+    MobHandle, MobMachineStateChanges, MobMemberSnapshot, MobMemberStatus,
+    MobPeerConnectivitySnapshot, MobRespawnError, MobSessionService, MobSpawnManyFailure, MobState,
+    MobUnreachablePeer, MobWireMembersBatchReport, PeerMessageReceipt, PeerTarget,
+    PreviousMemberCleanupReport, ResumeRejectionKind, ResumeSessionLoad, ResumeVerdictTerminality,
+    SessionResumeAuthority, SessionResumeLifecycle, SessionResumeMaterialization,
+    SessionResumePreparationReceipt, SessionResumeRejection, SessionResumeVerdict,
+    SpawnContinuityIntent, SpawnCustomizationContext, SpawnMemberAdmission,
+    SpawnMemberAdmissionObservations, SpawnMemberCustomizer, SpawnMemberSpec, SpawnPolicy,
+    SpawnResult, SpawnSource, SpawnSpec, SpawnSystemPromptOverride, SpawnToolAdmission,
+    SupervisorRotationReport, WorkBoundedTurnResult, WorkDeliveryReceipt, WorkTurnHandle,
     materialize_nonpersistent_session_resume_verdict, mob_error_wire_code, profile_to_wire,
     stored_realm_profile_to_wire,
 };

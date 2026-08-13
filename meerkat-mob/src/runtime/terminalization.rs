@@ -1,5 +1,5 @@
 use crate::error::MobError;
-use crate::event::{FlowFailureClass, MobEventKind, NewMobEvent};
+use crate::event::{FlowCancelClass, FlowFailureClass, MobEventKind, NewMobEvent};
 use crate::ids::{FlowId, MobId, RunId};
 use crate::run::{MobRun, MobRunStatus, mob_machine_run_status_is_terminal};
 use crate::store::{MobEventStore, MobRunStore, authority_validating_mob_run_store};
@@ -70,9 +70,18 @@ impl FlowFailureCause {
 
 #[derive(Debug, Clone)]
 pub(super) enum TerminalizationTarget {
-    Completed { structured_output: Option<Value> },
-    Failed { cause: FlowFailureCause },
-    Canceled,
+    Completed {
+        structured_output: Option<Value>,
+    },
+    Failed {
+        cause: FlowFailureCause,
+    },
+    /// `cause` is `None` only for repair of a run already persisted as
+    /// `Canceled` whose original cancellation origin is no longer
+    /// reconstructable; live terminalization always carries a typed class.
+    Canceled {
+        cause: Option<FlowCancelClass>,
+    },
 }
 
 impl TerminalizationTarget {
@@ -80,7 +89,7 @@ impl TerminalizationTarget {
         match self {
             Self::Completed { .. } => MobRunStatus::Completed,
             Self::Failed { .. } => MobRunStatus::Failed,
-            Self::Canceled => MobRunStatus::Canceled,
+            Self::Canceled { .. } => MobRunStatus::Canceled,
         }
     }
 
@@ -88,7 +97,7 @@ impl TerminalizationTarget {
         match self {
             Self::Completed { .. } => "FlowCompleted",
             Self::Failed { .. } => "FlowFailed",
-            Self::Canceled => "FlowCanceled",
+            Self::Canceled { .. } => "FlowCanceled",
         }
     }
 
@@ -105,7 +114,11 @@ impl TerminalizationTarget {
                 cause: cause.class(),
                 reason: cause.reason(),
             },
-            Self::Canceled => MobEventKind::FlowCanceled { run_id, flow_id },
+            Self::Canceled { cause } => MobEventKind::FlowCanceled {
+                run_id,
+                flow_id,
+                cause,
+            },
         }
     }
 }
@@ -235,7 +248,13 @@ impl FlowTerminalizationAuthority {
                 };
                 TerminalizationTarget::Failed { cause }
             }
-            MobRunStatus::Canceled => TerminalizationTarget::Canceled,
+            MobRunStatus::Canceled => {
+                let cause = match requested {
+                    TerminalizationTarget::Canceled { cause } => cause,
+                    _ => None,
+                };
+                TerminalizationTarget::Canceled { cause }
+            }
             MobRunStatus::Pending | MobRunStatus::Running => requested,
         }
     }
@@ -288,7 +307,7 @@ mod tests {
         FlowFailureCause, FlowTerminalizationAuthority, TerminalizationOutcome,
         TerminalizationTarget,
     };
-    use crate::event::{FlowFailureClass, MobEvent, MobEventKind, NewMobEvent};
+    use crate::event::{FlowCancelClass, FlowFailureClass, MobEvent, MobEventKind, NewMobEvent};
     use crate::ids::{FlowId, LoopId, MobId, RunId, StepId};
     use crate::run::{MobRun, MobRunProvenanceAuthority, MobRunStatus, StepLedgerEntry};
     use crate::store::{
@@ -747,6 +766,114 @@ mod tests {
         .expect("authority-backed sample run")
     }
 
+    fn mixed_step_run(run_id: RunId) -> MobRun {
+        MobRun::authority_backed_for_steps(
+            run_id,
+            MobId::from("mob"),
+            FlowId::from("flow"),
+            [
+                StepId::from("absent"),
+                StepId::from("dispatched"),
+                StepId::from("completed"),
+                StepId::from("failed"),
+                StepId::from("skipped"),
+                StepId::from("canceled"),
+            ],
+            MobRunStatus::Running,
+            serde_json::json!({}),
+        )
+        .expect("authority-backed mixed-step run")
+    }
+
+    fn mixed_step_commands(
+        terminal: crate::run::MobMachineFlowRunCommand,
+    ) -> Vec<crate::run::MobMachineFlowRunCommand> {
+        use crate::run::MobMachineFlowRunCommand as Command;
+        use crate::run::flow_run::inputs;
+
+        vec![
+            Command::DispatchStep(inputs::DispatchStep {
+                step_id: StepId::from("completed"),
+            }),
+            Command::CompleteStep(inputs::CompleteStep {
+                step_id: StepId::from("completed"),
+            }),
+            Command::DispatchStep(inputs::DispatchStep {
+                step_id: StepId::from("failed"),
+            }),
+            Command::FailStep(inputs::FailStep {
+                step_id: StepId::from("failed"),
+            }),
+            Command::DispatchStep(inputs::DispatchStep {
+                step_id: StepId::from("skipped"),
+            }),
+            Command::SkipStep(inputs::SkipStep {
+                step_id: StepId::from("skipped"),
+            }),
+            Command::DispatchStep(inputs::DispatchStep {
+                step_id: StepId::from("canceled"),
+            }),
+            Command::CancelStep(inputs::CancelStep {
+                step_id: StepId::from("canceled"),
+            }),
+            Command::DispatchStep(inputs::DispatchStep {
+                step_id: StepId::from("dispatched"),
+            }),
+            terminal,
+        ]
+    }
+
+    fn assert_mixed_terminal_fold(state: &crate::run::flow_run::State) {
+        use crate::run::flow_run::StepRunStatus;
+
+        for step_id in ["absent", "dispatched"] {
+            assert_eq!(
+                state.step_status.get(&StepId::from(step_id)),
+                Some(&Some(StepRunStatus::Canceled))
+            );
+        }
+        for (step_id, expected) in [
+            ("completed", StepRunStatus::Completed),
+            ("failed", StepRunStatus::Failed),
+            ("skipped", StepRunStatus::Skipped),
+            ("canceled", StepRunStatus::Canceled),
+        ] {
+            assert_eq!(
+                state.step_status.get(&StepId::from(step_id)),
+                Some(&Some(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn test_generated_machine_terminal_projection_atomically_folds_mixed_steps() {
+        use crate::run::MobMachineFlowRunCommand as Command;
+        use crate::run::flow_run::{Phase, inputs};
+
+        for (terminal, expected_phase) in [
+            (
+                Command::TerminalizeFailed(inputs::TerminalizeFailed {}),
+                Phase::Failed,
+            ),
+            (
+                Command::TerminalizeCanceled(inputs::TerminalizeCanceled {}),
+                Phase::Canceled,
+            ),
+        ] {
+            let run = mixed_step_run(RunId::new());
+            let (state, _) = run
+                .flow_run_commands_projection_for_test(mixed_step_commands(terminal))
+                .expect("generated machine projects atomic terminal fold");
+            assert_eq!(state.phase, expected_phase);
+            assert_mixed_terminal_fold(&state);
+            assert_eq!(state.failure_count, 1, "only the real failed step counts");
+            assert_eq!(
+                state.consecutive_failure_count, 1,
+                "terminal folding must not synthesize supervisor failures"
+            );
+        }
+    }
+
     #[test]
     fn test_flow_failure_cause_classifies_typed_error_into_typed_event_cause() {
         use crate::error::MobError;
@@ -791,14 +918,14 @@ mod tests {
         );
 
         let run_id = RunId::new();
-        let run = sample_run(run_id.clone(), MobRunStatus::Running);
+        let run = mixed_step_run(run_id.clone());
         let expected_flow_state = run.flow_state.clone();
-        let (next_flow_state, authority_input) = run
-            .flow_run_command_projection_for_test(
+        let (next_flow_state, authority_inputs) = run
+            .flow_run_commands_projection_for_test(mixed_step_commands(
                 crate::run::MobMachineFlowRunCommand::TerminalizeCanceled(
                     crate::run::flow_run::inputs::TerminalizeCanceled {},
                 ),
-            )
+            ))
             .expect("project canceled run state");
         run_store.create_run(run).await.expect("create run");
 
@@ -806,11 +933,13 @@ mod tests {
             .commit_terminalization_with_snapshot(
                 &run_id,
                 FlowId::from("flow"),
-                TerminalizationTarget::Canceled,
+                TerminalizationTarget::Canceled {
+                    cause: Some(FlowCancelClass::CancelRequested),
+                },
                 MobRunStatus::Running,
                 &expected_flow_state,
                 &next_flow_state,
-                vec![authority_input],
+                authority_inputs,
             )
             .await
             .expect("terminalize");
@@ -822,9 +951,16 @@ mod tests {
             .expect("get run")
             .expect("run exists");
         assert_eq!(run.status, MobRunStatus::Canceled);
+        assert_mixed_terminal_fold(&run.flow_state);
         let emitted = events.replay_all().await.expect("replay events");
         assert_eq!(emitted.len(), 1);
-        assert!(matches!(emitted[0].kind, MobEventKind::FlowCanceled { .. }));
+        assert!(matches!(
+            emitted[0].kind,
+            MobEventKind::FlowCanceled {
+                cause: Some(FlowCancelClass::CancelRequested),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -855,7 +991,9 @@ mod tests {
             .commit_terminalization_with_snapshot(
                 &run_id,
                 FlowId::from("flow"),
-                TerminalizationTarget::Canceled,
+                TerminalizationTarget::Canceled {
+                    cause: Some(FlowCancelClass::CancelRequested),
+                },
                 MobRunStatus::Pending,
                 &stale_flow_state,
                 &next_flow_state,

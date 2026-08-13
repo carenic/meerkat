@@ -1,0 +1,61 @@
+diff --git a/crate_universe/extensions.bzl b/crate_universe/extensions.bzl
+--- a/crate_universe/extensions.bzl
++++ b/crate_universe/extensions.bzl
+@@ -706,17 +706,26 @@
+         # buildifier: disable=print
+         print("WARN: {}".format(warning))
+ 
++    # Meerkat patch: cargo-bazel absolutizes in-tree [patch.crates-io] path
++    # dependencies onto the workspace root of whichever machine evaluates the
++    # extension (cargo canonicalizes the spliced symlinks, so the upstream
++    # relativization in metadata_annotation.rs never fires). Strip the current
++    # workspace-root prefix from generated metadata so recorded repo specs and
++    # the module lockfile stay machine-independent; local_crate_mirror rebases
++    # the relative form onto the evaluating workspace root at fetch time.
++    workspace_root_prefix = str(nonhermetic_root_bazel_workspace_dir) + "/"
++
+     crates_dir = tag_path.get_child(cfg.name)
+     _generate_repo(
+         name = cfg.name,
+         contents = {
+-            "BUILD.bazel": module_ctx.read(crates_dir.get_child("BUILD.bazel")),
+-            "alias_rules.bzl": module_ctx.read(crates_dir.get_child("alias_rules.bzl")),
+-            "defs.bzl": module_ctx.read(crates_dir.get_child("defs.bzl")),
++            "BUILD.bazel": module_ctx.read(crates_dir.get_child("BUILD.bazel")).replace(workspace_root_prefix, ""),
++            "alias_rules.bzl": module_ctx.read(crates_dir.get_child("alias_rules.bzl")).replace(workspace_root_prefix, ""),
++            "defs.bzl": module_ctx.read(crates_dir.get_child("defs.bzl")).replace(workspace_root_prefix, ""),
+         },
+     )
+ 
+-    contents = json.decode(module_ctx.read(lockfile))
++    contents = json.decode(module_ctx.read(lockfile).replace(workspace_root_prefix, ""))
+ 
+     for crate in contents["crates"].values():
+         repo = crate["repository"]
+@@ -783,6 +792,8 @@
+             local_crate_mirror(
+                 name = crate_repo_name,
+                 options_json = json.encode(options),
++                # Meerkat patch: relative paths are workspace-relative and are
++                # resolved against the consuming workspace root at fetch time.
+                 path = repo["Path"]["path"],
+                 **kwargs
+             )
+diff --git a/crate_universe/private/local_crate_mirror.bzl b/crate_universe/private/local_crate_mirror.bzl
+--- a/crate_universe/private/local_crate_mirror.bzl
++++ b/crate_universe/private/local_crate_mirror.bzl
+@@ -6,7 +6,13 @@
+ load("//rust/platform:triple.bzl", "get_host_triple")
+ 
+ def _local_crate_mirror_impl(repository_ctx):
+-    path = repository_ctx.path(repository_ctx.attr.path)
++    # Meerkat patch: extensions.bzl records in-tree path dependencies
++    # workspace-relative so checked-in lockfiles carry no machine-specific
++    # absolute paths. Rebase onto this workspace's root before resolving.
++    attr_path = repository_ctx.attr.path
++    if not attr_path.startswith("/"):
++        attr_path = "{}/{}".format(repository_ctx.workspace_root, attr_path)
++    path = repository_ctx.path(attr_path)
+ 
+     host_triple = get_host_triple(repository_ctx)
+ 

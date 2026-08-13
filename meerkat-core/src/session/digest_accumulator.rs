@@ -351,6 +351,13 @@ impl TranscriptDigestAccumulator {
         state.exact_row_current = Some(current);
     }
 
+    fn committed_row_prefix_count(&self) -> Option<u64> {
+        self.locked()
+            .exact_row_committed
+            .as_ref()
+            .map(SessionMessageRowPrefixAccumulator::row_count)
+    }
+
     fn exact_row_prefix_at(&self, row_count: u64) -> Option<SessionMessageRowPrefixAccumulator> {
         let state = self.locked();
         state
@@ -591,6 +598,14 @@ impl TranscriptMessages {
         }
         self.accumulator.install_exact_row_lineage(anchor, current);
         true
+    }
+
+    /// Row count of the exact durable-row boundary this buffer still
+    /// witnesses, when one is live. Rows below this count are bound into a
+    /// store-extendable prefix commitment; a non-append mutation inside it
+    /// cannot be represented by an ordinary incremental append.
+    pub(crate) fn committed_row_prefix_count(&self) -> Option<u64> {
+        self.accumulator.committed_row_prefix_count()
     }
 
     /// Exact durable-row prefix witnessed at `row_count`, if it is either the

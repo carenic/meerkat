@@ -613,6 +613,13 @@ export interface EventsSnapshotResult {
   snapshot: Record<string, unknown>;
 }
 
+export interface ExportAtifParams {
+  agent_name?: string | null;
+  agent_version?: string | null;
+  model_name?: string | null;
+  session_id: string;
+}
+
 export interface ForkSessionAtParams {
   message_index: number;
   running_behavior?: "reject";
@@ -1574,9 +1581,11 @@ export interface MobSpawnHelperParams {
   agent_identity?: string | null;
   auth_binding?: WireAuthBindingRef | null;
   backend?: WireMobBackendKind | null;
+  max_text_bytes: number;
   mob_id: string;
   model_override?: string | null;
   prompt: string;
+  result_label: string;
   role_name?: string | null;
   runtime_mode?: WireMobRuntimeMode | null;
 }
@@ -1586,9 +1595,11 @@ export interface MobForkHelperParams {
   auth_binding?: WireAuthBindingRef | null;
   backend?: WireMobBackendKind | null;
   fork_context?: unknown;
+  max_text_bytes: number;
   mob_id: string;
   model_override?: string | null;
   prompt: string;
+  result_label: string;
   role_name?: string | null;
   runtime_mode?: WireMobRuntimeMode | null;
   source_member_id: string;
@@ -1596,10 +1607,15 @@ export interface MobForkHelperParams {
 
 export interface MobHelperResult {
   agent_identity: string;
-  bounded_result?: Record<string, unknown> | null;
+  bounded_result: Record<string, unknown>;
   member_ref: WireMemberRef;
-  output?: string | null;
+  output: string;
+  retirement_error?: string | null;
+  session_id: string;
   tokens_used: number;
+  tool_calls: number;
+  turns: number;
+  usage: Record<string, unknown>;
 }
 
 export interface MobForceCancelResult {
@@ -2374,6 +2390,7 @@ export interface BridgeCapabilities {
 }
 
 export interface BridgeDeliveryPayload {
+  bounded_result_spec?: Record<string, unknown> | null;
   content: ContentInput;
   epoch: number;
   expected_member?: BridgeMemberIncarnation | null;
@@ -2549,6 +2566,7 @@ export interface WireFlowFailureDetail {
 }
 
 export interface BridgeTurnOutcomeRecord {
+  bounded_result?: unknown | null;
   fence_token: number;
   generation: number;
   input_id: string;
@@ -3289,6 +3307,7 @@ export interface BridgeCommandRevokeSupervisor {
 }
 
 export interface BridgeCommandDeliverMemberInput {
+  bounded_result_spec?: Record<string, unknown> | null;
   command: "deliver_member_input";
   content: ContentInput;
   epoch: number;

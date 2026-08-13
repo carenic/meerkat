@@ -51,6 +51,7 @@ pub(crate) mod control_plane;
 pub mod delivery_inbox;
 pub mod driver;
 pub(crate) mod effect;
+pub mod exact_operation;
 #[doc(hidden)]
 pub mod generated;
 pub mod handles;
@@ -519,6 +520,10 @@ pub use delivery_inbox::{
     RuntimeDeliveryReceipt, RuntimeDeliveryRecord, RuntimeDeliverySubmission,
 };
 pub use driver::{EphemeralRuntimeDriver, PersistentRuntimeDriver, PostAdmissionSignal};
+pub use exact_operation::{
+    ExactOperationCustody, ExactOperationObserver, ExactOperationObserverChannelClosed,
+    ExactOperationResolveError,
+};
 pub use handles::{
     HandleDslAuthority, RuntimeAuthLeaseHandle, RuntimeCommsDrainHandle,
     RuntimeExternalToolSurfaceHandle, RuntimeInteractionStreamHandle,
@@ -551,10 +556,11 @@ pub use meerkat_machine::{
     CommittedRuntimeExecutorAttachmentPublicationLease, CommsDrainMode, CommsDrainPhase,
     DrainExitReason, EnsureRuntimeExecutorAttachment, LocalSessionMaterializationMode,
     MachineServiceTurnCommitLease, MachineServiceTurnIdentity, MachineSessionArchiveLease,
-    MachineSessionControlAuthority, MeerkatConsumerSurface, MeerkatMachine, PeerIngressOwner,
-    PendingRuntimeExecutorAttachment, PreparedArchivedResumeCommitLease,
-    PreparedAttachedSessionActorRecovery, PreparedRuntimeExecutorAttachmentRetirement,
-    PreparedSessionMaterialization, RuntimeBindingsError, RuntimeCleanupTaskSpawner,
+    MachineSessionArchivePostCommitHook, MachineSessionControlAuthority, MeerkatConsumerSurface,
+    MeerkatMachine, PeerIngressOwner, PendingRuntimeExecutorAttachment,
+    PreparedArchivedResumeCommitLease, PreparedAttachedSessionActorRecovery,
+    PreparedRuntimeExecutorAttachmentRetirement, PreparedSessionMaterialization,
+    ReloadRequiredRegistrationDisposition, RuntimeBindingsError, RuntimeCleanupTaskSpawner,
     RuntimeExecutorAttachmentRetirementCompletion, RuntimeExecutorAttachmentWitness,
     RuntimeLifecycleFacts, RuntimeLoopQueueAdmissionPlan, RuntimeSessionLifecycleObservation,
     RuntimeSessionRegistrationOutcome, RuntimeSessionRegistrationWitness,

@@ -2317,13 +2317,79 @@ impl RuntimeOpsLifecycleRegistry {
         Ok(())
     }
 
+    /// Seal process-local operation production after the owning runtime shell
+    /// loses durable authority.
+    ///
+    /// Unlike ordinary unregister, this deliberately does not synthesize
+    /// terminal operation transitions and does not persist the uncertain live
+    /// image. The durable store remains the only recovery authority. Taking the
+    /// producer lets the machine join the exact persistence worker before a
+    /// replacement registration is admitted. `owner_retired` stays false:
+    /// callbacks that retained the old Arc may still read its operation
+    /// identity, while persistence sealing prevents them from publishing that
+    /// uncertain image. The recovered successor owns canonical terminalization.
+    pub(crate) fn seal_owner_for_reload_required_discard(&self) -> Result<(), OpsLifecycleError> {
+        let closed_sender = {
+            let mut state = self.write_state()?;
+            state.persistence_sealed = true;
+            state.persist_epoch_id = None;
+            state.persist_cursor_state = None;
+            state.persist_tx.take()
+        };
+        drop(closed_sender);
+        Ok(())
+    }
+
+    /// Reopen persistence only for a registry reconstructed from durable
+    /// authority during an exact ReloadRequired cold replacement. No ordinary
+    /// sealed or retired registry can cross this boundary.
+    pub(crate) fn install_recovered_persistence_channel(
+        &self,
+        tx: crate::tokio::sync::mpsc::UnboundedSender<OpsLifecyclePersistenceRequest>,
+        epoch_id: meerkat_core::RuntimeEpochId,
+        cursor_state: Arc<meerkat_core::EpochCursorState>,
+    ) -> Result<(), OpsLifecycleError> {
+        let mut state = self.write_state()?;
+        if state.owner_retired || state.persist_tx.is_some() {
+            return Err(OpsLifecycleError::Internal(
+                "recovered operation registry is already retired or has a persistence owner"
+                    .to_string(),
+            ));
+        }
+        state.persistence_sealed = false;
+        state.persist_tx = Some(tx);
+        state.persist_epoch_id = Some(epoch_id);
+        state.persist_cursor_state = Some(cursor_state);
+        Ok(())
+    }
+
     /// Recover from a persisted snapshot.
     ///
     /// Rebuilds DSL state, retaining terminal operations and running
     /// `DetachedJobWait` bindings while stripping every other non-terminal
-    /// operation. Fresh shell records come from specs; completion entries are
-    /// seeded only after generated recovery authority accepts them.
+    /// operation. ReloadRequired recovery may preserve one exact typed record
+    /// separately through [`Self::from_recovered_preserving_operation`]. Fresh
+    /// shell records come from specs; completion entries are seeded only after
+    /// generated recovery authority accepts them.
     pub fn from_recovered(snapshot: PersistedOpsSnapshot) -> Result<Self, OpsLifecycleError> {
+        Self::from_recovered_with_preservation(snapshot, None)
+    }
+
+    /// Recover one exact non-terminal operation for a ReloadRequired cold
+    /// replacement. Ordinary cold startup continues to apply the generated
+    /// discard classification. The explicit expectation must match the exact
+    /// persisted identity, kind, and source before the record is retained.
+    pub(crate) fn from_recovered_preserving_operation(
+        snapshot: PersistedOpsSnapshot,
+        preservation: &meerkat_core::OperationRetentionRequest,
+    ) -> Result<Self, OpsLifecycleError> {
+        Self::from_recovered_with_preservation(snapshot, Some(preservation))
+    }
+
+    fn from_recovered_with_preservation(
+        snapshot: PersistedOpsSnapshot,
+        preservation: Option<&meerkat_core::OperationRetentionRequest>,
+    ) -> Result<Self, OpsLifecycleError> {
         let PersistedOpsSnapshot {
             epoch_id: _,
             authority_state,
@@ -2337,6 +2403,26 @@ impl RuntimeOpsLifecycleRegistry {
         let next_completion_seq = authority_state.next_completion_seq;
         let authority_completion_entries = authority_state.completion_feed_entries;
         let authority_operations = authority_state.operations;
+        if let Some(expected) = preservation {
+            let exact_match = authority_operations
+                .get(expected.operation_id())
+                .is_some_and(|op| {
+                    op.kind == expected.expected_kind()
+                        && op.operation_source.as_ref() == Some(expected.expected_source())
+                        && matches!(
+                            op.status,
+                            OperationStatus::Provisioning | OperationStatus::Running
+                        )
+                        && op.terminal_outcome.is_none()
+                        && op.completion_sequence.is_none()
+                });
+            if !exact_match {
+                return Err(OpsLifecycleError::Internal(format!(
+                    "ReloadRequired preservation request did not match exact durable operation {}",
+                    expected.operation_id()
+                )));
+            }
+        }
         let mut shell = ShellState::new(max_completed, max_concurrent);
 
         // Replay every persisted op through generated recovery authority.
@@ -2359,6 +2445,56 @@ impl RuntimeOpsLifecycleRegistry {
                 op_state.completion_sequence.is_some(),
             )?;
             if disposition == RecoveredOperationRecordDisposition::Discard {
+                let preserve_exact_operation = preservation.is_some_and(|expected| {
+                    expected.operation_id() == &op_id
+                        && expected.expected_kind() == op_state.kind
+                        && op_state.operation_source.as_ref() == Some(expected.expected_source())
+                }) && matches!(
+                    op_state.status,
+                    OperationStatus::Provisioning | OperationStatus::Running
+                ) && op_state.terminal_outcome.is_none()
+                    && op_state.completion_sequence.is_none();
+                if !preserve_exact_operation {
+                    continue;
+                }
+                let spec = operation_specs.get(&op_id).ok_or_else(|| {
+                    OpsLifecycleError::Internal(format!(
+                        "ReloadRequired operation {op_id} has no exact persisted operation spec"
+                    ))
+                })?;
+                if spec.kind != op_state.kind
+                    || spec.operation_source.as_ref() != op_state.operation_source.as_ref()
+                {
+                    return Err(OpsLifecycleError::Internal(format!(
+                        "ReloadRequired operation {op_id} persisted spec drifted from generated authority"
+                    )));
+                }
+                let effects = shell.dsl_apply_with_effects(
+                    mm_dsl::MeerkatMachineInput::RegisterOp {
+                        operation_id: mm_dsl::OperationId::from_domain(&op_id).0,
+                        kind: mm_dsl::OperationKind::from_domain(&spec.kind),
+                        source: spec
+                            .operation_source
+                            .as_ref()
+                            .map(mm_dsl::OperationSource::from_domain),
+                        max_concurrent: max_concurrent.map(|limit| limit as u64),
+                    },
+                    "RecoverReloadRequiredOperation",
+                )?;
+                if let Some(error) = op_registration_error_from_effects(&op_id, &effects)? {
+                    return Err(error);
+                }
+                if op_state.status == OperationStatus::Running {
+                    apply_op_transition(
+                        &mut shell,
+                        &op_id,
+                        mm_dsl::MeerkatMachineInput::StartOp {
+                            operation_id: mm_dsl::OperationId::from_domain(&op_id).0,
+                        },
+                        mm_dsl::OpLifecycleActionKind::Start,
+                    )?;
+                }
+                retained_ids.insert(op_id);
                 continue;
             }
             if let Some(spec_source) = operation_specs
@@ -4642,6 +4778,78 @@ mod tests {
                 .is_empty(),
             "recovery of a wait binding must not mint completion"
         );
+    }
+
+    #[test]
+    fn reload_required_preservation_requires_exact_id_kind_and_source() {
+        let registry = RuntimeOpsLifecycleRegistry::new();
+        let owner_session_id = SessionId::new();
+        let child_session_id = SessionId::new();
+        let operation_id = OperationId::new();
+        let source = OperationSource::session_child(child_session_id.clone());
+        registry
+            .register_operation(OperationSpec {
+                id: operation_id.clone(),
+                kind: OperationKind::BackgroundToolOp,
+                owner_session_id,
+                display_name: "reload-required exact operation".into(),
+                source_label: "reload_required_exact".into(),
+                operation_source: Some(source.clone()),
+                child_session_id: Some(child_session_id),
+                expect_peer_channel: false,
+            })
+            .unwrap();
+        registry.provisioning_succeeded(&operation_id).unwrap();
+        let snapshot = registry
+            .capture_persistence_snapshot(
+                meerkat_core::RuntimeEpochId::new(),
+                &meerkat_core::EpochCursorState::new(),
+            )
+            .unwrap();
+
+        let exact = meerkat_core::OperationRetentionRequest::new(
+            operation_id.clone(),
+            OperationKind::BackgroundToolOp,
+            source.clone(),
+        );
+        let recovered = RuntimeOpsLifecycleRegistry::from_recovered_preserving_operation(
+            snapshot.clone(),
+            &exact,
+        )
+        .expect("exact operation preservation reconstructs generated authority");
+        assert_eq!(
+            recovered
+                .snapshot(&operation_id)
+                .unwrap()
+                .expect("exact operation retained")
+                .status,
+            OperationStatus::Running
+        );
+
+        for mismatch in [
+            meerkat_core::OperationRetentionRequest::new(
+                OperationId::new(),
+                OperationKind::BackgroundToolOp,
+                source.clone(),
+            ),
+            meerkat_core::OperationRetentionRequest::new(
+                operation_id.clone(),
+                OperationKind::DetachedJobWait,
+                source.clone(),
+            ),
+            meerkat_core::OperationRetentionRequest::new(
+                operation_id.clone(),
+                OperationKind::BackgroundToolOp,
+                OperationSource::session_child(SessionId::new()),
+            ),
+        ] {
+            let error = RuntimeOpsLifecycleRegistry::from_recovered_preserving_operation(
+                snapshot.clone(),
+                &mismatch,
+            )
+            .expect_err("mismatched preservation authority must fail closed");
+            assert!(error.to_string().contains("did not match"));
+        }
     }
 
     #[test]

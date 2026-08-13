@@ -21236,13 +21236,13 @@ macro_rules! meerkat_catalog_machine_dsl {
                 meerkat_tool_visibility_filter_has_catalog_witnesses(
                     self.staged_filter, catalog, catalog)
             }
+            // Only allow-side overlay names can be orphaned by a catalog
+            // replacement; standing deny names are pure subtraction and are
+            // admitted regardless of the incoming catalog (they may name
+            // tools that were never present).
             guard "turn_overlay_allow_matches_replacement_catalog" {
                 meerkat_tool_visibility_names_are_catalog_backed(
                     self.turn_tool_overlay_allow_names, catalog)
-            }
-            guard "turn_overlay_deny_matches_replacement_catalog" {
-                meerkat_tool_visibility_names_are_catalog_backed(
-                    self.turn_tool_overlay_deny_names, catalog)
             }
             update {
                 self.filter_visibility_authority_catalog = catalog;
@@ -21367,13 +21367,13 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "inactive_allow_carries_no_names" {
                 allow_active == true || allow_names == EmptySet
             }
+            // Allow names GRANT provider visibility and must be catalog
+            // backed. Deny names only SUBTRACT: denying an absent tool is a
+            // semantic no-op, so deny names are deliberately not guarded
+            // against the catalog.
             guard "allow_names_match_filter_authority_catalog" {
                 meerkat_tool_visibility_names_are_catalog_backed(
                     allow_names, self.filter_visibility_authority_catalog)
-            }
-            guard "deny_names_match_filter_authority_catalog" {
-                meerkat_tool_visibility_names_are_catalog_backed(
-                    deny_names, self.filter_visibility_authority_catalog)
             }
             update {
                 self.turn_tool_overlay_allow_active = allow_active;

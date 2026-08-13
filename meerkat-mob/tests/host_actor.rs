@@ -453,6 +453,7 @@ fn outcome_row(
         fence_token,
         terminal_seq,
         outcome: WireFlowTurnOutcome::RunCompleted,
+        bounded_result: None,
     }
 }
 
@@ -473,6 +474,7 @@ async fn reserve_pending(
             generation,
             fence_token,
             window_start,
+            bounded_result_spec: None,
         },
     )
     .await
@@ -830,6 +832,7 @@ async fn committed_then_error_pending_outcome_and_ack_converge_exactly() {
         generation: 5,
         fence_token: 9,
         window_start: 41,
+        bounded_result_spec: None,
     };
     assert_eq!(
         reserve_turn_outcome_pending(&mut fixture.authority, &pending, &key, &reserved)
@@ -966,6 +969,7 @@ async fn tracked_cancel_no_effect_blocks_delayed_delivery_across_restart() {
                 generation: 5,
                 fence_token: 9,
                 window_start: u64::MAX,
+                bounded_result_spec: None,
             },
         )
         .await
@@ -1040,6 +1044,7 @@ async fn accepted_pending_cancel_blocks_delivery_before_runtime_quiescence() {
                 generation: 5,
                 fence_token: 9,
                 window_start: u64::MAX,
+                bounded_result_spec: None,
             },
         )
         .await
@@ -1808,6 +1813,7 @@ async fn replay_only_arbitration_allows_exact_pending_or_terminal_and_never_comm
         fence_token: 11,
         // Replay-only arbitration must never commit this inert proposal.
         window_start: u64::MAX,
+        bounded_result_spec: None,
     };
 
     assert_eq!(

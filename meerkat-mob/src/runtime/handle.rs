@@ -20,8 +20,9 @@ type BoxedMachineCommandFuture = std::pin::Pin<
 type BoxedMachineCommandFuture = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<MobMachineCommandResult, MobError>> + 'static>,
 >;
+use crate::StepId;
 use crate::roster::MobMemberKickoffSnapshot;
-use crate::run::{MobMachineFlowRunCommand, flow_run};
+use crate::run::{MobMachineFlowRunCommand, MobRunStatus, flow_run};
 #[cfg(test)]
 use crate::runtime::MobLifecycleSnapshot;
 use crate::runtime::flow_frame_engine::FlowFrameLoopStorePlan;
@@ -59,6 +60,7 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Mutex as StdMutex;
 use std::sync::RwLock as StdRwLock;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -2277,6 +2279,26 @@ pub type MemberTurnEventSender =
 pub(crate) type MemberTurnLlmIdentityAppliedSender =
     tokio::sync::oneshot::Sender<Result<Option<meerkat_core::SessionLlmIdentity>, MobError>>;
 
+/// Private exact-turn completion carrier shared by the Mob actor and its
+/// provisioner. The runtime outcome is kept intact until the receiver-owned
+/// handle decides whether it needs only the legacy receipt or a bounded
+/// result projection.
+#[derive(Debug)]
+pub(crate) struct ExactTurnCompletion {
+    pub(crate) session_id: SessionId,
+    pub(crate) terminal: ExactTurnTerminal,
+}
+
+#[derive(Debug)]
+pub(crate) enum ExactTurnTerminal {
+    Runtime(meerkat_runtime::completion::CompletionOutcome),
+    DirectSessionError(meerkat_core::service::SessionError),
+    PlacedBounded(meerkat_contracts::wire::supervisor_bridge::BridgeBoundedTurnResult),
+}
+
+pub(crate) type ExactTurnCompletionSender =
+    tokio::sync::oneshot::Sender<Result<ExactTurnCompletion, MobError>>;
+
 /// Host-owned observation channels attached to one external member turn.
 ///
 /// Keeping these channels together makes the admission carrier explicit and
@@ -2285,7 +2307,8 @@ pub(crate) type MemberTurnLlmIdentityAppliedSender =
 #[derive(Default)]
 pub(super) struct MemberTurnObservers {
     pub(super) event_tx: Option<MemberTurnEventSender>,
-    pub(super) completion_tx: Option<tokio::sync::oneshot::Sender<Result<(), MobError>>>,
+    pub(super) completion_tx: Option<ExactTurnCompletionSender>,
+    pub(super) bounded_result_spec: Option<BoundedResultSpec>,
     pub(super) llm_identity_applied_tx: Option<MemberTurnLlmIdentityAppliedSender>,
 }
 
@@ -2430,7 +2453,7 @@ impl MemberTurnOptions {
 pub struct MemberTurnHandle {
     receipt: MemberDeliveryReceipt,
     session_id: Option<SessionId>,
-    completion_rx: tokio::sync::oneshot::Receiver<Result<(), MobError>>,
+    completion_rx: tokio::sync::oneshot::Receiver<Result<ExactTurnCompletion, MobError>>,
     llm_identity_applied_rx: Option<
         tokio::sync::oneshot::Receiver<Result<Option<meerkat_core::SessionLlmIdentity>, MobError>>,
     >,
@@ -2474,12 +2497,49 @@ impl MemberTurnHandle {
 
     pub async fn wait(self) -> Result<MemberDeliveryReceipt, MobError> {
         match self.completion_rx.await {
-            Ok(Ok(())) => Ok(self.receipt),
+            Ok(Ok(completion)) => legacy_exact_turn_result(completion).map(|_| self.receipt),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(MobError::Internal(
                 "member turn completion channel closed before terminal outcome".to_string(),
             )),
         }
+    }
+
+    /// Await this exact admitted turn and project its committed result under a
+    /// receiver-owned byte bound.
+    ///
+    /// The spec is already validated when constructed. This method reads only
+    /// the exact completion carried by this handle. It never consults member
+    /// status, session history, or any other shared observation.
+    pub async fn wait_bounded(
+        self,
+        spec: BoundedResultSpec,
+    ) -> Result<MemberBoundedTurnResult, BoundedTurnWaitError<MemberDeliveryReceipt>> {
+        let Self {
+            receipt,
+            session_id,
+            completion_rx,
+            ..
+        } = self;
+        let Some(admitted_session_id) = session_id else {
+            return Err(BoundedTurnWaitError {
+                receipt,
+                failure: BoundedTurnFailure::MissingAdmissionSession,
+            });
+        };
+        let completion = receive_exact_turn_completion(
+            completion_rx,
+            receipt.clone(),
+            admitted_session_id.clone(),
+        )
+        .await?;
+        let result = bounded_exact_turn_result(completion, &admitted_session_id, &spec).map_err(
+            |failure| BoundedTurnWaitError {
+                receipt: receipt.clone(),
+                failure,
+            },
+        )?;
+        Ok(MemberBoundedTurnResult { receipt, result })
     }
 }
 
@@ -2508,6 +2568,967 @@ pub struct WorkDeliveryReceipt {
     /// Binding-era atom: bridge-internal, `pub(crate)` + `#[serde(skip)]`.
     #[serde(skip)]
     pub(crate) runtime_id: AgentRuntimeId,
+}
+
+/// Completion-bearing handle for one admitted unit of internal work.
+///
+/// [`MobHandle::submit_work`] and [`MobHandle::submit_work_with_mode`] retain
+/// their ingress-only contract. Callers that need proof of the exact runtime
+/// commit boundary use [`MobHandle::start_work_with_mode`] and await this
+/// handle instead of inferring completion from a session-wide event stream.
+#[must_use = "work turns must be awaited or deliberately detached"]
+#[derive(Debug)]
+pub struct WorkTurnHandle {
+    receipt: WorkDeliveryReceipt,
+    session_id: SessionId,
+    completion_rx: tokio::sync::oneshot::Receiver<Result<ExactTurnCompletion, MobError>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FlowOperationCorrelation {
+    pub(super) mob_id: MobId,
+    pub(super) run_id: RunId,
+    pub(super) flow_id: FlowId,
+}
+
+pub(crate) type FlowOperationCustody = meerkat_runtime::ExactOperationCustody<
+    FlowOperationCorrelation,
+    Result<MobRun, FlowRunTerminalUnavailable>,
+    meerkat_runtime::completion::CompletionWaitError,
+>;
+
+/// Completion-bearing handle for one exact admitted Flow run.
+///
+/// The waiter is registered against the caller-minted [`RunId`] before the
+/// `RunFlow` command is admitted. Resolution is published only after the
+/// terminal run snapshot and terminal event have crossed their combined CAS.
+#[must_use = "flow runs must be awaited or deliberately detached"]
+pub struct FlowRunHandle {
+    run_id: RunId,
+    flow_id: FlowId,
+    spec: BoundedResultSpec,
+    custody: FlowOperationCustody,
+    observer: meerkat_runtime::ExactOperationObserver<
+        FlowOperationCorrelation,
+        Result<MobRun, FlowRunTerminalUnavailable>,
+        meerkat_runtime::completion::CompletionWaitError,
+    >,
+}
+
+impl std::fmt::Debug for FlowRunHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FlowRunHandle")
+            .field("run_id", &self.run_id)
+            .field("flow_id", &self.flow_id)
+            .field(
+                "operation_id",
+                &self.custody.admission().identity().operation_id(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl FlowRunHandle {
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    pub fn flow_id(&self) -> &FlowId {
+        &self.flow_id
+    }
+
+    /// Await the exact terminal snapshot for this admitted run and project
+    /// its root output under the receiver-owned bound validated pre-admission.
+    pub async fn wait_bounded(self) -> Result<BoundedFlowResult, FlowRunWaitError> {
+        let run_id = self.run_id.clone();
+        let flow_id = self.flow_id.clone();
+        let spec = self.spec.clone();
+        let receipt = self.observer.wait().await.map_err(|failure| {
+            FlowRunWaitError::TerminalUnavailable {
+                run_id: run_id.clone(),
+                detail: failure.error().to_string(),
+            }
+        })?;
+        let run = receipt.terminal().clone().map_err(|failure| {
+            FlowRunWaitError::TerminalUnavailable {
+                run_id: run_id.clone(),
+                detail: failure.detail,
+            }
+        })?;
+        if run.run_id != run_id || run.flow_id != flow_id {
+            return Err(FlowRunWaitError::AttributionMismatch {
+                expected_run_id: run_id,
+                actual_run_id: run.run_id,
+                expected_flow_id: flow_id,
+                actual_flow_id: run.flow_id,
+            });
+        }
+        match run.status {
+            MobRunStatus::Completed => {
+                let text = exact_flow_root_output(&run)?;
+                Ok(BoundedFlowResult {
+                    run_id: run.run_id,
+                    flow_id: run.flow_id,
+                    result: BoundedHelperResult::from_validated_spec(&spec, text, false),
+                })
+            }
+            MobRunStatus::Failed => Err(FlowRunWaitError::FlowFailed { run_id }),
+            MobRunStatus::Canceled => Err(FlowRunWaitError::FlowCanceled { run_id }),
+            MobRunStatus::Pending | MobRunStatus::Running => {
+                Err(FlowRunWaitError::NonTerminalResolution {
+                    run_id,
+                    status: run.status,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FlowRunTerminalUnavailable {
+    detail: String,
+}
+
+impl FlowRunTerminalUnavailable {
+    pub(crate) fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Receiver-bounded output of one exact terminal Flow run.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct BoundedFlowResult {
+    run_id: RunId,
+    flow_id: FlowId,
+    result: BoundedHelperResult,
+}
+
+impl BoundedFlowResult {
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    pub fn flow_id(&self) -> &FlowId {
+        &self.flow_id
+    }
+
+    pub fn result(&self) -> &BoundedHelperResult {
+        &self.result
+    }
+}
+
+/// Typed failure from awaiting an exact Flow run terminal.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum FlowRunWaitError {
+    #[error("flow run '{run_id}' terminal channel closed before durable terminalization")]
+    TerminalChannelClosed { run_id: RunId },
+    #[error("flow run '{run_id}' terminal became unavailable: {detail}")]
+    TerminalUnavailable { run_id: RunId, detail: String },
+    #[error("flow run '{run_id}' failed")]
+    FlowFailed { run_id: RunId },
+    #[error("flow run '{run_id}' was canceled")]
+    FlowCanceled { run_id: RunId },
+    #[error("flow run '{run_id}' resolved from non-terminal status {status:?}")]
+    NonTerminalResolution { run_id: RunId, status: MobRunStatus },
+    #[error(
+        "flow terminal attribution mismatch: expected run '{expected_run_id}' flow '{expected_flow_id}', got run '{actual_run_id}' flow '{actual_flow_id}'"
+    )]
+    AttributionMismatch {
+        expected_run_id: RunId,
+        actual_run_id: RunId,
+        expected_flow_id: FlowId,
+        actual_flow_id: FlowId,
+    },
+    #[error("flow run '{run_id}' completed without a root output")]
+    MissingRootOutput { run_id: RunId },
+    #[error("flow run '{run_id}' root output could not be encoded: {detail}")]
+    RootOutputEncoding { run_id: RunId, detail: String },
+}
+
+fn exact_flow_root_output(run: &MobRun) -> Result<String, FlowRunWaitError> {
+    exact_flow_root_output_values(&run.run_id, &run.root_step_outputs)
+}
+
+fn exact_flow_root_output_values(
+    run_id: &RunId,
+    root_step_outputs: &indexmap::IndexMap<StepId, serde_json::Value>,
+) -> Result<String, FlowRunWaitError> {
+    if root_step_outputs.len() == 1 {
+        let value = root_step_outputs.values().next().expect("length checked");
+        if let serde_json::Value::String(text) = value {
+            return Ok(text.clone());
+        }
+        return serde_json::to_string(&canonical_json(value.clone())).map_err(|error| {
+            FlowRunWaitError::RootOutputEncoding {
+                run_id: run_id.clone(),
+                detail: error.to_string(),
+            }
+        });
+    }
+    if root_step_outputs.is_empty() {
+        return Err(FlowRunWaitError::MissingRootOutput {
+            run_id: run_id.clone(),
+        });
+    }
+    let value = serde_json::Value::Object(
+        root_step_outputs
+            .iter()
+            .map(|(step_id, value)| (step_id.as_str().to_string(), canonical_json(value.clone())))
+            .collect(),
+    );
+    serde_json::to_string(&canonical_json(value)).map_err(|error| {
+        FlowRunWaitError::RootOutputEncoding {
+            run_id: run_id.clone(),
+            detail: error.to_string(),
+        }
+    })
+}
+
+fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let sorted = values
+                .into_iter()
+                .map(|(key, value)| (key, canonical_json(value)))
+                .collect::<BTreeMap<_, _>>();
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        scalar => scalar,
+    }
+}
+
+impl WorkTurnHandle {
+    /// Admission receipt for the exact work item carried by this handle.
+    pub fn receipt(&self) -> &WorkDeliveryReceipt {
+        &self.receipt
+    }
+
+    /// Await the authoritative committed terminal boundary for this work item.
+    pub async fn wait(self) -> Result<WorkDeliveryReceipt, MobError> {
+        match self.completion_rx.await {
+            Ok(Ok(completion)) => legacy_exact_turn_result(completion).map(|_| self.receipt),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(MobError::Internal(
+                "work turn completion channel closed before terminal outcome".to_string(),
+            )),
+        }
+    }
+
+    /// Await this exact admitted work item and project its committed result
+    /// under a receiver-owned byte bound.
+    pub async fn wait_bounded(
+        self,
+        spec: BoundedResultSpec,
+    ) -> Result<WorkBoundedTurnResult, BoundedTurnWaitError<WorkDeliveryReceipt>> {
+        let Self {
+            receipt,
+            session_id,
+            completion_rx,
+        } = self;
+        let completion =
+            receive_exact_turn_completion(completion_rx, receipt.clone(), session_id.clone())
+                .await?;
+        let result =
+            bounded_exact_turn_result(completion, &session_id, &spec).map_err(|failure| {
+                BoundedTurnWaitError {
+                    receipt: receipt.clone(),
+                    failure,
+                }
+            })?;
+        Ok(WorkBoundedTurnResult { receipt, result })
+    }
+}
+
+/// Successful receiver-bounded projection of one exact committed turn.
+///
+/// `result` is the compact text carrier. Session and usage come directly from
+/// the same `RunResult`; they are never reconstructed from member snapshots or
+/// session-wide accounting.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct BoundedTurnResult {
+    result: BoundedHelperResult,
+    session_id: SessionId,
+    usage: meerkat_core::Usage,
+    turns: u32,
+    tool_calls: u32,
+}
+
+impl BoundedTurnResult {
+    pub fn result(&self) -> &BoundedHelperResult {
+        &self.result
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn usage(&self) -> &meerkat_core::Usage {
+        &self.usage
+    }
+
+    pub const fn turns(&self) -> u32 {
+        self.turns
+    }
+
+    pub const fn tool_calls(&self) -> u32 {
+        self.tool_calls
+    }
+}
+
+/// Exact member-turn result paired with the admission receipt for that same
+/// operation.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct MemberBoundedTurnResult {
+    receipt: MemberDeliveryReceipt,
+    result: BoundedTurnResult,
+}
+
+impl MemberBoundedTurnResult {
+    pub fn receipt(&self) -> &MemberDeliveryReceipt {
+        &self.receipt
+    }
+
+    pub fn result(&self) -> &BoundedTurnResult {
+        &self.result
+    }
+
+    pub fn into_parts(self) -> (MemberDeliveryReceipt, BoundedTurnResult) {
+        (self.receipt, self.result)
+    }
+}
+
+/// Exact internal-work result paired with the admission receipt for that same
+/// work item.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct WorkBoundedTurnResult {
+    receipt: WorkDeliveryReceipt,
+    result: BoundedTurnResult,
+}
+
+impl WorkBoundedTurnResult {
+    pub fn receipt(&self) -> &WorkDeliveryReceipt {
+        &self.receipt
+    }
+
+    pub fn result(&self) -> &BoundedTurnResult {
+        &self.result
+    }
+
+    pub fn into_parts(self) -> (WorkDeliveryReceipt, BoundedTurnResult) {
+        (self.receipt, self.result)
+    }
+}
+
+/// Exact failure classification for [`MemberTurnHandle::wait_bounded`] and
+/// [`WorkTurnHandle::wait_bounded`]. No variant carries assistant output from
+/// an uncommitted finalization failure.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum BoundedTurnFailure {
+    MissingAdmissionSession,
+    CompletedWithoutResult {
+        session_id: SessionId,
+    },
+    CallbackPending {
+        session_id: SessionId,
+        tool_use_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+    },
+    CallbackBatchPending {
+        session_id: SessionId,
+        pending_tool_calls: Vec<meerkat_core::error::PendingCallbackToolCall>,
+    },
+    Cancelled {
+        session_id: SessionId,
+    },
+    Abandoned {
+        session_id: SessionId,
+        reason: String,
+        error: Box<meerkat_core::TurnErrorMetadata>,
+    },
+    AbandonedWithError {
+        session_id: SessionId,
+        reason: String,
+        error: Box<meerkat_core::TurnErrorMetadata>,
+    },
+    CompletedWithFinalizationFailure {
+        session_id: SessionId,
+        error: Box<meerkat_core::TurnErrorMetadata>,
+    },
+    RuntimeTerminated {
+        session_id: SessionId,
+        reason: String,
+        error: Box<meerkat_core::TurnErrorMetadata>,
+    },
+    ExtractionFailed {
+        session_id: SessionId,
+        reason: Box<BoundedHelperResult>,
+        last_output: Box<BoundedHelperResult>,
+        attempts: u32,
+    },
+    DirectSessionFailure {
+        session_id: SessionId,
+        error_code: &'static str,
+        detail: BoundedHelperResult,
+    },
+    CompletionAttributionMismatch {
+        admitted_session_id: SessionId,
+        completion_session_id: SessionId,
+    },
+    ResultAttributionMismatch {
+        admitted_session_id: SessionId,
+        completion_session_id: SessionId,
+        result_session_id: SessionId,
+    },
+    CompletionAuthorityClosed {
+        admitted_session_id: SessionId,
+    },
+    CompletionPlumbing {
+        admitted_session_id: SessionId,
+        error: MobError,
+    },
+}
+
+impl std::fmt::Display for BoundedTurnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingAdmissionSession => {
+                f.write_str("exact turn admission did not retain a bridge session")
+            }
+            Self::CompletedWithoutResult { session_id } => {
+                write!(
+                    f,
+                    "turn for session '{session_id}' completed without a result"
+                )
+            }
+            Self::CallbackPending {
+                session_id,
+                tool_name,
+                ..
+            } => write!(
+                f,
+                "turn for session '{session_id}' is waiting for callback '{tool_name}'"
+            ),
+            Self::CallbackBatchPending {
+                session_id,
+                pending_tool_calls,
+            } => write!(
+                f,
+                "turn for session '{session_id}' is waiting for {} callbacks",
+                pending_tool_calls.len()
+            ),
+            Self::Cancelled { session_id } => {
+                write!(f, "turn for session '{session_id}' was cancelled")
+            }
+            Self::Abandoned {
+                session_id, reason, ..
+            }
+            | Self::AbandonedWithError {
+                session_id, reason, ..
+            } => write!(f, "turn for session '{session_id}' was abandoned: {reason}"),
+            Self::CompletedWithFinalizationFailure { session_id, error } => write!(
+                f,
+                "turn for session '{session_id}' failed finalization: {}",
+                error
+                    .detail
+                    .as_deref()
+                    .unwrap_or("turn finalization failed")
+            ),
+            Self::RuntimeTerminated {
+                session_id, reason, ..
+            } => write!(f, "runtime for session '{session_id}' terminated: {reason}"),
+            Self::ExtractionFailed {
+                session_id,
+                reason,
+                attempts,
+                ..
+            } => write!(
+                f,
+                "turn result extraction failed for session '{session_id}' after {attempts} attempt(s): {}",
+                reason.text()
+            ),
+            Self::DirectSessionFailure {
+                session_id,
+                error_code,
+                detail,
+            } => write!(
+                f,
+                "direct session turn for '{session_id}' failed with {error_code}: {}",
+                detail.text()
+            ),
+            Self::CompletionAttributionMismatch {
+                admitted_session_id,
+                completion_session_id,
+            } => write!(
+                f,
+                "admitted session '{admitted_session_id}' does not match exact completion session '{completion_session_id}'"
+            ),
+            Self::ResultAttributionMismatch {
+                admitted_session_id,
+                completion_session_id,
+                result_session_id,
+            } => write!(
+                f,
+                "admitted session '{admitted_session_id}' and exact completion session '{completion_session_id}' do not match result session '{result_session_id}'"
+            ),
+            Self::CompletionAuthorityClosed {
+                admitted_session_id,
+            } => write!(
+                f,
+                "exact turn completion authority for admitted session '{admitted_session_id}' closed without a terminal outcome"
+            ),
+            Self::CompletionPlumbing {
+                admitted_session_id,
+                error,
+            } => {
+                write!(
+                    f,
+                    "exact turn completion plumbing for admitted session '{admitted_session_id}' failed: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BoundedTurnFailure {}
+
+/// A bounded wait failure paired with the admission receipt for the exact
+/// operation that failed.
+#[derive(Debug)]
+pub struct BoundedTurnWaitError<R> {
+    receipt: R,
+    failure: BoundedTurnFailure,
+}
+
+impl<R> BoundedTurnWaitError<R> {
+    pub fn receipt(&self) -> &R {
+        &self.receipt
+    }
+
+    pub fn failure(&self) -> &BoundedTurnFailure {
+        &self.failure
+    }
+
+    pub fn into_parts(self) -> (R, BoundedTurnFailure) {
+        (self.receipt, self.failure)
+    }
+}
+
+impl<R> std::fmt::Display for BoundedTurnWaitError<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.failure.fmt(f)
+    }
+}
+
+impl<R: std::fmt::Debug> std::error::Error for BoundedTurnWaitError<R> {}
+
+/// Failure from a spawn/fork -> exact turn composition.
+///
+/// Admission/provisioning failures and post-admission turn failures remain
+/// distinct. In particular, the latter retains the exact member-delivery
+/// receipt carried by [`MemberTurnHandle::wait_bounded`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum BoundedMemberRunError {
+    Admission(MobError),
+    Turn(BoundedTurnWaitError<MemberDeliveryReceipt>),
+    Work(BoundedTurnWaitError<WorkDeliveryReceipt>),
+    CleanupDebt {
+        operation: Box<BoundedMemberRunError>,
+        retirement_error: MobError,
+    },
+}
+
+impl BoundedMemberRunError {
+    fn with_cleanup_debt(self, retirement_error: MobError) -> Self {
+        Self::CleanupDebt {
+            operation: Box::new(self),
+            retirement_error,
+        }
+    }
+}
+
+impl std::fmt::Display for BoundedMemberRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission(error) => error.fmt(f),
+            Self::Turn(error) => error.fmt(f),
+            Self::Work(error) => error.fmt(f),
+            Self::CleanupDebt {
+                operation,
+                retirement_error,
+            } => write!(
+                f,
+                "{operation}; helper retirement also failed: {retirement_error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BoundedMemberRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Admission(error) => Some(error),
+            Self::Turn(error) => Some(error),
+            Self::Work(error) => Some(error),
+            Self::CleanupDebt { operation, .. } => Some(operation.as_ref()),
+        }
+    }
+}
+
+impl From<MobError> for BoundedMemberRunError {
+    fn from(error: MobError) -> Self {
+        Self::Admission(error)
+    }
+}
+
+impl From<BoundedTurnWaitError<MemberDeliveryReceipt>> for BoundedMemberRunError {
+    fn from(error: BoundedTurnWaitError<MemberDeliveryReceipt>) -> Self {
+        Self::Turn(error)
+    }
+}
+
+impl From<BoundedTurnWaitError<WorkDeliveryReceipt>> for BoundedMemberRunError {
+    fn from(error: BoundedTurnWaitError<WorkDeliveryReceipt>) -> Self {
+        Self::Work(error)
+    }
+}
+
+async fn receive_exact_turn_completion<R: Clone>(
+    completion_rx: tokio::sync::oneshot::Receiver<Result<ExactTurnCompletion, MobError>>,
+    receipt: R,
+    admitted_session_id: SessionId,
+) -> Result<ExactTurnCompletion, BoundedTurnWaitError<R>> {
+    match completion_rx.await {
+        Ok(Ok(completion)) if completion.session_id == admitted_session_id => Ok(completion),
+        Ok(Ok(completion)) => Err(BoundedTurnWaitError {
+            receipt,
+            failure: BoundedTurnFailure::CompletionAttributionMismatch {
+                admitted_session_id,
+                completion_session_id: completion.session_id,
+            },
+        }),
+        Ok(Err(error)) => Err(BoundedTurnWaitError {
+            receipt,
+            failure: BoundedTurnFailure::CompletionPlumbing {
+                admitted_session_id,
+                error,
+            },
+        }),
+        Err(_) => Err(BoundedTurnWaitError {
+            receipt,
+            failure: BoundedTurnFailure::CompletionAuthorityClosed {
+                admitted_session_id,
+            },
+        }),
+    }
+}
+
+fn bounded_exact_turn_result(
+    completion: ExactTurnCompletion,
+    admitted_session_id: &SessionId,
+    spec: &BoundedResultSpec,
+) -> Result<BoundedTurnResult, BoundedTurnFailure> {
+    let session_id = completion.session_id;
+    match completion.terminal {
+        ExactTurnTerminal::Runtime(outcome) => {
+            bounded_runtime_turn_result(outcome, admitted_session_id, session_id, spec)
+        }
+        ExactTurnTerminal::DirectSessionError(error) => {
+            Err(bounded_direct_session_failure(error, session_id, spec))
+        }
+        ExactTurnTerminal::PlacedBounded(result) => {
+            let result_session_id = SessionId::parse(&result.session_id).map_err(|_| {
+                BoundedTurnFailure::ResultAttributionMismatch {
+                    admitted_session_id: admitted_session_id.clone(),
+                    completion_session_id: session_id.clone(),
+                    result_session_id: session_id.clone(),
+                }
+            })?;
+            if result_session_id != session_id {
+                return Err(BoundedTurnFailure::ResultAttributionMismatch {
+                    admitted_session_id: admitted_session_id.clone(),
+                    completion_session_id: session_id,
+                    result_session_id,
+                });
+            }
+            let bounded = BoundedHelperResult::from_wire(result.result).map_err(|_| {
+                BoundedTurnFailure::CompletionPlumbing {
+                    admitted_session_id: admitted_session_id.clone(),
+                    error: MobError::Internal(
+                        "placed bounded result wire shape is invalid".to_string(),
+                    ),
+                }
+            })?;
+            if bounded.label() != spec.label()
+                || result.max_text_bytes != u64::try_from(spec.max_text_bytes()).unwrap_or(u64::MAX)
+                || bounded.text().len() > spec.max_text_bytes()
+            {
+                return Err(BoundedTurnFailure::CompletionPlumbing {
+                    admitted_session_id: admitted_session_id.clone(),
+                    error: MobError::Internal(
+                        "placed bounded result does not match the pre-admission result spec"
+                            .to_string(),
+                    ),
+                });
+            }
+            Ok(BoundedTurnResult {
+                result: bounded,
+                session_id: result_session_id,
+                usage: result.usage,
+                turns: result.turns,
+                tool_calls: result.tool_calls,
+            })
+        }
+    }
+}
+
+fn bounded_runtime_turn_result(
+    outcome: meerkat_runtime::completion::CompletionOutcome,
+    admitted_session_id: &SessionId,
+    session_id: SessionId,
+    spec: &BoundedResultSpec,
+) -> Result<BoundedTurnResult, BoundedTurnFailure> {
+    let mut result = match outcome {
+        meerkat_runtime::completion::CompletionOutcome::Completed(result) => result,
+        meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult => {
+            return Err(BoundedTurnFailure::CompletedWithoutResult { session_id });
+        }
+        meerkat_runtime::completion::CompletionOutcome::CallbackPending {
+            tool_use_id,
+            tool_name,
+            args,
+        } => {
+            return Err(BoundedTurnFailure::CallbackPending {
+                session_id,
+                tool_use_id,
+                tool_name,
+                args,
+            });
+        }
+        meerkat_runtime::completion::CompletionOutcome::CallbackBatchPending {
+            pending_tool_calls,
+        } => {
+            return Err(BoundedTurnFailure::CallbackBatchPending {
+                session_id,
+                pending_tool_calls,
+            });
+        }
+        meerkat_runtime::completion::CompletionOutcome::Cancelled => {
+            return Err(BoundedTurnFailure::Cancelled { session_id });
+        }
+        meerkat_runtime::completion::CompletionOutcome::Abandoned { reason, error } => {
+            return Err(BoundedTurnFailure::Abandoned {
+                session_id,
+                reason,
+                error: Box::new(error),
+            });
+        }
+        meerkat_runtime::completion::CompletionOutcome::AbandonedWithError { reason, error } => {
+            return Err(BoundedTurnFailure::AbandonedWithError {
+                session_id,
+                reason,
+                error: Box::new(error),
+            });
+        }
+        meerkat_runtime::completion::CompletionOutcome::CompletedWithFinalizationFailure {
+            error,
+        } => {
+            return Err(BoundedTurnFailure::CompletedWithFinalizationFailure {
+                session_id,
+                error: Box::new(error),
+            });
+        }
+        meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated { reason, error } => {
+            return Err(BoundedTurnFailure::RuntimeTerminated {
+                session_id,
+                reason,
+                error: Box::new(error),
+            });
+        }
+    };
+    if result.session_id != session_id {
+        return Err(BoundedTurnFailure::ResultAttributionMismatch {
+            admitted_session_id: admitted_session_id.clone(),
+            completion_session_id: session_id,
+            result_session_id: result.session_id.clone(),
+        });
+    }
+    if let Some(error) = result.extraction_error.take() {
+        return Err(BoundedTurnFailure::ExtractionFailed {
+            session_id,
+            reason: Box::new(BoundedHelperResult::from_validated_spec(
+                spec,
+                &error.reason,
+                true,
+            )),
+            last_output: Box::new(BoundedHelperResult::from_validated_spec(
+                spec,
+                &error.last_output,
+                true,
+            )),
+            attempts: error.attempts,
+        });
+    }
+    let bounded = BoundedHelperResult::from_validated_spec(spec, &result.text, false);
+    Ok(BoundedTurnResult {
+        result: bounded,
+        session_id,
+        usage: result.usage.clone(),
+        turns: result.turns,
+        tool_calls: result.tool_calls,
+    })
+}
+
+fn bounded_direct_session_failure(
+    error: meerkat_core::service::SessionError,
+    session_id: SessionId,
+    spec: &BoundedResultSpec,
+) -> BoundedTurnFailure {
+    match error {
+        meerkat_core::service::SessionError::Agent(
+            meerkat_core::error::AgentError::CallbackPending {
+                tool_use_id,
+                tool_name,
+                args,
+            },
+        ) => BoundedTurnFailure::CallbackPending {
+            session_id,
+            tool_use_id,
+            tool_name,
+            args,
+        },
+        meerkat_core::service::SessionError::Agent(
+            meerkat_core::error::AgentError::CallbackBatchPending { pending_tool_calls },
+        ) => BoundedTurnFailure::CallbackBatchPending {
+            session_id,
+            pending_tool_calls,
+        },
+        meerkat_core::service::SessionError::Agent(meerkat_core::error::AgentError::Cancelled) => {
+            BoundedTurnFailure::Cancelled { session_id }
+        }
+        meerkat_core::service::SessionError::Agent(
+            meerkat_core::error::AgentError::StructuredOutputValidationFailed {
+                attempts,
+                last_output,
+                reason,
+            },
+        ) => BoundedTurnFailure::ExtractionFailed {
+            session_id,
+            reason: Box::new(BoundedHelperResult::from_validated_spec(spec, reason, true)),
+            last_output: Box::new(BoundedHelperResult::from_validated_spec(
+                spec,
+                last_output,
+                true,
+            )),
+            attempts,
+        },
+        other => {
+            let error_code = other.code();
+            let detail = BoundedHelperResult::from_validated_spec(spec, other.to_string(), true);
+            BoundedTurnFailure::DirectSessionFailure {
+                session_id,
+                error_code,
+                detail,
+            }
+        }
+    }
+}
+
+pub(crate) fn legacy_exact_turn_result(
+    completion: ExactTurnCompletion,
+) -> Result<Option<Box<meerkat_core::RunResult>>, MobError> {
+    let session_id = completion.session_id;
+    let outcome = match completion.terminal {
+        ExactTurnTerminal::Runtime(outcome) => outcome,
+        ExactTurnTerminal::DirectSessionError(error) => {
+            return Err(legacy_direct_session_error(&session_id, error));
+        }
+        ExactTurnTerminal::PlacedBounded(_) => return Ok(None),
+    };
+    match outcome {
+        meerkat_runtime::completion::CompletionOutcome::Completed(result) => Ok(Some(result)),
+        meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult => Ok(None),
+        meerkat_runtime::completion::CompletionOutcome::CallbackPending {
+            tool_use_id,
+            tool_name,
+            args,
+        } => Err(MobError::CallbackPending {
+            session_id,
+            tool_use_id,
+            tool_name,
+            args,
+        }),
+        meerkat_runtime::completion::CompletionOutcome::CallbackBatchPending {
+            pending_tool_calls,
+        } => Err(MobError::CallbackBatchPending {
+            session_id,
+            pending_tool_calls,
+        }),
+        meerkat_runtime::completion::CompletionOutcome::Cancelled => {
+            Err(MobError::Internal("turn cancelled".to_string()))
+        }
+        meerkat_runtime::completion::CompletionOutcome::Abandoned { reason, .. } => {
+            Err(MobError::Internal(format!("turn abandoned: {reason}")))
+        }
+        meerkat_runtime::completion::CompletionOutcome::AbandonedWithError { reason, error } => {
+            Err(MobError::Internal(format!(
+                "turn abandoned: {reason}; error={}",
+                serde_json::to_string(&error).unwrap_or_else(|_| "<unserializable>".to_string())
+            )))
+        }
+        meerkat_runtime::completion::CompletionOutcome::CompletedWithFinalizationFailure {
+            error,
+        } => Err(MobError::Internal(format!(
+            "turn finalization failed after output: {}",
+            error
+                .detail
+                .as_deref()
+                .unwrap_or("turn finalization failed"),
+        ))),
+        meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated { reason, .. } => {
+            Err(MobError::Internal(format!("runtime terminated: {reason}")))
+        }
+    }
+}
+
+pub(crate) fn legacy_direct_session_error(
+    session_id: &SessionId,
+    error: meerkat_core::service::SessionError,
+) -> MobError {
+    match error {
+        meerkat_core::service::SessionError::Agent(
+            meerkat_core::error::AgentError::CallbackPending {
+                tool_use_id,
+                tool_name,
+                args,
+            },
+        ) => MobError::CallbackPending {
+            session_id: session_id.clone(),
+            tool_use_id,
+            tool_name,
+            args,
+        },
+        meerkat_core::service::SessionError::Agent(
+            meerkat_core::error::AgentError::CallbackBatchPending { pending_tool_calls },
+        ) => MobError::CallbackBatchPending {
+            session_id: session_id.clone(),
+            pending_tool_calls,
+        },
+        other => other.into(),
+    }
 }
 
 /// Options for helper convenience spawns.
@@ -2542,6 +3563,54 @@ pub const DEFAULT_BOUNDED_HELPER_RESULT_BYTES: usize = 4 * 1024;
 /// Marker appended inside `BoundedHelperResult::text` when receiver-side
 /// projection removes bytes.
 pub const HELPER_RESULT_TRUNCATION_MARKER: &str = "\n[truncated]";
+
+/// Receiver-owned specification for one bounded exact-turn projection.
+///
+/// Construction performs all label and cap validation. Callers can therefore
+/// build the spec before admitting work, and an invalid projection request can
+/// never consume model or runtime capacity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedResultSpec {
+    label: String,
+    max_text_bytes: usize,
+}
+
+impl BoundedResultSpec {
+    pub const MAX_LABEL_BYTES: usize = 128;
+
+    pub fn new(label: impl Into<String>, max_text_bytes: usize) -> Result<Self, MobError> {
+        let label = label.into();
+        if label.is_empty() || label.len() > Self::MAX_LABEL_BYTES {
+            return Err(MobError::InvalidBoundedHelperResult {
+                reason: format!(
+                    "label must contain 1-{} UTF-8 bytes (actual {})",
+                    Self::MAX_LABEL_BYTES,
+                    label.len()
+                ),
+            });
+        }
+        if max_text_bytes < HELPER_RESULT_TRUNCATION_MARKER.len() {
+            return Err(MobError::InvalidBoundedHelperResult {
+                reason: format!(
+                    "max_text_bytes must be at least {} so the explicit truncation marker fits",
+                    HELPER_RESULT_TRUNCATION_MARKER.len()
+                ),
+            });
+        }
+        Ok(Self {
+            label,
+            max_text_bytes,
+        })
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub const fn max_text_bytes(&self) -> usize {
+        self.max_text_bytes
+    }
+}
 
 /// Compact helper/member outcome. Truncation is encoded in the typed status as
 /// well as the text marker so structured consumers never have to inspect the
@@ -2630,18 +3699,76 @@ impl BoundedHelperResult {
         }
     }
 
-    fn from_exact_terminal_text(
+    pub(crate) fn from_wire(
+        wire: meerkat_contracts::MobBoundedHelperResult,
+    ) -> Result<Self, MobError> {
+        let status = match wire.status {
+            meerkat_contracts::MobBoundedHelperResultStatus::Completed => {
+                Self::completed_status(false)
+            }
+            meerkat_contracts::MobBoundedHelperResultStatus::CompletedTruncated => {
+                Self::completed_status(true)
+            }
+            _ => {
+                return Err(MobError::InvalidBoundedHelperResult {
+                    reason: "placed successful result carried a non-completed status".to_string(),
+                });
+            }
+        };
+        if wire.label.is_empty() || wire.label.len() > BoundedResultSpec::MAX_LABEL_BYTES {
+            return Err(MobError::InvalidBoundedHelperResult {
+                reason: "placed bounded result label is invalid".to_string(),
+            });
+        }
+        Ok(Self {
+            label: wire.label,
+            status,
+            text: wire.text,
+        })
+    }
+
+    fn completed_status(truncated: bool) -> BoundedHelperResultStatus {
+        BoundedHelperResultStatus::terminal(false, truncated)
+    }
+
+    pub(crate) fn from_validated_spec(
+        spec: &BoundedResultSpec,
+        exact_text: impl AsRef<str>,
+        failed: bool,
+    ) -> Self {
+        let exact_text = exact_text.as_ref();
+        let (text, truncated) = if exact_text.len() <= spec.max_text_bytes {
+            (exact_text.to_string(), false)
+        } else {
+            let prefix_limit = spec.max_text_bytes - HELPER_RESULT_TRUNCATION_MARKER.len();
+            let mut prefix_end = prefix_limit.min(exact_text.len());
+            while prefix_end > 0 && !exact_text.is_char_boundary(prefix_end) {
+                prefix_end -= 1;
+            }
+            let mut text = String::with_capacity(spec.max_text_bytes);
+            text.push_str(&exact_text[..prefix_end]);
+            text.push_str(HELPER_RESULT_TRUNCATION_MARKER);
+            (text, true)
+        };
+        Self {
+            label: spec.label.clone(),
+            status: BoundedHelperResultStatus::terminal(failed, truncated),
+            text,
+        }
+    }
+
+    fn try_from_legacy_terminal_text(
         label: impl Into<String>,
         exact_text: impl AsRef<str>,
         max_text_bytes: usize,
         failed: bool,
     ) -> Result<Self, MobError> {
-        const MAX_LABEL_BYTES: usize = 128;
         let label = label.into();
-        if label.is_empty() || label.len() > MAX_LABEL_BYTES {
+        if label.is_empty() || label.len() > BoundedResultSpec::MAX_LABEL_BYTES {
             return Err(MobError::InvalidBoundedHelperResult {
                 reason: format!(
-                    "label must contain 1-{MAX_LABEL_BYTES} UTF-8 bytes (actual {})",
+                    "label must contain 1-{} UTF-8 bytes (actual {})",
+                    BoundedResultSpec::MAX_LABEL_BYTES,
                     label.len()
                 ),
             });
@@ -2657,24 +3784,18 @@ impl BoundedHelperResult {
                 ),
             });
         }
-        let (text, truncated) = if exact_text.len() <= max_text_bytes {
-            (exact_text.to_string(), false)
-        } else {
-            let prefix_limit = max_text_bytes - HELPER_RESULT_TRUNCATION_MARKER.len();
-            let mut prefix_end = prefix_limit.min(exact_text.len());
-            while prefix_end > 0 && !exact_text.is_char_boundary(prefix_end) {
-                prefix_end -= 1;
-            }
-            let mut text = String::with_capacity(max_text_bytes);
-            text.push_str(&exact_text[..prefix_end]);
-            text.push_str(HELPER_RESULT_TRUNCATION_MARKER);
-            (text, true)
-        };
-        Ok(Self {
+        if exact_text.len() <= max_text_bytes {
+            return Ok(Self {
+                label,
+                status: BoundedHelperResultStatus::terminal(failed, false),
+                text: exact_text.to_string(),
+            });
+        }
+        let spec = BoundedResultSpec {
             label,
-            status: BoundedHelperResultStatus::terminal(failed, truncated),
-            text,
-        })
+            max_text_bytes,
+        };
+        Ok(Self::from_validated_spec(&spec, exact_text, failed))
     }
 }
 
@@ -2696,17 +3817,15 @@ pub struct ForkMemberResult {
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct HelperResult {
-    /// The member snapshot's output preview at the registration boundary.
-    /// This is not certified terminal text.
-    pub output: Option<String>,
+    /// Exact receiver-bounded canonical assistant text for this helper turn.
+    pub output: String,
     /// Total tokens used by the helper.
     pub tokens_used: u64,
     /// Stable member identity for the helper run.
     pub agent_identity: AgentIdentity,
-    /// Receiver-owned compact projection over exact canonical assistant text,
-    /// when the operation explicitly performed terminal projection.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bounded_result: Option<BoundedHelperResult>,
+    /// Receiver-owned compact projection over the exact canonical assistant
+    /// text from this helper operation.
+    pub bounded_result: BoundedHelperResult,
     /// Identity-native runtime ID for this incarnation.
     ///
     /// Binding-era atom: bridge-internal, `pub(crate)` + `#[serde(skip)]`.
@@ -2717,6 +3836,32 @@ pub struct HelperResult {
     /// Binding-era atom: bridge-internal, `pub(crate)` + `#[serde(skip)]`.
     #[serde(skip)]
     pub(crate) fence_token: FenceToken,
+}
+
+/// Exact result from a short-lived helper plus its best-effort retirement.
+///
+/// The exact turn result is captured before retirement begins. A retirement
+/// failure therefore remains visible as cleanup debt without erasing the
+/// already-certified result or its session attribution.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct BoundedHelperRunOutcome {
+    pub helper: HelperResult,
+    pub turn: WorkBoundedTurnResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement_error: Option<String>,
+}
+
+/// Result of persisting a transcript fork and running one exact child turn.
+///
+/// The fork is intentionally retained. Callers receive both the durable fork
+/// provisioning outcome and the exact result of the explicitly admitted child
+/// turn.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct ForkMemberBoundedRunOutcome {
+    pub fork: ForkMemberResult,
+    pub turn: WorkBoundedTurnResult,
 }
 
 /// Target for a wire operation from a local mob member.
@@ -3240,6 +4385,11 @@ pub struct SpawnMemberSpec {
     /// dropped at retire). Not persisted: re-supply across process restarts
     /// via `SpawnMemberCustomizer` (`SpawnSource::Resume`).
     pub external_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    /// Host-supplied compaction summary curator for this member.
+    ///
+    /// In-process only. Remote placement rejects a populated slot before
+    /// submit because executable host behavior has no wire representation.
+    pub compaction_curator_override: Option<Arc<dyn meerkat_core::CompactionCurator>>,
     /// Typed prompt replacement for this spawn.
     pub system_prompt_override: Option<SpawnSystemPromptOverride>,
     /// Explicit helper/member continuity intent.
@@ -3275,6 +4425,10 @@ impl std::fmt::Debug for SpawnMemberSpec {
             .field("objective_id", &self.objective_id)
             .field("auth_binding", &self.auth_binding)
             .field("external_tools", &self.external_tools.is_some())
+            .field(
+                "compaction_curator_override",
+                &self.compaction_curator_override.is_some(),
+            )
             .field("system_prompt_override", &self.system_prompt_override)
             .field("continuity_intent", &self.continuity_intent)
             .field("placement", &self.placement)
@@ -3305,6 +4459,7 @@ impl SpawnMemberSpec {
             objective_id: None,
             auth_binding: None,
             external_tools: None,
+            compaction_curator_override: None,
             system_prompt_override: None,
             continuity_intent: SpawnContinuityIntent::Ephemeral,
             placement: None,
@@ -4153,6 +5308,7 @@ impl MobHandle {
                 activation_params,
                 external_delivery_intent,
                 scoped_event_tx,
+                exact_operation,
             } => {
                 let run_id = self
                     .send_actor_command(|reply_tx| MobCommand::RunFlow {
@@ -4161,6 +5317,7 @@ impl MobHandle {
                         activation_params,
                         external_delivery_intent,
                         scoped_event_tx,
+                        exact_operation,
                         reply_tx,
                     })
                     .await??;
@@ -4252,6 +5409,7 @@ impl MobHandle {
                     mut turn_metadata,
                     event_tx,
                     completion_tx,
+                    bounded_result_spec,
                     llm_identity_applied_tx,
                     ack_mode,
                 } = *cmd;
@@ -4288,6 +5446,7 @@ impl MobHandle {
                     turn_metadata,
                     event_tx,
                     completion_tx,
+                    bounded_result_spec,
                     llm_identity_applied_tx,
                     ack_mode,
                 });
@@ -6292,6 +7451,93 @@ impl MobHandle {
         self.run_flow_with_stream(flow_id, params, None).await
     }
 
+    /// Admit one exact Flow run after registering its terminal waiter.
+    ///
+    /// The caller must construct `spec` before invoking this method, so an
+    /// invalid label or byte cap fails before any Flow admission. Unlike
+    /// [`Self::flow_status`], the returned handle is correlated to this exact
+    /// caller-minted run id and resolves only from durable terminalization.
+    pub async fn start_flow_bounded(
+        &self,
+        flow_id: FlowId,
+        params: serde_json::Value,
+        spec: BoundedResultSpec,
+    ) -> Result<FlowRunHandle, MobError> {
+        self.execute_machine_command(MobMachineCommand::PreviewRunFlowAdmission)
+            .await?;
+        if !self.definition.flows.contains_key(&flow_id) {
+            return Err(MobError::FlowNotFound(flow_id));
+        }
+        let provisioner = self
+            .flow_target_provisioner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(provisioner) = provisioner {
+            provisioner().await?;
+        }
+        self.ensure_flow_targets_provisioned(&flow_id).await?;
+
+        let run_id = RunId::new();
+        let correlation = FlowOperationCorrelation {
+            mob_id: self.definition.id.clone(),
+            run_id: run_id.clone(),
+            flow_id: flow_id.clone(),
+        };
+        let projection = meerkat_core::ValidatedResultProjectionSpec::new(
+            spec.label().to_string(),
+            spec.max_text_bytes(),
+            spec.max_text_bytes(),
+        )
+        .map_err(|error| MobError::InvalidBoundedHelperResult {
+            reason: error.to_string(),
+        })?;
+        let exact_operation =
+            FlowOperationCustody::active(meerkat_core::OperationAdmissionReceipt::new(
+                meerkat_core::ExactOperationIdentity::for_domain(OperationId::new(), correlation),
+                meerkat_core::OperationAcceptClass::Fresh,
+                Some(projection),
+            ));
+        let observer = exact_operation.observe();
+        let admission = self
+            .execute_machine_command(MobMachineCommand::RunFlow {
+                run_id: Some(run_id.clone()),
+                flow_id: flow_id.clone(),
+                activation_params: params,
+                external_delivery_intent: None,
+                scoped_event_tx: None,
+                exact_operation: Some(exact_operation.clone()),
+            })
+            .await;
+        match admission {
+            Ok(MobMachineCommandResult::RunId(admitted_run_id)) if admitted_run_id == run_id => {}
+            Ok(MobMachineCommandResult::RunId(admitted_run_id)) => {
+                return Err(MobError::Internal(format!(
+                    "bounded Flow admission returned run '{admitted_run_id}', expected '{run_id}'"
+                )));
+            }
+            Ok(_) => {
+                return Err(MobError::Internal(
+                    "unexpected command result variant for bounded Flow admission".into(),
+                ));
+            }
+            Err(error) => {
+                return Err(error);
+            }
+        }
+
+        // The actor installs custody before publishing admission. Terminal
+        // cleanup resolves the retained receipt before dropping actor custody,
+        // so completion-before-wait and dropped observers need no second map.
+        Ok(FlowRunHandle {
+            run_id,
+            flow_id,
+            spec,
+            custody: exact_operation,
+            observer,
+        })
+    }
+
     /// Persist one caller-stable external-delivery admission before its
     /// effect is attempted.
     pub async fn begin_external_delivery(
@@ -6559,6 +7805,7 @@ impl MobHandle {
                 activation_params: params,
                 external_delivery_intent: Some(intent.clone()),
                 scoped_event_tx: None,
+                exact_operation: None,
             })
             .await
         {
@@ -6626,6 +7873,7 @@ impl MobHandle {
                 activation_params: params,
                 external_delivery_intent: None,
                 scoped_event_tx,
+                exact_operation: None,
             })
             .await?
         {
@@ -8064,6 +9312,7 @@ impl MobHandle {
             turn_metadata,
             event_tx: observers.event_tx,
             completion_tx: observers.completion_tx,
+            bounded_result_spec: observers.bounded_result_spec,
             llm_identity_applied_tx: observers.llm_identity_applied_tx,
             ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
         });
@@ -8094,6 +9343,7 @@ impl MobHandle {
             turn_metadata: None,
             event_tx: None,
             completion_tx: None,
+            bounded_result_spec: None,
             llm_identity_applied_tx: None,
             ack_mode: crate::mob_machine::SubmitWorkAckMode::TurnCompleted,
         });
@@ -8199,6 +9449,199 @@ impl MobHandle {
             .await
     }
 
+    /// Admit internal work and return an exact committed-completion handle.
+    ///
+    /// This is the completion-bearing counterpart to
+    /// [`Self::submit_work_with_mode`]. Admission still returns promptly; the
+    /// returned [`WorkTurnHandle`] resolves only after the runtime commits the
+    /// terminal boundary for this exact `SubmitWork` command.
+    pub async fn start_work_with_mode(
+        &self,
+        runtime_id: AgentRuntimeId,
+        fence_token: FenceToken,
+        work_ref: WorkRef,
+        spec: WorkSpec,
+        handling_mode: HandlingMode,
+    ) -> Result<WorkTurnHandle, MobError> {
+        self.start_work_with_mode_inner(
+            runtime_id,
+            fence_token,
+            work_ref,
+            spec,
+            handling_mode,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Admit caller-identified internal work and return its exact committed
+    /// completion handle.
+    ///
+    /// The stable delivery identity remains the single idempotency authority:
+    /// it derives the work reference and is carried through runtime admission
+    /// exactly as in [`Self::submit_work_with_mode_and_delivery_identity`].
+    pub async fn start_work_with_mode_and_delivery_identity(
+        &self,
+        runtime_id: AgentRuntimeId,
+        fence_token: FenceToken,
+        spec: WorkSpec,
+        handling_mode: HandlingMode,
+        delivery_identity: crate::store::MobDeliveryIdentity,
+    ) -> Result<WorkTurnHandle, MobError> {
+        delivery_identity.validate()?;
+        let work_ref = WorkRef::for_delivery(
+            &self.definition.id,
+            &runtime_id.identity,
+            &delivery_identity.idempotency_key,
+        );
+        self.start_work_with_mode_inner(
+            runtime_id,
+            fence_token,
+            work_ref,
+            spec,
+            handling_mode,
+            Some(delivery_identity),
+            None,
+        )
+        .await
+    }
+
+    pub async fn start_work_with_mode_bounded(
+        &self,
+        runtime_id: AgentRuntimeId,
+        fence_token: FenceToken,
+        work_ref: WorkRef,
+        spec: WorkSpec,
+        handling_mode: HandlingMode,
+        result_spec: BoundedResultSpec,
+    ) -> Result<WorkTurnHandle, MobError> {
+        self.start_work_with_mode_inner(
+            runtime_id,
+            fence_token,
+            work_ref,
+            spec,
+            handling_mode,
+            None,
+            Some(result_spec),
+        )
+        .await
+    }
+
+    /// Resolve the current machine-owned runtime/fence for one identity and
+    /// admit an internal exact bounded work item against that same snapshot.
+    ///
+    /// This is the identity-first convenience for helpers that are not
+    /// externally addressable. The canonical SubmitWork transition still
+    /// rejects a binding that becomes stale before actor admission.
+    pub async fn start_work_for_identity_bounded(
+        &self,
+        identity: AgentIdentity,
+        spec: WorkSpec,
+        handling_mode: HandlingMode,
+        result_spec: BoundedResultSpec,
+    ) -> Result<WorkTurnHandle, MobError> {
+        let (runtime_id, fence_token) = self
+            .resolve_submit_work_runtime_binding(
+                &identity,
+                WorkOrigin::Internal,
+                "start_work_for_identity_bounded",
+            )
+            .await?;
+        self.start_work_with_mode_bounded(
+            runtime_id,
+            fence_token,
+            WorkRef::new(),
+            spec,
+            handling_mode,
+            result_spec,
+        )
+        .await
+    }
+
+    pub async fn start_work_with_mode_and_delivery_identity_bounded(
+        &self,
+        runtime_id: AgentRuntimeId,
+        fence_token: FenceToken,
+        spec: WorkSpec,
+        handling_mode: HandlingMode,
+        delivery_identity: crate::store::MobDeliveryIdentity,
+        result_spec: BoundedResultSpec,
+    ) -> Result<WorkTurnHandle, MobError> {
+        delivery_identity.validate()?;
+        let work_ref = WorkRef::for_delivery(
+            &self.definition.id,
+            &runtime_id.identity,
+            &delivery_identity.idempotency_key,
+        );
+        self.start_work_with_mode_inner(
+            runtime_id,
+            fence_token,
+            work_ref,
+            spec,
+            handling_mode,
+            Some(delivery_identity),
+            Some(result_spec),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_work_with_mode_inner(
+        &self,
+        runtime_id: AgentRuntimeId,
+        fence_token: FenceToken,
+        work_ref: WorkRef,
+        spec: WorkSpec,
+        handling_mode: HandlingMode,
+        external_delivery_identity: Option<crate::store::MobDeliveryIdentity>,
+        bounded_result_spec: Option<BoundedResultSpec>,
+    ) -> Result<WorkTurnHandle, MobError> {
+        let admitted_session_id = {
+            let machine_state = self.machine_state_watch_rx.borrow();
+            Self::machine_bridge_session_id_for_identity(&runtime_id.identity, &machine_state)
+        }
+        .ok_or_else(|| {
+            MobError::Internal(format!(
+                "tracked work admission for '{}' has no machine-owned session binding",
+                runtime_id.identity
+            ))
+        })?;
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let cmd = Box::new(crate::mob_machine::SubmitWorkCommand {
+            runtime_id: runtime_id.clone(),
+            fence_token,
+            work_ref: work_ref.clone(),
+            spec,
+            handling_mode,
+            external_delivery_identity,
+            turn_metadata: None,
+            event_tx: None,
+            completion_tx: Some(completion_tx),
+            bounded_result_spec: bounded_result_spec.clone(),
+            llm_identity_applied_tx: None,
+            ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
+        });
+        match self
+            .execute_machine_command(MobMachineCommand::SubmitWork(cmd))
+            .await?
+        {
+            MobMachineCommandResult::WorkReceipt {
+                work_ref: admitted_ref,
+            } => Ok(WorkTurnHandle {
+                receipt: WorkDeliveryReceipt {
+                    work_ref: admitted_ref,
+                    runtime_id,
+                },
+                session_id: admitted_session_id,
+                completion_rx,
+            }),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
     /// Submit a unit of work to a mob member with an explicit turn handling mode.
     ///
     /// This is the ingress-acknowledged work-lane counterpart to member send.
@@ -8223,6 +9666,7 @@ impl MobHandle {
             turn_metadata: None,
             event_tx: None,
             completion_tx: None,
+            bounded_result_spec: None,
             llm_identity_applied_tx: None,
             ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
         });
@@ -8269,6 +9713,7 @@ impl MobHandle {
             turn_metadata: None,
             event_tx: None,
             completion_tx: None,
+            bounded_result_spec: None,
             llm_identity_applied_tx: None,
             ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
         });
@@ -9436,6 +10881,51 @@ impl MobHandle {
         })
     }
 
+    /// Persist a real transcript fork, provision its child member, and run the
+    /// child's authored initial message through an exact bounded turn handle.
+    ///
+    /// `member.initial_message` is required and is removed from the provisioning
+    /// request before [`Self::fork_member`] runs. That prevents the resume path
+    /// from dispatching an untracked initial turn; this composition admits the
+    /// same message exactly once through the internal exact work carrier instead.
+    /// The bounded-result request is validated before any fork or member
+    /// admission occurs.
+    pub async fn fork_member_then_run_bounded(
+        &self,
+        source_identity: &AgentIdentity,
+        mut member: SpawnMemberSpec,
+        message_count: Option<usize>,
+        result_label: impl Into<String>,
+        max_text_bytes: usize,
+    ) -> Result<ForkMemberBoundedRunOutcome, BoundedMemberRunError> {
+        let result_spec = BoundedResultSpec::new(result_label, max_text_bytes)?;
+        let task = member.initial_message.take().ok_or_else(|| {
+            MobError::InvalidBoundedHelperResult {
+                reason: "fork_member_then_run_bounded requires member.initial_message so the exact turn has one caller-authored input"
+                    .to_string(),
+            }
+        })?;
+        let objective_id = member.objective_id;
+        let fork = self
+            .fork_member(source_identity, member, message_count)
+            .await?;
+        let mut work = WorkSpec::new(task, WorkOrigin::Internal);
+        if let Some(objective_id) = objective_id {
+            work = work.with_objective_id(objective_id);
+        }
+        let turn = self
+            .start_work_for_identity_bounded(
+                fork.agent_identity.clone(),
+                work,
+                HandlingMode::Queue,
+                result_spec.clone(),
+            )
+            .await?
+            .wait_bounded(result_spec)
+            .await?;
+        Ok(ForkMemberBoundedRunOutcome { fork, turn })
+    }
+
     /// Read one completed worker result from canonical session authority and
     /// project it under a receiver-owned UTF-8 byte limit.
     ///
@@ -9567,7 +11057,7 @@ impl MobHandle {
                 ),
             })?;
         let failed = matches!(before_status, MobMemberStatus::Broken);
-        let result = BoundedHelperResult::from_exact_terminal_text(
+        let result = BoundedHelperResult::try_from_legacy_terminal_text(
             label,
             exact_text,
             max_text_bytes,
@@ -9576,36 +11066,26 @@ impl MobHandle {
         Ok((result, session_id))
     }
 
-    /// Spawn a fresh helper, observe its admitted member snapshot, retire it,
-    /// and return that snapshot projection.
-    ///
-    /// Helpers are short-lived TurnDriven tasks by default. This convenience
-    /// operation intentionally does not wait for model-turn terminality: spawn
-    /// registers a deferred initial turn, then this method observes and retires
-    /// the member. Consequently `bounded_result` is `None`; callers that run a
-    /// worker and need an exact compact result must retain the member, await
-    /// terminality, and call `bounded_terminal_member_result` before retiring.
-    pub async fn spawn_helper(
+    fn bounded_helper_spawn_spec(
         &self,
         identity: AgentIdentity,
-        task: impl Into<String>,
         options: HelperOptions,
-    ) -> Result<HelperResult, MobError> {
-        // This is one SendCommand-scoped composite.  Admit before profile or
-        // roster inspection; status collection and retirement below are
-        // internal completion mechanics of the admitted operation.
-        self.admit_control_scope(mob_dsl::ControlScope::SendCommand)
-            .await?;
+        launch_mode: crate::launch::MemberLaunchMode,
+    ) -> Result<(SpawnMemberSpec, MemberTurnOptions), MobError> {
         let profile_name = options
             .role_name
             .or_else(|| self.definition.profiles.keys().next().cloned())
             .ok_or_else(|| {
                 MobError::Internal("no profile specified and definition has no profiles".into())
             })?;
-        let task_text = task.into();
-        let member_identity = identity.clone();
-        let mut spec = SpawnMemberSpec::new(profile_name, identity.clone());
-        spec.initial_message = Some(task_text.into());
+        let turn_options = MemberTurnOptions {
+            objective_id: options.objective_id,
+            ..MemberTurnOptions::default()
+        };
+        let mut spec = SpawnMemberSpec::new(profile_name, identity);
+        // The task is admitted explicitly through the exact internal work
+        // carrier after provisioning, so no deferred initial turn may exist.
+        spec.initial_message = None;
         spec.runtime_mode = Some(
             options
                 .runtime_mode
@@ -9619,39 +11099,134 @@ impl MobHandle {
         spec.model_override = options.model_override;
         spec.objective_id = options.objective_id;
         spec.auto_wire_parent = true;
+        spec.launch_mode = launch_mode;
+        Ok((spec, turn_options))
+    }
 
-        self.spawn_spec_internal_with_source(spec, SpawnSource::HelperSpawn)
-            .await?;
+    async fn finish_bounded_helper(
+        &self,
+        identity: AgentIdentity,
+        task: String,
+        turn_options: MemberTurnOptions,
+        result_spec: BoundedResultSpec,
+    ) -> Result<BoundedHelperRunOutcome, BoundedMemberRunError> {
         let admitted = self.clone().with_command_authority(
             crate::control_policy::CommandAuthority::principal(
                 crate::control_policy::MobControlPrincipal::Owner,
             ),
         );
-        let helper_snapshot = admitted.member_status(&identity).await?;
-        let (agent_runtime_id, fence_token) =
-            helper_snapshot.require_runtime_identity_fields("spawn_helper result")?;
-        let agent_identity = helper_snapshot.agent_identity().clone();
-        let agent_runtime_id = agent_runtime_id.clone();
-        let output = helper_snapshot.output_preview.clone();
-        admitted.retire(identity).await?;
+        let (runtime_id, fence_token) = match admitted
+            .resolve_submit_work_runtime_binding(
+                &identity,
+                WorkOrigin::Internal,
+                "finish_bounded_helper",
+            )
+            .await
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                let operation = BoundedMemberRunError::from(error);
+                return Err(match admitted.retire(identity.clone()).await {
+                    Ok(()) => operation,
+                    Err(retirement_error) => operation.with_cleanup_debt(retirement_error),
+                });
+            }
+        };
+        let mut work = WorkSpec::new(task, WorkOrigin::Internal);
+        if let Some(objective_id) = turn_options.objective_id {
+            work = work.with_objective_id(objective_id);
+        }
+        let turn_handle = match admitted
+            .start_work_with_mode_bounded(
+                runtime_id.clone(),
+                fence_token,
+                WorkRef::new(),
+                work,
+                HandlingMode::Queue,
+                result_spec.clone(),
+            )
+            .await
+        {
+            Ok(turn) => turn,
+            Err(error) => {
+                let operation = BoundedMemberRunError::from(error);
+                return Err(match admitted.retire(identity.clone()).await {
+                    Ok(()) => operation,
+                    Err(retirement_error) => operation.with_cleanup_debt(retirement_error),
+                });
+            }
+        };
+        let turn = match turn_handle.wait_bounded(result_spec).await {
+            Ok(turn) => turn,
+            Err(error) => {
+                let operation = BoundedMemberRunError::from(error);
+                return Err(match admitted.retire(identity.clone()).await {
+                    Ok(()) => operation,
+                    Err(retirement_error) => operation.with_cleanup_debt(retirement_error),
+                });
+            }
+        };
 
-        Ok(HelperResult {
-            output,
-            tokens_used: helper_snapshot.tokens_used,
-            agent_identity,
-            bounded_result: None,
-            agent_runtime_id,
+        // Capture every exact result fact before cleanup begins. Retirement is
+        // best-effort physical cleanup and cannot revoke a committed result.
+        let receipt = turn.receipt();
+        let bounded = turn.result().result().clone();
+        let helper = HelperResult {
+            output: bounded.text().to_string(),
+            tokens_used: turn.result().usage().total_tokens(),
+            agent_identity: receipt.runtime_id.identity.clone(),
+            bounded_result: bounded,
+            agent_runtime_id: receipt.runtime_id.clone(),
             fence_token,
+        };
+        let retirement_error = admitted
+            .retire(identity)
+            .await
+            .err()
+            .map(|error| error.to_string());
+
+        Ok(BoundedHelperRunOutcome {
+            helper,
+            turn,
+            retirement_error,
         })
     }
 
-    /// Fork from an existing member's context, observe the admitted member,
-    /// retire it, and return that snapshot projection.
+    /// Spawn a helper with `HelperSpawn` provenance, run one explicit exact
+    /// turn, capture its receiver-bounded result, then attempt retirement.
     ///
-    /// Like `spawn_helper`, this preserves the historical non-blocking helper
-    /// contract and therefore does not claim an exact terminal bounded result.
-    /// Use `fork_member`, wait for terminality, then call
-    /// `bounded_terminal_member_result` for fork -> work -> project-back.
+    /// Label and byte-bound validation occurs before control or spawn
+    /// admission. The result is captured before retirement begins, so cleanup
+    /// failure is returned as debt without erasing the certified turn result.
+    pub async fn spawn_helper(
+        &self,
+        identity: AgentIdentity,
+        task: impl Into<String>,
+        options: HelperOptions,
+        result_label: impl Into<String>,
+        max_text_bytes: usize,
+    ) -> Result<BoundedHelperRunOutcome, BoundedMemberRunError> {
+        let result_spec = BoundedResultSpec::new(result_label, max_text_bytes)?;
+        self.admit_control_scope(mob_dsl::ControlScope::SendCommand)
+            .await?;
+        let (spec, turn_options) = self.bounded_helper_spawn_spec(
+            identity.clone(),
+            options,
+            crate::launch::MemberLaunchMode::Fresh,
+        )?;
+        self.spawn_spec_internal_with_source(spec, SpawnSource::HelperSpawn)
+            .await?;
+        self.finish_bounded_helper(identity, task.into(), turn_options, result_spec)
+            .await
+    }
+
+    /// Fork-launch a helper with `Fork` provenance, run one explicit exact
+    /// turn, capture its receiver-bounded result, then attempt retirement.
+    ///
+    /// The fork context is installed during provisioning, while the task
+    /// itself is admitted once through the exact internal work carrier. Label
+    /// and byte-bound validation occurs before control or spawn admission.
+    #[allow(clippy::too_many_arguments)]
     pub async fn fork_helper(
         &self,
         source_identity: &AgentIdentity,
@@ -9659,61 +11234,24 @@ impl MobHandle {
         task: impl Into<String>,
         fork_context: crate::launch::ForkContext,
         options: HelperOptions,
-    ) -> Result<HelperResult, MobError> {
+        result_label: impl Into<String>,
+        max_text_bytes: usize,
+    ) -> Result<BoundedHelperRunOutcome, BoundedMemberRunError> {
+        let result_spec = BoundedResultSpec::new(result_label, max_text_bytes)?;
         self.admit_control_scope(mob_dsl::ControlScope::SendCommand)
             .await?;
-        let profile_name = options
-            .role_name
-            .or_else(|| self.definition.profiles.keys().next().cloned())
-            .ok_or_else(|| {
-                MobError::Internal("no profile specified and definition has no profiles".into())
-            })?;
-        let task_text = task.into();
-        let member_identity = identity.clone();
-        let source_member_id = source_identity.clone();
-        let mut spec = SpawnMemberSpec::new(profile_name, identity.clone());
-        spec.initial_message = Some(task_text.into());
-        spec.runtime_mode = Some(
-            options
-                .runtime_mode
-                .unwrap_or(crate::MobRuntimeMode::TurnDriven),
-        );
-        spec.backend = options.backend;
-        spec.tool_access_policy = options.tool_access_policy;
-        spec.auth_binding = options.auth_binding;
-        spec.inherited_tool_filter = options.inherited_tool_filter;
-        spec.override_profile = options.override_profile;
-        spec.model_override = options.model_override;
-        spec.objective_id = options.objective_id;
-        spec.auto_wire_parent = true;
-        spec.launch_mode = crate::launch::MemberLaunchMode::Fork {
-            source_member_id,
-            fork_context,
-        };
-
+        let (spec, turn_options) = self.bounded_helper_spawn_spec(
+            identity.clone(),
+            options,
+            crate::launch::MemberLaunchMode::Fork {
+                source_member_id: source_identity.clone(),
+                fork_context,
+            },
+        )?;
         self.spawn_spec_internal_with_source(spec, SpawnSource::Fork)
             .await?;
-        let admitted = self.clone().with_command_authority(
-            crate::control_policy::CommandAuthority::principal(
-                crate::control_policy::MobControlPrincipal::Owner,
-            ),
-        );
-        let helper_snapshot = admitted.member_status(&identity).await?;
-        let (agent_runtime_id, fence_token) =
-            helper_snapshot.require_runtime_identity_fields("fork_helper result")?;
-        let agent_identity = helper_snapshot.agent_identity().clone();
-        let agent_runtime_id = agent_runtime_id.clone();
-        let output = helper_snapshot.output_preview.clone();
-        admitted.retire(identity).await?;
-
-        Ok(HelperResult {
-            output,
-            tokens_used: helper_snapshot.tokens_used,
-            agent_identity,
-            bounded_result: None,
-            agent_runtime_id,
-            fence_token,
-        })
+        self.finish_bounded_helper(identity, task.into(), turn_options, result_spec)
+            .await
     }
 
     pub(crate) async fn project_machine_input(
@@ -10987,10 +12525,17 @@ impl MemberHandle {
                 MemberTurnObservers {
                     event_tx,
                     completion_tx: Some(completion_tx),
+                    bounded_result_spec: None,
                     llm_identity_applied_tx: Some(llm_identity_applied_tx),
                 },
             )
             .await?;
+        let session_id = session_id.ok_or_else(|| {
+            MobError::Internal(format!(
+                "tracked member turn admission for '{}' has no machine-owned session binding",
+                self.agent_identity
+            ))
+        })?;
         Ok(MemberTurnHandle {
             receipt: MemberDeliveryReceipt {
                 identity: self.identity(),
@@ -10998,7 +12543,56 @@ impl MemberHandle {
                 fence_token,
                 handling_mode,
             },
-            session_id,
+            session_id: Some(session_id),
+            completion_rx,
+            llm_identity_applied_rx: Some(llm_identity_applied_rx),
+        })
+    }
+
+    /// Start an exact member turn with its result bound fixed before
+    /// admission. Placed members carry this spec through the durable tracked
+    /// input protocol instead of reconstructing output from member state.
+    pub async fn start_turn_bounded(
+        &self,
+        content: impl Into<meerkat_core::types::ContentInput>,
+        handling_mode: HandlingMode,
+        options: MemberTurnOptions,
+        event_tx: Option<MemberTurnEventSender>,
+        result_spec: BoundedResultSpec,
+    ) -> Result<MemberTurnHandle, MobError> {
+        let turn_metadata = options.into_runtime_metadata(handling_mode);
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let (llm_identity_applied_tx, llm_identity_applied_rx) = tokio::sync::oneshot::channel();
+        let (agent_runtime_id, fence_token, session_id) = self
+            .mob
+            .external_turn_for_member(
+                self.agent_identity.clone(),
+                content.into(),
+                handling_mode,
+                Some(turn_metadata),
+                None,
+                MemberTurnObservers {
+                    event_tx,
+                    completion_tx: Some(completion_tx),
+                    bounded_result_spec: Some(result_spec),
+                    llm_identity_applied_tx: Some(llm_identity_applied_tx),
+                },
+            )
+            .await?;
+        let session_id = session_id.ok_or_else(|| {
+            MobError::Internal(format!(
+                "tracked member turn admission for '{}' has no machine-owned session binding",
+                self.agent_identity
+            ))
+        })?;
+        Ok(MemberTurnHandle {
+            receipt: MemberDeliveryReceipt {
+                identity: self.identity(),
+                agent_runtime_id,
+                fence_token,
+                handling_mode,
+            },
+            session_id: Some(session_id),
             completion_rx,
             llm_identity_applied_rx: Some(llm_identity_applied_rx),
         })
@@ -11011,7 +12605,7 @@ impl MemberHandle {
         turn_metadata: Option<RuntimeTurnMetadata>,
         external_delivery_identity: Option<crate::store::MobExternalDeliveryIdentity>,
         event_tx: Option<MemberTurnEventSender>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<Result<(), MobError>>>,
+        completion_tx: Option<ExactTurnCompletionSender>,
     ) -> Result<MemberDeliveryReceipt, MobError> {
         let (agent_runtime_id, fence_token, _session_id) = self
             .mob
@@ -11024,6 +12618,7 @@ impl MemberHandle {
                 MemberTurnObservers {
                     event_tx,
                     completion_tx,
+                    bounded_result_spec: None,
                     llm_identity_applied_tx: None,
                 },
             )
@@ -11558,10 +13153,14 @@ mod tests {
     fn helper_result_omits_binding_era_atoms_in_serialized_output() {
         let runtime_id = AgentRuntimeId::new(AgentIdentity::from("worker"), Generation::new(2));
         let result = HelperResult {
-            output: Some("done".to_string()),
+            output: "done".to_string(),
             tokens_used: 7,
             agent_identity: AgentIdentity::from("worker"),
-            bounded_result: None,
+            bounded_result: BoundedHelperResult::from_validated_spec(
+                &BoundedResultSpec::new("helper", 128).expect("bounded helper fixture"),
+                "done",
+                false,
+            ),
             agent_runtime_id: runtime_id.clone(),
             fence_token: FenceToken::new(9),
         };
@@ -11583,13 +13182,10 @@ mod tests {
     #[test]
     fn bounded_helper_result_enforces_utf8_byte_limit_and_explicit_marker() {
         let max_text_bytes = HELPER_RESULT_TRUNCATION_MARKER.len() + 4;
-        let result = BoundedHelperResult::from_exact_terminal_text(
-            "review",
-            "ab💡cdefghijklmnopqrstuvwxyz",
-            max_text_bytes,
-            false,
-        )
-        .expect("valid receiver bound should project");
+        let spec = BoundedResultSpec::new("review", max_text_bytes)
+            .expect("valid receiver bound should validate");
+        let result =
+            BoundedHelperResult::from_validated_spec(&spec, "ab💡cdefghijklmnopqrstuvwxyz", false);
 
         assert_eq!(result.label(), "review");
         assert_eq!(
@@ -11613,15 +13209,40 @@ mod tests {
 
     #[test]
     fn bounded_helper_result_rejects_a_bound_that_cannot_hold_the_marker() {
-        let error = BoundedHelperResult::from_exact_terminal_text(
-            "review",
-            "payload requiring truncation",
-            HELPER_RESULT_TRUNCATION_MARKER.len() - 1,
-            false,
-        )
-        .expect_err("receiver bound must hold the complete truncation marker");
+        let error = BoundedResultSpec::new("review", HELPER_RESULT_TRUNCATION_MARKER.len() - 1)
+            .expect_err("receiver bound must hold the complete truncation marker");
 
         assert!(matches!(error, MobError::InvalidBoundedHelperResult { .. }));
+    }
+
+    #[test]
+    fn legacy_bounded_projection_accepts_small_cap_when_exact_text_fits() {
+        let result = BoundedHelperResult::try_from_legacy_terminal_text("legacy", "ok", 2, false)
+            .expect("c4abb observational behavior accepts an exact result that fits");
+
+        assert_eq!(result.text(), "ok");
+        assert_eq!(result.status(), BoundedHelperResultStatus::Completed);
+    }
+
+    #[test]
+    fn legacy_bounded_projection_rejects_small_cap_only_when_truncation_is_required() {
+        let error =
+            BoundedHelperResult::try_from_legacy_terminal_text("legacy", "too long", 2, false)
+                .expect_err("a complete truncation marker cannot fit");
+
+        assert!(matches!(error, MobError::InvalidBoundedHelperResult { .. }));
+    }
+
+    #[test]
+    fn exact_turn_bounded_result_spec_rejects_invalid_labels_before_any_turn_handle_exists() {
+        assert!(matches!(
+            BoundedResultSpec::new("", 128),
+            Err(MobError::InvalidBoundedHelperResult { .. })
+        ));
+        assert!(matches!(
+            BoundedResultSpec::new("é".repeat(65), 128),
+            Err(MobError::InvalidBoundedHelperResult { .. })
+        ));
     }
 
     #[test]
@@ -11929,6 +13550,682 @@ mod tests {
         assert!(
             !MobHandle::ready_wait_is_satisfied(&entry, &state),
             "materialization failure must close placed readiness"
+        );
+    }
+
+    fn exact_turn_test_session(value: u128) -> SessionId {
+        SessionId::from_uuid(uuid::Uuid::from_u128(value))
+    }
+
+    fn exact_turn_test_run(
+        session_id: SessionId,
+        text: impl Into<String>,
+        output_tokens: u64,
+    ) -> meerkat_core::RunResult {
+        meerkat_core::RunResult {
+            text: text.into(),
+            session_id,
+            usage: meerkat_core::Usage {
+                input_tokens: 3,
+                output_tokens,
+                ..Default::default()
+            },
+            turns: 1,
+            tool_calls: 0,
+            terminal_cause_kind: None,
+            structured_output: None,
+            extraction_error: None,
+            schema_warnings: None,
+            skill_diagnostics: None,
+        }
+    }
+
+    fn exact_turn_test_receipt(identity: &str, generation: u64) -> MemberDeliveryReceipt {
+        let identity = AgentIdentity::from(identity);
+        MemberDeliveryReceipt {
+            agent_runtime_id: AgentRuntimeId::new(identity.clone(), Generation::new(generation)),
+            identity,
+            fence_token: FenceToken::new(generation),
+            handling_mode: HandlingMode::Queue,
+        }
+    }
+
+    fn exact_turn_test_member_handle(
+        receipt: MemberDeliveryReceipt,
+        session_id: SessionId,
+    ) -> (ExactTurnCompletionSender, MemberTurnHandle) {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        (
+            completion_tx,
+            MemberTurnHandle {
+                receipt,
+                session_id: Some(session_id),
+                completion_rx,
+                llm_identity_applied_rx: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn exact_turn_bounded_wait_keeps_two_reverse_order_turns_exactly_correlated() {
+        let first_session = exact_turn_test_session(1);
+        let second_session = exact_turn_test_session(2);
+        let (first_tx, first_handle) = exact_turn_test_member_handle(
+            exact_turn_test_receipt("first", 1),
+            first_session.clone(),
+        );
+        let (second_tx, second_handle) = exact_turn_test_member_handle(
+            exact_turn_test_receipt("second", 2),
+            second_session.clone(),
+        );
+
+        second_tx
+            .send(Ok(ExactTurnCompletion {
+                session_id: second_session.clone(),
+                terminal: ExactTurnTerminal::Runtime(
+                    meerkat_runtime::CompletionOutcome::Completed(Box::new(exact_turn_test_run(
+                        second_session.clone(),
+                        "second result",
+                        22,
+                    ))),
+                ),
+            }))
+            .expect("second exact completion receiver remains live");
+        first_tx
+            .send(Ok(ExactTurnCompletion {
+                session_id: first_session.clone(),
+                terminal: ExactTurnTerminal::Runtime(
+                    meerkat_runtime::CompletionOutcome::Completed(Box::new(exact_turn_test_run(
+                        first_session.clone(),
+                        "first result",
+                        11,
+                    ))),
+                ),
+            }))
+            .expect("first exact completion receiver remains live");
+
+        let first = first_handle
+            .wait_bounded(BoundedResultSpec::new("first", 128).expect("valid first spec"))
+            .await
+            .expect("first result");
+        let second = second_handle
+            .wait_bounded(BoundedResultSpec::new("second", 128).expect("valid second spec"))
+            .await
+            .expect("second result");
+
+        assert_eq!(first.receipt().identity.as_str(), "first");
+        assert_eq!(first.result().session_id(), &first_session);
+        assert_eq!(first.result().result().text(), "first result");
+        assert_eq!(first.result().usage().output_tokens, 11);
+        assert_eq!(second.receipt().identity.as_str(), "second");
+        assert_eq!(second.result().session_id(), &second_session);
+        assert_eq!(second.result().result().text(), "second result");
+        assert_eq!(second.result().usage().output_tokens, 22);
+    }
+
+    #[tokio::test]
+    async fn exact_turn_finalization_failure_is_typed_and_carries_no_result_projection() {
+        let session_id = exact_turn_test_session(4);
+        let (completion_tx, handle) = exact_turn_test_member_handle(
+            exact_turn_test_receipt("finalization", 4),
+            session_id.clone(),
+        );
+        completion_tx
+            .send(Ok(ExactTurnCompletion {
+                session_id: session_id.clone(),
+                terminal: ExactTurnTerminal::Runtime(
+                    meerkat_runtime::CompletionOutcome::CompletedWithFinalizationFailure {
+                        error: meerkat_core::TurnErrorMetadata::runtime_apply_failure(
+                            "checkpoint commit failed",
+                        ),
+                    },
+                ),
+            }))
+            .expect("exact completion receiver remains live");
+
+        let error = handle
+            .wait_bounded(BoundedResultSpec::new("finalization", 128).expect("valid spec"))
+            .await
+            .expect_err("uncommitted output must not surface as success");
+        assert_eq!(error.receipt().identity.as_str(), "finalization");
+        match error.failure() {
+            BoundedTurnFailure::CompletedWithFinalizationFailure {
+                session_id: actual,
+                error,
+            } => {
+                assert_eq!(actual, &session_id);
+                assert_eq!(error.detail.as_deref(), Some("checkpoint commit failed"));
+            }
+            other => panic!("expected typed finalization failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_turn_extraction_failure_is_typed_and_receipt_correlated() {
+        let session_id = exact_turn_test_session(5);
+        let (completion_tx, handle) = exact_turn_test_member_handle(
+            exact_turn_test_receipt("extraction", 5),
+            session_id.clone(),
+        );
+        let unbounded_output = format!(
+            "ab💡{}private-tail",
+            "x".repeat(HELPER_RESULT_TRUNCATION_MARKER.len() + 32)
+        );
+        let mut result = exact_turn_test_run(session_id.clone(), &unbounded_output, 9);
+        result.extraction_error = Some(meerkat_core::types::ExtractionError {
+            last_output: unbounded_output.clone(),
+            attempts: 2,
+            reason: "bad".to_string(),
+        });
+        completion_tx
+            .send(Ok(ExactTurnCompletion {
+                session_id: session_id.clone(),
+                terminal: ExactTurnTerminal::Runtime(
+                    meerkat_runtime::CompletionOutcome::Completed(Box::new(result)),
+                ),
+            }))
+            .expect("exact completion receiver remains live");
+
+        let cap = HELPER_RESULT_TRUNCATION_MARKER.len() + 4;
+        let error = handle
+            .wait_bounded(BoundedResultSpec::new("extraction", cap).expect("valid spec"))
+            .await
+            .expect_err("extraction failure must not become bounded success");
+        assert_eq!(error.receipt().identity.as_str(), "extraction");
+        match error.failure() {
+            BoundedTurnFailure::ExtractionFailed {
+                session_id: actual,
+                reason,
+                last_output,
+                attempts,
+            } => {
+                assert_eq!(actual, &session_id);
+                assert_eq!(*attempts, 2);
+                assert_eq!(reason.status(), BoundedHelperResultStatus::Failed);
+                assert_eq!(reason.text(), "bad");
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "turn result extraction failed for session '{session_id}' after 2 attempt(s): bad"
+                    )
+                );
+                assert_eq!(
+                    last_output.status(),
+                    BoundedHelperResultStatus::FailedTruncated
+                );
+                assert_eq!(
+                    last_output.text(),
+                    format!("ab{HELPER_RESULT_TRUNCATION_MARKER}")
+                );
+                assert!(last_output.text().len() <= cap);
+                assert!(!last_output.text().contains("private-tail"));
+            }
+            other => panic!("expected bounded extraction failure, got {other:?}"),
+        }
+
+        let long_reason_session = exact_turn_test_session(51);
+        let mut long_reason_result =
+            exact_turn_test_run(long_reason_session.clone(), "short output", 1);
+        long_reason_result.extraction_error = Some(meerkat_core::types::ExtractionError {
+            last_output: "ok".to_string(),
+            attempts: 4,
+            reason: format!(
+                "ab💡{}private-runtime-reason-tail",
+                "x".repeat(HELPER_RESULT_TRUNCATION_MARKER.len() + 32)
+            ),
+        });
+        let long_reason_failure = bounded_runtime_turn_result(
+            meerkat_runtime::CompletionOutcome::Completed(Box::new(long_reason_result)),
+            &long_reason_session,
+            long_reason_session.clone(),
+            &BoundedResultSpec::new("runtime-reason", cap).expect("valid spec"),
+        )
+        .expect_err("long runtime extraction reason remains a typed failure");
+        match long_reason_failure {
+            BoundedTurnFailure::ExtractionFailed {
+                session_id,
+                reason,
+                last_output,
+                attempts,
+            } => {
+                assert_eq!(session_id, long_reason_session);
+                assert_eq!(attempts, 4);
+                assert_eq!(reason.status(), BoundedHelperResultStatus::FailedTruncated);
+                assert_eq!(
+                    reason.text(),
+                    format!("ab{HELPER_RESULT_TRUNCATION_MARKER}")
+                );
+                assert!(!reason.text().contains("private-runtime-reason-tail"));
+                assert_eq!(last_output.status(), BoundedHelperResultStatus::Failed);
+                assert_eq!(last_output.text(), "ok");
+            }
+            other => panic!("expected bounded long runtime reason, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_turn_closed_completion_authority_is_typed_and_receipt_correlated() {
+        let session_id = exact_turn_test_session(6);
+        let (completion_tx, handle) =
+            exact_turn_test_member_handle(exact_turn_test_receipt("closed", 6), session_id.clone());
+        drop(completion_tx);
+
+        let error = handle
+            .wait_bounded(BoundedResultSpec::new("closed", 128).expect("valid spec"))
+            .await
+            .expect_err("closed authority must fail typed");
+        assert_eq!(error.receipt().identity.as_str(), "closed");
+        assert!(matches!(
+            error.failure(),
+            BoundedTurnFailure::CompletionAuthorityClosed {
+                admitted_session_id
+            } if admitted_session_id == &session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_turn_rejects_completion_carrier_that_differs_from_admission() {
+        let admitted_session_id = exact_turn_test_session(61);
+        let completion_session_id = exact_turn_test_session(62);
+        let (completion_tx, handle) = exact_turn_test_member_handle(
+            exact_turn_test_receipt("carrier-mismatch", 61),
+            admitted_session_id.clone(),
+        );
+        completion_tx
+            .send(Ok(ExactTurnCompletion {
+                session_id: completion_session_id.clone(),
+                terminal: ExactTurnTerminal::Runtime(
+                    meerkat_runtime::CompletionOutcome::Completed(Box::new(exact_turn_test_run(
+                        completion_session_id.clone(),
+                        "wrong carrier",
+                        1,
+                    ))),
+                ),
+            }))
+            .expect("exact completion receiver remains live");
+
+        let error = handle
+            .wait_bounded(BoundedResultSpec::new("carrier-mismatch", 128).expect("valid spec"))
+            .await
+            .expect_err("carrier identity must be checked against admission first");
+        assert!(matches!(
+            error.failure(),
+            BoundedTurnFailure::CompletionAttributionMismatch {
+                admitted_session_id: admitted,
+                completion_session_id: completion,
+            } if admitted == &admitted_session_id && completion == &completion_session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_turn_rejects_run_result_that_differs_from_admission_and_carrier() {
+        let admitted_session_id = exact_turn_test_session(71);
+        let result_session_id = exact_turn_test_session(72);
+        let (completion_tx, handle) = exact_turn_test_member_handle(
+            exact_turn_test_receipt("result-mismatch", 71),
+            admitted_session_id.clone(),
+        );
+        completion_tx
+            .send(Ok(ExactTurnCompletion {
+                session_id: admitted_session_id.clone(),
+                terminal: ExactTurnTerminal::Runtime(
+                    meerkat_runtime::CompletionOutcome::Completed(Box::new(exact_turn_test_run(
+                        result_session_id.clone(),
+                        "wrong result",
+                        1,
+                    ))),
+                ),
+            }))
+            .expect("exact completion receiver remains live");
+
+        let error = handle
+            .wait_bounded(BoundedResultSpec::new("result-mismatch", 128).expect("valid spec"))
+            .await
+            .expect_err("result identity must agree with admission and carrier");
+        assert!(matches!(
+            error.failure(),
+            BoundedTurnFailure::ResultAttributionMismatch {
+                admitted_session_id: admitted,
+                completion_session_id: completion,
+                result_session_id: result,
+            } if admitted == &admitted_session_id
+                && completion == &admitted_session_id
+                && result == &result_session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_turn_bounded_wait_applies_utf8_cap_to_the_run_result() {
+        let session_id = exact_turn_test_session(7);
+        let (completion_tx, handle) =
+            exact_turn_test_member_handle(exact_turn_test_receipt("utf8", 7), session_id.clone());
+        completion_tx
+            .send(Ok(ExactTurnCompletion {
+                session_id: session_id.clone(),
+                terminal: ExactTurnTerminal::Runtime(
+                    meerkat_runtime::CompletionOutcome::Completed(Box::new(exact_turn_test_run(
+                        session_id,
+                        "ab💡cdefghijklmnopqrstuvwxyz",
+                        4,
+                    ))),
+                ),
+            }))
+            .expect("exact completion receiver remains live");
+        let cap = HELPER_RESULT_TRUNCATION_MARKER.len() + 4;
+        let result = handle
+            .wait_bounded(BoundedResultSpec::new("utf8", cap).expect("valid UTF-8 cap"))
+            .await
+            .expect("bounded exact result");
+
+        assert_eq!(
+            result.result().result().text(),
+            format!("ab{HELPER_RESULT_TRUNCATION_MARKER}")
+        );
+        assert!(result.result().result().text().len() <= cap);
+        assert_eq!(
+            result.result().result().status(),
+            BoundedHelperResultStatus::CompletedTruncated
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_turn_work_bounded_wait_returns_receipt_and_attribution() {
+        let session_id = exact_turn_test_session(8);
+        let identity = AgentIdentity::from("work");
+        let receipt = WorkDeliveryReceipt {
+            work_ref: WorkRef::new(),
+            runtime_id: AgentRuntimeId::new(identity, Generation::new(8)),
+        };
+        let expected_work_ref = receipt.work_ref.clone();
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let handle = WorkTurnHandle {
+            receipt,
+            session_id: session_id.clone(),
+            completion_rx,
+        };
+        completion_tx
+            .send(Ok(ExactTurnCompletion {
+                session_id: session_id.clone(),
+                terminal: ExactTurnTerminal::Runtime(
+                    meerkat_runtime::CompletionOutcome::Completed(Box::new(exact_turn_test_run(
+                        session_id.clone(),
+                        "work result",
+                        13,
+                    ))),
+                ),
+            }))
+            .expect("exact work completion receiver remains live");
+
+        let result = handle
+            .wait_bounded(BoundedResultSpec::new("work", 128).expect("valid work spec"))
+            .await
+            .expect("exact work result");
+        assert_eq!(result.receipt().work_ref, expected_work_ref);
+        assert_eq!(result.result().session_id(), &session_id);
+        assert_eq!(result.result().usage().output_tokens, 13);
+        assert_eq!(result.result().result().text(), "work result");
+    }
+
+    #[test]
+    fn exact_turn_direct_callback_cancel_and_extraction_keep_typed_bounded_parity() {
+        let spec = BoundedResultSpec::new("direct", HELPER_RESULT_TRUNCATION_MARKER.len() + 4)
+            .expect("valid direct bound");
+        let callback_session = exact_turn_test_session(81);
+        let callback = bounded_direct_session_failure(
+            meerkat_core::service::SessionError::Agent(
+                meerkat_core::error::AgentError::CallbackPending {
+                    tool_use_id: "call-81".to_string(),
+                    tool_name: "ask_user".to_string(),
+                    args: serde_json::json!({"question": "continue?"}),
+                },
+            ),
+            callback_session.clone(),
+            &spec,
+        );
+        assert!(matches!(
+            callback,
+            BoundedTurnFailure::CallbackPending {
+                session_id,
+                tool_use_id,
+                tool_name,
+                ..
+            } if session_id == callback_session
+                && tool_use_id == "call-81"
+                && tool_name == "ask_user"
+        ));
+
+        let batch_session = exact_turn_test_session(84);
+        let pending_tool_calls = vec![meerkat_core::error::PendingCallbackToolCall {
+            tool_use_id: "call-84".to_string(),
+            tool_name: "ask_batch".to_string(),
+            args: serde_json::json!({"question": "continue all?"}),
+        }];
+        let batch = bounded_direct_session_failure(
+            meerkat_core::service::SessionError::Agent(
+                meerkat_core::error::AgentError::CallbackBatchPending {
+                    pending_tool_calls: pending_tool_calls.clone(),
+                },
+            ),
+            batch_session.clone(),
+            &spec,
+        );
+        assert!(matches!(
+            batch,
+            BoundedTurnFailure::CallbackBatchPending {
+                session_id,
+                pending_tool_calls: actual,
+            } if session_id == batch_session && actual == pending_tool_calls
+        ));
+
+        let cancelled_session = exact_turn_test_session(82);
+        let cancelled = bounded_direct_session_failure(
+            meerkat_core::service::SessionError::Agent(meerkat_core::error::AgentError::Cancelled),
+            cancelled_session.clone(),
+            &spec,
+        );
+        assert!(matches!(
+            cancelled,
+            BoundedTurnFailure::Cancelled { session_id }
+                if session_id == cancelled_session
+        ));
+
+        let short_reason_session = exact_turn_test_session(85);
+        let short_reason = bounded_direct_session_failure(
+            meerkat_core::service::SessionError::Agent(
+                meerkat_core::error::AgentError::StructuredOutputValidationFailed {
+                    attempts: 2,
+                    last_output: "ok".to_string(),
+                    reason: "bad".to_string(),
+                },
+            ),
+            short_reason_session.clone(),
+            &spec,
+        );
+        match short_reason {
+            BoundedTurnFailure::ExtractionFailed {
+                session_id,
+                reason,
+                last_output,
+                attempts,
+            } => {
+                assert_eq!(session_id, short_reason_session);
+                assert_eq!(attempts, 2);
+                assert_eq!(reason.status(), BoundedHelperResultStatus::Failed);
+                assert_eq!(reason.text(), "bad");
+                assert_eq!(last_output.status(), BoundedHelperResultStatus::Failed);
+                assert_eq!(last_output.text(), "ok");
+            }
+            other => panic!("expected retained short direct extraction reason, got {other:?}"),
+        }
+
+        let extraction_session = exact_turn_test_session(83);
+        let extraction = bounded_direct_session_failure(
+            meerkat_core::service::SessionError::Agent(
+                meerkat_core::error::AgentError::StructuredOutputValidationFailed {
+                    attempts: 3,
+                    last_output: format!(
+                        "ab💡{}private-direct-tail",
+                        "x".repeat(HELPER_RESULT_TRUNCATION_MARKER.len() + 32)
+                    ),
+                    reason: format!(
+                        "ab💡{}private-direct-reason-tail",
+                        "x".repeat(HELPER_RESULT_TRUNCATION_MARKER.len() + 32)
+                    ),
+                },
+            ),
+            extraction_session.clone(),
+            &spec,
+        );
+        match extraction {
+            BoundedTurnFailure::ExtractionFailed {
+                session_id,
+                reason,
+                last_output,
+                attempts,
+            } => {
+                assert_eq!(session_id, extraction_session);
+                assert_eq!(attempts, 3);
+                assert_eq!(reason.status(), BoundedHelperResultStatus::FailedTruncated);
+                assert_eq!(
+                    reason.text(),
+                    format!("ab{HELPER_RESULT_TRUNCATION_MARKER}")
+                );
+                assert!(!reason.text().contains("private-direct-reason-tail"));
+                assert_eq!(
+                    last_output.status(),
+                    BoundedHelperResultStatus::FailedTruncated
+                );
+                assert_eq!(
+                    last_output.text(),
+                    format!("ab{HELPER_RESULT_TRUNCATION_MARKER}")
+                );
+                assert!(!last_output.text().contains("private-direct-tail"));
+            }
+            other => panic!("expected bounded direct extraction failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_turn_bounded_path_has_no_observational_or_clock_fallback() {
+        let handle_source = include_str!("handle.rs");
+        let start = handle_source
+            .find("async fn receive_exact_turn_completion")
+            .expect("exact receiver function");
+        let end = handle_source[start..]
+            .find("fn legacy_exact_turn_result")
+            .map(|offset| start + offset)
+            .expect("legacy projection boundary");
+        let exact_path = &handle_source[start..end];
+        for forbidden in [
+            "last_assistant_text",
+            "output_preview",
+            "member_status(",
+            "session_service.read",
+            "tokio::time",
+            "std::time",
+            "timeout(",
+            "sleep(",
+            "poll!",
+            "is_idle",
+        ] {
+            assert!(
+                !exact_path.contains(forbidden),
+                "exact bounded path must not contain observational or clock fallback '{forbidden}'"
+            );
+        }
+
+        let provisioner_source = include_str!("provisioner.rs");
+        let start = provisioner_source
+            .find("fn runtime_completion_to_exact_turn")
+            .expect("exact runtime completion adapter");
+        let end = provisioner_source[start..]
+            .find("fn runtime_completion_to_mob_result")
+            .map(|offset| start + offset)
+            .expect("next adapter boundary");
+        let exact_adapter = &provisioner_source[start..end];
+        assert!(exact_adapter.contains("ExactTurnCompletion"));
+        assert!(!exact_adapter.contains("Result<(), MobError>"));
+    }
+
+    #[tokio::test]
+    async fn flow_terminal_waiter_is_exact_run_id_correlated() {
+        let run_a = RunId::new();
+        let run_b = RunId::new();
+        let custody_a = flow_test_custody(run_a.clone(), FlowId::from("flow-a"));
+        let custody_b = flow_test_custody(run_b.clone(), FlowId::from("flow-b"));
+        let wait_a = custody_a.observe();
+        let wait_b = custody_b.observe();
+        custody_b
+            .resolve_terminal(meerkat_core::OperationTerminal::new(
+                meerkat_core::OperationTerminalIdentity::from(custody_b.admission().identity()),
+                Err(FlowRunTerminalUnavailable::new("terminal-b")),
+            ))
+            .expect("run B terminal attributed");
+
+        let terminal_b = wait_b.wait().await.expect("run B waiter remains live");
+        assert!(matches!(terminal_b.terminal(), Err(error) if error.detail == "terminal-b"));
+        assert_eq!(custody_a.observer_count_for_test(), 1);
+        drop(wait_a);
+        assert_eq!(custody_a.observer_count_for_test(), 0);
+    }
+
+    fn flow_test_custody(run_id: RunId, flow_id: FlowId) -> FlowOperationCustody {
+        FlowOperationCustody::active(meerkat_core::OperationAdmissionReceipt::new(
+            meerkat_core::ExactOperationIdentity::for_domain(
+                OperationId::new(),
+                FlowOperationCorrelation {
+                    mob_id: MobId::from("flow-test"),
+                    run_id,
+                    flow_id,
+                },
+            ),
+            meerkat_core::OperationAcceptClass::Fresh,
+            None,
+        ))
+    }
+
+    #[tokio::test]
+    async fn dropping_flow_run_handle_unregisters_observer_without_cancelling_run() {
+        let run_id = RunId::new();
+        let flow_id = FlowId::from("drop-waiter");
+        let custody = flow_test_custody(run_id.clone(), flow_id.clone());
+        let handle = FlowRunHandle {
+            run_id,
+            flow_id,
+            spec: BoundedResultSpec::new("drop-waiter", 128).expect("valid result bound"),
+            custody: custody.clone(),
+            observer: custody.observe(),
+        };
+        assert_eq!(custody.observer_count_for_test(), 1);
+
+        drop(handle);
+
+        assert_eq!(
+            custody.observer_count_for_test(),
+            0,
+            "Drop must unregister only the exact observer"
+        );
+    }
+
+    #[test]
+    fn flow_root_projection_is_deterministic_and_preserves_single_string() {
+        let run_id = RunId::new();
+        let mut outputs = indexmap::IndexMap::new();
+        outputs.insert(
+            StepId::from("single"),
+            serde_json::Value::String("verbatim output".to_string()),
+        );
+        assert_eq!(
+            exact_flow_root_output_values(&run_id, &outputs).expect("single root output"),
+            "verbatim output"
+        );
+
+        outputs.clear();
+        outputs.insert(StepId::from("z"), serde_json::json!({"z": 1, "a": 2}));
+        outputs.insert(StepId::from("a"), serde_json::json!([3, 2, 1]));
+        assert_eq!(
+            exact_flow_root_output_values(&run_id, &outputs).expect("multi-root output"),
+            r#"{"a":[3,2,1],"z":{"a":2,"z":1}}"#
         );
     }
 }

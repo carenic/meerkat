@@ -123,6 +123,7 @@ rkat run --yolo --param temperature=0.2 "take the gloves off"
 - `-s, --stream`
 - `--no-stream`
 - `--no-web-search`
+- `--export-atif` (write an ATIF trajectory to the realm `trajectories/` directory after the turn; default off)
 - `--resume[=<SESSION>]`
 - `--skill <PATH_OR_ID>` repeatable
 - `-d, --max-duration <DURATION>`
@@ -266,6 +267,7 @@ rkat run --resume -m gemma-4-31b "Continue with the local model"
 ```bash
 rkat session list [--limit <N>] [--offset <N>] [--label <KEY=VALUE>]
 rkat session show <SESSION_ID>
+rkat session export-atif <SESSION_ID> [--output <FILE>]
 rkat session delete <SESSION_ID>
 rkat session interrupt <SESSION_ID>
 ```
@@ -482,8 +484,8 @@ rkat mob runs <MOB_ID> [--flow <FLOW_ID>] [--json]
 rkat mob status <MOB_ID> <RUN_ID> [--json]
 rkat mob logs <MOB_ID> [--after-cursor <CURSOR>] [--limit <N>] [--json]
 rkat mob attach <MOB_ID> <RUN_ID> [--json]
-rkat mob spawn-helper <MOB_ID> <PROMPT> --agent-identity <ID> [--profile <PROFILE>] [--model <MODEL>] [--auth-binding <REALM:BINDING[:PROFILE]>] [--json]
-rkat mob fork-helper <MOB_ID> <SOURCE_MEMBER_ID> <PROMPT> --agent-identity <ID> [--profile <PROFILE>] [--model <MODEL>] [--auth-binding <REALM:BINDING[:PROFILE]>] [--fork-context <full-history|last-messages>] [--last-messages <N>] [--json]
+rkat mob spawn-helper <MOB_ID> <PROMPT> --agent-identity <ID> --result-label <LABEL> --max-text-bytes <BYTES> [--profile <PROFILE>] [--model <MODEL>] [--auth-binding <REALM:BINDING[:PROFILE]>] [--json]
+rkat mob fork-helper <MOB_ID> <SOURCE_MEMBER_ID> <PROMPT> --agent-identity <ID> --result-label <LABEL> --max-text-bytes <BYTES> [--profile <PROFILE>] [--model <MODEL>] [--auth-binding <REALM:BINDING[:PROFILE]>] [--fork-context <full-history|last-messages>] [--last-messages <N>] [--json]
 rkat mob member-status <MOB_ID> <AGENT_IDENTITY> [--json]
 rkat mob force-cancel <MOB_ID> <AGENT_IDENTITY>
 rkat mob grant <MOB_ID> <PRINCIPAL> --scope <SCOPE>... [--expires-at-ms <MS>|--expires-in <DURATION>]

@@ -806,6 +806,43 @@ mod ops_persistence_worker_tests {
         OperationId, OperationKind, OperationSpec, OpsLifecycleError, OpsLifecycleRegistry,
     };
 
+    #[tokio::test]
+    async fn cancelled_prepared_archive_candidate_never_starts_detached_persistence_worker() {
+        let store: Arc<dyn RuntimeStore> = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let machine = MeerkatMachine::persistent(
+            Arc::clone(&store),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        );
+        let session_id = SessionId::new();
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("register durable preparation fixture");
+
+        let prepared = machine
+            .prepare_archive_session_registration(session_id.clone(), false, None)
+            .await
+            .expect("prepare cold candidate without publishing it");
+        assert!(
+            prepared.ops_lifecycle_persistence_receiver.is_some(),
+            "prepared candidate must retain the unstarted persistence receiver"
+        );
+        assert!(
+            prepared.entry.ops_lifecycle_persistence_worker.is_none(),
+            "pre-publication candidate must not own a started persistence worker"
+        );
+
+        // Dropping the prepared candidate models cancellation or a stale
+        // publication witness. The receiver and its entry-owned sender close
+        // synchronously; no JoinHandle exists to detach.
+        drop(prepared);
+
+        machine
+            .unregister_session(&session_id)
+            .await
+            .expect("cleanup original registration and its owned worker");
+    }
+
     // Idle-CPU regression gate: the persistence worker is change-notified
     // (it blocks on the mpsc request channel), never interval-polled. An
     // idle session must cost the worker zero store traffic — the loop only
@@ -1663,6 +1700,7 @@ impl MeerkatMachine {
             runtime_loop_teardown: None,
             unregister_coordinator: None,
             runtime_stop_cleanup_coordinator: None,
+            reload_required_discard_coordinator: None,
             pending_revival_lifecycle_persist: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_unregister_finalization: None,
             unregister_teardown_observations: Arc::new(
@@ -1836,6 +1874,7 @@ impl MeerkatMachine {
             runtime_loop_teardown: None,
             unregister_coordinator: None,
             runtime_stop_cleanup_coordinator: None,
+            reload_required_discard_coordinator: None,
             pending_revival_lifecycle_persist: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_unregister_finalization: None,
             unregister_teardown_observations: Arc::new(
@@ -2049,6 +2088,7 @@ impl MeerkatMachine {
             runtime_loop_teardown: None,
             unregister_coordinator: None,
             runtime_stop_cleanup_coordinator: None,
+            reload_required_discard_coordinator: None,
             pending_revival_lifecycle_persist: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_unregister_finalization: None,
             unregister_teardown_observations: recovered_teardown_observations,
@@ -2082,6 +2122,7 @@ impl MeerkatMachine {
         &self,
         session_id: SessionId,
         durable_lifecycle_was_quiescent: bool,
+        operation_preservation: Option<meerkat_core::OperationRetentionRequest>,
     ) -> Result<super::PreparedArchiveSessionRegistration, RuntimeDriverError> {
         let runtime_id = Self::logical_runtime_id(&session_id);
         let recovery = self
@@ -2090,6 +2131,54 @@ impl MeerkatMachine {
         let (mut entry, cold_recovered_generated_draining) = self
             .prepare_registered_session_entry(&session_id, &runtime_id, recovery, None, None)
             .await?;
+        if let Some(preservation) = operation_preservation {
+            let store = self.store.as_ref().ok_or_else(|| {
+                RuntimeDriverError::Internal(
+                    "ReloadRequired operation preservation requires a durable store".to_string(),
+                )
+            })?;
+            let snapshot = store
+                .load_ops_lifecycle(&runtime_id)
+                .await
+                .map_err(|error| {
+                    RuntimeDriverError::Internal(format!(
+                        "failed to reload exact operation authority: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    RuntimeDriverError::Internal(
+                        "ReloadRequired operation preservation found no durable ops snapshot"
+                            .to_string(),
+                    )
+                })?;
+            entry.ops_lifecycle = Arc::new(
+                crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::from_recovered_preserving_operation(
+                    snapshot,
+                    &preservation,
+                )
+                .map_err(|error| RuntimeDriverError::Internal(error.to_string()))?,
+            );
+        }
+        let ops_lifecycle_persistence_receiver = if self.store.is_some() {
+            let (persist_tx, persist_rx) = crate::tokio::sync::mpsc::unbounded_channel::<
+                crate::ops_lifecycle::OpsLifecyclePersistenceRequest,
+            >();
+            entry
+                .ops_lifecycle
+                .install_recovered_persistence_channel(
+                    persist_tx,
+                    entry.epoch_id.clone(),
+                    Arc::clone(&entry.cursor_state),
+                )
+                .map_err(|error| {
+                    RuntimeDriverError::Internal(format!(
+                        "failed to activate recovered ops persistence for session {session_id}: {error}"
+                    ))
+                })?;
+            Some(persist_rx)
+        } else {
+            None
+        };
         entry.archive_recovered_registration = true;
         entry.archive_recovered_from_quiescent = durable_lifecycle_was_quiescent;
         Ok(super::PreparedArchiveSessionRegistration {
@@ -2097,6 +2186,7 @@ impl MeerkatMachine {
             runtime_id,
             entry,
             cold_recovered_generated_draining,
+            ops_lifecycle_persistence_receiver,
         })
     }
 
@@ -2112,6 +2202,7 @@ impl MeerkatMachine {
             runtime_id,
             entry,
             cold_recovered_generated_draining,
+            ops_lifecycle_persistence_receiver,
         } = prepared;
         let mut sessions = self.sessions.write().await;
         if let Some(existing) = sessions.get_mut(&session_id) {
@@ -2129,6 +2220,23 @@ impl MeerkatMachine {
             }
             return Ok(RegisterSessionInnerOutcome::Existing);
         }
+        let mut entry = entry;
+        entry.ops_lifecycle_persistence_worker = match (
+            self.store.as_ref(),
+            ops_lifecycle_persistence_receiver,
+        ) {
+            (Some(store), Some(receiver)) => Some(spawn_ops_lifecycle_persistence_worker(
+                Arc::clone(store),
+                runtime_id.clone(),
+                receiver,
+            )?),
+            (None, None) => None,
+            _ => {
+                return Err(RuntimeDriverError::Internal(format!(
+                    "prepared archive registration for {session_id} had mismatched ops persistence authority"
+                )));
+            }
+        };
         sessions.insert(session_id, entry);
         tracing::debug!(
             %runtime_id,
@@ -3649,6 +3757,7 @@ impl MeerkatMachine {
                         runtime_loop_teardown: None,
                         unregister_coordinator: None,
                         runtime_stop_cleanup_coordinator: None,
+                        reload_required_discard_coordinator: None,
                         pending_revival_lifecycle_persist: Arc::new(
                             std::sync::atomic::AtomicBool::new(false),
                         ),
@@ -3813,13 +3922,34 @@ impl MeerkatMachine {
             let machine_managed_post_stop_unregister =
                 executor.machine_managed_post_stop_unregister();
             let post_stop_cleanup_handle = if machine_managed_post_stop_unregister {
-                Some(executor.post_stop_cleanup_handle().ok_or_else(|| {
+                let handle = executor.post_stop_cleanup_handle().ok_or_else(|| {
                     RuntimeDriverError::ValidationFailed {
                         reason: format!(
                             "machine-managed post-stop unregister for session {session_id} requires a cloneable cleanup handle"
                         ),
                     }
-                })?)
+                })?;
+                if self.store.is_some()
+                    && handle.durability_reload_cleanup_capability()
+                        != meerkat_core::lifecycle::core_executor::CoreDurabilityReloadCleanupCapability::ProcessLocalNonTerminal
+                {
+                    return Err(RuntimeDriverError::ValidationFailed {
+                        reason: format!(
+                            "persistent machine-managed executor for session {session_id} requires explicit non-terminal durability-reload cleanup capability"
+                        ),
+                    });
+                }
+                if self.store.is_some() {
+                    handle
+                        .prepare_durability_reload_cleanup()
+                        .await
+                        .map_err(|error| RuntimeDriverError::ValidationFailed {
+                            reason: format!(
+                                "persistent machine-managed executor for session {session_id} could not bind exact durability-reload cleanup authority: {error}"
+                            ),
+                        })?;
+                }
+                Some(handle)
             } else {
                 None
             };
@@ -4281,6 +4411,689 @@ impl MeerkatMachine {
             entry.epoch_id.clone(),
             Arc::downgrade(&entry.mutation_gate),
         ))
+    }
+
+    /// Return the operation registry owned by one exact current registration.
+    /// A session-id-only lookup is insufficient during cold replacement
+    /// because it could transfer an adapter binding to a later incarnation.
+    pub async fn ops_lifecycle_registry_if_current_registration(
+        &self,
+        witness: &RuntimeSessionRegistrationWitness,
+    ) -> Option<Arc<crate::ops_lifecycle::RuntimeOpsLifecycleRegistry>> {
+        if !witness.belongs_to(self) {
+            return None;
+        }
+        let sessions = self.sessions.read().await;
+        let entry = sessions.get(witness.session_id())?;
+        (&entry.epoch_id == witness.epoch_id() && witness.matches_entry(entry))
+            .then(|| Arc::clone(&entry.ops_lifecycle))
+    }
+
+    /// Return whether `witness` still names the exact current registration and
+    /// that registration retains no executor, attachment, cleanup, or actor
+    /// materialization owner.
+    ///
+    /// This is stricter than observing closed attachment channels. A pending
+    /// attachment or provisional actor claim is still process authority even
+    /// when it has not published a live executor. All process-local ownership
+    /// fields are therefore read from the same registration entry, and the
+    /// materialization claim is inspected under its own synchronous lock.
+    pub async fn registration_is_current_without_runtime_owner(
+        &self,
+        witness: &RuntimeSessionRegistrationWitness,
+    ) -> bool {
+        if !witness.belongs_to(self) {
+            return false;
+        }
+        let sessions = self.sessions.read().await;
+        let Some(entry) = sessions.get(witness.session_id()) else {
+            return false;
+        };
+        let materialization_is_vacant = {
+            let state = entry
+                .materialization_claim_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.current.is_none()
+                && state.phase == crate::RuntimeActorMaterializationClaimPhase::Vacant
+        };
+        let registration_has_no_teardown_owner = {
+            let authority = entry
+                .dsl_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            matches!(
+                authority.state().registration_phase,
+                dsl::RegistrationPhase::Queuing | dsl::RegistrationPhase::Active
+            )
+        };
+        entry.epoch_id == witness.epoch_id
+            && witness.matches_entry(entry)
+            && registration_has_no_teardown_owner
+            && matches!(entry.attachment_slot, RuntimeLoopAttachmentSlot::Empty)
+            && entry.runtime_loop_teardown.is_none()
+            && entry.unregister_coordinator.is_none()
+            && entry.runtime_stop_cleanup_coordinator.is_none()
+            && entry.reload_required_discard_coordinator.is_none()
+            && entry.pending_unregister_finalization.is_none()
+            && entry.provisional_materialization_claim_id.is_none()
+            && entry.provisional_interrupt_handle.is_none()
+            && entry.pending_user_interrupt_dispatch.is_none()
+            && entry.publication_handle.is_none()
+            && entry.post_stop_cleanup_handle.is_none()
+            && entry.post_stop_cleanup_attachment_id.is_none()
+            && materialization_is_vacant
+    }
+
+    /// Quiesce and discard only the exact process-local registration whose
+    /// persistent shell has entered `ReloadRequired`.
+    ///
+    /// This is recovery disposal, not lifecycle retirement. It does not route
+    /// through cancel, hard-cancel, Stop, Retire, input abandonment, or a live
+    /// lifecycle persistence write. The durable RuntimeStore remains the sole
+    /// source for the next cold registration. Admission takes the stable
+    /// registration transaction before the witness's opaque mutation gate, so
+    /// an old witness cannot remove a same-SessionId successor.
+    pub async fn recover_or_discard_reload_required_registration_if_current(
+        &self,
+        witness: &RuntimeSessionRegistrationWitness,
+    ) -> Result<ReloadRequiredRegistrationDisposition, RuntimeDriverError> {
+        self.recover_or_discard_reload_required_registration_with_operation_if_current(
+            witness, None,
+        )
+        .await
+    }
+
+    /// Reload one exact typed durable operation into the cold successor.
+    /// The opaque registration witness still fences every process-local owner;
+    /// the operation identity only selects durable authority to retain.
+    pub async fn recover_or_discard_reload_required_registration_with_operation_if_current(
+        &self,
+        witness: &RuntimeSessionRegistrationWitness,
+        operation_preservation: Option<meerkat_core::OperationRetentionRequest>,
+    ) -> Result<ReloadRequiredRegistrationDisposition, RuntimeDriverError> {
+        if !witness.belongs_to(self) {
+            return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+        }
+        let (mut result_rx, start) = {
+            let registration_transaction_guard = self
+                .lock_session_registration_transaction(witness.session_id())
+                .await;
+            let mut sessions = self.sessions.write().await;
+            let Some(entry) = sessions.get_mut(witness.session_id()) else {
+                return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+            };
+            if entry.epoch_id != *witness.epoch_id() || !witness.matches_entry(entry) {
+                return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+            }
+            if entry.require_durability_ready().is_ok() {
+                return Ok(ReloadRequiredRegistrationDisposition::NotDegraded);
+            }
+            if let Some(coordinator) = entry.reload_required_discard_coordinator.as_ref() {
+                (coordinator.result_rx.clone(), None)
+            } else {
+                if entry
+                    .pending_user_interrupt_dispatch
+                    .as_ref()
+                    .is_some_and(|pending| pending.result_rx.borrow().is_none())
+                {
+                    return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                        evidence_digest: None,
+                        reason: format!(
+                            "durability-degraded registration for session {} still has an active user-interrupt dispatch owner",
+                            witness.session_id()
+                        ),
+                    });
+                }
+                if entry.unregister_coordinator.is_some()
+                    || entry.runtime_stop_cleanup_coordinator.is_some()
+                    || entry.pending_unregister_finalization.is_some()
+                {
+                    return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                        evidence_digest: None,
+                        reason: format!(
+                            "durability-degraded registration for session {} still has an owned teardown coordinator",
+                            witness.session_id()
+                        ),
+                    });
+                }
+                let coordinator_id = uuid::Uuid::new_v4();
+                let teardown_slot = entry.runtime_loop_teardown.clone().ok_or_else(|| {
+                    RuntimeDriverError::RecoveryRepairBlocked {
+                        evidence_digest: None,
+                        reason: format!(
+                            "durability-degraded registration for session {} has no exact runtime-loop teardown handoff that can release its retained mutation fence",
+                            witness.session_id()
+                        ),
+                    }
+                })?;
+                let (result_tx, result_rx) = crate::tokio::sync::watch::channel(None);
+                entry.reload_required_discard_coordinator =
+                    Some(ReloadRequiredDiscardCoordinator {
+                        epoch_id: entry.epoch_id.clone(),
+                        coordinator_id,
+                        result_rx: result_rx.clone(),
+                    });
+                (
+                    result_rx,
+                    Some((
+                        entry.epoch_id.clone(),
+                        coordinator_id,
+                        result_tx,
+                        registration_transaction_guard,
+                        teardown_slot,
+                    )),
+                )
+            }
+        };
+
+        if let Some((epoch_id, coordinator_id, result_tx, registration_guard, teardown_slot)) =
+            start
+        {
+            let worker_machine = self.clone();
+            let worker_witness = witness.clone();
+            let worker = crate::tokio::spawn(async move {
+                drop(registration_guard);
+                worker_machine
+                    .run_reload_required_discard(
+                        &worker_witness,
+                        &epoch_id,
+                        coordinator_id,
+                        teardown_slot,
+                        operation_preservation,
+                    )
+                    .await
+            });
+            let supervisor_machine = self.clone();
+            let supervisor_session_id = witness.session_id().clone();
+            crate::tokio::spawn(async move {
+                let result = match worker.await {
+                    Ok(result) => result,
+                    Err(error) => Err(RuntimeDriverError::Internal(format!(
+                        "owned durability-reload discard task failed: {error}"
+                    ))),
+                };
+                if !matches!(
+                    &result,
+                    Ok(ReloadRequiredRegistrationDisposition::Discarded)
+                ) {
+                    supervisor_machine
+                        .clear_reload_required_discard_coordinator(
+                            &supervisor_session_id,
+                            coordinator_id,
+                        )
+                        .await;
+                }
+                let _ = result_tx.send(Some(result));
+            });
+        }
+
+        loop {
+            if let Some(result) = result_rx.borrow().clone() {
+                return result;
+            }
+            result_rx.changed().await.map_err(|_| {
+                RuntimeDriverError::Internal(format!(
+                    "durability-reload discard coordinator closed without a result for session {}",
+                    witness.session_id()
+                ))
+            })?;
+        }
+    }
+
+    async fn clear_reload_required_discard_coordinator(
+        &self,
+        session_id: &SessionId,
+        coordinator_id: uuid::Uuid,
+    ) {
+        let mut sessions = self.sessions.write().await;
+        let Some(entry) = sessions.get_mut(session_id) else {
+            return;
+        };
+        if entry
+            .reload_required_discard_coordinator
+            .as_ref()
+            .is_some_and(|current| current.coordinator_id == coordinator_id)
+        {
+            entry.reload_required_discard_coordinator = None;
+        }
+    }
+
+    async fn run_reload_required_discard(
+        &self,
+        witness: &RuntimeSessionRegistrationWitness,
+        epoch_id: &meerkat_core::RuntimeEpochId,
+        coordinator_id: uuid::Uuid,
+        teardown_slot: Arc<crate::runtime_loop::RuntimeLoopTeardownSlot>,
+        operation_preservation: Option<meerkat_core::OperationRetentionRequest>,
+    ) -> Result<ReloadRequiredRegistrationDisposition, RuntimeDriverError> {
+        // A machine-managed stop handoff may retain this registration's M in
+        // its exact executor. Claiming and discarding the already-published
+        // handoff is the only operation allowed before M: it releases that
+        // retained fence without publishing stop, retire, or unregister
+        // authority. T admission paired this exact slot with the coordinator.
+        teardown_slot.wait_until_published().await;
+        teardown_slot.discard_after_reload_required().await?;
+        #[cfg(feature = "live")]
+        let Some(live_lifecycle_lease) = self
+            .acquire_unregister_live_lifecycle_lease(witness.session_id())
+            .await?
+        else {
+            return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+        };
+        let Some(registration_gate) = witness.registration_gate() else {
+            return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+        };
+        let mutation_guard = Arc::clone(&registration_gate).lock_owned().await;
+        {
+            let mut sessions = self.sessions.write().await;
+            let Some(entry) = sessions.get_mut(witness.session_id()) else {
+                return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+            };
+            if entry.epoch_id != *epoch_id
+                || !witness.matches_entry(entry)
+                || entry.require_durability_ready().is_ok()
+                || !entry
+                    .reload_required_discard_coordinator
+                    .as_ref()
+                    .is_some_and(|current| {
+                        current.epoch_id == *epoch_id && current.coordinator_id == coordinator_id
+                    })
+                || !entry
+                    .runtime_loop_teardown
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &teardown_slot))
+            {
+                return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+            }
+            #[cfg(feature = "live")]
+            if !live_lifecycle_lease.matches_gate(&entry.live_lifecycle_gate) {
+                return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+            }
+            entry.close_handle_teardown_gate();
+            entry.provisional_interrupt_handle = None;
+            // Admission observed that any retained interrupt dispatch had
+            // already completed. Clear that completed owner only after the
+            // exact teardown handoff released M and this worker reacquired M;
+            // the T-only coordinator admission must remain read-only apart
+            // from publishing the coordinator itself.
+            entry.pending_user_interrupt_dispatch = None;
+            let mut claim = entry
+                .materialization_claim_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            claim.current = None;
+            claim.phase = crate::RuntimeActorMaterializationClaimPhase::Vacant;
+            claim.rollback_registration_available = false;
+            Arc::clone(&claim.changed).notify_waiters();
+        }
+        drop(mutation_guard);
+
+        #[cfg(feature = "live")]
+        self.prove_member_live_absence_while_lease_held(
+            witness.session_id(),
+            &live_lifecycle_lease,
+        )
+        .await
+        .map_err(|error| RuntimeDriverError::Internal(error.to_string()))?;
+
+        // No non-clone process owner is consumed until physical live-channel
+        // absence is proven. A retry after failure above therefore retains
+        // every exact join obligation in the entry.
+        let mutation_guard = Arc::clone(&registration_gate).lock_owned().await;
+        let (
+            runtime_loop,
+            captured_teardown_slot,
+            drain_task,
+            rotation_slot,
+            persistence_worker,
+            post_stop_cleanup_attachment_id,
+            sealed_ops_snapshot,
+        ) = {
+            let mut sessions = self.sessions.write().await;
+            let Some(entry) = sessions.get_mut(witness.session_id()) else {
+                return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+            };
+            if entry.epoch_id != *epoch_id
+                || !witness.matches_entry(entry)
+                || entry.require_durability_ready().is_ok()
+                || !entry
+                    .reload_required_discard_coordinator
+                    .as_ref()
+                    .is_some_and(|current| {
+                        current.epoch_id == *epoch_id && current.coordinator_id == coordinator_id
+                    })
+                || !entry
+                    .runtime_loop_teardown
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &teardown_slot))
+            {
+                return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+            }
+            #[cfg(feature = "live")]
+            if !live_lifecycle_lease.matches_gate(&entry.live_lifecycle_gate) {
+                return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+            }
+            // Seal before taking the worker handle. A seal failure leaves the
+            // join authority entry-owned for a later exact retry.
+            entry
+                .ops_lifecycle
+                .seal_owner_for_reload_required_discard()
+                .map_err(|error| {
+                    RuntimeDriverError::Internal(format!(
+                        "failed to seal degraded ops-lifecycle owner for session {}: {error}",
+                        witness.session_id()
+                    ))
+                })?;
+            // Non-terminal operations persist only on terminal transitions,
+            // so the exact operation named by a retention request may exist
+            // solely in the sealed process registry. Capture its final state
+            // now; it is written to the durable store below (after the
+            // persistence worker drains) so the typed preservation check in
+            // the cold successor reads real durable authority.
+            let sealed_ops_snapshot = match operation_preservation.as_ref() {
+                Some(_) => Some(
+                    entry
+                        .ops_lifecycle
+                        .capture_persistence_snapshot(
+                            entry.epoch_id.clone(),
+                            &entry.cursor_state,
+                        )
+                        .map_err(|error| {
+                            RuntimeDriverError::Internal(format!(
+                                "failed to capture sealed ops-lifecycle snapshot for session {}: {error}",
+                                witness.session_id()
+                            ))
+                        })?,
+                ),
+                None => None,
+            };
+            (
+                entry.take_runtime_loop_attachment(),
+                entry.runtime_loop_teardown.clone(),
+                entry.drain_slot.abort_keeping_handle(),
+                Arc::clone(&entry.supervisor_rotation_task),
+                entry.ops_lifecycle_persistence_worker.take(),
+                entry.post_stop_cleanup_attachment_id,
+                sealed_ops_snapshot,
+            )
+        };
+        drop(mutation_guard);
+        #[cfg(feature = "live")]
+        drop(live_lifecycle_lease);
+
+        if let Some(attachment) = runtime_loop {
+            let RuntimeLoopAttachment {
+                wake_tx,
+                effect_tx,
+                serving_release,
+                boundary_handle,
+                interrupt_handle,
+                loop_handle,
+                ..
+            } = attachment;
+            drop(wake_tx);
+            drop(effect_tx);
+            drop(serving_release);
+            drop(boundary_handle);
+            drop(interrupt_handle);
+            if let Err(error) = loop_handle.await {
+                tracing::warn!(
+                    session_id = %witness.session_id(),
+                    %error,
+                    "degraded runtime loop ended abnormally after publishing its retained teardown handoff"
+                );
+            }
+        }
+        if let Some(drain_task) = drain_task {
+            match drain_task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %witness.session_id(),
+                        %error,
+                        "degraded comms drain ended abnormally after cancellation"
+                    );
+                }
+            }
+        }
+        if let Some(rotation_task) = rotation_slot.abort_keeping_handle().await {
+            match rotation_task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %witness.session_id(),
+                        %error,
+                        "degraded supervisor rotation ended abnormally after cancellation"
+                    );
+                }
+            }
+        }
+        if let Some(persistence_worker) = persistence_worker {
+            join_ops_lifecycle_persistence_worker(persistence_worker).await?;
+        }
+        if let Some(sealed_ops_snapshot) = sealed_ops_snapshot.as_ref() {
+            // Written after the drained worker so this exact sealed snapshot
+            // is the durable state the retention-validating successor loads.
+            // A failed write fails the discard closed; retry re-seals and
+            // re-captures the same registry.
+            let store = self.store.as_ref().ok_or_else(|| {
+                RuntimeDriverError::Internal(
+                    "ReloadRequired operation preservation requires a durable store".to_string(),
+                )
+            })?;
+            store
+                .persist_ops_lifecycle(
+                    &Self::logical_runtime_id(witness.session_id()),
+                    sealed_ops_snapshot,
+                )
+                .await
+                .map_err(|error| {
+                    RuntimeDriverError::Internal(format!(
+                        "failed to persist sealed ops-lifecycle snapshot for session {}: {error}",
+                        witness.session_id()
+                    ))
+                })?;
+        }
+
+        // From this point every non-clone process owner is settled. The exact
+        // teardown slot and surface cleanup handle remain entry-owned, so a
+        // failed fallible cleanup can safely clear the coordinator and retry.
+        if let Some(current_teardown_slot) = captured_teardown_slot.as_ref()
+            && !Arc::ptr_eq(current_teardown_slot, &teardown_slot)
+        {
+            return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                evidence_digest: None,
+                reason: format!(
+                    "durability-reload cleanup for session {} captured a different teardown handoff after coordinator admission",
+                    witness.session_id()
+                ),
+            });
+        }
+        if let Some(attachment_id) = post_stop_cleanup_attachment_id {
+            self.complete_post_stop_cleanup_after_reload_required_if_needed(
+                witness.session_id(),
+                attachment_id,
+            )
+            .await?;
+        }
+
+        // The rejected boundary may have advanced the physical session head
+        // while its RuntimeStore boundary commit failed. Reconcile that exact
+        // durable tail through the store-owned recovery protocol before
+        // reconstructing the cold runtime registration. Merely replaying the
+        // runtime rows can otherwise publish a successor whose archive
+        // authority is behind the canonical physical transcript.
+        if let Some(store) = self.store.as_ref()
+            && store.session_persistence_profile()
+                == crate::store::RuntimeSessionPersistenceProfile::HeadCanonicalV1
+        {
+            match crate::recovery::recover_durable_tail(store.as_ref(), witness.session_id())
+                .await
+                .map_err(|error| RuntimeDriverError::RecoveryRepairBlocked {
+                    evidence_digest: None,
+                    reason: format!(
+                        "durability-reload tail recovery failed for session {}: {error}",
+                        witness.session_id()
+                    ),
+                })? {
+                crate::recovery::DurableTailRecoveryOutcome::Committed { .. }
+                | crate::recovery::DurableTailRecoveryOutcome::AlreadyAligned { .. } => {}
+                crate::recovery::DurableTailRecoveryOutcome::Held => {
+                    return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                        evidence_digest: None,
+                        reason: format!(
+                            "durability-reload tail recovery held ambiguous evidence for session {}",
+                            witness.session_id()
+                        ),
+                    });
+                }
+                crate::recovery::DurableTailRecoveryOutcome::Refused => {
+                    return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                        evidence_digest: None,
+                        reason: format!(
+                            "durability-reload tail recovery refused the exact candidate for session {}",
+                            witness.session_id()
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Prove that the store can execute the complete supported cold
+        // recovery path before removing the unreadable process shell. The
+        // prepared candidate is typed, exact to this session's canonical
+        // runtime id, and cannot publish itself. Retaining it until the final
+        // T/L/M revalidation prevents a blind ReloadRequired discard while
+        // still leaving a stale witness unable to replace a successor.
+        let prepared_recovery = self
+            .prepare_archive_session_registration(
+                witness.session_id().clone(),
+                false,
+                operation_preservation,
+            )
+            .await?;
+        let super::PreparedArchiveSessionRegistration {
+            session_id: recovered_session_id,
+            runtime_id: recovered_runtime_id,
+            entry: mut recovered_entry,
+            cold_recovered_generated_draining,
+            ops_lifecycle_persistence_receiver: recovered_ops_lifecycle_persistence_receiver,
+        } = prepared_recovery;
+        if recovered_session_id != *witness.session_id()
+            || recovered_runtime_id != Self::logical_runtime_id(witness.session_id())
+        {
+            return Err(RuntimeDriverError::Internal(format!(
+                "prepared durability-reload recovery candidate did not match session {}",
+                witness.session_id()
+            )));
+        }
+        if cold_recovered_generated_draining {
+            return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                evidence_digest: None,
+                reason: format!(
+                    "durability-reload recovery for session {} reconstructed generated Draining authority that requires canonical unregister recovery",
+                    witness.session_id()
+                ),
+            });
+        }
+        // This replacement is the ordinary recovered runtime registration,
+        // not archive-only reconstruction. Archive ownership remains with the
+        // caller's normal retire protocol after the exact degraded shell has
+        // been replaced.
+        recovered_entry.archive_recovered_registration = false;
+        recovered_entry.archive_recovered_from_quiescent = false;
+
+        let registration_transaction_guard = self
+            .lock_session_registration_transaction(witness.session_id())
+            .await;
+        #[cfg(feature = "live")]
+        let Some(live_lifecycle_lease) = self
+            .acquire_unregister_live_lifecycle_lease(witness.session_id())
+            .await?
+        else {
+            return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+        };
+        let mutation_guard = Arc::clone(&registration_gate).lock_owned().await;
+        let replaced = {
+            let mut sessions = self.sessions.write().await;
+            let Some(entry) = sessions.get(witness.session_id()) else {
+                return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+            };
+            if entry.epoch_id != *epoch_id
+                || !witness.matches_entry(entry)
+                || entry.require_durability_ready().is_ok()
+                || !entry
+                    .reload_required_discard_coordinator
+                    .as_ref()
+                    .is_some_and(|current| {
+                        current.epoch_id == *epoch_id && current.coordinator_id == coordinator_id
+                    })
+                || !entry
+                    .runtime_loop_teardown
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &teardown_slot))
+            {
+                return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+            }
+            #[cfg(feature = "live")]
+            if !live_lifecycle_lease.matches_gate(&entry.live_lifecycle_gate) {
+                return Ok(ReloadRequiredRegistrationDisposition::NotCurrent);
+            }
+            if !matches!(entry.attachment_slot, RuntimeLoopAttachmentSlot::Empty)
+                || entry.ops_lifecycle_persistence_worker.is_some()
+                || entry.pending_user_interrupt_dispatch.is_some()
+            {
+                return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                    evidence_digest: None,
+                    reason: format!(
+                        "durability-reload cleanup for session {} did not quiesce every process-owned producer",
+                        witness.session_id()
+                    ),
+                });
+            }
+            // The prepared candidate owns only the unstarted receiver until
+            // every T/L/M witness has been revalidated. Starting the worker
+            // earlier lets a stale-return or cancelled waiter detach its
+            // JoinHandle. Spawn at the exact publication point so every
+            // started worker is owned by the inserted registration.
+            recovered_entry.ops_lifecycle_persistence_worker = match (
+                self.store.as_ref(),
+                recovered_ops_lifecycle_persistence_receiver,
+            ) {
+                (Some(store), Some(receiver)) => Some(spawn_ops_lifecycle_persistence_worker(
+                    Arc::clone(store),
+                    recovered_runtime_id.clone(),
+                    receiver,
+                )?),
+                (None, None) => None,
+                _ => {
+                    return Err(RuntimeDriverError::Internal(format!(
+                        "prepared durability-reload registration for {} had mismatched ops persistence authority",
+                        witness.session_id()
+                    )));
+                }
+            };
+            sessions.insert(recovered_session_id, recovered_entry)
+        };
+        drop(mutation_guard);
+        #[cfg(feature = "live")]
+        drop(live_lifecycle_lease);
+        drop(registration_transaction_guard);
+        drop(replaced);
+        tracing::debug!(
+            session_id = %witness.session_id(),
+            %recovered_runtime_id,
+            "atomically replaced durability-degraded registration with recovered cold successor"
+        );
+        #[cfg(any(test, feature = "test-support"))]
+        self.run_reload_required_discard_after_successor_publication_test_hook(
+            witness.session_id(),
+        )
+        .await;
+        Ok(ReloadRequiredRegistrationDisposition::Discarded)
     }
 
     /// Unregister only when `witness` still names this machine's exact current
@@ -5060,7 +5873,13 @@ impl MeerkatMachine {
                 .await;
         }
 
-        let (generated_draining, observed_epoch, preinstalled_stop_coordinator, driver) = {
+        let (
+            generated_draining,
+            observed_epoch,
+            preinstalled_stop_coordinator,
+            reload_required,
+            driver,
+        ) = {
             let sessions = self.sessions.read().await;
             let Some(entry) = sessions.get(session_id) else {
                 return Ok(());
@@ -5083,9 +5902,16 @@ impl MeerkatMachine {
                 generated_draining,
                 entry.epoch_id.clone(),
                 entry.runtime_stop_cleanup_coordinator.is_some(),
+                entry.require_durability_ready().err(),
                 Arc::clone(&entry.driver),
             )
         };
+        if let Some(reload_required) = reload_required {
+            return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                evidence_digest: None,
+                reason: reload_required.to_string(),
+            });
+        }
         if generated_draining {
             return self
                 .join_or_start_unregister_teardown(
@@ -5274,6 +6100,14 @@ impl MeerkatMachine {
                     })
                 };
             };
+            if entry.reload_required_discard_coordinator.is_some() {
+                return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                    evidence_digest: None,
+                    reason: format!(
+                        "durability-reload disposal is already in progress for session {session_id}"
+                    ),
+                });
+            }
             if let Some(expected) = expected_teardown_slot.as_ref() {
                 let current_matches = entry
                     .runtime_loop_teardown
@@ -5898,6 +6732,14 @@ impl MeerkatMachine {
                         CoordinatorDecision::RegistrationChanged
                     }
                     Some(entry) => {
+                        if entry.reload_required_discard_coordinator.is_some() {
+                            return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                                evidence_digest: None,
+                                reason: format!(
+                                    "durability-reload disposal is already in progress for session {session_id}"
+                                ),
+                            });
+                        }
                         if let Some(active) = active_runtime_stop_coordinator()
                             && entry
                                 .runtime_stop_cleanup_coordinator
@@ -6308,6 +7150,61 @@ impl MeerkatMachine {
             return Ok(());
         }
         entry.post_stop_cleanup_complete = true;
+        Ok(())
+    }
+
+    /// Release the exact surface-owned actor/sidecar incarnation after a
+    /// durability fault has made the runtime registration unrecoverable in
+    /// place. Unlike ordinary stop cleanup this is not a terminal lifecycle
+    /// projection and must not route through a callback that can archive or
+    /// unregister the runtime recursively.
+    async fn complete_post_stop_cleanup_after_reload_required_if_needed(
+        &self,
+        session_id: &SessionId,
+        attachment_id: RuntimeLoopAttachmentId,
+    ) -> Result<(), RuntimeDriverError> {
+        let cleanup_gate = {
+            let sessions = self.sessions.read().await;
+            let Some(entry) = sessions.get(session_id) else {
+                return Ok(());
+            };
+            if entry.post_stop_cleanup_attachment_id != Some(attachment_id)
+                || entry.post_stop_cleanup_complete
+            {
+                return Ok(());
+            }
+            Arc::clone(&entry.post_stop_cleanup_gate)
+        };
+        let _cleanup_guard = cleanup_gate.lock().await;
+        let cleanup_handle = {
+            let sessions = self.sessions.read().await;
+            let Some(entry) = sessions.get(session_id) else {
+                return Ok(());
+            };
+            if entry.post_stop_cleanup_attachment_id != Some(attachment_id)
+                || entry.post_stop_cleanup_complete
+            {
+                return Ok(());
+            }
+            entry.post_stop_cleanup_handle.clone()
+        };
+        if let Some(cleanup_handle) = cleanup_handle {
+            cleanup_handle
+                .cleanup_after_durability_reload_required()
+                .await
+                .map_err(|error| {
+                    RuntimeDriverError::Internal(format!(
+                        "durability-reload surface cleanup failed for session {session_id}: {error}"
+                    ))
+                })?;
+        }
+        let mut sessions = self.sessions.write().await;
+        let Some(entry) = sessions.get_mut(session_id) else {
+            return Ok(());
+        };
+        if entry.post_stop_cleanup_attachment_id == Some(attachment_id) {
+            entry.post_stop_cleanup_complete = true;
+        }
         Ok(())
     }
 

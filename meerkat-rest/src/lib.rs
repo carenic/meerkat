@@ -2658,6 +2658,31 @@ fn mob_fork_context_from_wire(
     }
 }
 
+#[cfg(feature = "mob")]
+fn mob_helper_outcome_payload(
+    mob_id: &meerkat_mob::MobId,
+    outcome: &meerkat_mob::BoundedHelperRunOutcome,
+) -> Value {
+    let helper = &outcome.helper;
+    let turn = outcome.turn.result();
+    let identity = helper.agent_identity.to_string();
+    let mut payload = json!({
+        "output": helper.output,
+        "tokens_used": helper.tokens_used,
+        "agent_identity": helper.agent_identity,
+        "member_ref": meerkat_contracts::WireMemberRef::encode(mob_id.as_str(), &identity),
+        "bounded_result": helper.bounded_result.to_wire(),
+        "session_id": turn.session_id(),
+        "usage": turn.usage(),
+        "turns": turn.turns(),
+        "tool_calls": turn.tool_calls(),
+    });
+    if let Some(error) = outcome.retirement_error.as_ref() {
+        payload["retirement_error"] = Value::String(error.clone());
+    }
+    payload
+}
+
 /// POST /mob/{id}/spawn-helper — spawn a short-lived helper, wait, return result.
 #[cfg(feature = "mob")]
 async fn mob_spawn_helper(
@@ -2691,13 +2716,18 @@ async fn mob_spawn_helper(
     options.backend = req.backend.map(mob_backend_kind_from_wire);
     let result = state
         .mob_state
-        .mob_spawn_helper(&mob_id, identity, req.prompt, options)
+        .mob_spawn_helper(
+            &mob_id,
+            identity,
+            req.prompt,
+            options,
+            req.result_label,
+            req.max_text_bytes,
+        )
         .await
         .map_err(|err| mob_rest_error(&err, ApiError::BadRequest))?;
 
-    let payload = serde_json::to_value(result)
-        .map_err(|e| ApiError::Internal(format!("serialize helper result: {e}")).into_response())?;
-    Ok(Json(payload))
+    Ok(Json(mob_helper_outcome_payload(&mob_id, &result)))
 }
 
 #[cfg(feature = "mob")]
@@ -2828,13 +2858,13 @@ async fn mob_fork_helper(
             req.prompt,
             fork_context,
             options,
+            req.result_label,
+            req.max_text_bytes,
         )
         .await
         .map_err(|err| mob_rest_error(&err, ApiError::BadRequest))?;
 
-    let payload = serde_json::to_value(result)
-        .map_err(|e| ApiError::Internal(format!("serialize helper result: {e}")).into_response())?;
-    Ok(Json(payload))
+    Ok(Json(mob_helper_outcome_payload(&mob_id, &result)))
 }
 
 /// GET /mob/{id}/members/{agent_identity}/status — member execution snapshot.
@@ -2915,6 +2945,36 @@ impl MobRestWireErrorSource for meerkat_mob::MobRespawnError {
 
     fn mob_wire_error_code(&self) -> Option<meerkat_contracts::ErrorCode> {
         self.wire_error_code()
+    }
+}
+
+/// Bounded helper runs fail in two tiers: admission failures ARE mob errors
+/// and keep their typed wire detail; post-admission turn/cleanup failures
+/// have no wire-detail vocabulary yet and fall through to the route's
+/// fallback renderer via the trait's `None` path.
+#[cfg(feature = "mob")]
+impl MobRestWireErrorSource for meerkat_mob::BoundedMemberRunError {
+    fn mob_wire_detail(&self) -> Option<meerkat_contracts::wire::WireMobErrorDetail> {
+        match self {
+            meerkat_mob::BoundedMemberRunError::Admission(error) => error.wire_detail(),
+            _ => None,
+        }
+    }
+
+    fn structured_data(&self) -> Option<Value> {
+        match self {
+            meerkat_mob::BoundedMemberRunError::Admission(error) => {
+                meerkat_mob::MobError::structured_data(error)
+            }
+            _ => None,
+        }
+    }
+
+    fn mob_wire_error_code(&self) -> Option<meerkat_contracts::ErrorCode> {
+        match self {
+            meerkat_mob::BoundedMemberRunError::Admission(error) => error.wire_error_code(),
+            _ => None,
+        }
     }
 }
 
@@ -4865,6 +4925,7 @@ async fn create_session_inner(
         custom_models: std::collections::BTreeMap::new(),
         image_generation_provider: None,
         auto_compact_threshold_override: None,
+        compaction_curator_override: None,
         provider: Some(model_resolution.provider),
         override_comms: Default::default(),
         self_hosted_server_id: initial_identity.self_hosted_server_id.clone(),
@@ -6013,6 +6074,7 @@ async fn continue_session_inner(
             custom_models: std::collections::BTreeMap::new(),
             image_generation_provider: None,
             auto_compact_threshold_override: None,
+            compaction_curator_override: None,
             provider: llm_binding.provider,
             override_comms: Default::default(),
             self_hosted_server_id: llm_binding.self_hosted_server_id,
@@ -9155,6 +9217,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(pre_session),
                     llm_client_override: state
                         .llm_client_override
@@ -9207,6 +9270,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(pre_session),
                     llm_client_override: state
                         .llm_client_override
@@ -9396,6 +9460,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(pre_session),
                     llm_client_override: state
                         .llm_client_override
@@ -9450,6 +9515,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(pre_session),
                     comms_name: Some("rest-capacity-target".to_string()),
                     keep_alive: false,
@@ -10657,6 +10723,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -12262,6 +12329,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -12343,6 +12411,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(pre_session),
                     llm_client_override: state
                         .llm_client_override
@@ -12422,6 +12491,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     resume_session: Some(pre_session),
                     llm_client_override: state
                         .llm_client_override
@@ -13169,6 +13239,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -13242,6 +13313,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     comms_name: Some("stale-rest-agent".to_string()),
                     llm_client_override: state
                         .llm_client_override
@@ -13335,6 +13407,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -13431,6 +13504,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -13525,6 +13599,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -13610,6 +13685,7 @@ mod tests {
                     custom_models: std::collections::BTreeMap::new(),
                     image_generation_provider: None,
                     auto_compact_threshold_override: None,
+                    compaction_curator_override: None,
                     llm_client_override: state
                         .llm_client_override
                         .clone()
@@ -14536,6 +14612,8 @@ mod tests {
                     "prompt": "Hello from helper",
                     "agent_identity": "helper-rest",
                     "role_name": "worker",
+                    "result_label": "rest-helper-result",
+                    "max_text_bytes": 4096,
                 })
                 .to_string(),
             ))
@@ -14551,6 +14629,14 @@ mod tests {
         );
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["agent_identity"], "helper-rest");
+        assert_eq!(payload["bounded_result"]["label"], "rest-helper-result");
+        assert!(payload["output"].is_string());
+        assert!(payload["tokens_used"].is_number());
+        assert!(payload["session_id"].is_string());
+        assert!(payload["usage"].is_object());
+        assert!(payload["turns"].is_number());
+        assert!(payload["tool_calls"].is_number());
+        assert!(payload.get("retirement_error").is_none());
         assert!(
             payload["member_ref"]
                 .as_str()
@@ -14584,7 +14670,12 @@ mod tests {
             .uri("/mob/some-mob/spawn-helper")
             .header("content-type", "application/json")
             .body(Body::from(
-                serde_json::json!({ "prompt": "Hello from helper" }).to_string(),
+                serde_json::json!({
+                    "prompt": "Hello from helper",
+                    "result_label": "missing-identity",
+                    "max_text_bytes": 4096,
+                })
+                .to_string(),
             ))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
@@ -14913,6 +15004,7 @@ mod tests {
                         custom_models: std::collections::BTreeMap::new(),
                         image_generation_provider: None,
                         auto_compact_threshold_override: None,
+                        compaction_curator_override: None,
                         resume_session: Some(pre_session),
                         llm_client_override: state
                             .llm_client_override
@@ -14982,6 +15074,7 @@ mod tests {
                         custom_models: std::collections::BTreeMap::new(),
                         image_generation_provider: None,
                         auto_compact_threshold_override: None,
+                        compaction_curator_override: None,
                         resume_session: Some(pre_session),
                         llm_client_override: state
                             .llm_client_override

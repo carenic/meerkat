@@ -677,7 +677,7 @@ pub fn bridge_pre_0_8_10_realm_storage_in(
                 domain,
                 domain.supported_version(),
                 &[1],
-                None,
+                Some(meerkat_store::sqlite_store::prepare_pre_0_8_10_session_base_schema),
             )
         })
         .map_err(StoreError::from)?;
@@ -1275,6 +1275,101 @@ mod tests {
             Some(1),
             "the inactive standalone runtime must remain byte-authority untouched"
         );
+
+        Ok(())
+    }
+
+    /// Defect B regression: the exact physical catalog of a realm created
+    /// before the schema ledger existed - a plain-CREATE `sessions` table,
+    /// its `sessions_updated_idx` index, nothing else, and no
+    /// `meerkat_schema` table - must bridge to the current version chain and
+    /// keep its session readable through the real store opener.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn explicit_pre_floor_bridge_recovers_plain_create_legacy_session_realm()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let realm_id = "plain-create-realm";
+        let paths = realm_paths_in(temp.path(), realm_id);
+        write_builtin_manifest(&paths, realm_id, RealmBackend::Sqlite)?;
+
+        std::fs::create_dir_all(&paths.root)?;
+        let conn = meerkat_sqlite::open(
+            &paths.sessions_sqlite_path,
+            meerkat_sqlite::ConnectionProfile::Primary { create: true },
+        )?;
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 session_id TEXT PRIMARY KEY,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 message_count INTEGER NOT NULL,
+                 total_tokens INTEGER NOT NULL,
+                 metadata_json TEXT NOT NULL,
+                 session_json BLOB NOT NULL
+             );
+             CREATE INDEX sessions_updated_idx
+             ON sessions(updated_at_ms DESC, session_id ASC);",
+        )?;
+        let mut session = Session::new();
+        session.push(meerkat_core::Message::User(
+            meerkat_core::UserMessage::text("plain-create pre-floor fixture"),
+        ));
+        let session_id = session.id().to_string();
+        let mut document = serde_json::to_value(&session)?;
+        document["version"] = serde_json::json!(2);
+        let source = serde_json::to_vec(&document)?;
+        let _released_session = meerkat_core::import_released_0810_session(&source)
+            .expect("fixture must be an exact released-v2 session document");
+        conn.execute(
+            "INSERT INTO sessions (session_id, created_at_ms, updated_at_ms, message_count, \
+             total_tokens, metadata_json, session_json) VALUES (?1, 0, 0, 1, 0, ?2, ?3)",
+            (
+                &session_id,
+                serde_json::to_string(session.metadata())?,
+                &source,
+            ),
+        )?;
+        drop(conn);
+
+        let fence = meerkat_store::migrate::RealmMaintenanceFence::acquire(
+            &paths.root,
+            Duration::from_secs(1),
+        )?;
+        let report = bridge_pre_0_8_10_realm_storage_in(temp.path(), realm_id, &fence)?;
+        drop(fence);
+
+        let entry = report
+            .domains
+            .iter()
+            .find(|entry| entry.domain == "session-store")
+            .expect("session-store domain must be reported");
+        assert_eq!(
+            (entry.from_version, entry.to_version),
+            (
+                1,
+                meerkat_store::sqlite_store::SESSION_STORE_DOMAIN.supported_version()
+            ),
+            "the pre-floor catalog must bridge to the current version"
+        );
+        assert!(entry.ledger_established);
+
+        // Usable through the current version chain: the real opener applies
+        // the domain (preflight + current fingerprint) and the session row
+        // survived the physical rebuild.
+        let store = meerkat_store::SqliteSessionStore::open(&paths.sessions_sqlite_path)?;
+        drop(store);
+        let conn = meerkat_sqlite::open(
+            &paths.sessions_sqlite_path,
+            meerkat_sqlite::ConnectionProfile::ReadOnly,
+        )?;
+        assert_eq!(
+            meerkat_sqlite::domain_version(&conn, "session-store")?,
+            Some(meerkat_store::sqlite_store::SESSION_STORE_DOMAIN.supported_version()),
+        );
+        let stored_id: String =
+            conn.query_row("SELECT session_id FROM sessions", [], |row| row.get(0))?;
+        assert_eq!(stored_id, session_id, "session row must survive the bridge");
 
         Ok(())
     }

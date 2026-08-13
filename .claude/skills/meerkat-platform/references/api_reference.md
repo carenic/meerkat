@@ -179,8 +179,8 @@ Primary CLI mob usage is tool-driven from `run`/`run --resume` prompts using `mo
 
 | Subcommand | Purpose |
 |------------|---------|
-| `spawn-helper <mob_id> <prompt> --agent-identity <id> [--profile <profile>] [--model <model>] [--auth-binding <REALM:BINDING[:PROFILE]>] [--json]` | Spawn a short-lived helper, wait for completion, print the result |
-| `fork-helper <mob_id> <source_member> <prompt> --agent-identity <id> [--profile <profile>] [--model <model>] [--auth-binding <REALM:BINDING[:PROFILE]>] [--fork-context full-history\|last-messages] [--last-messages N] [--json]` | Fork from an existing member's context and run a helper |
+| `spawn-helper <mob_id> <prompt> --agent-identity <id> --result-label <label> --max-text-bytes <n> [--profile <profile>] [--model <model>] [--auth-binding <REALM:BINDING[:PROFILE]>] [--json]` | Spawn a short-lived helper, wait for completion, print the result |
+| `fork-helper <mob_id> <source_member> <prompt> --agent-identity <id> --result-label <label> --max-text-bytes <n> [--profile <profile>] [--model <model>] [--auth-binding <REALM:BINDING[:PROFILE]>] [--fork-context full-history\|last-messages] [--last-messages N] [--json]` | Fork from an existing member's context and run a helper |
 | `member-status <mob_id> <agent_identity> [--json]` | Execution status snapshot for a mob member |
 | `force-cancel <mob_id> <agent_identity>` | Force-cancel a member's in-flight turn |
 | `respawn <mob_id> <agent_identity> [--initial-message]` | Retire and respawn a member with the same profile |
@@ -821,7 +821,7 @@ if let Some(runtime) = factory.build_skill_runtime(&config).await {
 - **Comms choice**: agents use `send_message` for ordinary collaboration, `send_request` for structured ask/reply, and `send_response` for replies. Public peer reservation streams were removed.
 - Hooks and skills resolve from runtime root. Workspace-default CLI realms preserve project ergonomics.
 - **Skill introspection**: `SkillRuntime::list_all_with_provenance()` returns active + shadowed skills; `load_from_source()` bypasses first-wins.
-- Multi-agent orchestration uses mobs exclusively. `MemberLaunchMode::Fork` provides history branching via `Session::fork()`. `spawn_helper()`/`fork_helper()` provide one-call convenience.
+- Multi-agent orchestration uses mobs exclusively. `MemberLaunchMode::Fork` provides history branching via `Session::fork()`. `spawn_helper()`/`fork_helper()` provide one-call convenience; both require `result_label` and `max_text_bytes` and return a `BoundedHelperRunOutcome` carrying the certified bounded result.
 
 ---
 

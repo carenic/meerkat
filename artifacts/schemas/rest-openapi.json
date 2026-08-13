@@ -1752,6 +1752,65 @@
         "description": "One-time bootstrap proof exchanged between a mob supervisor and a\nmember runtime on initial bind.\n\nTransparent over the wire (`#[serde(transparent)]` — a bare JSON string),\nbut carries a redacting `Debug` impl and has no `Display` impl so the\nraw secret cannot accidentally land in logs or panic messages. Treat it\nlike an API key: read `as_str()` only at the comms/transport boundary.",
         "type": "string"
       },
+      "BridgeBoundedResultSpec": {
+        "additionalProperties": false,
+        "description": "Pre-admission receiver-owned bound for one exact placed turn result.",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "max_text_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "label",
+          "max_text_bytes"
+        ],
+        "type": "object"
+      },
+      "BridgeBoundedTurnResult": {
+        "additionalProperties": false,
+        "description": "Durable exact bounded result retained with one tracked input terminal.",
+        "properties": {
+          "max_text_bytes": {
+            "description": "Exact pre-admission byte cap that produced `result`.\n\nRetaining the cap prevents a replay with the same label but a different\nbound from accepting a result computed under another operation contract.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "result": {
+            "$ref": "#/components/schemas/MobBoundedHelperResult"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "tool_calls": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "turns": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Usage"
+          }
+        },
+        "required": [
+          "result",
+          "max_text_bytes",
+          "session_id",
+          "usage",
+          "turns",
+          "tool_calls"
+        ],
+        "type": "object"
+      },
       "BridgeCapabilities": {
         "additionalProperties": false,
         "description": "Capabilities advertised by a member runtime on bind.",
@@ -1958,6 +2017,17 @@
             "additionalProperties": false,
             "description": "Deliver one logical input to a member.",
             "properties": {
+              "bounded_result_spec": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/BridgeBoundedResultSpec"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Receiver-owned result bound validated before tracked admission.\nRequires `outcome_tracking: interaction` and is retained durably with\nthe exact input's terminal sidecar."
+              },
               "command": {
                 "const": "deliver_member_input",
                 "type": "string"
@@ -5478,6 +5548,17 @@
         "additionalProperties": false,
         "description": "Terminal outcome record for a directed turn, delivered as a sidecar on\n`MemberEventsPage` (the event envelope rows themselves stay unchanged —\n§7 envelope freeze).",
         "properties": {
+          "bounded_result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BridgeBoundedTurnResult"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Receiver-bounded exact result for a tracked plain interaction.\n\nPresent only when the delivery supplied `bounded_result_spec` before\nadmission and the exact terminal carried a committed `RunResult`."
+          },
           "fence_token": {
             "description": "Materialization fence paired with `generation`. A same-generation\nhigher-fence residency must not accept an older watcher's terminal.",
             "format": "uint64",
@@ -9576,6 +9657,40 @@
         ],
         "type": "string"
       },
+      "MobBoundedHelperResult": {
+        "description": "Receiver-bounded helper payload with explicit truncation state.",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MobBoundedHelperResultStatus"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "status",
+          "text"
+        ],
+        "type": "object"
+      },
+      "MobBoundedHelperResultStatus": {
+        "description": "Typed terminal/truncation state for a bounded helper projection.",
+        "enum": [
+          "completed",
+          "completed_truncated",
+          "failed",
+          "failed_truncated",
+          "in_progress",
+          "in_progress_truncated",
+          "unavailable",
+          "unavailable_truncated"
+        ],
+        "type": "string"
+      },
       "MobHostStatus": {
         "description": "One tracked host row for `mob/hosts` (A13).\n\n`endpoint`, `authority_epoch`, and `capabilities` are the CommitHostBind\nfacts — present for `Bound` hosts, typed-absent for a `Requested`-phase\nhost (an open or failed bind window commits nothing; fabricating empty\nvalues would launder ceremony state into committed facts).\n\n`control_reachability`/`last_seen_ms`/`freshness_reason` are fed by the\nobserver-local periodic `HostStatus` driver shared with orphan\nreconciliation. They remain typed-absent until the first observation and\nnever become durable membership facts.",
         "properties": {
@@ -12337,6 +12452,11 @@
               }
             ]
           },
+          "max_text_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
           "model_override": {
             "type": [
               "string",
@@ -12344,6 +12464,9 @@
             ]
           },
           "prompt": {
+            "type": "string"
+          },
+          "result_label": {
             "type": "string"
           },
           "role_name": {
@@ -12368,7 +12491,9 @@
         },
         "required": [
           "source_member_id",
-          "prompt"
+          "prompt",
+          "result_label",
+          "max_text_bytes"
         ],
         "title": "RestMobForkHelperRequest",
         "type": "object"
@@ -12402,6 +12527,11 @@
               }
             ]
           },
+          "max_text_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
           "model_override": {
             "type": [
               "string",
@@ -12409,6 +12539,9 @@
             ]
           },
           "prompt": {
+            "type": "string"
+          },
+          "result_label": {
             "type": "string"
           },
           "role_name": {
@@ -12429,7 +12562,9 @@
           }
         },
         "required": [
-          "prompt"
+          "prompt",
+          "result_label",
+          "max_text_bytes"
         ],
         "title": "RestMobHelperRequest",
         "type": "object"

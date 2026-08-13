@@ -8020,6 +8020,188 @@ mod tests {
         );
     }
 
+    fn mcp_pending_synthetic_notice(body: &str) -> Message {
+        Message::SystemNotice(SystemNoticeMessage::with_block(
+            SystemNoticeKind::McpPending,
+            Some(body.to_string()),
+            SystemNoticeBlock::Mcp {
+                server_id: None,
+                operation: None,
+                phase: Some(crate::event::ExternalToolDeltaPhase::Pending),
+                persisted: false,
+                detail: Some(body.to_string()),
+                pending_sources: vec!["king-search".to_string()],
+            },
+        ))
+    }
+
+    fn assistant_reply(text: &str) -> Message {
+        Message::BlockAssistant(BlockAssistantMessage {
+            blocks: vec![AssistantBlock::Text {
+                text: text.to_string(),
+                meta: None,
+            }],
+            stop_reason: StopReason::EndTurn,
+            identity: crate::types::TranscriptMessageIdentity::default(),
+            created_at: crate::types::message_timestamp_now(),
+        })
+    }
+
+    /// Committed HeadCanonical boundary whose row prefix CONTAINS a synthetic
+    /// mcp_pending notice: the exact resumed-session shape of the 0.8.21
+    /// intra-turn checkpoint wedge.
+    #[allow(clippy::expect_used)]
+    fn acknowledged_boundary_with_embedded_synthetic_notice() -> (Session, SessionHead) {
+        let mut session = Session::new();
+        session.push(Message::User(UserMessage::text("Hello".to_string())));
+        session.push(mcp_pending_synthetic_notice(
+            "Servers connecting: king-search. Tools will appear when ready.",
+        ));
+        session.push(assistant_reply("reply"));
+        let mutation = PreparedHeadCanonicalMutation::prepare_root(&session).expect("prepare root");
+        let boundary_head = mutation.successor_head().clone();
+        mutation
+            .acknowledge_session(&mut session, mutation.successor_head_token())
+            .expect("acknowledge committed boundary");
+        assert_eq!(boundary_head.message_count, 3);
+        (session, boundary_head)
+    }
+
+    /// Regression for the 0.8.21 resume wedge: a synthetic mcp_pending notice
+    /// inside the committed boundary prefix is retained across the resume-time
+    /// refresh, so the intra-turn checkpoint route stays an exact append and
+    /// MUST succeed — for both refresh shapes (servers connected: no
+    /// replacement; servers still connecting: fresh replacement at the tail).
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn intra_turn_checkpoint_survives_committed_prefix_synthetic_notice_refresh() {
+        let refresh_shapes: [Vec<Message>; 2] = [
+            Vec::new(),
+            vec![mcp_pending_synthetic_notice(
+                "Servers connecting: king-search (retrying).",
+            )],
+        ];
+        for replacements in refresh_shapes {
+            let (mut session, boundary_head) =
+                acknowledged_boundary_with_embedded_synthetic_notice();
+            let replacement_count = replacements.len();
+            session
+                .replace_synthetic_notices(SystemNoticeKind::McpPending, replacements)
+                .expect("resume-time synthetic refresh");
+            assert!(
+                matches!(
+                    &session.messages()[1],
+                    Message::SystemNotice(notice) if notice.is_synthetic_refresh_projection()
+                ),
+                "the committed-prefix synthetic notice must be retained in place"
+            );
+            assert_eq!(
+                session.messages().len(),
+                3 + replacement_count,
+                "replacements (if any) append at the tail; nothing is stripped"
+            );
+            session.push(Message::User(UserMessage::text("next".to_string())));
+            session.push(assistant_reply("reply 2"));
+
+            // Mirror the persistent.rs checkpoint flow: no pending rewrite
+            // occurrence, so the preflight is None and the ordinary route runs.
+            let preflight =
+                PreparedHeadCanonicalRewritePreflight::prepare(&session, &boundary_head)
+                    .expect("rewrite preflight probe");
+            assert!(preflight.is_none(), "no audited rewrite occurrence exists");
+            let route = PreparedHeadCanonicalMutationRoute::prepare_intra_turn_after_preflight(
+                &session,
+                &boundary_head,
+                boundary_head.clone(),
+                None,
+            )
+            .expect("intra-turn checkpoint must succeed after the refresh");
+            let mutation = route
+                .ordinary()
+                .expect("retention keeps the checkpoint an ordinary append");
+            assert_eq!(
+                mutation.successor_head().message_count,
+                session.messages().len() as u64
+            );
+            // The persisted successor covers exactly the live bytes: retention
+            // means no committed/live divergence to merge.
+            let live_prefix = SessionMessageRowPrefixAccumulator::from_messages(session.messages())
+                .expect("live row prefix");
+            assert_eq!(
+                mutation.successor_head().message_row_prefix.as_ref(),
+                Some(&live_prefix),
+                "successor row commitment must bind the live transcript byte-exact"
+            );
+            let successor_head = mutation.successor_head().clone();
+            let successor_token = mutation.successor_head_token().to_string();
+            mutation
+                .acknowledge_physical_projection(&mut session, &successor_token)
+                .expect("acknowledge checkpoint");
+
+            // Next boundary: the previously appended notice (if any) is now
+            // committed too; a further refresh must stay representable.
+            session
+                .replace_synthetic_notices(SystemNoticeKind::McpPending, Vec::new())
+                .expect("post-checkpoint refresh with all notices committed");
+            session.push(Message::User(UserMessage::text("another".to_string())));
+            let live_count = session.messages().len();
+            let route = PreparedHeadCanonicalMutationRoute::prepare_intra_turn_after_preflight(
+                &session,
+                &successor_head,
+                successor_head.clone(),
+                None,
+            )
+            .expect("checkpoint after a later refresh must also succeed");
+            let mutation = route.ordinary().expect("still an ordinary append");
+            assert_eq!(mutation.successor_head().message_count, live_count as u64);
+        }
+    }
+
+    /// Retention must not weaken continuity for non-synthetic divergence: a
+    /// committed-prefix change that is not a synthetic-notice refresh keeps
+    /// failing the checkpoint with the existing typed errors.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn intra_turn_checkpoint_still_rejects_non_synthetic_committed_prefix_divergence() {
+        // Divergence that also loses the exact row-lineage witness.
+        let (mut session, boundary_head) = acknowledged_boundary_with_embedded_synthetic_notice();
+        let mut tampered = session.messages().to_vec();
+        tampered[0] = Message::User(UserMessage::text("tampered".to_string()));
+        session.messages.replace(tampered.clone());
+        let error = PreparedHeadCanonicalMutationRoute::prepare_intra_turn_after_preflight(
+            &session,
+            &boundary_head,
+            boundary_head.clone(),
+            None,
+        )
+        .expect_err("non-synthetic divergence must keep failing");
+        assert!(
+            matches!(&error, SessionStoreError::InvalidTranscriptRewrite { reason, .. }
+                if reason.contains("live session does not retain the committed boundary row prefix")),
+            "unexpected error shape: {error}"
+        );
+
+        // Divergence that carries its own exact row lineage: the byte-exact
+        // boundary comparison must reject it.
+        let (mut session, boundary_head) = acknowledged_boundary_with_embedded_synthetic_notice();
+        session.messages.replace(tampered);
+        let tampered_prefix = SessionMessageRowPrefixAccumulator::from_messages(session.messages())
+            .expect("tampered prefix");
+        assert!(session.install_exact_message_row_prefix(tampered_prefix));
+        let error = PreparedHeadCanonicalMutationRoute::prepare_intra_turn_after_preflight(
+            &session,
+            &boundary_head,
+            boundary_head.clone(),
+            None,
+        )
+        .expect_err("lineage-carrying non-synthetic divergence must keep failing");
+        assert!(
+            matches!(&error, SessionStoreError::TranscriptContinuityViolation { reason, .. }
+                if reason.contains("live session does not continue the exact committed store boundary")),
+            "unexpected error shape: {error}"
+        );
+    }
+
     #[test]
     #[allow(clippy::expect_used)]
     fn rewrite_carrier_keeps_recurrent_revisions_occurrence_unique_and_delta_bounded() {

@@ -64,7 +64,12 @@ platform(
     exec_properties = {
         "Arch": "amd64",
         "OSFamily": "linux",
-        "container-image": "docker://docker.io/library/buildpack-deps:22.04",
+        # Release binaries inherit this image's glibc as their runtime floor.
+        # Bullseye pins glibc 2.31 (covers Debian 11 / Ubuntu 20.04 consumers);
+        # 22.04 (glibc 2.35) shipped binaries Bullseye could not load.
+        # scripts/check-linux-release-binary-portability.sh enforces the floor
+        # at packaging time - keep the two in sync when bumping this image.
+        "container-image": "docker://docker.io/library/buildpack-deps:bullseye",
     },
     parents = ["@toolchains_buildbuddy//platforms:linux_x86_64"],
 )
@@ -98,7 +103,9 @@ platform(
         # too-small default slot and stall inside rustc instead of failing fast.
         "EstimatedComputeUnits": "8",
         "OSFamily": "linux",
-        "container-image": "docker://docker.io/library/buildpack-deps:22.04",
+        # Same glibc 2.31 floor as linux_x86_64 above; the portability gate
+        # enforces it for every packaged Linux release binary.
+        "container-image": "docker://docker.io/library/buildpack-deps:bullseye",
     },
     parents = ["@toolchains_buildbuddy//platforms:linux_arm64"],
 )

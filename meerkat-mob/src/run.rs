@@ -5407,6 +5407,18 @@ impl MobRun {
         &self,
         command: MobMachineFlowRunCommand,
     ) -> Result<(flow_run::State, mob_dsl::MobMachineInput), MobError> {
+        let (state, mut inputs) = self.flow_run_commands_projection_for_test([command])?;
+        let input = inputs.pop().ok_or_else(|| {
+            MobError::Internal("test projection emitted no authority input".into())
+        })?;
+        Ok((state, input))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flow_run_commands_projection_for_test(
+        &self,
+        commands: impl IntoIterator<Item = MobMachineFlowRunCommand>,
+    ) -> Result<(flow_run::State, Vec<mob_dsl::MobMachineInput>), MobError> {
         let mut authority = mob_dsl::MobMachineAuthority::new();
         Self::replay_flow_authority_inputs_into(
             &mut authority,
@@ -5414,8 +5426,11 @@ impl MobRun {
             "test_project_flow_run_command",
         )?;
         let mut run = self.clone();
-        let input = run.apply_flow_run_command_for_test(&mut authority, command)?;
-        Ok((run.flow_state, input))
+        let mut inputs = Vec::new();
+        for command in commands {
+            inputs.push(run.apply_flow_run_command_for_test(&mut authority, command)?);
+        }
+        Ok((run.flow_state, inputs))
     }
 
     #[cfg(test)]

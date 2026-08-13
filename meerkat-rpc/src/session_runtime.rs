@@ -1481,6 +1481,17 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         .await
     }
 
+    async fn discard_live_session_actor_after_durability_reload_required(
+        &self,
+        witness: &meerkat::LiveSessionActorWitness,
+    ) -> Result<bool, SessionError> {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::discard_live_session_actor_after_durability_reload_required(
+            &self.service,
+            witness,
+        )
+        .await
+    }
+
     async fn await_event_projection_drain(
         &self,
         session_id: &SessionId,
@@ -4728,9 +4739,15 @@ impl SessionRuntime {
             message: error.to_string(),
             data: None,
         })?;
+        // Project the effective realm config's `[shell]` vocabulary into the
+        // monitor job manager, same seam as the factory-composed shell tool.
+        let effective_config = self.effective_config().await?;
         let manager = Arc::new(
             meerkat_tools::builtin::shell::JobManager::new(
-                meerkat_tools::builtin::shell::ShellConfig::with_project_root(project_root),
+                meerkat_tools::builtin::shell::ShellConfig::from_defaults(
+                    &effective_config.shell,
+                    project_root,
+                ),
             )
             .bind_canonical_async_ops(session_id.clone(), ops_registry)
             .with_durable_job_runtime(durable),
