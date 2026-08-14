@@ -9694,6 +9694,28 @@ fn with_unique_mob_id(mut definition: MobDefinition, label: &str) -> MobDefiniti
     definition
 }
 
+/// Await the release of a mob's process-global supervisor participant name.
+///
+/// A cold-restart test models a NEW process, where the predecessor's inproc
+/// route no longer exists. In one process the release starts at `shutdown` plus
+/// the last handle drop, and the actor task drops its own bridge reference on
+/// its own schedule, so a test that rebuilds the same mob id in-process must
+/// await the release instead of racing it. Publishing over a *live* route under
+/// another key is refused (`RegistrationRejection::NameOccupied`), which is the
+/// point: the refusal is what stops two live mobs from unbinding each other.
+async fn await_supervisor_route_release(mob_id: &MobId) {
+    let participant_name = format!("{mob_id}/__mob_supervisor__");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while meerkat_comms::InprocRegistry::global().contains_name(&participant_name) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "supervisor route '{participant_name}' was still published after the predecessor \
+             mob was shut down and dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 struct EchoBundleDispatcher;
 
 #[async_trait]
@@ -15199,9 +15221,19 @@ async fn test_rotate_supervisor_reauthorizes_live_remote_members_and_rejects_sta
         address.clone(),
     )
     .expect("peer spec");
-    let old_bridge = crate::runtime::MobSupervisorBridge::new(&mob_id, original.clone(), None)
-        .await
-        .expect("build old supervisor bridge");
+    // A stale-epoch probe is a SECOND supervisor endpoint for this mob, which
+    // production never has (rotation replaces the live runtime in place through
+    // the exact-generation seam). The live bridge already holds
+    // `{mob_id}/__mob_supervisor__` under the rotated key, and a second key may
+    // not claim a live participant name, so the probe publishes under its own
+    // name while still presenting the pre-rotation authority record. The
+    // receiver's rejection is decided by the command's supervisor epoch and peer
+    // id, not by the participant name.
+    let probe_mob_id = crate::MobId::from(format!("{mob_id}-stale-epoch-probe"));
+    let old_bridge =
+        crate::runtime::MobSupervisorBridge::new(&probe_mob_id, original.clone(), None)
+            .await
+            .expect("build old supervisor bridge");
     old_bridge
         .trust_recipient(&peer)
         .await
@@ -16817,6 +16849,12 @@ async fn test_rotate_supervisor_final_commit_failure_preserves_attempted_authori
         .shutdown()
         .await
         .expect("shutdown original actor before restart-style retry");
+    // A restart-style retry models a new process: release the predecessor's
+    // process-global supervisor route before republishing the same mob id. The
+    // rotation left the live runtime on the attempted authority key, so a
+    // still-published predecessor would be a different key holding the name.
+    drop(handle);
+    await_supervisor_route_release(&mob_id).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata.clone(),
@@ -17513,6 +17551,12 @@ async fn test_v4_resume_is_effect_free_until_explicit_rotation_then_adopts_direc
         .await
         .expect("seed peer-only member under current authority");
     handle.shutdown().await.expect("stop original actor");
+    // The resume below publishes a *different* supervisor key (the released V4
+    // record) under this mob's supervisor name, which is exactly what a live
+    // predecessor route refuses. Model the cold restart: release the original
+    // process-global route first.
+    drop(handle);
+    await_supervisor_route_release(&mob_id).await;
 
     // Reconstruct the exact structural/identity store under a released V4
     // supervisor record. The receiver has also lost its supervisor state, so
@@ -32748,11 +32792,16 @@ async fn test_spawn_rollback_archive_failure_retains_cleanup_authority_until_ret
 
 #[tokio::test]
 async fn test_fault_injected_lifecycle_operations_preserve_transactional_invariants() {
-    // Spawn rollback invariants.
-    let (spawn_handle, spawn_service) = create_test_mob(sample_definition_with_auto_wire()).await;
+    // Spawn rollback invariants. Every mob in this test is live at the same
+    // time, so each gets its own mob id: two concurrently live mobs sharing one
+    // id would collide on the supervisor participant name.
+    let spawn_definition =
+        with_unique_mob_id(sample_definition_with_auto_wire(), "fault-injected-spawn");
+    let spawn_mob_id = spawn_definition.id.clone();
+    let (spawn_handle, spawn_service) = create_test_mob(spawn_definition).await;
     spawn_service
         .set_comms_behavior(
-            &test_comms_name("worker", "w-1"),
+            &test_comms_name_for(&spawn_mob_id, "worker", "w-1"),
             MockCommsBehavior {
                 missing_public_key: true,
                 ..MockCommsBehavior::default()
@@ -32793,13 +32842,17 @@ async fn test_fault_injected_lifecycle_operations_preserve_transactional_invaria
         !spawn_service
             .trusted_peer_names(&sid_l)
             .await
-            .contains(&test_comms_name("worker", "w-1")),
+            .contains(&test_comms_name_for(&spawn_mob_id, "worker", "w-1")),
         "spawn rollback should remove leaked trust edges"
     );
 
     // Retire cleanup invariants: archive failure is surfaced and the retiring
     // roster entry remains as a non-routable retry anchor.
-    let (retire_handle, retire_service) = create_test_mob(sample_definition()).await;
+    let (retire_handle, retire_service) = create_test_mob(with_unique_mob_id(
+        sample_definition(),
+        "fault-injected-retire",
+    ))
+    .await;
     let sid_r1 = retire_handle
         .spawn(
             ProfileName::from("worker"),
@@ -39813,8 +39866,14 @@ async fn test_branch_winner_is_selected_only_after_success_allowing_fallback() {
 #[tokio::test]
 async fn test_malformed_templates_fail_flow_explicitly() {
     for template in ["Bad {{", "Bad }}", "{{   }}"] {
-        let (handle, _service) =
-            create_test_mob(sample_definition_with_template_message(template)).await;
+        // Each iteration's mob is live while the previous one is still being
+        // released, so every iteration gets its own mob id rather than racing
+        // the previous supervisor participant name.
+        let (handle, _service) = create_test_mob(with_unique_mob_id(
+            sample_definition_with_template_message(template),
+            "malformed-template",
+        ))
+        .await;
         handle
             .spawn(
                 ProfileName::from("worker"),
@@ -42619,8 +42678,11 @@ async fn test_schema_ref_file_path_validation_passes_and_fails() {
     .expect("write schema");
     let ok_path = schema_ok.path().to_string_lossy().to_string();
 
-    let (ok_handle, _ok_service) =
-        create_test_mob(sample_definition_with_schema_ref(&ok_path)).await;
+    let (ok_handle, _ok_service) = create_test_mob(with_unique_mob_id(
+        sample_definition_with_schema_ref(&ok_path),
+        "schema-ref-ok",
+    ))
+    .await;
     ok_handle
         .spawn(
             ProfileName::from("worker"),
@@ -42644,8 +42706,12 @@ async fn test_schema_ref_file_path_validation_passes_and_fails() {
     .expect("write schema");
     let bad_path = schema_bad.path().to_string_lossy().to_string();
 
-    let (bad_handle, _bad_service) =
-        create_test_mob(sample_definition_with_schema_ref(&bad_path)).await;
+    // Live alongside `ok_handle`, so it needs its own mob id.
+    let (bad_handle, _bad_service) = create_test_mob(with_unique_mob_id(
+        sample_definition_with_schema_ref(&bad_path),
+        "schema-ref-bad",
+    ))
+    .await;
     bad_handle
         .spawn(
             ProfileName::from("worker"),
@@ -49524,8 +49590,26 @@ async fn test_retire_saturated_actor_queue_reports_not_admitted_without_authorit
 
 #[tokio::test]
 async fn test_retirement_singleflight_scopes_identical_semantic_keys_to_exact_mob_store() {
-    let (first, _first_service) = create_test_mob(sample_definition()).await;
-    let (second, _second_service) = create_test_mob(sample_definition()).await;
+    // This is the one collision case that is load-bearing rather than
+    // incidental: proving that the STORE allocation discriminates the key
+    // requires two handles whose entire semantic id set - mob id included - is
+    // identical. Two live mobs under one mob id would collide on the supervisor
+    // participant name, so the second is built only after the first has
+    // released it. The first store's `events` allocation is pinned for the whole
+    // test so the pointer cannot be recycled into the second mob, which is the
+    // same guarantee production relies on (`retirement_operation_key`: "the
+    // detached leader retains `self.events`, preventing pointer reuse").
+    let definition = sample_definition();
+    let mob_id = definition.id.clone();
+    let first_storage = MobStorage::in_memory();
+    let _pinned_first_events = Arc::clone(&first_storage.events);
+    let first_service = Arc::new(MockSessionService::new());
+    let _ = first_service.enable_runtime_adapter();
+    let first = MobBuilder::new(definition.clone(), first_storage)
+        .with_session_service(first_service)
+        .create()
+        .await
+        .expect("create first mob");
     let identity = AgentIdentity::from("same-member");
     let generation = Generation::INITIAL;
     let expected = super::state::RetireMemberIncarnation {
@@ -49538,6 +49622,14 @@ async fn test_retirement_singleflight_scopes_identical_semantic_keys_to_exact_mo
 
     let first_key = first.retirement_operation_key(&expected);
     let reconstructed_same_store_key = first.clone().retirement_operation_key(&expected);
+    first
+        .shutdown()
+        .await
+        .expect("shut the first mob's actor down before rebuilding the same mob id");
+    drop(first);
+    await_supervisor_route_release(&mob_id).await;
+
+    let (second, _second_service) = create_test_mob(definition).await;
     let independent_store_key = second.retirement_operation_key(&expected);
     assert_eq!(
         first_key, reconstructed_same_store_key,
@@ -55640,6 +55732,87 @@ async fn test_supervisor_private_trust_failure_does_not_commit_spawn() {
             .iter()
             .all(|event| !matches!(event.kind, MobEventKind::MemberSpawned(_))),
         "failed supervisor trust publication must not append MemberSpawned"
+    );
+}
+
+/// Reconstruction of ONE member identity inside ONE process, with real inproc
+/// comms. A member's participant name (`{mob}/{role}/{member}`) is
+/// session-independent while its signing identity is per session, so a respawn
+/// presents the same name under a brand new key - exactly the collision shape
+/// that ordinary registration now refuses. It has to keep working: the retired
+/// generation is released before the replacement publishes, so the successor
+/// gets the name and the predecessor route is gone.
+///
+/// Without this, closing the name-eviction defect would have converted a silent
+/// eviction into a hard failure on every rollback-retry and retire-respawn.
+#[tokio::test]
+async fn respawning_one_member_identity_rebinds_its_participant_name() {
+    let _serial = lock_real_comms_tests();
+    let definition = with_unique_mob_id(sample_definition(), "member-respawn-route");
+    let (handle, service) = create_test_mob_with_real_comms(definition).await;
+    let member_id = AgentIdentity::from("w-respawn");
+    let retired_session_id = handle
+        .spawn(ProfileName::from("worker"), member_id.clone(), None)
+        .await
+        .expect("spawn session-backed member")
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed member has bridge session id");
+
+    let (participant_name, retired_key) = {
+        let retired_comms = service
+            .real_comms(&retired_session_id)
+            .await
+            .expect("retired member comms runtime");
+        (
+            retired_comms.participant_name().to_string(),
+            retired_comms.public_key(),
+        )
+    };
+    assert_eq!(
+        meerkat_comms::InprocRegistry::global().get_name_by_pubkey_in_namespace("", &retired_key),
+        Some(participant_name.clone()),
+        "the first generation must own the member participant name"
+    );
+
+    let receipt = handle
+        .respawn(member_id.clone(), None)
+        .await
+        .expect("respawn must succeed: the retired generation is released before its replacement");
+    let replacement_session_id = handle
+        .member_status(&receipt.identity)
+        .await
+        .expect("respawned member snapshot")
+        .current_bridge_session_id
+        .clone()
+        .expect("respawned member has a replacement bridge session id");
+    assert_ne!(replacement_session_id, retired_session_id);
+
+    let replacement_comms = service
+        .real_comms(&replacement_session_id)
+        .await
+        .expect("respawned member comms runtime");
+    assert_eq!(
+        replacement_comms.participant_name(),
+        participant_name,
+        "a respawn keeps the member's session-independent participant name"
+    );
+    let replacement_key = replacement_comms.public_key();
+    assert_ne!(
+        replacement_key, retired_key,
+        "a respawn mints a new session-scoped signing identity"
+    );
+    assert_eq!(
+        meerkat_comms::InprocRegistry::global()
+            .get_name_by_pubkey_in_namespace("", &replacement_key),
+        Some(participant_name.clone()),
+        "the replacement generation must own the member participant name"
+    );
+    assert!(
+        meerkat_comms::InprocRegistry::global()
+            .get_by_pubkey_in_namespace("", &retired_key)
+            .is_none(),
+        "the retired generation must not still hold a route under this name"
     );
 }
 
