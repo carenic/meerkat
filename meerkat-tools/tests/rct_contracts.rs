@@ -213,6 +213,14 @@ fn scan_for_manual_input_schema_literals(
             continue;
         }
 
+        // Whole-file test modules are declared `#[cfg(test)] mod foo_tests;`
+        // in the PARENT, so the in-file `#[cfg(test)]` tracking below cannot
+        // observe that the file is test-only. The `_tests.rs` suffix is the
+        // repo's convention for that inclusion shape.
+        if file_name.ends_with("_tests.rs") {
+            continue;
+        }
+
         let contents = std::fs::read_to_string(&path)?;
         let mut in_test_module = false;
         let mut test_brace_depth = 0;

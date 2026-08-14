@@ -111,6 +111,7 @@ fn cargo_workflow_covers_the_full_per_push_gate_set() {
             "gate",
             "int-heavy",
             "int-rest",
+            "locks",
             "machine-verify",
             "ratchets",
             "sdk-host",
