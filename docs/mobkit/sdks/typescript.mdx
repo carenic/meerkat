@@ -35,16 +35,56 @@ const results = await handle.memoryQuery({
   store: "knowledge_graph",
 });
 
-const evaluation = await handle.schedulingEvaluate([
-  {
-    schedule_id: "daily-report",
-    interval: "0 9 * * *",
-    timezone: "Europe/Stockholm",
-    jitter_ms: 0,
-    enabled: true,
-  },
-], Date.now());
 ```
+
+## Durable detached tools
+
+Long-running host work must declare detached execution rather than keeping a
+tool callback open:
+
+```typescript
+import { DetachedJobExecution, DetachedJobResult, MobKit } from "@rkat/mobkit-sdk";
+
+const runtime = await MobKit.builder()
+  .persistentState("state/mobkit")
+  .jobCredentials(resolveProfileCredentials)
+  .sessionService({
+    async buildAgent(draft) {
+      draft.registerTool(
+        "security_scan",
+        async () => ({ error: "detached owner required" }),
+        {
+          description: "Run a durable security scan",
+          execution: new DetachedJobExecution({
+            runner: "homecore.security_scan",
+            version: "v1",
+            restartClass: "checkpoint_resumable",
+            idempotencyScope: "interaction_and_arguments",
+            submissionTimeoutMs: 30_000,
+            credentialScopes: ["unifi.read"],
+            handler: async (ctx) => {
+              await ctx.progress(1, "scan started");
+              const resultRef = await performScan(ctx.arguments, ctx.credentials);
+              return new DetachedJobResult(resultRef);
+            },
+          }),
+        },
+      );
+    },
+  })
+  .build();
+
+const job = await runtime.jobs.get(jobId);
+await runtime.jobs.cancel(jobId);
+```
+
+The gateway durably accepts the job and returns a receipt; host work runs
+outside the agent turn. Start, reconcile, and cancel remain short callbacks
+inside the 120-second public contract (125-second host and 130-second wire
+margins). Reconnect offers the exact committed attempt, fence, lease,
+checkpoint, and runner handle. Reopening never mints a fence; only a
+machine-authorized claim or retry does. Credentials are resolved per attempt
+and never serialized into durable job state.
 
 For identity-first builds with a `rosterProvider`, `.agentMemory()` enables optional identity-scoped hot memory injection from `<persistentState>/agent-memory` with contextual recall by default. Options include `realm`, `selection`, `maxEntries`, `recallTimeoutMs`, `recallFailurePolicy`, and `instructionHeader`; automatic injection defaults to a 500 ms timeout and skips the memory block if recall fails. Write records with `handle.rememberAgentMemory(identity, { title, body, tags, realm })`, read them with `handle.recallAgentMemory(identity, { realm, selection, queryText, queryTerms, maxEntries })`, and delete them with `handle.forgetAgentMemory(identity, memoryId, { realm })`; new records are available on the next identity-first send and during later materialize/resume/respawn/reset flows. Forgetting a record removes it from future recall/injection, but does not erase text already delivered into an active model context.
 
@@ -75,13 +115,6 @@ interface UnifiedEvent {
   payload?: unknown;
 }
 
-interface ScheduleDefinition {
-  schedule_id: string;
-  interval: string;
-  timezone: string;
-  jitter_ms: number;
-  enabled: boolean;
-}
 ```
 
 ## Module support
@@ -183,6 +216,55 @@ Continuity stores should treat `checkpoint_version` as monotonic per identity an
 Gateway memory config accepts `{ backend: "local_json" }` with an optional `healthCheckEndpoint` (`memory.localJson(...)`); the legacy Elephant `{ backend, endpoint }` shape still works but is deprecated. Store, collection, and space selectors are retained on the helper object for app code but are not sent to the Rust gateway. Gateway auth config supports JWT validation; Google/OIDC helpers are model objects, not accepted by `mobkit/init` today.
 
 The builder forwards `consoleConfig(path)` as `runtime_options.console_config_path`, which lets the bundled console consume the same `console_config` contract projected by `/console/experience`. Use `consoleAuthRequired(false)` only for explicit local demos.
+
+## Storage durability declarations
+
+The gateway is fail-closed about durable storage: a store that cannot open
+is a startup error, never a silent in-memory fallback. The `runtimeStore`
+and `eventLog` config modules produce the explicit declarations:
+
+```typescript
+import { MobKit, eventLog, runtimeStore } from "@rkat/mobkit-sdk";
+
+const runtime = await MobKit.builder()
+  .mob("config/mob.toml")
+  .persistentState("state/mobkit")
+  // Declare an in-memory runtime store (sessions do not survive restart).
+  .runtimeStore(runtimeStore.memory())
+  // Declare a bounded queryable in-process event log — or eventLog.nullStore().
+  .eventLog(eventLog.memory({ batchSize: 64 }))
+  .build();
+```
+
+The resolved picture is the typed storage census: `StatusResult.storage` /
+`CapabilitiesResult.storage` parse the gateway's `storage` object into
+`StorageSummary` (blob durability, the H2 incremental probe, and the
+per-slot `StorageSlotSummary` census with `domain`, `durabilityClass`,
+`resolution`, `backend`, `degraded`, `detail`); apply `parseStorageSummary`
+to the raw `storage` record of `mobkit/storage/doctor`. A fail-closed
+startup refusal — file-name twins, a store that failed to open — surfaces
+as the typed `StorageResolutionError` (code `-32014`,
+`STORAGE_RESOLUTION_CODE`), not a `TransportError`; its message names the
+remediation (`mobkit/storage/doctor`, or the explicit ephemeral
+declaration). Blob-store durability has no wire declaration today — it is
+declared by Rust embedders via `ephemeral_blobs(true)` /
+`binary_blob_store(...)` and reported read-only in the census.
+
+## Gateway logging (stderr)
+
+The persistent gateway reports tracing lines, panic hooks, and storage
+migration progress on its stderr. By default the SDK **inherits** the host
+process's stderr, so those lines are visible where your application logs.
+Two environment variables adjust this (same shape as the Python SDK):
+
+| Variable | Effect |
+|----------|--------|
+| `MOBKIT_GATEWAY_STDERR_FILE=<path>` | Append gateway stderr to a file |
+| `MOBKIT_GATEWAY_STDERR=devnull` | Discard gateway stderr entirely |
+
+Discarding is the legacy pre-0.8.9 default and is not recommended: it hides
+panic output and makes a slow-but-working storage migration indistinguishable
+from a hang.
 
 ## HTTP transport timeout
 

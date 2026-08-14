@@ -34,6 +34,58 @@ async def main():
 asyncio.run(main())
 ```
 
+## Durable detached tools
+
+Declare long-running host work explicitly instead of holding
+`callback/call_tool` open:
+
+```python
+from meerkat_mobkit import DetachedJobExecution, DetachedJobResult
+
+async def run_scan(ctx):
+    await ctx.progress(1, "scan started")
+    # ctx.arguments is the persisted non-secret specification.
+    # ctx.credentials is resolved for this committed attempt only.
+    result_ref = await perform_scan(ctx.arguments, ctx.credentials)
+    return DetachedJobResult(result_ref)
+
+class AppAgentBuilder:
+    async def build_agent(self, options):
+        options.register_tool(
+            "security_scan",
+            lambda args: {"error": "detached owner required"},
+            description="Run a durable security scan",
+            execution=DetachedJobExecution(
+                runner="homecore.security_scan",
+                version="v1",
+                restart_class="checkpoint_resumable",
+                idempotency_scope="interaction_and_arguments",
+                submission_timeout_ms=30_000,
+                credential_scopes=("unifi.read",),
+                handler=run_scan,
+            ),
+        )
+
+runtime = await (
+    MobKit.builder()
+    .persistent_state("state/mobkit")
+    .job_credentials(resolve_profile_credentials)
+    .session_service(AppAgentBuilder())
+    .build()
+)
+
+job = await runtime.jobs.get(job_id)
+await runtime.jobs.cancel(job_id)
+```
+
+The gateway durably accepts the job and returns a receipt; host work then runs
+outside the agent turn. Start, reconcile, and cancel are short control-plane
+callbacks subject to the 120-second public contract (the Python host and wire
+margins are 125 and 130 seconds). On reconnect, MobKit offers the exact
+committed attempt, fence, lease, checkpoint, and runner handle. Reopening does
+not mint a new fence; only a machine-authorized claim or retry can do that.
+Resolved credentials are attempt-local and never enter durable job state.
+
 ## Identity-First API
 
 For household-style apps (HomeCore), the identity-first API provides durable lifecycle management.
@@ -64,9 +116,14 @@ luka = rt.agent("identity:luka")
 await luka.send("Hello")                                          # Addressable only
 await triage.dispatch_text("School closed", origin="connector")   # Any identity
 
+# Delivery + wait for THAT turn's answer. These wait on the completion
+# cursor the gateway captured before delivery, so they stay correct when an
+# agent answers two turns identically.
+answer = await luka.send_and_wait("Hello", timeout=90)
+
 # Observation (no mob_handle, no member IDs needed)
-inspection = await triage.inspect()   # output_preview, peer_reachable_count
-output = await triage.wait_for_output(timeout=90)
+inspection = await triage.inspect()   # output_preview, completion_cursor, peers
+output = await triage.wait_for_output(timeout=90)   # any output, including an earlier turn's
 await rt.wait_until_ready(["triage:main", "identity:luka"])
 
 # Status
@@ -281,7 +338,8 @@ rt = await (
 | `.pre_spawn(callback)` | Pre-spawn callback |
 | `.gating(path)` | Gating config path |
 | `.routing(path)` | Routing config path |
-| `.scheduling(*files)` | Schedule config files |
+| `.event_log(config)` | Operational event log declaration (`event_log.memory()` / `event_log.null()`) |
+| `.runtime_store(config)` | Explicit ephemeral runtime-store declaration (`runtime_store.memory()`) |
 | `.memory(config)` | Memory configuration |
 | `.agent_memory(config=True, **options)` | Durable identity-scoped agent memory |
 | `.auth(config)` | Auth configuration |
@@ -321,6 +379,39 @@ store. Options include `realm`, `selection`, `max_entries`,
 serializes them to the gateway wire contract. Automatic injection defaults to a
 500 ms timeout and skips the memory block if recall fails.
 
+**Storage durability declarations.** The gateway is fail-closed about
+durable storage: a store that cannot open is a startup error, never a
+silent in-memory fallback. The `config.runtime_store` and
+`config.event_log` modules produce the explicit declarations:
+
+```python
+from meerkat_mobkit.config import event_log, runtime_store
+
+runtime = await (
+    MobKit.builder()
+    .mob("config/mob.toml")
+    .persistent_state("state/mobkit")
+    # Declare an in-memory runtime store (sessions do not survive restart).
+    .runtime_store(runtime_store.memory())
+    # Declare a bounded queryable in-process event log — or event_log.null().
+    .event_log(event_log.memory(batch_size=64))
+    .build()
+)
+```
+
+The resolved picture is the typed storage census: `StatusResult.storage` /
+`CapabilitiesResult.storage` parse the gateway's `storage` object into
+`StorageSummary` (blob durability, the H2 incremental probe, and the
+per-slot `StorageSlotSummary` census with `domain`, `durability_class`,
+`resolution`, `backend`, `degraded`, `detail`). A fail-closed startup
+refusal — file-name twins, a store that failed to open — surfaces as the
+typed `StorageResolutionError` (code `-32014`,
+`STORAGE_RESOLUTION_CODE`), not a `TransportError`; its message names the
+remediation (`mobkit/storage/doctor`, or the explicit ephemeral
+declaration). Blob-store durability has no wire declaration today — it is
+declared by Rust embedders via `ephemeral_blobs(true)` /
+`binary_blob_store(...)` and reported read-only in the census.
+
 ## Runtime lifecycle
 
 ```python
@@ -337,6 +428,22 @@ try:
 finally:
     await rt.shutdown()
 ```
+
+## Gateway logging (stderr)
+
+The persistent gateway reports tracing lines, panic hooks, and storage
+migration progress on its stderr. By default the SDK **inherits** the host
+process's stderr, so those lines are visible where your application logs.
+Two environment variables adjust this:
+
+| Variable | Effect |
+|----------|--------|
+| `MOBKIT_GATEWAY_STDERR_FILE=<path>` | Append gateway stderr to a file |
+| `MOBKIT_GATEWAY_STDERR=devnull` | Discard gateway stderr entirely |
+
+Discarding is the legacy pre-0.8.9 default and is not recommended: it hides
+panic output and makes a slow-but-working storage migration indistinguishable
+from a hang.
 
 ## Session agent builder
 
@@ -364,6 +471,7 @@ from meerkat_mobkit.errors import (
     NotConnectedError,     # No active runtime connection
     CapabilityUnavailableError,  # Requested capability unavailable
     ContractMismatchError,       # SDK/runtime version mismatch
+    StorageResolutionError,      # Fail-closed storage refusal at init (-32014)
 )
 ```
 
@@ -430,9 +538,11 @@ from meerkat_mobkit import (
     # Errors
     MobKitError, TransportError, RpcError,
     MobEventsStaleError, MOB_EVENTS_STALE_CURSOR_CODE,
+    StorageResolutionError, STORAGE_RESOLUTION_CODE,
     NotConnectedError, CapabilityUnavailableError, ContractMismatchError,
     # Typed results
     StatusResult, CapabilitiesResult, ReconcileResult,
+    StorageSummary, StorageSlotSummary,
     SpawnResult, SpawnMemberResult,
     SendMessageResult, SubscribeResult,
     KeepAliveConfig, EventEnvelope,
@@ -453,7 +563,7 @@ from meerkat_mobkit import (
     MobStructuralEvent, MobRun, MobRunStatus,
     StepRecord, FailureRecord, FrameRecord, LoopRecord, LoopIterationRecord,
     # Config modules
-    auth, memory, session_store,
+    auth, event_log, memory, runtime_store, session_store,
 )
 ```
 
