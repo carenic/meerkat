@@ -2809,6 +2809,98 @@ impl EphemeralRuntimeDriver {
         Ok(())
     }
 
+    /// Resolve queued inputs the generated staging authority REFUSED.
+    ///
+    /// `StageForRun` only increments the attempt count when every guard passes,
+    /// so a refused input accrued nothing and could never reach the
+    /// max-attempts valve - it starved, and under fifo it starved the whole
+    /// lane behind it (field 0.8.22). The machine owns the disposition exactly
+    /// as it does for a staged-then-failed input: another attempt at the back
+    /// of the backlog, or a typed terminal outcome at the retry cap. The shell
+    /// supplies only the generated recovery-lane witness.
+    ///
+    /// Returns the inputs the machine terminalized, so the caller can fail
+    /// exactly their completion waiters and leave deferred ones pending.
+    pub(crate) fn resolve_unstageable_queued_inputs(
+        &mut self,
+        input_ids: &[InputId],
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        let mut abandoned = Vec::new();
+        for input_id in input_ids {
+            // Skip anything the machine already resolved out of the queued
+            // world (terminalized, or staged by a concurrent path). This is a
+            // resolved-member skip, not an "already resolved" judgement the
+            // shell is making on the machine's behalf: a row still claiming
+            // InputPhase::Queued always reaches the machine, and if it lost its
+            // lane the DSL's own `input_lane_bound` guard rejects loudly (same
+            // split `DeferInputBehindBacklogAlreadyResolved` draws).
+            if self.input_phase(input_id) != Some(InputLifecycleState::Queued) {
+                continue;
+            }
+            // A Queued row with no recovery lane is projection corruption, not
+            // a reachable refusal cause: `recovered_current_lane_matches_phase`
+            // forces lane == recovery_lane with both Some for any recovered
+            // Queued row, and every producer of a Queued row
+            // (QueueAccepted, SteerAccepted, ChangeLane, RollbackStaged,
+            // ResolveStagedRollbackQueued) inserts both together. Fail loudly
+            // rather than inventing a lane: both `ResolveUnstageableQueuedInput`
+            // transitions guard `recovery_lane_matches`, so a fabricated
+            // witness would be refused anyway and the refusal would be silent.
+            let lane = self.input_recovery_lane(input_id).ok_or_else(|| {
+                RuntimeDriverError::Internal(format!(
+                    "generated recovery lane missing for unstageable queued input '{input_id}'"
+                ))
+            })?;
+            self.dsl_apply(
+                mm_dsl::MeerkatMachineInput::ResolveUnstageableQueuedInput {
+                    input_id: Self::dsl_key(input_id),
+                    lane: mm_dsl::InputLane::from(lane),
+                },
+                "ResolveUnstageableQueuedInput",
+            )?;
+
+            match self.input_phase_required(input_id, "after unstageable queued resolution")? {
+                InputLifecycleState::Queued => {
+                    let attempts = self.input_attempt_count(input_id);
+                    tracing::warn!(
+                        input_id = %input_id,
+                        attempts,
+                        "queued input refused by generated staging authority; deferred behind the backlog for another attempt"
+                    );
+                }
+                InputLifecycleState::Abandoned => {
+                    let attempts = self.input_attempt_count(input_id);
+                    tracing::warn!(
+                        input_id = %input_id,
+                        attempts,
+                        "queued input abandoned after generated max stage attempts of refused staging"
+                    );
+                    self.sync_terminal_projection_from_machine(
+                        input_id,
+                        InputLifecycleState::Queued,
+                        InputLifecycleState::Abandoned,
+                        "ResolveUnstageableQueuedInput->Abandon",
+                    )?;
+                    self.events
+                        .push(self.make_envelope(RuntimeEvent::InputLifecycle(
+                            InputLifecycleEvent::Abandoned {
+                                input_id: input_id.clone(),
+                                reason: InputAbandonReason::MaxAttemptsExhausted { attempts },
+                            },
+                        )));
+                    abandoned.push(input_id.clone());
+                }
+                other => {
+                    return Err(RuntimeDriverError::Internal(format!(
+                        "generated unstageable queued resolution for input {input_id} produced unexpected phase {other:?}"
+                    )));
+                }
+            }
+        }
+
+        Ok(abandoned)
+    }
+
     pub(crate) fn finalize_retire(&mut self) -> RetireReport {
         let inputs_pending_drain = self
             .ledger

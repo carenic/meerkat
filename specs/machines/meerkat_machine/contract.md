@@ -484,6 +484,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `IncrementAttemptCount`(input_id: String)
 - `RollbackStaged`(input_id: String, lane: InputLane)
 - `ResolveStagedRollback`(input_id: String, lane: InputLane)
+- `ResolveUnstageableQueuedInput`(input_id: String, lane: InputLane)
 - `MarkApplied`(input_id: String)
 - `MarkAppliedPendingConsumption`(input_id: String)
 - `ConsumeInput`(input_id: String)
@@ -915,11 +916,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Source Inputs: `StageForRun`
 - Transitions: `StageForRunIdle`, `StageForRunAttached`, `StageForRunRunning`, `StageForRunRetired`, `StageForRunStopped`
 - Guard Expansion:
-  - `StageForRunIdle`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `input_not_run_associated`, `current_run_matches`
-  - `StageForRunAttached`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `input_not_run_associated`, `current_run_matches`
-  - `StageForRunRunning`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `input_not_run_associated`, `current_run_matches`
-  - `StageForRunRetired`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `input_not_run_associated`, `current_run_matches`
-  - `StageForRunStopped`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `input_not_run_associated`, `current_run_matches`
+  - `StageForRunIdle`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`
+  - `StageForRunAttached`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`
+  - `StageForRunRunning`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`
+  - `StageForRunRetired`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`
+  - `StageForRunStopped`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`
 - Emitted By Transitions: `RecordRunAssociation`
 
 ### `AuthorizedRuntimeLoopRunCommit`
@@ -10265,7 +10266,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `input_lane_bound`
   - `input_sequence_bound`
   - `input_recovery_lane_bound`
-  - `input_not_run_associated`
   - `current_run_matches`
 - Emits: `RecordRunAssociation`
 - To: `Idle`
@@ -10278,7 +10278,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `input_lane_bound`
   - `input_sequence_bound`
   - `input_recovery_lane_bound`
-  - `input_not_run_associated`
   - `current_run_matches`
 - Emits: `RecordRunAssociation`
 - To: `Attached`
@@ -10291,7 +10290,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `input_lane_bound`
   - `input_sequence_bound`
   - `input_recovery_lane_bound`
-  - `input_not_run_associated`
   - `current_run_matches`
 - Emits: `RecordRunAssociation`
 - To: `Running`
@@ -10304,7 +10302,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `input_lane_bound`
   - `input_sequence_bound`
   - `input_recovery_lane_bound`
-  - `input_not_run_associated`
   - `current_run_matches`
 - Emits: `RecordRunAssociation`
 - To: `Retired`
@@ -10317,7 +10314,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `input_lane_bound`
   - `input_sequence_bound`
   - `input_recovery_lane_bound`
-  - `input_not_run_associated`
   - `current_run_matches`
 - Emits: `RecordRunAssociation`
 - To: `Stopped`
@@ -10511,6 +10507,136 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `input_tracked`
   - `input_staged`
+  - `attempt_count_tracked`
+  - `recovery_lane_matches`
+  - `stage_attempts_exhausted`
+- Emits: `RecordTerminalOutcome`
+- To: `Stopped`
+
+### `ResolveUnstageableQueuedInputDeferredIdle`
+- From: `Idle`
+- On: `ResolveUnstageableQueuedInput`(input_id, lane)
+- Guards:
+  - `input_tracked`
+  - `input_queued`
+  - `input_lane_bound`
+  - `attempt_count_tracked`
+  - `recovery_lane_matches`
+  - `stage_attempts_remaining`
+- Emits: `InputLifecycleNotice`
+- To: `Idle`
+
+### `ResolveUnstageableQueuedInputDeferredAttached`
+- From: `Attached`
+- On: `ResolveUnstageableQueuedInput`(input_id, lane)
+- Guards:
+  - `input_tracked`
+  - `input_queued`
+  - `input_lane_bound`
+  - `attempt_count_tracked`
+  - `recovery_lane_matches`
+  - `stage_attempts_remaining`
+- Emits: `InputLifecycleNotice`
+- To: `Attached`
+
+### `ResolveUnstageableQueuedInputDeferredRunning`
+- From: `Running`
+- On: `ResolveUnstageableQueuedInput`(input_id, lane)
+- Guards:
+  - `input_tracked`
+  - `input_queued`
+  - `input_lane_bound`
+  - `attempt_count_tracked`
+  - `recovery_lane_matches`
+  - `stage_attempts_remaining`
+- Emits: `InputLifecycleNotice`
+- To: `Running`
+
+### `ResolveUnstageableQueuedInputDeferredRetired`
+- From: `Retired`
+- On: `ResolveUnstageableQueuedInput`(input_id, lane)
+- Guards:
+  - `input_tracked`
+  - `input_queued`
+  - `input_lane_bound`
+  - `attempt_count_tracked`
+  - `recovery_lane_matches`
+  - `stage_attempts_remaining`
+- Emits: `InputLifecycleNotice`
+- To: `Retired`
+
+### `ResolveUnstageableQueuedInputDeferredStopped`
+- From: `Stopped`
+- On: `ResolveUnstageableQueuedInput`(input_id, lane)
+- Guards:
+  - `input_tracked`
+  - `input_queued`
+  - `input_lane_bound`
+  - `attempt_count_tracked`
+  - `recovery_lane_matches`
+  - `stage_attempts_remaining`
+- Emits: `InputLifecycleNotice`
+- To: `Stopped`
+
+### `ResolveUnstageableQueuedInputMaxAttemptsExhaustedIdle`
+- From: `Idle`
+- On: `ResolveUnstageableQueuedInput`(input_id, lane)
+- Guards:
+  - `input_tracked`
+  - `input_queued`
+  - `input_lane_bound`
+  - `attempt_count_tracked`
+  - `recovery_lane_matches`
+  - `stage_attempts_exhausted`
+- Emits: `RecordTerminalOutcome`
+- To: `Idle`
+
+### `ResolveUnstageableQueuedInputMaxAttemptsExhaustedAttached`
+- From: `Attached`
+- On: `ResolveUnstageableQueuedInput`(input_id, lane)
+- Guards:
+  - `input_tracked`
+  - `input_queued`
+  - `input_lane_bound`
+  - `attempt_count_tracked`
+  - `recovery_lane_matches`
+  - `stage_attempts_exhausted`
+- Emits: `RecordTerminalOutcome`
+- To: `Attached`
+
+### `ResolveUnstageableQueuedInputMaxAttemptsExhaustedRunning`
+- From: `Running`
+- On: `ResolveUnstageableQueuedInput`(input_id, lane)
+- Guards:
+  - `input_tracked`
+  - `input_queued`
+  - `input_lane_bound`
+  - `attempt_count_tracked`
+  - `recovery_lane_matches`
+  - `stage_attempts_exhausted`
+- Emits: `RecordTerminalOutcome`
+- To: `Running`
+
+### `ResolveUnstageableQueuedInputMaxAttemptsExhaustedRetired`
+- From: `Retired`
+- On: `ResolveUnstageableQueuedInput`(input_id, lane)
+- Guards:
+  - `input_tracked`
+  - `input_queued`
+  - `input_lane_bound`
+  - `attempt_count_tracked`
+  - `recovery_lane_matches`
+  - `stage_attempts_exhausted`
+- Emits: `RecordTerminalOutcome`
+- To: `Retired`
+
+### `ResolveUnstageableQueuedInputMaxAttemptsExhaustedStopped`
+- From: `Stopped`
+- On: `ResolveUnstageableQueuedInput`(input_id, lane)
+- Guards:
+  - `input_tracked`
+  - `input_queued`
+  - `input_lane_bound`
   - `attempt_count_tracked`
   - `recovery_lane_matches`
   - `stage_attempts_exhausted`

@@ -3002,6 +3002,36 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ResolveStagedRollbackMaxAttemptsExhaustedStopped`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ResolveUnstageableQueuedInputDeferredIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveUnstageableQueuedInputDeferredAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveUnstageableQueuedInputDeferredRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveUnstageableQueuedInputDeferredRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveUnstageableQueuedInputDeferredStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveUnstageableQueuedInputMaxAttemptsExhaustedIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveUnstageableQueuedInputMaxAttemptsExhaustedAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveUnstageableQueuedInputMaxAttemptsExhaustedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveUnstageableQueuedInputMaxAttemptsExhaustedRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveUnstageableQueuedInputMaxAttemptsExhaustedStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `MarkAppliedIdle`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)

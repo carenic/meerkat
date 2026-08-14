@@ -4242,6 +4242,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             IncrementAttemptCount { input_id: String },
             RollbackStaged { input_id: String, lane: Enum<InputLane> },
             ResolveStagedRollback { input_id: String, lane: Enum<InputLane> },
+            ResolveUnstageableQueuedInput { input_id: String, lane: Enum<InputLane> },
             MarkApplied { input_id: String },
             MarkAppliedPendingConsumption { input_id: String },
             ConsumeInput { input_id: String },
@@ -17796,6 +17797,22 @@ macro_rules! meerkat_catalog_machine_dsl {
         // StageForRun: stage a queued input for a run. Removes the input
         // from its work lane - staged inputs are no longer "currently
         // queuable". `input_lane` is the singular ordered-membership authority.
+        //
+        // `input_run_associations` is ATTRIBUTION, not an active claim: it names
+        // the run an input was last staged for and outlives the staging attempt
+        // (`stored_input_state` persists it as `seed.last_run_id`, recovery
+        // re-enters it for requeued rows, and `terminal_status` reads it as "the
+        // run the input last contributed to"). This transition's own update
+        // rebinds it unconditionally, so guarding on its ABSENCE guarded
+        // "this input was never staged before" - false as a staging
+        // precondition, and the exact 0.8.22 field wedge: after a recovery pass
+        // rolled two household members' head-of-line inputs from Staged back to
+        // Queued, every later run was refused for those inputs forever, and
+        // under `queue_mode fifo` all 11 inputs behind the two heads starved
+        // (~4h down). `input_queued` + `input_lane_bound` already prove the
+        // input is not part of a live run: `staged_inputs_are_not_queued` keeps
+        // Staged out of every work lane, and Applied/AppliedPendingConsumption
+        // carry no lane either.
         transition StageForRun {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input StageForRun { input_id, run_id }
@@ -17806,7 +17823,6 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "input_lane_bound" { self.input_lane.contains_key(input_id) }
             guard "input_sequence_bound" { self.input_admission_seq.contains_key(input_id) }
             guard "input_recovery_lane_bound" { self.input_recovery_lanes.contains_key(input_id) }
-            guard "input_not_run_associated" { !self.input_run_associations.contains_key(input_id) }
             guard "current_run_matches" {
                 self.current_run_id != None
                 && self.current_run_id.get("value") == run_id
@@ -17899,6 +17915,83 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.input_attempt_counts.get(input_id).get("value") >= self.max_stage_attempts
             }
             update {
+                self.input_phases.insert(input_id, InputPhase::Abandoned);
+                self.input_lane.remove(input_id);
+                self.input_recovery_lanes.remove(input_id);
+                self.input_terminal_kind.insert(input_id, InputTerminalKind::Abandoned);
+                self.input_abandon_reason.insert(input_id, InputAbandonReason::MaxAttemptsExhausted);
+                self.input_abandon_attempt_count.insert(
+                    input_id,
+                    self.input_attempt_counts.get(input_id).get("value")
+                );
+                self.input_superseded_by.remove(input_id);
+                self.input_aggregate_id.remove(input_id);
+            }
+            to Idle
+            emit RecordTerminalOutcome
+        }
+
+        // ResolveUnstageableQueuedInput: machine-owned policy for a queued
+        // input the generated staging authority REFUSED. `StageForRun`'s update
+        // block - and therefore its attempt increment - only runs when every
+        // guard passes, so a refused input accrued no attempts and never
+        // reached the max-attempts valve: it starved silently, and under
+        // `queue_mode fifo` it starved everything behind it (field 0.8.22).
+        // The shell supplies only the generated recovery-lane witness; the
+        // machine decides whether the refused input goes to the back of the
+        // backlog for another attempt or terminalizes as max-attempts
+        // exhausted. Symmetric with `ResolveStagedRollback*`, which owns the
+        // same decision for inputs that DID stage and then failed.
+        transition ResolveUnstageableQueuedInputDeferred {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ResolveUnstageableQueuedInput { input_id, lane }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            guard "input_queued" {
+                self.input_phases.get(input_id).get("value") == InputPhase::Queued
+            }
+            guard "input_lane_bound" { self.input_lane.contains_key(input_id) }
+            guard "attempt_count_tracked" {
+                self.input_attempt_counts.contains_key(input_id)
+            }
+            guard "recovery_lane_matches" {
+                self.input_recovery_lanes.contains_key(input_id)
+                && self.input_recovery_lanes.get(input_id).get("value") == lane
+            }
+            guard "stage_attempts_remaining" {
+                self.input_attempt_counts.get(input_id).get("value") < self.max_stage_attempts
+            }
+            update {
+                self.input_attempt_counts.increment(input_id, 1);
+                self.input_admission_seq.insert(input_id, self.next_admission_seq);
+                self.next_admission_seq += 1;
+            }
+            to Idle
+            emit InputLifecycleNotice
+        }
+
+        transition ResolveUnstageableQueuedInputMaxAttemptsExhausted {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ResolveUnstageableQueuedInput { input_id, lane }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            guard "input_queued" {
+                self.input_phases.get(input_id).get("value") == InputPhase::Queued
+            }
+            guard "input_lane_bound" { self.input_lane.contains_key(input_id) }
+            guard "attempt_count_tracked" {
+                self.input_attempt_counts.contains_key(input_id)
+            }
+            guard "recovery_lane_matches" {
+                self.input_recovery_lanes.contains_key(input_id)
+                && self.input_recovery_lanes.get(input_id).get("value") == lane
+            }
+            guard "stage_attempts_exhausted" {
+                self.input_attempt_counts.get(input_id).get("value") >= self.max_stage_attempts
+            }
+            update {
+                // Attribution (`input_run_associations`) is deliberately kept,
+                // exactly as `ResolveStagedRollbackMaxAttemptsExhausted` keeps
+                // it: the run this input last contributed to stays readable as
+                // a terminal witness (`terminal_status::evaluate_run`).
                 self.input_phases.insert(input_id, InputPhase::Abandoned);
                 self.input_lane.remove(input_id);
                 self.input_recovery_lanes.remove(input_id);
@@ -24653,9 +24746,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                     if !state.input_recovery_lanes.contains_key(input_id) {
                         return None;
                     }
-                    if state.input_run_associations.contains_key(input_id) {
-                        return None;
-                    }
+                    // No run-association check: the association is attribution
+                    // that `StageForRun` rebinds, and refusing a queued input
+                    // for carrying one wedged the fifo lane forever (0.8.22).
                 }
                 Some(StageForRunPlan {
                     stage_capability: AuthorizedStageForRun::mint_from_generated_command_plan(),

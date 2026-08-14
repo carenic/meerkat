@@ -2291,7 +2291,6 @@ mod tests {
             "input_lane_bound",
             "input_sequence_bound",
             "input_recovery_lane_bound",
-            "input_not_run_associated",
             "current_run_matches",
         ] {
             assert!(
@@ -2299,6 +2298,16 @@ mod tests {
                 "StageForRun command-plan guard expansion must include {required}; got {guard_names:?}"
             );
         }
+        // Deliberately absent: `input_not_run_associated`. The run association
+        // is attribution ("the run this input was last staged for") that
+        // StageForRun's own update rebinds unconditionally, so refusing a
+        // queued input for carrying one refused every input that had ever been
+        // staged - the 0.8.22 field wedge where a recovery-requeued fifo head
+        // was refused against every later run and starved its whole lane.
+        assert!(
+            !guard_names.contains(&"input_not_run_associated"),
+            "StageForRun must not refuse a queued input for carrying run attribution; got {guard_names:?}"
+        );
 
         let run_commit_plan = schema
             .command_plans

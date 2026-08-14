@@ -1902,6 +1902,85 @@ impl PersistentRuntimeDriver {
         self.inner.rollback_staged(input_ids)
     }
 
+    /// Resolve queued inputs the generated staging authority refused, making
+    /// the machine's disposition durable before returning it.
+    ///
+    /// Unlike `rollback_staged` - whose mutation is persisted by its caller
+    /// (`persist_machine_realized_run_failed`) - nothing downstream of a
+    /// staging refusal persists: `prepare_runtime_loop_batch_start` returns a
+    /// typed `StageRefused` outcome and the runtime loop simply keeps draining.
+    /// So this wrapper owns the commit, exactly as `abandon_queued_input` does.
+    ///
+    /// BOTH dispositions are durable facts, not just the terminal one:
+    /// - Abandoned: the terminal truth the caller's waiter was already failed
+    ///   on. Without the commit the durable row still reads Queued with its
+    ///   lane, recovery re-admits it, and work the caller was told was
+    ///   abandoned executes after a restart.
+    /// - Deferred: the incremented attempt count and the re-minted admission
+    ///   sequence. Without the commit a restart restores the refused input as
+    ///   the fifo head with its old attempt count, so the valve never advances
+    ///   and the 0.8.22 wedge reconstitutes across the restart boundary.
+    ///
+    /// Fail-closed: every fallible step between the staged DSL transition and
+    /// the durable commit restores the pre-transition checkpoint (K11).
+    pub(crate) async fn resolve_unstageable_queued_inputs(
+        &mut self,
+        input_ids: &[InputId],
+    ) -> Result<Vec<InputId>, crate::traits::RuntimeDriverError> {
+        self.require_durability_ready()?;
+        let checkpoint = self.persistence_rollback_checkpoint();
+        // The change set mirrors the inner skip: the persistence helpers fail
+        // closed on an untracked id, and the inner resolution deliberately
+        // skips ids that own no queued state, so a batch member the driver does
+        // not track must not turn the never-starve floor back into a hard
+        // failure that drops the wake.
+        let changed_input_ids = input_ids
+            .iter()
+            .filter(|input_id| self.inner.stored_input_state(input_id).is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        let abandoned = match self.inner.resolve_unstageable_queued_inputs(input_ids) {
+            Ok(abandoned) => abandoned,
+            Err(error) => {
+                return Err(self.post_transition_failure(
+                    checkpoint,
+                    "resolve_unstageable_queued_inputs",
+                    error.to_string(),
+                ));
+            }
+        };
+        if changed_input_ids.is_empty() {
+            return Ok(abandoned);
+        }
+        let (checkpoint, input_states, commit) = self.lifecycle_persistence_payload_with_rollback(
+            checkpoint,
+            &changed_input_ids,
+            "unstageable queued input resolution",
+        )?;
+        if let Err(error) = self
+            .store
+            .commit_machine_lifecycle(&self.runtime_id, commit, &input_states)
+            .await
+        {
+            return Err(self.post_transition_failure(
+                checkpoint,
+                "resolve_unstageable_queued_inputs_commit",
+                format!("unstageable queued input resolution persist failed: {error}"),
+            ));
+        }
+        if let Err(error) = self
+            .inner
+            .archive_archivable_terminal_inputs_after_durable_commit(&changed_input_ids)
+        {
+            return Err(self.post_transition_failure(
+                None,
+                "resolve_unstageable_queued_inputs_archive",
+                error.to_string(),
+            ));
+        }
+        Ok(abandoned)
+    }
+
     /// Persist the just-staged run bindings BEFORE the run executes.
     ///
     /// `StageForRun` binds each contributing input to the run inside the
@@ -2763,6 +2842,119 @@ mod tests {
         assert!(
             driver.input_phase(&input_id).is_some(),
             "staged abandon must be rolled back: the pending input must still be live"
+        );
+    }
+
+    /// Both dispositions of a refused staging attempt must be DURABLE on a
+    /// persistent runtime, not just in-memory.
+    ///
+    /// Nothing downstream of a staging refusal persists: unlike
+    /// `rollback_staged` (whose mutation its caller commits through
+    /// `persist_machine_realized_run_failed`),
+    /// `prepare_runtime_loop_batch_start` returns a typed `StageRefused`
+    /// outcome and the runtime loop just keeps draining. So an uncommitted
+    /// resolution reconstitutes the 0.8.22 wedge across a restart:
+    /// - Abandoned: the durable row still reads Queued with its lane, recovery
+    ///   re-admits it, and work whose caller was already told "abandoned"
+    ///   executes anyway.
+    /// - Deferred: the durable row keeps its old admission sequence and attempt
+    ///   count, so the refused input returns as the fifo head with the
+    ///   max-attempts valve reset to zero progress.
+    #[tokio::test]
+    async fn resolve_unstageable_queued_inputs_commits_both_dispositions_durably() {
+        async fn durable_seed(
+            store: &crate::store::InMemoryRuntimeStore,
+            runtime_id: &LogicalRuntimeId,
+            input_id: &InputId,
+        ) -> InputStateSeed {
+            store
+                .load_input_states_strict(runtime_id)
+                .await
+                .expect("durable input rows must decode")
+                .into_iter()
+                .find(|bundle| &bundle.state.input_id == input_id)
+                .expect("a resolved input must keep a durable row")
+                .seed
+        }
+
+        let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let runtime_store: Arc<dyn RuntimeStore> = store.clone();
+        let blob_store: Arc<dyn BlobStore> = Arc::new(meerkat_store::MemoryBlobStore::new());
+        let runtime_id = LogicalRuntimeId::new("unstageable-queued-durability");
+        let mut driver =
+            PersistentRuntimeDriver::new(runtime_id.clone(), runtime_store, blob_store);
+
+        let input = make_prompt("refused head");
+        let input_id = input.id().clone();
+        assert!(driver.accept_input(input).await.unwrap().is_accepted());
+        assert_eq!(
+            driver.input_phase(&input_id),
+            Some(InputLifecycleState::Queued)
+        );
+        let queued_seed = durable_seed(&store, &runtime_id, &input_id).await;
+        assert_eq!(queued_seed.phase, InputLifecycleState::Queued);
+        assert_eq!(queued_seed.attempt_count, 0);
+
+        // Deferral: attempt count and re-minted admission order are durable.
+        assert!(
+            driver
+                .resolve_unstageable_queued_inputs(std::slice::from_ref(&input_id))
+                .await
+                .expect("machine resolves a refused queued input")
+                .is_empty(),
+            "attempts remain, so nothing terminalizes yet"
+        );
+        let deferred_seed = durable_seed(&store, &runtime_id, &input_id).await;
+        assert_eq!(deferred_seed.phase, InputLifecycleState::Queued);
+        assert_eq!(
+            deferred_seed.attempt_count, 1,
+            "the refusal must be durably counted; an in-memory-only count means a restart \
+             resets the max-attempts valve and the refused head starves forever"
+        );
+        assert!(
+            deferred_seed.admission_sequence > queued_seed.admission_sequence,
+            "the deferral must durably re-mint the admission order: {:?} -> {:?}",
+            queued_seed.admission_sequence,
+            deferred_seed.admission_sequence
+        );
+
+        // Burn the remaining generated attempts.
+        for _ in 0..2 {
+            assert!(
+                driver
+                    .resolve_unstageable_queued_inputs(std::slice::from_ref(&input_id))
+                    .await
+                    .expect("machine resolves a refused queued input")
+                    .is_empty(),
+                "the retry cap is not reached yet"
+            );
+        }
+        assert_eq!(
+            driver
+                .resolve_unstageable_queued_inputs(std::slice::from_ref(&input_id))
+                .await
+                .expect("machine resolves a refused queued input"),
+            vec![input_id.clone()],
+            "at the generated retry cap the refused input terminalizes"
+        );
+
+        let terminal_seed = durable_seed(&store, &runtime_id, &input_id).await;
+        assert_eq!(
+            terminal_seed.phase,
+            InputLifecycleState::Abandoned,
+            "the machine's terminal truth must be durable: a Queued row here means recovery \
+             re-admits work whose caller was already told it was abandoned"
+        );
+        assert_eq!(
+            terminal_seed.terminal_outcome,
+            Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::MaxAttemptsExhausted { attempts: 3 }
+            }),
+            "the durable terminal outcome is the machine-owned typed class"
+        );
+        assert_eq!(
+            terminal_seed.recovery_lane, None,
+            "a terminalized row durably leaves the work lane"
         );
     }
 

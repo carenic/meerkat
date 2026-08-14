@@ -713,6 +713,7 @@ meerkat_machine_runtime_internal_inputs!(
         ResolveTranscriptEditAdmission,
         RegisterAcceptedIdempotency,
         ResolveStagedRollback,
+        ResolveUnstageableQueuedInput,
         RetryRequested,
         RollbackStaged,
         StageForRun,

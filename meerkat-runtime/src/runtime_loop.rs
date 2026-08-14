@@ -5433,23 +5433,55 @@ async fn process_queue(
                 primitive,
                 batch,
             } => {
-                if let Err(err) = crate::meerkat_machine::prepare_runtime_loop_batch_start(
+                match crate::meerkat_machine::prepare_runtime_loop_batch_start(
                     driver,
                     run_id.clone(),
                     batch,
                 )
                 .await
                 {
-                    tracing::error!(%run_id, error = %err, "failed to prepare runtime loop batch");
-                    if let Some(completions) = completions.as_ref() {
-                        let mut completions = completions.lock().await;
-                        fail_completion_waiters(
-                            &mut completions,
-                            &input_ids,
-                            format!("runtime batch preparation failed: {err}"),
+                    Ok(crate::meerkat_machine::driver::RuntimeLoopBatchStart::Started) => {}
+                    Ok(crate::meerkat_machine::driver::RuntimeLoopBatchStart::StageRefused {
+                        reason,
+                        abandoned_input_ids,
+                    }) => {
+                        // The machine refused to stage an accepted batch. Its
+                        // members are already resolved (another attempt at the
+                        // back of the backlog, or terminalized at the retry
+                        // cap), so this wake keeps draining: returning here
+                        // dropped the wake and, under fifo, starved every input
+                        // behind the refused head indefinitely (field 0.8.22).
+                        tracing::warn!(
+                            %run_id,
+                            reason = %reason,
+                            abandoned = abandoned_input_ids.len(),
+                            "generated staging authority refused an accepted input batch; resolved through machine authority"
                         );
+                        if !abandoned_input_ids.is_empty()
+                            && let Some(completions) = completions.as_ref()
+                        {
+                            let mut completions = completions.lock().await;
+                            fail_completion_waiters(
+                                &mut completions,
+                                &abandoned_input_ids,
+                                format!("runtime batch staging refused: {reason}"),
+                            );
+                        }
+                        drop(queue_authority_guard);
+                        continue;
                     }
-                    return false;
+                    Err(err) => {
+                        tracing::error!(%run_id, error = %err, "failed to prepare runtime loop batch");
+                        if let Some(completions) = completions.as_ref() {
+                            let mut completions = completions.lock().await;
+                            fail_completion_waiters(
+                                &mut completions,
+                                &input_ids,
+                                format!("runtime batch preparation failed: {err}"),
+                            );
+                        }
+                        return false;
+                    }
                 }
                 let staged_directed_interaction_ids = {
                     let driver_guard = driver.lock().await;
@@ -8705,6 +8737,321 @@ mod tests {
             crate::accept::AcceptOutcome::Accepted { input_id, .. } => input_id,
             other => panic!("expected accepted queued input, got {other:?}"),
         }
+    }
+
+    /// Stage `input_id` for a fresh run and then run the recovery-normalization
+    /// pass over the live driver, reproducing the exact field precondition: a
+    /// row that was Staged when its run went away, rolled back to Queued by a
+    /// recovery pass ("recovery: RollbackStaged") without the runtime loop's
+    /// own failure path ever running.
+    async fn stage_then_recover_rollback(
+        driver: &crate::meerkat_machine::SharedDriver,
+        input_id: &InputId,
+    ) -> RunId {
+        let staged_run_id = RunId::new();
+        let mut guard = driver.lock().await;
+        match &mut *guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                d.contract_begin_run_authority(staged_run_id.clone())
+                    .expect("run authority should begin through generated DSL");
+                d.machine_realize_authorized_stage_batch(
+                    crate::meerkat_machine::driver::test_authorized_stage_for_run(
+                        vec![input_id.clone()],
+                        staged_run_id.clone(),
+                    ),
+                )
+                .expect("input should stage for the run");
+                assert_eq!(
+                    d.input_phase(input_id),
+                    Some(crate::input_state::InputLifecycleState::Staged)
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+        // The run goes away while the input is still Staged - no loop failure
+        // path, so nothing resolves the staged input.
+        crate::meerkat_machine::driver::machine_apply_run_return_projection(
+            &mut guard,
+            &staged_run_id,
+            crate::meerkat_machine::driver::RunReturnDisposition::Rollback,
+        )
+        .expect("run should return through generated DSL");
+        match &mut *guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_phase(input_id),
+                    Some(crate::input_state::InputLifecycleState::Staged),
+                    "a returned run leaves the staged input for recovery to normalize"
+                );
+                d.recover_ephemeral()
+                    .expect("recovery pass should normalize");
+                assert_eq!(
+                    d.input_phase(input_id),
+                    Some(crate::input_state::InputLifecycleState::Queued),
+                    "recovery normalizes a staged row back to queued"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+        staged_run_id
+    }
+
+    /// Field class (0.8.22 household fleet): a recovery pass rolled two
+    /// members' head-of-line inputs from Staged back to Queued, keeping the
+    /// durable attribution of the run they had been staged for. `StageForRun`'s
+    /// `input_not_run_associated` guard then refused those inputs against every
+    /// later run ("generated machine did not authorize StageForRun") even though
+    /// its own update rebinds that attribution. The refusal counted no attempt,
+    /// so the max-attempts valve never fired, and under `queue_mode fifo`
+    /// nothing behind the refused head could run - two members were down ~4
+    /// hours with 11 inputs piled up behind 2 heads. Post-fix the attribution
+    /// stays durable AND the same wake re-stages the head and keeps draining the
+    /// backlog behind it.
+    #[tokio::test]
+    async fn recovery_requeued_head_restages_and_the_backlog_drains() {
+        let driver = make_shared_ephemeral_driver("stage-refusal-wedge-class");
+        let head_id =
+            accept_queued_input_id(&driver, make_peer_message("lead-rt", "stuck head")).await;
+        let follower_id = accept_queued_input_id(
+            &driver,
+            make_terminal_peer_response(TEST_PEER_RESPONSE_ROUTE_ID, TEST_PEER_RESPONSE_REQUEST_ID),
+        )
+        .await;
+
+        let staged_run_id = stage_then_recover_rollback(&driver, &head_id).await;
+
+        {
+            let guard = driver.lock().await;
+            match &*guard {
+                crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                    assert_eq!(
+                        d.input_last_run_id(&head_id),
+                        Some(staged_run_id.clone()),
+                        "a requeued input keeps the durable attribution of the run it last \
+                         contributed to (pinned by recovery_replay); staging must rebind it, \
+                         not refuse it"
+                    );
+                    assert_eq!(
+                        d.input_attempt_count(&head_id),
+                        1,
+                        "the rolled-back staging attempt stays counted"
+                    );
+                    assert_eq!(
+                        crate::meerkat_machine::driver::machine_authorize_runtime_loop_batch(
+                            &guard
+                        )
+                        .expect("generated runtime-loop batch")
+                        .input_ids()
+                        .to_vec(),
+                        vec![head_id.clone()],
+                        "the requeued input is still the fifo head"
+                    );
+                }
+                _ => panic!("expected ephemeral driver"),
+            }
+            drop(guard);
+        }
+
+        // The exact field refusal point: a NEW run, the recovery-requeued head
+        // still carrying the attribution of the run it was rolled back from.
+        let restage_run_id = RunId::new();
+        {
+            let mut guard = driver.lock().await;
+            crate::meerkat_machine::driver::machine_begin_run(&mut guard, restage_run_id.clone())
+                .expect("run authority should begin through generated DSL");
+            assert!(
+                crate::meerkat_machine::driver::machine_authorize_stage_for_run(
+                    &guard,
+                    &restage_run_id,
+                    std::slice::from_ref(&head_id),
+                    crate::meerkat_machine::driver::RuntimeLoopBatchSource::Queue,
+                )
+                .is_some(),
+                "the generated authority must stage a recovery-requeued input for a new run: \
+                 refusing it here is the 0.8.22 wedge - the input can never run again and every \
+                 fifo follower starves behind it"
+            );
+        }
+
+        let apply_calls = Arc::new(AtomicUsize::new(0));
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = crate::control_plane::test_support::ApplyFailingExecutor::new(
+            Arc::clone(&apply_calls),
+            Arc::clone(&stop_calls),
+        );
+        let (_effect_tx, mut effect_rx) = tokio::sync::mpsc::channel(1);
+        let authority_binding = RuntimeLoopAuthorityBinding::detached_for_test();
+        let teardown_slot = RuntimeLoopTeardownSlot::pending();
+        let mut terminal_handoff = RuntimeLoopTerminalHandoff::default();
+
+        let should_stop = process_queue(
+            &driver,
+            &mut executor,
+            &mut effect_rx,
+            None,
+            &authority_binding,
+            &teardown_slot,
+            &mut terminal_handoff,
+        )
+        .await;
+        assert!(
+            !should_stop,
+            "a recovered requeued head must not stop the runtime loop"
+        );
+        assert_eq!(stop_calls.load(Ordering::SeqCst), 0);
+
+        // Exact counters, matching the exactness of the preserved
+        // `max_attempts_abandonment_does_not_wedge_the_backlog` pin. The
+        // executor fails every apply, so both inputs eventually burn their
+        // generated attempts either way; what discriminates staged-vs-refused is
+        // WHERE the attempts came from:
+        //   post-fix laps: head staged+failed, follower staged+failed, head
+        //     staged+failed (cap -> abandoned), follower staged+failed (park)
+        //     => head 3, follower 2, applies 4
+        //   pre-fix laps: head REFUSED (counted, deferred, no apply), follower
+        //     staged+failed, head refused, follower staged+failed, head refused
+        //     (cap -> abandoned), follower staged+failed (park)
+        //     => head 3, follower 3, applies 3
+        // So the head's count alone proves nothing; `apply_calls`, the
+        // follower's count, and the rebound run association do.
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_ne!(
+                    d.input_last_run_id(&head_id),
+                    Some(staged_run_id.clone()),
+                    "re-staging must rebind the run association away from the rolled-back run; \
+                     keeping it means the head was never staged again"
+                );
+                assert_eq!(
+                    d.input_attempt_count(&head_id),
+                    3,
+                    "the recovered head must burn its generated attempts through real staging"
+                );
+                assert_eq!(
+                    d.input_attempt_count(&follower_id),
+                    2,
+                    "the same wake must keep draining past the recovered head - a zero count \
+                     means the fifo backlog wedged behind it, and 3 means the head consumed its \
+                     laps on refusals instead of runs"
+                );
+                assert_eq!(
+                    d.input_phase(&head_id),
+                    Some(crate::input_state::InputLifecycleState::Abandoned),
+                    "an always-failing executor terminalizes the head at the generated cap, \
+                     which is the honest outcome; it must never sit queued and unstageable"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+        assert_eq!(
+            apply_calls.load(Ordering::SeqCst),
+            4,
+            "every lap of this wake must reach the executor: a refused head never applies"
+        );
+    }
+
+    /// The safety valve for a genuinely unstageable queued input. `StageForRun`
+    /// increments the attempt count inside its update block, which only runs
+    /// when every guard PASSES, so a refused input used to accrue nothing and
+    /// starve forever. The machine now owns the refusal disposition: another
+    /// attempt at the back of the backlog (so a fifo follower becomes the head)
+    /// until the generated retry cap, then a typed terminal outcome.
+    #[tokio::test]
+    async fn refused_staging_counts_attempts_then_terminalizes() {
+        let driver = make_shared_ephemeral_driver("stage-refusal-valve-class");
+        let head_id =
+            accept_queued_input_id(&driver, make_peer_message("lead-rt", "doomed head")).await;
+        let follower_id =
+            accept_queued_input_id(&driver, make_peer_message("lead-rt", "innocent follower"))
+                .await;
+
+        let mut guard = driver.lock().await;
+        assert_eq!(
+            crate::meerkat_machine::driver::machine_authorize_runtime_loop_batch(&guard)
+                .expect("generated runtime-loop batch")
+                .input_ids()
+                .first(),
+            Some(&head_id),
+            "the doomed input starts as the fifo head"
+        );
+
+        // Attempt 1: refused, counted, and deferred behind the backlog.
+        let abandoned = guard
+            .resolve_unstageable_queued_inputs(std::slice::from_ref(&head_id))
+            .await
+            .expect("machine resolves a refused queued input");
+        assert!(
+            abandoned.is_empty(),
+            "attempts remain, so nothing terminalizes yet"
+        );
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(d.input_attempt_count(&head_id), 1);
+                assert_eq!(
+                    d.input_phase(&head_id),
+                    Some(crate::input_state::InputLifecycleState::Queued)
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+        assert_eq!(
+            crate::meerkat_machine::driver::machine_authorize_runtime_loop_batch(&guard)
+                .expect("generated runtime-loop batch")
+                .input_ids()
+                .first(),
+            Some(&follower_id),
+            "the refused head goes behind the backlog so the follower can run"
+        );
+
+        // Burn the remaining generated attempts.
+        for _ in 0..2 {
+            let abandoned = guard
+                .resolve_unstageable_queued_inputs(std::slice::from_ref(&head_id))
+                .await
+                .expect("machine resolves a refused queued input");
+            assert!(abandoned.is_empty(), "the retry cap is not reached yet");
+        }
+
+        let abandoned = guard
+            .resolve_unstageable_queued_inputs(std::slice::from_ref(&head_id))
+            .await
+            .expect("machine resolves a refused queued input");
+        assert_eq!(
+            abandoned,
+            vec![head_id.clone()],
+            "at the generated retry cap the refused input terminalizes instead of starving"
+        );
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_phase(&head_id),
+                    Some(crate::input_state::InputLifecycleState::Abandoned)
+                );
+                assert_eq!(
+                    d.input_terminal_outcome(&head_id),
+                    Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                        reason: crate::input_state::InputAbandonReason::MaxAttemptsExhausted {
+                            attempts: 3
+                        }
+                    }),
+                    "the terminal outcome is machine-owned and typed"
+                );
+                assert!(
+                    !d.has_queued_input(&head_id),
+                    "a terminalized input leaves the work lane"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+        assert_eq!(
+            crate::meerkat_machine::driver::machine_authorize_runtime_loop_batch(&guard)
+                .expect("generated runtime-loop batch")
+                .input_ids()
+                .to_vec(),
+            vec![follower_id],
+            "the backlog behind a doomed head is intact and selectable"
+        );
     }
 
     #[tokio::test]

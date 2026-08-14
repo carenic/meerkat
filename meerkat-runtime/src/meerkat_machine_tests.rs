@@ -26350,9 +26350,19 @@ async fn prepare_live_run_for_authority_test(
         machine_authorize_runtime_loop_batch(&entry).expect("accepted input should authorize batch")
     };
     assert_eq!(batch.input_ids(), std::slice::from_ref(&input_id));
-    prepare_runtime_loop_batch_start(&driver, run_id.clone(), batch)
+    let outcome = prepare_runtime_loop_batch_start(&driver, run_id.clone(), batch)
         .await
         .expect("run prepare should stage the accepted input");
+    // A refusal is a typed `Ok` outcome now, so the fixture must assert it
+    // actually staged: silently proceeding with nothing staged would make the
+    // expect message above a lie for every test built on this fixture.
+    assert!(
+        matches!(
+            outcome,
+            crate::meerkat_machine::driver::RuntimeLoopBatchStart::Started
+        ),
+        "run prepare should stage the accepted input, got {outcome:?}"
+    );
     (driver, input_id, run_id)
 }
 
@@ -26737,9 +26747,16 @@ async fn staged_batch_commit_driver(
             .expect("accepted inputs should authorize batch")
     };
     assert_eq!(batch.input_ids(), staged_ids.as_slice());
-    prepare_runtime_loop_batch_start(&driver, run_id.clone(), batch)
+    let outcome = prepare_runtime_loop_batch_start(&driver, run_id.clone(), batch)
         .await
         .expect("batch prepare should stage both inputs");
+    assert!(
+        matches!(
+            outcome,
+            crate::meerkat_machine::driver::RuntimeLoopBatchStart::Started
+        ),
+        "batch prepare should stage both inputs, got {outcome:?}"
+    );
     (driver, run_id, staged_ids)
 }
 
@@ -39138,21 +39155,34 @@ async fn prepare_runtime_loop_batch_start_unwinds_run_state_when_staging_rejects
         }
     };
 
-    let err = prepare_runtime_loop_batch_start(
+    // A staging REFUSAL is a typed, non-fatal outcome: the generated authority
+    // declined the batch, the machine resolved every member it still owns, and
+    // the run is unwound. It is not an error the runtime loop stops on - that
+    // dropped the wake and starved the fifo backlog behind the refused head
+    // (field 0.8.22).
+    let outcome = prepare_runtime_loop_batch_start(
         &driver,
         RunId::new(),
         crate::meerkat_machine::driver::test_authorized_runtime_loop_batch(vec![InputId::new()]),
     )
     .await
-    .expect_err("staging an unknown input should fail and unwind");
-    assert!(
-        err.to_string()
-            .contains("failed to stage accepted input batch")
-            || err
-                .to_string()
-                .contains("stage drain snapshot requires queued contributors"),
-        "unexpected helper error: {err}"
-    );
+    .expect("staging refusal is a typed outcome, not a loop failure");
+    match outcome {
+        crate::meerkat_machine::driver::RuntimeLoopBatchStart::StageRefused {
+            reason,
+            abandoned_input_ids,
+        } => {
+            assert!(
+                reason.contains("did not authorize StageForRun"),
+                "unexpected refusal reason: {reason}"
+            );
+            assert!(
+                abandoned_input_ids.is_empty(),
+                "an untracked input id owns no queued state to terminalize"
+            );
+        }
+        other => panic!("staging an unknown input should refuse and unwind, got {other:?}"),
+    }
 
     let entry = driver.lock().await;
     let DriverEntry::Ephemeral(driver) = &*entry else {

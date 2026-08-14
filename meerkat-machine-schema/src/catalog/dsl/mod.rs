@@ -2526,6 +2526,7 @@ runtime_internal_inputs!(
         ResolveMobEventStreamClose,
         ResolveSessionEventStreamClose,
         ResolveStagedRollback,
+        ResolveUnstageableQueuedInput,
         RetireCompletedOp,
         RetireRequestedOp,
         RetryRequested,

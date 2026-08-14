@@ -4170,6 +4170,19 @@ impl DriverEntry {
         }
     }
 
+    /// Resolve queued inputs the generated staging authority refused, returning
+    /// the inputs the machine terminalized. The persistent arm commits the
+    /// machine's disposition durably before returning it.
+    pub(crate) async fn resolve_unstageable_queued_inputs(
+        &mut self,
+        input_ids: &[InputId],
+    ) -> Result<Vec<InputId>, crate::traits::RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.resolve_unstageable_queued_inputs(input_ids),
+            DriverEntry::Persistent(d) => d.resolve_unstageable_queued_inputs(input_ids).await,
+        }
+    }
+
     pub(crate) async fn abandon_pending_inputs(
         &mut self,
         reason: crate::input_state::InputAbandonReason,
@@ -7196,11 +7209,35 @@ pub(crate) async fn machine_recycle_preserving_work(
     }
 }
 
+/// What happened when the runtime loop asked the machine to turn an authorized
+/// batch into a run.
+///
+/// `StageRefused` is NOT a loop-stopping failure: the generated authority
+/// declined to stage an accepted, queued batch, every member has been resolved
+/// through machine authority (deferred behind the backlog for another attempt,
+/// or terminalized at the retry cap), and the run has been returned. The caller
+/// must keep draining - the field class this variant closes is a fifo head the
+/// machine refuses forever while the wake is dropped, which starved every input
+/// behind it (0.8.22, two household members down ~4h).
+///
+/// `#[must_use]`: discarding the outcome silently accepts a refusal where the
+/// caller believes it staged, which is exactly what two test fixtures did when
+/// this was a bare `Result<(), _>` whose `Err` they unwrapped.
+#[must_use]
+#[derive(Debug)]
+pub(crate) enum RuntimeLoopBatchStart {
+    Started,
+    StageRefused {
+        reason: String,
+        abandoned_input_ids: Vec<InputId>,
+    },
+}
+
 pub(crate) async fn prepare_runtime_loop_batch_start(
     driver: &SharedDriver,
     run_id: RunId,
     batch: AuthorizedRuntimeLoopBatch,
-) -> Result<(), RuntimeDriverError> {
+) -> Result<RuntimeLoopBatchStart, RuntimeDriverError> {
     let mut driver = driver.lock().await;
     let staged_ids = batch.input_ids().to_vec();
     let stage_source = batch.source();
@@ -7208,17 +7245,57 @@ pub(crate) async fn prepare_runtime_loop_batch_start(
         RuntimeDriverError::Internal(format!("failed to start runtime run: {err}"))
     })?;
 
-    let stage_result = machine_authorize_stage_for_run(&driver, &run_id, &staged_ids, stage_source)
-        .ok_or_else(|| {
-            RuntimeDriverError::Internal(format!(
+    let stage_authority = match machine_authorize_stage_for_run(
+        &driver,
+        &run_id,
+        &staged_ids,
+        stage_source,
+    ) {
+        Some(stage_authority) => stage_authority,
+        None => {
+            let reason = format!(
                 "generated machine did not authorize StageForRun for run {run_id:?} and inputs {staged_ids:?}"
-            ))
-        })
-        .and_then(|stage_authority| {
-            driver.machine_realize_authorized_stage_batch(stage_authority)
-        });
+            );
+            // Count the refusal and let the machine decide the disposition
+            // BEFORE returning the run: an uncounted refusal never reaches
+            // the max-attempts valve, so the input would be re-selected as
+            // the fifo head on every later wake forever.
+            //
+            // The disposition is applied to the WHOLE batch, mirroring the
+            // existing whole-batch `ResolveStagedRollback` idiom: every still
+            // queued member accrues an attempt and is re-minted behind the
+            // backlog together, so at the retry cap the whole batch
+            // terminalizes rather than only the culpable member. Blast radius
+            // is therefore the batch size (`select_queue_batch` does batch
+            // multiple non-prompt inputs). Accepted deliberately: a per-input
+            // refusal probe cannot attribute a batch-level refusal to any
+            // single member, so it would need a whole-batch fallback anyway -
+            // a second, untested path through the never-starve floor.
+            let abandoned_input_ids = driver
+                    .resolve_unstageable_queued_inputs(&staged_ids)
+                    .await
+                    .map_err(|resolve_err| {
+                        RuntimeDriverError::Internal(format!(
+                            "failed to resolve unstageable queued inputs: {resolve_err}; staging refusal: {reason}"
+                        ))
+                    })?;
+            if let Err(rollback_err) = machine_apply_run_return_projection(
+                &mut driver,
+                &run_id,
+                RunReturnDisposition::Rollback,
+            ) {
+                return Err(RuntimeDriverError::Internal(format!(
+                    "failed to roll back runtime run after batch staging refusal: {rollback_err}; staging refusal: {reason}"
+                )));
+            }
+            return Ok(RuntimeLoopBatchStart::StageRefused {
+                reason,
+                abandoned_input_ids,
+            });
+        }
+    };
 
-    if let Err(err) = stage_result {
+    if let Err(err) = driver.machine_realize_authorized_stage_batch(stage_authority) {
         let _ = driver.rollback_staged(&staged_ids);
         if let Err(rollback_err) = machine_apply_run_return_projection(
             &mut driver,
@@ -7257,7 +7334,7 @@ pub(crate) async fn prepare_runtime_loop_batch_start(
         }
     }
 
-    Ok(())
+    Ok(RuntimeLoopBatchStart::Started)
 }
 
 /// Validate the committed boundary witness.

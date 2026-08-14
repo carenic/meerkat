@@ -12384,6 +12384,11 @@ pub mod inputs {
         pub lane: InputLane,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveUnstageableQueuedInput {
+        pub input_id: String,
+        pub lane: InputLane,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct MarkApplied {
         pub input_id: String,
     }
@@ -13325,6 +13330,7 @@ pub enum Input {
     IncrementAttemptCount(inputs::IncrementAttemptCount),
     RollbackStaged(inputs::RollbackStaged),
     ResolveStagedRollback(inputs::ResolveStagedRollback),
+    ResolveUnstageableQueuedInput(inputs::ResolveUnstageableQueuedInput),
     MarkApplied(inputs::MarkApplied),
     MarkAppliedPendingConsumption(inputs::MarkAppliedPendingConsumption),
     ConsumeInput(inputs::ConsumeInput),
@@ -13678,6 +13684,7 @@ impl Input {
             Self::IncrementAttemptCount(_) => InputKind::IncrementAttemptCount,
             Self::RollbackStaged(_) => InputKind::RollbackStaged,
             Self::ResolveStagedRollback(_) => InputKind::ResolveStagedRollback,
+            Self::ResolveUnstageableQueuedInput(_) => InputKind::ResolveUnstageableQueuedInput,
             Self::MarkApplied(_) => InputKind::MarkApplied,
             Self::MarkAppliedPendingConsumption(_) => InputKind::MarkAppliedPendingConsumption,
             Self::ConsumeInput(_) => InputKind::ConsumeInput,
@@ -14026,6 +14033,7 @@ pub enum InputKind {
     IncrementAttemptCount,
     RollbackStaged,
     ResolveStagedRollback,
+    ResolveUnstageableQueuedInput,
     MarkApplied,
     MarkAppliedPendingConsumption,
     ConsumeInput,
@@ -16885,6 +16893,16 @@ pub enum TransitionId {
     ResolveStagedRollbackMaxAttemptsExhaustedRunning,
     ResolveStagedRollbackMaxAttemptsExhaustedRetired,
     ResolveStagedRollbackMaxAttemptsExhaustedStopped,
+    ResolveUnstageableQueuedInputDeferredIdle,
+    ResolveUnstageableQueuedInputDeferredAttached,
+    ResolveUnstageableQueuedInputDeferredRunning,
+    ResolveUnstageableQueuedInputDeferredRetired,
+    ResolveUnstageableQueuedInputDeferredStopped,
+    ResolveUnstageableQueuedInputMaxAttemptsExhaustedIdle,
+    ResolveUnstageableQueuedInputMaxAttemptsExhaustedAttached,
+    ResolveUnstageableQueuedInputMaxAttemptsExhaustedRunning,
+    ResolveUnstageableQueuedInputMaxAttemptsExhaustedRetired,
+    ResolveUnstageableQueuedInputMaxAttemptsExhaustedStopped,
     MarkAppliedIdle,
     MarkAppliedAttached,
     MarkAppliedRunning,
