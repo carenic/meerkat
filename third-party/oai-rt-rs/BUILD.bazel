@@ -29,14 +29,14 @@ rust_library(
         "@crates__schemars-0.8.22//:schemars",
         "@crates__serde-1.0.229//:serde",
         "@crates__serde_json-1.0.151//:serde_json",
-        "@crates__thiserror-2.0.18//:thiserror",
+        "@crates__thiserror-2.0.20//:thiserror",
         "@crates__tokio-1.52.3//:tokio",
         "@crates__tokio-tungstenite-0.26.2//:tokio_tungstenite",
         "@crates__tracing-0.1.44//:tracing",
         "@crates__url-2.5.8//:url",
     ],
     proc_macro_deps = [
-        "@crates__async-trait-0.1.91//:async_trait",
+        "@crates__async-trait-0.1.92//:async_trait",
     ],
     compile_data = glob(
         allow_empty = True,
