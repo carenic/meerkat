@@ -60,6 +60,11 @@ impl BuiltinTool for TaskGetTool {
         true
     }
 
+    /// Task-store read.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::ReadOnly
+    }
+
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
         let params: TaskGetParams = serde_json::from_value(args)
             .map_err(|e| BuiltinToolError::InvalidArgs(e.to_string()))?;

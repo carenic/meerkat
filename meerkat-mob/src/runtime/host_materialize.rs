@@ -565,6 +565,7 @@ fn decompile_portable_spec_with_env(
             mob: spec.profile.tools.mob,
             schedule: spec.profile.tools.schedule,
             image_generation: spec.profile.tools.image_generation,
+            read_only: spec.profile.tools.read_only,
             // The host-surface MCP allowlist and rust bundles are
             // structurally absent from the portable vocabulary (A4) —
             // nothing to map.
@@ -642,6 +643,7 @@ fn decompile_portable_spec_with_env(
             WireResolvedToolAccessPolicy::DenyList(names) => {
                 meerkat_core::ops::ToolAccessPolicy::DenyList(names.iter().cloned().collect())
             }
+            WireResolvedToolAccessPolicy::ReadOnly => meerkat_core::ops::ToolAccessPolicy::ReadOnly,
         }
     });
 
@@ -2979,6 +2981,7 @@ mod tests {
                     mob: true,
                     schedule: false,
                     image_generation: false,
+                    read_only: false,
                     mcp_servers: BTreeMap::new(),
                     non_portable_disabled: Vec::new(),
                 },

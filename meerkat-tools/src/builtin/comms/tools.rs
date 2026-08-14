@@ -80,6 +80,11 @@ impl BuiltinTool for SendTool {
         true
     }
 
+    /// Delivers a message to another agent.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::Mutating
+    }
+
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
         handle_tools_call(&self.state.tool_context, "send", &args)
             .await
@@ -112,6 +117,11 @@ impl BuiltinTool for PeersTool {
 
     fn default_enabled(&self) -> bool {
         true
+    }
+
+    /// Peer-roster read.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::ReadOnly
     }
 
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {

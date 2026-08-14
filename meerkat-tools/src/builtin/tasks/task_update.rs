@@ -108,6 +108,11 @@ impl BuiltinTool for TaskUpdateTool {
         true
     }
 
+    /// Writes a task row.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::Mutating
+    }
+
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
         let params: TaskUpdateParams = serde_json::from_value(args)
             .map_err(|e| BuiltinToolError::InvalidArgs(e.to_string()))?;

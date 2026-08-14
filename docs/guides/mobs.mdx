@@ -132,6 +132,42 @@ Profiles are role contracts. Spawn requests may override selected profile
 fields, but the definition remains the durable source for the mob's intended
 shape.
 
+### Read-only profiles
+
+`tools.read_only = true` declares a profile whose members may execute only
+tools their owning dispatcher declares read-only. It is enforcement at the
+execution gate, not prompt guidance, and it is the floor: a spawn request
+cannot widen it.
+
+```json
+{
+  "reviewer": {
+    "model": "claude-opus-5",
+    "peer_description": "Reviews changes and reports findings; cannot mutate anything",
+    "tools": { "builtins": true, "comms": true, "read_only": true }
+  }
+}
+```
+
+A denied call comes back as an ordinary `access_denied` tool error, so the run
+continues and the transcript records the refusal. The model-visible tool list is
+unchanged (gating never moves the prompt-cache prefix).
+
+What the declaration covers, and what it cannot:
+
+| Tool class | Under `read_only` | Why |
+|------------|-------------------|-----|
+| Built-ins that declare read-only (`datetime`, `task_get`, `task_list`, `peers`, `blob_inspect`, skill browsing/reads, `view_image`, `web_search`, shell job status/list) | Permitted | The owning tool declares `ReadOnly` |
+| Built-ins that mutate (`apply_patch`, `shell`, `blob_save_file`, `generate_image`, `task_create`/`task_update`, `send_message`, `monitor_start`) | Denied | Declared `Mutating` |
+| `shell` specifically | Denied, always | Nothing classifies a command line, so there is no read-only shell. File reads in-tree go through `shell`, so a read-only member cannot read files unless the host supplies a dispatcher that declares its own read tools |
+| MCP tools | Denied | `readOnlyHint` is a hint from the server being gated, not a proof. Audit the tool and use an explicit allow-list policy instead |
+| Host rust bundles / external tool surfaces | Denied until they declare | Undeclared is `Unknown`, and `Unknown` is never admitted |
+| Provider-native server tools (provider-run search, code execution, computer use) | Not gated at all | They never traverse the tool dispatcher. A read-only launch is only truthful when the host also disables native tool capabilities |
+
+Anything undeclared is denied: over-denial is honest, silent admission would be
+a false guarantee. Hosts widen the read surface by implementing
+`AgentToolDispatcher::tool_mutation_class` on their own dispatcher.
+
 ### Profile model and provider fields
 
 Beyond `model`, a profile can pin provider identity and per-member behavior:
@@ -520,6 +556,70 @@ Run and inspect a flow:
     ```
   </Tab>
 </Tabs>
+
+### Auditing a run
+
+Every run-result surface carries an `accounting` block next to the flow result:
+`rkat mob run --json`, `rkat mob attach --json` (the detached-run audit path),
+the `mob/run_result` RPC method, and the `meerkat_mob_run_result` MCP tool. The
+two polled surfaces (RPC, MCP) attach it only once the run is terminal, so a
+mid-run poll stays cheap and never reports totals for an unfinished run; the CLI
+paths wait for terminality before collecting. The block is also absent when
+collection failed, which the CLI reports on stderr.
+
+```json
+{
+  "run_id": "…", "mob_id": "release-triage", "flow_id": "triage",
+  "status": "completed",
+  "result": { "…": "flow output" },
+  "accounting": {
+    "attribution": "session_cumulative",
+    "members": [
+      { "agent_identity": "analyst-1", "role": "analyst", "session_id": "…",
+        "model": "claude-sonnet-4-6", "provider": "anthropic",
+        "message_count": 12,
+        "usage": { "input_tokens": 41230, "output_tokens": 1880, "total_tokens": 43110 } }
+    ],
+    "usage_total": { "input_tokens": 41230, "output_tokens": 1880, "total_tokens": 43110 },
+    "member_session_ids": ["…"],
+    "unpriced_reason": "no price data in the model catalog; token counts are exact, monetary cost is not computed"
+  }
+}
+```
+
+Read those numbers exactly as labelled:
+
+- **`attribution: session_cumulative`** - each number is the lifetime total of
+  that member's bridge session. It equals the run's usage when the session
+  served this run alone; on a mob that has executed several runs it includes the
+  other turns. Nothing in the durable run projection records per-run usage.
+- **`usage_total`** is the sum of the readable members only. When
+  `members_usage_unavailable` is non-zero (remote members, archived sessions)
+  it is a floor, and each affected member carries a `usage_unavailable` reason
+  instead of a zero. It carries input and output tokens only: cache counters
+  stay per member, because their relation to `input_tokens` is
+  provider-specific and the total may span providers.
+- **`members` is the mob's current roster**, not this run's participant set:
+  the run projection records no participation, so a member that took no part in
+  the run is still listed and its session id still rides in
+  `member_session_ids`. Exporting the whole pointer set can pull transcripts
+  unrelated to the run.
+- **No monetary cost** is reported. The model catalog carries no price data, so
+  a cost number would be invented; `unpriced_reason` says so explicitly.
+
+Full transcripts stay with their single authority, the ATIF exporter. The
+envelope hands you the pointer set rather than duplicating messages, tool calls,
+tool results, or per-turn usage:
+
+```bash
+rkat mob run release-triage --flow triage --json \
+  | jq -r '.accounting.member_session_ids[]' \
+  | xargs -n1 rkat session export-atif
+```
+
+In text mode the same facts print as `usage`, `cost`, and `transcript` lines,
+the last of which carries the ready-to-run `rkat session export-atif <id>`
+command. `rkat run --export-atif` writes a trajectory for a single-session run.
 
 ## Observe And Operate
 

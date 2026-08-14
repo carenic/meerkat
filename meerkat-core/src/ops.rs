@@ -396,6 +396,24 @@ pub enum ToolAccessPolicy {
     AllowList(ToolNameSet),
     /// Block specific tools
     DenyList(ToolNameSet),
+    /// Only tools whose owning dispatcher declares
+    /// [`crate::ToolMutationClass::ReadOnly`] may execute.
+    ///
+    /// Name-independent intent: a tool the dispatcher chain does not declare
+    /// read-only is denied, so tools that appear later (MCP servers finishing
+    /// their handshake, host bundles) never widen the policy. See
+    /// [`crate::tool_execution_policy`] for the exact guarantee boundary this
+    /// declaration does and does not cover.
+    ///
+    /// Downgrade consequence: this enum is closed and adjacently tagged, and
+    /// it is persisted in durable session metadata
+    /// (`SessionMetadata.tooling.tool_access_policy`), so a binary older than
+    /// the release that added this variant cannot decode the metadata of a
+    /// session launched with read-only intent. Failing to decode is the
+    /// intended outcome (a downgrade that silently read it as `Inherit` would
+    /// drop the enforcement), but the session is unresumable on that binary
+    /// until it is upgraded.
+    ReadOnly,
 }
 
 /// Policy for operation execution

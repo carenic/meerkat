@@ -15050,7 +15050,11 @@ async fn run_pack_flow_foreground(
     )
     .await
     {
-        PackRunWaitFirst::Terminal(run) => render_mob_run_envelope(&run?, json),
+        PackRunWaitFirst::Terminal(run) => {
+            let run = run?;
+            let accounting = collect_mob_run_accounting(state, mob_id.as_str()).await;
+            render_mob_run_envelope_with_accounting(&run, accounting, json)
+        }
         PackRunWaitFirst::ShutdownSignal(signal) => {
             signal?;
             state
@@ -15068,8 +15072,9 @@ async fn run_pack_flow_foreground(
                     PACK_RUN_CANCEL_GRACE.as_secs()
                 )
             })??;
+            let accounting = collect_mob_run_accounting(state, mob_id.as_str()).await;
             let (stdout_render, stderr_warnings) = render_mob_run_pack_with_warnings(
-                render_mob_run_envelope(&run, json)?,
+                render_mob_run_envelope_with_accounting(&run, accounting, json)?,
                 warnings.to_vec(),
                 json,
             );
@@ -15242,23 +15247,207 @@ fn mob_run_status_text(status: &meerkat_mob::MobRunStatus) -> &'static str {
     }
 }
 
+/// Collect the mob's token accounting for a finished run.
+///
+/// A diagnostic projection must never turn a reached terminal into a failed
+/// command: a collection failure is reported on stderr and the accounting
+/// block is omitted, so the envelope never carries a fabricated zero.
 #[cfg(feature = "mob")]
-fn render_mob_run_envelope(run: &meerkat_mob::MobRun, json: bool) -> anyhow::Result<String> {
-    let envelope = run
+async fn collect_mob_run_accounting(
+    state: &meerkat_mob_mcp::MobMcpState,
+    mob_id: &str,
+) -> Option<meerkat_contracts::WireMobRunAccounting> {
+    match state
+        .mob_run_accounting(&meerkat_mob::MobId::from(mob_id.to_string()))
+        .await
+    {
+        Ok(accounting) => Some(accounting),
+        Err(error) => {
+            eprintln!("warning\tmob run accounting unavailable: {error}");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "mob")]
+fn render_mob_run_envelope_with_accounting(
+    run: &meerkat_mob::MobRun,
+    accounting: Option<meerkat_contracts::WireMobRunAccounting>,
+    json: bool,
+) -> anyhow::Result<String> {
+    let mut envelope = run
         .public_result_value()
         .map_err(|err| anyhow::anyhow!("failed to project mob run result: {err}"))?;
+    envelope.accounting = accounting;
     if json {
         return Ok(serde_json::to_string_pretty(&envelope)?);
     }
-    let result = envelope.result.unwrap_or(serde_json::Value::Null);
-    Ok(format!(
-        "run\tmob={}\tflow={}\trun_id={}\tstatus={}\nresult\t{}",
-        envelope.mob_id,
-        envelope.flow_id,
-        envelope.run_id,
-        mob_run_status_text(&run.status),
-        serde_json::to_string(&result)?
-    ))
+    render_mob_run_envelope_text(&envelope, mob_run_status_text(&run.status))
+}
+
+/// Human-readable projection of a run envelope.
+///
+/// Accounting rides as its own lines rather than being folded into `result`:
+/// the result is the flow's output, the usage numbers are session-cumulative
+/// facts about the members, and the transcript lines are pointers to the
+/// exporter (which owns messages, tool calls, and per-turn usage).
+#[cfg(feature = "mob")]
+fn render_mob_run_envelope_text(
+    envelope: &meerkat_contracts::WireMobRunResultEnvelope,
+    status: &str,
+) -> anyhow::Result<String> {
+    let result = envelope.result.clone().unwrap_or(serde_json::Value::Null);
+    let mut lines = vec![
+        format!(
+            "run\tmob={}\tflow={}\trun_id={}\tstatus={status}",
+            envelope.mob_id, envelope.flow_id, envelope.run_id,
+        ),
+        format!("result\t{}", serde_json::to_string(&result)?),
+    ];
+    if let Some(accounting) = envelope.accounting.as_ref() {
+        lines.push(format!(
+            "usage\tattribution=session_cumulative\tinput={}\toutput={}\ttotal={}\tmembers_unavailable={}",
+            accounting.usage_total.input_tokens,
+            accounting.usage_total.output_tokens,
+            accounting.usage_total.total_tokens,
+            accounting.members_usage_unavailable
+        ));
+        lines.push(format!("cost\tunpriced\t{}", accounting.unpriced_reason));
+        for session_id in &accounting.member_session_ids {
+            lines.push(format!(
+                "transcript\tsession={session_id}\texport=rkat session export-atif {session_id}"
+            ));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+#[cfg(all(test, feature = "mob"))]
+mod mob_run_accounting_render_tests {
+    use super::*;
+
+    fn accounting() -> meerkat_contracts::WireMobRunAccounting {
+        meerkat_contracts::WireMobRunAccounting {
+            attribution: meerkat_contracts::WireMobRunUsageAttribution::SessionCumulative,
+            members: vec![meerkat_contracts::WireMobRunMemberAccounting {
+                agent_identity: "reviewer-1".to_string(),
+                role: "reviewer".to_string(),
+                session_id: Some("sess-1".to_string()),
+                model: Some("claude-opus-5".to_string()),
+                provider: Some(meerkat_core::Provider::Anthropic),
+                message_count: Some(6),
+                usage: Some(meerkat_contracts::wire::WireUsage {
+                    input_tokens: 120,
+                    output_tokens: 30,
+                    total_tokens: 150,
+                    cache_creation_tokens: None,
+                    cache_read_tokens: None,
+                }),
+                usage_unavailable: None,
+            }],
+            usage_total: meerkat_contracts::wire::WireUsage {
+                input_tokens: 120,
+                output_tokens: 30,
+                total_tokens: 150,
+                cache_creation_tokens: None,
+                cache_read_tokens: None,
+            },
+            members_usage_unavailable: 0,
+            member_session_ids: vec!["sess-1".to_string()],
+            unpriced_reason: meerkat_contracts::wire::MOB_RUN_ACCOUNTING_UNPRICED_REASON
+                .to_string(),
+        }
+    }
+
+    fn envelope(
+        accounting: Option<meerkat_contracts::WireMobRunAccounting>,
+    ) -> meerkat_contracts::WireMobRunResultEnvelope {
+        meerkat_contracts::WireMobRunResultEnvelope {
+            run_id: "run-1".to_string(),
+            mob_id: "mob-1".to_string(),
+            flow_id: "main".to_string(),
+            status: meerkat_contracts::WireMobRunStatus::Completed,
+            result: Some(serde_json::json!("done")),
+            outputs: Default::default(),
+            accounting,
+        }
+    }
+
+    /// `--json` shape pin: the pre-existing keys keep their meaning and the
+    /// accounting block carries usage, the attribution label, the session
+    /// pointer set, and an explicit no-cost statement.
+    #[test]
+    fn json_envelope_carries_accounting_without_a_cost_number() {
+        let encoded = serde_json::to_value(envelope(Some(accounting())))
+            .expect("run envelope serializes to json");
+        assert_eq!(encoded["run_id"], "run-1");
+        assert_eq!(encoded["status"], "completed");
+        assert_eq!(encoded["result"], "done");
+        let accounting = &encoded["accounting"];
+        assert_eq!(accounting["attribution"], "session_cumulative");
+        assert_eq!(accounting["usage_total"]["input_tokens"], 120);
+        assert_eq!(accounting["usage_total"]["output_tokens"], 30);
+        assert_eq!(accounting["usage_total"]["total_tokens"], 150);
+        assert_eq!(accounting["members"][0]["session_id"], "sess-1");
+        assert_eq!(accounting["members"][0]["model"], "claude-opus-5");
+        assert_eq!(accounting["members"][0]["usage"]["total_tokens"], 150);
+        assert_eq!(accounting["member_session_ids"][0], "sess-1");
+        assert_eq!(
+            accounting["unpriced_reason"],
+            meerkat_contracts::wire::MOB_RUN_ACCOUNTING_UNPRICED_REASON
+        );
+        assert!(
+            accounting.get("cost_usd").is_none() && accounting.get("total_cost_usd").is_none(),
+            "no monetary cost may be reported: {accounting}"
+        );
+        // The envelope must not grow a second transcript authority.
+        for forbidden in ["messages", "steps", "tool_calls", "transcript"] {
+            assert!(
+                accounting.get(forbidden).is_none(),
+                "accounting must point at the exporter, not duplicate '{forbidden}'"
+            );
+        }
+    }
+
+    /// Old consumers keep parsing the old shape: with no accounting collected,
+    /// the field is absent rather than null.
+    #[test]
+    fn json_envelope_omits_accounting_when_absent() {
+        let encoded =
+            serde_json::to_value(envelope(None)).expect("run envelope serializes to json");
+        assert!(encoded.get("accounting").is_none());
+    }
+
+    #[test]
+    fn text_render_reports_usage_attribution_and_the_export_command() {
+        let rendered = render_mob_run_envelope_text(&envelope(Some(accounting())), "completed")
+            .expect("text render");
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines[0], "run\tmob=mob-1\tflow=main\trun_id=run-1\tstatus=completed",
+            "the existing first line must not change shape"
+        );
+        assert_eq!(lines[1], "result\t\"done\"");
+        assert_eq!(
+            lines[2],
+            "usage\tattribution=session_cumulative\tinput=120\toutput=30\ttotal=150\tmembers_unavailable=0"
+        );
+        assert!(lines[3].starts_with("cost\tunpriced\t"));
+        assert_eq!(
+            lines[4],
+            "transcript\tsession=sess-1\texport=rkat session export-atif sess-1"
+        );
+    }
+
+    #[test]
+    fn text_render_without_accounting_keeps_the_two_line_shape() {
+        let rendered =
+            render_mob_run_envelope_text(&envelope(None), "failed").expect("text render");
+        assert_eq!(
+            rendered,
+            "run\tmob=mob-1\tflow=main\trun_id=run-1\tstatus=failed\nresult\t\"done\""
+        );
+    }
 }
 
 #[cfg(feature = "mob")]
@@ -15573,7 +15762,11 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
                 eprintln!("warning\t{}", detach_execution_custody_warning(&run_id));
             } else {
                 let run = wait_for_terminal_flow_run(state.as_ref(), &target, &run_id).await?;
-                println!("{}", render_mob_run_envelope(&run, json)?);
+                let accounting = collect_mob_run_accounting(state.as_ref(), &target).await;
+                println!(
+                    "{}",
+                    render_mob_run_envelope_with_accounting(&run, accounting, json)?
+                );
             }
             Ok(())
         }
@@ -15640,7 +15833,14 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
         } => {
             let parsed_run_id = parse_cli_run_id(&run_id)?;
             let run = wait_for_terminal_flow_run(state.as_ref(), &mob_id, &parsed_run_id).await?;
-            println!("{}", render_mob_run_envelope(&run, json)?);
+            // `attach` is the audit path for a detached run, so it collects the
+            // same accounting the foreground run does; the wait above already
+            // established terminality.
+            let accounting = collect_mob_run_accounting(state.as_ref(), &mob_id).await;
+            println!(
+                "{}",
+                render_mob_run_envelope_with_accounting(&run, accounting, json)?
+            );
             Ok(())
         }
         MobCommands::SpawnHelper {

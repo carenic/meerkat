@@ -86,6 +86,18 @@ impl AgentToolDispatcher for CommsToolSurface {
             .into()
     }
 
+    /// `peers` is a roster read; every other comms tool delivers a message to
+    /// another agent, which is a mutation of state outside this session.
+    fn tool_mutation_class(&self, tool_name: &str) -> meerkat_core::ToolMutationClass {
+        if !self.tool_defs.iter().any(|tool| tool.name == tool_name) {
+            return meerkat_core::ToolMutationClass::Unknown;
+        }
+        match tool_name {
+            "peers" => meerkat_core::ToolMutationClass::ReadOnly,
+            _ => meerkat_core::ToolMutationClass::Mutating,
+        }
+    }
+
     fn tool_catalog_capabilities(&self) -> ToolCatalogCapabilities {
         ToolCatalogCapabilities {
             exact_catalog: true,

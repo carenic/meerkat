@@ -5692,6 +5692,7 @@ fn sample_definition() -> MobDefinition {
                 mob: true,
                 schedule: false,
                 image_generation: false,
+                read_only: false,
                 mcp: vec![],
                 mcp_servers: vec![],
                 rust_bundles: vec![],

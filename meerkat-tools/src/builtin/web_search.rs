@@ -74,6 +74,11 @@ impl BuiltinTool for WebSearchTool {
         false
     }
 
+    /// Retrieval-only outbound query; it publishes nothing and writes no local state.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::ReadOnly
+    }
+
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
         let args: WebSearchToolArgs = serde_json::from_value(args)
             .map_err(|err| BuiltinToolError::invalid_args(err.to_string()))?;

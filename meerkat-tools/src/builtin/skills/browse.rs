@@ -60,6 +60,11 @@ impl BuiltinTool for BrowseSkillsTool {
         false
     }
 
+    /// Skill-catalog read.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::ReadOnly
+    }
+
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
         let args: BrowseSkillsArgs = serde_json::from_value(args)
             .map_err(|err| BuiltinToolError::InvalidArgs(err.to_string()))?;

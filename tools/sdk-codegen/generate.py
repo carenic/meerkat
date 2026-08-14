@@ -109,6 +109,12 @@ MOB_RPC_CONTRACT_TYPES = [
     "WireMobToolConfig",
     "WireMobProfile",
     "WireMobRun",
+    # Dependencies of `WireMobRunResultEnvelope.accounting`, listed before it
+    # so the emitted rows exist by the time the envelope references them. The
+    # attribution vocabulary is an alias, so it lives in
+    # MOB_RPC_CONTRACT_ALIAS_TYPES instead.
+    "WireMobRunMemberAccounting",
+    "WireMobRunAccounting",
     "WireMobRunResultEnvelope",
     "WireMobRunStatus",
     "WireWorkGraphFlowWorkRef",
@@ -486,6 +492,10 @@ MOB_RPC_CONTRACT_ALIAS_TYPES = [
     "WireReachability",
     "WireNonPortableResourceKind",
     "WireMobRunStatus",
+    # Closed usage-attribution vocabulary on the run-result accounting block.
+    # An alias, not a contract type: the object emitter would turn a
+    # single-variant string enum into an empty `{}` interface.
+    "WireMobRunUsageAttribution",
     "WireWorkExecutionLifecyclePhase",
     "WirePeerConnectivity",
     "WireHostBindingDescriptorKind",
@@ -577,6 +587,16 @@ MOB_RPC_PROMOTED_SCHEMA_DEFS = frozenset(
         "MobHostStatus",
         "WireHostCapabilityFlags",
         "WireRouteInstallObligation",
+        # Run-result accounting: the block, its per-member rows, and the
+        # attribution tag are schema-local `$defs` under
+        # `WireMobRunResultEnvelope`. Without promotion the envelope's
+        # `accounting` widens to `Record<string, unknown>` / `dict[str, Any]`,
+        # so an SDK auditor cannot narrow the usage totals, the
+        # `session_cumulative` attribution, or the per-member
+        # `usage_unavailable` reasons. The attribution alias is promoted
+        # through MOB_RPC_CONTRACT_ALIAS_TYPES below.
+        "WireMobRunAccounting",
+        "WireMobRunMemberAccounting",
         *MOB_RPC_CONTRACT_ALIAS_TYPES,
         *MOB_RPC_CONTRACT_HELPER_TYPES,
         "MobMemberListEntryWire",
@@ -655,6 +675,11 @@ SESSION_TRANSCRIPT_SCHEMA_ROOTS = {
 
 PUBLIC_TRANSITIVE_SCHEMA_ROOTS = {
     "WireAssistantBlock",
+    # Run-result accounting: its usage rows are the whole point of the block,
+    # so promoting the block alone would leave `usage` / `usage_total` widened
+    # to opaque maps. The closure keeps `WireMobRunMemberAccounting`,
+    # `WireUsage`, and `Provider` named without a hand-copied roster.
+    "WireMobRunAccounting",
     *SESSION_TRANSCRIPT_SCHEMA_ROOTS,
 }
 

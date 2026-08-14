@@ -839,7 +839,7 @@ class HelpResponse:
     text: str
     tool_calls: int
     turns: int
-    usage: dict[str, Any]
+    usage: WireUsage
     extraction_error: Optional[dict[str, Any]] = None
     schema_warnings: Optional[list[dict[str, Any]]] = None
     session_ref: Optional[str] = None
@@ -1717,6 +1717,7 @@ class WireMobToolConfig:
     mcp: Optional[list[str]] = None
     memory: Optional[bool] = None
     mob: Optional[bool] = None
+    read_only: Optional[bool] = None
     schedule: Optional[bool] = None
     shell: Optional[bool] = None
     workgraph: Optional[bool] = None
@@ -1758,12 +1759,49 @@ shape so consumers never re-derive run identity or lifecycle from a free
 
 
 @dataclass
+class WireMobRunMemberAccounting:
+    """Per-member token accounting and the session pointer an auditor exports."""
+    agent_identity: str
+    role: str
+    message_count: Optional[int] = None
+    model: Optional[str] = None
+    provider: Optional[Provider] = None
+    session_id: Optional[str] = None
+    usage: Optional[WireUsage] = None
+    usage_unavailable: Optional[str] = None
+
+
+@dataclass
+class WireMobRunAccounting:
+    """Token accounting projection attached to a mob run envelope.
+
+This is deliberately NOT a second transcript authority. Full messages,
+tool calls, tool results, and per-turn usage live in the session event
+stream and are exported by `rkat session export-atif <session_id>` (or the
+`--export-atif` flag on a run); `member_session_ids` is the pointer set for
+that export. What rides here is only what is cheap and canonical at the
+point a run terminalizes: the per-member session usage totals and their
+attribution.
+
+Cost is structurally absent: the model catalog carries no price data, so
+no truthful monetary number can be produced in-tree. `unpriced_reason`
+states that instead of emitting a zero or a guess."""
+    attribution: WireMobRunUsageAttribution
+    unpriced_reason: str
+    usage_total: WireUsage
+    member_session_ids: Optional[list[str]] = None
+    members: Optional[list[WireMobRunMemberAccounting]] = None
+    members_usage_unavailable: Optional[int] = None
+
+
+@dataclass
 class WireMobRunResultEnvelope:
     """Typed output envelope for a completed or in-flight mob flow run."""
     flow_id: str
     mob_id: str
     run_id: str
     status: WireMobRunStatus
+    accounting: Optional[WireMobRunAccounting] = None
     outputs: Optional[dict[str, Any]] = None
     result: Optional[Any] = None
 
@@ -2761,6 +2799,7 @@ class MobToolConfigInput:
     mcp: Optional[list[str]] = None
     memory: Optional[bool] = None
     mob: Optional[bool] = None
+    read_only: Optional[bool] = None
     schedule: Optional[bool] = None
     shell: Optional[bool] = None
     workgraph: Optional[bool] = None
@@ -4742,7 +4781,7 @@ class WireLiveAdapterObservationAssistantTranscriptFinal(TypedDict, total=False)
     response_id: NotRequired[Optional[str]]
     stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled']]
     text: Required[str]
-    usage: Required[dict[str, Any]]
+    usage: Required[WireUsage]
 
 class WireLiveAdapterObservationAssistantTranscriptTruncated(TypedDict, total=False):
     content_index: NotRequired[Optional[int]]
@@ -5400,7 +5439,10 @@ class WireToolAccessPolicyDenyList(TypedDict, total=False):
     type: Required[Literal['deny_list']]
     value: Required[list[str]]
 
-WireToolAccessPolicy = WireToolAccessPolicyInherit | WireToolAccessPolicyAllowList | WireToolAccessPolicyDenyList
+class WireToolAccessPolicyReadOnly(TypedDict, total=False):
+    type: Required[Literal['read_only']]
+
+WireToolAccessPolicy = WireToolAccessPolicyInherit | WireToolAccessPolicyAllowList | WireToolAccessPolicyDenyList | WireToolAccessPolicyReadOnly
 
 # Pre-resolved tool filter inherited by a spawned mob member.
 WireToolFilter = Literal['All'] | dict[str, list[str]]
@@ -5563,6 +5605,14 @@ WireNonPortableResourceKind = Literal['rust_bundles', 'per_spawn_external_tools'
 # `meerkat_mob::MobRunStatus` so consumers branch on a closed type rather than
 # re-deriving meaning from a free-form status string.
 WireMobRunStatus = Literal['pending', 'running', 'completed', 'failed', 'canceled']
+
+# How a usage number in [`WireMobRunAccounting`] was attributed.
+#
+# A closed vocabulary rather than a doc comment because the difference is
+# load-bearing for an auditor: nothing in the mob run projection records
+# per-run token usage, so these numbers come from the members' bridge
+# sessions.
+WireMobRunUsageAttribution = Literal['session_cumulative']
 
 # Mob RPC helper wire type for WireWorkExecutionLifecyclePhase.
 WireWorkExecutionLifecyclePhase = Literal['absent', 'launch_requested', 'launch_uncertain', 'launch_quarantined', 'running', 'evidence_projection_requested', 'failure_evidence_projection_requested', 'cancellation_evidence_projection_requested', 'launch_failure_evidence_projection_requested', 'work_closure_requested', 'flow_failed', 'flow_canceled', 'evidence_projected', 'work_closed', 'launch_failed']

@@ -354,6 +354,15 @@ pub async fn build_agent_config(
         explicit => explicit,
     };
 
+    // A read-only profile is a declaration by the mob author, so it is the
+    // floor rather than a default: it replaces whatever the spawn site asked
+    // for instead of being overridden by it. Every other composition above
+    // already ran, so this is the single seam where the effective policy for a
+    // profile-built member is decided.
+    if profile.tools.read_only {
+        config.tool_access_policy = Some(meerkat_core::ops::ToolAccessPolicy::ReadOnly);
+    }
+
     Ok(config)
 }
 
@@ -803,6 +812,7 @@ mod tests {
                     mob: true,
                     schedule: false,
                     image_generation: true,
+                    read_only: false,
                     mcp: vec![],
                     mcp_servers: vec![],
                     rust_bundles: vec![],
@@ -835,6 +845,7 @@ mod tests {
                     mob: false,
                     schedule: false,
                     image_generation: false,
+                    read_only: false,
                     mcp: vec![],
                     mcp_servers: vec![],
                     rust_bundles: vec![],
@@ -1260,6 +1271,98 @@ mod tests {
             .await
             .expect("build_agent_config");
         assert_eq!(config.tool_access_policy, None);
+    }
+
+    /// A read-only profile is an enforcement declaration, so it is the floor:
+    /// the spawn site cannot widen it, and it survives an absent spec policy.
+    #[tokio::test]
+    async fn test_read_only_profile_forces_read_only_tool_access_policy() {
+        let mut def = sample_definition();
+        let profile_name = ProfileName::from("lead");
+        def.profiles
+            .get_mut(&profile_name)
+            .and_then(|binding| binding.as_inline_mut())
+            .expect("lead profile is inline")
+            .tools
+            .read_only = true;
+        let profile = def.profiles[&profile_name].as_inline().unwrap();
+        let agent_identity = AgentIdentity::from("lead-1");
+        let params = |policy: Option<meerkat_core::ops::ToolAccessPolicy>| BuildAgentConfigParams {
+            mob_id: &def.id,
+            profile_name: &profile_name,
+            agent_identity: &agent_identity,
+            profile,
+            definition: &def,
+            external_tools: None,
+            compaction_curator_override: None,
+            context: None,
+            labels: None,
+            additional_instructions: None,
+            shell_env: None,
+            mob_tool_authority_context: None,
+            tool_access_policy: policy,
+            inherited_tool_filter: None,
+            system_prompt_override: None,
+        };
+
+        let config = build_agent_config(params(None))
+            .await
+            .expect("build_agent_config");
+        assert_eq!(
+            config.tool_access_policy,
+            Some(meerkat_core::ops::ToolAccessPolicy::ReadOnly),
+            "a read-only profile must resolve to read-only intent with no spec policy"
+        );
+
+        // The widest possible spawn request must not defeat the declaration.
+        let wide = meerkat_core::ops::ToolAccessPolicy::DenyList(Default::default());
+        let config = build_agent_config(params(Some(wide)))
+            .await
+            .expect("build_agent_config");
+        assert_eq!(
+            config.tool_access_policy,
+            Some(meerkat_core::ops::ToolAccessPolicy::ReadOnly),
+            "a spawn-site policy must not widen a read-only profile"
+        );
+
+        // Control: the same definition without the declaration keeps the
+        // spawn-site policy, so the assertion above is about the declaration.
+        let mut open_def = sample_definition();
+        open_def
+            .profiles
+            .get_mut(&profile_name)
+            .and_then(|binding| binding.as_inline_mut())
+            .expect("lead profile is inline")
+            .tools
+            .read_only = false;
+        let open_profile = open_def.profiles[&profile_name].as_inline().unwrap();
+        let config = build_agent_config(BuildAgentConfigParams {
+            mob_id: &open_def.id,
+            profile_name: &profile_name,
+            agent_identity: &agent_identity,
+            profile: open_profile,
+            definition: &open_def,
+            external_tools: None,
+            compaction_curator_override: None,
+            context: None,
+            labels: None,
+            additional_instructions: None,
+            shell_env: None,
+            mob_tool_authority_context: None,
+            tool_access_policy: Some(meerkat_core::ops::ToolAccessPolicy::DenyList(
+                Default::default(),
+            )),
+            inherited_tool_filter: None,
+            system_prompt_override: None,
+        })
+        .await
+        .expect("build_agent_config");
+        assert_eq!(
+            config.tool_access_policy,
+            Some(meerkat_core::ops::ToolAccessPolicy::DenyList(
+                Default::default()
+            ))
+        );
     }
 
     #[tokio::test]

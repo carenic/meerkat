@@ -114,6 +114,11 @@ impl BuiltinTool for ViewImageTool {
         true
     }
 
+    /// Reads an image path into the transcript.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::ReadOnly
+    }
+
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
         let args: ViewImageArgs = serde_json::from_value(args)
             .map_err(|e| BuiltinToolError::invalid_args(e.to_string()))?;

@@ -103,6 +103,16 @@ pub trait BuiltinTool: Send + Sync {
     /// Returns whether this tool is enabled by default
     fn default_enabled(&self) -> bool;
 
+    /// Declared world-mutation semantics for this built-in.
+    ///
+    /// The default is [`meerkat_core::ToolMutationClass::Unknown`], so a new
+    /// built-in is never silently admitted by a read-only launch. Only tools
+    /// that provably cannot change state outside the session transcript
+    /// declare [`meerkat_core::ToolMutationClass::ReadOnly`].
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::Unknown
+    }
+
     /// Internal execution declaration for this built-in tool.
     ///
     /// Provider-facing [`ToolDef`] remains unchanged; the composite attaches

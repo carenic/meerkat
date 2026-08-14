@@ -97,6 +97,20 @@ fn is_comms_tool(name: &str) -> bool {
     )
 }
 
+/// Mutation class of a comms-owned tool.
+///
+/// These wrappers execute comms tools themselves, so they own the declaration
+/// for them rather than forwarding it. `peers` is a roster read; every other
+/// comms tool delivers a message to another agent, which mutates state outside
+/// this session. Classified by the same `is_comms_tool` predicate that routes
+/// dispatch, so routing and classification cannot disagree on a name.
+fn comms_tool_mutation_class(name: &str) -> meerkat_core::ToolMutationClass {
+    match name {
+        "peers" => meerkat_core::ToolMutationClass::ReadOnly,
+        _ => meerkat_core::ToolMutationClass::Mutating,
+    }
+}
+
 fn callability_for_context(ctx: &ToolContext, name: &str) -> ToolCallability {
     comms_tool_unavailable_reason(ctx, name)
         .map_or_else(ToolCallability::callable, ToolCallability::unavailable)
@@ -215,6 +229,21 @@ impl<T: AgentToolDispatcher + 'static> AgentToolDispatcher for CommsToolDispatch
         } else {
             ExternalToolUpdate::default()
         }
+    }
+
+    /// Comms tools are classified here; everything else keeps the inner
+    /// dispatcher's declaration. Without this forwarding a read-only execution
+    /// policy would deny the inner builtins too, because an undeclared tool is
+    /// `Unknown` and `Unknown` is never admitted.
+    fn tool_mutation_class(&self, tool_name: &str) -> meerkat_core::ToolMutationClass {
+        if is_comms_tool(tool_name) {
+            return comms_tool_mutation_class(tool_name);
+        }
+        self.inner
+            .as_ref()
+            .map_or(meerkat_core::ToolMutationClass::Unknown, |inner| {
+                inner.tool_mutation_class(tool_name)
+            })
     }
 
     fn tool_catalog_capabilities(&self) -> ToolCatalogCapabilities {
@@ -441,6 +470,17 @@ impl AgentToolDispatcher for DynCommsToolDispatcher {
 
     async fn poll_external_updates(&self) -> ExternalToolUpdate {
         self.inner.poll_external_updates().await
+    }
+
+    /// Comms tools are classified here; everything else keeps the inner
+    /// dispatcher's declaration. `ToolBuilder::build` wraps the builtin
+    /// composite in this type whenever comms is enabled, so without the
+    /// forwarding a read-only execution policy would deny every builtin too.
+    fn tool_mutation_class(&self, tool_name: &str) -> meerkat_core::ToolMutationClass {
+        if is_comms_tool(tool_name) {
+            return comms_tool_mutation_class(tool_name);
+        }
+        self.inner.tool_mutation_class(tool_name)
     }
 
     fn tool_catalog_capabilities(&self) -> ToolCatalogCapabilities {
@@ -1343,5 +1383,89 @@ mod tests {
         assert!(names.contains(&"peers"));
         assert!(!names.contains(&"send_request"));
         assert!(!names.contains(&"send_response"));
+    }
+
+    /// An inner dispatcher that declares one read and one write, so a wrapper
+    /// that drops the declaration is visible as `Unknown`.
+    struct DeclaringInnerDispatcher;
+
+    #[async_trait]
+    impl AgentToolDispatcher for DeclaringInnerDispatcher {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            ["inner_read", "inner_write"]
+                .into_iter()
+                .map(|name| {
+                    Arc::new(ToolDef {
+                        name: name.into(),
+                        description: String::new(),
+                        input_schema: serde_json::json!({"type": "object"}),
+                        provenance: None,
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into()
+        }
+
+        async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
+            Ok(ToolResult::new(call.id.to_string(), "inner".to_string(), false).into())
+        }
+
+        fn tool_mutation_class(&self, tool_name: &str) -> meerkat_core::ToolMutationClass {
+            match tool_name {
+                "inner_read" => meerkat_core::ToolMutationClass::ReadOnly,
+                "inner_write" => meerkat_core::ToolMutationClass::Mutating,
+                _ => meerkat_core::ToolMutationClass::Unknown,
+            }
+        }
+    }
+
+    /// A read-only execution policy admits only declared reads, so a wrapper
+    /// that answered `Unknown` for the inner tools would leave the member able
+    /// to execute nothing at all.
+    #[test]
+    fn comms_wrappers_forward_inner_mutation_declarations() {
+        let (router, trusted_peers) = test_router();
+        let inner: Arc<dyn AgentToolDispatcher> = Arc::new(DeclaringInnerDispatcher);
+        let dyn_wrapper =
+            DynCommsToolDispatcher::new(Arc::clone(&router), trusted_peers.clone(), inner);
+        for (name, expected) in [
+            ("inner_read", meerkat_core::ToolMutationClass::ReadOnly),
+            ("inner_write", meerkat_core::ToolMutationClass::Mutating),
+            ("peers", meerkat_core::ToolMutationClass::ReadOnly),
+            ("send_message", meerkat_core::ToolMutationClass::Mutating),
+            ("no_such_tool", meerkat_core::ToolMutationClass::Unknown),
+        ] {
+            assert_eq!(
+                dyn_wrapper.tool_mutation_class(name),
+                expected,
+                "DynCommsToolDispatcher must report {name} as {expected:?}"
+            );
+        }
+
+        let generic = CommsToolDispatcher::with_inner(
+            Arc::clone(&router),
+            trusted_peers.clone(),
+            Arc::new(DeclaringInnerDispatcher),
+        );
+        assert_eq!(
+            generic.tool_mutation_class("inner_read"),
+            meerkat_core::ToolMutationClass::ReadOnly
+        );
+        assert_eq!(
+            generic.tool_mutation_class("send_message"),
+            meerkat_core::ToolMutationClass::Mutating
+        );
+
+        // No inner dispatcher: comms tools are still declared, everything else
+        // is unknown and therefore denied under read-only intent.
+        let bare = CommsToolDispatcher::new(router, trusted_peers);
+        assert_eq!(
+            bare.tool_mutation_class("peers"),
+            meerkat_core::ToolMutationClass::ReadOnly
+        );
+        assert_eq!(
+            bare.tool_mutation_class("inner_read"),
+            meerkat_core::ToolMutationClass::Unknown
+        );
     }
 }

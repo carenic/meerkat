@@ -260,6 +260,31 @@ impl ToolGateway {
         })
     }
 
+    /// The single dispatcher that owns `name` for declaration purposes.
+    ///
+    /// Deliberately callability-agnostic (unlike [`Self::resolve_routing`]):
+    /// a declaration must not flicker with a tool's momentary availability.
+    /// `None` when no entry surfaces the name or more than one does.
+    fn declaring_owner(&self, name: &str) -> Option<&dyn AgentToolDispatcher> {
+        if let Some(&owner_index) = self.routing.get(name) {
+            let owner = self.entries.get(owner_index)?;
+            if !matches!(Self::entry_routing(owner, name), EntryRouting::NotSurfaced) {
+                return Some(owner.dispatcher.as_ref());
+            }
+        }
+        let mut owner: Option<&DispatcherEntry> = None;
+        for entry in &self.entries {
+            if matches!(Self::entry_routing(entry, name), EntryRouting::NotSurfaced) {
+                continue;
+            }
+            if owner.is_some() {
+                return None;
+            }
+            owner = Some(entry);
+        }
+        owner.map(|entry| entry.dispatcher.as_ref())
+    }
+
     /// Classify how the owning entry routes `name`: not surfaced, callable, or
     /// unavailable for a typed reason.
     fn entry_routing(entry: &DispatcherEntry, name: &str) -> EntryRouting {
@@ -366,6 +391,19 @@ impl AgentToolDispatcher for ToolGateway {
             .map(|entry| Arc::clone(&entry.tool))
             .collect::<Vec<_>>()
             .into()
+    }
+
+    /// Forward the owning child's declaration.
+    ///
+    /// Mutation semantics are a static property of the tool, not of its current
+    /// callability, so this forwards for any identifiable owner - including one
+    /// whose tool is momentarily unavailable. A name no single dispatcher owns
+    /// (absent, or ambiguously surfaced) has no declaration to forward and stays
+    /// `Unknown`, which read-only intent denies.
+    fn tool_mutation_class(&self, tool_name: &str) -> crate::ToolMutationClass {
+        self.declaring_owner(tool_name)
+            .map(|dispatcher| dispatcher.tool_mutation_class(tool_name))
+            .unwrap_or_default()
     }
 
     fn resolve_execution_plan(
@@ -724,6 +762,25 @@ impl DynamicToolComposite {
             .unwrap_or(EntryRouting::NotSurfaced)
     }
 
+    /// The single dispatcher that surfaces `name`, regardless of whether it is
+    /// currently callable. `None` when none or several surface it.
+    fn declaring_owner(&self, name: &str) -> Option<&dyn AgentToolDispatcher> {
+        let mut owner: Option<&dyn AgentToolDispatcher> = None;
+        for dispatcher in &self.dispatchers {
+            if matches!(
+                Self::entry_routing(dispatcher.as_ref(), name),
+                EntryRouting::NotSurfaced
+            ) {
+                continue;
+            }
+            if owner.is_some() {
+                return None;
+            }
+            owner = Some(dispatcher.as_ref());
+        }
+        owner
+    }
+
     fn resolve_live_routing(&self, name: &str) -> Result<DynamicRouting<'_>, ToolError> {
         let mut surfaced: Option<(usize, &dyn AgentToolDispatcher, EntryRouting)> = None;
         for (owner_index, dispatcher) in self.dispatchers.iter().enumerate() {
@@ -770,6 +827,16 @@ impl AgentToolDispatcher for DynamicToolComposite {
             .map(|entry| entry.tool)
             .collect::<Vec<_>>()
             .into()
+    }
+
+    /// Forward the owning child's declaration, callability-agnostic for the
+    /// same reason as [`ToolGateway::tool_mutation_class`]. An unowned or
+    /// ambiguously surfaced name stays `Unknown` (denied under read-only
+    /// intent).
+    fn tool_mutation_class(&self, tool_name: &str) -> crate::ToolMutationClass {
+        self.declaring_owner(tool_name)
+            .map(|dispatcher| dispatcher.tool_mutation_class(tool_name))
+            .unwrap_or_default()
     }
 
     fn resolve_execution_plan(
@@ -2697,5 +2764,146 @@ mod tests {
             .unwrap();
         let payload: Value = serde_json::from_str(&outcome.result.text_content()).unwrap();
         assert_eq!(payload["saw_context_image"], true);
+    }
+    /// Declares a mutation class and can be toggled to surface its tool as
+    /// currently unavailable, so declaration lookup can be tested independently
+    /// of callability.
+    struct DeclaringToggleDispatcher {
+        tool: Arc<ToolDef>,
+        class: crate::ToolMutationClass,
+        callable: Arc<AtomicBool>,
+    }
+
+    impl DeclaringToggleDispatcher {
+        fn new(
+            tool_name: &str,
+            class: crate::ToolMutationClass,
+            callable: Arc<AtomicBool>,
+        ) -> Self {
+            Self {
+                tool: Arc::new(ToolDef {
+                    name: tool_name.into(),
+                    description: format!("declaring tool: {tool_name}"),
+                    input_schema: empty_object_schema(),
+                    provenance: None,
+                }),
+                class,
+                callable,
+            }
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentToolDispatcher for DeclaringToggleDispatcher {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            Arc::from([Arc::clone(&self.tool)])
+        }
+
+        fn tool_catalog_capabilities(&self) -> crate::ToolCatalogCapabilities {
+            crate::ToolCatalogCapabilities {
+                exact_catalog: true,
+                may_require_catalog_control_plane: false,
+            }
+        }
+
+        fn tool_catalog(&self) -> Arc<[crate::ToolCatalogEntry]> {
+            let entry = if self.callable.load(Ordering::SeqCst) {
+                crate::ToolCatalogEntry::session_inline(Arc::clone(&self.tool), true)
+            } else {
+                crate::ToolCatalogEntry::session_inline_with_callability(
+                    Arc::clone(&self.tool),
+                    crate::ToolCallability::unavailable(
+                        ToolUnavailableReason::NotCurrentlyCallable,
+                    ),
+                )
+            };
+            Arc::from([entry])
+        }
+
+        fn tool_mutation_class(&self, tool_name: &str) -> crate::ToolMutationClass {
+            if self.tool.name == tool_name {
+                self.class
+            } else {
+                crate::ToolMutationClass::Unknown
+            }
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+            Ok(ToolResult::new(call.id.to_string(), "ok".to_string(), false).into())
+        }
+    }
+
+    /// A declaration is a static property of the tool: it must not flip to
+    /// `Unknown` (and therefore deny under read-only intent) just because the
+    /// owning dispatcher currently reports the tool as unavailable.
+    #[test]
+    fn composites_forward_declarations_for_currently_unavailable_tools() {
+        let callable = Arc::new(AtomicBool::new(true));
+        let reader = Arc::new(DeclaringToggleDispatcher::new(
+            "declared_read",
+            crate::ToolMutationClass::ReadOnly,
+            Arc::clone(&callable),
+        )) as Arc<dyn AgentToolDispatcher>;
+        let gateway = ToolGatewayBuilder::new()
+            .add_dispatcher(Arc::clone(&reader))
+            .build()
+            .expect("gateway builds");
+        let composite = DynamicToolComposite::new(vec![Arc::clone(&reader)]);
+
+        assert_eq!(
+            gateway.tool_mutation_class("declared_read"),
+            crate::ToolMutationClass::ReadOnly
+        );
+        assert_eq!(
+            composite.tool_mutation_class("declared_read"),
+            crate::ToolMutationClass::ReadOnly
+        );
+
+        callable.store(false, Ordering::SeqCst);
+        assert_eq!(
+            gateway.tool_mutation_class("declared_read"),
+            crate::ToolMutationClass::ReadOnly,
+            "an unavailable tool keeps its declaration"
+        );
+        assert_eq!(
+            composite.tool_mutation_class("declared_read"),
+            crate::ToolMutationClass::ReadOnly,
+            "an unavailable tool keeps its declaration"
+        );
+
+        assert_eq!(
+            gateway.tool_mutation_class("never_registered"),
+            crate::ToolMutationClass::Unknown
+        );
+        assert_eq!(
+            composite.tool_mutation_class("never_registered"),
+            crate::ToolMutationClass::Unknown
+        );
+    }
+
+    /// Two dispatchers surfacing the same name have no single owner, so no
+    /// declaration may be trusted.
+    #[test]
+    fn ambiguously_surfaced_names_have_no_declaration() {
+        let callable = Arc::new(AtomicBool::new(true));
+        let first = Arc::new(DeclaringToggleDispatcher::new(
+            "shared_name",
+            crate::ToolMutationClass::ReadOnly,
+            Arc::clone(&callable),
+        )) as Arc<dyn AgentToolDispatcher>;
+        let second = Arc::new(DeclaringToggleDispatcher::new(
+            "shared_name",
+            crate::ToolMutationClass::ReadOnly,
+            Arc::clone(&callable),
+        )) as Arc<dyn AgentToolDispatcher>;
+        let composite = DynamicToolComposite::new(vec![first, second]);
+        assert_eq!(
+            composite.tool_mutation_class("shared_name"),
+            crate::ToolMutationClass::Unknown
+        );
     }
 }

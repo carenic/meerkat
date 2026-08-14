@@ -1063,6 +1063,7 @@ fn domain_tool_access_policy(
         WireResolvedToolAccessPolicy::DenyList(names) => {
             meerkat_core::ops::ToolAccessPolicy::DenyList(names.into_iter().collect())
         }
+        WireResolvedToolAccessPolicy::ReadOnly => meerkat_core::ops::ToolAccessPolicy::ReadOnly,
     }
 }
 

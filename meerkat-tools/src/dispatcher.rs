@@ -266,6 +266,10 @@ impl AgentToolDispatcher for ToolDispatcher {
             .into()
     }
 
+    fn tool_mutation_class(&self, tool_name: &str) -> meerkat_core::ToolMutationClass {
+        self.router.tool_mutation_class(tool_name)
+    }
+
     async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
         self.dispatch_with_context(call, &ToolDispatchContext::default())
             .await

@@ -1168,8 +1168,20 @@ pub async fn handle_public_tools_call(
                 .mob_flow_status(&mob_id, run_id)
                 .await
                 .map_err(|err| McpToolError::from_mob(&err))?;
-            let run = meerkat_mob::MobRun::public_run_result_value(run.as_ref())
+            let mut run = meerkat_mob::MobRun::public_run_result_value(run.as_ref())
                 .map_err(|err| McpToolError::from_mob(&err))?;
+            // Same accounting the RPC and CLI run-result surfaces attach, on
+            // the same terminal-only condition: this is the surface an
+            // agent-driven auditor reads, and it is polled, so a mid-run
+            // collection would both cost a read per member and report totals
+            // for an unfinished run. A collection failure omits the block
+            // rather than failing the tool call.
+            if let Some(envelope) = run.as_mut()
+                && envelope.status.is_terminal()
+                && let Ok(accounting) = state.mob_run_accounting(&mob_id).await
+            {
+                envelope.accounting = Some(accounting);
+            }
             serde_json::to_value(meerkat_contracts::MobRunResult { run })
                 .map_err(|err| McpToolError::invalid_params(err.to_string()))
         }

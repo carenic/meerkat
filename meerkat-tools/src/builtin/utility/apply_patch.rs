@@ -112,6 +112,11 @@ impl BuiltinTool for ApplyPatchTool {
         true
     }
 
+    /// Writes files.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::Mutating
+    }
+
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
         let args: ApplyPatchArgs = serde_json::from_value(args)
             .map_err(|e| BuiltinToolError::invalid_args(format!("Invalid arguments: {e}")))?;

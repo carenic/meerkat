@@ -3841,6 +3841,7 @@ pub fn sample_portable_member_spec(
                 mob: false,
                 schedule: false,
                 image_generation: false,
+                read_only: false,
                 mcp_servers: std::collections::BTreeMap::new(),
                 non_portable_disabled: Vec::new(),
             },

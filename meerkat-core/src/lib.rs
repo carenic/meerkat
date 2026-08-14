@@ -433,6 +433,7 @@ pub use tool_execution::{
 };
 pub use tool_execution_policy::{
     ExecutionPolicyGatedDispatcher, ToolExecutionPolicy, ToolExecutionPolicyError,
+    ToolMutationClass,
 };
 pub use tool_scope::{
     ComposedToolFilter, EXTERNAL_TOOL_FILTER_METADATA_KEY, ExternalToolSurfaceBaseState,

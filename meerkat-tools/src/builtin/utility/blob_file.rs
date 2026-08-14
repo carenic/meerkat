@@ -311,6 +311,11 @@ impl BuiltinTool for BlobSaveFileTool {
         true
     }
 
+    /// Writes a file to disk.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::Mutating
+    }
+
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
         let args: BlobSaveFileArgs = serde_json::from_value(args)
             .map_err(|err| BuiltinToolError::invalid_args(err.to_string()))?;
@@ -403,6 +408,11 @@ impl BuiltinTool for BlobLoadFileTool {
         true
     }
 
+    /// Writes a blob into the session blob store.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::Mutating
+    }
+
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
         let args: BlobLoadFileArgs = serde_json::from_value(args)
             .map_err(|err| BuiltinToolError::invalid_args(err.to_string()))?;
@@ -469,6 +479,11 @@ impl BuiltinTool for BlobInspectTool {
 
     fn default_enabled(&self) -> bool {
         true
+    }
+
+    /// Blob-metadata read.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::ReadOnly
     }
 
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {

@@ -9609,6 +9609,10 @@
             },
             "type": "array"
           },
+          "read_only": {
+            "description": "Profile-declared read-only intent, carried so a member materialized on\nanother host enforces the same execution gate.\n\nUnlike its sibling category toggles this field is omitted when false,\nwhich is load-bearing twice over: a spec that carries no read-only\nintent keeps the exact digest-covered bytes it had before the field\nexisted, and a read-only spec sent to a host too old to know the field\nis rejected by `deny_unknown_fields` instead of silently materializing\nan ungated member.",
+            "type": "boolean"
+          },
           "schedule": {
             "default": false,
             "type": "boolean"
@@ -10722,6 +10726,19 @@
             "required": [
               "type",
               "value"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Read-only intent, carried across the host boundary so a remotely\nmaterialized member keeps the declaration instead of silently\ndowngrading to unrestricted.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
             ],
             "type": "object"
           }
@@ -16813,6 +16830,10 @@
             },
             "type": "array"
           },
+          "read_only": {
+            "description": "Profile-declared read-only intent, carried so a member materialized on\nanother host enforces the same execution gate.\n\nUnlike its sibling category toggles this field is omitted when false,\nwhich is load-bearing twice over: a spec that carries no read-only\nintent keeps the exact digest-covered bytes it had before the field\nexisted, and a read-only spec sent to a host too old to know the field\nis rejected by `deny_unknown_fields` instead of silently materializing\nan ungated member.",
+            "type": "boolean"
+          },
           "schedule": {
             "default": false,
             "type": "boolean"
@@ -17743,6 +17764,19 @@
             "required": [
               "type",
               "value"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Read-only intent, carried across the host boundary so a remotely\nmaterialized member keeps the declaration instead of silently\ndowngrading to unrestricted.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
             ],
             "type": "object"
           }
@@ -24689,6 +24723,19 @@
             "required": [
               "type",
               "value"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Read-only intent, carried across the host boundary so a remotely\nmaterialized member keeps the declaration instead of silently\ndowngrading to unrestricted.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
             ],
             "type": "object"
           }
@@ -45116,6 +45163,10 @@
             },
             "type": "array"
           },
+          "read_only": {
+            "description": "Profile-declared read-only intent, carried so a member materialized on\nanother host enforces the same execution gate.\n\nUnlike its sibling category toggles this field is omitted when false,\nwhich is load-bearing twice over: a spec that carries no read-only\nintent keeps the exact digest-covered bytes it had before the field\nexisted, and a read-only spec sent to a host too old to know the field\nis rejected by `deny_unknown_fields` instead of silently materializing\nan ungated member.",
+            "type": "boolean"
+          },
           "schedule": {
             "default": false,
             "type": "boolean"
@@ -49023,6 +49074,19 @@
               "value"
             ],
             "type": "object"
+          },
+          {
+            "description": "Read-only intent, carried across the host boundary so a remotely\nmaterialized member keeps the declaration instead of silently\ndowngrading to unrestricted.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -52873,6 +52937,10 @@
             },
             "type": "array"
           },
+          "read_only": {
+            "description": "Profile-declared read-only intent, carried so a member materialized on\nanother host enforces the same execution gate.\n\nUnlike its sibling category toggles this field is omitted when false,\nwhich is load-bearing twice over: a spec that carries no read-only\nintent keeps the exact digest-covered bytes it had before the field\nexisted, and a read-only spec sent to a host too old to know the field\nis rejected by `deny_unknown_fields` instead of silently materializing\nan ungated member.",
+            "type": "boolean"
+          },
           "schedule": {
             "default": false,
             "type": "boolean"
@@ -53986,6 +54054,19 @@
             "required": [
               "type",
               "value"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Read-only intent, carried across the host boundary so a remotely\nmaterialized member keeps the declaration instead of silently\ndowngrading to unrestricted.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
             ],
             "type": "object"
           }
@@ -76686,6 +76767,19 @@
               "value"
             ],
             "type": "object"
+          },
+          {
+            "description": "Read-only intent, carried across the host boundary so a remotely\nmaterialized member keeps the declaration instead of silently\ndowngrading to unrestricted.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ]
       }
@@ -78881,6 +78975,19 @@
               "value"
             ],
             "type": "object"
+          },
+          {
+            "description": "Read-only intent, carried across the host boundary so a remotely\nmaterialized member keeps the declaration instead of silently\ndowngrading to unrestricted.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ]
       }
@@ -80054,6 +80161,7 @@
               "image_generation": false,
               "memory": false,
               "mob": false,
+              "read_only": false,
               "schedule": false,
               "shell": false,
               "workgraph": false
@@ -80232,6 +80340,11 @@
           },
           "mob": {
             "default": false,
+            "type": "boolean"
+          },
+          "read_only": {
+            "default": false,
+            "description": "Declare the profile read-only: the execution gate admits only tools\ntheir owning dispatcher declares read-only, and a spawn cannot widen\nit. Enforcement, not prompt guidance.",
             "type": "boolean"
           },
           "schedule": {
@@ -86728,6 +86841,10 @@
             "default": false,
             "type": "boolean"
           },
+          "read_only": {
+            "description": "Declare the profile read-only: the execution gate admits only tools\ntheir owning dispatcher declares read-only, and a spawn cannot widen\nit. Enforcement, not prompt guidance.\n\nOmitted when false, unlike its sibling toggles: this struct is\n`deny_unknown_fields`, so a projection that always carried the key would\nbe rejected by clients built before the field existed. Emitting it only\nwhen a profile actually declares read-only keeps old clients working and\nmakes the new-intent case fail closed and loudly instead of silently.",
+            "type": "boolean"
+          },
           "schedule": {
             "default": false,
             "type": "boolean"
@@ -87700,6 +87817,10 @@
             "default": false,
             "type": "boolean"
           },
+          "read_only": {
+            "description": "Declare the profile read-only: the execution gate admits only tools\ntheir owning dispatcher declares read-only, and a spawn cannot widen\nit. Enforcement, not prompt guidance.\n\nOmitted when false, unlike its sibling toggles: this struct is\n`deny_unknown_fields`, so a projection that always carried the key would\nbe rejected by clients built before the field existed. Emitting it only\nwhen a profile actually declares read-only keeps old clients working and\nmakes the new-intent case fail closed and loudly instead of silently.",
+            "type": "boolean"
+          },
           "schedule": {
             "default": false,
             "type": "boolean"
@@ -88629,10 +88750,141 @@
   },
   "MobRunResult": {
     "$defs": {
+      "Provider": {
+        "description": "Supported LLM providers.\n\n`JsonSchema` is derived unconditionally (schemars is a non-optional\nmeerkat-core dependency): config-owned types such as\n[`crate::config::CustomModelConfig`] embed the typed provider directly and\nderive their schemas without the `schema` feature.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "gemini",
+          "self_hosted",
+          "other"
+        ],
+        "type": "string"
+      },
+      "WireMobRunAccounting": {
+        "additionalProperties": false,
+        "description": "Token accounting projection attached to a mob run envelope.\n\nThis is deliberately NOT a second transcript authority. Full messages,\ntool calls, tool results, and per-turn usage live in the session event\nstream and are exported by `rkat session export-atif <session_id>` (or the\n`--export-atif` flag on a run); `member_session_ids` is the pointer set for\nthat export. What rides here is only what is cheap and canonical at the\npoint a run terminalizes: the per-member session usage totals and their\nattribution.\n\nCost is structurally absent: the model catalog carries no price data, so\nno truthful monetary number can be produced in-tree. `unpriced_reason`\nstates that instead of emitting a zero or a guess.",
+        "properties": {
+          "attribution": {
+            "$ref": "#/$defs/WireMobRunUsageAttribution"
+          },
+          "member_session_ids": {
+            "description": "Session ids for `rkat session export-atif`, in member order. Scoped to\nthe current roster, so this may include members that took no part in\nthis run (see [`WireMobRunUsageAttribution::SessionCumulative`]).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "members": {
+            "description": "The mob's current member roster, not this run's participants: see\n[`WireMobRunUsageAttribution::SessionCumulative`].",
+            "items": {
+              "$ref": "#/$defs/WireMobRunMemberAccounting"
+            },
+            "type": "array"
+          },
+          "members_usage_unavailable": {
+            "description": "Number of members whose usage could not be read.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unpriced_reason": {
+            "description": "Why no monetary cost is reported.",
+            "type": "string"
+          },
+          "usage_total": {
+            "$ref": "#/$defs/WireUsage",
+            "description": "Sum of the per-member usage that was readable. Members with\n`usage_unavailable` contribute nothing, so this is a floor, not a\nclaim of completeness.\n\nInput and output tokens only: the cache counters are absent here even\nwhen members report them, because their relation to `input_tokens` is\nprovider-specific and this aggregate may span providers. Read cache\nnumbers per member, never off this total."
+          }
+        },
+        "required": [
+          "attribution",
+          "usage_total",
+          "unpriced_reason"
+        ],
+        "type": "object"
+      },
+      "WireMobRunMemberAccounting": {
+        "additionalProperties": false,
+        "description": "Per-member token accounting and the session pointer an auditor exports.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "message_count": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Provider"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "role": {
+            "type": "string"
+          },
+          "session_id": {
+            "description": "Session id to feed `rkat session export-atif` for this member's full\ntranscript. Absent when the member has no current bridge session.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Session-cumulative usage, present only when the session was readable\nfrom this host."
+          },
+          "usage_unavailable": {
+            "description": "Why `usage` is absent, when it is (remote member, archived session).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "agent_identity",
+          "role"
+        ],
+        "type": "object"
+      },
       "WireMobRunResultEnvelope": {
         "additionalProperties": false,
         "description": "Typed output envelope for a completed or in-flight mob flow run.",
         "properties": {
+          "accounting": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireMobRunAccounting"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Token accounting and transcript pointers for the mob that ran this\nflow. Absent when the surface did not collect it (the run projection\nitself owns no usage: see [`WireMobRunAccounting`])."
+          },
           "flow_id": {
             "type": "string"
           },
@@ -88669,6 +88921,58 @@
           "canceled"
         ],
         "type": "string"
+      },
+      "WireMobRunUsageAttribution": {
+        "description": "How a usage number in [`WireMobRunAccounting`] was attributed.\n\nA closed vocabulary rather than a doc comment because the difference is\nload-bearing for an auditor: nothing in the mob run projection records\nper-run token usage, so these numbers come from the members' bridge\nsessions.",
+        "oneOf": [
+          {
+            "const": "session_cumulative",
+            "description": "Each number is the lifetime total of the member's current bridge\nsession, which is the run's usage only when that session served this\nrun alone. On a mob that has executed more than one run, or whose\nmembers took turns outside a flow, the totals include those turns.\n\nThe member set is scoped the same way: it is the mob's current roster\nat collection time, not the run's participant set (the run aggregate\nrecords no participation). A member that took no part in this run is\nstill listed, and its session id still rides in\n`member_session_ids`, so an auditor exporting that pointer set may get\ntranscripts unrelated to this run.",
+            "type": "string"
+          }
+        ]
+      },
+      "WireUsage": {
+        "description": "Canonical token usage for wire protocol.",
+        "properties": {
+          "cache_creation_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cache_read_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "total_tokens"
+        ],
+        "type": "object"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -91785,6 +92089,10 @@
             },
             "type": "array"
           },
+          "read_only": {
+            "description": "Profile-declared read-only intent, carried so a member materialized on\nanother host enforces the same execution gate.\n\nUnlike its sibling category toggles this field is omitted when false,\nwhich is load-bearing twice over: a spec that carries no read-only\nintent keeps the exact digest-covered bytes it had before the field\nexisted, and a read-only spec sent to a host too old to know the field\nis rejected by `deny_unknown_fields` instead of silently materializing\nan ungated member.",
+            "type": "boolean"
+          },
           "schedule": {
             "default": false,
             "type": "boolean"
@@ -92717,6 +93025,19 @@
               "value"
             ],
             "type": "object"
+          },
+          {
+            "description": "Read-only intent, carried across the host boundary so a remotely\nmaterialized member keeps the declaration instead of silently\ndowngrading to unrestricted.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -92965,6 +93286,10 @@
               "$ref": "#/$defs/WireNonPortableResourceKind"
             },
             "type": "array"
+          },
+          "read_only": {
+            "description": "Profile-declared read-only intent, carried so a member materialized on\nanother host enforces the same execution gate.\n\nUnlike its sibling category toggles this field is omitted when false,\nwhich is load-bearing twice over: a spec that carries no read-only\nintent keeps the exact digest-covered bytes it had before the field\nexisted, and a read-only spec sent to a host too old to know the field\nis rejected by `deny_unknown_fields` instead of silently materializing\nan ungated member.",
+            "type": "boolean"
           },
           "schedule": {
             "default": false,
@@ -94137,6 +94462,19 @@
               "value"
             ],
             "type": "object"
+          },
+          {
+            "description": "Read-only intent, carried across the host boundary so a remotely\nmaterialized member keeps the declaration instead of silently\ndowngrading to unrestricted.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -94451,6 +94789,10 @@
           "$ref": "#/$defs/WireNonPortableResourceKind"
         },
         "type": "array"
+      },
+      "read_only": {
+        "description": "Profile-declared read-only intent, carried so a member materialized on\nanother host enforces the same execution gate.\n\nUnlike its sibling category toggles this field is omitted when false,\nwhich is load-bearing twice over: a spec that carries no read-only\nintent keeps the exact digest-covered bytes it had before the field\nexisted, and a read-only spec sent to a host too old to know the field\nis rejected by `deny_unknown_fields` instead of silently materializing\nan ungated member.",
+        "type": "boolean"
       },
       "schedule": {
         "default": false,
@@ -98320,6 +98662,19 @@
               "value"
             ],
             "type": "object"
+          },
+          {
+            "description": "Only tools whose owning dispatcher declares\n[`crate::ToolMutationClass::ReadOnly`] may execute.\n\nName-independent intent: a tool the dispatcher chain does not declare\nread-only is denied, so tools that appear later (MCP servers finishing\ntheir handshake, host bundles) never widen the policy. See\n[`crate::tool_execution_policy`] for the exact guarantee boundary this\ndeclaration does and does not cover.\n\nDowngrade consequence: this enum is closed and adjacently tagged, and\nit is persisted in durable session metadata\n(`SessionMetadata.tooling.tool_access_policy`), so a binary older than\nthe release that added this variant cannot decode the metadata of a\nsession launched with read-only intent. Failing to decode is the\nintended outcome (a downgrade that silently read it as `Inherit` would\ndrop the enforcement), but the session is unresumable on that binary\nuntil it is upgraded.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -100709,6 +101064,19 @@
             "required": [
               "type",
               "value"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only tools whose owning dispatcher declares\n[`crate::ToolMutationClass::ReadOnly`] may execute.\n\nName-independent intent: a tool the dispatcher chain does not declare\nread-only is denied, so tools that appear later (MCP servers finishing\ntheir handshake, host bundles) never widen the policy. See\n[`crate::tool_execution_policy`] for the exact guarantee boundary this\ndeclaration does and does not cover.\n\nDowngrade consequence: this enum is closed and adjacently tagged, and\nit is persisted in durable session metadata\n(`SessionMetadata.tooling.tool_access_policy`), so a binary older than\nthe release that added this variant cannot decode the metadata of a\nsession launched with read-only intent. Failing to decode is the\nintended outcome (a downgrade that silently read it as `Inherit` would\ndrop the enforcement), but the session is unresumable on that binary\nuntil it is upgraded.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
             ],
             "type": "object"
           }
@@ -103250,6 +103618,19 @@
             "required": [
               "type",
               "value"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only tools whose owning dispatcher declares\n[`crate::ToolMutationClass::ReadOnly`] may execute.\n\nName-independent intent: a tool the dispatcher chain does not declare\nread-only is denied, so tools that appear later (MCP servers finishing\ntheir handshake, host bundles) never widen the policy. See\n[`crate::tool_execution_policy`] for the exact guarantee boundary this\ndeclaration does and does not cover.\n\nDowngrade consequence: this enum is closed and adjacently tagged, and\nit is persisted in durable session metadata\n(`SessionMetadata.tooling.tool_access_policy`), so a binary older than\nthe release that added this variant cannot decode the metadata of a\nsession launched with read-only intent. Failing to decode is the\nintended outcome (a downgrade that silently read it as `Inherit` would\ndrop the enforcement), but the session is unresumable on that binary\nuntil it is upgraded.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
             ],
             "type": "object"
           }
@@ -123465,6 +123846,10 @@
             "default": false,
             "type": "boolean"
           },
+          "read_only": {
+            "description": "Declare the profile read-only: the execution gate admits only tools\ntheir owning dispatcher declares read-only, and a spawn cannot widen\nit. Enforcement, not prompt guidance.\n\nOmitted when false, unlike its sibling toggles: this struct is\n`deny_unknown_fields`, so a projection that always carried the key would\nbe rejected by clients built before the field existed. Emitting it only\nwhen a profile actually declares read-only keeps old clients working and\nmakes the new-intent case fail closed and loudly instead of silently.",
+            "type": "boolean"
+          },
           "schedule": {
             "default": false,
             "type": "boolean"
@@ -124141,8 +124526,427 @@
     "title": "WireMobRun",
     "type": "object"
   },
+  "WireMobRunAccounting": {
+    "$defs": {
+      "Provider": {
+        "description": "Supported LLM providers.\n\n`JsonSchema` is derived unconditionally (schemars is a non-optional\nmeerkat-core dependency): config-owned types such as\n[`crate::config::CustomModelConfig`] embed the typed provider directly and\nderive their schemas without the `schema` feature.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "gemini",
+          "self_hosted",
+          "other"
+        ],
+        "type": "string"
+      },
+      "WireMobRunMemberAccounting": {
+        "additionalProperties": false,
+        "description": "Per-member token accounting and the session pointer an auditor exports.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "message_count": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Provider"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "role": {
+            "type": "string"
+          },
+          "session_id": {
+            "description": "Session id to feed `rkat session export-atif` for this member's full\ntranscript. Absent when the member has no current bridge session.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Session-cumulative usage, present only when the session was readable\nfrom this host."
+          },
+          "usage_unavailable": {
+            "description": "Why `usage` is absent, when it is (remote member, archived session).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "agent_identity",
+          "role"
+        ],
+        "type": "object"
+      },
+      "WireMobRunUsageAttribution": {
+        "description": "How a usage number in [`WireMobRunAccounting`] was attributed.\n\nA closed vocabulary rather than a doc comment because the difference is\nload-bearing for an auditor: nothing in the mob run projection records\nper-run token usage, so these numbers come from the members' bridge\nsessions.",
+        "oneOf": [
+          {
+            "const": "session_cumulative",
+            "description": "Each number is the lifetime total of the member's current bridge\nsession, which is the run's usage only when that session served this\nrun alone. On a mob that has executed more than one run, or whose\nmembers took turns outside a flow, the totals include those turns.\n\nThe member set is scoped the same way: it is the mob's current roster\nat collection time, not the run's participant set (the run aggregate\nrecords no participation). A member that took no part in this run is\nstill listed, and its session id still rides in\n`member_session_ids`, so an auditor exporting that pointer set may get\ntranscripts unrelated to this run.",
+            "type": "string"
+          }
+        ]
+      },
+      "WireUsage": {
+        "description": "Canonical token usage for wire protocol.",
+        "properties": {
+          "cache_creation_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cache_read_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "total_tokens"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Token accounting projection attached to a mob run envelope.\n\nThis is deliberately NOT a second transcript authority. Full messages,\ntool calls, tool results, and per-turn usage live in the session event\nstream and are exported by `rkat session export-atif <session_id>` (or the\n`--export-atif` flag on a run); `member_session_ids` is the pointer set for\nthat export. What rides here is only what is cheap and canonical at the\npoint a run terminalizes: the per-member session usage totals and their\nattribution.\n\nCost is structurally absent: the model catalog carries no price data, so\nno truthful monetary number can be produced in-tree. `unpriced_reason`\nstates that instead of emitting a zero or a guess.",
+    "properties": {
+      "attribution": {
+        "$ref": "#/$defs/WireMobRunUsageAttribution"
+      },
+      "member_session_ids": {
+        "description": "Session ids for `rkat session export-atif`, in member order. Scoped to\nthe current roster, so this may include members that took no part in\nthis run (see [`WireMobRunUsageAttribution::SessionCumulative`]).",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "members": {
+        "description": "The mob's current member roster, not this run's participants: see\n[`WireMobRunUsageAttribution::SessionCumulative`].",
+        "items": {
+          "$ref": "#/$defs/WireMobRunMemberAccounting"
+        },
+        "type": "array"
+      },
+      "members_usage_unavailable": {
+        "description": "Number of members whose usage could not be read.",
+        "format": "uint",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "unpriced_reason": {
+        "description": "Why no monetary cost is reported.",
+        "type": "string"
+      },
+      "usage_total": {
+        "$ref": "#/$defs/WireUsage",
+        "description": "Sum of the per-member usage that was readable. Members with\n`usage_unavailable` contribute nothing, so this is a floor, not a\nclaim of completeness.\n\nInput and output tokens only: the cache counters are absent here even\nwhen members report them, because their relation to `input_tokens` is\nprovider-specific and this aggregate may span providers. Read cache\nnumbers per member, never off this total."
+      }
+    },
+    "required": [
+      "attribution",
+      "usage_total",
+      "unpriced_reason"
+    ],
+    "title": "WireMobRunAccounting",
+    "type": "object"
+  },
+  "WireMobRunMemberAccounting": {
+    "$defs": {
+      "Provider": {
+        "description": "Supported LLM providers.\n\n`JsonSchema` is derived unconditionally (schemars is a non-optional\nmeerkat-core dependency): config-owned types such as\n[`crate::config::CustomModelConfig`] embed the typed provider directly and\nderive their schemas without the `schema` feature.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "gemini",
+          "self_hosted",
+          "other"
+        ],
+        "type": "string"
+      },
+      "WireUsage": {
+        "description": "Canonical token usage for wire protocol.",
+        "properties": {
+          "cache_creation_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cache_read_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "total_tokens"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Per-member token accounting and the session pointer an auditor exports.",
+    "properties": {
+      "agent_identity": {
+        "type": "string"
+      },
+      "message_count": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "model": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "provider": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Provider"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "role": {
+        "type": "string"
+      },
+      "session_id": {
+        "description": "Session id to feed `rkat session export-atif` for this member's full\ntranscript. Absent when the member has no current bridge session.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "usage": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireUsage"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Session-cumulative usage, present only when the session was readable\nfrom this host."
+      },
+      "usage_unavailable": {
+        "description": "Why `usage` is absent, when it is (remote member, archived session).",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "agent_identity",
+      "role"
+    ],
+    "title": "WireMobRunMemberAccounting",
+    "type": "object"
+  },
   "WireMobRunResultEnvelope": {
     "$defs": {
+      "Provider": {
+        "description": "Supported LLM providers.\n\n`JsonSchema` is derived unconditionally (schemars is a non-optional\nmeerkat-core dependency): config-owned types such as\n[`crate::config::CustomModelConfig`] embed the typed provider directly and\nderive their schemas without the `schema` feature.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "gemini",
+          "self_hosted",
+          "other"
+        ],
+        "type": "string"
+      },
+      "WireMobRunAccounting": {
+        "additionalProperties": false,
+        "description": "Token accounting projection attached to a mob run envelope.\n\nThis is deliberately NOT a second transcript authority. Full messages,\ntool calls, tool results, and per-turn usage live in the session event\nstream and are exported by `rkat session export-atif <session_id>` (or the\n`--export-atif` flag on a run); `member_session_ids` is the pointer set for\nthat export. What rides here is only what is cheap and canonical at the\npoint a run terminalizes: the per-member session usage totals and their\nattribution.\n\nCost is structurally absent: the model catalog carries no price data, so\nno truthful monetary number can be produced in-tree. `unpriced_reason`\nstates that instead of emitting a zero or a guess.",
+        "properties": {
+          "attribution": {
+            "$ref": "#/$defs/WireMobRunUsageAttribution"
+          },
+          "member_session_ids": {
+            "description": "Session ids for `rkat session export-atif`, in member order. Scoped to\nthe current roster, so this may include members that took no part in\nthis run (see [`WireMobRunUsageAttribution::SessionCumulative`]).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "members": {
+            "description": "The mob's current member roster, not this run's participants: see\n[`WireMobRunUsageAttribution::SessionCumulative`].",
+            "items": {
+              "$ref": "#/$defs/WireMobRunMemberAccounting"
+            },
+            "type": "array"
+          },
+          "members_usage_unavailable": {
+            "description": "Number of members whose usage could not be read.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unpriced_reason": {
+            "description": "Why no monetary cost is reported.",
+            "type": "string"
+          },
+          "usage_total": {
+            "$ref": "#/$defs/WireUsage",
+            "description": "Sum of the per-member usage that was readable. Members with\n`usage_unavailable` contribute nothing, so this is a floor, not a\nclaim of completeness.\n\nInput and output tokens only: the cache counters are absent here even\nwhen members report them, because their relation to `input_tokens` is\nprovider-specific and this aggregate may span providers. Read cache\nnumbers per member, never off this total."
+          }
+        },
+        "required": [
+          "attribution",
+          "usage_total",
+          "unpriced_reason"
+        ],
+        "type": "object"
+      },
+      "WireMobRunMemberAccounting": {
+        "additionalProperties": false,
+        "description": "Per-member token accounting and the session pointer an auditor exports.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "message_count": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Provider"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "role": {
+            "type": "string"
+          },
+          "session_id": {
+            "description": "Session id to feed `rkat session export-atif` for this member's full\ntranscript. Absent when the member has no current bridge session.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Session-cumulative usage, present only when the session was readable\nfrom this host."
+          },
+          "usage_unavailable": {
+            "description": "Why `usage` is absent, when it is (remote member, archived session).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "agent_identity",
+          "role"
+        ],
+        "type": "object"
+      },
       "WireMobRunStatus": {
         "description": "Lifecycle status of a flow run on the wire. Mirrors\n`meerkat_mob::MobRunStatus` so consumers branch on a closed type rather than\nre-deriving meaning from a free-form status string.",
         "enum": [
@@ -124153,12 +124957,75 @@
           "canceled"
         ],
         "type": "string"
+      },
+      "WireMobRunUsageAttribution": {
+        "description": "How a usage number in [`WireMobRunAccounting`] was attributed.\n\nA closed vocabulary rather than a doc comment because the difference is\nload-bearing for an auditor: nothing in the mob run projection records\nper-run token usage, so these numbers come from the members' bridge\nsessions.",
+        "oneOf": [
+          {
+            "const": "session_cumulative",
+            "description": "Each number is the lifetime total of the member's current bridge\nsession, which is the run's usage only when that session served this\nrun alone. On a mob that has executed more than one run, or whose\nmembers took turns outside a flow, the totals include those turns.\n\nThe member set is scoped the same way: it is the mob's current roster\nat collection time, not the run's participant set (the run aggregate\nrecords no participation). A member that took no part in this run is\nstill listed, and its session id still rides in\n`member_session_ids`, so an auditor exporting that pointer set may get\ntranscripts unrelated to this run.",
+            "type": "string"
+          }
+        ]
+      },
+      "WireUsage": {
+        "description": "Canonical token usage for wire protocol.",
+        "properties": {
+          "cache_creation_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cache_read_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "total_tokens"
+        ],
+        "type": "object"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
     "description": "Typed output envelope for a completed or in-flight mob flow run.",
     "properties": {
+      "accounting": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireMobRunAccounting"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Token accounting and transcript pointers for the mob that ran this\nflow. Absent when the surface did not collect it (the run projection\nitself owns no usage: see [`WireMobRunAccounting`])."
+      },
       "flow_id": {
         "type": "string"
       },
@@ -124198,6 +125065,18 @@
     ],
     "title": "WireMobRunStatus",
     "type": "string"
+  },
+  "WireMobRunUsageAttribution": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "How a usage number in [`WireMobRunAccounting`] was attributed.\n\nA closed vocabulary rather than a doc comment because the difference is\nload-bearing for an auditor: nothing in the mob run projection records\nper-run token usage, so these numbers come from the members' bridge\nsessions.",
+    "oneOf": [
+      {
+        "const": "session_cumulative",
+        "description": "Each number is the lifetime total of the member's current bridge\nsession, which is the run's usage only when that session served this\nrun alone. On a mob that has executed more than one run, or whose\nmembers took turns outside a flow, the totals include those turns.\n\nThe member set is scoped the same way: it is the mob's current roster\nat collection time, not the run's participant set (the run aggregate\nrecords no participation). A member that took no part in this run is\nstill listed, and its session id still rides in\n`member_session_ids`, so an auditor exporting that pointer set may get\ntranscripts unrelated to this run.",
+        "type": "string"
+      }
+    ],
+    "title": "WireMobRunUsageAttribution"
   },
   "WireMobRuntimeMode": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -124353,6 +125232,10 @@
       },
       "mob": {
         "default": false,
+        "type": "boolean"
+      },
+      "read_only": {
+        "description": "Declare the profile read-only: the execution gate admits only tools\ntheir owning dispatcher declares read-only, and a spawn cannot widen\nit. Enforcement, not prompt guidance.\n\nOmitted when false, unlike its sibling toggles: this struct is\n`deny_unknown_fields`, so a projection that always carried the key would\nbe rejected by clients built before the field existed. Emitting it only\nwhen a profile actually declares read-only keeps old clients working and\nmakes the new-intent case fail closed and loudly instead of silently.",
         "type": "boolean"
       },
       "schedule": {
@@ -125437,6 +126320,19 @@
         "required": [
           "type",
           "value"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Read-only intent, carried across the host boundary so a remotely\nmaterialized member keeps the declaration instead of silently\ndowngrading to unrestricted.",
+        "properties": {
+          "type": {
+            "const": "read_only",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
         ],
         "type": "object"
       }
@@ -134023,6 +134919,19 @@
         "required": [
           "type",
           "value"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Read-only intent: only tools their owning dispatcher declares\nread-only may execute. Name-independent and fail-closed, so tools that\nappear after the launch cannot widen it. The guarantee covers only\ndispatcher-traversing tools (see\n`meerkat_core::tool_execution_policy`).",
+        "properties": {
+          "type": {
+            "const": "read_only",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
         ],
         "type": "object"
       }

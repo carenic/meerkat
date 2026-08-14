@@ -4913,6 +4913,9 @@ impl MobRun {
             status: self.wire_status(),
             result,
             outputs,
+            // The run aggregate owns no token usage; accounting is attached by
+            // the surface that can read the members' sessions.
+            accounting: None,
         })
     }
 

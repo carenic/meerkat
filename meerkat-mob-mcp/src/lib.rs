@@ -8,6 +8,7 @@
 mod agent_tools;
 mod public_definition;
 mod public_mcp;
+pub mod run_accounting;
 #[cfg(not(target_arch = "wasm32"))]
 mod schedule_host;
 mod surface;
@@ -1937,6 +1938,63 @@ impl MobMcpState {
         run_id: RunId,
     ) -> Result<Option<meerkat_mob::MobRun>, MobError> {
         self.handle_for(mob_id).await?.flow_status(run_id).await
+    }
+
+    /// Project token accounting and transcript pointers for a mob.
+    ///
+    /// The mob run aggregate records no token usage (`MobRun` has no usage
+    /// field, and the flow turn bridge drops the `RunCompleted` usage it
+    /// observes), so the only canonical usage authority reachable here is each
+    /// member's bridge session. That makes every number in this projection
+    /// session-cumulative, which
+    /// [`meerkat_contracts::WireMobRunUsageAttribution`] states explicitly
+    /// rather than implying per-run attribution. Members whose session cannot
+    /// be read locally (remote placement, archived session) are reported with
+    /// `usage_unavailable` instead of a zero that would read as "cost nothing".
+    ///
+    /// Full transcripts, tool calls, and per-turn usage are NOT projected
+    /// here: `member_session_ids` is the pointer set for
+    /// `rkat session export-atif`, which is the single transcript authority.
+    ///
+    /// Per-member absence degrades per member, never for the whole mob: a
+    /// member whose status or session cannot be resolved is projected with a
+    /// `usage_unavailable` reason. Only a failure to read the roster is fatal,
+    /// because without it there is no member set to project.
+    pub async fn mob_run_accounting(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<meerkat_contracts::WireMobRunAccounting, MobError> {
+        let members = self.mob_list_members(mob_id).await?;
+        let mut inputs = Vec::with_capacity(members.len());
+        for member in members {
+            let session = match self.mob_member_status(mob_id, &member.agent_identity).await {
+                Err(error) => run_accounting::MobMemberSessionUsage::StatusUnresolved {
+                    reason: format!("member status is not resolvable here: {error}"),
+                },
+                Ok(snapshot) => match snapshot.current_session_id.as_ref() {
+                    None => run_accounting::MobMemberSessionUsage::NoSession,
+                    Some(session_id) => match self.session_service.read(session_id).await {
+                        Ok(view) => run_accounting::MobMemberSessionUsage::Read {
+                            session_id: session_id.to_string(),
+                            model: view.state.model.clone(),
+                            provider: view.state.provider,
+                            message_count: view.state.message_count as u64,
+                            usage: view.billing.usage,
+                        },
+                        Err(error) => run_accounting::MobMemberSessionUsage::Unreadable {
+                            session_id: session_id.to_string(),
+                            reason: format!("member session is not readable here: {error}"),
+                        },
+                    },
+                },
+            };
+            inputs.push(run_accounting::MobMemberUsageInput {
+                agent_identity: member.agent_identity.as_str().to_string(),
+                role: member.role.as_str().to_string(),
+                session,
+            });
+        }
+        Ok(run_accounting::mob_run_accounting_projection(inputs))
     }
 
     /// Resolve the redacted WorkGraph linkage for one exact Flow run.
@@ -6426,6 +6484,10 @@ mod tests {
         /// Counting-wrapper guard state: metadata-only reads through
         /// `load_persisted_session_metadata`.
         persisted_metadata_loads: AtomicU64,
+        /// Per-session billing usage returned by `read`. Distinct numbers per
+        /// session id are what make a session-to-usage mapping assertion
+        /// meaningful; unprimed sessions keep reporting zero.
+        session_usage: RwLock<HashMap<SessionId, Usage>>,
         runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
     }
 
@@ -6443,8 +6505,30 @@ mod tests {
                 start_turn_calls: AtomicU64::new(0),
                 persisted_full_loads: AtomicU64::new(0),
                 persisted_metadata_loads: AtomicU64::new(0),
+                session_usage: RwLock::new(HashMap::new()),
                 runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
             }
+        }
+
+        /// Give one session id a distinct billing total.
+        async fn prime_session_usage(&self, id: &SessionId, usage: Usage) {
+            self.session_usage.write().await.insert(id.clone(), usage);
+        }
+
+        /// Make one session unreadable, the way a remote placement or an
+        /// archived document is unreadable from this host.
+        async fn forget_session(&self, id: &SessionId) {
+            self.sessions.write().await.remove(id);
+            self.persisted_sessions.write().await.remove(id);
+        }
+
+        async fn session_usage_for(&self, id: &SessionId) -> Usage {
+            self.session_usage
+                .read()
+                .await
+                .get(id)
+                .cloned()
+                .unwrap_or_default()
         }
 
         async fn cold_restart(&self) -> Self {
@@ -6464,6 +6548,7 @@ mod tests {
                 start_turn_calls: AtomicU64::new(0),
                 persisted_full_loads: AtomicU64::new(0),
                 persisted_metadata_loads: AtomicU64::new(0),
+                session_usage: RwLock::new(self.session_usage.read().await.clone()),
                 runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
             }
         }
@@ -6784,6 +6869,7 @@ mod tests {
         }
 
         async fn read(&self, id: &SessionId) -> Result<SessionView, SessionError> {
+            let usage = self.session_usage_for(id).await;
             if !self.sessions.read().await.contains_key(id) {
                 if self.persisted_sessions.read().await.contains_key(id) {
                     return Ok(SessionView {
@@ -6799,8 +6885,8 @@ mod tests {
                             labels: Default::default(),
                         },
                         billing: SessionUsage {
-                            total_tokens: 0,
-                            usage: Usage::default(),
+                            total_tokens: usage.total_tokens(),
+                            usage,
                         },
                     });
                 }
@@ -6819,8 +6905,8 @@ mod tests {
                     labels: Default::default(),
                 },
                 billing: SessionUsage {
-                    total_tokens: 0,
-                    usage: Usage::default(),
+                    total_tokens: usage.total_tokens(),
+                    usage,
                 },
             })
         }
@@ -11362,6 +11448,184 @@ mod tests {
                 .await
                 .expect("SubscribeEvents-only wait must not require List")
                 .is_empty()
+        );
+    }
+
+    /// The collector's job is the member -> session-id -> usage mapping. Each
+    /// member's session is primed with distinct numbers, so a transposed
+    /// mapping cannot pass: the projection unit tests cannot catch that class
+    /// of defect because they are handed the mapping already resolved.
+    #[tokio::test]
+    async fn run_accounting_attributes_each_session_usage_to_its_own_member() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let state = MobMcpState::new(svc.clone(), MobControlPrincipal::Owner);
+        let mob_id = state
+            .mob_create_definition(explicit_definition("run-accounting-mapping"))
+            .await
+            .expect("create mob");
+
+        let mut expected: Vec<(AgentIdentity, SessionId, u64)> = Vec::new();
+        for (index, identity) in ["auditor-1", "auditor-2"].into_iter().enumerate() {
+            let identity = AgentIdentity::from(identity);
+            state
+                .mob_spawn(
+                    &mob_id,
+                    ProfileName::from("worker"),
+                    identity.clone(),
+                    Some(MobRuntimeMode::TurnDriven),
+                    None,
+                    None,
+                )
+                .await
+                .expect("spawn accounting fixture member");
+            let session_id = state
+                .mob_member_status(&mob_id, &identity)
+                .await
+                .expect("member status")
+                .current_session_id
+                .expect("a spawned turn-driven member holds a bridge session");
+            let input_tokens = 100 * (index as u64 + 1);
+            svc.prime_session_usage(
+                &session_id,
+                Usage {
+                    input_tokens,
+                    output_tokens: 7,
+                    ..Default::default()
+                },
+            )
+            .await;
+            expected.push((identity, session_id, input_tokens));
+        }
+
+        let accounting = state
+            .mob_run_accounting(&mob_id)
+            .await
+            .expect("roster is readable, so the projection is produced");
+
+        assert_eq!(accounting.members.len(), expected.len());
+        assert_eq!(accounting.members_usage_unavailable, 0);
+        for (identity, session_id, input_tokens) in &expected {
+            let member = accounting
+                .members
+                .iter()
+                .find(|member| member.agent_identity == identity.as_str())
+                .expect("every roster member is projected");
+            assert_eq!(
+                member.session_id.as_deref(),
+                Some(session_id.to_string().as_str()),
+                "member must carry its own bridge session id"
+            );
+            let usage = member
+                .usage
+                .as_ref()
+                .expect("a readable session reports usage");
+            assert_eq!(
+                usage.input_tokens, *input_tokens,
+                "usage must be attributed to the member whose session it came from"
+            );
+            assert!(member.usage_unavailable.is_none());
+            assert!(
+                accounting
+                    .member_session_ids
+                    .iter()
+                    .any(|pointer| pointer == &session_id.to_string()),
+                "the export pointer set must contain every member session"
+            );
+        }
+        assert_eq!(accounting.usage_total.input_tokens, 300);
+        assert_eq!(accounting.usage_total.output_tokens, 14);
+        assert_eq!(
+            accounting.attribution,
+            meerkat_contracts::WireMobRunUsageAttribution::SessionCumulative
+        );
+    }
+
+    /// A member whose session the host cannot read is named, not zeroed, and
+    /// the members it can read keep their numbers.
+    #[tokio::test]
+    async fn run_accounting_degrades_per_member_when_a_session_is_unreadable() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let state = MobMcpState::new(svc.clone(), MobControlPrincipal::Owner);
+        let mob_id = state
+            .mob_create_definition(explicit_definition("run-accounting-degrade"))
+            .await
+            .expect("create mob");
+        let readable = AgentIdentity::from("readable-1");
+        state
+            .mob_spawn(
+                &mob_id,
+                ProfileName::from("worker"),
+                readable.clone(),
+                Some(MobRuntimeMode::TurnDriven),
+                None,
+                None,
+            )
+            .await
+            .expect("spawn readable member");
+        let readable_session = state
+            .mob_member_status(&mob_id, &readable)
+            .await
+            .expect("member status")
+            .current_session_id
+            .expect("bridge session");
+        svc.prime_session_usage(
+            &readable_session,
+            Usage {
+                input_tokens: 42,
+                output_tokens: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Drop the session document behind the second member's back so its
+        // read fails the way a remote or archived session does.
+        let unreadable = AgentIdentity::from("unreadable-1");
+        state
+            .mob_spawn(
+                &mob_id,
+                ProfileName::from("worker"),
+                unreadable.clone(),
+                Some(MobRuntimeMode::TurnDriven),
+                None,
+                None,
+            )
+            .await
+            .expect("spawn second member");
+        let unreadable_session = state
+            .mob_member_status(&mob_id, &unreadable)
+            .await
+            .expect("member status")
+            .current_session_id
+            .expect("bridge session");
+        svc.forget_session(&unreadable_session).await;
+
+        let accounting = state
+            .mob_run_accounting(&mob_id)
+            .await
+            .expect("one unreadable member must not fail the whole projection");
+        assert_eq!(accounting.members.len(), 2);
+        assert_eq!(accounting.members_usage_unavailable, 1);
+        assert_eq!(accounting.usage_total.input_tokens, 42);
+        let degraded = accounting
+            .members
+            .iter()
+            .find(|member| member.agent_identity == unreadable.as_str())
+            .expect("the unreadable member is still projected");
+        assert!(degraded.usage.is_none());
+        assert!(
+            degraded
+                .usage_unavailable
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not readable here")),
+            "absence must carry its reason: {degraded:?}"
+        );
+        // Its session id still rides along: unreadable here is still
+        // exportable where the session lives.
+        assert_eq!(
+            degraded.session_id,
+            Some(unreadable_session.to_string()),
+            "an unreadable-here session is still exportable where it lives"
         );
     }
 }

@@ -11066,6 +11066,10 @@
             },
             "type": "array"
           },
+          "read_only": {
+            "description": "Profile-declared read-only intent, carried so a member materialized on\nanother host enforces the same execution gate.\n\nUnlike its sibling category toggles this field is omitted when false,\nwhich is load-bearing twice over: a spec that carries no read-only\nintent keeps the exact digest-covered bytes it had before the field\nexisted, and a read-only spec sent to a host too old to know the field\nis rejected by `deny_unknown_fields` instead of silently materializing\nan ungated member.",
+            "type": "boolean"
+          },
           "schedule": {
             "default": false,
             "type": "boolean"
@@ -15189,6 +15193,19 @@
               "value"
             ],
             "type": "object"
+          },
+          {
+            "description": "Only tools whose owning dispatcher declares\n[`crate::ToolMutationClass::ReadOnly`] may execute.\n\nName-independent intent: a tool the dispatcher chain does not declare\nread-only is denied, so tools that appear later (MCP servers finishing\ntheir handshake, host bundles) never widen the policy. See\n[`crate::tool_execution_policy`] for the exact guarantee boundary this\ndeclaration does and does not cover.\n\nDowngrade consequence: this enum is closed and adjacently tagged, and\nit is persisted in durable session metadata\n(`SessionMetadata.tooling.tool_access_policy`), so a binary older than\nthe release that added this variant cannot decode the metadata of a\nsession launched with read-only intent. Failing to decode is the\nintended outcome (a downgrade that silently read it as `Inherit` would\ndrop the enforcement), but the session is unresumable on that binary\nuntil it is upgraded.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -18836,6 +18853,19 @@
             "required": [
               "type",
               "value"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Read-only intent, carried across the host boundary so a remotely\nmaterialized member keeps the declaration instead of silently\ndowngrading to unrestricted.",
+            "properties": {
+              "type": {
+                "const": "read_only",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
             ],
             "type": "object"
           }

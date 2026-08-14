@@ -351,6 +351,9 @@ pub(crate) fn spawn_spec_from_desired_member(
                 WireResolvedToolAccessPolicy::DenyList(names) => {
                     meerkat_core::ops::ToolAccessPolicy::DenyList(names.iter().cloned().collect())
                 }
+                WireResolvedToolAccessPolicy::ReadOnly => {
+                    meerkat_core::ops::ToolAccessPolicy::ReadOnly
+                }
             });
     spec.auth_binding = material.overlay.auth_binding.clone().map(Into::into);
     spec.budget_limits = material.overlay.budget_limits.clone();
@@ -477,6 +480,9 @@ fn resolved_tool_access_policy(
         Some(meerkat_core::ops::ToolAccessPolicy::DenyList(names)) => Ok(Some(
             WireResolvedToolAccessPolicy::DenyList(sorted_tool_names(names)),
         )),
+        Some(meerkat_core::ops::ToolAccessPolicy::ReadOnly) => {
+            Ok(Some(WireResolvedToolAccessPolicy::ReadOnly))
+        }
         Some(meerkat_core::ops::ToolAccessPolicy::Inherit) => Err(MobError::WiringError(format!(
             "tool access policy for member '{agent_identity}' is still Inherit at material compile; callers must resolve it before the actor seals desired material"
         ))),

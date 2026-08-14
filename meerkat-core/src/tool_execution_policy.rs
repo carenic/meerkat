@@ -16,6 +16,38 @@
 //! continues. Provider-native server tools never traverse
 //! [`AgentToolDispatcher`] and cannot be gated here; hosts that need them
 //! gated must disable the native capability on gated builds.
+//!
+//! # Read-only intent and the exact boundary of its guarantee
+//!
+//! [`ToolAccessPolicy::ReadOnly`] is the name-independent form: it admits a
+//! call only when the dispatcher that owns the name declares
+//! [`ToolMutationClass::ReadOnly`] for it. Declaration is made by the code
+//! that owns the tool (`AgentToolDispatcher::tool_mutation_class`), so an
+//! undeclared tool is [`ToolMutationClass::Unknown`] and is denied. That
+//! fail-closed default is the whole design: over-denial is honest,
+//! under-denial would be a false guarantee.
+//!
+//! What the declaration therefore does NOT promise:
+//!
+//! - **Provider-native server tools** (web search, code execution, computer
+//!   use run by the provider) never traverse [`AgentToolDispatcher`], so this
+//!   gate cannot see them. A read-only launch is only truthful when the host
+//!   also disables native tool capabilities.
+//! - **MCP tools** are `Unknown` and denied. The MCP `readOnlyHint`
+//!   annotation is a hint supplied by the server being gated, not a proof, so
+//!   it is deliberately not honored here. An operator who has audited a
+//!   specific MCP tool should use an explicit `AllowList` instead of asking
+//!   read-only intent to guess.
+//! - **`shell`** is mutating: nothing in-tree classifies a command line, so
+//!   there is no read-only shell. Read-only intent denies it outright, which
+//!   also means the in-tree read surface is narrow (file reads go through
+//!   `shell`); hosts that want a read-only agent to read files supply their
+//!   own dispatcher and declare its read tools.
+//! - **Host-supplied dispatchers** (rust bundles, external tool surfaces)
+//!   are `Unknown` until they implement the declaration themselves.
+//!
+//! Within those boundaries the guarantee is exact: no call reaches the inner
+//! dispatcher unless its owner declared it read-only.
 
 use crate::agent::{
     AgentToolDispatcher, BindOutcome, DispatcherCapabilities, ExternalToolUpdate,
@@ -54,6 +86,34 @@ impl ToolExecutionPolicyError {
     }
 }
 
+/// Declared world-mutation semantics of one tool binding.
+///
+/// The declaration is made by the dispatcher that owns the tool name, never
+/// inferred from the name or the schema. `Unknown` is the default because an
+/// undeclared tool must not be treated as safe: read-only intent denies
+/// everything that is not positively declared read-only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolMutationClass {
+    /// The tool cannot change state outside this session's own transcript:
+    /// no filesystem writes, no network writes, no store mutation, no
+    /// messages to other agents, no process spawning.
+    ReadOnly,
+    /// The tool can change state outside the session.
+    Mutating,
+    /// Mutation semantics are undeclared or not knowable at this seam
+    /// (third-party MCP tools, host bundles that have not declared).
+    #[default]
+    Unknown,
+}
+
+impl ToolMutationClass {
+    /// Whether this class is a positive read-only declaration.
+    #[must_use]
+    pub const fn is_declared_read_only(self) -> bool {
+        matches!(self, Self::ReadOnly)
+    }
+}
+
 /// Sealed resolved form of a per-launch tool access policy.
 ///
 /// Constructed only through [`ToolExecutionPolicy::unrestricted`] or the
@@ -72,6 +132,9 @@ enum ToolExecutionPolicyKind {
     AllowList(ToolNameSet),
     /// The named tools may not execute.
     DenyList(ToolNameSet),
+    /// Only tools declared [`ToolMutationClass::ReadOnly`] by their owning
+    /// dispatcher may execute.
+    ReadOnly,
 }
 
 impl ToolExecutionPolicy {
@@ -98,6 +161,9 @@ impl ToolExecutionPolicy {
             ToolAccessPolicy::DenyList(names) => Ok(Self {
                 kind: ToolExecutionPolicyKind::DenyList(names),
             }),
+            ToolAccessPolicy::ReadOnly => Ok(Self {
+                kind: ToolExecutionPolicyKind::ReadOnly,
+            }),
         }
     }
 
@@ -107,14 +173,38 @@ impl ToolExecutionPolicy {
         matches!(self.kind, ToolExecutionPolicyKind::Unrestricted)
     }
 
-    /// Whether a call to the named tool is permitted by this policy.
+    /// Whether this policy admits calls solely on a read-only declaration.
     #[must_use]
-    pub fn permits(&self, name: &str) -> bool {
+    pub fn is_read_only_intent(&self) -> bool {
+        matches!(self.kind, ToolExecutionPolicyKind::ReadOnly)
+    }
+
+    /// Whether a call to the named tool is permitted, given the mutation class
+    /// its owning dispatcher declares for that name.
+    ///
+    /// Name-list policies ignore the class; read-only intent decides on the
+    /// class alone and admits nothing but a positive
+    /// [`ToolMutationClass::ReadOnly`] declaration.
+    #[must_use]
+    pub fn permits_call(&self, name: &str, declared: ToolMutationClass) -> bool {
         match &self.kind {
             ToolExecutionPolicyKind::Unrestricted => true,
             ToolExecutionPolicyKind::AllowList(names) => names.contains(name),
             ToolExecutionPolicyKind::DenyList(names) => !names.contains(name),
+            ToolExecutionPolicyKind::ReadOnly => declared.is_declared_read_only(),
         }
+    }
+
+    /// Whether a call to the named tool is permitted without a declaration in
+    /// hand.
+    ///
+    /// Equivalent to `permits_call(name, ToolMutationClass::Unknown)`: a
+    /// caller that cannot supply the owning dispatcher's declaration gets the
+    /// fail-closed answer under read-only intent. Callers that CAN reach the
+    /// declaration (the dispatch gate) must use [`Self::permits_call`].
+    #[must_use]
+    pub fn permits(&self, name: &str) -> bool {
+        self.permits_call(name, ToolMutationClass::Unknown)
     }
 }
 
@@ -138,6 +228,20 @@ impl<T: AgentToolDispatcher + ?Sized> ExecutionPolicyGatedDispatcher<T> {
     /// Wrap `inner` with the resolved execution policy.
     pub fn new(inner: Arc<T>, policy: ToolExecutionPolicy) -> Self {
         Self { inner, policy }
+    }
+
+    /// Whether the policy admits this call, consulting the inner dispatcher's
+    /// own mutation declaration for the name.
+    ///
+    /// The declaration is only read for read-only intent; name-list policies
+    /// must not pay for a forwarded lookup on every dispatch.
+    fn permits_inner_call(&self, name: &str) -> bool {
+        if self.policy.is_read_only_intent() {
+            return self
+                .policy
+                .permits_call(name, self.inner.tool_mutation_class(name));
+        }
+        self.policy.permits(name)
     }
 
     /// Deny verdict for a call, preserving the `not_found` vs `access_denied`
@@ -179,6 +283,10 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         self.inner.tool_catalog()
     }
 
+    fn tool_mutation_class(&self, tool_name: &str) -> ToolMutationClass {
+        self.inner.tool_mutation_class(tool_name)
+    }
+
     fn pending_catalog_sources(&self) -> Arc<[String]> {
         self.inner.pending_catalog_sources()
     }
@@ -187,7 +295,7 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         &self,
         tool_name: &str,
     ) -> Result<crate::EphemeralToolBindingFingerprint, crate::ToolExecutionResolutionError> {
-        if !self.policy.permits(tool_name) {
+        if !self.permits_inner_call(tool_name) {
             return Err(match self.denial_error(tool_name) {
                 ToolError::NotFound { .. } => crate::ToolExecutionResolutionError::NotFound {
                     tool_name: tool_name.to_string(),
@@ -215,7 +323,7 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         dispatch_context: &ToolDispatchContext,
         resolution_context: &crate::ToolExecutionResolutionContext,
     ) -> Result<crate::ResolvedToolExecutionPlan, crate::ToolExecutionResolutionError> {
-        if !self.policy.permits(call.name) {
+        if !self.permits_inner_call(call.name) {
             return Err(match self.denial_error(call.name) {
                 ToolError::NotFound { .. } => crate::ToolExecutionResolutionError::NotFound {
                     tool_name: call.name.to_string(),
@@ -233,7 +341,7 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         &self,
         call: ToolCallView<'_>,
     ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
-        if !self.policy.permits(call.name) {
+        if !self.permits_inner_call(call.name) {
             return Err(self.denial_error(call.name));
         }
         self.inner.dispatch(call).await
@@ -244,7 +352,7 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         call: ToolCallView<'_>,
         context: &ToolDispatchContext,
     ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
-        if !self.policy.permits(call.name) {
+        if !self.permits_inner_call(call.name) {
             return Err(self.denial_error(call.name));
         }
         self.inner.dispatch_with_context(call, context).await
@@ -256,7 +364,7 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         context: &ToolDispatchContext,
         plan: &crate::ResolvedToolExecutionPlan,
     ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
-        if !self.policy.permits(call.name) {
+        if !self.permits_inner_call(call.name) {
             return Err(self.denial_error(call.name));
         }
         self.inner
@@ -718,6 +826,70 @@ mod tests {
             .expect("deny list resolves")
     }
 
+    fn read_only() -> ToolExecutionPolicy {
+        ToolExecutionPolicy::resolve(ToolAccessPolicy::ReadOnly).expect("read-only resolves")
+    }
+
+    /// Inner dispatcher that both records dispatches and declares a mutation
+    /// class per name, so the read-only gate can be tested against the exact
+    /// declaration seam a real dispatcher implements.
+    struct DeclaringDispatcher {
+        inner: Arc<SpyDispatcher>,
+        classes: Vec<(String, ToolMutationClass)>,
+    }
+
+    impl DeclaringDispatcher {
+        fn new(declared: &[(&str, ToolMutationClass)], undeclared: &[&str]) -> Self {
+            let names: Vec<&str> = declared
+                .iter()
+                .map(|(name, _)| *name)
+                .chain(undeclared.iter().copied())
+                .collect();
+            Self {
+                inner: Arc::new(SpyDispatcher::new(&names)),
+                classes: declared
+                    .iter()
+                    .map(|(name, class)| ((*name).to_string(), *class))
+                    .collect(),
+            }
+        }
+
+        fn dispatched(&self) -> Vec<String> {
+            self.inner.dispatched()
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentToolDispatcher for DeclaringDispatcher {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            self.inner.tools()
+        }
+
+        fn tool_mutation_class(&self, tool_name: &str) -> ToolMutationClass {
+            self.classes
+                .iter()
+                .find(|(name, _)| name == tool_name)
+                .map(|(_, class)| *class)
+                .unwrap_or_default()
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+            self.inner.dispatch(call).await
+        }
+
+        async fn dispatch_with_context(
+            &self,
+            call: ToolCallView<'_>,
+            context: &ToolDispatchContext,
+        ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+            self.inner.dispatch_with_context(call, context).await
+        }
+    }
+
     async fn dispatch_named<T: AgentToolDispatcher + ?Sized>(
         dispatcher: &T,
         name: &str,
@@ -908,6 +1080,129 @@ mod tests {
             .expect_err("memory_search absent from allow list must be denied");
         assert_eq!(err, ToolError::access_denied("memory_search"));
         assert!(inner.dispatched().is_empty());
+    }
+
+    // ── Read-only intent ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_only_admits_declared_reads_and_refuses_everything_else() {
+        let inner = Arc::new(DeclaringDispatcher::new(
+            &[
+                ("datetime", ToolMutationClass::ReadOnly),
+                ("shell", ToolMutationClass::Mutating),
+            ],
+            &["mcp_unknown_tool"],
+        ));
+        let gated = ExecutionPolicyGatedDispatcher::new(Arc::clone(&inner), read_only());
+
+        let outcome = dispatch_named(&gated, "datetime")
+            .await
+            .expect("declared read-only tool must dispatch");
+        assert!(!outcome.result.is_error);
+
+        let err = dispatch_named(&gated, "shell")
+            .await
+            .expect_err("declared mutating tool must be denied");
+        assert_eq!(err, ToolError::access_denied("shell"));
+        assert_eq!(err.error_code(), "access_denied");
+
+        // An undeclared tool (the MCP case) is Unknown, not safe.
+        let err = dispatch_named(&gated, "mcp_unknown_tool")
+            .await
+            .expect_err("undeclared tool must be denied under read-only intent");
+        assert_eq!(err, ToolError::access_denied("mcp_unknown_tool"));
+
+        // Mutation check: exactly one call reached the inner dispatcher, so the
+        // refusals happened before execution rather than after it.
+        assert_eq!(inner.dispatched(), vec!["datetime".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn read_only_refusal_precedes_execution_on_every_dispatch_entry_point() {
+        let inner = Arc::new(DeclaringDispatcher::new(
+            &[("shell", ToolMutationClass::Mutating)],
+            &[],
+        ));
+        let gated = ExecutionPolicyGatedDispatcher::new(Arc::clone(&inner), read_only());
+
+        dispatch_named(&gated, "shell")
+            .await
+            .expect_err("dispatch must deny");
+        dispatch_named_with_context(&gated, "shell")
+            .await
+            .expect_err("dispatch_with_context must deny");
+        let args = empty_args();
+        let call = ToolCallView {
+            id: "call-1",
+            name: "shell",
+            args: &args,
+        };
+        let resolution = crate::ToolExecutionResolutionContext::new(
+            crate::ToolDeadlineChain::new(vec![crate::ToolDeadlineContributor::finite(
+                crate::ToolDeadlineOwner::CoreToolDispatch,
+                std::time::Duration::from_secs(600),
+            )])
+            .expect("deadline chain"),
+        );
+        gated
+            .resolve_execution_plan(call, &ToolDispatchContext::default(), &resolution)
+            .expect_err("plan resolution must deny before any execution plan exists");
+        assert!(
+            inner.dispatched().is_empty(),
+            "no read-only denial may reach the inner dispatcher"
+        );
+    }
+
+    /// The declaration is a property of the owning dispatcher, so a policy
+    /// without one in hand must not guess.
+    #[test]
+    fn read_only_policy_denies_when_no_declaration_is_supplied() {
+        let policy = read_only();
+        assert!(!policy.permits("datetime"));
+        assert!(policy.permits_call("datetime", ToolMutationClass::ReadOnly));
+        assert!(!policy.permits_call("datetime", ToolMutationClass::Mutating));
+        assert!(!policy.permits_call("datetime", ToolMutationClass::Unknown));
+        assert!(policy.is_read_only_intent());
+        assert!(!policy.is_unrestricted());
+    }
+
+    /// Name-list policies must keep ignoring declarations: a deny-list host
+    /// that never opted into read-only intent gets exactly its old behavior.
+    #[test]
+    fn name_list_policies_ignore_mutation_declarations() {
+        assert!(allow_list(&["alpha"]).permits_call("alpha", ToolMutationClass::Mutating));
+        assert!(!allow_list(&["alpha"]).permits_call("beta", ToolMutationClass::ReadOnly));
+        assert!(deny_list(&["beta"]).permits_call("alpha", ToolMutationClass::Unknown));
+        assert!(!deny_list(&["beta"]).permits_call("beta", ToolMutationClass::ReadOnly));
+        assert!(
+            ToolExecutionPolicy::unrestricted().permits_call("beta", ToolMutationClass::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_gate_keeps_the_llm_visible_tool_list_unchanged() {
+        let inner = Arc::new(DeclaringDispatcher::new(
+            &[
+                ("datetime", ToolMutationClass::ReadOnly),
+                ("shell", ToolMutationClass::Mutating),
+            ],
+            &[],
+        ));
+        let gated = ExecutionPolicyGatedDispatcher::new(Arc::clone(&inner), read_only());
+        let before: Vec<String> = inner
+            .tools()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        let after: Vec<String> = gated
+            .tools()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(
+            before, after,
+            "read-only gating must not change the prompt-cache prefix"
+        );
     }
 
     // ── Bind survival ────────────────────────────────────────────────────
