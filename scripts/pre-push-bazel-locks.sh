@@ -3,19 +3,39 @@
 # module lockfile are stale, so CI doesn't reject the push for the same
 # reason after a long round-trip.
 #
-# Two gates:
+# Three gates:
 #   1. node scripts/generate-bazel-rust-builds.mjs --check
 #      Verifies the generated Bazel BUILD files match the workspace's
 #      Cargo metadata. Always runs (no `bb` CLI dependency).
-#   2. bb mod deps --lockfile_mode=error
-#      Verifies MODULE.bazel.lock matches MODULE.bazel. Requires the
-#      pinned `bb` CLI. Skipped (with a clear note) when `bb` is not
-#      available on this developer's machine — CI will catch staleness
-#      regardless.
+#   2. scripts/check_bazel_module_lock_inputs.py
+#      Verifies MODULE.bazel.lock still matches the workspace files it
+#      recorded as crate_universe extension inputs (Cargo.lock and every
+#      member manifest). Offline and always runs: this is the class that
+#      broke every BuildBuddy release-binary lane in 0.8.22, when a
+#      one-line Cargo.lock heal landed without a module-lock refresh.
+#   3. bb mod deps --lockfile_mode=error
+#      Full authority over MODULE.bazel.lock vs MODULE.bazel, including
+#      registry inputs gate 2 cannot see. Requires the pinned `bb` CLI.
+#      Skipped (with a clear note) when `bb` is not available, unless
+#      --require-bb is passed (the release preflight does).
 #
-# Exit 0 = locks fresh (or skipped honestly), exit 1 = stale locks.
+# Usage: pre-push-bazel-locks.sh [--require-bb]
+# Exit 0 = locks fresh (or gate 3 skipped honestly), exit 1 = stale locks.
 
 set -euo pipefail
+
+require_bb=0
+for arg in "$@"; do
+  case "$arg" in
+    --require-bb)
+      require_bb=1
+      ;;
+    *)
+      echo "usage: pre-push-bazel-locks.sh [--require-bb]" >&2
+      exit 2
+      ;;
+  esac
+done
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -42,7 +62,21 @@ else
   failed=1
 fi
 
-# ---- Gate 2: MODULE.bazel.lock freshness ------------------------------------
+# ---- Gate 2: recorded workspace inputs vs on-disk content -------------------
+
+PYTHON="${PYTHON:-$(command -v python3.11 2>/dev/null || command -v python3)}"
+
+if "${PYTHON}" scripts/check_bazel_module_lock_inputs.py "${ROOT}"; then
+  printf '%bMODULE.bazel.lock matches its recorded workspace inputs%b\n' "${GREEN}" "${NC}"
+else
+  printf '%bMODULE.bazel.lock no longer matches the workspace files it recorded.%b\n' \
+    "${RED}" "${NC}"
+  printf '%bEvery BuildBuddy lane reads this lock in error mode; it fails there instead.%b\n\n' \
+    "${YELLOW}" "${NC}"
+  failed=1
+fi
+
+# ---- Gate 3: MODULE.bazel.lock freshness ------------------------------------
 
 # Locate the pinned `bb` CLI the same way scripts/buildbuddy-doctor does.
 bb_bin=""
@@ -56,10 +90,21 @@ elif [[ -x /tmp/buildbuddy-poc/bin/bb ]]; then
   bb_bin="/tmp/buildbuddy-poc/bin/bb"
 fi
 
-if [[ -z "${bb_bin}" ]]; then
-  printf '%bbb CLI not installed locally; skipping MODULE.bazel.lock check%b\n' \
+if [[ -z "${bb_bin}" && "${require_bb}" -eq 1 ]]; then
+  printf '%bbb CLI is required for the authoritative MODULE.bazel.lock check.%b\n' \
+    "${RED}" "${NC}"
+  printf '%bInstall it with:%b  make buildbuddy-install\n' "${YELLOW}" "${NC}"
+  printf '%bThe release path may not skip this: a stale module lock fails every%b\n' \
     "${YELLOW}" "${NC}"
-  printf '%b(CI runs this check too — install with `make buildbuddy-install` to catch it locally.)%b\n' \
+  printf '%bBuildBuddy release-binary lane after the tag already exists.%b\n\n' \
+    "${YELLOW}" "${NC}"
+  failed=1
+elif [[ -z "${bb_bin}" ]]; then
+  printf '%bbb CLI not installed locally; skipping full lockfile_mode=error check%b\n' \
+    "${YELLOW}" "${NC}"
+  printf '%b(Gate 2 above still covers the workspace-input class offline. Install%b\n' \
+    "${YELLOW}" "${NC}"
+  printf '%bwith `make buildbuddy-install`, or run `make verify-bazel-locks-strict`.)%b\n' \
     "${YELLOW}" "${NC}"
 else
   lock_log="${TMPDIR:-/tmp}/meerkat-pre-push-bazel-lock.$$"

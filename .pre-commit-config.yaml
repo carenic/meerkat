@@ -193,6 +193,30 @@ repos:
         always_run: true
         stages: [pre-push]
 
+      - id: lock-consistency-gate-contract
+        name: lock gate rejects merge-manufactured dangling lock references
+        entry: scripts/test-lock-consistency-gate.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: bazel-module-lock-gate-contract
+        name: module lock gate rejects stale and unrecorded workspace inputs
+        entry: scripts/test-bazel-module-lock-gate.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: crate-enumeration-gate-contract
+        name: release gate names crates missing from any required enumeration
+        entry: scripts/test-crate-enumeration-gate.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
       - id: cargo-test
         name: workspace deterministic unit + integration + e2e gate
         entry: scripts/pre-push-unit.sh

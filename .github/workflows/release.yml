@@ -290,6 +290,16 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish_release_assets_only != 'true' }}
         run: make check-rust-release-config
 
+      # 0.8.22 lost a release evening here: the tag's Cargo.lock referenced a
+      # thiserror version the merged lock no longer contained (only --locked
+      # refuses it, and cargo publish is --locked), and healing that lock
+      # staled MODULE.bazel.lock, which failed every BuildBuddy binary lane.
+      - name: Verify Cargo.lock resolves under --locked
+        run: make verify-lock-consistency
+
+      - name: Verify MODULE.bazel.lock recorded inputs
+        run: make verify-bazel-module-lock-inputs
+
       - name: Check formatting
         run: make fmt-check
 
@@ -327,6 +337,9 @@ jobs:
       - name: Verify Rust release config
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish_release_assets_only != 'true' }}
         run: make check-rust-release-config
+
+      - name: Verify MODULE.bazel.lock recorded inputs
+        run: make verify-bazel-module-lock-inputs
 
   release_validate_gate:
     name: Release validation gate

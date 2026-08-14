@@ -9,6 +9,9 @@ name: Cargo CI
 #   changes         — path classification (docs-only skips build/test jobs;
 #                     SDK-relevant paths enable the full Web SDK suite)
 #   fmt-governance  — always-run fmt + surface + typed governance gates
+#   locks           - always-run, never path-gated: Cargo.lock --locked
+#                     resolution (merge danglers) + MODULE.bazel.lock
+#                     recorded-input freshness
 #   clippy          — workspace clippy, all features, lib/bin targets
 #                     (--all-targets multiplies build volume several-fold for
 #                     test-only lint yield; it runs nightly)
@@ -202,6 +205,44 @@ jobs:
 
       - name: Generated headers audit
         run: make audit-generated-headers
+
+  locks:
+    name: Lock consistency
+    # No `needs` and no path gate: on a pull_request run the checked out tree is
+    # refs/pull/N/merge, and that merge preview is the only place the
+    # dangling-lock class exists. A release branch is always self-consistent
+    # because cargo wrote it; the MERGE is where git resolves a shared
+    # [[package]] block textually and leaves a branch-only crate pointing at a
+    # version the merged lock no longer contains. No conflict marker, no test
+    # failure, and then `cargo publish` (which is --locked) dies seconds in.
+    runs-on: ubuntu-latest
+    steps:
+      # Depth 2, not the default 1: a depth-1 clone grafts HEAD to have no
+      # parents, which hides the very merge topology this job reports on.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust-ci
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-locks
+
+      - name: Cargo.lock resolves under --locked
+        run: make verify-lock-consistency
+
+      # MODULE.bazel.lock records Cargo.lock and every member manifest as
+      # crate_universe extension inputs. Healing the Cargo.lock without
+      # refreshing it fails every BuildBuddy release-binary lane, which is far
+      # too late; the recorded hashes make that decidable here, offline. The
+      # generated-BUILD half of `make verify-bazel-locks` stays on pre-push and
+      # local `make ci`, where it is proven.
+      - name: MODULE.bazel.lock recorded inputs
+        run: make verify-bazel-module-lock-inputs
 
   clippy:
     name: Clippy (workspace, all features)
@@ -829,6 +870,7 @@ jobs:
     needs:
       - changes
       - fmt-governance
+      - locks
       - clippy
       - unit
       - int-heavy
@@ -849,6 +891,7 @@ jobs:
           RESULTS: >-
             ${{ needs.changes.result }}
             ${{ needs.fmt-governance.result }}
+            ${{ needs.locks.result }}
             ${{ needs.clippy.result }}
             ${{ needs.unit.result }}
             ${{ needs.int-heavy.result }}
