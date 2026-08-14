@@ -589,6 +589,7 @@ export type {
   ExternalToolDeltaPhase,
   MalformedEvent,
   UnknownEvent,
+  ProviderTokenAccounting,
   StopReason,
   ToolCallArguments,
   BudgetType,

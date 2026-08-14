@@ -231,6 +231,106 @@ mod tests {
     }
 
     #[test]
+    fn wire_event_turn_completed_carries_resolved_model_attribution() {
+        let usage = meerkat_core::TurnUsage::new(
+            meerkat_core::Usage {
+                input_tokens: 300,
+                output_tokens: 150,
+                cache_creation_tokens: Some(0),
+                cache_read_tokens: Some(4000),
+                provider_accounting: None,
+            },
+            meerkat_core::ProviderTokenAccounting::anthropic("claude-opus-5", 300, 0, 4000),
+        );
+        let event = WireEvent {
+            session_id: SessionId::new(),
+            sequence: 7,
+            event: AgentEvent::TurnCompleted {
+                stop_reason: meerkat_core::StopReason::EndTurn,
+                usage: usage.clone(),
+            },
+            contract_version: ContractVersion::CURRENT,
+        };
+
+        let encoded = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(
+            encoded["event"]["usage"]["accounting"]["provider"],
+            serde_json::json!("anthropic"),
+            "a consumer reading only the event stream must see the provider"
+        );
+        assert_eq!(
+            encoded["event"]["usage"]["accounting"]["model"],
+            serde_json::json!("claude-opus-5"),
+            "a consumer reading only the event stream must see the model"
+        );
+        assert_eq!(
+            encoded["event"]["usage"]["accounting"]["presented_tokens"],
+            serde_json::json!(4300)
+        );
+
+        let decoded: WireEvent = serde_json::from_value(encoded).expect("deserialize");
+        match decoded.event {
+            AgentEvent::TurnCompleted {
+                usage: decoded_usage,
+                ..
+            } => assert_eq!(decoded_usage, usage),
+            other => panic!("expected turn_completed, got {other:?}"),
+        }
+
+        // The cumulative run boundary deliberately carries no single-model
+        // attribution: one run may span providers and models.
+        let cumulative = meerkat_core::CumulativeUsage::from_usage(usage.into_inner());
+        let run = WireEvent {
+            session_id: SessionId::new(),
+            sequence: 8,
+            event: AgentEvent::RunCompleted {
+                session_id: SessionId::new(),
+                result: "done".to_string(),
+                structured_output: None,
+                extraction_required: false,
+                usage: cumulative,
+                terminal_cause_kind: None,
+            },
+            contract_version: ContractVersion::CURRENT,
+        };
+        let run_encoded = serde_json::to_value(&run).expect("serialize run");
+        assert!(
+            run_encoded["event"]["usage"].get("accounting").is_none()
+                && run_encoded["event"]["usage"]
+                    .get("provider_accounting")
+                    .is_none(),
+            "run-level cumulative usage must not claim one per-call model"
+        );
+    }
+
+    #[test]
+    fn wire_turn_usage_preserves_attribution_and_normalized_total() {
+        let usage = meerkat_core::TurnUsage::new(
+            meerkat_core::Usage {
+                input_tokens: 1000,
+                output_tokens: 200,
+                cache_creation_tokens: Some(4000),
+                cache_read_tokens: Some(0),
+                provider_accounting: None,
+            },
+            meerkat_core::ProviderTokenAccounting::anthropic("claude-opus-5", 1000, 4000, 0),
+        );
+        let wire: crate::wire::WireTurnUsage = usage.into();
+        assert_eq!(wire.accounting.model, "claude-opus-5");
+        assert_eq!(wire.accounting.provider, meerkat_core::Provider::Anthropic);
+        assert_eq!(wire.usage.input_tokens, 1000);
+        assert_eq!(
+            wire.usage.total_tokens, 5200,
+            "wire total for one call is presented input plus output"
+        );
+
+        let encoded = serde_json::to_value(&wire).expect("serialize");
+        let decoded: crate::wire::WireTurnUsage =
+            serde_json::from_value(encoded).expect("deserialize");
+        assert_eq!(decoded, wire);
+    }
+
+    #[test]
     fn event_replay_cursor_is_typed_and_scope_checked() {
         let session_a = SessionId::new();
         let session_b = SessionId::new();

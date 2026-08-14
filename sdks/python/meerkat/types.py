@@ -294,7 +294,11 @@ PeerCorrelationId = NewType("PeerCorrelationId", str)
 """Canonical request/response correlation identity for peer interactions."""
 
 # Re-export Usage from events so there's a single canonical definition.
-from .events import Event, Usage as Usage  # noqa: F401
+from .events import (  # noqa: F401
+    Event,
+    ProviderTokenAccounting as ProviderTokenAccounting,
+    Usage as Usage,
+)
 
 
 # ---------------------------------------------------------------------------

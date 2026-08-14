@@ -6672,6 +6672,77 @@ mod tests {
         Ok(())
     }
 
+    /// Per-call model attribution must be readable from the durable log alone.
+    ///
+    /// The 0.8.21 field report had to join event files against SQLite session
+    /// metadata to learn which model produced a turn; this pins that a
+    /// `turn_completed` row carries provider and model in its own bytes.
+    #[tokio::test]
+    async fn turn_completed_model_attribution_round_trips_through_the_durable_log()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("events");
+        let store = FileEventStore::new(&root);
+        let session_id = SessionId::new();
+        let usage = meerkat_core::TurnUsage::new(
+            meerkat_core::Usage {
+                input_tokens: 300,
+                output_tokens: 150,
+                cache_creation_tokens: Some(0),
+                cache_read_tokens: Some(4000),
+                provider_accounting: None,
+            },
+            meerkat_core::ProviderTokenAccounting::anthropic("claude-opus-5", 300, 0, 4000),
+        );
+        store
+            .append(
+                &session_id,
+                &[AgentEvent::TurnCompleted {
+                    stop_reason: meerkat_core::StopReason::EndTurn,
+                    usage: usage.clone(),
+                }],
+            )
+            .await?;
+
+        // A cold reader (fresh store over the same root) is the recovery path.
+        let reader = FileEventStore::new(&root);
+        let rows = reader.read_from(&session_id, 0).await?;
+        assert_eq!(rows.len(), 1);
+        let AgentEvent::TurnCompleted {
+            usage: stored_usage,
+            ..
+        } = &rows[0].event
+        else {
+            return Err(format!(
+                "expected a durable turn_completed row, got {:?}",
+                rows[0].event
+            )
+            .into());
+        };
+        assert_eq!(stored_usage, &usage);
+        assert_eq!(
+            stored_usage.accounting().provider,
+            meerkat_core::Provider::Anthropic
+        );
+        assert_eq!(stored_usage.accounting().model, "claude-opus-5");
+        assert_eq!(stored_usage.accounting().presented_tokens, 4300);
+
+        // The raw JSONL is what an external consumer greps; assert the
+        // attribution is in those bytes and not only in the decoded struct.
+        let raw = tokio::fs::read_to_string(store.log_path(&session_id)).await?;
+        let line = raw.lines().next().expect("one durable row");
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        assert_eq!(
+            value["event"]["usage"]["accounting"]["model"],
+            serde_json::json!("claude-opus-5")
+        );
+        assert_eq!(
+            value["event"]["usage"]["accounting"]["provider"],
+            serde_json::json!("anthropic")
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn exact_interaction_batch_accepts_256_and_rejects_larger_or_duplicate_input()
     -> Result<(), Box<dyn std::error::Error>> {

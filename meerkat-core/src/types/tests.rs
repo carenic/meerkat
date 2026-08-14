@@ -2433,3 +2433,121 @@ mod content_block_tests {
         assert!(def.provenance.is_none());
     }
 }
+
+// ===========================================================================
+// Usage aggregation semantics (pins docs/reference/usage-accounting.mdx)
+// ===========================================================================
+
+mod usage_aggregation_semantics {
+    use super::*;
+    use crate::{Provider, ProviderTokenAccounting};
+
+    /// One Anthropic-shaped provider call from the documented worked example.
+    ///
+    /// `uncached`/`cache_creation`/`cache_read` are the disjoint input
+    /// components Anthropic reports; `presented_tokens` is their sum.
+    fn documented_call(
+        model: &str,
+        uncached: u64,
+        cache_creation: u64,
+        cache_read: u64,
+        output: u64,
+    ) -> TurnUsage {
+        TurnUsage::new(
+            Usage {
+                input_tokens: uncached,
+                output_tokens: output,
+                cache_creation_tokens: Some(cache_creation),
+                cache_read_tokens: Some(cache_read),
+                provider_accounting: None,
+            },
+            ProviderTokenAccounting::anthropic(model, uncached, cache_creation, cache_read),
+        )
+    }
+
+    /// The four calls of the worked example in
+    /// `docs/reference/usage-accounting.mdx`: three in the session's first run,
+    /// then one in a second run on the same session. These literals and the
+    /// assertions below must stay identical to that page.
+    fn documented_session() -> Vec<TurnUsage> {
+        vec![
+            documented_call("claude-opus-5", 1000, 4000, 0, 200),
+            documented_call("claude-opus-5", 300, 0, 4000, 150),
+            documented_call("claude-opus-5", 120, 0, 4300, 90),
+            documented_call("claude-opus-5", 200, 0, 4500, 60),
+        ]
+    }
+
+    #[test]
+    fn cumulative_usage_matches_documented_aggregation_example() {
+        let calls = documented_session();
+        assert_eq!(
+            calls
+                .iter()
+                .map(TurnUsage::presented_tokens)
+                .collect::<Vec<_>>(),
+            vec![5000, 4300, 4420, 4700],
+            "per-call presented totals are the documented per-call inputs"
+        );
+
+        // The account is session-scoped, so the first run's total is a snapshot
+        // of the same running value rather than a separate per-run account.
+        let mut cumulative = CumulativeUsage::default();
+        for call in &calls[..3] {
+            cumulative.add_turn(call);
+        }
+        assert_eq!(cumulative.input_tokens, 13_720);
+        assert_eq!(cumulative.output_tokens, 440);
+        assert_eq!(cumulative.total_tokens(), 14_160);
+        let first_run_snapshot = cumulative.total_tokens();
+
+        cumulative.add_turn(&calls[3]);
+        assert_eq!(cumulative.input_tokens, 18_420);
+        assert_eq!(cumulative.output_tokens, 500);
+        assert_eq!(cumulative.total_tokens(), 18_920);
+
+        assert!(
+            cumulative.cache_creation_tokens.is_none() && cumulative.cache_read_tokens.is_none(),
+            "cumulative usage never aggregates provider cache detail counters"
+        );
+        assert!(
+            cumulative.provider_accounting.is_none(),
+            "a possibly multi-model aggregate must not claim one per-call convention"
+        );
+
+        // A consumer that adds the two observed run totals instead of taking
+        // the latest one.
+        assert_eq!(
+            first_run_snapshot + cumulative.total_tokens(),
+            33_080,
+            "summing session-cumulative snapshots is the documented double count"
+        );
+    }
+
+    #[test]
+    fn per_call_usage_owns_provider_and_model_attribution() {
+        let call = documented_call("claude-opus-5", 120, 0, 4300, 90);
+        assert_eq!(call.accounting().provider, Provider::Anthropic);
+        assert_eq!(call.accounting().model, "claude-opus-5");
+        assert_eq!(call.presented_tokens(), 4420);
+        assert_eq!(call.normalized_total_tokens(), 4510);
+        assert_eq!(
+            call.total_tokens(),
+            210,
+            "raw per-call total uses the uncached input denominator"
+        );
+    }
+
+    #[test]
+    fn turn_usage_serializes_provider_and_model_beside_the_counters() {
+        let call = documented_call("claude-opus-5", 120, 0, 4300, 90);
+        let json = serde_json::to_value(&call).unwrap();
+        assert_eq!(json["accounting"]["provider"], json!("anthropic"));
+        assert_eq!(json["accounting"]["model"], json!("claude-opus-5"));
+        assert_eq!(json["accounting"]["presented_tokens"], json!(4420));
+        assert_eq!(json["input_tokens"], json!(120));
+
+        let decoded: TurnUsage = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, call);
+    }
+}

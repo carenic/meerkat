@@ -1788,7 +1788,7 @@
       },
       "CumulativeUsage": {
         "$ref": "#/$defs/Usage",
-        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific."
+        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific.\n\nThis value is **already a total**, and the total is session-scoped: on the\nevent stream it is `Session::total_usage()`, which is persisted with the\nsession and restored on resume, so `run_completed.usage` on the second run of\na session already contains the first run's calls. Adding it to per-call\nusage, or summing the values observed on two runs, double-counts. It also\nintentionally carries no [`crate::ProviderTokenAccounting`], because one\nsession may span providers and models and so cannot truthfully claim a\nsingle per-call convention; per-model attribution is read from the per-call\n`turn_completed` rows, which cover only the calls that closed a run."
       },
       "DeferredCatalogDelta": {
         "description": "Additive hidden-catalog delta metadata for runtime notices.",
@@ -3574,7 +3574,7 @@
         "type": "string"
       },
       "TurnUsage": {
-        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.\n\n# Model and provider attribution\n\n`accounting` is the single owner of per-call attribution: it carries the\n[`crate::Provider`] and the model string of the request that produced these\ncounters, minted by the provider adapter from the lowered request rather than\nfrom configuration intent. A consumer reading only the event stream can\ntherefore attribute one `turn_completed` row to a model without joining\nagainst session metadata:\n`turn_completed.usage.accounting.provider` /\n`turn_completed.usage.accounting.model`.\n\nThere is deliberately no second copy of the model or provider beside\n`accounting` on the event: attribution has one owner.",
         "properties": {
           "accounting": {
             "$ref": "#/$defs/ProviderTokenAccounting"
@@ -3625,7 +3625,7 @@
         "type": "object"
       },
       "Usage": {
-        "description": "Token usage statistics",
+        "description": "Token usage statistics.\n\n# The same field names carry two different denominators\n\nThis shape is reused for two semantically different accounts, and\n`input_tokens` does not mean the same thing in both:\n\n- **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw\n  provider counters for exactly one provider request. For Anthropic\n  `input_tokens` is the *uncached* input only, with cache-write and\n  cache-read input reported separately in `cache_creation_tokens` and\n  `cache_read_tokens`. The normalized presented-input total for that one\n  call is [`TurnUsage::presented_tokens`].\n- **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a\n  running total over every provider call recorded on the *session*, not on\n  one run. Its `input_tokens` is the saturating sum of each call's\n  *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache\n  detail fields are always `None` because their relationship to the input\n  total is provider-specific.\n\n# What consumers must not sum\n\n- Never sum `run_completed.usage` with per-call usage, and never sum\n  `run_completed.usage` across runs: each value is already the whole\n  session's total to date, so adding two of them double-counts everything\n  before the later one. Take the latest value.\n- Never sum per-call `input_tokens` and expect it to match\n  `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the\n  two use different denominators and will not agree. Sum\n  `turn_completed.usage.accounting.presented_tokens` (that is,\n  [`TurnUsage::presented_tokens`]) instead, which is exactly what\n  [`CumulativeUsage::add_turn`] does.\n- Do not expect the per-call rows to reconcile with the cumulative account\n  either. Intermediate tool-loop calls, the structured-output extraction\n  call, and the compaction summary call are all charged to the cumulative\n  account and publish no `turn_completed` row, so the rows cover a strict\n  subset of the tokens.\n\nThe worked example lives in `docs/reference/usage-accounting.mdx`. Its\nnumbers are pinned against the agent loop by\n`turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`\n(`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's\narithmetic by `cumulative_usage_matches_documented_aggregation_example`.",
         "properties": {
           "cache_creation_tokens": {
             "format": "uint64",
@@ -19818,7 +19818,7 @@
       },
       "CumulativeUsage": {
         "$ref": "#/$defs/Usage",
-        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific."
+        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific.\n\nThis value is **already a total**, and the total is session-scoped: on the\nevent stream it is `Session::total_usage()`, which is persisted with the\nsession and restored on resume, so `run_completed.usage` on the second run of\na session already contains the first run's calls. Adding it to per-call\nusage, or summing the values observed on two runs, double-counts. It also\nintentionally carries no [`crate::ProviderTokenAccounting`], because one\nsession may span providers and models and so cannot truthfully claim a\nsingle per-call convention; per-model attribution is read from the per-call\n`turn_completed` rows, which cover only the calls that closed a run."
       },
       "DeferredCatalogDelta": {
         "description": "Additive hidden-catalog delta metadata for runtime notices.",
@@ -21676,7 +21676,7 @@
         "type": "string"
       },
       "TurnUsage": {
-        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.\n\n# Model and provider attribution\n\n`accounting` is the single owner of per-call attribution: it carries the\n[`crate::Provider`] and the model string of the request that produced these\ncounters, minted by the provider adapter from the lowered request rather than\nfrom configuration intent. A consumer reading only the event stream can\ntherefore attribute one `turn_completed` row to a model without joining\nagainst session metadata:\n`turn_completed.usage.accounting.provider` /\n`turn_completed.usage.accounting.model`.\n\nThere is deliberately no second copy of the model or provider beside\n`accounting` on the event: attribution has one owner.",
         "properties": {
           "accounting": {
             "$ref": "#/$defs/ProviderTokenAccounting"
@@ -21727,7 +21727,7 @@
         "type": "object"
       },
       "Usage": {
-        "description": "Token usage statistics",
+        "description": "Token usage statistics.\n\n# The same field names carry two different denominators\n\nThis shape is reused for two semantically different accounts, and\n`input_tokens` does not mean the same thing in both:\n\n- **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw\n  provider counters for exactly one provider request. For Anthropic\n  `input_tokens` is the *uncached* input only, with cache-write and\n  cache-read input reported separately in `cache_creation_tokens` and\n  `cache_read_tokens`. The normalized presented-input total for that one\n  call is [`TurnUsage::presented_tokens`].\n- **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a\n  running total over every provider call recorded on the *session*, not on\n  one run. Its `input_tokens` is the saturating sum of each call's\n  *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache\n  detail fields are always `None` because their relationship to the input\n  total is provider-specific.\n\n# What consumers must not sum\n\n- Never sum `run_completed.usage` with per-call usage, and never sum\n  `run_completed.usage` across runs: each value is already the whole\n  session's total to date, so adding two of them double-counts everything\n  before the later one. Take the latest value.\n- Never sum per-call `input_tokens` and expect it to match\n  `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the\n  two use different denominators and will not agree. Sum\n  `turn_completed.usage.accounting.presented_tokens` (that is,\n  [`TurnUsage::presented_tokens`]) instead, which is exactly what\n  [`CumulativeUsage::add_turn`] does.\n- Do not expect the per-call rows to reconcile with the cumulative account\n  either. Intermediate tool-loop calls, the structured-output extraction\n  call, and the compaction summary call are all charged to the cumulative\n  account and publish no `turn_completed` row, so the rows cover a strict\n  subset of the tokens.\n\nThe worked example lives in `docs/reference/usage-accounting.mdx`. Its\nnumbers are pinned against the agent loop by\n`turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`\n(`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's\narithmetic by `cumulative_usage_matches_documented_aggregation_example`.",
         "properties": {
           "cache_creation_tokens": {
             "format": "uint64",
@@ -29955,7 +29955,7 @@
       },
       "CumulativeUsage": {
         "$ref": "#/$defs/Usage",
-        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific."
+        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific.\n\nThis value is **already a total**, and the total is session-scoped: on the\nevent stream it is `Session::total_usage()`, which is persisted with the\nsession and restored on resume, so `run_completed.usage` on the second run of\na session already contains the first run's calls. Adding it to per-call\nusage, or summing the values observed on two runs, double-counts. It also\nintentionally carries no [`crate::ProviderTokenAccounting`], because one\nsession may span providers and models and so cannot truthfully claim a\nsingle per-call convention; per-model attribution is read from the per-call\n`turn_completed` rows, which cover only the calls that closed a run."
       },
       "DeferredCatalogDelta": {
         "description": "Additive hidden-catalog delta metadata for runtime notices.",
@@ -32509,7 +32509,7 @@
         "type": "string"
       },
       "TurnUsage": {
-        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.\n\n# Model and provider attribution\n\n`accounting` is the single owner of per-call attribution: it carries the\n[`crate::Provider`] and the model string of the request that produced these\ncounters, minted by the provider adapter from the lowered request rather than\nfrom configuration intent. A consumer reading only the event stream can\ntherefore attribute one `turn_completed` row to a model without joining\nagainst session metadata:\n`turn_completed.usage.accounting.provider` /\n`turn_completed.usage.accounting.model`.\n\nThere is deliberately no second copy of the model or provider beside\n`accounting` on the event: attribution has one owner.",
         "properties": {
           "accounting": {
             "$ref": "#/$defs/ProviderTokenAccounting"
@@ -32560,7 +32560,7 @@
         "type": "object"
       },
       "Usage": {
-        "description": "Token usage statistics",
+        "description": "Token usage statistics.\n\n# The same field names carry two different denominators\n\nThis shape is reused for two semantically different accounts, and\n`input_tokens` does not mean the same thing in both:\n\n- **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw\n  provider counters for exactly one provider request. For Anthropic\n  `input_tokens` is the *uncached* input only, with cache-write and\n  cache-read input reported separately in `cache_creation_tokens` and\n  `cache_read_tokens`. The normalized presented-input total for that one\n  call is [`TurnUsage::presented_tokens`].\n- **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a\n  running total over every provider call recorded on the *session*, not on\n  one run. Its `input_tokens` is the saturating sum of each call's\n  *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache\n  detail fields are always `None` because their relationship to the input\n  total is provider-specific.\n\n# What consumers must not sum\n\n- Never sum `run_completed.usage` with per-call usage, and never sum\n  `run_completed.usage` across runs: each value is already the whole\n  session's total to date, so adding two of them double-counts everything\n  before the later one. Take the latest value.\n- Never sum per-call `input_tokens` and expect it to match\n  `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the\n  two use different denominators and will not agree. Sum\n  `turn_completed.usage.accounting.presented_tokens` (that is,\n  [`TurnUsage::presented_tokens`]) instead, which is exactly what\n  [`CumulativeUsage::add_turn`] does.\n- Do not expect the per-call rows to reconcile with the cumulative account\n  either. Intermediate tool-loop calls, the structured-output extraction\n  call, and the compaction summary call are all charged to the cumulative\n  account and publish no `turn_completed` row, so the rows cover a strict\n  subset of the tokens.\n\nThe worked example lives in `docs/reference/usage-accounting.mdx`. Its\nnumbers are pinned against the agent loop by\n`turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`\n(`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's\narithmetic by `cumulative_usage_matches_documented_aggregation_example`.",
         "properties": {
           "cache_creation_tokens": {
             "format": "uint64",
@@ -36656,7 +36656,7 @@
         ]
       },
       "Usage": {
-        "description": "Token usage statistics",
+        "description": "Token usage statistics.\n\n# The same field names carry two different denominators\n\nThis shape is reused for two semantically different accounts, and\n`input_tokens` does not mean the same thing in both:\n\n- **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw\n  provider counters for exactly one provider request. For Anthropic\n  `input_tokens` is the *uncached* input only, with cache-write and\n  cache-read input reported separately in `cache_creation_tokens` and\n  `cache_read_tokens`. The normalized presented-input total for that one\n  call is [`TurnUsage::presented_tokens`].\n- **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a\n  running total over every provider call recorded on the *session*, not on\n  one run. Its `input_tokens` is the saturating sum of each call's\n  *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache\n  detail fields are always `None` because their relationship to the input\n  total is provider-specific.\n\n# What consumers must not sum\n\n- Never sum `run_completed.usage` with per-call usage, and never sum\n  `run_completed.usage` across runs: each value is already the whole\n  session's total to date, so adding two of them double-counts everything\n  before the later one. Take the latest value.\n- Never sum per-call `input_tokens` and expect it to match\n  `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the\n  two use different denominators and will not agree. Sum\n  `turn_completed.usage.accounting.presented_tokens` (that is,\n  [`TurnUsage::presented_tokens`]) instead, which is exactly what\n  [`CumulativeUsage::add_turn`] does.\n- Do not expect the per-call rows to reconcile with the cumulative account\n  either. Intermediate tool-loop calls, the structured-output extraction\n  call, and the compaction summary call are all charged to the cumulative\n  account and publish no `turn_completed` row, so the rows cover a strict\n  subset of the tokens.\n\nThe worked example lives in `docs/reference/usage-accounting.mdx`. Its\nnumbers are pinned against the agent loop by\n`turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`\n(`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's\narithmetic by `cumulative_usage_matches_documented_aggregation_example`.",
         "properties": {
           "cache_creation_tokens": {
             "format": "uint64",
@@ -43136,7 +43136,7 @@
       },
       "CumulativeUsage": {
         "$ref": "#/$defs/Usage",
-        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific."
+        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific.\n\nThis value is **already a total**, and the total is session-scoped: on the\nevent stream it is `Session::total_usage()`, which is persisted with the\nsession and restored on resume, so `run_completed.usage` on the second run of\na session already contains the first run's calls. Adding it to per-call\nusage, or summing the values observed on two runs, double-counts. It also\nintentionally carries no [`crate::ProviderTokenAccounting`], because one\nsession may span providers and models and so cannot truthfully claim a\nsingle per-call convention; per-model attribution is read from the per-call\n`turn_completed` rows, which cover only the calls that closed a run."
       },
       "CustomModelConfig": {
         "additionalProperties": false,
@@ -46868,7 +46868,7 @@
         "type": "string"
       },
       "TurnUsage": {
-        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.\n\n# Model and provider attribution\n\n`accounting` is the single owner of per-call attribution: it carries the\n[`crate::Provider`] and the model string of the request that produced these\ncounters, minted by the provider adapter from the lowered request rather than\nfrom configuration intent. A consumer reading only the event stream can\ntherefore attribute one `turn_completed` row to a model without joining\nagainst session metadata:\n`turn_completed.usage.accounting.provider` /\n`turn_completed.usage.accounting.model`.\n\nThere is deliberately no second copy of the model or provider beside\n`accounting` on the event: attribution has one owner.",
         "properties": {
           "accounting": {
             "$ref": "#/$defs/ProviderTokenAccounting"
@@ -46919,7 +46919,7 @@
         "type": "object"
       },
       "Usage": {
-        "description": "Token usage statistics",
+        "description": "Token usage statistics.\n\n# The same field names carry two different denominators\n\nThis shape is reused for two semantically different accounts, and\n`input_tokens` does not mean the same thing in both:\n\n- **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw\n  provider counters for exactly one provider request. For Anthropic\n  `input_tokens` is the *uncached* input only, with cache-write and\n  cache-read input reported separately in `cache_creation_tokens` and\n  `cache_read_tokens`. The normalized presented-input total for that one\n  call is [`TurnUsage::presented_tokens`].\n- **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a\n  running total over every provider call recorded on the *session*, not on\n  one run. Its `input_tokens` is the saturating sum of each call's\n  *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache\n  detail fields are always `None` because their relationship to the input\n  total is provider-specific.\n\n# What consumers must not sum\n\n- Never sum `run_completed.usage` with per-call usage, and never sum\n  `run_completed.usage` across runs: each value is already the whole\n  session's total to date, so adding two of them double-counts everything\n  before the later one. Take the latest value.\n- Never sum per-call `input_tokens` and expect it to match\n  `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the\n  two use different denominators and will not agree. Sum\n  `turn_completed.usage.accounting.presented_tokens` (that is,\n  [`TurnUsage::presented_tokens`]) instead, which is exactly what\n  [`CumulativeUsage::add_turn`] does.\n- Do not expect the per-call rows to reconcile with the cumulative account\n  either. Intermediate tool-loop calls, the structured-output extraction\n  call, and the compaction summary call are all charged to the cumulative\n  account and publish no `turn_completed` row, so the rows cover a strict\n  subset of the tokens.\n\nThe worked example lives in `docs/reference/usage-accounting.mdx`. Its\nnumbers are pinned against the agent loop by\n`turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`\n(`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's\narithmetic by `cumulative_usage_matches_documented_aggregation_example`.",
         "properties": {
           "cache_creation_tokens": {
             "format": "uint64",
@@ -58074,7 +58074,7 @@
       },
       "CumulativeUsage": {
         "$ref": "#/$defs/Usage",
-        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific."
+        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific.\n\nThis value is **already a total**, and the total is session-scoped: on the\nevent stream it is `Session::total_usage()`, which is persisted with the\nsession and restored on resume, so `run_completed.usage` on the second run of\na session already contains the first run's calls. Adding it to per-call\nusage, or summing the values observed on two runs, double-counts. It also\nintentionally carries no [`crate::ProviderTokenAccounting`], because one\nsession may span providers and models and so cannot truthfully claim a\nsingle per-call convention; per-model attribution is read from the per-call\n`turn_completed` rows, which cover only the calls that closed a run."
       },
       "DeferredCatalogDelta": {
         "description": "Additive hidden-catalog delta metadata for runtime notices.",
@@ -60628,7 +60628,7 @@
         "type": "string"
       },
       "TurnUsage": {
-        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.\n\n# Model and provider attribution\n\n`accounting` is the single owner of per-call attribution: it carries the\n[`crate::Provider`] and the model string of the request that produced these\ncounters, minted by the provider adapter from the lowered request rather than\nfrom configuration intent. A consumer reading only the event stream can\ntherefore attribute one `turn_completed` row to a model without joining\nagainst session metadata:\n`turn_completed.usage.accounting.provider` /\n`turn_completed.usage.accounting.model`.\n\nThere is deliberately no second copy of the model or provider beside\n`accounting` on the event: attribution has one owner.",
         "properties": {
           "accounting": {
             "$ref": "#/$defs/ProviderTokenAccounting"
@@ -60679,7 +60679,7 @@
         "type": "object"
       },
       "Usage": {
-        "description": "Token usage statistics",
+        "description": "Token usage statistics.\n\n# The same field names carry two different denominators\n\nThis shape is reused for two semantically different accounts, and\n`input_tokens` does not mean the same thing in both:\n\n- **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw\n  provider counters for exactly one provider request. For Anthropic\n  `input_tokens` is the *uncached* input only, with cache-write and\n  cache-read input reported separately in `cache_creation_tokens` and\n  `cache_read_tokens`. The normalized presented-input total for that one\n  call is [`TurnUsage::presented_tokens`].\n- **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a\n  running total over every provider call recorded on the *session*, not on\n  one run. Its `input_tokens` is the saturating sum of each call's\n  *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache\n  detail fields are always `None` because their relationship to the input\n  total is provider-specific.\n\n# What consumers must not sum\n\n- Never sum `run_completed.usage` with per-call usage, and never sum\n  `run_completed.usage` across runs: each value is already the whole\n  session's total to date, so adding two of them double-counts everything\n  before the later one. Take the latest value.\n- Never sum per-call `input_tokens` and expect it to match\n  `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the\n  two use different denominators and will not agree. Sum\n  `turn_completed.usage.accounting.presented_tokens` (that is,\n  [`TurnUsage::presented_tokens`]) instead, which is exactly what\n  [`CumulativeUsage::add_turn`] does.\n- Do not expect the per-call rows to reconcile with the cumulative account\n  either. Intermediate tool-loop calls, the structured-output extraction\n  call, and the compaction summary call are all charged to the cumulative\n  account and publish no `turn_completed` row, so the rows cover a strict\n  subset of the tokens.\n\nThe worked example lives in `docs/reference/usage-accounting.mdx`. Its\nnumbers are pinned against the agent loop by\n`turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`\n(`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's\narithmetic by `cumulative_usage_matches_documented_aggregation_example`.",
         "properties": {
           "cache_creation_tokens": {
             "format": "uint64",
@@ -65280,7 +65280,7 @@
       },
       "CumulativeUsage": {
         "$ref": "#/$defs/Usage",
-        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific."
+        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific.\n\nThis value is **already a total**, and the total is session-scoped: on the\nevent stream it is `Session::total_usage()`, which is persisted with the\nsession and restored on resume, so `run_completed.usage` on the second run of\na session already contains the first run's calls. Adding it to per-call\nusage, or summing the values observed on two runs, double-counts. It also\nintentionally carries no [`crate::ProviderTokenAccounting`], because one\nsession may span providers and models and so cannot truthfully claim a\nsingle per-call convention; per-model attribution is read from the per-call\n`turn_completed` rows, which cover only the calls that closed a run."
       },
       "DeferredCatalogDelta": {
         "description": "Additive hidden-catalog delta metadata for runtime notices.",
@@ -67129,7 +67129,7 @@
         "type": "string"
       },
       "TurnUsage": {
-        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.\n\n# Model and provider attribution\n\n`accounting` is the single owner of per-call attribution: it carries the\n[`crate::Provider`] and the model string of the request that produced these\ncounters, minted by the provider adapter from the lowered request rather than\nfrom configuration intent. A consumer reading only the event stream can\ntherefore attribute one `turn_completed` row to a model without joining\nagainst session metadata:\n`turn_completed.usage.accounting.provider` /\n`turn_completed.usage.accounting.model`.\n\nThere is deliberately no second copy of the model or provider beside\n`accounting` on the event: attribution has one owner.",
         "properties": {
           "accounting": {
             "$ref": "#/$defs/ProviderTokenAccounting"
@@ -67180,7 +67180,7 @@
         "type": "object"
       },
       "Usage": {
-        "description": "Token usage statistics",
+        "description": "Token usage statistics.\n\n# The same field names carry two different denominators\n\nThis shape is reused for two semantically different accounts, and\n`input_tokens` does not mean the same thing in both:\n\n- **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw\n  provider counters for exactly one provider request. For Anthropic\n  `input_tokens` is the *uncached* input only, with cache-write and\n  cache-read input reported separately in `cache_creation_tokens` and\n  `cache_read_tokens`. The normalized presented-input total for that one\n  call is [`TurnUsage::presented_tokens`].\n- **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a\n  running total over every provider call recorded on the *session*, not on\n  one run. Its `input_tokens` is the saturating sum of each call's\n  *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache\n  detail fields are always `None` because their relationship to the input\n  total is provider-specific.\n\n# What consumers must not sum\n\n- Never sum `run_completed.usage` with per-call usage, and never sum\n  `run_completed.usage` across runs: each value is already the whole\n  session's total to date, so adding two of them double-counts everything\n  before the later one. Take the latest value.\n- Never sum per-call `input_tokens` and expect it to match\n  `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the\n  two use different denominators and will not agree. Sum\n  `turn_completed.usage.accounting.presented_tokens` (that is,\n  [`TurnUsage::presented_tokens`]) instead, which is exactly what\n  [`CumulativeUsage::add_turn`] does.\n- Do not expect the per-call rows to reconcile with the cumulative account\n  either. Intermediate tool-loop calls, the structured-output extraction\n  call, and the compaction summary call are all charged to the cumulative\n  account and publish no `turn_completed` row, so the rows cover a strict\n  subset of the tokens.\n\nThe worked example lives in `docs/reference/usage-accounting.mdx`. Its\nnumbers are pinned against the agent loop by\n`turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`\n(`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's\narithmetic by `cumulative_usage_matches_documented_aggregation_example`.",
         "properties": {
           "cache_creation_tokens": {
             "format": "uint64",
@@ -82038,7 +82038,7 @@
         ]
       },
       "Usage": {
-        "description": "Token usage statistics",
+        "description": "Token usage statistics.\n\n# The same field names carry two different denominators\n\nThis shape is reused for two semantically different accounts, and\n`input_tokens` does not mean the same thing in both:\n\n- **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw\n  provider counters for exactly one provider request. For Anthropic\n  `input_tokens` is the *uncached* input only, with cache-write and\n  cache-read input reported separately in `cache_creation_tokens` and\n  `cache_read_tokens`. The normalized presented-input total for that one\n  call is [`TurnUsage::presented_tokens`].\n- **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a\n  running total over every provider call recorded on the *session*, not on\n  one run. Its `input_tokens` is the saturating sum of each call's\n  *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache\n  detail fields are always `None` because their relationship to the input\n  total is provider-specific.\n\n# What consumers must not sum\n\n- Never sum `run_completed.usage` with per-call usage, and never sum\n  `run_completed.usage` across runs: each value is already the whole\n  session's total to date, so adding two of them double-counts everything\n  before the later one. Take the latest value.\n- Never sum per-call `input_tokens` and expect it to match\n  `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the\n  two use different denominators and will not agree. Sum\n  `turn_completed.usage.accounting.presented_tokens` (that is,\n  [`TurnUsage::presented_tokens`]) instead, which is exactly what\n  [`CumulativeUsage::add_turn`] does.\n- Do not expect the per-call rows to reconcile with the cumulative account\n  either. Intermediate tool-loop calls, the structured-output extraction\n  call, and the compaction summary call are all charged to the cumulative\n  account and publish no `turn_completed` row, so the rows cover a strict\n  subset of the tokens.\n\nThe worked example lives in `docs/reference/usage-accounting.mdx`. Its\nnumbers are pinned against the agent loop by\n`turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`\n(`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's\narithmetic by `cumulative_usage_matches_documented_aggregation_example`.",
         "properties": {
           "cache_creation_tokens": {
             "format": "uint64",
@@ -95461,7 +95461,7 @@
         ]
       },
       "TurnUsage": {
-        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.\n\n# Model and provider attribution\n\n`accounting` is the single owner of per-call attribution: it carries the\n[`crate::Provider`] and the model string of the request that produced these\ncounters, minted by the provider adapter from the lowered request rather than\nfrom configuration intent. A consumer reading only the event stream can\ntherefore attribute one `turn_completed` row to a model without joining\nagainst session metadata:\n`turn_completed.usage.accounting.provider` /\n`turn_completed.usage.accounting.model`.\n\nThere is deliberately no second copy of the model or provider beside\n`accounting` on the event: attribution has one owner.",
         "properties": {
           "accounting": {
             "$ref": "#/$defs/ProviderTokenAccounting"
@@ -111193,7 +111193,7 @@
       },
       "CumulativeUsage": {
         "$ref": "#/$defs/Usage",
-        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific."
+        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific.\n\nThis value is **already a total**, and the total is session-scoped: on the\nevent stream it is `Session::total_usage()`, which is persisted with the\nsession and restored on resume, so `run_completed.usage` on the second run of\na session already contains the first run's calls. Adding it to per-call\nusage, or summing the values observed on two runs, double-counts. It also\nintentionally carries no [`crate::ProviderTokenAccounting`], because one\nsession may span providers and models and so cannot truthfully claim a\nsingle per-call convention; per-model attribution is read from the per-call\n`turn_completed` rows, which cover only the calls that closed a run."
       },
       "DeferredCatalogDelta": {
         "description": "Additive hidden-catalog delta metadata for runtime notices.",
@@ -113017,7 +113017,7 @@
         "type": "string"
       },
       "TurnUsage": {
-        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.\n\n# Model and provider attribution\n\n`accounting` is the single owner of per-call attribution: it carries the\n[`crate::Provider`] and the model string of the request that produced these\ncounters, minted by the provider adapter from the lowered request rather than\nfrom configuration intent. A consumer reading only the event stream can\ntherefore attribute one `turn_completed` row to a model without joining\nagainst session metadata:\n`turn_completed.usage.accounting.provider` /\n`turn_completed.usage.accounting.model`.\n\nThere is deliberately no second copy of the model or provider beside\n`accounting` on the event: attribution has one owner.",
         "properties": {
           "accounting": {
             "$ref": "#/$defs/ProviderTokenAccounting"
@@ -113068,7 +113068,7 @@
         "type": "object"
       },
       "Usage": {
-        "description": "Token usage statistics",
+        "description": "Token usage statistics.\n\n# The same field names carry two different denominators\n\nThis shape is reused for two semantically different accounts, and\n`input_tokens` does not mean the same thing in both:\n\n- **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw\n  provider counters for exactly one provider request. For Anthropic\n  `input_tokens` is the *uncached* input only, with cache-write and\n  cache-read input reported separately in `cache_creation_tokens` and\n  `cache_read_tokens`. The normalized presented-input total for that one\n  call is [`TurnUsage::presented_tokens`].\n- **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a\n  running total over every provider call recorded on the *session*, not on\n  one run. Its `input_tokens` is the saturating sum of each call's\n  *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache\n  detail fields are always `None` because their relationship to the input\n  total is provider-specific.\n\n# What consumers must not sum\n\n- Never sum `run_completed.usage` with per-call usage, and never sum\n  `run_completed.usage` across runs: each value is already the whole\n  session's total to date, so adding two of them double-counts everything\n  before the later one. Take the latest value.\n- Never sum per-call `input_tokens` and expect it to match\n  `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the\n  two use different denominators and will not agree. Sum\n  `turn_completed.usage.accounting.presented_tokens` (that is,\n  [`TurnUsage::presented_tokens`]) instead, which is exactly what\n  [`CumulativeUsage::add_turn`] does.\n- Do not expect the per-call rows to reconcile with the cumulative account\n  either. Intermediate tool-loop calls, the structured-output extraction\n  call, and the compaction summary call are all charged to the cumulative\n  account and publish no `turn_completed` row, so the rows cover a strict\n  subset of the tokens.\n\nThe worked example lives in `docs/reference/usage-accounting.mdx`. Its\nnumbers are pinned against the agent loop by\n`turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`\n(`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's\narithmetic by `cumulative_usage_matches_documented_aggregation_example`.",
         "properties": {
           "cache_creation_tokens": {
             "format": "uint64",
@@ -118875,7 +118875,7 @@
         ]
       },
       "TurnUsage": {
-        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.\n\n# Model and provider attribution\n\n`accounting` is the single owner of per-call attribution: it carries the\n[`crate::Provider`] and the model string of the request that produced these\ncounters, minted by the provider adapter from the lowered request rather than\nfrom configuration intent. A consumer reading only the event stream can\ntherefore attribute one `turn_completed` row to a model without joining\nagainst session metadata:\n`turn_completed.usage.accounting.provider` /\n`turn_completed.usage.accounting.model`.\n\nThere is deliberately no second copy of the model or provider beside\n`accounting` on the event: attribution has one owner.",
         "properties": {
           "accounting": {
             "$ref": "#/$defs/ProviderTokenAccounting"

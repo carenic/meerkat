@@ -15,6 +15,8 @@ mod state;
 #[cfg(test)]
 #[doc(hidden)]
 pub(crate) mod test_turn_state_handle;
+#[cfg(test)]
+mod usage_accounting_tests;
 use crate::budget::Budget;
 use crate::comms::{
     CommsCommand, CommsTrustMutation, CommsTrustMutationResult, EventStream, PeerDirectoryEntry,

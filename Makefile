@@ -478,6 +478,7 @@ docs-check:
 	@$(PYTHON) scripts/validate-mintlify-docs.py
 	@$(PYTHON) scripts/test_sync_mobkit_docs.py
 	@$(PYTHON) scripts/test_publish_mobkit_docs.py
+	@$(PYTHON) scripts/test_usage_accounting_docs.py
 
 MOBKIT_REPO ?= ../meerkat-mobkit
 MOBKIT_REF ?= $(shell git -C "$(MOBKIT_REPO)" describe --tags --exact-match HEAD 2>/dev/null)

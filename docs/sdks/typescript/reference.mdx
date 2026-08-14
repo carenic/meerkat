@@ -183,16 +183,40 @@ reports degraded continuity, and the server rejects zero.
 
 ### Usage
 
-Token usage for a single run. All fields are camelCase — there is no `total_tokens` field.
+Token usage. All fields are camelCase - there is no `total_tokens` field.
 
 ```typescript
+interface ProviderTokenAccounting {
+  readonly provider: string;
+  readonly model: string;
+  readonly presentedTokens: number;
+  readonly convention: string;
+  readonly aggregation: string;
+}
+
 interface Usage {
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly cacheCreationTokens?: number;
   readonly cacheReadTokens?: number;
+  readonly accounting?: ProviderTokenAccounting;
 }
 ```
+
+One type serves two different accounts. On `turn_completed` this is per-call
+usage: `inputTokens` is the raw provider counter (for Anthropic, uncached input
+only) and `accounting` names the resolved provider/model plus the normalized
+`presentedTokens` for that call. On `RunResult.usage` and `run_completed` it is
+the **session**-cumulative total: `inputTokens` is already the sum of every
+recorded call's `presentedTokens`, it is persisted with the session so it keeps
+growing across turns, and `accounting` is absent because a session may span
+models.
+
+Do not sum the cumulative value with anything - take the latest one - and sum
+`accounting.presentedTokens` rather than per-call `inputTokens`. The per-call
+rows cover only the calls that closed a run, so they do not reconcile with the
+cumulative total. See [Usage accounting](/reference/usage-accounting) for the
+worked example.
 
 ### SessionInfo
 

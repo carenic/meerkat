@@ -259,7 +259,14 @@ tokio::spawn(async move {
                 println!("[Calling {}...]", name);
             }
             AgentEvent::TurnCompleted { usage, .. } => {
-                println!("\n[Tokens: {}]", usage.total_tokens());
+                // `usage` is per-call `TurnUsage`; its `accounting` names the
+                // resolved provider/model and the normalized presented input.
+                println!(
+                    "\n[{} {}: {} tokens]",
+                    usage.accounting().provider.as_str(),
+                    usage.accounting().model,
+                    usage.normalized_total_tokens()
+                );
             }
             _ => {}
         }
@@ -268,6 +275,13 @@ tokio::spawn(async move {
 
 let result = agent.run_with_events("Tell me a story".into(), tx).await?;
 ```
+
+<Note>
+`turn_completed` carries usage for one provider call while `run_completed`
+carries the session-cumulative total, and their `input_tokens` fields use
+different denominators. Read
+[Usage accounting](/reference/usage-accounting) before aggregating either.
+</Note>
 
 ### Agent methods
 

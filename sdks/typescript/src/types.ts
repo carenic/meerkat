@@ -35,7 +35,7 @@ import type {
 import type * as Generated from "./generated/types.js";
 import type { TurnTerminalCauseKind, Usage } from "./events.js";
 
-export type { TurnTerminalCauseKind, Usage } from "./events.js";
+export type { ProviderTokenAccounting, TurnTerminalCauseKind, Usage } from "./events.js";
 export type {
   AttentionDelegatedAuthority,
   AttentionProjectionPolicy,

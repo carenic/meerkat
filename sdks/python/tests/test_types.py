@@ -2664,6 +2664,49 @@ def test_parse_turn_started():
     assert event.turn_number == 3
 
 
+def test_parse_turn_completed_carries_model_attribution():
+    """Per-call usage exposes the resolved provider/model, not just counters."""
+    raw = {
+        "type": "turn_completed",
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 300,
+            "output_tokens": 150,
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 4000,
+            "accounting": {
+                "provider": "anthropic",
+                "model": "claude-opus-5",
+                "presented_tokens": 4300,
+                "convention": "anthropic_disjoint_input_components",
+                "aggregation": "sum_disjoint_provider_components",
+            },
+        },
+    }
+    event = parse_event(raw)
+    assert isinstance(event, TurnCompleted)
+    accounting = event.usage.accounting
+    assert accounting is not None
+    assert accounting.provider == "anthropic"
+    assert accounting.model == "claude-opus-5"
+    assert accounting.presented_tokens == 4300
+    # The raw per-call counter uses a different denominator than the
+    # normalized presented total; both must stay readable.
+    assert event.usage.input_tokens == 300
+
+
+def test_parse_turn_completed_without_accounting_is_accepted():
+    """Rows written before 0.8.22 carry no attribution and must still parse."""
+    raw = {
+        "type": "turn_completed",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 2},
+    }
+    event = parse_event(raw)
+    assert isinstance(event, TurnCompleted)
+    assert event.usage.accounting is None
+
+
 def test_parse_interaction_complete_structured_output():
     raw = {
         "type": "interaction_complete",
