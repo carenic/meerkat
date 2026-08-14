@@ -3593,6 +3593,12 @@ impl Session {
     /// refresh strips and appends only at or beyond the boundary. Sessions
     /// without a boundary witness keep the full strip, which whole-document
     /// save guards accept through the synthetic-refresh relaxation.
+    ///
+    /// That same retention answers an audited transcript-history endpoint: a
+    /// notice retained below the lowest changed row leaves the audited prefix
+    /// byte-identical, so the live rows remain an exact append over the
+    /// endpoint and compaction lineage is untouched. Only a strip that reaches
+    /// inside the audited prefix is refused, atomically.
     pub fn replace_synthetic_notices(
         &mut self,
         kind: crate::types::SystemNoticeKind,
@@ -3724,14 +3730,18 @@ impl Session {
                     )
                 })?
                 .message_count();
-            // This transformation removes only matching notices and appends
-            // every replacement at the tail. Therefore an existing matching
-            // notice inside the audited prefix is exactly the shape that
-            // would alter it; no whole-prefix hash or message copy is needed
-            // to prove the negative.
-            if self.messages.len() < head_len
-                || self.messages[..head_len].iter().any(&is_refresh_notice)
-            {
+            // This transformation strips matching notices only at or beyond
+            // the committed durable-row boundary and appends every replacement
+            // at the tail, so `lowest_mutated_index` IS the lowest row it
+            // changes: the same value the accumulator's retention already
+            // trusts below. A notice retained beneath that index leaves the
+            // audited prefix byte-identical, so exactly one shape breaks the
+            // audited relation: a stripped row inside the prefix. Testing the
+            // prefix for ANY matching notice instead would also refuse
+            // retained ones, which is the committed-boundary resume shape that
+            // must stay refreshable; no whole-prefix hash or message copy is
+            // needed either way.
+            if self.messages.len() < head_len || lowest_mutated_index < head_len {
                 return Err(TranscriptEditError::InvalidTranscriptShape(
                     "synthetic notice refresh would rewrite the audited transcript prefix; route it through a typed transcript rewrite"
                         .to_string(),
@@ -7582,6 +7592,14 @@ mod tests {
     /// audited endpoint. Refuse it atomically at the mechanical mutation seam
     /// instead of allowing a graph/live divergence that only the next save or
     /// rewrite discovers.
+    ///
+    /// The refusable shape is a notice that is BOTH strippable (at or beyond
+    /// the committed durable-row boundary) and inside the audited prefix: a
+    /// notice retained below the boundary changes no audited byte, which is
+    /// the separate `..._appends_beside_audited_prefix_notice` case. Sessions
+    /// reach this shape whenever the accumulator loses its committed witness
+    /// while the graph stays: `preflight_durable_fork_blobs` resolves its
+    /// in-place scan at index 0 and does exactly that.
     #[test]
     fn synthetic_notice_refresh_inside_audited_prefix_fails_before_mutation() {
         use crate::types::{SystemNoticeKind, SystemNoticeMessage};
@@ -7613,6 +7631,15 @@ mod tests {
         // Ordinary append, then an attempted refresh that would move the
         // audited notice from inside the prefix to the tail.
         session.push(Message::User(UserMessage::text("u-2")));
+        // Same accumulator effect as the fork-blob preflight scan: the
+        // committed durable-row witness is dropped, so the audited notice is
+        // strip-eligible again and the refusal is the only safe answer.
+        let _ = session.messages.begin_in_place_scan();
+        session.messages.finish_in_place_scan(Some(0));
+        assert!(
+            session.exact_message_row_prefix_at(3).is_none(),
+            "the fixture must leave no committed boundary covering the notice"
+        );
         let before = session.messages().to_vec();
         let error = session
             .replace_synthetic_notices(
@@ -7634,6 +7661,122 @@ mod tests {
         let decoded: Session = serde_json::from_slice(&bytes)
             .expect("the failed rewrite must leave a graph every cold reader accepts");
         assert_eq!(decoded.messages().len(), session.messages().len());
+    }
+
+    /// The carried edge of the committed-boundary retention: a synthetic notice
+    /// covered by BOTH the committed durable-row boundary and an audited
+    /// endpoint must still refresh. It is retained in place and the replacement
+    /// is appended, so the audited prefix keeps its exact bytes and the live
+    /// rows stay an exact append over that endpoint. This shape used to fail
+    /// typed and kill the turn: a resumed-and-compacted session (audited
+    /// endpoint) whose MCP server is still connecting (non-empty replacement).
+    #[test]
+    fn synthetic_notice_refresh_appends_beside_audited_prefix_notice() {
+        use crate::types::{SystemNoticeKind, SystemNoticeMessage};
+
+        let mut session = Session::new();
+        session.push(Message::User(UserMessage::text("u-0")));
+        session.push(Message::User(UserMessage::text("u-1")));
+        session
+            .replace_synthetic_notices(
+                SystemNoticeKind::McpPending,
+                vec![Message::SystemNotice(SystemNoticeMessage::new(
+                    SystemNoticeKind::McpPending,
+                    "pending v1",
+                ))],
+            )
+            .expect("initial notice install");
+        session
+            .commit_transcript_rewrite(
+                TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+                vec![Message::User(UserMessage::text("u-0-rewritten"))],
+                TranscriptRewriteReason::new("unit-test"),
+                Some("unit-test".to_string()),
+                None,
+            )
+            .expect("rewrite commits with the notice inside its endpoint");
+        session.push(Message::User(UserMessage::text("u-2")));
+
+        let graph_before = session
+            .validated_transcript_history_state()
+            .expect("history validation")
+            .expect("audited graph");
+        let endpoint_before = graph_before
+            .state()
+            .final_endpoint_witness()
+            .expect("audited endpoint")
+            .clone();
+        assert_eq!(endpoint_before.message_count(), 3);
+        assert!(
+            matches!(&session.messages()[2], Message::SystemNotice(_)),
+            "the fixture notice must sit inside the audited prefix"
+        );
+        assert!(
+            session.exact_message_row_prefix_at(3).is_some(),
+            "the rewrite commit leaves a committed durable-row boundary at 3 rows"
+        );
+
+        // The empty-replacement flavour stays the retention no-op it already
+        // was: nothing is strippable, nothing is appended.
+        let before_refresh = session.messages().to_vec();
+        session
+            .replace_synthetic_notices(SystemNoticeKind::McpPending, Vec::new())
+            .expect("empty refresh over an audited, committed notice");
+        assert_eq!(session.messages(), before_refresh.as_slice());
+
+        // The non-empty flavour: retained in place, replacement at the tail.
+        let fresh = Message::SystemNotice(SystemNoticeMessage::new(
+            SystemNoticeKind::McpPending,
+            "pending v2",
+        ));
+        session
+            .replace_synthetic_notices(SystemNoticeKind::McpPending, vec![fresh.clone()])
+            .expect("audited-prefix refresh must complete instead of failing the turn");
+        assert_eq!(session.messages().len(), 5);
+        assert_eq!(&session.messages()[..4], before_refresh.as_slice());
+        assert_eq!(&session.messages()[4], &fresh);
+
+        // The audited prefix is byte-identical and still the live rows' base.
+        let graph_after = session
+            .validated_transcript_history_state()
+            .expect("history validation")
+            .expect("audited graph");
+        assert!(
+            graph_before.shares_exact_state_with(&graph_after),
+            "retention must preserve the exact audited graph authority"
+        );
+        let endpoint_after = graph_after
+            .state()
+            .final_endpoint_witness()
+            .expect("audited endpoint")
+            .clone();
+        assert_eq!(
+            endpoint_after.message_count(),
+            endpoint_before.message_count()
+        );
+        assert_eq!(endpoint_after.row_prefix(), endpoint_before.row_prefix());
+        assert!(
+            graph_after
+                .state()
+                .derive_live_row_lineage_after_final_semantic_replay(session.messages())
+                .expect("live row lineage derivation")
+                .is_some(),
+            "live rows must remain an exact append over the audited endpoint"
+        );
+        assert_eq!(
+            graph_after.state().commit_count(),
+            1,
+            "a mechanical refresh must not mint a rewrite commit"
+        );
+        assert!(
+            session.exact_message_row_prefix_at(3).is_some(),
+            "the committed boundary witness survives the tail append"
+        );
+
+        let bytes = serde_json::to_vec(&session).expect("session serializes");
+        let decoded: Session = serde_json::from_slice(&bytes)
+            .expect("every cold reader must accept the refreshed document");
+        assert_eq!(decoded.messages().len(), 5);
     }
 
     /// Decode validates the graph internally but the save/rewrite boundary

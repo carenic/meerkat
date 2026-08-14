@@ -8157,6 +8157,146 @@ mod tests {
         }
     }
 
+    /// Regression for the 0.8.23 carried edge: on a resumed session whose
+    /// AUDITED endpoint covers a synthetic mcp_pending notice, a refresh with a
+    /// NON-EMPTY replacement (servers still connecting) must complete and the
+    /// intra-turn checkpoint must still persist as an ordinary append. Before
+    /// 0.8.23 the refresh itself failed typed with "would rewrite the audited
+    /// transcript prefix" and killed the turn.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn intra_turn_checkpoint_survives_audited_prefix_synthetic_notice_refresh() {
+        let (mut session, root_head) = acknowledged_boundary_with_embedded_synthetic_notice();
+
+        // Compaction-shaped audited rewrite: its endpoint retains the notice.
+        session
+            .commit_transcript_rewrite(
+                TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+                vec![Message::User(UserMessage::text("compacted".to_string()))],
+                crate::TranscriptRewriteReason::new("test compaction"),
+                Some("unit-test".to_string()),
+                None,
+            )
+            .expect("audited rewrite over the notice-bearing prefix");
+        let rewrite = PreparedHeadCanonicalRewriteMutation::prepare_intra_turn(
+            &session,
+            &root_head,
+            root_head.clone(),
+        )
+        .expect("prepare the specialized rewrite projection");
+        let audited_head = rewrite.successor_head().clone();
+        rewrite
+            .acknowledge_physical_projection(&mut session, rewrite.successor_head_token())
+            .expect("acknowledge the rewrite projection");
+        let adoption =
+            PreparedHeadCanonicalMutation::prepare_intra_turn(&session, &root_head, audited_head)
+                .expect("runtime adoption of the persisted rewrite head");
+        let boundary_head = adoption.successor_head().clone();
+        adoption
+            .acknowledge_session(&mut session, adoption.successor_head_token())
+            .expect("acknowledge the post-rewrite runtime boundary");
+        assert_eq!(boundary_head.message_count, 3);
+        assert_eq!(boundary_head.rewrite_count, 1);
+
+        let endpoint_before = session
+            .already_validated_transcript_history_state()
+            .expect("validated graph read")
+            .expect("audited graph")
+            .state()
+            .final_endpoint_witness()
+            .expect("audited endpoint")
+            .clone();
+        assert_eq!(endpoint_before.message_count(), 3);
+
+        // Resume-time refresh: the notice is inside the audited endpoint AND
+        // inside the committed boundary, and a server is still connecting.
+        session
+            .replace_synthetic_notices(
+                SystemNoticeKind::McpPending,
+                vec![mcp_pending_synthetic_notice(
+                    "Servers connecting: king-search (retrying).",
+                )],
+            )
+            .expect("audited-prefix synthetic refresh must complete");
+        assert!(
+            matches!(
+                &session.messages()[1],
+                Message::SystemNotice(notice) if notice.is_synthetic_refresh_projection()
+            ),
+            "the audited-prefix synthetic notice must be retained in place"
+        );
+        assert_eq!(
+            session.messages().len(),
+            4,
+            "the replacement appends at the tail; nothing is stripped"
+        );
+
+        // The audited prefix is unrewritten: its exact row commitment still
+        // equals the live session's committed boundary at 3 rows.
+        let endpoint_after = session
+            .already_validated_transcript_history_state()
+            .expect("validated graph read")
+            .expect("audited graph")
+            .state()
+            .final_endpoint_witness()
+            .expect("audited endpoint")
+            .clone();
+        assert_eq!(endpoint_after.row_prefix(), endpoint_before.row_prefix());
+        assert_eq!(
+            session.exact_message_row_prefix_at(3).as_ref(),
+            Some(endpoint_after.row_prefix()),
+            "the live rows still carry the audited endpoint byte-exact"
+        );
+
+        // ... and the turn continues: no pending rewrite occurrence remains, so
+        // the checkpoint is the ordinary append that used to be unreachable.
+        session.push(Message::User(UserMessage::text("next".to_string())));
+        session.push(assistant_reply("reply 2"));
+        let preflight = PreparedHeadCanonicalRewritePreflight::prepare(&session, &boundary_head)
+            .expect("rewrite preflight probe");
+        assert!(
+            preflight.is_none(),
+            "the audited rewrite is already persisted"
+        );
+        let route = PreparedHeadCanonicalMutationRoute::prepare_intra_turn_after_preflight(
+            &session,
+            &boundary_head,
+            boundary_head.clone(),
+            None,
+        )
+        .expect("intra-turn checkpoint must succeed after the refresh");
+        let mutation = route
+            .ordinary()
+            .expect("retention keeps the checkpoint an ordinary append");
+        assert_eq!(
+            mutation.successor_head().message_count,
+            session.messages().len() as u64
+        );
+        // The successor commits exactly the retained boundary rows (notice
+        // included) plus the live tail: proof that retention left every row
+        // below the boundary byte-identical. A rewritten session's row lineage
+        // is strand history, not a from-scratch fold over the live rows, so the
+        // boundary prefix extension is the exact baseline.
+        let serialized_tail = session.messages()[3..]
+            .iter()
+            .map(|message| serde_json::to_vec(message).expect("serialize live tail row"))
+            .collect::<Vec<_>>();
+        let expected_successor = boundary_head
+            .message_row_prefix
+            .as_ref()
+            .expect("committed boundary row prefix")
+            .extend_serialized_rows(&serialized_tail)
+            .expect("extend the committed boundary with the live tail");
+        assert_eq!(
+            mutation.successor_head().message_row_prefix.as_ref(),
+            Some(&expected_successor),
+            "successor row commitment must bind the live transcript byte-exact"
+        );
+        mutation
+            .acknowledge_physical_projection(&mut session, mutation.successor_head_token())
+            .expect("acknowledge the post-refresh checkpoint");
+    }
+
     /// Retention must not weaken continuity for non-synthetic divergence: a
     /// committed-prefix change that is not a synthetic-notice refresh keeps
     /// failing the checkpoint with the existing typed errors.
