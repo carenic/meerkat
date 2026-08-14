@@ -87,6 +87,7 @@ rust_library(
         "//meerkat-mcp-server:__pkg__",
         "//meerkat-mob:__pkg__",
         "//meerkat-mob-mcp:__pkg__",
+        "//meerkat-rpc:__pkg__",
         "//meerkat-session:__pkg__",
         "//meerkat-web-runtime:__pkg__",
         "//tests/integration:__pkg__",

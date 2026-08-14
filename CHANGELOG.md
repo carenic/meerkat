@@ -13,6 +13,49 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+### Breaking
+
+- The facade's and `meerkat-mob`'s `atif` re-export moves behind a new
+  off-by-default `atif` feature on each crate (`meerkat/atif`,
+  `meerkat-mob/atif`). Hosts that referenced `meerkat::atif` or
+  `meerkat_mob::atif` must enable the feature; `rkat` and `rkat-rpc` depend on
+  `meerkat-atif` directly and are unaffected.
+
+### Changed
+
+- `session/export_atif` now folds the durable log into the trajectory page by
+  page instead of buffering every event, and its replay bound rises from
+  100,000 to 500,000 events. Passing that bound is a typed `INVALID_PARAMS`
+  rejection naming the bound and pointing at `events/list_since` or the
+  file-writing `rkat session export-atif`, replacing the previous
+  `INTERNAL_ERROR`.
+- `session/export_atif` also bounds what it accumulates, not just what it reads:
+  the fold measures its own retained document bytes per page and refuses with
+  `BUDGET_EXHAUSTED` once they pass the outbound message limit, naming the limit
+  and the bytes accumulated. Previously an oversized export built the whole
+  document before outbound admission refused it; the outcome is unchanged and
+  the transient cost is bounded. The event bound guards all-delta logs, the byte
+  bound guards tool-heavy ones.
+- `session/export_atif` stops reporting `SESSION_NOT_FOUND` for conditions that
+  are not a missing session: a host without the durable event projection fails
+  with `INVALID_REQUEST` (`event replay is not enabled for this runtime host`),
+  and an existing session with an empty durable log exports an empty trajectory
+  that names the session. A genuinely missing session still fails with
+  `SESSION_NOT_FOUND`.
+
+### Added
+
+- `meerkat_atif::TrajectoryBuilder`: incremental ATIF export that folds event
+  pages as they are read. `trajectory_from_events` is now a thin wrapper over
+  it and keeps its signature. `TrajectoryBuilder::retained_bytes` reports a
+  strict lower bound on the serialized size of the document folded so far, so a
+  paginating host can bound its accumulation without finishing the document.
+- `meerkat_rpc::handlers::session::ATIF_EXPORT_MAX_EVENTS`: the export's event
+  bound is public. The bounds-injecting entry point beside it
+  (`handle_export_atif_bounded`, `AtifExportBounds`) is `#[doc(hidden)]`
+  test-facing surface, not a supported way to serve `session/export_atif`;
+  `handle_export_atif` is the wire path and supplies the host bounds.
+
 ## [0.8.22] - 2026-08-09
 
 ### Breaking

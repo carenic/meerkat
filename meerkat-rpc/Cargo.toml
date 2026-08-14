@@ -65,6 +65,9 @@ live-webrtc = ["meerkat-live/webrtc", "meerkat/live-webrtc"]
 
 [dev-dependencies]
 meerkat-llm-core = { workspace = true }
+# Durable event-store trait for seeding a session's committed log in the ATIF
+# export contract battery.
+meerkat-session = { workspace = true, features = ["session-store"] }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 futures = { workspace = true }
 async-stream = { workspace = true }

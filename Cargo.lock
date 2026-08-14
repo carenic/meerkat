@@ -3595,6 +3595,7 @@ dependencies = [
  "meerkat-models",
  "meerkat-providers",
  "meerkat-runtime",
+ "meerkat-session",
  "meerkat-store",
  "meerkat-tools",
  "reqwest 0.12.28",

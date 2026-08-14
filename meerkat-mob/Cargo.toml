@@ -15,7 +15,7 @@ categories.workspace = true
 [dependencies]
 # Internal crates
 meerkat-core = { workspace = true }
-meerkat-atif = { workspace = true }
+meerkat-atif = { workspace = true, optional = true }
 meerkat-models = { workspace = true }
 meerkat-contracts = { workspace = true }
 meerkat-comms = { workspace = true }
@@ -119,6 +119,10 @@ default = ["runtime-adapter"]
 # feature is retained only to keep the cfg-gates compiling. The dep expression
 # is empty because the dep is always present.
 runtime-adapter = []
+# ATIF trajectory export vocabulary, re-exported for hosts that assemble mob
+# member trajectories. Off by default: nothing inside this crate consumes it,
+# so a host that does not export trajectories does not compile it.
+atif = ["dep:meerkat-atif"]
 integration-real-tests = []
 schema = ["dep:schemars", "meerkat-core/schema"]
 test-support = []

@@ -39,6 +39,10 @@
     )
 )]
 
+/// ATIF trajectory export vocabulary, for hosts that assemble mob member
+/// trajectories into one document. Gated because nothing in this crate consumes
+/// it (feature `atif`).
+#[cfg(feature = "atif")]
 pub use meerkat_atif as atif;
 
 // On wasm32, use tokio_with_wasm as a drop-in replacement for tokio.

@@ -13540,8 +13540,12 @@ async fn export_session_atif(
     let (config, _) = load_config(scope).await?;
     let session_id = resolve_flexible_session_id(raw_id, scope, &config).await?;
     let service = build_cli_persistent_service(scope, config).await?.0;
-    let mut events = Vec::new();
+    // Pages fold straight into the trajectory: the durable log is never held
+    // in memory a second time alongside the document it produces.
+    let mut trajectory =
+        meerkat_atif::TrajectoryBuilder::new().with_session_id(session_id.to_string());
     let mut from_seq = 1u64;
+    let mut last_seq: Option<u64> = None;
     const PAGE_SIZE: usize = 512;
     loop {
         let page = service
@@ -13565,26 +13569,23 @@ async fn export_session_atif(
                 .duration_since(meerkat_core::time_compat::SystemTime::UNIX_EPOCH)
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or(0);
-            events.push(envelope);
+            last_seq = Some(envelope.seq);
+            trajectory.push(&envelope)?;
         }
         if page_len < PAGE_SIZE {
             break;
         }
-        from_seq = events
-            .last()
-            .map(|event| event.seq.saturating_add(1))
+        from_seq = last_seq
+            .map(|seq| seq.saturating_add(1))
             .ok_or_else(|| anyhow::anyhow!("event replay made no progress"))?;
     }
-    let trajectory = meerkat_atif::trajectory_from_events(
-        &events,
-        meerkat_atif::Agent {
-            name: "meerkat".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            model_name: None,
-            tool_definitions: None,
-            extra: None,
-        },
-    )?;
+    let trajectory = trajectory.finish(meerkat_atif::Agent {
+        name: "meerkat".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        model_name: None,
+        tool_definitions: None,
+        extra: None,
+    });
     let destination = output.unwrap_or_else(|| {
         meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
             .root

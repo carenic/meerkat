@@ -27,6 +27,10 @@
     )
 )]
 
+/// ATIF trajectory export vocabulary (feature `atif`). Gated because the facade
+/// only re-exports it; surfaces that export trajectories (`rkat`, `rkat-rpc`)
+/// depend on `meerkat-atif` directly.
+#[cfg(feature = "atif")]
 pub use meerkat_atif as atif;
 
 // On wasm32, provide tokio alias backed by tokio_with_wasm.
