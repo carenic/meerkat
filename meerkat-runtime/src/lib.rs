@@ -41,6 +41,7 @@ pub use ::tokio;
 
 pub mod accept;
 pub mod auth_machine;
+pub mod bounded_submit;
 pub mod coalescing;
 pub mod comms_bridge;
 pub mod comms_drain;
@@ -508,6 +509,11 @@ fn begin_session_runtime_actor_materialization_with_phase_policy(
 
 // Re-exports for convenience
 pub use accept::{AcceptOutcome, RejectReason};
+pub use bounded_submit::{
+    AdmissionDurability, AdmittedWorkState, BoundedSubmission, BoundedSubmitOutcome,
+    BoundedSubmitReport, DEFAULT_SUBMIT_BOUND, SubmitBound, SubmitRefusal, SubmitTimeoutCause,
+    SubmitTimeoutDisposition, SubmitUnknownCause, submit_bounded,
+};
 pub use coalescing::{
     AggregateDescriptor, CoalescingResult, SupersessionScope, check_supersession,
     create_aggregate_input, is_coalescing_eligible,

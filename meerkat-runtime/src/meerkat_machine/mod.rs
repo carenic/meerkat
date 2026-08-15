@@ -8288,6 +8288,7 @@ impl MeerkatMachine {
                 | MeerkatMachineCommand::PrepareLocalSessionBindings { .. }
                 | MeerkatMachineCommand::InputState { .. }
                 | MeerkatMachineCommand::InputStateByIdempotencyKey { .. }
+                | MeerkatMachineCommand::DurableInputStateByIdempotencyKey { .. }
                 | MeerkatMachineCommand::InteractionTerminalStatus { .. }
                 | MeerkatMachineCommand::RunTerminalStatus { .. }
                 | MeerkatMachineCommand::ListActiveInputs { .. }

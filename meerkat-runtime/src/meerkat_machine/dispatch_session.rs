@@ -2875,6 +2875,22 @@ impl MeerkatMachine {
                     )),
                 }
             }
+            // Durable-only key resolution. The live admission map is
+            // deliberately not consulted: a caller classifying an expired
+            // submit bound must not be told "durably queued" on the strength
+            // of an in-memory row, and this read must stay answerable while
+            // the session driver lock is held by the admission it is
+            // classifying.
+            MeerkatMachineCommand::DurableInputStateByIdempotencyKey {
+                session_id,
+                idempotency_key,
+            } => Ok(MeerkatMachineCommandResult::InputState(
+                self.durable_input_witness_by_idempotency_key_if_present(
+                    &session_id,
+                    &idempotency_key,
+                )
+                .await?,
+            )),
             MeerkatMachineCommand::InteractionTerminalStatus {
                 session_id,
                 selector,

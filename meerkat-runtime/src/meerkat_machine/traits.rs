@@ -285,6 +285,29 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         }
     }
 
+    async fn durable_input_state_by_idempotency_key(
+        &self,
+        session_id: &SessionId,
+        idempotency_key: &str,
+    ) -> Result<Option<StoredInputState>, RuntimeDriverError> {
+        match self
+            .execute_meerkat_machine_command(
+                None,
+                MeerkatMachineCommand::DurableInputStateByIdempotencyKey {
+                    session_id: session_id.clone(),
+                    idempotency_key: idempotency_key.to_string(),
+                },
+            )
+            .await
+            .map_err(MeerkatMachine::driver_error_from_command_error)?
+        {
+            MeerkatMachineCommandResult::InputState(state) => Ok(state),
+            other => Err(RuntimeDriverError::Internal(format!(
+                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::durable_input_state_by_idempotency_key: {other:?}"
+            ))),
+        }
+    }
+
     async fn interaction_terminal_status(
         &self,
         session_id: &SessionId,
