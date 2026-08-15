@@ -3486,6 +3486,18 @@ async fn aborted_finalized_directed_publication_replays_once_and_preserves_compl
 async fn mixed_directed_max_attempt_failure_terminalizes_only_exhausted_contributor() {
     const FAILURE_DETAIL: &str = "mixed directed max-attempt failure";
 
+    /// Bound on a choreography step that either happens or never happens.
+    ///
+    /// Every wait below is for a STRUCTURAL property - an input parking at a
+    /// known attempt count, or an executor reaching a gate. None of them is a
+    /// latency assertion, so a tight bound measures how loaded the runner is
+    /// rather than whether the property holds. This test failed in CI at two
+    /// seconds while passing in 0.02s locally and in three consecutive local
+    /// reruns, on a runner executing roughly twenty concurrent jobs. The bound
+    /// exists so a genuinely stuck choreography fails instead of hanging the
+    /// suite, and a generous one serves that identically.
+    const STEP_BOUND: Duration = Duration::from_secs(60);
+
     struct MixedMaxAttemptsExecutor {
         apply_calls: Arc<AtomicUsize>,
         second_apply_started: Arc<Notify>,
@@ -3609,7 +3621,7 @@ async fn mixed_directed_max_attempt_failure_terminalizes_only_exhausted_contribu
         .await
         .expect("accept first max-attempt input");
 
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(STEP_BOUND, async {
         loop {
             let first = machine
                 .input_state(&session_id, &first_input_id)
@@ -3632,7 +3644,7 @@ async fn mixed_directed_max_attempt_failure_terminalizes_only_exhausted_contribu
             .await
             .expect("wake first input for its second attempt")
     );
-    tokio::time::timeout(Duration::from_secs(1), second_apply_started.notified())
+    tokio::time::timeout(STEP_BOUND, second_apply_started.notified())
         .await
         .expect("first input must reach its gated second attempt");
 
@@ -3651,12 +3663,12 @@ async fn mixed_directed_max_attempt_failure_terminalizes_only_exhausted_contribu
         .await
         .expect("accept second contributor while attempt two is in flight");
     release_second_apply.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), mixed_apply_started.notified())
+    tokio::time::timeout(STEP_BOUND, mixed_apply_started.notified())
         .await
         .expect("backlog must form a mixed third batch");
 
     let first_completion = tokio::time::timeout(
-        Duration::from_secs(3),
+        STEP_BOUND,
         first_completion
             .expect("first directed input has a completion waiter")
             .wait_authorized(),
@@ -3793,7 +3805,7 @@ async fn mixed_directed_max_attempt_failure_terminalizes_only_exhausted_contribu
 
     abort_attached_runtime_loop(&machine, &session_id).await;
     let survivor_terminal = tokio::time::timeout(
-        Duration::from_secs(3),
+        STEP_BOUND,
         second_completion
             .expect("second directed input retains its completion waiter")
             .wait_authorized(),
