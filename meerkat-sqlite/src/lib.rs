@@ -15,8 +15,9 @@
 //!   schema DDL; stores apply their [`ledger`] domain after opening. The
 //!   optional [`OpenOptions::schema_preflight`] proves an exact current,
 //!   released-predecessor, or fresh-domain shape before any mutating pragma,
-//!   and [`WriteContact`] types each profile's honest no-write guarantee
-//!   (WAL reads may need sidecar files).
+//!   [`JournalPolicy`] states per profile whether an open establishes WAL or
+//!   preserves the mode it finds, and [`WriteContact`] types each profile's
+//!   honest no-write guarantee (WAL reads may need sidecar files).
 //! - [`ledger`]: the per-file migration ledger (`meerkat_schema(domain,
 //!   version)`) with the pinned concurrent-open transaction protocol and the
 //!   typed refusals for future, pre-floor, gap, unledgered-owned, and
@@ -61,6 +62,6 @@ pub use ledger::{
     verify_released_schema_structure,
 };
 pub use profile::{
-    ConnectionProfile, OpenOptions, SHARED_BUSY_TIMEOUT, WriteContact, begin_immediate, open,
-    open_with,
+    ConnectionProfile, JournalPolicy, OpenOptions, SHARED_BUSY_TIMEOUT, WriteContact,
+    begin_immediate, open, open_with,
 };

@@ -9030,6 +9030,22 @@ mod tests {
         (dir, store)
     }
 
+    /// The durable-writer invariant for the session store, asserted through
+    /// the constructor every surface calls. Read back over a connection the
+    /// store did not configure, because journal mode belongs to the file: a
+    /// rollback-journal session database would take a database-wide
+    /// EXCLUSIVE lock for every write.
+    #[test]
+    fn production_session_store_open_leaves_the_database_in_wal() {
+        let (_dir, store) = temp_store();
+        let conn = meerkat_sqlite::open(store.path(), meerkat_sqlite::ConnectionProfile::ReadOnly)
+            .expect("read-only reopen");
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("journal_mode");
+        assert_eq!(mode, "wal");
+    }
+
     #[test]
     fn busy_writer_is_retried_with_per_store_policy() {
         let dir = TempDir::new().unwrap();

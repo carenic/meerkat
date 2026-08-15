@@ -216,7 +216,13 @@ impl From<meerkat_sqlite::SqliteStoreError> for StoreError {
             | E::SchemaFingerprintMismatch { .. }
             | E::UnledgeredSchemaNoMatch { .. }
             | E::UnledgeredSchemaAmbiguous { .. }
+            // Both WAL-establishment failures stay one typed refusal at this
+            // boundary: the open did not produce a durable read-write
+            // connection, and the Display carries the path plus whether the
+            // effective mode was wrong or the conversion stayed contended.
+            // Neither is a routine `Busy` a caller may quietly retry into.
             | E::WalNotEstablished { .. }
+            | E::WalConversionContended { .. }
             | E::InvalidMigrationList { .. }
             | E::OpenRefused { .. }) => StoreError::Internal(other.to_string()),
         }
@@ -346,6 +352,11 @@ mod tests {
             meerkat_sqlite::SqliteStoreError::WalNotEstablished {
                 path: std::path::PathBuf::from("/tmp/db.sqlite3"),
                 actual: "delete".to_string(),
+            },
+            meerkat_sqlite::SqliteStoreError::WalConversionContended {
+                path: std::path::PathBuf::from("/tmp/db.sqlite3"),
+                waited_ms: 250,
+                source: sqlite_failure(rusqlite::ErrorCode::DatabaseBusy),
             },
         ] {
             let display = err.to_string();

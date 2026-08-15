@@ -15976,6 +15976,66 @@ ORDER BY runtime_id";
             );
         }
 
+        fn file_journal_mode(path: &Path) -> String {
+            // A fresh connection, opened normally: journal mode is recorded
+            // in the database header, so reading it back over a connection
+            // the store did not configure is the only honest check. (A probe
+            // that opens with `immutable=1` reports `delete` for every file,
+            // WAL included, and can never answer this question.)
+            let conn = meerkat_sqlite::open(path, meerkat_sqlite::ConnectionProfile::ReadOnly)
+                .expect("read-only reopen");
+            conn.pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .expect("journal_mode")
+        }
+
+        /// The durable-writer invariant, asserted through the constructor the
+        /// production hosts actually call. A rollback-journal runtime
+        /// database takes a database-wide EXCLUSIVE lock for every write,
+        /// with no reader/writer separation, so any host with durable
+        /// on-disk runtime state depends on this holding.
+        #[test]
+        fn production_runtime_store_open_leaves_the_database_in_wal() {
+            let tempdir = TempDir::new().unwrap();
+            let path = tempdir.path().join("runtime.sqlite3");
+            let store = SqliteRuntimeStore::new(path.clone()).unwrap();
+            assert_eq!(file_journal_mode(store.path()), "wal");
+
+            // Head-canonical composition shares the same open path and owes
+            // the same guarantee.
+            let head_canonical_path = tempdir.path().join("head-canonical.sqlite3");
+            let store = SqliteRuntimeStore::new_head_canonical(head_canonical_path).unwrap();
+            assert_eq!(file_journal_mode(store.path()), "wal");
+        }
+
+        /// A host that already carries a rollback-journal runtime database
+        /// converges on the ordinary open, with its rows intact: no operator
+        /// step, no separate migration verb.
+        #[test]
+        fn existing_delete_mode_runtime_database_converts_on_open_with_content_intact() {
+            let tempdir = TempDir::new().unwrap();
+            let path = tempdir.path().join("runtime.sqlite3");
+            {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE host_marker (x INTEGER); INSERT INTO host_marker VALUES (7);",
+                )
+                .unwrap();
+                let mode: String = conn
+                    .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                    .unwrap();
+                assert_eq!(mode, "delete", "fixture must start non-WAL");
+            }
+
+            let store = SqliteRuntimeStore::new(path.clone()).unwrap();
+            assert_eq!(file_journal_mode(store.path()), "wal");
+
+            let conn = Connection::open(&path).unwrap();
+            let carried: i64 = conn
+                .query_row("SELECT x FROM host_marker", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(carried, 7, "conversion must not disturb existing content");
+        }
+
         #[tokio::test]
         async fn pending_terminal_owner_index_satisfies_store_contract() {
             let tempdir = tempfile::TempDir::new().unwrap();

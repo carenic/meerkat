@@ -23,6 +23,36 @@
 //!
 //! Opening a connection never runs schema DDL. Stores apply their
 //! [`crate::ledger`] domain after opening.
+//!
+//! # Journal mode is a property of the file
+//!
+//! Journal mode lives in the database header, not in a connection: a durable
+//! read-write connection to a rollback-journal ("delete") database takes a
+//! database-wide EXCLUSIVE lock for every write, with no reader/writer
+//! separation, however the connection was configured. Which profiles
+//! establish WAL and which leave the file as found is therefore stated once,
+//! as [`ConnectionProfile::journal_policy`], instead of being implied by the
+//! shape of a `match` arm.
+//!
+//! # Reading a store's journal mode by hand
+//!
+//! `PRAGMA journal_mode` is only truthful over a connection that opened the
+//! file normally. Two shapes routinely mislead an operator diagnosing a store
+//! from the outside:
+//!
+//! - A database opened with the `immutable=1` URI parameter reports `delete`
+//!   whatever the file actually is: `immutable=1` asserts the file cannot
+//!   change, so SQLite ignores WAL entirely. It can never establish a journal
+//!   mode, and it must never be pointed at a live database, whose concurrent
+//!   writes it also suppresses the locking for.
+//! - Absent `-wal`/`-shm` sidecars are the normal at-rest shape here. These
+//!   stores hold no long-lived connection, and SQLite checkpoints and unlinks
+//!   both sidecars when the last connection to a WAL database closes.
+//!   Sidecars on disk mean a connection is currently open; their absence
+//!   means nothing about the mode. Note also that some system SQLite builds
+//!   refuse a read-only open of a WAL database whose sidecars are absent
+//!   (`SQLITE_CANTOPEN`), which is what tempts a hand probe into
+//!   `immutable=1` in the first place.
 
 use std::path::Path;
 use std::time::Duration;
@@ -70,6 +100,22 @@ pub enum ConnectionProfile {
     Maintenance { write: bool },
 }
 
+/// What an open under a profile does to the file's journal mode.
+///
+/// Naming this makes the durable-writer rule checkable instead of accidental:
+/// a profile added later has to choose a policy, and cannot inherit
+/// "not `Primary`, therefore no WAL" from the shape of a `match` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalPolicy {
+    /// Convert-or-confirm `journal_mode=WAL` at open, verified against the
+    /// mode SQLite reports back, and fail the open when WAL cannot be
+    /// established. Every profile that serves durable read-write traffic is
+    /// here; a store that cannot get WAL must not run degraded.
+    EstablishWal,
+    /// Leave the file's journal mode exactly as found.
+    PreserveExisting,
+}
+
 /// The strongest filesystem no-write guarantee an open under a profile can
 /// make. Diagnostic surfaces (doctor) report from this instead of promising
 /// a zero-touch open that SQLite cannot deliver.
@@ -107,6 +153,25 @@ impl ConnectionProfile {
         match self {
             Self::Primary { .. } | Self::ReadOnly => SHARED_BUSY_TIMEOUT,
             Self::Maintenance { .. } => Duration::ZERO,
+        }
+    }
+
+    /// What an open under this profile does to the file's journal mode.
+    ///
+    /// `Maintenance { write: true }` is the one read-write profile that
+    /// preserves the mode it finds, and deliberately: it is the offline
+    /// surgeon's profile, taken by the party holding the exclusive
+    /// maintenance fence to bridge ledgers or to archive a file by rename.
+    /// Converting the journal mode of a database another step is about to
+    /// relocate is a mutation outside that mandate, and it would leave
+    /// sidecars beside bytes that are about to move. Durable serving traffic
+    /// therefore never uses that profile; it uses
+    /// [`ConnectionProfile::Primary`], which establishes and verifies WAL or
+    /// refuses the open.
+    pub fn journal_policy(self) -> JournalPolicy {
+        match self {
+            Self::Primary { .. } => JournalPolicy::EstablishWal,
+            Self::ReadOnly | Self::Maintenance { .. } => JournalPolicy::PreserveExisting,
         }
     }
 
@@ -199,9 +264,14 @@ pub fn open_with(
         crate::ledger::preflight_schema_eligibility(&conn, domain)?;
     }
 
-    if let ConnectionProfile::Primary { .. } = profile {
-        set_wal_journal_mode(&conn, path, busy)?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
+    match profile.journal_policy() {
+        JournalPolicy::EstablishWal => {
+            set_wal_journal_mode(&conn, path, busy)?;
+            // The durable-writer pair: WAL for reader/writer separation,
+            // `synchronous=FULL` for the commit durability that goes with it.
+            conn.pragma_update(None, "synchronous", "FULL")?;
+        }
+        JournalPolicy::PreserveExisting => {}
     }
 
     Ok(conn)
@@ -210,11 +280,16 @@ pub fn open_with(
 /// Convert (or confirm) the WAL journal mode with a bounded retry, verified
 /// against the effective mode SQLite reports back.
 ///
-/// Converting a fresh rollback-journal database to WAL needs an exclusive
-/// lock, and SQLite can return `SQLITE_BUSY` from the journal-mode pragma
-/// WITHOUT consulting the busy handler while concurrent creators race the
-/// conversion. Once a file is WAL the pragma is a lock-free no-op, so the
-/// retry only ever spins during the first-create race.
+/// Converting a rollback-journal database to WAL needs an exclusive lock, and
+/// SQLite can return `SQLITE_BUSY` from the journal-mode pragma WITHOUT
+/// consulting the busy handler while another connection holds the file. Once
+/// a file is WAL the pragma is a lock-free no-op, so the retry only ever
+/// spins while an existing rollback-journal file is being converted (the
+/// first-create race, or the one-time conversion of a legacy database).
+///
+/// Both ways this can end are failures of the open, not degraded successes: a
+/// non-WAL effective mode is [`SqliteStoreError::WalNotEstablished`], and an
+/// exhausted retry budget is [`SqliteStoreError::WalConversionContended`].
 fn set_wal_journal_mode(
     conn: &Connection,
     path: &Path,
@@ -222,7 +297,8 @@ fn set_wal_journal_mode(
 ) -> Result<(), SqliteStoreError> {
     // Bound the retry by the connection's busy policy (with a small floor so
     // zero-timeout profiles still tolerate the momentary create race).
-    let deadline = std::time::Instant::now() + busy_timeout.max(Duration::from_millis(250));
+    let budget = busy_timeout.max(Duration::from_millis(250));
+    let deadline = std::time::Instant::now() + budget;
     loop {
         // `pragma_update` would discard the mode the pragma returns, and
         // SQLite can decline the conversion without raising an error — so
@@ -241,11 +317,21 @@ fn set_wal_journal_mode(
                     actual: mode,
                 });
             }
-            Err(error)
-                if crate::error::is_busy_or_locked(&error)
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(5));
+            Err(error) if crate::error::is_busy_or_locked(&error) => {
+                if std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                // The retry budget is spent and the file is still locked by
+                // someone else. Fail the open typed rather than hand back a
+                // bare "database is locked", which reads as ordinary
+                // contention and hides that the store would otherwise serve
+                // durable traffic from a rollback-journal database.
+                return Err(SqliteStoreError::WalConversionContended {
+                    path: path.to_path_buf(),
+                    waited_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                    source: error,
+                });
             }
             Err(error) => return Err(error.into()),
         }
@@ -280,7 +366,31 @@ pub fn begin_immediate(conn: &mut Connection) -> Result<Transaction<'_>, SqliteS
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+
+    fn sidecar_paths(path: &Path) -> (PathBuf, PathBuf) {
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let mut shm = path.as_os_str().to_os_string();
+        shm.push("-shm");
+        (PathBuf::from(wal), PathBuf::from(shm))
+    }
+
+    fn journal_mode(conn: &Connection) -> String {
+        conn.pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("journal_mode")
+    }
+
+    /// Seed a rollback-journal ("delete") database with one row, exactly the
+    /// shape a host that predates the WAL policy carries on disk.
+    fn seed_delete_mode_database(path: &Path) {
+        let conn = Connection::open(path).expect("create");
+        conn.execute_batch("CREATE TABLE legacy (x INTEGER); INSERT INTO legacy VALUES (7);")
+            .expect("seed");
+        assert_eq!(journal_mode(&conn), "delete", "fixture must start non-WAL");
+    }
 
     #[test]
     fn primary_creates_dirs_sets_wal_and_full() {
@@ -553,5 +663,150 @@ mod tests {
             ConnectionProfile::Maintenance { write: false }.write_contact(),
             WriteContact::ReadOnlyWalSidecars
         );
+    }
+
+    #[test]
+    fn journal_policy_is_pinned_for_every_profile() {
+        // A new profile must choose a policy here rather than inherit
+        // "not Primary, therefore no WAL" by omission. `Maintenance { write:
+        // true }` is read-write and still preserves the mode it finds: see
+        // `ConnectionProfile::journal_policy` for why.
+        for (profile, expected) in [
+            (ConnectionProfile::PRIMARY, JournalPolicy::EstablishWal),
+            (
+                ConnectionProfile::Primary { create: false },
+                JournalPolicy::EstablishWal,
+            ),
+            (ConnectionProfile::ReadOnly, JournalPolicy::PreserveExisting),
+            (
+                ConnectionProfile::Maintenance { write: true },
+                JournalPolicy::PreserveExisting,
+            ),
+            (
+                ConnectionProfile::Maintenance { write: false },
+                JournalPolicy::PreserveExisting,
+            ),
+        ] {
+            assert_eq!(profile.journal_policy(), expected, "{profile:?}");
+        }
+    }
+
+    #[test]
+    fn primary_open_converts_an_existing_delete_mode_database_and_keeps_its_content() {
+        // The migration path for a host whose file predates the WAL policy:
+        // the ordinary production open converts it, in place, on open.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.sqlite3");
+        seed_delete_mode_database(&path);
+
+        let conn = open(&path, ConnectionProfile::PRIMARY).expect("open");
+        assert_eq!(journal_mode(&conn), "wal");
+        let row: i64 = conn
+            .query_row("SELECT x FROM legacy", [], |row| row.get(0))
+            .expect("content survives the conversion");
+        assert_eq!(row, 7);
+        drop(conn);
+
+        // The conversion is a property of the file, so it outlives the
+        // connection that performed it.
+        let reopened = open(&path, ConnectionProfile::ReadOnly).expect("reopen");
+        assert_eq!(journal_mode(&reopened), "wal");
+    }
+
+    #[test]
+    fn non_wal_profiles_leave_an_existing_delete_mode_file_alone() {
+        // The deliberate exclusion, pinned behaviorally: the offline
+        // surgeon's read-write profile must not convert a file another
+        // maintenance step may be about to archive or relocate.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.sqlite3");
+        seed_delete_mode_database(&path);
+
+        for profile in [
+            ConnectionProfile::Maintenance { write: true },
+            ConnectionProfile::Maintenance { write: false },
+            ConnectionProfile::ReadOnly,
+        ] {
+            let conn = open(&path, profile).expect("open");
+            assert_eq!(journal_mode(&conn), "delete", "{profile:?}");
+        }
+    }
+
+    #[test]
+    fn wal_database_at_rest_has_no_sidecars_and_still_reports_wal() {
+        // The at-rest shape an operator diagnoses by hand. These stores keep
+        // no long-lived connection, so the steady state of a healthy WAL
+        // database is: no `-wal`, no `-shm`, WAL recorded in the header.
+        // Absent sidecars are not evidence of a rollback-journal file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("at-rest.sqlite3");
+        {
+            let conn = open(&path, ConnectionProfile::PRIMARY).expect("open");
+            conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .expect("write");
+            assert_eq!(journal_mode(&conn), "wal");
+        }
+
+        let (wal, shm) = sidecar_paths(&path);
+        assert!(!wal.exists(), "a closed WAL database keeps no -wal");
+        assert!(!shm.exists(), "a closed WAL database keeps no -shm");
+
+        // Header bytes 18/19 are the file-format read/write versions; 2 means
+        // WAL. This is the byte-level authority the pragma reports from.
+        let header = std::fs::read(&path).expect("read header");
+        assert_eq!(header.get(18).copied(), Some(2), "read version");
+        assert_eq!(header.get(19).copied(), Some(2), "write version");
+
+        // Both ordinary opens report the truth with no sidecars present.
+        assert_eq!(
+            journal_mode(&open(&path, ConnectionProfile::ReadOnly).expect("read-only reopen")),
+            "wal"
+        );
+        assert_eq!(
+            journal_mode(&open(&path, ConnectionProfile::PRIMARY).expect("primary reopen")),
+            "wal"
+        );
+    }
+
+    #[test]
+    fn wal_conversion_that_cannot_win_the_lock_fails_typed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("contended.sqlite3");
+        seed_delete_mode_database(&path);
+
+        // A reader parked inside a read transaction holds the SHARED lock
+        // that converting to WAL needs to escalate past. Only a
+        // rollback-journal file can contend here: once a file is WAL the
+        // pragma is a lock-free no-op.
+        let reader = Connection::open(&path).expect("reader");
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM legacy;")
+            .expect("hold the shared lock");
+
+        let err = open_with(
+            &path,
+            ConnectionProfile::PRIMARY,
+            OpenOptions {
+                busy_timeout: Some(Duration::ZERO),
+                ..OpenOptions::default()
+            },
+        )
+        .expect_err("a durable read-write open must fail closed, not run in delete mode");
+        assert!(
+            matches!(
+                err,
+                SqliteStoreError::WalConversionContended { path: ref refused, waited_ms, .. }
+                    if refused == &path && waited_ms >= 250
+            ),
+            "{err}"
+        );
+
+        // The refusal left the database exactly as found.
+        reader.execute_batch("COMMIT").expect("release");
+        assert_eq!(journal_mode(&reader), "delete");
+        let row: i64 = reader
+            .query_row("SELECT x FROM legacy", [], |row| row.get(0))
+            .expect("content untouched");
+        assert_eq!(row, 7);
     }
 }

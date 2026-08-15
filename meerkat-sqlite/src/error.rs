@@ -133,12 +133,37 @@ pub enum SqliteStoreError {
     #[error("meerkat_schema ledger is malformed: {detail}")]
     LedgerMalformed { detail: String },
 
-    /// The Primary profile asked SQLite to establish `journal_mode=WAL` and
-    /// SQLite reported a different effective mode without raising an error
-    /// (the journal-mode pragma can silently keep the old mode). The
-    /// connection does not satisfy the profile's durability policy.
+    /// A profile whose journal policy is
+    /// [`JournalPolicy::EstablishWal`](crate::JournalPolicy::EstablishWal)
+    /// asked SQLite to establish `journal_mode=WAL` and SQLite reported a
+    /// different effective mode without raising an error (the journal-mode
+    /// pragma can silently keep the old mode). The connection does not
+    /// satisfy the profile's durability policy.
     #[error("could not establish journal_mode=WAL on `{path}`: effective mode is `{actual}`")]
     WalNotEstablished { path: PathBuf, actual: String },
+
+    /// Converting an existing rollback-journal database to WAL needs a brief
+    /// exclusive lock, and the journal-mode pragma reports `SQLITE_BUSY`
+    /// without consulting the busy handler while another connection holds the
+    /// file. The bounded retry spent its whole budget without winning that
+    /// lock, so the open fails closed rather than serving durable read-write
+    /// traffic from a rollback-journal database, where every write takes a
+    /// database-wide EXCLUSIVE lock with no reader/writer separation.
+    ///
+    /// The database is left exactly as found; the operator remedy is to retry
+    /// once the contending connection releases the file (a second boot
+    /// attempt normally wins it, since the conversion is a no-op the moment
+    /// the file is WAL).
+    #[error(
+        "could not establish journal_mode=WAL on `{path}`: the conversion stayed lock-contended \
+         for {waited_ms} ms"
+    )]
+    WalConversionContended {
+        path: PathBuf,
+        waited_ms: u64,
+        #[source]
+        source: rusqlite::Error,
+    },
 
     /// A domain registered an invalid migration list (non-contiguous or
     /// not starting at version 1). This is a programming error in the store
