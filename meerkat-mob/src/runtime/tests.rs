@@ -33806,25 +33806,24 @@ async fn test_reload_recovery_cancel_after_hook_reuses_terminal_receipt() {
         })
     };
     let hook_result = tokio::time::timeout(Duration::from_secs(3), hook_completed).await;
-    if hook_result.is_err() {
-        panic!(
-            "post-commit hook did not publish terminal receipt: first_finished={} first_result={:?} registration={:?} state={:?}",
-            first.is_finished(),
-            if first.is_finished() {
-                Some(first.await)
-            } else {
-                None
-            },
-            adapter
-                .current_session_registration_witness(&session_id)
-                .await,
-            meerkat_runtime::RuntimeControlPlane::runtime_state(
-                adapter.as_ref(),
-                &meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
-            )
+    assert!(
+        hook_result.is_ok(),
+        "post-commit hook did not publish terminal receipt: first_finished={} first_result={:?} registration={:?} state={:?}",
+        first.is_finished(),
+        if first.is_finished() {
+            Some(first.await)
+        } else {
+            None
+        },
+        adapter
+            .current_session_registration_witness(&session_id)
             .await,
-        );
-    }
+        meerkat_runtime::RuntimeControlPlane::runtime_state(
+            adapter.as_ref(),
+            &meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
+        )
+        .await,
+    );
     assert!(provisioner.ops_binding_present_for_test(&session_id));
     first.abort();
     let _ = first.await;

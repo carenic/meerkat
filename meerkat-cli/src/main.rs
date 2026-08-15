@@ -15115,6 +15115,7 @@ mod pack_run_shutdown_seam_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::panic, reason = "test asserts an unreachable match arm")]
     async fn pack_flow_wait_prefers_reached_terminal_over_pending_shutdown() {
         let first = select_pack_flow_terminal_or_shutdown(
             std::future::ready(Err(anyhow::anyhow!("terminal-first"))),
