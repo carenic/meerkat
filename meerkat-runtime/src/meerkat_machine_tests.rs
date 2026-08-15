@@ -29248,6 +29248,7 @@ async fn persistent_failed_run_lifecycle_commit_failure_preserves_pre_terminal_s
         &driver,
         run_id.clone(),
         CoreApplyFailureCause::executor_internal("synthetic run failure"),
+        crate::meerkat_machine::FailedRunContributorDisposition::Replayed,
     )
     .await
     .expect_err("synthetic lifecycle commit failure should reject the failed-run persist");

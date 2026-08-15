@@ -2157,6 +2157,8 @@ pub enum InputAbandonReason {
     Cancelled,
     #[serde(rename = "MaxAttemptsExhausted")]
     MaxAttemptsExhausted,
+    #[serde(rename = "NeverExecuted")]
+    NeverExecuted,
 }
 impl InputAbandonReason {
     pub fn as_str(&self) -> &'static str {
@@ -2167,6 +2169,7 @@ impl InputAbandonReason {
             Self::Destroyed => "Destroyed",
             Self::Cancelled => "Cancelled",
             Self::MaxAttemptsExhausted => "MaxAttemptsExhausted",
+            Self::NeverExecuted => "NeverExecuted",
         }
     }
 }
@@ -2180,6 +2183,7 @@ impl std::convert::TryFrom<&str> for InputAbandonReason {
             "Destroyed" => Ok(Self::Destroyed),
             "Cancelled" => Ok(Self::Cancelled),
             "MaxAttemptsExhausted" => Ok(Self::MaxAttemptsExhausted),
+            "NeverExecuted" => Ok(Self::NeverExecuted),
             other => Err(format!("invalid InputAbandonReason value `{other}`")),
         }
     }

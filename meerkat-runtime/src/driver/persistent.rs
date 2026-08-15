@@ -2471,7 +2471,7 @@ impl PersistentRuntimeDriver {
             replay_plan,
             terminal_error,
             runtime_apply_failure,
-            recoverable,
+            contributor_disposition,
             applied_commit,
         } = realization;
         self.require_durability_ready()?;
@@ -2484,7 +2484,7 @@ impl PersistentRuntimeDriver {
             run_id = ?run_id,
             contributors = contributing_input_ids.len(),
             replay_kind = replay_plan.notice_kind,
-            recoverable,
+            contributor_disposition = contributor_disposition.as_str(),
             error = terminal_error,
             failure_cause = ?failure_cause,
             "persistent driver realized machine-owned failed-run replay"

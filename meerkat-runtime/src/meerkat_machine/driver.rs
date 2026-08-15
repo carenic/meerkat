@@ -3923,7 +3923,7 @@ impl DriverEntry {
             replay_plan,
             terminal_error,
             runtime_apply_failure,
-            recoverable,
+            contributor_disposition,
             applied_commit,
         } = realization;
         let checkpoint = self.begin_terminal_transition("failed_run_terminal_realization")?;
@@ -3932,7 +3932,7 @@ impl DriverEntry {
             &run_id,
             &contributing_input_ids,
             &replay_plan,
-            recoverable,
+            contributor_disposition,
         ) {
             return Err(self.fail_terminal_transition(checkpoint, "failed_run_realization", error));
         }
@@ -3984,13 +3984,14 @@ impl DriverEntry {
             ));
         }
 
-        // A recoverable failed run normally requeues its contributors, but the
+        // A replayed failed run normally requeues its contributors, but the
         // generated rollback transition can terminalize the exact inputs whose
-        // stage-attempt budget was exhausted. Only directed members own
-        // Interaction rows, but the owner row retains the complete terminal
-        // recipient set so one generated completion finalizes directed and
-        // non-directed inputs together.
-        if recoverable && !terminal_input_ids.is_empty() {
+        // stage-attempt budget was exhausted, and a never-started run
+        // terminalizes all of them. Only directed members own Interaction rows,
+        // but the owner row retains the complete terminal recipient set so one
+        // generated completion finalizes directed and non-directed inputs
+        // together.
+        if contributor_disposition.owes_terminal_outboxes() && !terminal_input_ids.is_empty() {
             let outboxes = match authorized_staged_directed_terminal_outboxes(
                 self,
                 InteractionTerminalBatchScope::Run(&run_id),
@@ -4029,7 +4030,7 @@ impl DriverEntry {
                         replay_plan,
                         terminal_error,
                         runtime_apply_failure,
-                        recoverable,
+                        contributor_disposition,
                         applied_commit,
                     })
                     .await
@@ -4675,6 +4676,48 @@ pub(crate) struct MachineTerminalAppliedCommit {
     pub(crate) owner_session_id: SessionId,
 }
 
+/// What becomes of a failed run's staged contributors.
+///
+/// A failed run does not imply one answer for its inputs, and the answer is a
+/// semantic fact about the failure rather than something to reconstruct from a
+/// bool at the persistence boundary. It travels with the realization so the
+/// contributor transition lands inside the same machine realization - and, on
+/// the persistent driver, the same store commit - as the run terminal itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailedRunContributorDisposition {
+    /// The run reached a machine-owned terminal after mutating the session, so
+    /// its contributors were applied and are consumed.
+    Consumed,
+    /// The executor gave a received answer and nothing is in flight, so
+    /// replaying repeats nothing. The machine's staged-rollback resolution
+    /// decides per input whether that means the work lane or the retry cap.
+    Replayed,
+    /// The run never began executing and the loop dropped an `apply` whose
+    /// in-flight fate it cannot observe. A contributor returned to its lane
+    /// here could be executed a second time by a consumer that drains late,
+    /// and for a household instruction that means an action taken twice. The
+    /// machine terminalizes the contributors instead: refuse the release
+    /// rather than risk it.
+    Terminalized,
+}
+
+impl FailedRunContributorDisposition {
+    /// Whether the failed-run realization still owes its contributors a staged
+    /// terminal outbox. The machine-terminal path staged one before this point;
+    /// the other two did not.
+    pub(crate) fn owes_terminal_outboxes(self) -> bool {
+        matches!(self, Self::Replayed | Self::Terminalized)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Consumed => "Consumed",
+            Self::Replayed => "Replayed",
+            Self::Terminalized => "Terminalized",
+        }
+    }
+}
+
 /// Complete mechanical payload for realizing a machine-authorized failed run.
 ///
 /// The runtime-loop owner assembles this only after the generated authority has
@@ -4687,7 +4730,7 @@ pub(crate) struct MachineRunFailureRealization {
     pub(crate) replay_plan: crate::driver::ephemeral::ReplayQueuedContributorsPlan,
     pub(crate) terminal_error: String,
     pub(crate) runtime_apply_failure: Option<CoreApplyFailureCause>,
-    pub(crate) recoverable: bool,
+    pub(crate) contributor_disposition: FailedRunContributorDisposition,
     pub(crate) applied_commit: Option<MachineTerminalAppliedCommit>,
 }
 
@@ -7942,10 +7985,18 @@ pub(crate) async fn machine_resolve_runtime_terminated_completion_result(
     )
 }
 
+/// Terminalize a failed runtime-loop run, disposing of its staged contributors
+/// as the caller's typed disposition says.
+///
+/// The disposition is the caller's because only the runtime loop knows whether
+/// the executor answered (nothing in flight, replay repeats nothing) or whether
+/// the loop concluded non-progress and dropped an `apply` whose fate it cannot
+/// observe (replay could execute the instruction twice).
 pub(crate) async fn fail_runtime_loop_run(
     driver: &SharedDriver,
     run_id: RunId,
     failure: CoreApplyFailureCause,
+    contributor_disposition: FailedRunContributorDisposition,
 ) -> Result<(), RuntimeLoopRunFailError> {
     fail_runtime_loop_run_inner(
         driver,
@@ -7956,6 +8007,7 @@ pub(crate) async fn fail_runtime_loop_run(
             machine_terminal_failure_observed: false,
             machine_terminal_error: None,
             terminal_failure_source: None,
+            contributor_disposition,
             applied_terminal: None,
         },
     )
@@ -7969,6 +8021,11 @@ pub(crate) async fn fail_machine_run(
     run_id: RunId,
     failure: super::MeerkatMachineRunFailure,
 ) -> Result<(), RuntimeLoopRunFailError> {
+    let contributor_disposition = if failure.machine_terminal_failure_observed {
+        FailedRunContributorDisposition::Consumed
+    } else {
+        FailedRunContributorDisposition::Replayed
+    };
     fail_runtime_loop_run_inner(
         driver,
         run_id,
@@ -7978,6 +8035,7 @@ pub(crate) async fn fail_machine_run(
             machine_terminal_failure_observed: failure.machine_terminal_failure_observed,
             machine_terminal_error: failure.machine_terminal_error,
             terminal_failure_source: failure.source,
+            contributor_disposition,
             applied_terminal: None,
         },
     )
@@ -8001,6 +8059,7 @@ pub(crate) async fn commit_machine_terminal_run(
             machine_terminal_failure_observed: failure.machine_terminal_failure_observed,
             machine_terminal_error: failure.machine_terminal_error,
             terminal_failure_source: failure.source,
+            contributor_disposition: FailedRunContributorDisposition::Consumed,
             applied_terminal: Some(applied),
         },
     )
@@ -8246,6 +8305,7 @@ struct RuntimeLoopRunFailureContext {
     machine_terminal_failure_observed: bool,
     machine_terminal_error: Option<meerkat_core::TurnErrorMetadata>,
     terminal_failure_source: Option<crate::meerkat_machine::dsl::RunFailureSourceKind>,
+    contributor_disposition: FailedRunContributorDisposition,
     applied_terminal: Option<MachineTerminalAppliedDraft>,
 }
 
@@ -8260,6 +8320,7 @@ async fn fail_runtime_loop_run_inner(
         machine_terminal_failure_observed,
         machine_terminal_error,
         terminal_failure_source,
+        contributor_disposition,
         applied_terminal,
     } = failure;
     let mut driver = driver.lock().await;
@@ -8272,6 +8333,24 @@ async fn fail_runtime_loop_run_inner(
             RuntimeDriverError::ValidationFailed {
                 reason: "machine-terminal failure observation and typed completion error disagreed"
                     .to_string(),
+            },
+        ));
+    }
+    // Consumed asserts the contributors were applied, which only a
+    // machine-terminal failure witnesses. Fail closed rather than let a caller
+    // consume inputs no turn ever touched, or replay ones a turn did.
+    if machine_terminal_failure_observed
+        != matches!(
+            contributor_disposition,
+            FailedRunContributorDisposition::Consumed
+        )
+    {
+        return Err(RuntimeLoopRunFailError::Rejected(
+            RuntimeDriverError::ValidationFailed {
+                reason: format!(
+                    "machine-terminal failure observation and contributor disposition {} disagreed",
+                    contributor_disposition.as_str()
+                ),
             },
         ));
     }
@@ -8414,7 +8493,6 @@ async fn fail_runtime_loop_run_inner(
             return Err(RuntimeLoopRunFailError::Rejected(error));
         }
     };
-    let recoverable = !machine_terminal_failure_observed;
     let replay_plan = machine_build_replay_plan(&driver, &staged_input_ids, "RunFailed");
     if let Err(err) = machine_apply_run_return_projection(
         &mut driver,
@@ -8438,7 +8516,7 @@ async fn fail_runtime_loop_run_inner(
             replay_plan,
             terminal_error,
             runtime_apply_failure,
-            recoverable,
+            contributor_disposition,
             applied_commit,
         })
         .await

@@ -90,6 +90,7 @@ pub mod protocol_supervisor_trust_publish;
 #[path = "generated/protocol_supervisor_trust_revoke.rs"]
 pub mod protocol_supervisor_trust_revoke;
 pub mod recovery;
+pub(crate) mod run_progress;
 pub mod runtime_event;
 pub(crate) mod runtime_loop;
 pub mod runtime_state;

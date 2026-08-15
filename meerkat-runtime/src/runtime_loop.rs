@@ -974,6 +974,10 @@ enum OwnedRuntimeLoopTerminalization {
     Failed {
         failure: CoreApplyFailureCause,
         completion_reason: String,
+        /// What the machine does with this run's staged contributors. Only the
+        /// loop knows whether the executor answered or whether the loop gave up
+        /// on it while an `apply` it can no longer observe may still land.
+        contributor_disposition: crate::meerkat_machine::FailedRunContributorDisposition,
     },
 }
 
@@ -1044,10 +1048,16 @@ async fn realize_runtime_loop_terminal_owned(
             OwnedRuntimeLoopTerminalization::Failed {
                 failure,
                 completion_reason,
+                contributor_disposition,
             } => (
-                crate::meerkat_machine::fail_runtime_loop_run(&driver, run_id.clone(), failure)
-                    .await
-                    .map_err(|error| error.to_string()),
+                crate::meerkat_machine::fail_runtime_loop_run(
+                    &driver,
+                    run_id.clone(),
+                    failure,
+                    contributor_disposition,
+                )
+                .await
+                .map_err(|error| error.to_string()),
                 completion_reason,
             ),
         };
@@ -3746,16 +3756,25 @@ fn primitive_turn_start_input(
     }
 }
 
+/// Signal the machine's turn start for this run, and report whether it was
+/// actually signalled.
+///
+/// The two `NotSignalled` returns are deliberate skips, not failures, but they
+/// leave `TurnPhase` describing whatever ran before this run. The caller must
+/// therefore not read the shared phase as a fact about this run: see
+/// [`crate::run_progress::TurnStartSignal`].
 async fn prepare_turn_state_for_primitive(
     driver: &crate::meerkat_machine::SharedDriver,
     run_id: &RunId,
     primitive: &RunPrimitive,
-) -> Result<(), crate::RuntimeDriverError> {
+) -> Result<crate::run_progress::TurnStartSignal, crate::RuntimeDriverError> {
     if let Some(reason) = primitive.peer_response_terminal_apply_intent_violation() {
         return Err(crate::RuntimeDriverError::Internal(reason.to_string()));
     }
     let Some(input) = primitive_turn_start_input(run_id, primitive) else {
-        return Ok(());
+        // An appends-empty staged primitive (the transient-turn-context /
+        // live-steer class) has no turn-start transition to apply.
+        return Ok(crate::run_progress::TurnStartSignal::NotSignalled);
     };
     let authority = {
         let driver = driver.lock().await;
@@ -3773,15 +3792,45 @@ async fn prepare_turn_state_for_primitive(
     // signal during drain; shell-side `set_control_projection` has
     // already advanced control so `executor.apply` proceeds next.
     if auth.state().lifecycle_phase == crate::meerkat_machine::dsl::MeerkatPhase::Retired {
-        return Ok(());
+        return Ok(crate::run_progress::TurnStartSignal::NotSignalled);
     }
     crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(&mut *auth, input)
-        .map(|_| ())
+        .map(|_| crate::run_progress::TurnStartSignal::Signalled)
         .map_err(|err| {
             crate::RuntimeDriverError::Internal(format!(
                 "failed to start runtime turn state for run {run_id}: {err}"
             ))
         })
+}
+
+/// Decide what becomes of a failed run's staged contributors, from the typed
+/// apply failure alone.
+///
+/// Exactly one failure class refuses the release: a run whose consumer never
+/// began executing. There the loop dropped an `apply` whose in-flight fate it
+/// cannot observe, so returning a contributor to its work lane could have the
+/// instruction carried out twice. Every other failure - including every other
+/// teardown reason - is an answer the executor gave, with nothing in flight, so
+/// replay repeats nothing.
+///
+/// `CoreExecutorTeardownReason` is `#[non_exhaustive]`, so this stays a
+/// `matches!` on the one reason rather than a `match` that would silently
+/// re-classify a reason added later.
+fn failed_run_contributor_disposition(
+    error: &CoreExecutorError,
+) -> crate::meerkat_machine::FailedRunContributorDisposition {
+    if matches!(
+        error,
+        CoreExecutorError::TeardownRequired {
+            reason: meerkat_core::lifecycle::core_executor::
+                CoreExecutorTeardownReason::ExecutorNotProgressing,
+            ..
+        }
+    ) {
+        crate::meerkat_machine::FailedRunContributorDisposition::Terminalized
+    } else {
+        crate::meerkat_machine::FailedRunContributorDisposition::Replayed
+    }
 }
 
 #[cfg(test)]
@@ -5511,12 +5560,19 @@ async fn process_queue(
                         return false;
                     }
                 }
-                let staged_directed_interaction_ids = {
+                // The input is durably `Staged` from here: it has left its work
+                // lane and is owned by exactly one consumer. Everything below
+                // is inside the staged -> executing window, so the window's
+                // clock and its watchdog start here rather than at `apply`.
+                let staged_at = crate::run_progress::Instant::now();
+                let turn_start_signal = crate::run_progress::TurnStartSignalCell::default();
+                let (staged_directed_interaction_ids, shared_dsl_authority) = {
                     let driver_guard = driver.lock().await;
+                    let shared_dsl_authority = driver_guard.shared_dsl_authority();
                     match crate::meerkat_machine::driver::machine_staged_directed_interaction_ids(
                         &driver_guard,
                     ) {
-                        Ok(interaction_ids) => interaction_ids,
+                        Ok(interaction_ids) => (interaction_ids, shared_dsl_authority),
                         Err(error) => {
                             drop(driver_guard);
                             drop(queue_authority_guard);
@@ -5534,6 +5590,28 @@ async fn process_queue(
                         }
                     }
                 };
+                // Read seam for the machine-owned "this run began executing"
+                // fact. Captured without the async driver lock - which the
+                // wedged party may itself be holding - so both supervisors can
+                // observe progress without joining the queue behind it.
+                let execution_progress =
+                    std::sync::Arc::new(crate::run_progress::AuthorityRunExecutionProgress::new(
+                        shared_dsl_authority,
+                        turn_start_signal.clone(),
+                    ));
+                // Reports, never terminalizes, and lives in its own task so a
+                // wedge anywhere in the window - including the blocking machine
+                // authority lock below, which no `select!` in this task could
+                // survive - still names the run and its inputs in the log. The
+                // guard retires it on every path out of this window.
+                let start_watchdog = crate::run_progress::StagedRunStartWatchdog::spawn(
+                    std::sync::Arc::clone(&execution_progress)
+                        as std::sync::Arc<dyn crate::run_progress::RunExecutionProgressSource>,
+                    run_id.clone(),
+                    input_ids.clone(),
+                    staged_at,
+                    crate::run_progress::RUN_EXECUTION_START_NOTICE,
+                );
                 let primitive = match *primitive {
                     Ok(primitive) => primitive,
                     Err(conflict) => {
@@ -5565,6 +5643,10 @@ async fn process_queue(
                                         conflict.to_string(),
                                     ),
                                     completion_reason: completion_reason.clone(),
+                                    // The executor was never called, so nothing
+                                    // is in flight and replay repeats nothing.
+                                    contributor_disposition:
+                                        crate::meerkat_machine::FailedRunContributorDisposition::Replayed,
                                 },
                             )
                             .await
@@ -5671,9 +5753,14 @@ async fn process_queue(
                         }
                     }
                 };
-                if let Err(error) =
-                    prepare_turn_state_for_primitive(driver, &run_id, &primitive).await
-                {
+                let turn_start =
+                    prepare_turn_state_for_primitive(driver, &run_id, &primitive).await;
+                if let Ok(crate::run_progress::TurnStartSignal::Signalled) = turn_start {
+                    // Only now does the shared `TurnPhase` describe this run,
+                    // so only now may either supervisor read it as evidence.
+                    turn_start_signal.mark_signalled();
+                }
+                if let Err(error) = turn_start {
                     tracing::error!(%run_id, error = %error, "failed to start runtime turn state");
                     let completion_reason =
                         format!("runtime turn-state preparation failed: {error}");
@@ -5698,6 +5785,10 @@ async fn process_queue(
                                     error.to_string(),
                                 ),
                                 completion_reason: completion_reason.clone(),
+                                // Turn-state preparation failed before the
+                                // executor was called, so nothing is in flight.
+                                contributor_disposition:
+                                    crate::meerkat_machine::FailedRunContributorDisposition::Replayed,
                             },
                         )
                         .await
@@ -5807,8 +5898,25 @@ async fn process_queue(
 
                 let directed_interaction_ids = staged_directed_interaction_ids;
 
-                // Execute outside the driver lock (this calls start_turn, which is slow)
-                let result = executor.apply(run_id.clone(), primitive).await;
+                // Execute outside the driver lock (this calls start_turn, which is slow).
+                // The staged -> executing transition is bounded and typed: a
+                // consumer that never begins executing this run yields a typed
+                // ExecutorNotProgressing teardown instead of holding the staged
+                // input, and its caller, forever. The deadline runs from the
+                // staging instant, so the pre-apply segment counts against the
+                // same window instead of extending it.
+                let result = crate::run_progress::apply_with_execution_start_bound(
+                    executor,
+                    execution_progress.as_ref(),
+                    run_id.clone(),
+                    primitive,
+                    staged_at,
+                    crate::run_progress::RUN_EXECUTION_START_BOUND,
+                )
+                .await;
+                // The window is closed: `apply` returned an outcome, whatever
+                // it is. Retire the watchdog before the terminal paths below.
+                drop(start_watchdog);
 
                 // Lock again to update driver state
                 let d = driver.lock().await;
@@ -6205,10 +6313,21 @@ async fn process_queue(
                             }
                         };
                         let cancelled = e.is_cancelled();
+                        let contributor_disposition = failed_run_contributor_disposition(&e);
                         let executor_stopped = matches!(&e, CoreExecutorError::Stopped);
                         let legacy_machine_terminal =
                             matches!(&e, CoreExecutorError::TerminalFailure { .. });
                         let error_msg = e.to_string();
+                        // The completion detail must be byte-identical to the
+                        // one the failed-run realization stages on the input
+                        // terminal-completion batch
+                        // (`TurnErrorMetadata::runtime_apply_failure` over the
+                        // apply-failure cause message). The completion authority
+                        // refuses to deliver a payload whose digest differs from
+                        // the staged candidate, so a second wording here would
+                        // resolve the caller with `AuthorityUnavailable` instead
+                        // of the typed reason the run terminal carries.
+                        let completion_detail = e.apply_failure_cause().message().to_owned();
                         if executor_stopped || legacy_machine_terminal {
                             // `Stopped` and the legacy error-shaped terminal
                             // are fail-closed executor exits. Neither carries
@@ -6242,7 +6361,8 @@ async fn process_queue(
                         } else {
                             OwnedRuntimeLoopTerminalization::Failed {
                                 failure: e.apply_failure_cause(),
-                                completion_reason: format!("apply failed: {error_msg}"),
+                                completion_reason: completion_detail.clone(),
+                                contributor_disposition,
                             }
                         };
                         let (terminal_authority_guard, terminalization_outcome) =
@@ -6435,7 +6555,7 @@ async fn process_queue(
                                     teardown_slot,
                                     &nondirected_input_ids,
                                     &run_id,
-                                    format!("apply failed: {error_msg}"),
+                                    completion_detail.clone(),
                                 )
                                 .await;
                             }
@@ -9112,6 +9232,582 @@ mod tests {
                 .to_vec(),
             vec![follower_id],
             "the backlog behind a doomed head is intact and selectable"
+        );
+    }
+
+    // ─── Staged -> executing bound (field: staged 757s+ on an established run) ───
+
+    /// Seed the runtime binding a session-owned handle bundle records. Without
+    /// it there is no turn-state handle bound to this authority, the staged ->
+    /// executing fact is unobservable, and the bound must refuse to escalate.
+    async fn bind_runtime_for_progress_test(
+        driver: &crate::meerkat_machine::SharedDriver,
+        runtime_name: &str,
+    ) {
+        let mut guard = driver.lock().await;
+        match &mut *guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => d
+                .install_registered_authority_for_test(
+                    crate::meerkat_machine::dsl::SessionId::from_domain(&SessionId::new()),
+                    Some(&crate::identifiers::LogicalRuntimeId::new(runtime_name)),
+                    Some(1),
+                    Some(crate::meerkat_machine::dsl::Generation::from(1)),
+                    Some(crate::meerkat_machine::dsl::RuntimeEpochId::from(
+                        "progress-bound-epoch".to_string(),
+                    )),
+                    crate::store::SupervisorAuthoritySnapshot::UnboundNoReceipt,
+                )
+                .expect("seed session-owned runtime binding"),
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    async fn shared_authority_for_test(
+        driver: &crate::meerkat_machine::SharedDriver,
+    ) -> crate::driver::ephemeral::SharedIngressDslAuthority {
+        let guard = driver.lock().await;
+        guard.shared_dsl_authority()
+    }
+
+    fn last_apply_failure_message(
+        authority: &crate::driver::ephemeral::SharedIngressDslAuthority,
+    ) -> Option<String> {
+        authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state()
+            .last_runtime_apply_failure_message
+            .clone()
+    }
+
+    /// The consumer from the field report: it takes the run and applies
+    /// nothing, forever.
+    struct NotDrainingExecutor {
+        entered: Arc<AtomicBool>,
+        stop_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::CoreExecutor for NotDrainingExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, CoreExecutorError>
+        {
+            self.entered.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            unreachable!("a command loop that is not draining never returns")
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A live consumer whose turn takes far longer than the bound. It does
+    /// exactly what a real agent does first: applies the primitive, moving the
+    /// machine's turn phase off `ApplyingPrimitive` before the first LLM call.
+    struct SlowButExecutingExecutor {
+        authority: crate::driver::ephemeral::SharedIngressDslAuthority,
+        applies: Arc<AtomicUsize>,
+        completed: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::CoreExecutor for SlowButExecutingExecutor {
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, CoreExecutorError>
+        {
+            self.applies.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut authority = self
+                    .authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                    &mut *authority,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::PrimitiveApplied {
+                        run_id: crate::meerkat_machine::dsl::RunId::from_domain(&run_id),
+                    },
+                )
+                .expect("agent-side PrimitiveApplied should be legal for a started run");
+            }
+            crate::tokio::time::sleep(crate::run_progress::RUN_EXECUTION_START_BOUND * 10).await;
+            self.completed.store(true, Ordering::SeqCst);
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                    meerkat_core::RunBoundaryReceiptDraft {
+                        run_id,
+                        boundary: RunApplyBoundary::RunStart,
+                        contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                        conversation_digest: None,
+                        message_count: 0,
+                    },
+                    None,
+                    None,
+                ),
+            )
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    /// Field class (0.8.22, household fleet): `QueueAccepted`, then
+    /// `StageForRun(run …)`, then 757+ seconds of nothing. Zero gateway lines
+    /// for the run or the input, no error, no transcript append, no state
+    /// change. The run existed and owned the input; the executor that had to
+    /// consume it was not draining, and `StageForRun` never asked whether it
+    /// could.
+    ///
+    /// This is the lane's regression guard: it is RED on revert, where
+    /// `process_queue` hangs inside `apply` forever - the exact mute wait the
+    /// field saw, with the caller waiting behind it.
+    #[tokio::test(start_paused = true)]
+    async fn staged_run_whose_consumer_never_executes_terminalizes_with_a_typed_reason() {
+        let driver = make_shared_ephemeral_driver("consumer-not-draining");
+        bind_runtime_for_progress_test(&driver, "consumer-not-draining").await;
+        let authority = shared_authority_for_test(&driver).await;
+        let input_id = accept_queued_input_id(&driver, make_prompt("is the door locked?")).await;
+
+        let completions: crate::meerkat_machine::SharedCompletionRegistry = Arc::new(
+            crate::tokio::sync::Mutex::new(crate::completion::CompletionRegistry::new()),
+        );
+        let waiter = completions.lock().await.register(input_id.clone());
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = NotDrainingExecutor {
+            entered: Arc::clone(&entered),
+            stop_calls: Arc::clone(&stop_calls),
+        };
+        let (_effect_tx, mut effect_rx) = tokio::sync::mpsc::channel(1);
+        let authority_binding = RuntimeLoopAuthorityBinding::detached_for_test();
+        let teardown_slot = RuntimeLoopTeardownSlot::pending();
+        let mut terminal_handoff = RuntimeLoopTerminalHandoff::default();
+
+        let should_stop = tokio::time::timeout(
+            crate::run_progress::RUN_EXECUTION_START_BOUND * 8,
+            process_queue(
+                &driver,
+                &mut executor,
+                &mut effect_rx,
+                Some(&completions),
+                &authority_binding,
+                &teardown_slot,
+                &mut terminal_handoff,
+            ),
+        )
+        .await
+        .expect("a staged run whose consumer never executes must not wait forever");
+
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "the consumer must have owned the staged run"
+        );
+        assert!(
+            should_stop,
+            "a consumer proven not to be draining must hand its executor off, not receive more work"
+        );
+        // The field evidence was a caller waiting forever. A terminalized input
+        // with the caller still hanging would fail this lane's criterion the
+        // same way the original defect did.
+        let outcome = tokio::time::timeout(
+            crate::run_progress::RUN_EXECUTION_START_BOUND,
+            waiter.wait_authorized(),
+        )
+        .await
+        .expect("the caller must stop waiting when its run is terminalized");
+        let reason = match &outcome {
+            crate::completion::CompletionOutcome::Abandoned { reason, .. }
+            | crate::completion::CompletionOutcome::AbandonedWithError { reason, .. } => {
+                reason.clone()
+            }
+            other => panic!("expected a typed abandoned completion, got {other:?}"),
+        };
+        assert!(
+            reason.contains("ExecutorNotProgressing"),
+            "the caller's outcome must name why its run could not progress, got: {reason}"
+        );
+        let failure = last_apply_failure_message(&authority)
+            .expect("the machine must record why the run could not progress");
+        assert!(
+            failure.contains("ExecutorNotProgressing"),
+            "the recorded failure must name the reason, got: {failure}"
+        );
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_phase(&input_id),
+                    Some(crate::input_state::InputLifecycleState::Abandoned),
+                    "the staged input must terminalize, never be released back into the queue \
+                     where a late-draining consumer could execute the instruction twice"
+                );
+                assert!(
+                    !d.has_queued_input(&input_id),
+                    "a never-started run's contributor must never re-enter a work lane"
+                );
+                assert_eq!(
+                    d.input_terminal_outcome(&input_id),
+                    Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                        reason: crate::input_state::InputAbandonReason::NeverExecuted,
+                    }),
+                    "the durable reason must say the run never executed, not `Cancelled`: a host \
+                     reading `Cancelled` here concludes a user stopped the work, and this is the \
+                     one path that drives the real escalation end to end"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    /// The window measures staged -> executing, not how long a live turn may
+    /// take. A turn that begins executing and then runs ten times longer than
+    /// the bound must keep its own outcome and must never be applied twice.
+    ///
+    /// Mutation guard, not a regression guard: this also passes on revert,
+    /// because an unbounded `apply` lets a slow executor finish. It goes RED if
+    /// the escalation branch stops requiring positive proof of non-progress.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_that_began_executing_is_not_disturbed_by_the_bound() {
+        let driver = make_shared_ephemeral_driver("slow-but-executing");
+        bind_runtime_for_progress_test(&driver, "slow-but-executing").await;
+        let authority = shared_authority_for_test(&driver).await;
+        let input_id = accept_queued_input_id(&driver, make_prompt("is the door locked?")).await;
+
+        let applies = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicBool::new(false));
+        let mut executor = SlowButExecutingExecutor {
+            authority: authority.clone(),
+            applies: Arc::clone(&applies),
+            completed: Arc::clone(&completed),
+        };
+        let (_effect_tx, mut effect_rx) = tokio::sync::mpsc::channel(1);
+        let authority_binding = RuntimeLoopAuthorityBinding::detached_for_test();
+        let teardown_slot = RuntimeLoopTeardownSlot::pending();
+        let mut terminal_handoff = RuntimeLoopTerminalHandoff::default();
+
+        let _should_stop = tokio::time::timeout(
+            crate::run_progress::RUN_EXECUTION_START_BOUND * 40,
+            process_queue(
+                &driver,
+                &mut executor,
+                &mut effect_rx,
+                None,
+                &authority_binding,
+                &teardown_slot,
+                &mut terminal_handoff,
+            ),
+        )
+        .await
+        .expect("a slow but executing turn must still finish");
+
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "a live turn must run to its own completion, not be cut off at the bound"
+        );
+        assert_eq!(
+            applies.load(Ordering::SeqCst),
+            1,
+            "the bound must never cause a staged instruction to be executed twice"
+        );
+        let failure = last_apply_failure_message(&authority);
+        assert!(
+            !failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("ExecutorNotProgressing")),
+            "an executing turn must not be recorded as a non-progressing one: {failure:?}"
+        );
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_ne!(
+                    d.input_phase(&input_id),
+                    Some(crate::input_state::InputLifecycleState::Abandoned),
+                    "a turn that began executing must not be terminalized by the bound"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    /// The detector refuses when it cannot prove non-progress. Without a
+    /// session-owned runtime binding no turn-state handle writes to this
+    /// authority, so `ApplyingPrimitive` is not evidence of anything and the
+    /// bound must not terminalize on it.
+    ///
+    /// Mutation guard, not a regression guard: asserting that the call times
+    /// out is an assertion the code still waits, which also holds on revert. It
+    /// goes RED if the escalation branch ever fires on an unprovable
+    /// observation. The cost it documents is real - this run stays unbounded,
+    /// which is why the watchdog reports it rather than the bound resolving it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unobservable_session_refuses_to_terminalize_its_staged_run() {
+        let driver = make_shared_ephemeral_driver("runtime-unbound");
+        let authority = shared_authority_for_test(&driver).await;
+        let input_id = accept_queued_input_id(&driver, make_prompt("is the door locked?")).await;
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = NotDrainingExecutor {
+            entered: Arc::clone(&entered),
+            stop_calls: Arc::clone(&stop_calls),
+        };
+        let (_effect_tx, mut effect_rx) = tokio::sync::mpsc::channel(1);
+        let authority_binding = RuntimeLoopAuthorityBinding::detached_for_test();
+        let teardown_slot = RuntimeLoopTeardownSlot::pending();
+        let mut terminal_handoff = RuntimeLoopTerminalHandoff::default();
+
+        let outcome = tokio::time::timeout(
+            crate::run_progress::RUN_EXECUTION_START_BOUND * 8,
+            process_queue(
+                &driver,
+                &mut executor,
+                &mut effect_rx,
+                None,
+                &authority_binding,
+                &teardown_slot,
+                &mut terminal_handoff,
+            ),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "an unobservable session must refuse to escalate rather than risk terminalizing live work"
+        );
+        assert!(
+            last_apply_failure_message(&authority).is_none(),
+            "refusing to escalate must not record a failure the machine cannot prove"
+        );
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_phase(&input_id),
+                    Some(crate::input_state::InputLifecycleState::Staged),
+                    "an unprovable observation must leave the staged input owned by its run"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    /// Stage exactly one accepted input onto a fresh run, leaving the driver
+    /// where the runtime loop sits when it calls `apply`.
+    async fn stage_one_run_for_disposition_test(
+        driver: &crate::meerkat_machine::SharedDriver,
+    ) -> (RunId, InputId) {
+        let input_id = accept_queued_input_id(driver, make_prompt("is the door locked?")).await;
+        let batch = {
+            let guard = driver.lock().await;
+            crate::meerkat_machine::driver::machine_authorize_runtime_loop_batch(&guard)
+                .expect("generated runtime-loop batch")
+        };
+        let run_id = RunId::new();
+        // The starvation-valve lane made a refusal a typed `Ok` outcome, so
+        // this fixture must assert it actually staged: silently proceeding
+        // with nothing staged would make the expect message below a lie for
+        // every disposition test built on this fixture.
+        let outcome =
+            crate::meerkat_machine::prepare_runtime_loop_batch_start(driver, run_id.clone(), batch)
+                .await
+                .expect("staging an accepted batch must succeed");
+        assert!(
+            matches!(
+                outcome,
+                crate::meerkat_machine::driver::RuntimeLoopBatchStart::Started
+            ),
+            "staging an accepted batch must succeed, got {outcome:?}"
+        );
+        (run_id, input_id)
+    }
+
+    /// Scoping guard for the never-started disposition. Every other failed run
+    /// still replays: the executor gave a received answer, nothing is in
+    /// flight, and re-queuing repeats nothing. If this goes RED the new
+    /// disposition has leaked into a class it does not describe.
+    #[tokio::test]
+    async fn an_ordinary_apply_failure_still_returns_its_contributor_to_the_work_lane() {
+        let driver = make_shared_ephemeral_driver("replayed-disposition");
+        let (run_id, input_id) = stage_one_run_for_disposition_test(&driver).await;
+
+        crate::meerkat_machine::fail_runtime_loop_run(
+            &driver,
+            run_id,
+            CoreApplyFailureCause::executor_internal("ordinary apply failure"),
+            crate::meerkat_machine::FailedRunContributorDisposition::Replayed,
+        )
+        .await
+        .expect("an ordinary apply failure must terminalize its run");
+
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_phase(&input_id),
+                    Some(crate::input_state::InputLifecycleState::Queued),
+                    "an answered failure must return its contributor to the queue"
+                );
+                assert!(
+                    d.has_queued_input(&input_id),
+                    "a replayed contributor must be lane-bound again"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    /// The double-execution refusal, at the machine realization rather than as
+    /// a compensating step after it: a never-started run's contributors are
+    /// terminalized by the same realization that terminalizes the run, so they
+    /// are never durably queued for a successor attachment, not even briefly.
+    ///
+    /// Two boundary facts that claim does not cover: a crash *before* the
+    /// commit leaves the row durably `Staged`, and successor recovery
+    /// normalizes it to `Queued` and re-runs it - safe, because the crash took
+    /// the in-flight `apply` with it, and that is the pre-existing recovery
+    /// contract. A store-commit *failure without a crash* takes
+    /// checkpoint-restore plus loop teardown and leaves the row `Staged` for
+    /// same-process recovery to re-queue on a fresh executor while the
+    /// torn-down consumer's channel may still hold the command; that is the
+    /// residual double-execution window, and it is named rather than implied.
+    #[tokio::test]
+    async fn a_never_started_run_terminalizes_its_contributor_in_the_same_realization() {
+        let driver = make_shared_ephemeral_driver("terminalized-disposition");
+        let (run_id, input_id) = stage_one_run_for_disposition_test(&driver).await;
+
+        crate::meerkat_machine::fail_runtime_loop_run(
+            &driver,
+            run_id,
+            CoreApplyFailureCause::executor_stopped(),
+            crate::meerkat_machine::FailedRunContributorDisposition::Terminalized,
+        )
+        .await
+        .expect("a never-started run must terminalize");
+
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_phase(&input_id),
+                    Some(crate::input_state::InputLifecycleState::Abandoned),
+                    "a never-started run's contributor must terminalize, not re-queue"
+                );
+                assert!(
+                    !d.has_queued_input(&input_id),
+                    "a never-started run's contributor must not be lane-bound again"
+                );
+                // The durable reason is the whole point: a host reading this
+                // row (and, once the abandon-delivery lane lands, a waiter
+                // receiving it typed) must not be told an operator cancelled
+                // work the runtime itself refused.
+                assert_eq!(
+                    d.input_terminal_outcome(&input_id),
+                    Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                        reason: crate::input_state::InputAbandonReason::NeverExecuted,
+                    }),
+                    "a never-started run's contributor must carry the never-executed reason"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    /// The other mint site for a staged-run abandonment. An operator
+    /// cancellation keeps `Cancelled`, so the two reasons stay distinguishable
+    /// at the durable row that every host reads. If this and its sibling ever
+    /// agree, the typed reason has stopped carrying information.
+    #[tokio::test]
+    async fn an_operator_cancelled_run_keeps_the_cancelled_reason() {
+        let driver = make_shared_ephemeral_driver("cancelled-disposition");
+        let (run_id, input_id) = stage_one_run_for_disposition_test(&driver).await;
+
+        crate::meerkat_machine::cancel_runtime_loop_run(&driver, run_id)
+            .await
+            .expect("a cancelled run must terminalize");
+
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_terminal_outcome(&input_id),
+                    Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                        reason: crate::input_state::InputAbandonReason::Cancelled,
+                    }),
+                    "a genuine cancellation must keep the cancelled reason"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    /// Symmetric pin on the disposition classifier. The positive half
+    /// (`ExecutorNotProgressing` -> `Terminalized`) is exercised end to end
+    /// above; the negative half needs a `TeardownRequired` carrying some
+    /// *other* reason, or a later widening of the match to all teardown
+    /// reasons would silently start terminalizing contributors of runs whose
+    /// executor answered.
+    #[test]
+    fn only_the_never_started_teardown_reason_terminalizes_contributors() {
+        use crate::meerkat_machine::FailedRunContributorDisposition;
+        use meerkat_core::lifecycle::core_executor::CoreExecutorTeardownReason;
+
+        assert_eq!(
+            failed_run_contributor_disposition(
+                &CoreExecutorError::executor_not_progressing_requires_teardown(
+                    "consumer never began executing"
+                )
+            ),
+            FailedRunContributorDisposition::Terminalized
+        );
+        for reason in [
+            CoreExecutorTeardownReason::ArchivedSession,
+            CoreExecutorTeardownReason::SessionUnavailable,
+            CoreExecutorTeardownReason::DurableProjectionAuthorityUnknown,
+        ] {
+            assert_eq!(
+                failed_run_contributor_disposition(&CoreExecutorError::teardown_required(
+                    reason,
+                    "executor requested teardown"
+                )),
+                FailedRunContributorDisposition::Replayed,
+                "{} is an answer the executor gave, so its contributors still replay",
+                reason.as_str()
+            );
+        }
+        assert_eq!(
+            failed_run_contributor_disposition(&CoreExecutorError::Internal(
+                "ordinary apply failure".into()
+            )),
+            FailedRunContributorDisposition::Replayed
         );
     }
 

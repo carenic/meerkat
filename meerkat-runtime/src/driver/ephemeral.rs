@@ -990,6 +990,7 @@ impl EphemeralRuntimeDriver {
                         }) as u32;
                         InputAbandonReason::MaxAttemptsExhausted { attempts }
                     }
+                    mm_dsl::InputAbandonReason::NeverExecuted => InputAbandonReason::NeverExecuted,
                 };
                 Some(InputTerminalOutcome::Abandoned { reason })
             }
@@ -4035,7 +4036,11 @@ impl EphemeralRuntimeDriver {
                     reason: dsl_reason,
                     attempt_count,
                 },
-                "AbandonInput(CancelledRun)",
+                // Every caller of this helper abandons inputs still owned by a
+                // staged run; the reason says which kind of abandonment it is.
+                // Naming a cancellation here would misdescribe the callers that
+                // are not one.
+                "AbandonInput(StagedRun)",
             )?;
 
             self.sync_terminal_projection_from_machine(
@@ -4123,28 +4128,77 @@ impl EphemeralRuntimeDriver {
         run_id: &RunId,
         contributing_input_ids: &[InputId],
         replay_plan: &ReplayQueuedContributorsPlan,
-        recoverable: bool,
+        contributor_disposition: crate::meerkat_machine::driver::FailedRunContributorDisposition,
     ) -> Result<(), RuntimeDriverError> {
-        if !recoverable {
-            tracing::debug!(
-                run_id = ?run_id,
-                contributors = contributing_input_ids.len(),
-                "runtime consumed contributors after a machine-owned terminal failure"
-            );
-            return self.consume_inputs(contributing_input_ids, run_id);
-        }
-        tracing::debug!(
-            run_id = ?run_id,
-            kind = replay_plan.notice_kind,
-            queue = replay_plan.queue_work_ids.len(),
-            steer = replay_plan.steer_work_ids.len(),
-            "runtime replayed queued contributors"
-        );
+        use crate::meerkat_machine::driver::FailedRunContributorDisposition;
+        match contributor_disposition {
+            FailedRunContributorDisposition::Consumed => {
+                tracing::debug!(
+                    run_id = ?run_id,
+                    contributors = contributing_input_ids.len(),
+                    "runtime consumed contributors after a machine-owned terminal failure"
+                );
+                self.consume_inputs(contributing_input_ids, run_id)
+            }
+            FailedRunContributorDisposition::Terminalized => {
+                // The one failure class that must not re-enter a work lane:
+                // the loop concluded non-progress and dropped an `apply` whose
+                // in-flight fate it cannot observe, so a late-draining consumer
+                // could still carry the instruction out. Terminalizing here -
+                // inside the same realization, and so inside the same durable
+                // commit, as the run terminal - means the input is never
+                // durably *Queued* for a successor, not even for an instant.
+                //
+                // Two boundary facts that claim does not cover, stated rather
+                // than implied:
+                //
+                // * A crash before the commit leaves the row durably `Staged`,
+                //   and successor recovery normalizes `Staged` to `Queued` and
+                //   re-runs it. That is safe and is the pre-existing recovery
+                //   contract: the crash killed the in-flight `apply` with the
+                //   process, so nothing can drain late.
+                // * A store-commit *failure* without a crash is different, and
+                //   the two drivers diverge here: the ephemeral checkpoint is
+                //   restored, while a persistent post-checkpoint failure is
+                //   NOT snapshot-restored - it marks the shell as requiring a
+                //   durable reload and fails closed. Either way the durable
+                //   row stays `Staged` for same-process recovery to re-queue
+                //   on a fresh executor, while the torn-down consumer's
+                //   channel may still hold the command. That is the residual
+                //   double-execution window this disposition does not close.
+                //
+                // `NeverExecuted`, not `Cancelled`: nobody asked for this work
+                // to stop, and a host reading the durable reason to answer
+                // "why did my work not run" must not be told an operator
+                // cancelled it.
+                tracing::error!(
+                    run_id = ?run_id,
+                    contributors = contributing_input_ids.len(),
+                    "runtime terminalized the contributors of a run that never began executing; \
+                     they are deliberately not re-queued because an execution this loop could not \
+                     observe could still land"
+                );
+                self.abandon_staged_inputs(
+                    contributing_input_ids,
+                    InputAbandonReason::NeverExecuted,
+                )
+                .map(|_| ())
+            }
+            FailedRunContributorDisposition::Replayed => {
+                tracing::debug!(
+                    run_id = ?run_id,
+                    kind = replay_plan.notice_kind,
+                    queue = replay_plan.queue_work_ids.len(),
+                    steer = replay_plan.steer_work_ids.len(),
+                    "runtime replayed queued contributors"
+                );
 
-        // `rollback_staged` drives generated `ResolveStagedRollback`
-        // authority and re-inserts surviving contributors into the correct
-        // lane — no separate lane seeding is needed here.
-        self.rollback_staged(contributing_input_ids)
+                // `rollback_staged` drives generated `ResolveStagedRollback`
+                // authority and re-inserts surviving contributors into the correct
+                // lane - no separate lane seeding is needed here.
+                self.rollback_staged(contributing_input_ids)
+            }
+        }
     }
 
     /// Machine-owned realization for a validated cancelled run.

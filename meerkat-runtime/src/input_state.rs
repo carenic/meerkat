@@ -54,7 +54,18 @@ pub enum InputAbandonReason {
     Stopped,
     Destroyed,
     Cancelled,
-    MaxAttemptsExhausted { attempts: u32 },
+    MaxAttemptsExhausted {
+        attempts: u32,
+    },
+    /// The input was staged onto a run that never began executing, and the
+    /// runtime refused the run rather than releasing the input back to a work
+    /// lane where an unobservable late execution could carry it out twice.
+    ///
+    /// Deliberately distinct from [`Self::Cancelled`]: nobody asked for this
+    /// work to stop. A host reading the reason is asking why its work did not
+    /// run, and "cancelled" would answer that question with something that
+    /// never happened.
+    NeverExecuted,
 }
 
 /// Terminal outcome for an input.
@@ -2401,11 +2412,27 @@ mod tests {
             InputAbandonReason::Reset,
             InputAbandonReason::Destroyed,
             InputAbandonReason::Cancelled,
+            InputAbandonReason::NeverExecuted,
         ] {
             let json = serde_json::to_value(&reason).unwrap();
             let parsed: InputAbandonReason = serde_json::from_value(json).unwrap();
             assert_eq!(reason, parsed);
         }
+    }
+
+    /// The durable wire string a host reads. `never_executed` must not collide
+    /// with `cancelled`: an operator cancellation and a run the runtime refused
+    /// are different facts, and this row is where a reader tells them apart.
+    #[test]
+    fn never_executed_is_a_distinct_wire_reason_from_cancelled() {
+        assert_eq!(
+            serde_json::to_value(InputAbandonReason::NeverExecuted).unwrap(),
+            serde_json::Value::String("never_executed".into())
+        );
+        assert_ne!(
+            serde_json::to_value(InputAbandonReason::NeverExecuted).unwrap(),
+            serde_json::to_value(InputAbandonReason::Cancelled).unwrap()
+        );
     }
 
     #[test]

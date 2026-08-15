@@ -209,6 +209,14 @@ pub enum CoreExecutorTeardownReason {
     ArchivedSession,
     SessionUnavailable,
     DurableProjectionAuthorityUnknown,
+    /// The runtime loop proved the executor never began executing an exact
+    /// staged run: machine authority still reported the run's primitive
+    /// un-applied after the bounded staged -> executing window elapsed.
+    ///
+    /// This reason is concluded by the runtime loop, not requested by the
+    /// executor. It exists so a consumer that cannot consume produces a typed
+    /// terminal instead of holding a staged input (and its caller) forever.
+    ExecutorNotProgressing,
 }
 
 impl CoreExecutorTeardownReason {
@@ -217,6 +225,7 @@ impl CoreExecutorTeardownReason {
             Self::ArchivedSession => "ArchivedSession",
             Self::SessionUnavailable => "SessionUnavailable",
             Self::DurableProjectionAuthorityUnknown => "DurableProjectionAuthorityUnknown",
+            Self::ExecutorNotProgressing => "ExecutorNotProgressing",
         }
     }
 
@@ -225,6 +234,7 @@ impl CoreExecutorTeardownReason {
             "ArchivedSession" => Some(Self::ArchivedSession),
             "SessionUnavailable" => Some(Self::SessionUnavailable),
             "DurableProjectionAuthorityUnknown" => Some(Self::DurableProjectionAuthorityUnknown),
+            "ExecutorNotProgressing" => Some(Self::ExecutorNotProgressing),
             _ => None,
         }
     }
@@ -358,6 +368,18 @@ impl CoreExecutorError {
         )
     }
 
+    /// The runtime loop concluded that this executor never began executing an
+    /// exact staged run within the bounded staged -> executing window.
+    ///
+    /// Unlike the reasons above, the executor does not raise this: the loop
+    /// mints it after machine authority proved the run's primitive was still
+    /// un-applied. Routing it through teardown is deliberate - a consumer that
+    /// never drained one run will not drain the next one either, so the exact
+    /// executor is handed off instead of being handed more work.
+    pub fn executor_not_progressing_requires_teardown(message: impl Into<String>) -> Self {
+        Self::teardown_required(CoreExecutorTeardownReason::ExecutorNotProgressing, message)
+    }
+
     pub fn apply_failed_from_session_error(error: SessionError) -> Self {
         if error.requests_runtime_executor_stop() {
             return Self::Stopped;
@@ -416,6 +438,19 @@ impl CoreExecutorError {
                     "typed machine terminal failure escaped runtime-loop handling: {cause_kind:?}"
                 ))
             }
+            // `ExecutorNotProgressing` is the one teardown reason the executor
+            // does not raise: the runtime loop concludes it. Saying "requested"
+            // would misattribute agency in the state table an operator reads.
+            Self::TeardownRequired {
+                reason: CoreExecutorTeardownReason::ExecutorNotProgressing,
+                message,
+            } => CoreApplyFailureCause::new(
+                CoreApplyFailureCauseKind::ExecutorStopped,
+                format!(
+                    "runtime loop concluded {} teardown: {message}",
+                    CoreExecutorTeardownReason::ExecutorNotProgressing.as_str()
+                ),
+            ),
             Self::TeardownRequired { reason, message } => CoreApplyFailureCause::new(
                 CoreApplyFailureCauseKind::ExecutorStopped,
                 format!("executor requested {} teardown: {message}", reason.as_str()),

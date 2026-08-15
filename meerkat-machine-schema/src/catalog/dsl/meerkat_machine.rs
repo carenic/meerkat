@@ -1951,6 +1951,11 @@ pub enum InputAbandonReason {
     Destroyed,
     Cancelled,
     MaxAttemptsExhausted,
+    /// The input was staged onto a run that never began executing. Distinct
+    /// from `Cancelled` because nobody asked for the work to stop; the runtime
+    /// refused a run it could not prove had started. `ResolveInputPublicTerminalOutcome`
+    /// therefore resolves it to the public `Abandoned` class, not `Cancelled`.
+    NeverExecuted,
 }
 
 /// Typed work-lane assignment for admitted inputs. Replaces the former
