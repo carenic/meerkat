@@ -1315,6 +1315,38 @@
             "type": "object"
           },
           {
+            "description": "Provider-authored cache breakpoints were discarded at a turn commit.\n\nA cache breakpoint is an optimization artifact anchored to one exact\ncommitted transcript prefix. Ordinary transcript motion unbinds it, and\ndropping it costs caching for the turn - never the turn itself. This\nevent is the host-observable record of that cost, so a degraded turn is\na routed fact rather than a log line: the same turn still completes.\n\n`origin` on each discard separates inherited poison (persisted by an\nearlier turn) from this turn's own lowering disagreeing with the\ncommitted transcript. Those have different root causes and are\nindistinguishable without it.",
+            "properties": {
+              "discarded": {
+                "description": "Non-empty whenever this event is emitted.",
+                "items": {
+                  "$ref": "#/$defs/DiscardedCacheBreakpoint"
+                },
+                "type": "array"
+              },
+              "retained": {
+                "description": "Proofs that still bind and remain durable evidence. A non-zero\nvalue means caching was weakened, not lost.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "provider_cache_breakpoints_discarded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "retained",
+              "discarded"
+            ],
+            "type": "object"
+          },
+          {
             "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
               "kind": {
@@ -1445,6 +1477,137 @@
           "tool_calls"
         ],
         "type": "string"
+      },
+      "CacheBreakpointBoundary": {
+        "description": "Stable provider-independent identity of an authored cache breakpoint.",
+        "oneOf": [
+          {
+            "description": "Stable leading system/profile prefix. `message_count` is the exclusive\ncanonical transcript boundary.",
+            "properties": {
+              "kind": {
+                "const": "system_profile_prefix",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Explicit breakpoint after one canonical transcript message.",
+            "properties": {
+              "kind": {
+                "const": "transcript_after",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardOrigin": {
+        "description": "Which side of a turn commit produced the discarded proof.\n\nLoad-bearing for hosts: `PersistedEvidence` is inherited poison from an\nearlier turn, `AuthoredThisTurn` is this turn's own lowering disagreeing\nwith the committed transcript. The two have different root causes and are\notherwise indistinguishable from the outside.",
+        "oneOf": [
+          {
+            "const": "authored_this_turn",
+            "description": "Freshly authored by the lowering that produced this turn's request.",
+            "type": "string"
+          },
+          {
+            "const": "persisted_evidence",
+            "description": "Persisted by an earlier turn and re-checked before the merge.",
+            "type": "string"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardReason": {
+        "description": "Why one provider-authored cache breakpoint was discarded instead of\nretained as durable session evidence.\n\nA cache breakpoint is an optimization artifact anchored to the exact\ntranscript head a provider lowered. Ordinary transcript motion - a\nsynthetic-notice refresh, a compaction, a re-materialized prefix - moves\nthat anchor without saying anything about the transcript's own integrity.\nEvery variant here therefore describes the ARTIFACT. Faults that describe\nthe committed TRANSCRIPT stay [`CacheBreakpointEvidenceError`].",
+        "oneOf": [
+          {
+            "description": "The anchored boundary is past the end of the committed transcript.",
+            "properties": {
+              "kind": {
+                "const": "boundary_outside_committed_transcript",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "message_len": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count",
+              "message_len"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The committed transcript prefix at the anchored boundary is no longer\nthe one the provider lowered.",
+            "properties": {
+              "kind": {
+                "const": "canonical_prefix_moved",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The proof itself is not usable evidence, independently of any\ntranscript: a malformed rendered identity, an incoherent\nprovider/encoding pairing, or an undecodable persisted row.",
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "evidence_unusable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Durable history retains superseded prompt versions, so the projected\nprovider boundary has no raw-to-projected map to rebind through.",
+            "properties": {
+              "kind": {
+                "const": "projected_boundary_unmappable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "CapabilityId": {
         "description": "Slug-validated capability identifier for skill requirements.\n\nReplaces the legacy `Vec<String>` capability lists with a typed\nnamespace. Parsed at construction, so callers cannot smuggle invalid\nidentifiers into descriptors or requirements.",
@@ -1812,6 +1975,55 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "DiscardedCacheBreakpoint": {
+        "additionalProperties": false,
+        "description": "One provider-authored cache proof that could not be retained.",
+        "properties": {
+          "identity": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DiscardedCacheBreakpointIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Absent only when the persisted evidence row itself could not be\ndecoded, so no individual proof identity exists to name."
+          },
+          "origin": {
+            "$ref": "#/$defs/CacheBreakpointDiscardOrigin"
+          },
+          "reason": {
+            "$ref": "#/$defs/CacheBreakpointDiscardReason"
+          }
+        },
+        "required": [
+          "origin",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "DiscardedCacheBreakpointIdentity": {
+        "additionalProperties": false,
+        "description": "Identity of a discarded proof, when the proof itself could be decoded.",
+        "properties": {
+          "boundary": {
+            "$ref": "#/$defs/CacheBreakpointBoundary"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "boundary"
+        ],
         "type": "object"
       },
       "EventSourceIdentity": {
@@ -19287,6 +19499,38 @@
             "type": "object"
           },
           {
+            "description": "Provider-authored cache breakpoints were discarded at a turn commit.\n\nA cache breakpoint is an optimization artifact anchored to one exact\ncommitted transcript prefix. Ordinary transcript motion unbinds it, and\ndropping it costs caching for the turn - never the turn itself. This\nevent is the host-observable record of that cost, so a degraded turn is\na routed fact rather than a log line: the same turn still completes.\n\n`origin` on each discard separates inherited poison (persisted by an\nearlier turn) from this turn's own lowering disagreeing with the\ncommitted transcript. Those have different root causes and are\nindistinguishable without it.",
+            "properties": {
+              "discarded": {
+                "description": "Non-empty whenever this event is emitted.",
+                "items": {
+                  "$ref": "#/$defs/DiscardedCacheBreakpoint"
+                },
+                "type": "array"
+              },
+              "retained": {
+                "description": "Proofs that still bind and remain durable evidence. A non-zero\nvalue means caching was weakened, not lost.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "provider_cache_breakpoints_discarded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "retained",
+              "discarded"
+            ],
+            "type": "object"
+          },
+          {
             "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
               "kind": {
@@ -19509,6 +19753,137 @@
           "tool_calls"
         ],
         "type": "string"
+      },
+      "CacheBreakpointBoundary": {
+        "description": "Stable provider-independent identity of an authored cache breakpoint.",
+        "oneOf": [
+          {
+            "description": "Stable leading system/profile prefix. `message_count` is the exclusive\ncanonical transcript boundary.",
+            "properties": {
+              "kind": {
+                "const": "system_profile_prefix",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Explicit breakpoint after one canonical transcript message.",
+            "properties": {
+              "kind": {
+                "const": "transcript_after",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardOrigin": {
+        "description": "Which side of a turn commit produced the discarded proof.\n\nLoad-bearing for hosts: `PersistedEvidence` is inherited poison from an\nearlier turn, `AuthoredThisTurn` is this turn's own lowering disagreeing\nwith the committed transcript. The two have different root causes and are\notherwise indistinguishable from the outside.",
+        "oneOf": [
+          {
+            "const": "authored_this_turn",
+            "description": "Freshly authored by the lowering that produced this turn's request.",
+            "type": "string"
+          },
+          {
+            "const": "persisted_evidence",
+            "description": "Persisted by an earlier turn and re-checked before the merge.",
+            "type": "string"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardReason": {
+        "description": "Why one provider-authored cache breakpoint was discarded instead of\nretained as durable session evidence.\n\nA cache breakpoint is an optimization artifact anchored to the exact\ntranscript head a provider lowered. Ordinary transcript motion - a\nsynthetic-notice refresh, a compaction, a re-materialized prefix - moves\nthat anchor without saying anything about the transcript's own integrity.\nEvery variant here therefore describes the ARTIFACT. Faults that describe\nthe committed TRANSCRIPT stay [`CacheBreakpointEvidenceError`].",
+        "oneOf": [
+          {
+            "description": "The anchored boundary is past the end of the committed transcript.",
+            "properties": {
+              "kind": {
+                "const": "boundary_outside_committed_transcript",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "message_len": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count",
+              "message_len"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The committed transcript prefix at the anchored boundary is no longer\nthe one the provider lowered.",
+            "properties": {
+              "kind": {
+                "const": "canonical_prefix_moved",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The proof itself is not usable evidence, independently of any\ntranscript: a malformed rendered identity, an incoherent\nprovider/encoding pairing, or an undecodable persisted row.",
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "evidence_unusable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Durable history retains superseded prompt versions, so the projected\nprovider boundary has no raw-to-projected map to rebind through.",
+            "properties": {
+              "kind": {
+                "const": "projected_boundary_unmappable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "CapabilityId": {
         "description": "Slug-validated capability identifier for skill requirements.\n\nReplaces the legacy `Vec<String>` capability lists with a typed\nnamespace. Parsed at construction, so callers cannot smuggle invalid\nidentifiers into descriptors or requirements.",
@@ -19876,6 +20251,55 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "DiscardedCacheBreakpoint": {
+        "additionalProperties": false,
+        "description": "One provider-authored cache proof that could not be retained.",
+        "properties": {
+          "identity": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DiscardedCacheBreakpointIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Absent only when the persisted evidence row itself could not be\ndecoded, so no individual proof identity exists to name."
+          },
+          "origin": {
+            "$ref": "#/$defs/CacheBreakpointDiscardOrigin"
+          },
+          "reason": {
+            "$ref": "#/$defs/CacheBreakpointDiscardReason"
+          }
+        },
+        "required": [
+          "origin",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "DiscardedCacheBreakpointIdentity": {
+        "additionalProperties": false,
+        "description": "Identity of a discarded proof, when the proof itself could be decoded.",
+        "properties": {
+          "boundary": {
+            "$ref": "#/$defs/CacheBreakpointBoundary"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "boundary"
+        ],
         "type": "object"
       },
       "EventEnvelope": {
@@ -27989,6 +28413,38 @@
             "type": "object"
           },
           {
+            "description": "Provider-authored cache breakpoints were discarded at a turn commit.\n\nA cache breakpoint is an optimization artifact anchored to one exact\ncommitted transcript prefix. Ordinary transcript motion unbinds it, and\ndropping it costs caching for the turn - never the turn itself. This\nevent is the host-observable record of that cost, so a degraded turn is\na routed fact rather than a log line: the same turn still completes.\n\n`origin` on each discard separates inherited poison (persisted by an\nearlier turn) from this turn's own lowering disagreeing with the\ncommitted transcript. Those have different root causes and are\nindistinguishable without it.",
+            "properties": {
+              "discarded": {
+                "description": "Non-empty whenever this event is emitted.",
+                "items": {
+                  "$ref": "#/$defs/DiscardedCacheBreakpoint"
+                },
+                "type": "array"
+              },
+              "retained": {
+                "description": "Proofs that still bind and remain durable evidence. A non-zero\nvalue means caching was weakened, not lost.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "provider_cache_breakpoints_discarded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "retained",
+              "discarded"
+            ],
+            "type": "object"
+          },
+          {
             "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
               "kind": {
@@ -29645,6 +30101,137 @@
         ],
         "type": "string"
       },
+      "CacheBreakpointBoundary": {
+        "description": "Stable provider-independent identity of an authored cache breakpoint.",
+        "oneOf": [
+          {
+            "description": "Stable leading system/profile prefix. `message_count` is the exclusive\ncanonical transcript boundary.",
+            "properties": {
+              "kind": {
+                "const": "system_profile_prefix",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Explicit breakpoint after one canonical transcript message.",
+            "properties": {
+              "kind": {
+                "const": "transcript_after",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardOrigin": {
+        "description": "Which side of a turn commit produced the discarded proof.\n\nLoad-bearing for hosts: `PersistedEvidence` is inherited poison from an\nearlier turn, `AuthoredThisTurn` is this turn's own lowering disagreeing\nwith the committed transcript. The two have different root causes and are\notherwise indistinguishable from the outside.",
+        "oneOf": [
+          {
+            "const": "authored_this_turn",
+            "description": "Freshly authored by the lowering that produced this turn's request.",
+            "type": "string"
+          },
+          {
+            "const": "persisted_evidence",
+            "description": "Persisted by an earlier turn and re-checked before the merge.",
+            "type": "string"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardReason": {
+        "description": "Why one provider-authored cache breakpoint was discarded instead of\nretained as durable session evidence.\n\nA cache breakpoint is an optimization artifact anchored to the exact\ntranscript head a provider lowered. Ordinary transcript motion - a\nsynthetic-notice refresh, a compaction, a re-materialized prefix - moves\nthat anchor without saying anything about the transcript's own integrity.\nEvery variant here therefore describes the ARTIFACT. Faults that describe\nthe committed TRANSCRIPT stay [`CacheBreakpointEvidenceError`].",
+        "oneOf": [
+          {
+            "description": "The anchored boundary is past the end of the committed transcript.",
+            "properties": {
+              "kind": {
+                "const": "boundary_outside_committed_transcript",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "message_len": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count",
+              "message_len"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The committed transcript prefix at the anchored boundary is no longer\nthe one the provider lowered.",
+            "properties": {
+              "kind": {
+                "const": "canonical_prefix_moved",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The proof itself is not usable evidence, independently of any\ntranscript: a malformed rendered identity, an incoherent\nprovider/encoding pairing, or an undecodable persisted row.",
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "evidence_unusable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Durable history retains superseded prompt versions, so the projected\nprovider boundary has no raw-to-projected map to rebind through.",
+            "properties": {
+              "kind": {
+                "const": "projected_boundary_unmappable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "CapabilityId": {
         "description": "Slug-validated capability identifier for skill requirements.\n\nReplaces the legacy `Vec<String>` capability lists with a typed\nnamespace. Parsed at construction, so callers cannot smuggle invalid\nidentifiers into descriptors or requirements.",
         "type": "string"
@@ -30026,6 +30613,55 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "DiscardedCacheBreakpoint": {
+        "additionalProperties": false,
+        "description": "One provider-authored cache proof that could not be retained.",
+        "properties": {
+          "identity": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DiscardedCacheBreakpointIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Absent only when the persisted evidence row itself could not be\ndecoded, so no individual proof identity exists to name."
+          },
+          "origin": {
+            "$ref": "#/$defs/CacheBreakpointDiscardOrigin"
+          },
+          "reason": {
+            "$ref": "#/$defs/CacheBreakpointDiscardReason"
+          }
+        },
+        "required": [
+          "origin",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "DiscardedCacheBreakpointIdentity": {
+        "additionalProperties": false,
+        "description": "Identity of a discarded proof, when the proof itself could be decoded.",
+        "properties": {
+          "boundary": {
+            "$ref": "#/$defs/CacheBreakpointBoundary"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "boundary"
+        ],
         "type": "object"
       },
       "EventEnvelope": {
@@ -38693,6 +39329,38 @@
             "type": "object"
           },
           {
+            "description": "Provider-authored cache breakpoints were discarded at a turn commit.\n\nA cache breakpoint is an optimization artifact anchored to one exact\ncommitted transcript prefix. Ordinary transcript motion unbinds it, and\ndropping it costs caching for the turn - never the turn itself. This\nevent is the host-observable record of that cost, so a degraded turn is\na routed fact rather than a log line: the same turn still completes.\n\n`origin` on each discard separates inherited poison (persisted by an\nearlier turn) from this turn's own lowering disagreeing with the\ncommitted transcript. Those have different root causes and are\nindistinguishable without it.",
+            "properties": {
+              "discarded": {
+                "description": "Non-empty whenever this event is emitted.",
+                "items": {
+                  "$ref": "#/$defs/DiscardedCacheBreakpoint"
+                },
+                "type": "array"
+              },
+              "retained": {
+                "description": "Proofs that still bind and remain durable evidence. A non-zero\nvalue means caching was weakened, not lost.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "provider_cache_breakpoints_discarded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "retained",
+              "discarded"
+            ],
+            "type": "object"
+          },
+          {
             "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
               "kind": {
@@ -42720,6 +43388,137 @@
         ],
         "type": "string"
       },
+      "CacheBreakpointBoundary": {
+        "description": "Stable provider-independent identity of an authored cache breakpoint.",
+        "oneOf": [
+          {
+            "description": "Stable leading system/profile prefix. `message_count` is the exclusive\ncanonical transcript boundary.",
+            "properties": {
+              "kind": {
+                "const": "system_profile_prefix",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Explicit breakpoint after one canonical transcript message.",
+            "properties": {
+              "kind": {
+                "const": "transcript_after",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardOrigin": {
+        "description": "Which side of a turn commit produced the discarded proof.\n\nLoad-bearing for hosts: `PersistedEvidence` is inherited poison from an\nearlier turn, `AuthoredThisTurn` is this turn's own lowering disagreeing\nwith the committed transcript. The two have different root causes and are\notherwise indistinguishable from the outside.",
+        "oneOf": [
+          {
+            "const": "authored_this_turn",
+            "description": "Freshly authored by the lowering that produced this turn's request.",
+            "type": "string"
+          },
+          {
+            "const": "persisted_evidence",
+            "description": "Persisted by an earlier turn and re-checked before the merge.",
+            "type": "string"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardReason": {
+        "description": "Why one provider-authored cache breakpoint was discarded instead of\nretained as durable session evidence.\n\nA cache breakpoint is an optimization artifact anchored to the exact\ntranscript head a provider lowered. Ordinary transcript motion - a\nsynthetic-notice refresh, a compaction, a re-materialized prefix - moves\nthat anchor without saying anything about the transcript's own integrity.\nEvery variant here therefore describes the ARTIFACT. Faults that describe\nthe committed TRANSCRIPT stay [`CacheBreakpointEvidenceError`].",
+        "oneOf": [
+          {
+            "description": "The anchored boundary is past the end of the committed transcript.",
+            "properties": {
+              "kind": {
+                "const": "boundary_outside_committed_transcript",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "message_len": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count",
+              "message_len"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The committed transcript prefix at the anchored boundary is no longer\nthe one the provider lowered.",
+            "properties": {
+              "kind": {
+                "const": "canonical_prefix_moved",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The proof itself is not usable evidence, independently of any\ntranscript: a malformed rendered identity, an incoherent\nprovider/encoding pairing, or an undecodable persisted row.",
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "evidence_unusable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Durable history retains superseded prompt versions, so the projected\nprovider boundary has no raw-to-projected map to rebind through.",
+            "properties": {
+              "kind": {
+                "const": "projected_boundary_unmappable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "CapabilityId": {
         "description": "Slug-validated capability identifier for skill requirements.\n\nReplaces the legacy `Vec<String>` capability lists with a typed\nnamespace. Parsed at construction, so callers cannot smuggle invalid\nidentifiers into descriptors or requirements.",
         "type": "string"
@@ -43269,6 +44068,55 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "DiscardedCacheBreakpoint": {
+        "additionalProperties": false,
+        "description": "One provider-authored cache proof that could not be retained.",
+        "properties": {
+          "identity": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DiscardedCacheBreakpointIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Absent only when the persisted evidence row itself could not be\ndecoded, so no individual proof identity exists to name."
+          },
+          "origin": {
+            "$ref": "#/$defs/CacheBreakpointDiscardOrigin"
+          },
+          "reason": {
+            "$ref": "#/$defs/CacheBreakpointDiscardReason"
+          }
+        },
+        "required": [
+          "origin",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "DiscardedCacheBreakpointIdentity": {
+        "additionalProperties": false,
+        "description": "Identity of a discarded proof, when the proof itself could be decoded.",
+        "properties": {
+          "boundary": {
+            "$ref": "#/$defs/CacheBreakpointBoundary"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "boundary"
+        ],
         "type": "object"
       },
       "Duration": {
@@ -55434,6 +56282,38 @@
             "type": "object"
           },
           {
+            "description": "Provider-authored cache breakpoints were discarded at a turn commit.\n\nA cache breakpoint is an optimization artifact anchored to one exact\ncommitted transcript prefix. Ordinary transcript motion unbinds it, and\ndropping it costs caching for the turn - never the turn itself. This\nevent is the host-observable record of that cost, so a degraded turn is\na routed fact rather than a log line: the same turn still completes.\n\n`origin` on each discard separates inherited poison (persisted by an\nearlier turn) from this turn's own lowering disagreeing with the\ncommitted transcript. Those have different root causes and are\nindistinguishable without it.",
+            "properties": {
+              "discarded": {
+                "description": "Non-empty whenever this event is emitted.",
+                "items": {
+                  "$ref": "#/$defs/DiscardedCacheBreakpoint"
+                },
+                "type": "array"
+              },
+              "retained": {
+                "description": "Proofs that still bind and remain durable evidence. A non-zero\nvalue means caching was weakened, not lost.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "provider_cache_breakpoints_discarded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "retained",
+              "discarded"
+            ],
+            "type": "object"
+          },
+          {
             "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
               "kind": {
@@ -57770,6 +58650,137 @@
         ],
         "type": "string"
       },
+      "CacheBreakpointBoundary": {
+        "description": "Stable provider-independent identity of an authored cache breakpoint.",
+        "oneOf": [
+          {
+            "description": "Stable leading system/profile prefix. `message_count` is the exclusive\ncanonical transcript boundary.",
+            "properties": {
+              "kind": {
+                "const": "system_profile_prefix",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Explicit breakpoint after one canonical transcript message.",
+            "properties": {
+              "kind": {
+                "const": "transcript_after",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardOrigin": {
+        "description": "Which side of a turn commit produced the discarded proof.\n\nLoad-bearing for hosts: `PersistedEvidence` is inherited poison from an\nearlier turn, `AuthoredThisTurn` is this turn's own lowering disagreeing\nwith the committed transcript. The two have different root causes and are\notherwise indistinguishable from the outside.",
+        "oneOf": [
+          {
+            "const": "authored_this_turn",
+            "description": "Freshly authored by the lowering that produced this turn's request.",
+            "type": "string"
+          },
+          {
+            "const": "persisted_evidence",
+            "description": "Persisted by an earlier turn and re-checked before the merge.",
+            "type": "string"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardReason": {
+        "description": "Why one provider-authored cache breakpoint was discarded instead of\nretained as durable session evidence.\n\nA cache breakpoint is an optimization artifact anchored to the exact\ntranscript head a provider lowered. Ordinary transcript motion - a\nsynthetic-notice refresh, a compaction, a re-materialized prefix - moves\nthat anchor without saying anything about the transcript's own integrity.\nEvery variant here therefore describes the ARTIFACT. Faults that describe\nthe committed TRANSCRIPT stay [`CacheBreakpointEvidenceError`].",
+        "oneOf": [
+          {
+            "description": "The anchored boundary is past the end of the committed transcript.",
+            "properties": {
+              "kind": {
+                "const": "boundary_outside_committed_transcript",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "message_len": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count",
+              "message_len"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The committed transcript prefix at the anchored boundary is no longer\nthe one the provider lowered.",
+            "properties": {
+              "kind": {
+                "const": "canonical_prefix_moved",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The proof itself is not usable evidence, independently of any\ntranscript: a malformed rendered identity, an incoherent\nprovider/encoding pairing, or an undecodable persisted row.",
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "evidence_unusable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Durable history retains superseded prompt versions, so the projected\nprovider boundary has no raw-to-projected map to rebind through.",
+            "properties": {
+              "kind": {
+                "const": "projected_boundary_unmappable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "CapabilityId": {
         "description": "Slug-validated capability identifier for skill requirements.\n\nReplaces the legacy `Vec<String>` capability lists with a typed\nnamespace. Parsed at construction, so callers cannot smuggle invalid\nidentifiers into descriptors or requirements.",
         "type": "string"
@@ -58179,6 +59190,55 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "DiscardedCacheBreakpoint": {
+        "additionalProperties": false,
+        "description": "One provider-authored cache proof that could not be retained.",
+        "properties": {
+          "identity": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DiscardedCacheBreakpointIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Absent only when the persisted evidence row itself could not be\ndecoded, so no individual proof identity exists to name."
+          },
+          "origin": {
+            "$ref": "#/$defs/CacheBreakpointDiscardOrigin"
+          },
+          "reason": {
+            "$ref": "#/$defs/CacheBreakpointDiscardReason"
+          }
+        },
+        "required": [
+          "origin",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "DiscardedCacheBreakpointIdentity": {
+        "additionalProperties": false,
+        "description": "Identity of a discarded proof, when the proof itself could be decoded.",
+        "properties": {
+          "boundary": {
+            "$ref": "#/$defs/CacheBreakpointBoundary"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "boundary"
+        ],
         "type": "object"
       },
       "EventEnvelope": {
@@ -64862,6 +65922,38 @@
             "type": "object"
           },
           {
+            "description": "Provider-authored cache breakpoints were discarded at a turn commit.\n\nA cache breakpoint is an optimization artifact anchored to one exact\ncommitted transcript prefix. Ordinary transcript motion unbinds it, and\ndropping it costs caching for the turn - never the turn itself. This\nevent is the host-observable record of that cost, so a degraded turn is\na routed fact rather than a log line: the same turn still completes.\n\n`origin` on each discard separates inherited poison (persisted by an\nearlier turn) from this turn's own lowering disagreeing with the\ncommitted transcript. Those have different root causes and are\nindistinguishable without it.",
+            "properties": {
+              "discarded": {
+                "description": "Non-empty whenever this event is emitted.",
+                "items": {
+                  "$ref": "#/$defs/DiscardedCacheBreakpoint"
+                },
+                "type": "array"
+              },
+              "retained": {
+                "description": "Proofs that still bind and remain durable evidence. A non-zero\nvalue means caching was weakened, not lost.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "provider_cache_breakpoints_discarded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "retained",
+              "discarded"
+            ],
+            "type": "object"
+          },
+          {
             "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
               "kind": {
@@ -64992,6 +66084,137 @@
           "tool_calls"
         ],
         "type": "string"
+      },
+      "CacheBreakpointBoundary": {
+        "description": "Stable provider-independent identity of an authored cache breakpoint.",
+        "oneOf": [
+          {
+            "description": "Stable leading system/profile prefix. `message_count` is the exclusive\ncanonical transcript boundary.",
+            "properties": {
+              "kind": {
+                "const": "system_profile_prefix",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Explicit breakpoint after one canonical transcript message.",
+            "properties": {
+              "kind": {
+                "const": "transcript_after",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardOrigin": {
+        "description": "Which side of a turn commit produced the discarded proof.\n\nLoad-bearing for hosts: `PersistedEvidence` is inherited poison from an\nearlier turn, `AuthoredThisTurn` is this turn's own lowering disagreeing\nwith the committed transcript. The two have different root causes and are\notherwise indistinguishable from the outside.",
+        "oneOf": [
+          {
+            "const": "authored_this_turn",
+            "description": "Freshly authored by the lowering that produced this turn's request.",
+            "type": "string"
+          },
+          {
+            "const": "persisted_evidence",
+            "description": "Persisted by an earlier turn and re-checked before the merge.",
+            "type": "string"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardReason": {
+        "description": "Why one provider-authored cache breakpoint was discarded instead of\nretained as durable session evidence.\n\nA cache breakpoint is an optimization artifact anchored to the exact\ntranscript head a provider lowered. Ordinary transcript motion - a\nsynthetic-notice refresh, a compaction, a re-materialized prefix - moves\nthat anchor without saying anything about the transcript's own integrity.\nEvery variant here therefore describes the ARTIFACT. Faults that describe\nthe committed TRANSCRIPT stay [`CacheBreakpointEvidenceError`].",
+        "oneOf": [
+          {
+            "description": "The anchored boundary is past the end of the committed transcript.",
+            "properties": {
+              "kind": {
+                "const": "boundary_outside_committed_transcript",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "message_len": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count",
+              "message_len"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The committed transcript prefix at the anchored boundary is no longer\nthe one the provider lowered.",
+            "properties": {
+              "kind": {
+                "const": "canonical_prefix_moved",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The proof itself is not usable evidence, independently of any\ntranscript: a malformed rendered identity, an incoherent\nprovider/encoding pairing, or an undecodable persisted row.",
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "evidence_unusable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Durable history retains superseded prompt versions, so the projected\nprovider boundary has no raw-to-projected map to rebind through.",
+            "properties": {
+              "kind": {
+                "const": "projected_boundary_unmappable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "CapabilityId": {
         "description": "Slug-validated capability identifier for skill requirements.\n\nReplaces the legacy `Vec<String>` capability lists with a typed\nnamespace. Parsed at construction, so callers cannot smuggle invalid\nidentifiers into descriptors or requirements.",
@@ -65385,6 +66608,55 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "DiscardedCacheBreakpoint": {
+        "additionalProperties": false,
+        "description": "One provider-authored cache proof that could not be retained.",
+        "properties": {
+          "identity": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DiscardedCacheBreakpointIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Absent only when the persisted evidence row itself could not be\ndecoded, so no individual proof identity exists to name."
+          },
+          "origin": {
+            "$ref": "#/$defs/CacheBreakpointDiscardOrigin"
+          },
+          "reason": {
+            "$ref": "#/$defs/CacheBreakpointDiscardReason"
+          }
+        },
+        "required": [
+          "origin",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "DiscardedCacheBreakpointIdentity": {
+        "additionalProperties": false,
+        "description": "Identity of a discarded proof, when the proof itself could be decoded.",
+        "properties": {
+          "boundary": {
+            "$ref": "#/$defs/CacheBreakpointBoundary"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "boundary"
+        ],
         "type": "object"
       },
       "EventReplayCursor": {
@@ -111101,6 +112373,38 @@
             "type": "object"
           },
           {
+            "description": "Provider-authored cache breakpoints were discarded at a turn commit.\n\nA cache breakpoint is an optimization artifact anchored to one exact\ncommitted transcript prefix. Ordinary transcript motion unbinds it, and\ndropping it costs caching for the turn - never the turn itself. This\nevent is the host-observable record of that cost, so a degraded turn is\na routed fact rather than a log line: the same turn still completes.\n\n`origin` on each discard separates inherited poison (persisted by an\nearlier turn) from this turn's own lowering disagreeing with the\ncommitted transcript. Those have different root causes and are\nindistinguishable without it.",
+            "properties": {
+              "discarded": {
+                "description": "Non-empty whenever this event is emitted.",
+                "items": {
+                  "$ref": "#/$defs/DiscardedCacheBreakpoint"
+                },
+                "type": "array"
+              },
+              "retained": {
+                "description": "Proofs that still bind and remain durable evidence. A non-zero\nvalue means caching was weakened, not lost.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "provider_cache_breakpoints_discarded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "retained",
+              "discarded"
+            ],
+            "type": "object"
+          },
+          {
             "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
               "kind": {
@@ -111231,6 +112535,137 @@
           "tool_calls"
         ],
         "type": "string"
+      },
+      "CacheBreakpointBoundary": {
+        "description": "Stable provider-independent identity of an authored cache breakpoint.",
+        "oneOf": [
+          {
+            "description": "Stable leading system/profile prefix. `message_count` is the exclusive\ncanonical transcript boundary.",
+            "properties": {
+              "kind": {
+                "const": "system_profile_prefix",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Explicit breakpoint after one canonical transcript message.",
+            "properties": {
+              "kind": {
+                "const": "transcript_after",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardOrigin": {
+        "description": "Which side of a turn commit produced the discarded proof.\n\nLoad-bearing for hosts: `PersistedEvidence` is inherited poison from an\nearlier turn, `AuthoredThisTurn` is this turn's own lowering disagreeing\nwith the committed transcript. The two have different root causes and are\notherwise indistinguishable from the outside.",
+        "oneOf": [
+          {
+            "const": "authored_this_turn",
+            "description": "Freshly authored by the lowering that produced this turn's request.",
+            "type": "string"
+          },
+          {
+            "const": "persisted_evidence",
+            "description": "Persisted by an earlier turn and re-checked before the merge.",
+            "type": "string"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardReason": {
+        "description": "Why one provider-authored cache breakpoint was discarded instead of\nretained as durable session evidence.\n\nA cache breakpoint is an optimization artifact anchored to the exact\ntranscript head a provider lowered. Ordinary transcript motion - a\nsynthetic-notice refresh, a compaction, a re-materialized prefix - moves\nthat anchor without saying anything about the transcript's own integrity.\nEvery variant here therefore describes the ARTIFACT. Faults that describe\nthe committed TRANSCRIPT stay [`CacheBreakpointEvidenceError`].",
+        "oneOf": [
+          {
+            "description": "The anchored boundary is past the end of the committed transcript.",
+            "properties": {
+              "kind": {
+                "const": "boundary_outside_committed_transcript",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "message_len": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count",
+              "message_len"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The committed transcript prefix at the anchored boundary is no longer\nthe one the provider lowered.",
+            "properties": {
+              "kind": {
+                "const": "canonical_prefix_moved",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The proof itself is not usable evidence, independently of any\ntranscript: a malformed rendered identity, an incoherent\nprovider/encoding pairing, or an undecodable persisted row.",
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "evidence_unusable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Durable history retains superseded prompt versions, so the projected\nprovider boundary has no raw-to-projected map to rebind through.",
+            "properties": {
+              "kind": {
+                "const": "projected_boundary_unmappable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "CapabilityId": {
         "description": "Slug-validated capability identifier for skill requirements.\n\nReplaces the legacy `Vec<String>` capability lists with a typed\nnamespace. Parsed at construction, so callers cannot smuggle invalid\nidentifiers into descriptors or requirements.",
@@ -111598,6 +113033,55 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "DiscardedCacheBreakpoint": {
+        "additionalProperties": false,
+        "description": "One provider-authored cache proof that could not be retained.",
+        "properties": {
+          "identity": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DiscardedCacheBreakpointIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Absent only when the persisted evidence row itself could not be\ndecoded, so no individual proof identity exists to name."
+          },
+          "origin": {
+            "$ref": "#/$defs/CacheBreakpointDiscardOrigin"
+          },
+          "reason": {
+            "$ref": "#/$defs/CacheBreakpointDiscardReason"
+          }
+        },
+        "required": [
+          "origin",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "DiscardedCacheBreakpointIdentity": {
+        "additionalProperties": false,
+        "description": "Identity of a discarded proof, when the proof itself could be decoded.",
+        "properties": {
+          "boundary": {
+            "$ref": "#/$defs/CacheBreakpointBoundary"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "boundary"
+        ],
         "type": "object"
       },
       "EventEnvelope": {

@@ -3987,28 +3987,63 @@ impl Session {
             // an authored index cannot be rebound to this durable history.
             return Ok(Vec::new());
         }
+        let evidence = self.persisted_authored_cache_breakpoints()?;
+        for breakpoint in &evidence {
+            self.bind_authored_cache_breakpoint(breakpoint)?;
+        }
+        Ok(evidence)
+    }
+
+    /// Count durable proofs that still bind, without touching durable
+    /// evidence.
+    ///
+    /// Observation only, for the one boundary that reports a discard without
+    /// having authored anything: every claim this turn produced was rejected
+    /// as unusable before it reached [`Session::retain_authored_cache_breakpoints`],
+    /// so that seam's early return reports `0` retained by construction. A row
+    /// that cannot be decoded, or a proof that no longer binds, contributes
+    /// nothing here - the same reading the retention seam would take.
+    pub(crate) fn bound_authored_cache_breakpoint_count(&self) -> usize {
+        self.persisted_authored_cache_breakpoints()
+            .map(|evidence| {
+                evidence
+                    .iter()
+                    .filter(|breakpoint| self.bind_authored_cache_breakpoint(breakpoint).is_ok())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Decode the persisted evidence row without binding it to a transcript.
+    fn persisted_authored_cache_breakpoints(
+        &self,
+    ) -> Result<Vec<crate::AuthoredCacheBreakpoint>, crate::CacheBreakpointEvidenceError> {
         let Some(value) = self.metadata.get(SESSION_AUTHORED_CACHE_BREAKPOINTS_KEY) else {
             return Ok(Vec::new());
         };
-        let evidence: Vec<crate::AuthoredCacheBreakpoint> = serde_json::from_value(value.clone())
-            .map_err(|error| {
+        serde_json::from_value(value.clone()).map_err(|error| {
             crate::CacheBreakpointEvidenceError::PersistedEvidenceMalformed {
                 detail: error.to_string(),
             }
-        })?;
-        for breakpoint in &evidence {
-            breakpoint.validate_rendered_identity()?;
-            let (digest, bytes) = crate::canonical_cache_prefix_identity(
-                self.messages(),
-                breakpoint.boundary().message_count(),
-            )?;
-            if breakpoint.canonical_prefix_sha256() != digest
-                || breakpoint.canonical_prefix_bytes() != bytes
-            {
-                return Err(crate::CacheBreakpointEvidenceError::CanonicalPrefixMismatch);
-            }
+        })
+    }
+
+    /// Bind one proof to this session's current canonical transcript.
+    fn bind_authored_cache_breakpoint(
+        &self,
+        breakpoint: &crate::AuthoredCacheBreakpoint,
+    ) -> Result<(), crate::CacheBreakpointEvidenceError> {
+        breakpoint.validate_rendered_identity()?;
+        let (digest, bytes) = crate::canonical_cache_prefix_identity(
+            self.messages(),
+            breakpoint.boundary().message_count(),
+        )?;
+        if breakpoint.canonical_prefix_sha256() != digest
+            || breakpoint.canonical_prefix_bytes() != bytes
+        {
+            return Err(crate::CacheBreakpointEvidenceError::CanonicalPrefixMismatch);
         }
-        Ok(evidence)
+        Ok(())
     }
 
     /// Revalidate persisted source evidence and convert it into one-shot fork
@@ -4047,19 +4082,145 @@ impl Session {
             return Ok(());
         }
         for breakpoint in authored {
-            breakpoint.validate_rendered_identity()?;
-            let (digest, bytes) = crate::canonical_cache_prefix_identity(
-                self.messages(),
-                breakpoint.boundary().message_count(),
-            )?;
-            if breakpoint.canonical_prefix_sha256() != digest
-                || breakpoint.canonical_prefix_bytes() != bytes
+            self.bind_authored_cache_breakpoint(breakpoint)?;
+        }
+
+        let retained = self.authored_cache_breakpoints()?;
+        self.store_merged_authored_cache_breakpoints(retained, authored)?;
+        Ok(())
+    }
+
+    /// Merge this turn's provider-authored proofs into durable evidence,
+    /// discarding whatever no longer binds instead of refusing the turn.
+    ///
+    /// A cache breakpoint is an optimization artifact anchored to one exact
+    /// transcript head. Ordinary transcript motion - a synthetic-notice
+    /// refresh, a compaction, a re-materialized prefix - legitimately moves
+    /// that anchor, and a moved anchor must cost caching, never a completed
+    /// provider turn. Only a fault in the committed transcript itself (it
+    /// cannot be canonically encoded) or a failure of our own durable write
+    /// still surfaces as a typed error.
+    ///
+    /// Proofs that still bind are retained, so the normal cached path is
+    /// unaffected.
+    pub(crate) fn retain_authored_cache_breakpoints(
+        &mut self,
+        authored: &[crate::AuthoredCacheBreakpoint],
+    ) -> Result<crate::AuthoredCacheBreakpointRetention, crate::CacheBreakpointEvidenceError> {
+        use crate::provider_evidence::{
+            CacheBreakpointDiscardOrigin, CacheBreakpointDiscardReason, DiscardedCacheBreakpoint,
+            classify_cache_breakpoint_binding_failure,
+        };
+
+        let mut retention = crate::AuthoredCacheBreakpointRetention::default();
+        if !crate::types::superseded_system_prompt_offsets(self.messages()).is_empty() {
+            if self
+                .metadata
+                .contains_key(SESSION_AUTHORED_CACHE_BREAKPOINTS_KEY)
             {
-                return Err(crate::CacheBreakpointEvidenceError::CanonicalPrefixMismatch);
+                retention.push_discard(DiscardedCacheBreakpoint::persisted_row(
+                    CacheBreakpointDiscardReason::ProjectedBoundaryUnmappable,
+                ));
+            }
+            for breakpoint in authored {
+                retention.push_discard(DiscardedCacheBreakpoint::proof(
+                    CacheBreakpointDiscardOrigin::AuthoredThisTurn,
+                    breakpoint,
+                    CacheBreakpointDiscardReason::ProjectedBoundaryUnmappable,
+                ));
+            }
+            self.invalidate_authored_cache_breakpoints();
+            return Ok(retention);
+        }
+        if authored.is_empty() {
+            // Deliberate: a turn that authored nothing does not touch durable
+            // evidence at all. Do NOT "fix" this into an unconditional prune.
+            //
+            // Pruning here would re-hash canonical prefixes on every turn of
+            // every session that ever cached, including turns with caching
+            // switched off - the exact O(prefix)-per-turn cost this seam was
+            // built to avoid. It buys nothing for the failure this guards:
+            // stale evidence can no longer fail a turn from here, and the next
+            // turn that authors anything re-checks the persisted set and drops
+            // whatever stopped binding.
+            //
+            // Known consequence, accepted: `authored_cache_breakpoints` stays
+            // strict, so a fork attempted while a stale row is still parked in
+            // metadata hard-fails until that next authoring turn. That fails a
+            // fork, not a turn, and the fork proof path is required to be
+            // fail-closed.
+            return Ok(retention);
+        }
+
+        // Persisted proofs are re-checked FIRST and independently. A proof
+        // anchored to an earlier head must never be able to refuse this
+        // turn's own authoring.
+        let mut retained = match self.persisted_authored_cache_breakpoints() {
+            Ok(evidence) => {
+                let mut bound = Vec::with_capacity(evidence.len());
+                for breakpoint in evidence {
+                    match self.bind_authored_cache_breakpoint(&breakpoint) {
+                        Ok(()) => bound.push(breakpoint),
+                        Err(error) => {
+                            let reason = classify_cache_breakpoint_binding_failure(error)?;
+                            retention.push_discard(DiscardedCacheBreakpoint::proof(
+                                CacheBreakpointDiscardOrigin::PersistedEvidence,
+                                &breakpoint,
+                                reason,
+                            ));
+                        }
+                    }
+                }
+                bound
+            }
+            Err(error) => {
+                // An undecodable row is a corrupt artifact, not a corrupt
+                // transcript: drop the whole row rather than the turn.
+                retention.push_discard(DiscardedCacheBreakpoint::persisted_row(
+                    CacheBreakpointDiscardReason::EvidenceUnusable {
+                        detail: error.to_string(),
+                    },
+                ));
+                Vec::new()
+            }
+        };
+
+        let mut accepted = Vec::with_capacity(authored.len());
+        for breakpoint in authored {
+            match self.bind_authored_cache_breakpoint(breakpoint) {
+                Ok(()) => accepted.push(breakpoint.clone()),
+                Err(error) => {
+                    let reason = classify_cache_breakpoint_binding_failure(error)?;
+                    retention.push_discard(DiscardedCacheBreakpoint::proof(
+                        CacheBreakpointDiscardOrigin::AuthoredThisTurn,
+                        breakpoint,
+                        reason,
+                    ));
+                }
             }
         }
 
-        let mut retained = self.authored_cache_breakpoints()?;
+        // No `accepted.is_empty() && !retention.is_degraded()` arm: past the
+        // early return `authored` is non-empty, and every element either lands
+        // in `accepted` or pushes a discard, so an empty `accepted` always
+        // implies a degraded retention. Such an arm would read as policy while
+        // being unreachable.
+        if accepted.is_empty() && retained.is_empty() {
+            self.invalidate_authored_cache_breakpoints();
+            return Ok(retention);
+        }
+
+        retained = self.store_merged_authored_cache_breakpoints(retained, &accepted)?;
+        retention.set_retained(retained.len());
+        Ok(retention)
+    }
+
+    /// Replace same-identity proofs, cap the durable set, and persist it.
+    fn store_merged_authored_cache_breakpoints(
+        &mut self,
+        mut retained: Vec<crate::AuthoredCacheBreakpoint>,
+        authored: &[crate::AuthoredCacheBreakpoint],
+    ) -> Result<Vec<crate::AuthoredCacheBreakpoint>, crate::CacheBreakpointEvidenceError> {
         for replacement in authored {
             retained.retain(|existing| {
                 existing.provider() != replacement.provider()
@@ -4073,13 +4234,13 @@ impl Session {
             let remove = retained.len() - MAX_DURABLE_CACHE_BREAKPOINTS;
             retained.drain(..remove);
         }
-        let value = serde_json::to_value(retained).map_err(|error| {
+        let value = serde_json::to_value(&retained).map_err(|error| {
             crate::CacheBreakpointEvidenceError::PersistedEvidenceMalformed {
                 detail: error.to_string(),
             }
         })?;
         self.set_metadata_unchecked(SESSION_AUTHORED_CACHE_BREAKPOINTS_KEY, value);
-        Ok(())
+        Ok(retained)
     }
 
     /// Consume verifier-issued authority to install cache evidence on a fork
@@ -13912,5 +14073,251 @@ mod tests {
         assert!(view.session_metadata.is_none());
         assert!(view.lifecycle_terminal.is_none());
         assert!(view.mob_member_binding().is_none());
+    }
+
+    // ========================================================================
+    // Provider cache-breakpoint retention.
+    //
+    // Ruling under test: a provider-authored cache breakpoint is an
+    // optimization artifact. When it stops binding to the committed
+    // transcript it costs CACHING, never the turn. The fork proof path stays
+    // fail-closed, and a fault in the transcript itself stays terminal.
+    // ========================================================================
+
+    fn anthropic_test_breakpoint(
+        messages: &[Message],
+        message_count: u64,
+    ) -> crate::AuthoredCacheBreakpoint {
+        let claim =
+            crate::provider_cache_breakpoint_claim(crate::ProviderCacheBreakpointClaimRequest {
+                provider: crate::Provider::Anthropic,
+                model: "claude-opus-5",
+                messages,
+                boundary: crate::CacheBreakpointBoundary::TranscriptAfter { message_count },
+                ttl: crate::ProviderCacheTtl::ProviderDefault,
+                rendered_prefix: br#"{"renderer_mode":"session-test"}"#,
+                lowered_request_encoding: crate::LoweredRequestEncoding::AnthropicMessagesJson,
+                lowered_request_body: br#"{"model":"claude-opus-5"}"#,
+            })
+            .expect("test claim shape");
+        crate::AuthoredCacheBreakpoint::from_provider_claim(claim)
+    }
+
+    fn session_with_one_message() -> Session {
+        let mut session = Session::new();
+        session.push(Message::User(UserMessage::text("hello".to_string())));
+        session
+    }
+
+    /// A proof that still binds must be kept and must stay usable. Without
+    /// this, "never fails a turn" would be satisfied by disabling caching.
+    #[test]
+    fn binding_cache_breakpoint_is_retained_and_stays_usable() {
+        let mut session = session_with_one_message();
+        let breakpoint = anthropic_test_breakpoint(session.messages(), 1);
+
+        let retention = session
+            .retain_authored_cache_breakpoints(std::slice::from_ref(&breakpoint))
+            .expect("a binding proof must not error");
+
+        assert!(
+            !retention.is_degraded(),
+            "a binding proof must not be discarded: {:?}",
+            retention.discarded()
+        );
+        assert_eq!(retention.retained(), 1);
+        // The strict read is the fork proof path: retained evidence is real,
+        // revalidated evidence, not just a row left in metadata.
+        assert_eq!(
+            session
+                .authored_cache_breakpoints()
+                .expect("retained evidence must survive the strict read")
+                .len(),
+            1
+        );
+    }
+
+    /// Root-cause shape A: the lowering anchored past the end of what the
+    /// session actually committed (request-local injected context).
+    #[test]
+    fn anchor_outside_the_committed_transcript_is_discarded_not_fatal() {
+        let mut session = session_with_one_message();
+        let lowered = vec![
+            Message::User(UserMessage::text("hello".to_string())),
+            Message::User(UserMessage::text("request-local context".to_string())),
+        ];
+        let breakpoint = anthropic_test_breakpoint(&lowered, 2);
+
+        let retention = session
+            .retain_authored_cache_breakpoints(std::slice::from_ref(&breakpoint))
+            .expect("an out-of-range anchor must cost caching, not the turn");
+
+        assert_eq!(retention.retained(), 0);
+        let [discard] = retention.discarded() else {
+            panic!(
+                "expected exactly one discard, got {:?}",
+                retention.discarded()
+            );
+        };
+        assert_eq!(
+            discard.origin(),
+            crate::CacheBreakpointDiscardOrigin::AuthoredThisTurn
+        );
+        assert!(
+            matches!(
+                discard.reason(),
+                crate::CacheBreakpointDiscardReason::BoundaryOutsideCommittedTranscript {
+                    message_count: 2,
+                    message_len: 1,
+                }
+            ),
+            "unexpected reason: {:?}",
+            discard.reason()
+        );
+    }
+
+    /// Root-cause shape B: the boundary is in range but the committed prefix
+    /// beneath it is no longer the prefix the provider lowered.
+    #[test]
+    fn moved_prefix_is_discarded_not_fatal() {
+        let mut session = session_with_one_message();
+        let moved = vec![Message::User(UserMessage::text(
+            "a different prefix".to_string(),
+        ))];
+        let breakpoint = anthropic_test_breakpoint(&moved, 1);
+
+        let retention = session
+            .retain_authored_cache_breakpoints(std::slice::from_ref(&breakpoint))
+            .expect("a moved prefix must cost caching, not the turn");
+
+        assert_eq!(retention.retained(), 0);
+        let [discard] = retention.discarded() else {
+            panic!(
+                "expected exactly one discard, got {:?}",
+                retention.discarded()
+            );
+        };
+        assert!(matches!(
+            discard.reason(),
+            crate::CacheBreakpointDiscardReason::CanonicalPrefixMoved
+        ));
+        let identity = discard.identity().expect("a decoded proof has an identity");
+        assert_eq!(identity.model, "claude-opus-5");
+        assert_eq!(identity.provider, crate::Provider::Anthropic);
+    }
+
+    /// The field wedge: evidence persisted by an earlier turn stops binding,
+    /// and every later turn dies on it because the strict re-read runs
+    /// UPSTREAM of the only write that could clear it. The turn must survive,
+    /// and the wedge must clear itself.
+    #[test]
+    fn stale_persisted_proof_is_pruned_and_cannot_wedge_later_turns() {
+        let mut session = session_with_one_message();
+        let stale = anthropic_test_breakpoint(
+            &[Message::User(UserMessage::text("older prefix".to_string()))],
+            1,
+        );
+        session.set_metadata_unchecked_for_test(
+            SESSION_AUTHORED_CACHE_BREAKPOINTS_KEY,
+            serde_json::to_value(vec![stale]).expect("stale row serializes"),
+        );
+
+        // Pre-condition: this is exactly the poisoned state the field hit.
+        assert!(
+            session.authored_cache_breakpoints().is_err(),
+            "test setup must reproduce the poisoned strict read"
+        );
+
+        let fresh = anthropic_test_breakpoint(session.messages(), 1);
+        let retention = session
+            .retain_authored_cache_breakpoints(std::slice::from_ref(&fresh))
+            .expect("inherited poison must not fail a completed turn");
+
+        assert_eq!(
+            retention.retained(),
+            1,
+            "this turn's own binding proof must survive the stale row"
+        );
+        let [discard] = retention.discarded() else {
+            panic!(
+                "expected exactly one discard, got {:?}",
+                retention.discarded()
+            );
+        };
+        assert_eq!(
+            discard.origin(),
+            crate::CacheBreakpointDiscardOrigin::PersistedEvidence,
+            "origin must name this as inherited, not a this-turn disagreement"
+        );
+
+        // The wedge is gone: the next turn starts from healthy evidence.
+        assert_eq!(
+            session
+                .authored_cache_breakpoints()
+                .expect("the stale row must be pruned, clearing the wedge")
+                .len(),
+            1
+        );
+    }
+
+    /// Only the turn-commit door was loosened. The fork proof path still
+    /// refuses to infer cache inheritance from evidence that stopped binding.
+    #[test]
+    fn fork_read_still_fails_closed_on_a_moved_prefix() {
+        let mut session = session_with_one_message();
+        let stale = anthropic_test_breakpoint(
+            &[Message::User(UserMessage::text("older prefix".to_string()))],
+            1,
+        );
+        session.set_metadata_unchecked_for_test(
+            SESSION_AUTHORED_CACHE_BREAKPOINTS_KEY,
+            serde_json::to_value(vec![stale]).expect("stale row serializes"),
+        );
+
+        assert!(matches!(
+            session.authored_cache_breakpoints(),
+            Err(crate::CacheBreakpointEvidenceError::CanonicalPrefixMismatch)
+        ));
+        assert!(
+            session.validated_source_cache_breakpoints().is_err(),
+            "fork proof capabilities must not be minted from stale evidence"
+        );
+    }
+
+    /// The discriminator itself: which faults describe the ARTIFACT (drop)
+    /// and which describe the TRANSCRIPT being bound against (stay terminal).
+    #[test]
+    fn transcript_faults_stay_terminal_while_artifact_faults_drop() {
+        use crate::provider_evidence::CacheBreakpointEvidenceError as Error;
+        use crate::provider_evidence::classify_cache_breakpoint_binding_failure as classify;
+
+        assert!(classify(Error::CanonicalPrefixMismatch).is_ok());
+        assert!(
+            classify(Error::BoundaryOutOfRange {
+                message_count: 9,
+                message_len: 2,
+            })
+            .is_ok()
+        );
+        assert!(classify(Error::RenderedPrefixMalformed).is_ok());
+        assert!(classify(Error::ProviderEncodingMismatch).is_ok());
+
+        // `CanonicalEncodingFailed` is the ONLY fault that describes the
+        // transcript we are binding against: it would fail identically for
+        // every boundary, and for a transcript carrying no evidence at all.
+        // Dropping it would hide a corrupt transcript behind a cache warning.
+        assert!(
+            classify(Error::CanonicalEncodingFailed {
+                detail: "boom".to_string(),
+            })
+            .is_err()
+        );
+        // Our own durable write failing is not a stale artifact either.
+        assert!(
+            classify(Error::PersistedEvidenceMalformed {
+                detail: "boom".to_string(),
+            })
+            .is_err()
+        );
     }
 }

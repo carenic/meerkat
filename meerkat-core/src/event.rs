@@ -1026,6 +1026,9 @@ pub fn agent_event_type(event: &AgentEvent) -> &'static str {
             TRANSCRIPT_REWRITE_AUDIT_RECEIPT_COMMITTED_EVENT_TYPE
         }
         AgentEvent::PeerContentIngested { .. } => "peer_content_ingested",
+        AgentEvent::ProviderCacheBreakpointsDiscarded { .. } => {
+            "provider_cache_breakpoints_discarded"
+        }
     }
 }
 
@@ -2094,6 +2097,27 @@ pub enum AgentEvent {
         final_assistant_text: Option<String>,
     },
 
+    /// Provider-authored cache breakpoints were discarded at a turn commit.
+    ///
+    /// A cache breakpoint is an optimization artifact anchored to one exact
+    /// committed transcript prefix. Ordinary transcript motion unbinds it, and
+    /// dropping it costs caching for the turn - never the turn itself. This
+    /// event is the host-observable record of that cost, so a degraded turn is
+    /// a routed fact rather than a log line: the same turn still completes.
+    ///
+    /// `origin` on each discard separates inherited poison (persisted by an
+    /// earlier turn) from this turn's own lowering disagreeing with the
+    /// committed transcript. Those have different root causes and are
+    /// indistinguishable without it.
+    ProviderCacheBreakpointsDiscarded {
+        session_id: SessionId,
+        /// Proofs that still bind and remain durable evidence. A non-zero
+        /// value means caching was weakened, not lost.
+        retained: usize,
+        /// Non-empty whenever this event is emitted.
+        discarded: Vec<crate::provider_evidence::DiscardedCacheBreakpoint>,
+    },
+
     /// Inbound peer content was committed into this session's context.
     ///
     /// Emitted as a pure projection of the typed transcript carrier
@@ -2372,6 +2396,14 @@ pub fn format_verbose_event_with_config(
         } => Some(format!(
             "  ⧖ Callback pending: {tool_name} {}",
             truncate_preview(&args.to_string(), config.max_tool_args_bytes)
+        )),
+        AgentEvent::ProviderCacheBreakpointsDiscarded {
+            retained,
+            discarded,
+            ..
+        } => Some(format!(
+            "  ⚠ Cache breakpoints discarded (continuing): {} dropped, {retained} still binding",
+            discarded.len()
         )),
         _ => None,
     }

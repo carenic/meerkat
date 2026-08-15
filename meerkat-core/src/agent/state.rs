@@ -99,35 +99,46 @@ enum LlmRetryOutcome {
     RepollAfterCompaction,
 }
 
+/// Promote this turn's provider claims into authored evidence, discarding any
+/// claim whose reported identity does not match the active lowering.
+///
+/// A claim is provider-reported metadata ABOUT the request, never the
+/// request's content. An adapter that reports a claim for a different
+/// provider/model has produced untrustworthy evidence, so the artifact is
+/// dropped - the turn's actual content is unaffected and must still commit.
+/// This is the commit-time binding rule applied one door earlier: a mismatch
+/// here can only mean a lying or confused adapter, and no shape of it implies
+/// the committed transcript is corrupt.
 fn promote_cache_breakpoint_claims(
     claims: &[crate::ProviderCacheBreakpointClaim],
     active_provider: crate::Provider,
     active_model: &str,
-) -> Result<Vec<crate::AuthoredCacheBreakpoint>, AgentError> {
-    if let Some(mismatch) = claims
-        .iter()
-        .find(|claim| claim.provider() != active_provider || claim.model() != active_model)
-    {
-        return Err(AgentError::llm(
-            active_provider.as_str(),
-            LlmFailureReason::ProviderError(crate::error::LlmProviderError::non_retryable(
-                crate::error::LlmProviderErrorKind::IncompleteResponse,
-                serde_json::json!({
-                    "reason": "cache_breakpoint_claim_identity_mismatch",
-                    "expected_provider": active_provider,
-                    "expected_model": active_model,
-                    "reported_provider": mismatch.provider(),
-                    "reported_model": mismatch.model(),
-                }),
-            )),
-            "provider cache-breakpoint claim did not match the active provider/model identity",
-        ));
+) -> (
+    Vec<crate::AuthoredCacheBreakpoint>,
+    Vec<crate::DiscardedCacheBreakpoint>,
+) {
+    let mut authored = Vec::with_capacity(claims.len());
+    let mut discarded = Vec::new();
+    for claim in claims {
+        let breakpoint = crate::AuthoredCacheBreakpoint::from_provider_claim(claim.clone());
+        if breakpoint.provider() != active_provider || breakpoint.model() != active_model {
+            let detail = format!(
+                "claim reported provider={} model={} but the active lowering is provider={} model={}",
+                breakpoint.provider().as_str(),
+                breakpoint.model(),
+                active_provider.as_str(),
+                active_model
+            );
+            discarded.push(crate::DiscardedCacheBreakpoint::proof(
+                crate::CacheBreakpointDiscardOrigin::AuthoredThisTurn,
+                &breakpoint,
+                crate::CacheBreakpointDiscardReason::EvidenceUnusable { detail },
+            ));
+            continue;
+        }
+        authored.push(breakpoint);
     }
-    Ok(claims
-        .iter()
-        .cloned()
-        .map(crate::AuthoredCacheBreakpoint::from_provider_claim)
-        .collect())
+    (authored, discarded)
 }
 
 type AppliedModelFallbackSwitch = (
@@ -4846,11 +4857,12 @@ where
         in_extraction: bool,
         result: LlmStreamResult,
     ) -> Result<CallingLlmGate<CallingLlmAssistantTurn>, AgentError> {
-        let authored_cache_breakpoints = promote_cache_breakpoint_claims(
-            result.cache_breakpoint_claims(),
-            self.client.provider(),
-            self.client.model(),
-        )?;
+        let (authored_cache_breakpoints, mut cache_breakpoint_discards) =
+            promote_cache_breakpoint_claims(
+                result.cache_breakpoint_claims(),
+                self.client.provider(),
+                self.client.model(),
+            );
         let turn_usage = TurnUsage::try_from_usage(result.usage.clone()).map_err(|error| {
             AgentError::llm(
                 self.client.provider().as_str(),
@@ -4869,13 +4881,57 @@ where
             self.client.provider(),
             self.client.model(),
         )?;
-        self.session
-            .record_authored_cache_breakpoints(&authored_cache_breakpoints)
+        // A provider-authored cache breakpoint is an optimization artifact
+        // anchored to one exact transcript head. It must never be able to fail
+        // a completed provider turn: an anchor the committed transcript has
+        // moved past is discarded and observed, and only a fault in the
+        // transcript itself still terminalizes.
+        let cache_breakpoint_retention = self
+            .session
+            .retain_authored_cache_breakpoints(&authored_cache_breakpoints)
             .map_err(|error| {
                 AgentError::InternalError(format!(
-                    "provider-authored cache breakpoint did not bind to the committed transcript head: {error}"
+                    "committed transcript could not carry provider-authored cache evidence: {error}"
                 ))
             })?;
+        let retained_cache_breakpoints =
+            if authored_cache_breakpoints.is_empty() && !cache_breakpoint_discards.is_empty() {
+                // `retained` is the severity axis a host pages on, so it must not
+                // understate. The retention seam deliberately leaves durable
+                // evidence untouched when a turn authors nothing, reporting `0` by
+                // construction, and this is the one path that can report a discard
+                // without having authored anything: every claim was rejected as
+                // unusable one door earlier. Count the durable set here rather than
+                // making every ordinary turn pay for the same walk.
+                self.session.bound_authored_cache_breakpoint_count()
+            } else {
+                cache_breakpoint_retention.retained()
+            };
+        cache_breakpoint_discards.extend(cache_breakpoint_retention.into_discarded());
+        if !cache_breakpoint_discards.is_empty() {
+            for discard in &cache_breakpoint_discards {
+                tracing::warn!(
+                    session_id = %self.session.id(),
+                    origin = discard.origin().as_str(),
+                    reason = discard.reason().code(),
+                    discarded = %discard,
+                    retained = retained_cache_breakpoints,
+                    "provider-authored cache breakpoint discarded; the turn proceeds with less caching"
+                );
+            }
+            // A discard that only reaches tracing is an unrouted signal. The
+            // same fact rides the ordinary event stream so a host can page on
+            // it without scraping logs.
+            emit_phase_event!(
+                self,
+                ctx,
+                AgentEvent::ProviderCacheBreakpointsDiscarded {
+                    session_id: self.session.id().clone(),
+                    retained: retained_cache_breakpoints,
+                    discarded: cache_breakpoint_discards,
+                }
+            );
+        }
         // Update budget + session usage only from normalized provider evidence.
         self.budget.record_turn_usage(&turn_usage);
         self.last_input_tokens = turn_usage.presented_tokens();
@@ -6322,16 +6378,355 @@ mod tests {
             })
             .expect("claim shape");
 
-        let error =
-            promote_cache_breakpoint_claims(&[claim], crate::Provider::OpenAI, "active-model")
-                .expect_err("mismatched custom-client claim must fail closed");
+        // A lying adapter yields untrustworthy EVIDENCE, not a corrupt
+        // transcript: the claim is discarded and the turn's content still
+        // commits. The proof is never promoted into durable evidence.
+        let (authored, discarded) =
+            promote_cache_breakpoint_claims(&[claim], crate::Provider::OpenAI, "active-model");
+        assert!(
+            authored.is_empty(),
+            "a mismatched claim must never be promoted into durable evidence"
+        );
+        let [discard] = discarded.as_slice() else {
+            panic!("expected exactly one discard, got {discarded:?}");
+        };
+        assert_eq!(
+            discard.origin(),
+            crate::CacheBreakpointDiscardOrigin::AuthoredThisTurn
+        );
         assert!(matches!(
-            error,
-            AgentError::Llm {
-                reason: LlmFailureReason::ProviderError(ref provider_error),
-                ..
-            } if provider_error.kind == LlmProviderErrorKind::IncompleteResponse
+            discard.reason(),
+            crate::CacheBreakpointDiscardReason::EvidenceUnusable { .. }
         ));
+        assert_eq!(
+            discard
+                .identity()
+                .expect("a decoded claim has an identity")
+                .model,
+            "forged-model",
+            "the discard must name what the adapter claimed, not the active model"
+        );
+    }
+
+    // ========================================================================
+    // Provider cache-breakpoint degradation at the agent layer.
+    //
+    // The session-layer tests prove the drop. These prove the RULING: the
+    // turn that produced real model output still completes, and the discard
+    // reaches a routed, host-observable event rather than only a log line.
+    // ========================================================================
+
+    fn anthropic_agent_claim(
+        messages: &[Message],
+        message_count: u64,
+    ) -> crate::ProviderCacheBreakpointClaim {
+        anthropic_agent_claim_for_model("claude-opus-5", messages, message_count)
+    }
+
+    fn anthropic_agent_claim_for_model(
+        model: &str,
+        messages: &[Message],
+        message_count: u64,
+    ) -> crate::ProviderCacheBreakpointClaim {
+        crate::provider_cache_breakpoint_claim(crate::ProviderCacheBreakpointClaimRequest {
+            provider: crate::Provider::Anthropic,
+            model,
+            messages,
+            boundary: crate::CacheBreakpointBoundary::TranscriptAfter { message_count },
+            ttl: crate::ProviderCacheTtl::ProviderDefault,
+            rendered_prefix: br#"{"renderer_mode":"agent-test"}"#,
+            lowered_request_encoding: crate::LoweredRequestEncoding::AnthropicMessagesJson,
+            lowered_request_body: br#"{"model":"claude-opus-5"}"#,
+        })
+        .expect("agent test claim shape")
+    }
+
+    /// How far past the lowered transcript the overhanging shape anchors.
+    const OVERHANGING_ANCHOR_ROWS: usize = 4;
+
+    /// How the test client anchors its cache-breakpoint claim.
+    #[derive(Clone, Copy)]
+    enum CacheClaimShape {
+        /// Anchored to exactly the messages the lowering was handed, so the
+        /// proof binds to the committed transcript.
+        Binding,
+        /// Anchored past the end of the committed transcript, the way a
+        /// request-local injected-context row does.
+        Overhanging,
+        /// In range, but over a prefix the committed transcript does not have.
+        MovedPrefix,
+        /// Binds perfectly, but the adapter labels it with a model that is not
+        /// the active lowering: untrustworthy evidence, rejected one door
+        /// before the retention seam.
+        MismatchedIdentity,
+    }
+
+    struct CacheClaimingLlmClient {
+        /// One shape per call, in order. The last entry repeats.
+        shapes: Vec<CacheClaimShape>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CacheClaimingLlmClient {
+        fn next_shape(&self) -> CacheClaimShape {
+            let call = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.shapes[call.min(self.shapes.len().saturating_sub(1))]
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentLlmClient for CacheClaimingLlmClient {
+        async fn stream_response(
+            &self,
+            messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            let claim = match self.next_shape() {
+                CacheClaimShape::Binding => anthropic_agent_claim(messages, messages.len() as u64),
+                CacheClaimShape::Overhanging => {
+                    // Overhang by several rows, not one, so the anchor is past
+                    // the committed length no matter how many rows this turn
+                    // commits. A one-row overhang would land as a moved prefix
+                    // the moment commit ordering changes, and the reason is
+                    // exactly what this test asserts.
+                    let mut lowered = messages.to_vec();
+                    for index in 0..OVERHANGING_ANCHOR_ROWS {
+                        lowered.push(Message::User(UserMessage::text(format!(
+                            "request-local context {index}"
+                        ))));
+                    }
+                    let count = lowered.len() as u64;
+                    anthropic_agent_claim(&lowered, count)
+                }
+                CacheClaimShape::MovedPrefix => {
+                    // Anchor at the first row, which is always in range: the
+                    // committed transcript holds at least the user turn. Only
+                    // the content underneath the anchor differs, so this is
+                    // unambiguously a moved prefix and never an overhang.
+                    let mut doctored = messages.to_vec();
+                    doctored.truncate(1);
+                    let moved = Message::User(UserMessage::text(
+                        "a prefix the session does not have".to_string(),
+                    ));
+                    match doctored.first_mut() {
+                        Some(first) => *first = moved,
+                        None => doctored.push(moved),
+                    }
+                    anthropic_agent_claim(&doctored, 1)
+                }
+                CacheClaimShape::MismatchedIdentity => {
+                    anthropic_agent_claim_for_model("forged-model", messages, messages.len() as u64)
+                }
+            };
+            Ok(super::LlmStreamResult::new(
+                vec![AssistantBlock::Text {
+                    text: "ok".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+                normalized_test_usage(self, Usage::default()),
+            )
+            .with_cache_breakpoint_claims(vec![claim]))
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::Anthropic
+        }
+
+        fn model(&self) -> &'static str {
+            "claude-opus-5"
+        }
+    }
+
+    /// Discards routed by one turn: the retained count plus the discarded set.
+    type ObservedCacheDiscards = Vec<(usize, Vec<crate::DiscardedCacheBreakpoint>)>;
+
+    async fn run_turn_with_cache_claim(
+        shape: CacheClaimShape,
+    ) -> (crate::Session, ObservedCacheDiscards) {
+        let (session, mut per_turn) = run_turns_with_cache_claims(&[shape]).await;
+        (session, per_turn.remove(0))
+    }
+
+    /// Run one turn per shape against a single agent, returning the routed
+    /// discard events observed in each turn.
+    async fn run_turns_with_cache_claims(
+        shapes: &[CacheClaimShape],
+    ) -> (crate::Session, Vec<ObservedCacheDiscards>) {
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .build_standalone(
+                Arc::new(CacheClaimingLlmClient {
+                    shapes: shapes.to_vec(),
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                Arc::new(NoTools),
+                Arc::new(NoopStore),
+            )
+            .await;
+
+        let mut per_turn = Vec::with_capacity(shapes.len());
+        for turn in 0..shapes.len() {
+            let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+            agent
+                .run_with_events(format!("hello {turn}").into(), tx)
+                .await
+                .expect("a cache-breakpoint artifact must never fail a completed turn");
+
+            let mut observed = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if let crate::event::AgentEvent::ProviderCacheBreakpointsDiscarded {
+                    retained,
+                    discarded,
+                    ..
+                } = event
+                {
+                    observed.push((retained, discarded));
+                }
+            }
+            per_turn.push(observed);
+        }
+        (agent.session().clone(), per_turn)
+    }
+
+    /// Root-cause shape A, end to end: the turn COMPLETES and the discard is
+    /// routed onto the ordinary event stream a host already watches.
+    #[tokio::test]
+    async fn overhanging_cache_anchor_is_discarded_and_the_turn_completes() {
+        let (session, observed) = run_turn_with_cache_claim(CacheClaimShape::Overhanging).await;
+
+        let [(retained, discarded)] = observed.as_slice() else {
+            panic!("expected exactly one routed discard event, got {observed:?}");
+        };
+        assert_eq!(*retained, 0);
+        let [discard] = discarded.as_slice() else {
+            panic!("expected exactly one discard, got {discarded:?}");
+        };
+        assert_eq!(
+            discard.origin(),
+            crate::CacheBreakpointDiscardOrigin::AuthoredThisTurn
+        );
+        assert!(
+            matches!(
+                discard.reason(),
+                crate::CacheBreakpointDiscardReason::BoundaryOutsideCommittedTranscript { .. }
+            ),
+            "unexpected reason: {:?}",
+            discard.reason()
+        );
+        // The turn's real output is committed; only the artifact was dropped.
+        assert!(
+            session
+                .messages()
+                .iter()
+                .any(|message| matches!(message, Message::BlockAssistant(_))),
+            "the completed turn's assistant output must be committed"
+        );
+        assert!(
+            session
+                .authored_cache_breakpoints()
+                .expect("no evidence was persisted")
+                .is_empty()
+        );
+    }
+
+    /// Root-cause shape B, end to end.
+    #[tokio::test]
+    async fn moved_prefix_cache_anchor_is_discarded_and_the_turn_completes() {
+        let (session, observed) = run_turn_with_cache_claim(CacheClaimShape::MovedPrefix).await;
+
+        let [(_, discarded)] = observed.as_slice() else {
+            panic!("expected exactly one routed discard event, got {observed:?}");
+        };
+        let [discard] = discarded.as_slice() else {
+            panic!("expected exactly one discard, got {discarded:?}");
+        };
+        assert!(
+            matches!(
+                discard.reason(),
+                crate::CacheBreakpointDiscardReason::CanonicalPrefixMoved
+            ),
+            "unexpected reason: {:?}",
+            discard.reason()
+        );
+        assert!(
+            session
+                .messages()
+                .iter()
+                .any(|message| matches!(message, Message::BlockAssistant(_))),
+            "the completed turn's assistant output must be committed"
+        );
+    }
+
+    /// The other half of the ruling: a proof that DOES bind is preserved and
+    /// stays usable. Without this, "never fails a turn" would be satisfied by
+    /// simply discarding every breakpoint.
+    #[tokio::test]
+    async fn binding_cache_anchor_is_preserved_and_emits_no_discard() {
+        let (session, observed) = run_turn_with_cache_claim(CacheClaimShape::Binding).await;
+
+        assert!(
+            observed.is_empty(),
+            "a binding proof must not emit a discard event: {observed:?}"
+        );
+        let retained = session
+            .authored_cache_breakpoints()
+            .expect("a binding proof must survive the strict read");
+        assert_eq!(
+            retained.len(),
+            1,
+            "the binding proof must remain durable, revalidated evidence"
+        );
+        assert_eq!(retained[0].provider(), crate::Provider::Anthropic);
+    }
+
+    /// `retained` is the severity axis a host pages on: `0` means this turn
+    /// lost caching outright. It must therefore never understate. A turn whose
+    /// every claim is rejected as unusable authors nothing, so the retention
+    /// seam reports `0` by construction - the boundary has to count the
+    /// durable set that is still binding instead of forwarding that `0`.
+    #[tokio::test]
+    async fn discard_event_reports_durable_evidence_that_still_binds() {
+        let (session, per_turn) = run_turns_with_cache_claims(&[
+            CacheClaimShape::Binding,
+            CacheClaimShape::MismatchedIdentity,
+        ])
+        .await;
+
+        let [first, second] = per_turn.as_slice() else {
+            panic!("expected one observation set per turn, got {per_turn:?}");
+        };
+        assert!(
+            first.is_empty(),
+            "the binding turn must not emit a discard event: {first:?}"
+        );
+        let [(retained, discarded)] = second.as_slice() else {
+            panic!("expected exactly one routed discard event, got {second:?}");
+        };
+        let [discard] = discarded.as_slice() else {
+            panic!("expected exactly one discard, got {discarded:?}");
+        };
+        assert!(matches!(
+            discard.reason(),
+            crate::CacheBreakpointDiscardReason::EvidenceUnusable { .. }
+        ));
+        assert_eq!(
+            *retained, 1,
+            "caching was weakened, not lost: the first turn's proof still binds"
+        );
+        assert_eq!(
+            session
+                .authored_cache_breakpoints()
+                .expect("durable evidence must still be readable")
+                .len(),
+            1,
+            "a rejected claim must not disturb durable evidence that still binds"
+        );
     }
 
     #[test]

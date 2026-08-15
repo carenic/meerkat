@@ -93,6 +93,29 @@ export interface BlobRef {
 
 export type BudgetType = "tokens" | "time" | "tool_calls";
 
+export type CacheBreakpointBoundary = {
+  kind: "system_profile_prefix";
+  message_count: number;
+} | {
+  kind: "transcript_after";
+  message_count: number;
+};
+
+export type CacheBreakpointDiscardOrigin = "authored_this_turn" | "persisted_evidence";
+
+export type CacheBreakpointDiscardReason = {
+  kind: "boundary_outside_committed_transcript";
+  message_count: number;
+  message_len: number;
+} | {
+  kind: "canonical_prefix_moved";
+} | {
+  detail: string;
+  kind: "evidence_unusable";
+} | {
+  kind: "projected_boundary_unmappable";
+};
+
 export type CapabilityId = string;
 
 export type CommsNoticeKind = string;
@@ -155,6 +178,18 @@ export interface DeferredCatalogDelta {
   added_hidden_names?: ToolName[];
   pending_sources?: string[];
   removed_hidden_names?: ToolName[];
+}
+
+export type DiscardedCacheBreakpoint = {
+  identity?: DiscardedCacheBreakpointIdentity | null;
+  origin: CacheBreakpointDiscardOrigin;
+  reason: CacheBreakpointDiscardReason;
+};
+
+export interface DiscardedCacheBreakpointIdentity {
+  boundary: CacheBreakpointBoundary;
+  model: string;
+  provider: Provider;
 }
 
 export type ExternalToolDeltaPhase = "pending" | "applied" | "draining" | "forced" | "failed";
@@ -757,6 +792,13 @@ export interface TranscriptRewriteAuditReceiptCommittedEvent {
   type: "transcript_rewrite_audit_receipt_committed";
 }
 
+export interface ProviderCacheBreakpointsDiscardedEvent {
+  discarded: DiscardedCacheBreakpoint[];
+  retained: number;
+  session_id: SessionId;
+  type: "provider_cache_breakpoints_discarded";
+}
+
 export interface PeerContentIngestedEvent {
   kind: CommsNoticeKind;
   peer?: SystemNoticePeer | null;
@@ -801,7 +843,8 @@ export const KNOWN_AGENT_EVENT_TYPES = [
   "tool_config_changed",
   "background_job_completed",
   "transcript_rewrite_committed",
-  "peer_content_ingested"
+  "peer_content_ingested",
+  "provider_cache_breakpoints_discarded"
 ] as const;
 
 export type KnownAgentEventType = typeof KNOWN_AGENT_EVENT_TYPES[number];
@@ -844,4 +887,5 @@ export type AgentEvent =
   BackgroundJobCompletedEvent |
   TranscriptRewriteCommittedEvent |
   TranscriptRewriteAuditReceiptCommittedEvent |
+  ProviderCacheBreakpointsDiscardedEvent |
   PeerContentIngestedEvent;

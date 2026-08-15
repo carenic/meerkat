@@ -295,11 +295,13 @@ pub use placement::{ExecutionPlacement, ExecutionPlacementIdentity, PlacementErr
 pub use prompt::{AGENTS_MD_MAX_BYTES, DEFAULT_SYSTEM_PROMPT, SystemPromptConfig};
 pub use provider::Provider;
 pub use provider_evidence::{
-    AuthoredCacheBreakpoint, CacheBreakpointBoundary, CacheBreakpointEvidenceError,
-    LoweredRequestEncoding, LoweredRequestProvenance, PresentedTokenConvention,
-    ProviderCacheBreakpointClaim, ProviderCacheBreakpointClaimRequest, ProviderCacheTtl,
-    ProviderTokenAccounting, TargetCacheLoweringCapability, TargetCacheLoweringIssuer,
-    TokenAggregationProvenance, ValidatedSourceCacheBreakpoint, canonical_cache_prefix_identity,
+    AuthoredCacheBreakpoint, AuthoredCacheBreakpointRetention, CacheBreakpointBoundary,
+    CacheBreakpointDiscardOrigin, CacheBreakpointDiscardReason, CacheBreakpointEvidenceError,
+    DiscardedCacheBreakpoint, DiscardedCacheBreakpointIdentity, LoweredRequestEncoding,
+    LoweredRequestProvenance, PresentedTokenConvention, ProviderCacheBreakpointClaim,
+    ProviderCacheBreakpointClaimRequest, ProviderCacheTtl, ProviderTokenAccounting,
+    TargetCacheLoweringCapability, TargetCacheLoweringIssuer, TokenAggregationProvenance,
+    ValidatedSourceCacheBreakpoint, canonical_cache_prefix_identity,
     provider_cache_breakpoint_claim,
 };
 pub use realtime_transcript::{

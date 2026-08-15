@@ -445,6 +445,14 @@ function handleEvent(event: AgentEvent): string {
       // sender_taint is tri-state: absent means "no declaration", which
       // consumers must never coalesce into "clean".
       return `${event.type}:${event.sender_taint ?? 'undeclared'}`;
+    case 'provider_cache_breakpoints_discarded':
+      // `retained` is the severity axis a host pages on: 0 means this turn
+      // lost caching outright, above 0 means caching was only weakened.
+      // `identity` is absent only for an undecodable persisted row, which has
+      // no individual proof to name.
+      return `${event.type}:${event.retained}:${event.discarded
+        .map((discard) => `${discard.origin}/${discard.identity?.model ?? 'unnamed'}`)
+        .join(',')}`;
     default: {
       const _exhaustive: never = event;
       return _exhaustive;
