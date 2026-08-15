@@ -60,6 +60,16 @@ via cargo-semver-checks against the published baselines).
     non-null `tooling.tool_access_policy` to enumerate which sessions have
     walked through the door. Do that before planning a downgrade rather than
     reconstructing it from deployment history.
+    Query the FIELD, never grep for the string `ReadOnly`. Validated against a
+    4,170-session production estate: the field matched zero sessions and the
+    bare string matched one, which was a ticket summary an agent had quoted
+    inside a transcript. Agents discuss the concept in ordinary work, so a
+    substring search returns false positives on real data at exactly the moment
+    someone is deciding whether a rollback is still available.
+  - **Capture the baseline BEFORE upgrading.** Run that query on the old binary
+    first. The field is new in this release, so a pre-upgrade count is trivially
+    zero - and that is the point: it establishes that any non-null appearing
+    later is attributable to a decision you made rather than inherited state.
   - Failing to decode is the INTENDED outcome. A downgrade that silently read
     the marker as `Inherit` would drop the enforcement, which is worse than
     refusing to resume.
