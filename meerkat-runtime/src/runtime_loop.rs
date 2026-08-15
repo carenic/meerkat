@@ -2105,13 +2105,14 @@ fn resolve_process_local_failed_run_waiters(
     run_id: &RunId,
     reason: String,
 ) {
+    let finalization = machine_failed_completion_finalization(driver);
     let authorized = machine_terminal_completion_error(driver, reason)
         .and_then(|error_metadata| {
             crate::meerkat_machine::driver::machine_resolve_runtime_completion_result(
                 driver,
                 Some(run_id),
                 crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::MachineTerminal,
-                crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+                finalization,
             )
             .map(|authority| (authority, error_metadata))
         })
@@ -2230,13 +2231,14 @@ async fn resolve_machine_terminal_completion_waiters_under_authority(
                 return;
             }
         };
+    let finalization = machine_failed_completion_finalization(&driver_guard);
     let bundle = machine_terminal_completion_error(&driver_guard, reason)
         .and_then(|error_metadata| {
             crate::meerkat_machine::driver::machine_resolve_runtime_completion_result(
                 &driver_guard,
                 Some(&owned_run_id),
                 crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::MachineTerminal,
-                crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+                finalization,
             )
             .map(|authority| (authority, error_metadata))
         })
@@ -3661,19 +3663,123 @@ fn machine_terminal_completion_error(
     })?;
     match outcome {
         crate::meerkat_machine::dsl::TurnTerminalOutcome::Cancelled => {
-            match auth.state().terminal_cause_kind {
-                None | Some(crate::meerkat_machine::dsl::TurnTerminalCauseKind::Unknown) => {
-                    Ok(None)
-                }
-                Some(cause_kind) => Err(crate::RuntimeDriverError::Internal(format!(
-                    "generated cancelled terminal carried failure cause {cause_kind:?}"
-                ))),
-            }
+            // A cancelled terminal carries no failure cause, and
+            // `terminal_cause_kind` is not this run's fact to read here.
+            //
+            // Refusing a specific cause on this arm was the same defect the
+            // `Completed` arm below was written to fix, one arm over. The
+            // refusal returned `Err`, which
+            // [`realize_runtime_loop_terminal_owned`] turns into
+            // `OwnedRuntimeLoopTerminalizationOutcome::CleanupCarrierCorrupt`
+            // by short-circuiting its `and_then` chain, and that ends the
+            // runtime loop task for the remaining life of the process: the
+            // session cannot run another turn.
+            //
+            // IT IS REACHABLE, BY TWO ORDINARY ROUTES.
+            //
+            // - A cancel inheriting an earlier run's cause. `RunCancelled`
+            //   sets `terminal_outcome = Cancelled` and `turn_terminal_run_id`
+            //   and does not touch `terminal_cause_kind` at all; neither do
+            //   the other cancel-producing transitions
+            //   (`BoundaryCompleteCancelled`, `BoundaryContinueToCancelled`,
+            //   `PrimitiveAppliedImmediateCancelled`, `CancellationObserved`,
+            //   `ForceCancelNoRun`). Only `StartConversationRun*` /
+            //   `StartImmediate*` clear the cause at turn start, and the
+            //   skipped-turn-start classes documented on
+            //   [`completed_terminal_witness_before_failure_realization`] route
+            //   through `PrepareIdle` / `PrepareAttached` /
+            //   `DrainQueuedRunRetired`, which clear `turn_terminal_run_id` and
+            //   leave the cause standing.
+            // - A failed run inheriting an earlier run's cancelled outcome. The
+            //   generated `RunFailed` update replaces `terminal_outcome` only
+            //   when it is unset (`None`, or the `None` variant), so a stale
+            //   `Cancelled` survives while the independent cause branch fills
+            //   `terminal_cause_kind` with this run's own specific failure
+            //   cause. That state lands here too, carrying a cause the machine
+            //   itself wrote one transition earlier.
+            //
+            // THE MACHINE DOES NOT CONSIDER EITHER STATE IMPOSSIBLE.
+            // `ResolveRuntimeCompletionResultCancelled` guards on
+            // `terminal_outcome == Cancelled` and consults no cause at all, so
+            // it accepts exactly the states this arm used to refuse and
+            // resolves them as `RuntimeCompletionResultClass::Cancelled`. The
+            // shell was refusing a state its own authority classifies.
+            //
+            // `Ok(None)` is not a new answer: it is what every cancelled run
+            // already resolves to, so this only stops the stale-cause case
+            // from diverging from the ordinary one. No new metadata shape,
+            // staged candidate or payload digest is introduced by it.
+            //
+            // DO NOT DERIVE A CAUSE FROM `last_runtime_apply_failure_cause`
+            // HERE the way the `Completed` arm does. That field is run-scoped
+            // only because `RunFailed` assigns it; `RunCancelled` does not
+            // touch it either, so on a cancelled run it is exactly as stale as
+            // `terminal_cause_kind`.
+            Ok(None)
         }
         crate::meerkat_machine::dsl::TurnTerminalOutcome::Failed
         | crate::meerkat_machine::dsl::TurnTerminalOutcome::BudgetExhausted
         | crate::meerkat_machine::dsl::TurnTerminalOutcome::TimeBudgetExceeded
         | crate::meerkat_machine::dsl::TurnTerminalOutcome::StructuredOutputValidationFailed => {
+            // THIS ARM KEEPS READING `terminal_cause_kind`, ON PURPOSE. It is
+            // not left this way for symmetry with the arms above; on a failed
+            // outcome this field is the machine's own classifier, and the two
+            // properties that made it the wrong field on `Completed` and
+            // `Cancelled` do not hold here.
+            //
+            // IT IS WHAT THE MACHINE CLASSIFIES BY.
+            // [`machine_failed_completion_finalization`] answers `Succeeded`
+            // for every outcome in this arm, so the generated transitions that
+            // can accept the state are
+            // `ResolveRuntimeCompletionResult{RuntimeApplyFailed,MachineFailed}`,
+            // and they select between the `RuntimeApplyFailed` and `Abandoned`
+            // cleanup outcomes on `self.terminal_cause_kind` alone
+            // (`machine_runtime_apply_failed` /
+            // `machine_not_runtime_apply_failed`). Deriving some other cause
+            // here would hand the caller typed metadata that contradicts the
+            // cleanup outcome the machine emits for the very same state, which
+            // is classifying in the shell.
+            //
+            // NOTHING DECLARES THIS PAIR INCOHERENT. That is the difference
+            // from `Completed`, and it is the whole of the difference. There
+            // the machine states outright that a cause next to a completed
+            // outcome is not part of a coherent terminal
+            // (`completed_terminal_is_coherent` requires `terminal_cause_kind
+            // == None`), which is what proved the field wrong on that arm. A
+            // cause next to a failure outcome is the normal shape, and the
+            // transition that will actually fire here places no constraint
+            // between the two at all.
+            //
+            // THE TWO `Err` RETURNS BELOW ARE NOT THE CARRIER-WEDGE DEFECT.
+            // Every caller that can reach this arm runs after `RunFailed` (the
+            // caller table is on the `Completed` arm below), and `RunFailed`
+            // leaves `terminal_cause_kind` `Some` and specific: it preserves an
+            // existing specific cause, and otherwise fills from a table whose
+            // every branch is a specific cause. In the states where these would
+            // fire the machine refuses too, since both applicable transitions
+            // guard `machine_failure_cause_known` (`terminal_cause_kind != None
+            // && != Unknown`), so the caller is answered `AuthorityUnavailable`
+            // either way. These report machine authority rather than inventing
+            // a refusal of a state the machine accepts.
+            //
+            // WHAT REMAINS, STATED RATHER THAN WAVED AWAY. Two shapes survive
+            // on the skipped-turn-start classes. An earlier run's whole
+            // terminal can be reported for this run, because `RunFailed`
+            // preserves both facts when both are already set. And the pair can
+            // be mixed: `AcknowledgeTerminal` clears `terminal_cause_kind`
+            // while setting `terminal_outcome` from its input, so a later
+            // `RunFailed` can fill this run's cause next to that inherited
+            // outcome, which the `ServiceTurnCommitted*` guard
+            // `failed_terminal_outcome_matches_cause` would reject at the
+            // commit boundary even though nothing rejects it here.
+            //
+            // Neither is fixable by reading a different field in this shell
+            // function. In both shapes the machine's own result class is
+            // selected from the same `terminal_cause_kind` this arm reads, so
+            // a shell that answered differently would only disagree with the
+            // authority; the fix is to stop the terminal from outliving its run
+            // at turn start, which is schema work on the generated update
+            // blocks.
             let cause_kind = auth.state().terminal_cause_kind.ok_or_else(|| {
                 crate::RuntimeDriverError::Internal(
                     "missing generated terminal_cause_kind for failed runtime completion"
@@ -3692,13 +3798,279 @@ fn machine_terminal_completion_error(
                 detail,
             )))
         }
-        crate::meerkat_machine::dsl::TurnTerminalOutcome::None
-        | crate::meerkat_machine::dsl::TurnTerminalOutcome::Completed => {
+        crate::meerkat_machine::dsl::TurnTerminalOutcome::Completed => {
+            // A runtime-failed run may legitimately still hold a `Completed`
+            // machine terminal. The turn reached `BoundaryCompleteCompleted`
+            // and only the run-boundary persistence after it failed, and the
+            // generated `RunFailed` transition deliberately preserves a
+            // pre-existing terminal outcome instead of overwriting it. Every
+            // guard that would forbid the (Failed, Completed) pair is keyed on
+            // `machine_terminal_failure_observed`, which the runtime-loop
+            // failure path always passes as `false`.
+            //
+            // Refusing this pair corrupted the recovery carrier, which ended
+            // the loop task for the remaining life of the process and left the
+            // session unable to run another turn (field regression, household
+            // fleet, 0.8.23). Resolve the typed terminal instead of refusing
+            // it.
+            //
+            // DERIVE THE CAUSE, DO NOT ASSERT IT, AND DO NOT READ
+            // `terminal_cause_kind` HERE. `terminal_cause_kind` is the wrong
+            // field on this arm, and reading it would report a dead cause as
+            // this run's:
+            //
+            // - No generated transition ever sets a specific cause together
+            //   with a `Completed` outcome. `BoundaryCompleteCompleted`,
+            //   `PrimitiveAppliedImmediateCompleted`, `ExtractionValidationPassed`
+            //   and `RunCompleted` all set `terminal_outcome = Completed` while
+            //   leaving `terminal_cause_kind` exactly as they found it.
+            // - `Prepare*` / `DrainQueuedRunRetired` - the skipped-turn-start
+            //   classes documented on
+            //   [`completed_terminal_witness_before_failure_realization`] -
+            //   clear only `turn_terminal_run_id`, so an earlier run's cause
+            //   survives into this one.
+            // - The generated `RunFailed` update fills `terminal_cause_kind`
+            //   only when it is `None`/`Unknown`, and otherwise preserves it.
+            //
+            // The machine states the same thing directly in its own coherence
+            // rule: the `ServiceTurnCommitted*` guard `completed_terminal_is_coherent`
+            // requires a `Completed` terminal to carry `terminal_cause_kind ==
+            // None`. A cause sitting next to a `Completed` outcome is therefore
+            // not part of a coherent terminal at all, and reporting it would
+            // hand the host a confident wrong cause - the same defect class in
+            // the opposite direction.
+            //
+            // `last_runtime_apply_failure_cause` is the run-scoped fact.
+            // `RunFailed` assigns it unconditionally from this run's
+            // `runtime_apply_failure_cause`, so it is this run's ON THIS ARM.
+            //
+            // THE REASON IS THE ARM, NOT THE FUNCTION, AND THE DIFFERENCE
+            // MATTERS. `RunFailed` is the only terminal-realizing transition
+            // that preserves a pre-existing outcome, so it is the only one that
+            // can leave a `Completed` outcome standing on a failed runtime
+            // completion; every other route overwrites the outcome and lands on
+            // a different arm. Do not restate this as a property of the
+            // function: callers of this function do NOT all run after
+            // `RunFailed`. The caller table:
+            //
+            // - [`realize_runtime_loop_terminal_owned`] calls it after a
+            //   successful realization of either `OwnedRuntimeLoopTerminalization`
+            //   variant. `Failed` fires `RunFailed`. `Cancelled` fires
+            //   `RunCancelled`, which does NOT assign
+            //   `last_runtime_apply_failure_cause` - but it does set
+            //   `terminal_outcome = Cancelled` unconditionally, so that branch
+            //   lands on the `Cancelled` arm above and never here. That arm
+            //   reads neither field, for exactly this reason.
+            // - [`resolve_process_local_failed_run_waiters`] and
+            //   [`resolve_machine_terminal_completion_waiters_under_authority`]
+            //   are reached only from failed-run resolution sites that are
+            //   themselves past `RunFailed`: the three
+            //   [`resolve_machine_terminal_completion_waiters`] call sites in
+            //   `process_queue` (primitive rejection, turn-state preparation
+            //   failure, and the non-cancelled branch of the apply failure),
+            //   and the teardown recovery site, whose `failed_execution_attempt`
+            //   gate requires a `completion_error_metadata` that only a failed
+            //   realization ever stages.
+            //
+            // Its presence is also exactly the predicate `RunFailed`'s own cause
+            // table uses to select `RuntimeApplyFailure`, so mirroring it is
+            // reading machine authority rather than classifying in the shell.
+            //
+            // On that branch the metadata is byte-identical to the candidate
+            // the failed-run realization staged on the input terminal-completion
+            // batch - `TurnErrorMetadata::terminal(RuntimeApplyFailure, Failed,
+            // detail)` is the definition of `runtime_apply_failure(detail)`
+            // over the same apply-failure message - so the completion authority
+            // accepts the payload digest rather than answering
+            // `AuthorityUnavailable`.
+            //
+            // Absent that fact the machine holds no cause this run can claim.
+            // `Unknown` is the vocabulary's own "not classified", and the
+            // operator-facing `detail` still travels; a narrower true statement
+            // beats a confident wrong one. Neither delivery path turns it into
+            // durable truth, and they do not behave the same way, so do not
+            // read one guarantee onto the other. The durable batch fails
+            // closed: a payload that is not the staged `runtime_apply_failure`
+            // candidate is rejected by the digest check in
+            // `authorize_runtime_terminal_bundle` before any receipt is
+            // written, and a non-specific cause would also be refused by
+            // `InteractionTerminalCandidate::runtime_completion_terminal_recovery`
+            // on recovery. The process-local path in
+            // `resolve_process_local_failed_run_waiters` has no digest check
+            // and does deliver the unclassified-but-true cause to its waiters -
+            // it persists nothing either way.
+            //
+            // The outcome stays `Failed`. It describes the runtime completion
+            // being delivered, not the turn terminal the machine holds: this
+            // path resolves `AbandonedWithError`, and durable machine-terminal
+            // recovery rejects any non-failure outcome outright.
+            let cause_kind = match auth.state().last_runtime_apply_failure_cause {
+                Some(_) => meerkat_core::TurnTerminalCauseKind::RuntimeApplyFailure,
+                None => meerkat_core::TurnTerminalCauseKind::Unknown,
+            };
+            Ok(Some(meerkat_core::TurnErrorMetadata::terminal(
+                cause_kind,
+                meerkat_core::TurnTerminalOutcome::Failed,
+                detail,
+            )))
+        }
+        crate::meerkat_machine::dsl::TurnTerminalOutcome::None => {
+            // Unlike `Completed`, `None` is not preserved: the generated
+            // `RunFailed` update replaces a `None` outcome with a real failure
+            // outcome. Observing it here therefore means no failed-run terminal
+            // was realized at all, so keep failing closed rather than minting a
+            // terminal the machine does not hold.
             Err(crate::RuntimeDriverError::Internal(format!(
                 "generated terminal outcome {outcome:?} cannot resolve failed runtime completion"
             )))
         }
     }
+}
+
+/// The generated finalization observation a failed runtime completion must be
+/// resolved under.
+///
+/// The ordinary failed run carries a failed machine terminal, and `Succeeded`
+/// selects the generated `RuntimeApplyFailed` / `MachineFailed` result classes
+/// for it. A run that already reached its completed terminal carries
+/// `Completed` instead, and every `Succeeded` + `MachineTerminal` transition
+/// guards on a failed terminal outcome, so `Succeeded` matches nothing there
+/// and the caller would be answered `AuthorityUnavailable` rather than a typed
+/// terminal. `Failed` is both the matching and the honest observation for that
+/// run: the turn produced its result and the runtime finalization after it is
+/// exactly what failed. It selects the generated
+/// `FinalizationFailureWithoutResult` transition, whose result class is
+/// `AbandonedWithError` with a `RuntimeApplyFailed` cleanup outcome.
+///
+/// DELIBERATELY NOT THE SAME PREDICATE AS
+/// [`completed_terminal_witness_before_failure_realization`]. That one adds the
+/// exact-run witness (`turn_terminal_run_id`); this one reads the bare
+/// `terminal_outcome`. They look interchangeable and are not, so do not unify
+/// them - they answer different questions:
+///
+/// - Here: "which generated transition will accept the authority state as it
+///   stands right now". `ResolveRuntimeCompletionResult{RuntimeApplyFailed,
+///   MachineFailed}` both guard `finalization == Succeeded` together with a
+///   `machine_failed` guard over `terminal_outcome`, so a `Completed` outcome
+///   guard-rejects `Succeeded` no matter which run produced it. Provenance is
+///   irrelevant because the guard cannot see provenance either.
+/// - There: "did THIS run mutate and complete before it failed". Provenance is
+///   the whole question, because the answer decides whether to retire a live
+///   session.
+///
+/// The disagreement is observable, not theoretical. Two turn-start classes skip
+/// the turn-start transition and so never reset `terminal_outcome`: an
+/// appends-empty staged primitive (the transient-turn-context / live-steer
+/// class, where `primitive_turn_start_input` yields nothing) and the retired
+/// drain (where the phase is `Retired` and the generated turn-start transitions
+/// have no `Retired` variant). Both still route through `PrepareIdle` /
+/// `PrepareAttached` / `DrainQueuedRunRetired`, which reset
+/// `turn_terminal_run_id = None` but leave `terminal_outcome` untouched; only
+/// the `StartConversationRun*` / `StartImmediate*` transitions reset both. On
+/// those two classes a stale `Completed` from an earlier run is therefore
+/// visible while the exact-run witness is correctly false - and each function
+/// gives the right answer for its own question precisely because they differ.
+fn machine_failed_completion_finalization(
+    driver: &crate::meerkat_machine::driver::DriverEntry,
+) -> crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation {
+    // Deliberately keyed on the bare terminal outcome, not on the exact-run
+    // witness below. This answers "which generated transition will accept this
+    // state", which is a question about the state the authority is in right
+    // now, and `Succeeded` is guard-rejected for a `Completed` outcome however
+    // that outcome got there.
+    if machine_terminal_outcome_is_completed(driver) {
+        crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Failed
+    } else {
+        crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded
+    }
+}
+
+fn machine_terminal_outcome_is_completed(
+    driver: &crate::meerkat_machine::driver::DriverEntry,
+) -> bool {
+    let authority = driver.shared_dsl_authority();
+    let auth = authority
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    matches!(
+        auth.state().terminal_outcome,
+        Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::Completed)
+    )
+}
+
+/// Whether the machine recorded a completed turn terminal for THIS run before
+/// its runtime-level completion failed, captured while the pre-realization
+/// driver guard is still held and releasing that guard by consuming it.
+///
+/// WHAT THIS READS. `BoundaryCompleteCompleted` is applied only after the model
+/// call, the tool calls, the boundary effects and every terminal hook have run,
+/// and after `AgentEvent::TurnCompleted` has already been published to the host.
+/// A failure observed after that fact is a post-mutation failure: the turn's
+/// effects happened, the host was told the turn succeeded, and nothing marks the
+/// contributing inputs as applied. Returning such a contributor to its work lane
+/// re-appends its content and re-runs the whole turn, with tools free to fire a
+/// second time.
+///
+/// WHY THE EXACT-RUN WITNESS IS REQUIRED, NOT DECORATIVE. The turn-start signal
+/// is deliberately skipped for an appends-empty staged primitive (the
+/// transient-turn-context / live-steer class) and for the retired drain, and
+/// those two classes still run `PrepareIdle` / `PrepareAttached` /
+/// `DrainQueuedRunRetired`, which clear `turn_terminal_run_id` but leave
+/// `terminal_outcome` describing whatever ran before this run. Reading the
+/// outcome alone would classify a transient-context failure as post-mutation and
+/// tear the session down for a run that never mutated anything.
+///
+/// That is exactly why this must not be unified with
+/// [`machine_failed_completion_finalization`], which reads the bare outcome on
+/// purpose. The two are meant to disagree on those skipped-turn-start classes: a
+/// stale `Completed` still decides which generated transition can accept the
+/// state (its question), and still does not mean this run mutated anything (the
+/// question here). See that function's note for the full statement.
+///
+/// WHY IT MUST PRECEDE THE REALIZATION. The failed-run realization that follows
+/// (`realize_runtime_loop_terminal_owned`) fires the generated `RunFailed`
+/// update, which sets `turn_terminal_run_id = Some(run_id)` unconditionally
+/// while deliberately preserving a pre-existing `Completed` outcome. The two
+/// halves of the conjunction below are independent only before that update.
+/// After it the run-id half is true by construction for the run being failed, so
+/// the conjunction degenerates to "is the outcome `Completed`" - and on the
+/// skipped-turn-start classes above that outcome can be a stale `Completed` left
+/// by an earlier run.
+///
+/// WHAT BREAKS IF IT MOVES. Every failed run carrying a preserved or stale
+/// `Completed` outcome would be classified post-mutation and torn down, so an
+/// ordinary transient failure would retire a live session instead of retrying
+/// it. The correctness of the whole arming rests on this ordering.
+///
+/// HOW THE ORDERING IS HELD: by ownership, not by convention. This function
+/// consumes the driver guard, so the fact can only be captured while that guard
+/// is alive. There is deliberately no borrowing form of this predicate for a
+/// later statement to call: reading it again downstream requires acquiring a
+/// fresh driver lock, which is a deliberate act rather than a moved line.
+/// Relocating the capture past the realization does not silently work either -
+/// the realization takes the same driver mutex itself, so it cannot run while
+/// this guard is held.
+fn completed_terminal_witness_before_failure_realization(
+    driver_guard: crate::tokio::sync::MutexGuard<'_, crate::meerkat_machine::driver::DriverEntry>,
+    cancelled: bool,
+    run_id: &RunId,
+) -> bool {
+    // A cancellation is a caller-requested stop, not a post-mutation failure,
+    // and it has its own terminalization below. The guard is consumed on this
+    // path too, so the ownership argument above holds for both.
+    if cancelled {
+        return false;
+    }
+    let authority = driver_guard.shared_dsl_authority();
+    let auth = authority
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = auth.state();
+    matches!(
+        state.terminal_outcome,
+        Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::Completed)
+    ) && state.turn_terminal_run_id.as_ref()
+        == Some(&crate::meerkat_machine::dsl::RunId::from_domain(run_id))
 }
 
 fn primitive_admitted_content_shape(primitive: &RunPrimitive) -> TurnContentShape {
@@ -6289,8 +6661,49 @@ async fn process_queue(
                         }
                     }
                     Err(e) => {
-                        drop(d);
-                        let teardown_required = e.requires_runtime_teardown();
+                        let cancelled = e.is_cancelled();
+                        // Post-mutation failures must not re-enter the retry
+                        // lane. `failed_run_contributor_disposition` classifies
+                        // from the typed error alone, and every failure that is
+                        // not the never-started class is `Replayed`; the
+                        // catch-all in `apply_failed_from_session_error` puts an
+                        // ordinary run-boundary persistence failure there too.
+                        // For a run that already reached its completed terminal
+                        // that release is unsafe: the model call and the tools
+                        // already ran, so the backlog resolution below would
+                        // restage the same content and execute the turn again
+                        // inside this process. Route it to the same fail-closed
+                        // teardown handoff the typed
+                        // `SessionDurableProjectionAuthorityUnknown` class uses,
+                        // so the terminal publishes, the waiters resolve, and
+                        // the shell is retired instead of being handed the work
+                        // a second time.
+                        //
+                        // ORDERING CONSTRAINT - READ THIS BEFORE MOVING THE
+                        // LINE BELOW. This witness must be captured here, ahead
+                        // of `realize_runtime_loop_terminal_owned`, which fires
+                        // the generated `RunFailed` update. That update sets
+                        // `turn_terminal_run_id = Some(run_id)` unconditionally
+                        // while preserving a pre-existing `Completed` outcome,
+                        // so after it the exact-run half of the witness is true
+                        // by construction and the conjunction collapses into a
+                        // bare "outcome is Completed" - which the skipped
+                        // turn-start classes can leave stale. Read after the
+                        // realization, or read a second time downstream, and
+                        // every failed run holding a preserved or stale
+                        // `Completed` outcome is classified post-mutation and
+                        // torn down: an ordinary transient failure would retire
+                        // a live session instead of retrying it. The correctness
+                        // of the whole arming rests on this ordering, so the
+                        // capture consumes the driver guard rather than
+                        // borrowing it; a later read has to take a fresh lock,
+                        // and the realization cannot run while this one is held.
+                        let completed_terminal_before_failure =
+                            completed_terminal_witness_before_failure_realization(
+                                d, cancelled, &run_id,
+                            );
+                        let teardown_required =
+                            e.requires_runtime_teardown() || completed_terminal_before_failure;
                         if teardown_required {
                             handoff.disposition =
                                 RuntimeLoopTeardownDisposition::UnregisterRequired;
@@ -6312,7 +6725,6 @@ async fn process_queue(
                                 return true;
                             }
                         };
-                        let cancelled = e.is_cancelled();
                         let contributor_disposition = failed_run_contributor_disposition(&e);
                         let executor_stopped = matches!(&e, CoreExecutorError::Stopped);
                         let legacy_machine_terminal =
@@ -11625,5 +12037,562 @@ mod tests {
                 .expect_err("conflicting batch metadata should be rejected");
 
         assert_eq!(err.field, "model");
+    }
+
+    /// Drive the generated machine into the state the `Completed` arm of
+    /// [`machine_terminal_completion_error`] actually sees in the field, using
+    /// nothing but real generated inputs.
+    ///
+    /// Every step below is a transition the runtime already applies in
+    /// production, in the order it applies them:
+    ///
+    /// 1. `Prepare` binds a first run.
+    /// 2. `RecoverRuntimeCompletionResultCorrelation` restores a durable
+    ///    machine-failure terminal - what a process restart does after an
+    ///    earlier run failed. It sets `terminal_cause_kind` without touching
+    ///    `turn_phase`, which is the only way a cause can outlive its run.
+    /// 3. `Prepare` binds a second run. It clears `turn_terminal_run_id` and
+    ///    leaves the terminal facts alone.
+    /// 4. `RunCompleted` closes that run. Because `turn_phase` is still
+    ///    non-terminal it sets `terminal_outcome = Completed` - and it does not
+    ///    clear `terminal_cause_kind`, so the recovered cause is now sitting
+    ///    next to a completed outcome.
+    /// 5. `Commit` returns the shell to `Idle`. It carries no terminal
+    ///    coherence guard, so the pair survives the run boundary.
+    /// 6. `Prepare` binds a third run: the skipped-turn-start class, which
+    ///    inherits both stale terminal facts.
+    /// 7. `RunFailed` fails that third run with a runtime apply failure. It
+    ///    preserves the stale outcome and the stale cause, and records this
+    ///    run's own apply-failure cause.
+    ///
+    /// Nothing is hand-set: each fact is placed by the transition that owns it.
+    fn stale_completed_terminal_driver(
+        stale_cause: crate::meerkat_machine::dsl::TurnTerminalCauseKind,
+        runtime_apply_failure: Option<crate::meerkat_machine::dsl::RuntimeApplyFailureCause>,
+        failure_message: &str,
+    ) -> crate::meerkat_machine::driver::DriverEntry {
+        use crate::meerkat_machine::dsl;
+
+        let mut driver = crate::driver::ephemeral::EphemeralRuntimeDriver::new(
+            crate::identifiers::LogicalRuntimeId::for_session(&SessionId::new()),
+        );
+        let recovered_run = RunId::new();
+        driver
+            .contract_begin_run_authority(recovered_run.clone())
+            .expect("the first run must bind through generated authority");
+        let driver = crate::meerkat_machine::driver::DriverEntry::Ephemeral(driver);
+
+        crate::meerkat_machine::driver::machine_recover_runtime_completion_result_correlation(
+            &driver,
+            &recovered_run,
+            crate::input_state::RuntimeCompletionTerminalRecovery::MachineFailure {
+                outcome: meerkat_core::TurnTerminalOutcome::Failed,
+                cause: meerkat_core::TurnTerminalCauseKind::from(stale_cause),
+            },
+        )
+        .expect("a durable machine-failure terminal must be recoverable");
+
+        let completed_run = RunId::new();
+        let failed_run = RunId::new();
+        // Read once and hold no lock across an apply: the authority mutex is
+        // not reentrant, and taking it inside an argument expression would
+        // still be held when the closure below locks it again.
+        let session_id = {
+            let authority = driver.shared_dsl_authority();
+            let authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            authority
+                .state()
+                .session_id
+                .clone()
+                .expect("the fixture registered a session")
+        };
+        let apply = |input: dsl::MeerkatMachineInput, context: &str| {
+            let authority = driver.shared_dsl_authority();
+            let mut authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            dsl::MeerkatMachineMutator::apply(&mut *authority, input)
+                .unwrap_or_else(|err| panic!("generated machine rejected {context}: {err:?}"));
+        };
+
+        // The recovery correlation is declared `per_phase`, so it restores the
+        // terminal facts without leaving `Running`. The run boundary is what
+        // returns the shell to `Idle`, exactly as the runtime loop does it.
+        apply(
+            dsl::MeerkatMachineInput::Commit {
+                input_id: dsl::InputId::from_domain(&InputId::new()),
+                run_id: dsl::RunId::from_domain(&recovered_run),
+            },
+            "Commit(recovered run)",
+        );
+        apply(
+            dsl::MeerkatMachineInput::Prepare {
+                session_id: session_id.clone(),
+                run_id: dsl::RunId::from_domain(&completed_run),
+            },
+            "Prepare(completed run)",
+        );
+        apply(
+            dsl::MeerkatMachineInput::RunCompleted {
+                run_id: dsl::RunId::from_domain(&completed_run),
+            },
+            "RunCompleted(completed run)",
+        );
+        apply(
+            dsl::MeerkatMachineInput::Commit {
+                input_id: dsl::InputId::from_domain(&InputId::new()),
+                run_id: dsl::RunId::from_domain(&completed_run),
+            },
+            "Commit(completed run)",
+        );
+        apply(
+            dsl::MeerkatMachineInput::Prepare {
+                session_id,
+                run_id: dsl::RunId::from_domain(&failed_run),
+            },
+            "Prepare(skipped turn-start run)",
+        );
+        apply(
+            dsl::MeerkatMachineInput::RunFailed {
+                run_id: dsl::RunId::from_domain(&failed_run),
+                runtime_apply_failure_cause: runtime_apply_failure,
+                runtime_apply_failure_message: runtime_apply_failure
+                    .map(|_| failure_message.to_string()),
+                machine_terminal_failure_observed: false,
+                terminal_failure_source: None,
+                error: failure_message.to_string(),
+            },
+            "RunFailed(skipped turn-start run)",
+        );
+
+        driver
+    }
+
+    fn assert_stale_completed_terminal_state(
+        driver: &crate::meerkat_machine::driver::DriverEntry,
+        expected_stale_cause: Option<crate::meerkat_machine::dsl::TurnTerminalCauseKind>,
+    ) {
+        let authority = driver.shared_dsl_authority();
+        let authority = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = authority.state();
+        assert_eq!(
+            state.terminal_outcome,
+            Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::Completed),
+            "the fixture must reach the arm under test, not a different one"
+        );
+        assert_eq!(
+            state.terminal_cause_kind, expected_stale_cause,
+            "the stale cause the machine carries is the premise of this test"
+        );
+    }
+
+    /// The cause the host is told must be this run's, not the one the machine
+    /// happens to still be carrying.
+    ///
+    /// The machine's own coherence rule (`completed_terminal_is_coherent` on
+    /// the `ServiceTurnCommitted*` transitions) says a `Completed` terminal
+    /// carries no cause at all, so the `LlmFailure` visible here belongs to a
+    /// run that ended before this one. Reporting it would be the same defect as
+    /// the one this arm was written to fix, pointed the other way: a typed
+    /// reason that names a failure that did not happen.
+    ///
+    /// `last_runtime_apply_failure_cause` is the run-scoped fact - `RunFailed`
+    /// assigns it unconditionally - and it says this run failed applying its
+    /// runtime turn.
+    #[test]
+    fn completed_terminal_reports_this_runs_cause_not_the_stale_one() {
+        const DETAIL: &str = "run-boundary session save failed after the turn completed";
+        let driver = stale_completed_terminal_driver(
+            crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure,
+            Some(crate::meerkat_machine::dsl::RuntimeApplyFailureCause::RuntimeTurn),
+            DETAIL,
+        );
+        assert_stale_completed_terminal_state(
+            &driver,
+            Some(crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure),
+        );
+
+        let metadata = machine_terminal_completion_error(&driver, DETAIL.to_string())
+            .expect("a completed terminal with a failed runtime completion must resolve")
+            .expect("a failed runtime completion must carry typed metadata");
+
+        assert_eq!(
+            metadata.kind,
+            meerkat_core::TurnTerminalCauseKind::RuntimeApplyFailure,
+            "the host must be told the runtime apply failure that actually happened, not the \
+             dead cause the machine still carries next to a completed outcome"
+        );
+        assert_ne!(
+            metadata.kind,
+            meerkat_core::TurnTerminalCauseKind::LlmFailure,
+            "reporting the stale cause would name a failure this run never had"
+        );
+        assert_eq!(
+            metadata.outcome,
+            Some(meerkat_core::TurnTerminalOutcome::Failed),
+            "the metadata describes the runtime completion being delivered, which is abandoned \
+             work; durable machine-terminal recovery rejects any non-failure outcome outright"
+        );
+        assert_eq!(metadata.detail.as_deref(), Some(DETAIL));
+        assert!(metadata.terminal);
+    }
+
+    /// The digest contract the durable path enforces, stated as an equality
+    /// rather than trusted.
+    ///
+    /// `authorize_runtime_terminal_bundle` compares the delivered payload
+    /// against the candidate the failed-run realization staged, which is
+    /// `TurnErrorMetadata::runtime_apply_failure` over the same apply-failure
+    /// message. The derived metadata must be that value exactly, or the durable
+    /// batch resolves `AuthorityUnavailable` instead of a typed terminal.
+    ///
+    /// Both sides are produced independently: the left by driving the machine,
+    /// the right by the constructor the staging site calls.
+    #[test]
+    fn completed_terminal_metadata_matches_the_staged_durable_candidate() {
+        const DETAIL: &str = "run-boundary session save failed after the turn completed";
+        let driver = stale_completed_terminal_driver(
+            crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure,
+            Some(crate::meerkat_machine::dsl::RuntimeApplyFailureCause::RuntimeTurn),
+            DETAIL,
+        );
+
+        let metadata = machine_terminal_completion_error(&driver, DETAIL.to_string())
+            .expect("a completed terminal with a failed runtime completion must resolve")
+            .expect("a failed runtime completion must carry typed metadata");
+
+        assert_eq!(
+            metadata,
+            meerkat_core::TurnErrorMetadata::runtime_apply_failure(DETAIL),
+            "the delivered payload must digest identically to the staged candidate, or the \
+             durable batch answers AuthorityUnavailable instead of this terminal"
+        );
+    }
+
+    /// The fail-honest branch: a failed run that carries no runtime apply
+    /// failure of its own.
+    ///
+    /// No production caller reaches this today - `fail_runtime_loop_run` always
+    /// carries `Some(cause)` from `CoreExecutorError::apply_failure_cause`, and
+    /// the machine-terminal route cannot hold a `Completed` outcome at all. It
+    /// is pinned because the alternative is a branch that mints a confident
+    /// `runtime_apply_failure` for a run that had none, which is what the
+    /// hardcode did and what would silently return the moment `RunFailed`'s
+    /// inputs widen.
+    ///
+    /// `Unknown` is the vocabulary's own "not classified", and the
+    /// operator-facing detail still travels. It cannot become durable truth:
+    /// the candidate digest rejects it before any receipt is written, so this
+    /// branch fails closed at the waiter rather than persisting an
+    /// unclassified terminal.
+    #[test]
+    fn completed_terminal_without_this_runs_apply_failure_reports_an_unknown_cause() {
+        const DETAIL: &str = "runtime completion failed with no apply-failure cause of its own";
+        let driver = stale_completed_terminal_driver(
+            crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure,
+            None,
+            DETAIL,
+        );
+        assert_stale_completed_terminal_state(
+            &driver,
+            Some(crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure),
+        );
+
+        let metadata = machine_terminal_completion_error(&driver, DETAIL.to_string())
+            .expect("a completed terminal with a failed runtime completion must resolve")
+            .expect("a failed runtime completion must carry typed metadata");
+
+        assert_eq!(
+            metadata.kind,
+            meerkat_core::TurnTerminalCauseKind::Unknown,
+            "with no run-scoped apply failure and only an incoherent stale cause available, the \
+             honest answer is that the cause is unclassified"
+        );
+        assert!(
+            !metadata.kind.is_specific_failure_cause(),
+            "an unclassified cause must not read as a specific one to a host keying off it"
+        );
+        assert_eq!(metadata.detail.as_deref(), Some(DETAIL));
+    }
+
+    fn apply_generated_input(
+        driver: &crate::meerkat_machine::driver::DriverEntry,
+        input: crate::meerkat_machine::dsl::MeerkatMachineInput,
+        context: &str,
+    ) {
+        let authority = driver.shared_dsl_authority();
+        let mut authority = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(&mut *authority, input)
+            .unwrap_or_else(|err| panic!("generated machine rejected {context}: {err:?}"));
+    }
+
+    fn generated_session_id(
+        driver: &crate::meerkat_machine::driver::DriverEntry,
+    ) -> crate::meerkat_machine::dsl::SessionId {
+        let authority = driver.shared_dsl_authority();
+        let authority = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        authority
+            .state()
+            .session_id
+            .clone()
+            .expect("the fixture registered a session")
+    }
+
+    fn bound_ephemeral_driver() -> (crate::meerkat_machine::driver::DriverEntry, RunId) {
+        let mut driver = crate::driver::ephemeral::EphemeralRuntimeDriver::new(
+            crate::identifiers::LogicalRuntimeId::for_session(&SessionId::new()),
+        );
+        let first_run = RunId::new();
+        driver
+            .contract_begin_run_authority(first_run.clone())
+            .expect("the first run must bind through generated authority");
+        (
+            crate::meerkat_machine::driver::DriverEntry::Ephemeral(driver),
+            first_run,
+        )
+    }
+
+    fn assert_cancelled_terminal_with_cause(
+        driver: &crate::meerkat_machine::driver::DriverEntry,
+        expected_cause: crate::meerkat_machine::dsl::TurnTerminalCauseKind,
+    ) {
+        let authority = driver.shared_dsl_authority();
+        let authority = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = authority.state();
+        assert_eq!(
+            state.terminal_outcome,
+            Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::Cancelled),
+            "the fixture must reach the arm under test, not a different one"
+        );
+        assert_eq!(
+            state.terminal_cause_kind,
+            Some(expected_cause),
+            "a cancelled terminal carrying a failure cause is the premise of this test"
+        );
+    }
+
+    /// Assert the generated machine accepts the same authority state the shell
+    /// just resolved, and classifies it as a cancellation.
+    ///
+    /// This is the load-bearing half. A shell function that returns `Err` for a
+    /// state its own authority accepts is the defect class this release exists
+    /// to stop, so the test states the machine's answer rather than assuming
+    /// the shell's is unopposed.
+    fn assert_machine_classifies_cancelled(
+        driver: &crate::meerkat_machine::driver::DriverEntry,
+        run_id: &RunId,
+    ) {
+        let finalization = machine_failed_completion_finalization(driver);
+        assert_eq!(
+            finalization,
+            crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+            "a cancelled outcome is not a completed one, so the completion must still be \
+             finalized under Succeeded"
+        );
+        let authority = crate::meerkat_machine::driver::machine_resolve_runtime_completion_result(
+            driver,
+            Some(run_id),
+            crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::MachineTerminal,
+            finalization,
+        )
+        .expect(
+            "the generated machine accepts this state: ResolveRuntimeCompletionResultCancelled \
+             guards on the cancelled outcome and consults no cause at all",
+        );
+        assert_eq!(
+            authority.result_class(),
+            crate::meerkat_machine::dsl::RuntimeCompletionResultClass::Cancelled,
+            "the machine's own result class for this state is Cancelled, so no error metadata \
+             belongs in the shell's answer either"
+        );
+    }
+
+    /// Drive the generated machine to a cancelled terminal that still carries
+    /// an earlier run's failure cause, using nothing but real generated inputs.
+    ///
+    /// Every step is a transition the runtime already applies in production, in
+    /// the order it applies them:
+    ///
+    /// 1. `Prepare` binds a first run.
+    /// 2. `RecoverRuntimeCompletionResultCorrelation` restores a durable
+    ///    machine-failure terminal - what a process restart does after an
+    ///    earlier run failed. It sets `terminal_cause_kind` without touching
+    ///    `turn_phase`, which is how a cause outlives its run.
+    /// 3. `Commit` returns the shell to `Idle`.
+    /// 4. `Prepare` binds a second run: the skipped-turn-start class, which
+    ///    clears `turn_terminal_run_id` and inherits the stale cause. Only
+    ///    `StartConversationRun*` / `StartImmediate*` would have cleared it.
+    /// 5. `RunCancelled` cancels that run. It sets `terminal_outcome =
+    ///    Cancelled` and does not touch `terminal_cause_kind`, so the dead
+    ///    cause is now sitting next to a cancelled outcome.
+    fn cancelled_terminal_inheriting_a_stale_cause_driver(
+        stale_cause: crate::meerkat_machine::dsl::TurnTerminalCauseKind,
+    ) -> (crate::meerkat_machine::driver::DriverEntry, RunId) {
+        use crate::meerkat_machine::dsl;
+
+        let (driver, recovered_run) = bound_ephemeral_driver();
+        crate::meerkat_machine::driver::machine_recover_runtime_completion_result_correlation(
+            &driver,
+            &recovered_run,
+            crate::input_state::RuntimeCompletionTerminalRecovery::MachineFailure {
+                outcome: meerkat_core::TurnTerminalOutcome::Failed,
+                cause: meerkat_core::TurnTerminalCauseKind::from(stale_cause),
+            },
+        )
+        .expect("a durable machine-failure terminal must be recoverable");
+
+        let session_id = generated_session_id(&driver);
+        let cancelled_run = RunId::new();
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::Commit {
+                input_id: dsl::InputId::from_domain(&InputId::new()),
+                run_id: dsl::RunId::from_domain(&recovered_run),
+            },
+            "Commit(recovered run)",
+        );
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::Prepare {
+                session_id,
+                run_id: dsl::RunId::from_domain(&cancelled_run),
+            },
+            "Prepare(skipped turn-start run)",
+        );
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::RunCancelled {
+                run_id: dsl::RunId::from_domain(&cancelled_run),
+            },
+            "RunCancelled(skipped turn-start run)",
+        );
+        (driver, cancelled_run)
+    }
+
+    /// The cancel-path sibling of the carrier wedge, pinned on a state a
+    /// production caller reaches.
+    ///
+    /// PRODUCTION CALLER: [`realize_runtime_loop_terminal_owned`] with
+    /// `OwnedRuntimeLoopTerminalization::Cancelled`. It calls this function
+    /// after `cancel_runtime_loop_run` has applied `RunCancelled`, whenever the
+    /// cancelled run retained non-directed completion waiters, and it turns an
+    /// `Err` here into
+    /// `OwnedRuntimeLoopTerminalizationOutcome::CleanupCarrierCorrupt` by
+    /// short-circuiting its `and_then` chain. `process_queue` answers that
+    /// outcome by returning, which ends the runtime loop task for the remaining
+    /// life of the process.
+    ///
+    /// The reachability argument is inherited rather than new: it is the same
+    /// skipped-turn-start class the `Completed` arm already relies on, and no
+    /// cancel-producing transition clears `terminal_cause_kind`.
+    #[test]
+    fn cancelled_terminal_with_a_stale_cause_resolves_instead_of_wedging() {
+        let (driver, cancelled_run) = cancelled_terminal_inheriting_a_stale_cause_driver(
+            crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure,
+        );
+        assert_cancelled_terminal_with_cause(
+            &driver,
+            crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure,
+        );
+
+        let metadata =
+            machine_terminal_completion_error(&driver, "runtime run cancelled".to_string()).expect(
+                "a cancelled terminal carrying a dead cause must resolve; refusing it corrupts the \
+             recovery carrier and ends the runtime loop",
+            );
+
+        assert_eq!(
+            metadata, None,
+            "a cancellation carries no failure metadata, and the stale cause is not this run's \
+             to report"
+        );
+        assert_machine_classifies_cancelled(&driver, &cancelled_run);
+    }
+
+    /// The same arm reached from the other direction, with no recovery input
+    /// anywhere in the fixture: an ordinary cancelled run, then a
+    /// skipped-turn-start run that fails.
+    ///
+    /// PRODUCTION CALLERS: [`resolve_process_local_failed_run_waiters`] and
+    /// [`resolve_machine_terminal_completion_waiters_under_authority`], both
+    /// past `RunFailed`. The generated `RunFailed` update replaces
+    /// `terminal_outcome` only when it is absent, so it preserves the stale
+    /// `Cancelled` and fills `terminal_cause_kind` with this run's own
+    /// `RuntimeApplyFailure`. The cause the old code refused was written by the
+    /// machine one transition earlier.
+    ///
+    /// The shell must answer what the machine answers for this state, which is
+    /// `Cancelled` with no error metadata: reporting the failure cause instead
+    /// would contradict the generated result class, and refusing it wedges the
+    /// carrier.
+    #[test]
+    fn failed_run_inheriting_a_cancelled_outcome_resolves_instead_of_wedging() {
+        use crate::meerkat_machine::dsl;
+        const DETAIL: &str = "run-boundary session save failed after an inherited cancellation";
+
+        let (driver, cancelled_run) = bound_ephemeral_driver();
+        let session_id = generated_session_id(&driver);
+        let failed_run = RunId::new();
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::RunCancelled {
+                run_id: dsl::RunId::from_domain(&cancelled_run),
+            },
+            "RunCancelled(first run)",
+        );
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::Commit {
+                input_id: dsl::InputId::from_domain(&InputId::new()),
+                run_id: dsl::RunId::from_domain(&cancelled_run),
+            },
+            "Commit(cancelled run)",
+        );
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::Prepare {
+                session_id,
+                run_id: dsl::RunId::from_domain(&failed_run),
+            },
+            "Prepare(skipped turn-start run)",
+        );
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::RunFailed {
+                run_id: dsl::RunId::from_domain(&failed_run),
+                runtime_apply_failure_cause: Some(dsl::RuntimeApplyFailureCause::RuntimeTurn),
+                runtime_apply_failure_message: Some(DETAIL.to_string()),
+                machine_terminal_failure_observed: false,
+                terminal_failure_source: None,
+                error: DETAIL.to_string(),
+            },
+            "RunFailed(skipped turn-start run)",
+        );
+        assert_cancelled_terminal_with_cause(
+            &driver,
+            crate::meerkat_machine::dsl::TurnTerminalCauseKind::RuntimeApplyFailure,
+        );
+
+        let metadata = machine_terminal_completion_error(&driver, DETAIL.to_string()).expect(
+            "a failed run holding an inherited cancelled outcome must resolve; refusing it \
+             corrupts the recovery carrier and ends the runtime loop",
+        );
+
+        assert_eq!(
+            metadata, None,
+            "the machine classifies this state as a cancellation, so the shell must not attach \
+             failure metadata the generated result class contradicts"
+        );
+        assert_machine_classifies_cancelled(&driver, &failed_run);
     }
 }
