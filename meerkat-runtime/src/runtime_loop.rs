@@ -8940,18 +8940,20 @@ mod tests {
 
         // Exact counters, matching the exactness of the preserved
         // `max_attempts_abandonment_does_not_wedge_the_backlog` pin. The
-        // executor fails every apply, so both inputs eventually burn their
-        // generated attempts either way; what discriminates staged-vs-refused is
-        // WHERE the attempts came from:
-        //   post-fix laps: head staged+failed, follower staged+failed, head
-        //     staged+failed (cap -> abandoned), follower staged+failed (park)
-        //     => head 3, follower 2, applies 4
-        //   pre-fix laps: head REFUSED (counted, deferred, no apply), follower
-        //     staged+failed, head refused, follower staged+failed, head refused
-        //     (cap -> abandoned), follower staged+failed (park)
-        //     => head 3, follower 3, applies 3
-        // So the head's count alone proves nothing; `apply_calls`, the
-        // follower's count, and the rebound run association do.
+        // executor fails every apply, so both inputs burn their generated
+        // attempts either way; what discriminates staged-from-refused is
+        // WHERE the attempts came from.
+        //
+        // The loop no longer parks while a lane still holds queued work, so
+        // the follower is drained to its own cap in this same wake rather than
+        // left with attempts unspent. That RETIRED the follower's count as a
+        // discriminator: it reaches 3 whether the head staged or was refused.
+        // `apply_calls` is what still separates the two, and it separates them
+        // more sharply than before, because a refused head never applies:
+        //   staged (correct): every lap of both inputs reaches the executor.
+        //   refused (the regression this test exists for): only the follower's
+        //     laps reach it, and the head burns its budget on refusals.
+        // The rebound run association is the second live discriminator.
         let guard = driver.lock().await;
         match &*guard {
             crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
@@ -8968,10 +8970,11 @@ mod tests {
                 );
                 assert_eq!(
                     d.input_attempt_count(&follower_id),
-                    2,
-                    "the same wake must keep draining past the recovered head - a zero count \
-                     means the fifo backlog wedged behind it, and 3 means the head consumed its \
-                     laps on refusals instead of runs"
+                    3,
+                    "the same wake must keep draining past the recovered head, and past the \
+                     follower too: a zero count means the fifo backlog wedged behind the head, \
+                     and anything short of the cap means the loop parked while the lane still \
+                     held selectable queued work"
                 );
                 assert_eq!(
                     d.input_phase(&head_id),
@@ -8983,10 +8986,30 @@ mod tests {
             _ => panic!("expected ephemeral driver"),
         }
         assert_eq!(
-            apply_calls.load(Ordering::SeqCst),
-            4,
-            "every lap of this wake must reach the executor: a refused head never applies"
+            d_follower_phase(&guard, &follower_id),
+            Some(crate::input_state::InputLifecycleState::Abandoned),
+            "the follower is drained to its own generated cap in this wake rather than left \
+             queued with attempts unspent"
         );
+        drop(guard);
+        assert_eq!(
+            apply_calls.load(Ordering::SeqCst),
+            5,
+            "every lap of this wake that reaches staging must reach the executor: a refused head \
+             never applies, so this count is what separates a re-staged head from a re-refused \
+             one. Five, not six: the lap that carries an input past its generated cap \
+             terminalizes it instead of applying it"
+        );
+    }
+
+    fn d_follower_phase(
+        guard: &crate::meerkat_machine::DriverEntry,
+        input_id: &InputId,
+    ) -> Option<crate::input_state::InputLifecycleState> {
+        match guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => d.input_phase(input_id),
+            _ => panic!("expected ephemeral driver"),
+        }
     }
 
     /// The safety valve for a genuinely unstageable queued input. `StageForRun`

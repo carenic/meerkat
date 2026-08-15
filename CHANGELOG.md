@@ -43,6 +43,21 @@ via cargo-semver-checks against the published baselines).
 
 ### Fixed
 
+- A failed turn no longer silently disarms a member. When a turn failed, its
+  staged input was rolled back to queued and nothing re-armed the runtime loop.
+  The input stayed immediately selectable and nobody took the next lap, so it
+  sat until unrelated traffic happened to wake the loop, or forever. The loop
+  can no longer park while machine-owned lane truth still holds selectable
+  queued work, which makes returning work to a lane inseparable from coming back
+  for it.
+  Consequence to plan for, because it changes what a failing input costs: the
+  shell was under-delivering the machine's declared `max_stage_attempts = 3`,
+  granting one attempt per external wake with no wake owed, so a quiet member
+  spent one attempt and went dark. A persistently failing turn now spends three
+  applies BACK TO BACK WITHIN ONE WAKE and then terminalizes as
+  `Abandoned { MaxAttemptsExhausted }`. That is roughly three times the model
+  spend for a persistently failing input, in a burst, bought in exchange for a
+  typed terminal in seconds instead of silence.
 - An accepted input can no longer be starved indefinitely behind a backlog: a
   refused head is re-minted behind the queue with its attempt counted, and the
   attempt budget ends in a typed terminal rather than an unbounded retry. Two
