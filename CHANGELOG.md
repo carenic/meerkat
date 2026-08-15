@@ -39,7 +39,35 @@ via cargo-semver-checks against the published baselines).
   and persisted in durable session metadata, which carries a forward-compat
   consequence worth planning around: a session launched with read-only intent
   cannot have its metadata decoded by a pre-0.8.23 binary, so that session is
-  unresumable there until the binary is upgraded.
+  unresumable there until the binary is upgraded. The wire mirrors
+  `meerkat_contracts::WireToolAccessPolicy` and `WireResolvedToolAccessPolicy`
+  gain the same variant.
+- `meerkat_mob::MobEventKind` gains `SupervisorEscalationFailed`. The enum is not
+  `#[non_exhaustive]`, so any consumer that mirrors every event kind needs the
+  arm.
+- `meerkat_core::CompactionCommitCoordinationError::Rejected` is renamed to
+  `Refused`.
+- `meerkat_core::agent::compact::build_compaction_context` takes a sixth
+  parameter (the composed-request budget the escalation side now measures).
+- Externally-constructible structs gain fields, so struct-literal construction
+  breaks: `CompactionContext.request_context_budget`;
+  `FlowStepSpec.failure_policy` and `FrameStepSpec.failure_policy`;
+  `FlowFrameSeedAuthorityRecord.node_failure_policy`; the wire inputs
+  `MobFlowStepInput.failure_policy`, `MobFrameStepInput.failure_policy`,
+  `MobRepeatUntilInput.failure_policy`, `MobToolConfigInput.read_only` and
+  `PortableToolConfig.read_only`.
+- Machine-authority vocabulary changes, which are public because the generated
+  kernels are published. `MeerkatMachineInput` / `Input` gain
+  `ResolveUnstageableQueuedInput`; `MeerkatMachineEffect` / `Effect` gain
+  `SessionRegistrationRejected`; `InputAbandonReason` gains `NeverExecuted`;
+  `MeerkatMachineInput::RegisterSession` gains a `runtime_epoch_id` field and
+  `MobMachineInput::CreateFrameSeed` gains `node_failure_policy`;
+  `TransitionId::ResolveMemberRevivalSucceededRunning` is replaced by
+  `...RunningLocal` and `...RunningPlaced`, and new `TransitionId` variants land
+  for the epoch-conflict and unstageable-input transitions. Because
+  `EffectKind`, `InputKind` and `TransitionId` are dense enums, adding variants
+  also SHIFTS the discriminants of later ones - anything persisting a
+  discriminant numerically rather than by name must re-derive it.
 
 ### Known issues
 
