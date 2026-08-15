@@ -126,6 +126,7 @@ fn initialized_test_peer_projection_dsl(session_id: String) -> TestMeerkatMachin
     dsl.apply_input(
         meerkat_runtime::meerkat_machine::dsl::MeerkatMachineInput::RegisterSession {
             session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(session_id.clone()),
+            runtime_epoch_id: None,
         },
         "test::register_session",
     )

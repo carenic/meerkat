@@ -42,6 +42,7 @@ fn new_authority() -> Arc<HandleDslAuthority> {
     dsl.apply_input(
         mm_dsl::MeerkatMachineInput::RegisterSession {
             session_id: mm_dsl::SessionId::from("peer-projection-test".to_string()),
+            runtime_epoch_id: None,
         },
         "test::register_session",
     )

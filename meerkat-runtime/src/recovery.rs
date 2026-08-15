@@ -1704,8 +1704,10 @@ pub async fn recover_durable_tail(
     .await?;
 
     let mut authority =
-        crate::meerkat_machine::dsl_authority::new_registered_authority(&candidate.session_id)
-            .map_err(|error| DurableTailRecoveryError::Authority(error.to_string()))?;
+        crate::meerkat_machine::dsl_authority::new_registered_authority_without_runtime_entry(
+            &candidate.session_id,
+        )
+        .map_err(|error| DurableTailRecoveryError::Authority(error.to_string()))?;
     let transition = mm_dsl::MeerkatMachineMutator::apply(
         &mut authority,
         mm_dsl::MeerkatMachineInput::AuthorizeDurableTailRecovery {

@@ -957,10 +957,18 @@ mod generated_visibility_test_owner {
                     &state,
                     &input(
                         "RegisterSession",
-                        [(
-                            "session_id",
-                            named_string("SessionId", "tool-scope-test-session".to_string()),
-                        )],
+                        [
+                            (
+                                "session_id",
+                                named_string("SessionId", "tool-scope-test-session".to_string()),
+                            ),
+                            // The kernel refuses an input missing any DECLARED
+                            // field, so the registration-owned runtime epoch is
+                            // present even where this fixture registers
+                            // epochlessly (no runtime binding is involved in
+                            // tool visibility).
+                            ("runtime_epoch_id", KernelValue::None),
+                        ],
                     ),
                 )
                 .expect("generated MeerkatMachine register session")

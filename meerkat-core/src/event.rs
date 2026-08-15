@@ -1541,6 +1541,167 @@ impl ExternalToolDelta {
     }
 }
 
+/// Scope of the token-axis evidence offered to
+/// [`CompactionPreservedHistoryFit::classify`].
+///
+/// The two scopes are not interchangeable, which is why the scope is carried
+/// in the type rather than left to the caller's discipline: a budget measured
+/// over the preserved transcript alone omits the visible tool set and the
+/// output reserve that ride the very same request, so it is a floor. It can
+/// prove an excess and never a fit.
+///
+/// Not a wire type: this is the classifier's input vocabulary, and only the
+/// resulting [`CompactionPreservedHistoryFit`] crosses the event boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionFitTokenEvidence {
+    /// Budget of the exact composed provider request the boundary measured:
+    /// request messages, the visible tool definitions, and the effective
+    /// output reserve. Decisive in both directions.
+    ComposedRequest(crate::ContextBudgetState),
+    /// Budget measured over the preserved history alone, with no tools and no
+    /// output reserve. A floor on the composed request, so `Within` proves
+    /// nothing.
+    PreservedHistoryFloor(crate::ContextBudgetState),
+}
+
+/// Byte-axis evidence offered to
+/// [`CompactionPreservedHistoryFit::classify`].
+///
+/// Both variants report the same measurement: the exact provider-lowered body
+/// of the composed request, compared against the effective request-byte cap
+/// (the compactor's cap, else the provider witness's own). The comparison is
+/// carried in the type for the same reason the token scope is: its absence is
+/// not a third outcome of it. No lowered-body witness and no cap in force are
+/// both "this axis measured nothing", and an axis that measured nothing cannot
+/// supply the half of a fit that only it can measure.
+///
+/// Not a wire type: this is the classifier's input vocabulary, and only the
+/// resulting [`CompactionPreservedHistoryFit`] crosses the event boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionFitByteEvidence {
+    /// The exact lowered body is within the effective request-byte cap.
+    LoweredBodyWithinCap,
+    /// The exact lowered body exceeds the effective request-byte cap.
+    /// Decisive on its own: the next turn's body can only be larger.
+    LoweredBodyOverCap,
+}
+
+/// Whether the history a failed compaction preserved can still be sent.
+///
+/// This is the severity discriminator for compaction-persistence failures: the
+/// same refusal is a log line on a session that still fits its window and a
+/// hard wedge on one that does not (every subsequent turn is refused, and the
+/// only path out is a compaction that persists). Classification reuses the
+/// pre-dispatch authorities rather than a second limit table:
+/// [`ContextBudgetState`](crate::ContextBudgetState) over the active model
+/// profile's window, and the compactor's effective request-byte cap over the
+/// exact provider-lowered body size.
+///
+/// Both authorities are read at composed-request scope, which is the scope the
+/// question is asked at: the transcript is not what crosses the provider
+/// boundary, the request built from it is. A transcript-only token measure
+/// under-reports every request by the tool schemas that ride it, which is the
+/// exact shape that used to be reported as [`Self::StillFits`] while every
+/// turn died on the provider's context limit.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CompactionPreservedHistoryFit {
+    /// Nothing proved an excess, and no axis established a fit at
+    /// composed-request scope: the active model declares no context window,
+    /// the provider exposed no lowered-body witness or no request-byte cap is
+    /// in force, or the only token evidence available was a preserved-history
+    /// floor that did not cross. One measured axis is not a fit either, so a
+    /// composed request within the window with no cap comparison behind it
+    /// lands here. Absence of evidence is reported as such rather than as a
+    /// fit.
+    Unclassified,
+    /// The composed request the preserved history produces remains within the
+    /// active context window and under the effective request-byte cap. Both
+    /// axes measured and both fit; an axis that measured nothing yields
+    /// [`Self::Unclassified`] instead. The run continues normally; the failed
+    /// persistence costs a summary call and a retry, not progress.
+    StillFits,
+    /// The composed request the preserved history produces already exceeds the
+    /// active context window, or the preserved history alone does, or the
+    /// exact lowered body exceeds the effective request-byte cap. The session
+    /// cannot make progress until a compaction persists.
+    OverWindow,
+}
+
+impl CompactionPreservedHistoryFit {
+    /// Classify from the byte-axis and token-axis evidence the compaction
+    /// boundary could measure.
+    ///
+    /// Either axis is `None` when that authority measured nothing:
+    /// `byte_evidence` when no provider lowered-body witness exists or no
+    /// effective request-byte cap is in force, `token_evidence` when the
+    /// active model profile declares no context window.
+    ///
+    /// The two directions are deliberately asymmetric. Either axis proving an
+    /// excess is decisive on its own, because one crossed limit already wedges
+    /// the session. A fit is the conjunction [`Self::StillFits`] states, so it
+    /// requires both halves to have been measured: an exact lowered body
+    /// within the cap AND [`CompactionFitTokenEvidence::ComposedRequest`]
+    /// within the window. Neither axis can stand in for the other - the byte
+    /// axis says nothing about tokens, the token axis says nothing about
+    /// bytes, and a preserved-history floor says nothing about the tools and
+    /// reserve the same request carries.
+    #[must_use]
+    pub fn classify(
+        byte_evidence: Option<CompactionFitByteEvidence>,
+        token_evidence: Option<CompactionFitTokenEvidence>,
+    ) -> Self {
+        if byte_evidence == Some(CompactionFitByteEvidence::LoweredBodyOverCap) {
+            return Self::OverWindow;
+        }
+        match token_evidence {
+            // Forecast and exact evidence are both decisive here: unlike
+            // pre-dispatch refusal (which may only act on an exact
+            // provider-issued count), this fact routes host severity and must
+            // not stay silent while a forecast-visible strand wedges. A floor
+            // that already crosses is decisive for the same reason: the
+            // composed request can only be larger.
+            Some(
+                CompactionFitTokenEvidence::ComposedRequest(
+                    crate::ContextBudgetState::Exceeded
+                    | crate::ContextBudgetState::ForecastExceeded,
+                )
+                | CompactionFitTokenEvidence::PreservedHistoryFloor(
+                    crate::ContextBudgetState::Exceeded
+                    | crate::ContextBudgetState::ForecastExceeded,
+                ),
+            ) => Self::OverWindow,
+            // The fit direction is a conjunction over both axes, and only the
+            // byte axis can measure its half. Reaching here with no cap
+            // comparison behind the request is one measured axis, not a fit:
+            // `AgentLlmClient::request_pressure` defaults to no witness, so
+            // every host client that does not override it arrives with the
+            // byte axis unmeasured, and claiming a byte fit for it is the same
+            // over-report on the byte axis that transcript-only token
+            // accounting was on the token axis.
+            Some(CompactionFitTokenEvidence::ComposedRequest(
+                crate::ContextBudgetState::Within,
+            )) => {
+                if byte_evidence == Some(CompactionFitByteEvidence::LoweredBodyWithinCap) {
+                    Self::StillFits
+                } else {
+                    Self::Unclassified
+                }
+            }
+            // A floor that stays within the window measured less than the
+            // request the next turn sends, so it cannot answer the question
+            // this fact is asked. Reporting the scope it did measure means
+            // reporting no verdict.
+            Some(CompactionFitTokenEvidence::PreservedHistoryFloor(
+                crate::ContextBudgetState::Within,
+            ))
+            | None => Self::Unclassified,
+        }
+    }
+}
+
 /// Typed, serializable cause of a non-fatal compaction failure.
 ///
 /// Compaction is best-effort: when it fails the agent continues with the
@@ -1591,6 +1752,27 @@ pub enum CompactionFailureReason {
         /// Display projection of the commit error.
         message: String,
     },
+    /// The runtime refused to authorize the durable transcript+memory handoff,
+    /// so the original (uncompacted) history was preserved.
+    ///
+    /// Distinct from [`Self::MemoryIndexingFailed`]: the memory store never saw
+    /// the batch. The refusal is a runtime-authority fact, and
+    /// `preserved_history` says whether the session can still make progress
+    /// while it persists: a wedged member needs paging, a fitting one needs a
+    /// log line. When no authority could answer that at composed-request
+    /// scope, it says so
+    /// ([`CompactionPreservedHistoryFit::Unclassified`]) rather than guessing.
+    ProjectionHandoffRefused {
+        /// Typed cause of the runtime refusal.
+        refusal: crate::memory::CompactionHandoffRefusal,
+        /// Whether the request the preserved history composes can still be
+        /// sent to the provider.
+        preserved_history: CompactionPreservedHistoryFit,
+        /// Number of discard entries that would have been projected.
+        attempted_entries: usize,
+        /// Display projection of the refusal's exact facts.
+        message: String,
+    },
 }
 
 impl CompactionFailureReason {
@@ -1627,6 +1809,22 @@ impl CompactionFailureReason {
             message: message.into(),
         }
     }
+
+    /// Runtime refusal of the durable projection handoff, carrying the typed
+    /// cause and the fit of the history the refusal preserved.
+    #[must_use]
+    pub fn projection_handoff_refused(
+        error: &crate::memory::CompactionCommitCoordinationError,
+        preserved_history: CompactionPreservedHistoryFit,
+        attempted_entries: usize,
+    ) -> Self {
+        Self::ProjectionHandoffRefused {
+            refusal: error.refusal(),
+            preserved_history,
+            attempted_entries,
+            message: error.to_string(),
+        }
+    }
 }
 
 impl std::fmt::Display for CompactionFailureReason {
@@ -1651,6 +1849,17 @@ impl std::fmt::Display for CompactionFailureReason {
                     "failed to commit compaction transcript rewrite: {message}"
                 )
             }
+            Self::ProjectionHandoffRefused {
+                refusal,
+                preserved_history,
+                attempted_entries,
+                message,
+            } => write!(
+                f,
+                "runtime refused the durable compaction projection handoff \
+                 ({refusal:?}, {attempted_entries} entries attempted, preserved history \
+                 {preserved_history:?}): {message}"
+            ),
         }
     }
 }
@@ -2435,6 +2644,148 @@ mod tests {
     use crate::retry::{LlmRetryFailure, LlmRetryFailureKind, LlmRetryPlan, LlmRetrySchedule};
     use crate::skills::SkillName;
     use crate::types::{ContentBlock, Usage};
+
+    /// A fit is a conjunction over both axes and either axis alone can prove
+    /// an excess. Absence on either axis is reported as absence, never as a
+    /// fit - a false "still fits" on a wedged session is the failure this
+    /// discriminator exists to prevent.
+    #[test]
+    fn preserved_history_fit_never_claims_a_fit_without_a_window_authority() {
+        use crate::ContextBudgetState as Budget;
+        use CompactionFitByteEvidence as Bytes;
+        use CompactionFitTokenEvidence as Evidence;
+        use CompactionPreservedHistoryFit as Fit;
+
+        assert_eq!(Fit::classify(None, None), Fit::Unclassified);
+        assert_eq!(
+            Fit::classify(Some(Bytes::LoweredBodyWithinCap), None),
+            Fit::Unclassified
+        );
+        assert_eq!(
+            Fit::classify(
+                Some(Bytes::LoweredBodyWithinCap),
+                Some(Evidence::ComposedRequest(Budget::Within))
+            ),
+            Fit::StillFits
+        );
+        assert_eq!(
+            Fit::classify(None, Some(Evidence::ComposedRequest(Budget::Within))),
+            Fit::Unclassified,
+            "a composed request within the window with no cap comparison behind it is one \
+             measured axis, not the two-axis fit `StillFits` states"
+        );
+        assert_eq!(
+            Fit::classify(
+                Some(Bytes::LoweredBodyOverCap),
+                Some(Evidence::ComposedRequest(Budget::Within))
+            ),
+            Fit::OverWindow,
+            "an exact byte excess is decisive even when the token axis fits"
+        );
+        assert_eq!(
+            Fit::classify(
+                None,
+                Some(Evidence::ComposedRequest(Budget::ForecastExceeded))
+            ),
+            Fit::OverWindow,
+            "severity routing must not wait for an exact provider token count"
+        );
+        assert_eq!(
+            Fit::classify(None, Some(Evidence::ComposedRequest(Budget::Exceeded))),
+            Fit::OverWindow
+        );
+    }
+
+    /// The scope rule, which is the whole reason the evidence carries its own
+    /// scope: a transcript-only measure omits the tool schemas and the output
+    /// reserve that ride the same request, so it may only ever prove an excess.
+    /// This is the exact shape of a session whose transcript fits its window
+    /// while every composed turn dies on the provider's context limit.
+    #[test]
+    fn a_preserved_history_floor_can_prove_an_excess_but_never_a_fit() {
+        use crate::ContextBudgetState as Budget;
+        use CompactionFitByteEvidence as Bytes;
+        use CompactionFitTokenEvidence as Evidence;
+        use CompactionPreservedHistoryFit as Fit;
+
+        assert_eq!(
+            Fit::classify(None, Some(Evidence::PreservedHistoryFloor(Budget::Within))),
+            Fit::Unclassified,
+            "history alone staying within the window says nothing about the request built from it"
+        );
+        assert_eq!(
+            Fit::classify(
+                Some(Bytes::LoweredBodyWithinCap),
+                Some(Evidence::PreservedHistoryFloor(Budget::Within))
+            ),
+            Fit::Unclassified,
+            "a body under the byte cap does not upgrade a floor into a fit"
+        );
+        assert_eq!(
+            Fit::classify(
+                None,
+                Some(Evidence::PreservedHistoryFloor(Budget::ForecastExceeded))
+            ),
+            Fit::OverWindow,
+            "a floor that already crosses is decisive: the composed request is only larger"
+        );
+        assert_eq!(
+            Fit::classify(
+                None,
+                Some(Evidence::PreservedHistoryFloor(Budget::Exceeded))
+            ),
+            Fit::OverWindow
+        );
+        assert_eq!(
+            Fit::classify(
+                Some(Bytes::LoweredBodyOverCap),
+                Some(Evidence::PreservedHistoryFloor(Budget::Within))
+            ),
+            Fit::OverWindow,
+            "the byte axis remains decisive on its own scope"
+        );
+    }
+
+    #[test]
+    fn projection_handoff_refusal_carries_the_coordinators_typed_cause() {
+        let error = crate::memory::CompactionCommitCoordinationError::refused(
+            crate::memory::CompactionHandoffRefusal::RuntimeEpochRotated,
+            "runtime epoch changed",
+        );
+        let reason = CompactionFailureReason::projection_handoff_refused(
+            &error,
+            CompactionPreservedHistoryFit::OverWindow,
+            7,
+        );
+        match &reason {
+            CompactionFailureReason::ProjectionHandoffRefused {
+                refusal,
+                preserved_history,
+                attempted_entries,
+                message,
+            } => {
+                assert_eq!(
+                    *refusal,
+                    crate::memory::CompactionHandoffRefusal::RuntimeEpochRotated
+                );
+                assert_eq!(
+                    *preserved_history,
+                    CompactionPreservedHistoryFit::OverWindow
+                );
+                assert_eq!(*attempted_entries, 7);
+                assert!(message.contains("runtime epoch changed"));
+            }
+            other => panic!("unexpected reason: {other:?}"),
+        }
+        let round_trip: CompactionFailureReason =
+            serde_json::from_str(&serde_json::to_string(&reason).expect("serialize reason"))
+                .expect("the new reason must round-trip on the wire");
+        assert_eq!(round_trip, reason);
+        assert!(
+            reason.to_string().contains("RuntimeEpochRotated"),
+            "the display projection must name the typed cause: {reason}"
+        );
+    }
 
     mod peer_content_ingested_projection {
         use super::super::{AgentEvent, peer_content_ingested_events};

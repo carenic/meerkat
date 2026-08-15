@@ -4929,6 +4929,7 @@ mod tests {
                 session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(
                     "meerkat-comms-runtime-test-projection",
                 ),
+                runtime_epoch_id: None,
             },
             "test_projection_add_authority::register_session",
         )
@@ -5050,6 +5051,7 @@ mod tests {
                 session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(
                     "meerkat-comms-runtime-test-projection",
                 ),
+                runtime_epoch_id: None,
             },
             "test_projection_remove_authority::register_session",
         )

@@ -27,7 +27,11 @@ struct RuntimeCompactionCommitCoordinator {
             Option<crate::meerkat_machine::dsl::Generation>,
         )>,
     >,
-    runtime_epoch_id: crate::meerkat_machine::dsl::RuntimeEpochId,
+    /// The epoch this coordinator authorizes against. Re-derivable: the DSL
+    /// authority owns the session's live epoch, so a coordinator whose epoch
+    /// rotated under it can adopt the live value once per authorization instead
+    /// of wedging the session's durable compaction forever.
+    runtime_epoch_id: std::sync::Mutex<crate::meerkat_machine::dsl::RuntimeEpochId>,
     allow_late_binding: bool,
     dsl_authority: Arc<crate::handles::HandleDslAuthority>,
     store: Option<Arc<dyn crate::store::RuntimeStore>>,
@@ -509,6 +513,96 @@ async fn commit_head_canonical_control_snapshot(
     }
 }
 
+impl RuntimeCompactionCommitCoordinator {
+    const AUTHORIZE_CONTEXT: &'static str =
+        "RuntimeCompactionCommitCoordinator::authorize_projection";
+
+    /// Sample the session's live binding, re-deriving the epoch at most once.
+    ///
+    /// A rotated epoch under a live session is the benign race
+    /// (`RegisterSessionResumesStopped` re-registers the entry): the DSL
+    /// authority is the epoch's owner, so the coordinator re-reads it and
+    /// re-validates against the fresh value. The bound is exactly one attempt
+    /// per authorization, and the re-read is a second acquisition of the
+    /// authority lock, so a rotation racing the retry refuses instead of
+    /// looping. Safety does not rest on this check: the placement latch below
+    /// still fences a re-placed runtime, and the transcript
+    /// revision/fingerprint CAS at the runtime's atomic apply is what makes a
+    /// commit against the wrong history impossible. This covers epoch-only
+    /// changes; a placement rotation is never adopted.
+    fn sample_live_binding(
+        &self,
+    ) -> Result<
+        (
+            crate::meerkat_machine::dsl::AgentRuntimeId,
+            Option<crate::meerkat_machine::dsl::FenceToken>,
+            Option<crate::meerkat_machine::dsl::Generation>,
+        ),
+        meerkat_core::memory::CompactionCommitCoordinationError,
+    > {
+        let dsl_session_id = crate::meerkat_machine::dsl::SessionId::from_domain(&self.session_id);
+        let mut epoch = self
+            .runtime_epoch_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let refusal = match self.dsl_authority.current_runtime_binding(
+            &dsl_session_id,
+            &epoch,
+            Self::AUTHORIZE_CONTEXT,
+        ) {
+            Ok(binding) => return Ok(binding),
+            Err(refusal) => refusal,
+        };
+        let crate::handles::RuntimeBindingSampleRefusal::EpochChanged {
+            current: Some(live_epoch),
+            ..
+        } = &refusal
+        else {
+            return Err(Self::refusal_error(&refusal));
+        };
+        let live_epoch = live_epoch.clone();
+        let binding = self
+            .dsl_authority
+            .current_runtime_binding(&dsl_session_id, &live_epoch, Self::AUTHORIZE_CONTEXT)
+            .map_err(|retry_refusal| {
+                tracing::warn!(
+                    initial = %refusal,
+                    retry = %retry_refusal,
+                    "bounded compaction epoch re-derivation did not recover the runtime binding"
+                );
+                Self::refusal_error(&retry_refusal)
+            })?;
+        tracing::warn!(
+            initial = %refusal,
+            "adopted the session's live runtime epoch for compaction commit authorization"
+        );
+        *epoch = live_epoch;
+        Ok(binding)
+    }
+
+    fn refusal_error(
+        refusal: &crate::handles::RuntimeBindingSampleRefusal,
+    ) -> meerkat_core::memory::CompactionCommitCoordinationError {
+        use crate::handles::RuntimeBindingSampleRefusal as Refusal;
+        use meerkat_core::memory::CompactionHandoffRefusal as Cause;
+        let cause = match refusal {
+            // A gate refusal and a session rebind both mean this
+            // session/epoch pair is no longer the authority's live pair.
+            Refusal::AuthorityUnavailable(_) | Refusal::SessionChanged { .. } => {
+                Cause::RuntimeEpochRetired
+            }
+            Refusal::EpochChanged {
+                current: Some(_), ..
+            } => Cause::RuntimeEpochRotated,
+            // No live epoch to rotate to: the entry is unregistered or its
+            // epoch was cleared.
+            Refusal::EpochChanged { current: None, .. } => Cause::RuntimeEpochRetired,
+            Refusal::PlacementAbsent => Cause::RuntimeBindingAbsent,
+        };
+        meerkat_core::memory::CompactionCommitCoordinationError::refused(cause, refusal.to_string())
+    }
+}
+
 impl meerkat_core::memory::CompactionCommitCoordinator for RuntimeCompactionCommitCoordinator {
     fn authorize_projection(
         &self,
@@ -523,26 +617,20 @@ impl meerkat_core::memory::CompactionCommitCoordinator for RuntimeCompactionComm
             );
         }
         let store = self.store.as_ref().ok_or_else(|| {
-            meerkat_core::memory::CompactionCommitCoordinationError::Rejected(
-                "runtime binding has no durable RuntimeStore".to_string(),
+            meerkat_core::memory::CompactionCommitCoordinationError::refused(
+                meerkat_core::memory::CompactionHandoffRefusal::DurableProjectionUnsupported,
+                "runtime binding has no durable RuntimeStore",
             )
         })?;
         if !store.supports_compaction_projection_outbox() {
             return Err(
-                meerkat_core::memory::CompactionCommitCoordinationError::Rejected(
-                    "runtime store does not support atomic compaction projection outbox"
-                        .to_string(),
+                meerkat_core::memory::CompactionCommitCoordinationError::refused(
+                    meerkat_core::memory::CompactionHandoffRefusal::DurableProjectionUnsupported,
+                    "runtime store does not support atomic compaction projection outbox",
                 ),
             );
         }
-        let current = self
-            .dsl_authority
-            .current_runtime_binding(
-                &crate::meerkat_machine::dsl::SessionId::from_domain(&self.session_id),
-                &self.runtime_epoch_id,
-                "RuntimeCompactionCommitCoordinator::authorize_projection",
-            )
-            .map_err(meerkat_core::memory::CompactionCommitCoordinationError::Rejected)?;
+        let current = self.sample_live_binding()?;
         let mut expected = self
             .runtime_binding
             .lock()
@@ -551,9 +639,12 @@ impl meerkat_core::memory::CompactionCommitCoordinator for RuntimeCompactionComm
             Some(expected) if expected == &current => {}
             Some(expected) => {
                 return Err(
-                    meerkat_core::memory::CompactionCommitCoordinationError::Rejected(format!(
-                        "runtime binding rotated (expected {expected:?}, current {current:?})"
-                    )),
+                    meerkat_core::memory::CompactionCommitCoordinationError::refused(
+                        meerkat_core::memory::CompactionHandoffRefusal::RuntimeBindingRotated,
+                        format!(
+                            "runtime binding rotated (expected {expected:?}, current {current:?})"
+                        ),
+                    ),
                 );
             }
             None if self.allow_late_binding => {
@@ -565,9 +656,9 @@ impl meerkat_core::memory::CompactionCommitCoordinator for RuntimeCompactionComm
             }
             None => {
                 return Err(
-                    meerkat_core::memory::CompactionCommitCoordinationError::Rejected(
-                        "session resources do not carry an authoritative runtime binding"
-                            .to_string(),
+                    meerkat_core::memory::CompactionCommitCoordinationError::refused(
+                        meerkat_core::memory::CompactionHandoffRefusal::RuntimeBindingAbsent,
+                        "session resources do not carry an authoritative runtime binding",
                     ),
                 );
             }
@@ -581,6 +672,9 @@ mod compaction_coordinator_tests {
     use super::*;
     use meerkat_core::memory::CompactionCommitCoordinator;
 
+    use crate::meerkat_machine::dsl;
+    use meerkat_core::memory::CompactionHandoffRefusal;
+
     fn projection(session_id: &SessionId) -> meerkat_core::CompactionProjectionId {
         serde_json::from_value(serde_json::json!({
             "session_id": session_id,
@@ -591,101 +685,305 @@ mod compaction_coordinator_tests {
         .expect("persisted compaction projection fixture")
     }
 
+    struct CoordinatorFixture {
+        session_id: SessionId,
+        dsl_session_id: dsl::SessionId,
+        dsl_epoch_id: dsl::RuntimeEpochId,
+        authority: Arc<std::sync::Mutex<dsl::MeerkatMachineAuthority>>,
+        teardown_gate: Arc<crate::handles::HandleTeardownGate>,
+        handle: Arc<crate::handles::HandleDslAuthority>,
+    }
+
+    impl CoordinatorFixture {
+        fn new() -> Self {
+            let session_id = SessionId::new();
+            let dsl_session_id = dsl::SessionId::from_domain(&session_id);
+            let dsl_epoch_id =
+                dsl::RuntimeEpochId::from_domain(&meerkat_core::RuntimeEpochId::new());
+            let authority = Arc::new(std::sync::Mutex::new(dsl::MeerkatMachineAuthority::new()));
+            let teardown_gate = crate::handles::HandleTeardownGate::open();
+            let handle = Arc::new(
+                crate::handles::HandleDslAuthority::from_shared_with_teardown_gate(
+                    Arc::clone(&authority),
+                    Arc::clone(&teardown_gate),
+                ),
+            );
+            Self {
+                session_id,
+                dsl_session_id,
+                dsl_epoch_id,
+                authority,
+                teardown_gate,
+                handle,
+            }
+        }
+
+        fn coordinator(&self, allow_late_binding: bool) -> RuntimeCompactionCommitCoordinator {
+            RuntimeCompactionCommitCoordinator {
+                session_id: self.session_id.clone(),
+                runtime_binding: std::sync::Mutex::new(None),
+                runtime_epoch_id: std::sync::Mutex::new(self.dsl_epoch_id.clone()),
+                allow_late_binding,
+                dsl_authority: Arc::clone(&self.handle),
+                store: Some(Arc::new(crate::store::memory::InMemoryRuntimeStore::new())),
+            }
+        }
+
+        fn register(&self) {
+            self.handle
+                .apply_signal(
+                    dsl::MeerkatMachineSignal::Initialize,
+                    "compaction_coordinator_test::initialize",
+                )
+                .expect("initialize machine");
+            self.handle
+                .apply_input(
+                    dsl::MeerkatMachineInput::RegisterSession {
+                        session_id: self.dsl_session_id.clone(),
+                        runtime_epoch_id: Some(self.dsl_epoch_id.clone()),
+                    },
+                    "compaction_coordinator_test::register",
+                )
+                .expect("register session");
+        }
+
+        fn bind(&self, fence_token: u64) {
+            self.handle
+                .apply_input(
+                    dsl::MeerkatMachineInput::PrepareBindings {
+                        agent_runtime_id: dsl::AgentRuntimeId::from("mob-runtime"),
+                        fence_token: dsl::FenceToken::from(fence_token),
+                        generation: Some(dsl::Generation::from(3)),
+                        runtime_epoch_id: Some(self.dsl_epoch_id.clone()),
+                        session_id: self.dsl_session_id.clone(),
+                    },
+                    "compaction_coordinator_test::bind",
+                )
+                .expect("mob binding");
+        }
+
+        fn register_and_bind(&self, fence_token: u64) {
+            self.register();
+            self.bind(fence_token);
+        }
+
+        /// Rewrite live DSL state directly. Production reaches these states
+        /// through registration/placement transitions across process lifetimes;
+        /// a unit test cannot replay a competing registrar, so it recovers the
+        /// authority from the exact state that registrar would have left.
+        fn rewrite_state(&self, mutate: impl FnOnce(&mut dsl::MeerkatMachineState)) {
+            let mut guard = self
+                .authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = guard.state().clone();
+            mutate(&mut state);
+            *guard = dsl::MeerkatMachineAuthority::recover_from_state(state)
+                .expect("rewritten authority state must satisfy the machine invariants");
+        }
+    }
+
+    fn refusal_of(
+        error: &meerkat_core::memory::CompactionCommitCoordinationError,
+    ) -> CompactionHandoffRefusal {
+        error.refusal()
+    }
+
     #[test]
     fn local_binding_rejects_before_mob_bind_accepts_after_and_rejects_stale_epoch() {
-        let session_id = SessionId::new();
-        let dsl_session_id = crate::meerkat_machine::dsl::SessionId::from_domain(&session_id);
-        let epoch_id = meerkat_core::RuntimeEpochId::new();
-        let dsl_epoch_id = crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(&epoch_id);
-        let authority = Arc::new(std::sync::Mutex::new(
-            crate::meerkat_machine::dsl::MeerkatMachineAuthority::new(),
-        ));
-        let teardown_gate = crate::handles::HandleTeardownGate::open();
-        let handle = Arc::new(
-            crate::handles::HandleDslAuthority::from_shared_with_teardown_gate(
-                Arc::clone(&authority),
-                Arc::clone(&teardown_gate),
-            ),
-        );
-        let coordinator = RuntimeCompactionCommitCoordinator {
-            session_id: session_id.clone(),
-            runtime_binding: std::sync::Mutex::new(None),
-            runtime_epoch_id: dsl_epoch_id.clone(),
-            allow_late_binding: true,
-            dsl_authority: Arc::clone(&handle),
-            store: Some(Arc::new(crate::store::memory::InMemoryRuntimeStore::new())),
-        };
+        let fixture = CoordinatorFixture::new();
+        let session_id = fixture.session_id.clone();
+        let teardown_gate = Arc::clone(&fixture.teardown_gate);
+        let coordinator = fixture.coordinator(true);
         let projection = projection(&session_id);
 
         assert!(coordinator.authorize_projection(&projection).is_err());
-        handle
-            .apply_signal(
-                crate::meerkat_machine::dsl::MeerkatMachineSignal::Initialize,
-                "compaction_coordinator_test::initialize",
-            )
-            .expect("initialize machine");
-        handle
-            .apply_input(
-                crate::meerkat_machine::dsl::MeerkatMachineInput::RegisterSession {
-                    session_id: dsl_session_id.clone(),
-                },
-                "compaction_coordinator_test::register",
-            )
-            .expect("register session");
-        handle
-            .apply_input(
-                crate::meerkat_machine::dsl::MeerkatMachineInput::PrepareBindings {
-                    agent_runtime_id: crate::meerkat_machine::dsl::AgentRuntimeId::from(
-                        "mob-runtime",
-                    ),
-                    fence_token: crate::meerkat_machine::dsl::FenceToken::from(7),
-                    generation: Some(crate::meerkat_machine::dsl::Generation::from(3)),
-                    runtime_epoch_id: Some(dsl_epoch_id),
-                    session_id: dsl_session_id,
-                },
-                "compaction_coordinator_test::bind",
-            )
-            .expect("mob binding");
+        fixture.register_and_bind(7);
         coordinator
             .authorize_projection(&projection)
             .expect("late generated mob binding must be accepted and latched");
 
-        {
-            let mut guard = authority
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut rotated = guard.state().clone();
-            rotated.active_fence_token = Some(crate::meerkat_machine::dsl::FenceToken::from(8));
-            *guard =
-                crate::meerkat_machine::dsl::MeerkatMachineAuthority::recover_from_state(rotated)
-                    .expect("same-epoch rotated binding state");
-        }
-        assert!(
-            coordinator.authorize_projection(&projection).is_err(),
-            "a same-gate fence rotation must not be accepted by the latched coordinator"
+        fixture.rewrite_state(|state| {
+            state.active_fence_token = Some(dsl::FenceToken::from(8));
+        });
+        let rotated = coordinator.authorize_projection(&projection).expect_err(
+            "a same-gate fence rotation must not be accepted by the latched coordinator",
+        );
+        assert_eq!(
+            refusal_of(&rotated),
+            CompactionHandoffRefusal::RuntimeBindingRotated
         );
 
         // Restore the originally latched facts to distinguish epoch teardown
         // rejection from the binding-rotation assertion above.
-        {
-            let mut guard = authority
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut restored = guard.state().clone();
-            restored.active_fence_token = Some(crate::meerkat_machine::dsl::FenceToken::from(7));
-            *guard =
-                crate::meerkat_machine::dsl::MeerkatMachineAuthority::recover_from_state(restored)
-                    .expect("restored binding state");
-        }
+        fixture.rewrite_state(|state| {
+            state.active_fence_token = Some(dsl::FenceToken::from(7));
+        });
         coordinator
             .authorize_projection(&projection)
             .expect("restored exact binding must match the latch");
 
         teardown_gate.close();
-        assert!(
-            coordinator.authorize_projection(&projection).is_err(),
-            "a coordinator from the torn-down epoch must fail closed"
+        let torn_down = coordinator
+            .authorize_projection(&projection)
+            .expect_err("a coordinator from the torn-down epoch must fail closed");
+        assert_eq!(
+            refusal_of(&torn_down),
+            CompactionHandoffRefusal::RuntimeEpochRetired
         );
+    }
+
+    /// A rotated epoch under a live session is the benign race the design
+    /// names: registration re-mints the entry epoch while a running agent still
+    /// holds a coordinator from the previous one. One bounded re-derivation
+    /// adopts the live value, so the member's durable compaction persists
+    /// instead of being refused forever.
+    #[test]
+    fn epoch_only_rotation_is_recovered_by_one_bounded_rederivation() {
+        let fixture = CoordinatorFixture::new();
+        let coordinator = fixture.coordinator(true);
+        let projection = projection(&fixture.session_id);
+        fixture.register_and_bind(7);
+        coordinator
+            .authorize_projection(&projection)
+            .expect("the initial binding latches");
+
+        let rotated_epoch = dsl::RuntimeEpochId::from_domain(&meerkat_core::RuntimeEpochId::new());
+        fixture.rewrite_state(|state| {
+            state.active_runtime_epoch_id = Some(rotated_epoch.clone());
+        });
+
+        coordinator.authorize_projection(&projection).expect(
+            "an epoch-only rotation must be recovered by the single bounded re-derivation, not \
+             wedge durable compaction",
+        );
+        assert_eq!(
+            *coordinator
+                .runtime_epoch_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            rotated_epoch,
+            "the re-derived epoch must be adopted so later authorizations start from live truth"
+        );
+        coordinator
+            .authorize_projection(&projection)
+            .expect("the adopted epoch must authorize without re-deriving again");
+    }
+
+    /// The re-derivation is recovery for the epoch alone. A placement rotation
+    /// riding along still fails closed on the latch, and a second rotation
+    /// racing the retry has no second attempt to catch it.
+    #[test]
+    fn rederivation_never_adopts_a_rotated_placement() {
+        let fixture = CoordinatorFixture::new();
+        let coordinator = fixture.coordinator(true);
+        let projection = projection(&fixture.session_id);
+        fixture.register_and_bind(7);
+        coordinator
+            .authorize_projection(&projection)
+            .expect("the initial binding latches");
+
+        fixture.rewrite_state(|state| {
+            state.active_runtime_epoch_id = Some(dsl::RuntimeEpochId::from_domain(
+                &meerkat_core::RuntimeEpochId::new(),
+            ));
+            state.active_fence_token = Some(dsl::FenceToken::from(9));
+        });
+
+        let error = coordinator
+            .authorize_projection(&projection)
+            .expect_err("a re-placed runtime must not be authorized by epoch re-derivation");
+        assert_eq!(
+            refusal_of(&error),
+            CompactionHandoffRefusal::RuntimeBindingRotated
+        );
+    }
+
+    /// A cleared epoch is not a rotation: there is no live value to adopt, so
+    /// the coordinator refuses with the retired cause rather than re-deriving
+    /// its way into an epochless session (the exact state the 0.8.23 wedge
+    /// left behind).
+    #[test]
+    fn cleared_epoch_refuses_as_retired_without_rederivation() {
+        let fixture = CoordinatorFixture::new();
+        let coordinator = fixture.coordinator(true);
+        let projection = projection(&fixture.session_id);
+        fixture.register_and_bind(7);
+        coordinator
+            .authorize_projection(&projection)
+            .expect("the initial binding latches");
+
+        fixture.rewrite_state(|state| {
+            state.active_runtime_epoch_id = None;
+        });
+
+        let error = coordinator
+            .authorize_projection(&projection)
+            .expect_err("an epochless session cannot authorize a durable handoff");
+        assert_eq!(
+            refusal_of(&error),
+            CompactionHandoffRefusal::RuntimeEpochRetired
+        );
+        assert_eq!(
+            *coordinator
+                .runtime_epoch_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            fixture.dsl_epoch_id,
+            "a refused re-derivation must not move the coordinator's epoch"
+        );
+    }
+
+    /// The remaining refusal causes a host routes on.
+    #[test]
+    fn refusal_causes_are_typed_per_structural_reason() {
+        let fixture = CoordinatorFixture::new();
+        let projection = projection(&fixture.session_id);
+
+        let mut storeless = fixture.coordinator(true);
+        storeless.store = None;
+        let error = storeless
+            .authorize_projection(&projection)
+            .expect_err("a runtime with no durable store cannot commit a durable pair");
+        assert_eq!(
+            refusal_of(&error),
+            CompactionHandoffRefusal::DurableProjectionUnsupported
+        );
+
+        let foreign = fixture.coordinator(true);
+        let error = foreign
+            .authorize_projection(&projection_for_other_session())
+            .expect_err("a foreign projection is refused");
+        assert_eq!(
+            refusal_of(&error),
+            CompactionHandoffRefusal::SessionMismatch
+        );
+
+        // Registered and epoch-bearing but not yet placed: the window the
+        // registration-owned epoch created.
+        fixture.register();
+        let unplaced = fixture.coordinator(true);
+        let error = unplaced
+            .authorize_projection(&projection)
+            .expect_err("a registered-unplaced session has no placement to commit against");
+        assert_eq!(
+            refusal_of(&error),
+            CompactionHandoffRefusal::RuntimeBindingAbsent
+        );
+
+        fixture.bind(7);
+        let strict = fixture.coordinator(false);
+        let error = strict
+            .authorize_projection(&projection)
+            .expect_err("a canonical coordinator refuses an unlatched binding");
+        assert_eq!(
+            refusal_of(&error),
+            CompactionHandoffRefusal::RuntimeBindingAbsent
+        );
+    }
+
+    fn projection_for_other_session() -> meerkat_core::CompactionProjectionId {
+        projection(&SessionId::new())
     }
 }
 
@@ -1151,7 +1449,7 @@ impl MeerkatMachine {
                 Arc::new(RuntimeCompactionCommitCoordinator {
                     session_id,
                     runtime_binding: std::sync::Mutex::new(compaction_runtime_binding),
-                    runtime_epoch_id: compaction_runtime_epoch_id,
+                    runtime_epoch_id: std::sync::Mutex::new(compaction_runtime_epoch_id),
                     allow_late_binding: allow_late_compaction_binding,
                     dsl_authority: shared_handle_authority,
                     store: self.store.clone(),
@@ -1926,6 +2224,9 @@ impl MeerkatMachine {
         } else {
             crate::meerkat_machine::dsl::MeerkatMachineInput::RegisterSession {
                 session_id: dsl_session_id,
+                // The entry epoch this preparation owns. A warm/idempotent
+                // registration restates it; a cold revival installs it.
+                runtime_epoch_id: Some(current_epoch.clone()),
             }
         };
         match self
@@ -1941,6 +2242,28 @@ impl MeerkatMachine {
             .await
         {
             Ok(staged) => {
+                // The machine may ACCEPT the registration and return a refusal
+                // verdict (a different entry epoch is registered under this
+                // session id). Surface it as stale authority; never let it read
+                // as an idempotent no-op.
+                if let Some(refusal) = staged.effects.session_registration_refusal() {
+                    release_failed_materialization_claim(
+                        &materialization_claim_state,
+                        materialization_claim_id,
+                    );
+                    drop(mutation_guard);
+                    self.cleanup_failed_materialization_claim(
+                        &session_id,
+                        inserted_by_call,
+                        &epoch_id,
+                        materialization_claim_id,
+                        &materialization_claim_state,
+                    )
+                    .await;
+                    return Err(RuntimeDriverError::StaleAuthority {
+                        reason: format!("session {session_id}: {refusal}"),
+                    });
+                }
                 if staged.revived_stopped_session() {
                     // Machine-emitted revival: refresh the durable lifecycle
                     // record so cross-process readers never observe a stale
@@ -2672,25 +2995,51 @@ impl MeerkatMachine {
                     return Ok(MeerkatMachineCommandResult::Unit);
                 }
                 let _registration_gate_guard = self.lock_registration_gate(&sid).await?;
+                // The entry that `register_session_inner` just published owns
+                // the runtime epoch this registration restates.
+                let entry_epoch_id = {
+                    let sessions = self.sessions.read().await;
+                    sessions
+                        .get(&sid)
+                        .map(|entry| entry.epoch_id.clone())
+                        .ok_or(RuntimeDriverError::NotReady {
+                            state: RuntimeState::Destroyed,
+                        })?
+                };
                 // Stage-first: the generated machine owns the legality verdict.
                 // RegisterSession is not declared from Destroyed (it is a
                 // resurrection input the DestroyedShapeInvariant forbids), so a
                 // resident OR cold-recovered Destroyed binding is rejected by
                 // the machine and classified as the terminal `Destroyed` truth
                 // — never silently skipped, never preflighted in the shell. A
-                // same-binding re-registration is the machine-owned
-                // `RegisterSessionIdempotent` no-op.
-                if let Err(reason) = self
-                    .stage_session_dsl_input(
+                // same-binding, same-epoch re-registration is the machine-owned
+                // `RegisterSessionIdempotent` no-op; a same-binding registration
+                // naming a different entry epoch is the machine-owned refusal
+                // verdict handled below.
+                let staged = match self
+                    .stage_session_dsl_transition(
                         &sid,
                         crate::meerkat_machine::dsl::MeerkatMachineInput::RegisterSession {
                             session_id: crate::meerkat_machine::dsl::SessionId::from_domain(&sid),
+                            runtime_epoch_id: Some(
+                                crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(
+                                    &entry_epoch_id,
+                                ),
+                            ),
                         },
                         "RegisterSession",
                     )
                     .await
                 {
-                    return Err(self.classify_session_dsl_rejection(&sid, reason).await);
+                    Ok(staged) => staged,
+                    Err(reason) => {
+                        return Err(self.classify_session_dsl_rejection(&sid, reason).await);
+                    }
+                };
+                if let Some(refusal) = staged.effects.session_registration_refusal() {
+                    return Err(RuntimeDriverError::StaleAuthority {
+                        reason: format!("session {sid}: {refusal}"),
+                    });
                 }
                 Ok(MeerkatMachineCommandResult::Unit)
             }

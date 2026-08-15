@@ -46,6 +46,26 @@ pub struct CompactionContext {
     /// threshold) must be visible to trigger decisions in the same unit the
     /// provider enforces.
     pub estimated_request_bytes: u64,
+    /// Whole-request token budget for the exact request this boundary would
+    /// send, when the active model profile declares a context window.
+    ///
+    /// The two token measures above are not commensurable with the threshold
+    /// they are compared against. `last_input_tokens` is the provider's own
+    /// count, so it already includes tool schemas and provider framing, and it
+    /// lags the transcript by whatever the current boundary appended.
+    /// `estimated_history_tokens` measures the transcript alone: no tool
+    /// definitions, no blob payloads a later hydration pass inlines, no output
+    /// reserve. A threshold derived from the model context window has to hold
+    /// the whole request, so comparing it against a strictly smaller quantity
+    /// under-triggers by exactly the omitted components. This fact is the same
+    /// measurement the pre-dispatch preflight performs, over the fully
+    /// hydrated request messages, the exact visible tool set, and the effective
+    /// output reserve.
+    ///
+    /// `None` is truthful rather than tolerant: custom and self-hosted models
+    /// may declare no context window, and no substitute ceiling may be invented
+    /// for them.
+    pub request_context_budget: Option<crate::ContextBudgetFact>,
     /// Exact provider-lowered request-body pressure, when the active client can
     /// prove it. This is measured after ordered System-message projection,
     /// blob hydration, tool selection, provider-parameter resolution, replay

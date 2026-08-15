@@ -12019,7 +12019,8 @@ macro_rules! mob_catalog_machine_dsl {
         // exactly one shell materialization attempt via the emitted
         // ReviveAuthorized verdict. A missing durable snapshot is a terminal
         // restore failure (existing Broken classification). Resolution comes
-        // back as a typed signal: success clears the obligation; failure
+        // back as a typed signal: success clears the obligation and, on the
+        // local lane, re-emits the member's runtime binding request; failure
         // converts it into the Broken classification, whose `not_broken`
         // guard below refuses any further revival authorization — fail-closed,
         // no retry loop.
@@ -12064,13 +12065,62 @@ macro_rules! mob_catalog_machine_dsl {
             }
         }
 
-        transition ResolveMemberRevivalSucceededRunning {
+        // Revival resolution re-establishes the runtime binding for a LOCAL
+        // member. A successful revival re-materialized the member's live
+        // session, but nothing on that path re-establishes the consumer's
+        // PLACEMENT tuple: revival prepares LOCAL session resources, which
+        // register the entry without committing a placement, and the
+        // consumer's re-admission arms clear the placement triple by
+        // construction. A revived member with no placement is registered but
+        // unplaced, so every routed work request is refused on the placement
+        // guards - live, and unable to take work. This arm is the one emit
+        // site that closes that gap, sourced from the machine's own membership
+        // maps rather than from a shell probe.
+        //
+        // The effect deliberately carries no runtime epoch: the epoch is a
+        // consumer-owned fact about a consumer-owned session entry, resolved
+        // on that side, and MobMachine must never learn or forward it. An
+        // identical tuple is an idempotent no-op on the consumer, an absent
+        // one binds, and a different one is a contained typed rejection.
+        //
+        // Presence is guarded rather than defaulted: a map accessor yields the
+        // field default for an absent key, so an unguarded emit would route an
+        // empty session id or a zero fence token. A revival that cannot name
+        // the exact tuple matches NO arm and is refused, instead of resolving
+        // the obligation and leaving the member permanently unbindable.
+        transition ResolveMemberRevivalSucceededRunningLocal {
             on signal ResolveMemberRevivalSucceeded { agent_identity }
             guard { self.lifecycle_phase == Phase::Running }
             guard "revival_pending" { self.member_revival_pending.contains(agent_identity) == true }
-            guard "placed_carrier_binding_active_or_local" {
-                self.member_placement.contains_key(agent_identity) == false
-                || mob_machine_placed_carrier_binding_active(self.member_placement, self.current_placed_spawn_host_binding_generations, self.host_bind_phase, self.host_binding_generations, agent_identity)
+            guard "member_is_local" { self.member_placement.contains_key(agent_identity) == false }
+            guard "runtime_binding_present" { self.identity_to_runtime.contains_key(agent_identity) == true }
+            guard "fence_binding_present" { self.identity_runtime_fence_tokens.contains_key(agent_identity) == true }
+            guard "generation_binding_present" { self.identity_runtime_generations.contains_key(agent_identity) == true }
+            guard "session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
+            update {
+                self.member_revival_pending.remove(agent_identity);
+            }
+            to Running
+            emit RequestRuntimeBinding {
+                agent_identity: agent_identity,
+                agent_runtime_id: self.identity_to_runtime.get_cloned(agent_identity).get("value"),
+                fence_token: self.identity_runtime_fence_tokens.get_copied(agent_identity).get("value"),
+                generation: self.identity_runtime_generations.get_copied(agent_identity),
+                session_id: self.member_session_bindings.get_cloned(agent_identity).get("value")
+            }
+        }
+
+        // A placed member's runtime binding belongs to its member host, which
+        // binds it explicitly - the same reason CommitSpawnMembershipRemote
+        // emits no RequestRuntimeBinding. Revival on this lane resolves the
+        // obligation and stays out of the tuple.
+        transition ResolveMemberRevivalSucceededRunningPlaced {
+            on signal ResolveMemberRevivalSucceeded { agent_identity }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "revival_pending" { self.member_revival_pending.contains(agent_identity) == true }
+            guard "member_is_placed" { self.member_placement.contains_key(agent_identity) == true }
+            guard "placed_carrier_binding_active" {
+                mob_machine_placed_carrier_binding_active(self.member_placement, self.current_placed_spawn_host_binding_generations, self.host_bind_phase, self.host_binding_generations, agent_identity)
             }
             update {
                 self.member_revival_pending.remove(agent_identity);

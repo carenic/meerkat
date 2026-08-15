@@ -2175,7 +2175,10 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ClassifyMemberLiveMaterializationTerminal`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
-- `ResolveMemberRevivalSucceededRunning`
+- `ResolveMemberRevivalSucceededRunningLocal`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalSucceededRunningPlaced`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `ResolveMemberRevivalFailedRunning`

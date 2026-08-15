@@ -1034,6 +1034,10 @@ impl MobSupervisorBridge {
         dsl.apply_input(
             meerkat_runtime::meerkat_machine::dsl::MeerkatMachineInput::RegisterSession {
                 session_id: session_id.clone(),
+                // Honestly epochless: the supervisor bridge authority projects
+                // peer interaction for a participant name, not a runtime session
+                // entry, so it owns no entry runtime epoch.
+                runtime_epoch_id: None,
             },
             "mob_supervisor_bridge::register",
         )

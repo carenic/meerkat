@@ -9057,6 +9057,54 @@ impl std::fmt::Display for SessionLlmIdentity {
         f.write_str(&self.0)
     }
 }
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum SessionRegistrationRejectReasonKind {
+    #[default]
+    #[serde(rename = "RuntimeEpochConflict")]
+    RuntimeEpochConflict,
+}
+impl SessionRegistrationRejectReasonKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RuntimeEpochConflict => "RuntimeEpochConflict",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for SessionRegistrationRejectReasonKind {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "RuntimeEpochConflict" => Ok(Self::RuntimeEpochConflict),
+            other => Err(format!(
+                "invalid SessionRegistrationRejectReasonKind value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for SessionRegistrationRejectReasonKind {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for SessionRegistrationRejectReasonKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 #[derive(
     Debug,
     Clone,
@@ -11457,6 +11505,7 @@ pub mod inputs {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RegisterSession {
         pub session_id: SessionId,
+        pub runtime_epoch_id: Option<RuntimeEpochId>,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct AuthorizeDurableTailRecovery {
@@ -14704,6 +14753,13 @@ pub mod effects {
         pub active_op_count: u64,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SessionRegistrationRejected {
+        pub session_id: SessionId,
+        pub reason: SessionRegistrationRejectReasonKind,
+        pub registered_runtime_epoch_id: Option<RuntimeEpochId>,
+        pub attempted_runtime_epoch_id: Option<RuntimeEpochId>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct OpLifecycleTransitionRejected {
         pub operation_id: String,
         pub action: OpLifecycleActionKind,
@@ -15251,6 +15307,7 @@ pub enum Effect {
     RuntimeObservedCompletionCursorAdvanced(effects::RuntimeObservedCompletionCursorAdvanced),
     RuntimeInjectedCompletionCursorAdvanced(effects::RuntimeInjectedCompletionCursorAdvanced),
     OpRegistrationAdmissionResolved(effects::OpRegistrationAdmissionResolved),
+    SessionRegistrationRejected(effects::SessionRegistrationRejected),
     OpLifecycleTransitionRejected(effects::OpLifecycleTransitionRejected),
     WaitAllAdmissionResolved(effects::WaitAllAdmissionResolved),
     WaitAllSatisfied(effects::WaitAllSatisfied),
@@ -15425,6 +15482,7 @@ pub enum EffectKind {
     RuntimeObservedCompletionCursorAdvanced,
     RuntimeInjectedCompletionCursorAdvanced,
     OpRegistrationAdmissionResolved,
+    SessionRegistrationRejected,
     OpLifecycleTransitionRejected,
     WaitAllAdmissionResolved,
     WaitAllSatisfied,
@@ -15936,6 +15994,10 @@ pub enum TransitionId {
     RegisterSessionIdempotentAttached,
     RegisterSessionIdempotentRunning,
     RegisterSessionIdempotentRetired,
+    RegisterSessionEpochConflictRejectedIdle,
+    RegisterSessionEpochConflictRejectedAttached,
+    RegisterSessionEpochConflictRejectedRunning,
+    RegisterSessionEpochConflictRejectedRetired,
     RegisterSessionResumesStopped,
     RegisterSessionNewBindingFromStopped,
     StageDeferredSession,

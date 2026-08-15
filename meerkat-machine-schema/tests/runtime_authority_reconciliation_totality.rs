@@ -27,7 +27,9 @@ fn expected_decision(
     agent_runtime_id: &Option<AgentRuntimeId>,
     fence_token: Option<FenceToken>,
     runtime_generation: Option<Generation>,
-    runtime_epoch_id: &Option<RuntimeEpochId>,
+    // Part of the complete raw-observation tuple, and deliberately not read: the
+    // retained entry epoch does not participate in the convergence decision.
+    _runtime_epoch_id: &Option<RuntimeEpochId>,
     current_run_id: &Option<RunId>,
     pre_run_phase: Option<PreRunPhase>,
     malformed_reclaim_safe: bool,
@@ -36,12 +38,16 @@ fn expected_decision(
         RuntimeAuthorityObservationKind::Missing => {
             RuntimeAuthorityReconcileDecision::NormalizeOrReplace
         }
+        // A persisted runtime epoch is NOT part of the clean unbound
+        // projection: the entry epoch is a per-process registration fact, so a
+        // decoded row carrying one without a placement is the registered-unplaced
+        // shape that a fresh registration re-establishes anyway. Classifying it
+        // as NormalizeOrReplace would churn a CAS write on every cold recovery.
         RuntimeAuthorityObservationKind::Decoded
             if state == Some(RuntimeLifecycleObservedState::Idle)
                 && agent_runtime_id.is_none()
                 && fence_token.is_none()
                 && runtime_generation.is_none()
-                && runtime_epoch_id.is_none()
                 && current_run_id.is_none()
                 && pre_run_phase.is_none() =>
         {
@@ -105,6 +111,54 @@ fn runtime_authority_classifier_is_one_state_free_initializing_self_loop() {
         transition.guards.is_empty(),
         "phase extraction may constrain `from`, but no observation-shape guard is allowed"
     );
+}
+
+/// A decoded, unplaced Idle row is Converged whether or not it retained a
+/// runtime epoch: the entry epoch is a per-process registration fact, so a
+/// retained one is not evidence of a torn placement. Classifying it as
+/// NormalizeOrReplace would make every cold recovery of a registered-unplaced
+/// entry churn a lifecycle CAS write.
+#[test]
+fn unplaced_idle_row_converges_with_or_without_a_retained_runtime_epoch() {
+    for epoch in [
+        None,
+        Some(RuntimeEpochId(
+            "epoch-registered-previous-process".to_owned(),
+        )),
+    ] {
+        let mut authority = MeerkatMachineAuthority::new();
+        let result = MeerkatMachineMutator::apply(
+            &mut authority,
+            MeerkatMachineInput::ClassifyRuntimeAuthorityReconciliation {
+                observation_kind: RuntimeAuthorityObservationKind::Decoded,
+                state: Some(RuntimeLifecycleObservedState::Idle),
+                agent_runtime_id: None,
+                fence_token: None,
+                runtime_generation: None,
+                runtime_epoch_id: epoch.clone(),
+                current_run_id: None,
+                pre_run_phase: None,
+                malformed_reclaim_safe: false,
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "the classifier is total over every decoded tuple; epoch={epoch:?}: {:?}",
+            result.as_ref().err()
+        );
+        let Ok(transition) = result else {
+            continue;
+        };
+        assert_eq!(
+            transition.into_effects(),
+            vec![
+                MeerkatMachineEffect::RuntimeAuthorityReconciliationClassified {
+                    decision: RuntimeAuthorityReconcileDecision::Converged,
+                }
+            ],
+            "unplaced Idle row with epoch={epoch:?} must be a fixed point"
+        );
+    }
 }
 
 #[test]
@@ -222,7 +276,9 @@ fn runtime_authority_classifier_is_total_over_every_raw_tuple() {
     // 5 record kinds x 8 optional lifecycle states x 2^5 optional binding/run
     // presences x 4 optional pre-run values x 2 reclaim-safety values.
     assert_eq!(cases, 10_240);
-    // The exact clean decoded Idle row is the sole fixed point; the reclaim bit
-    // is irrelevant outside Malformed, so that row appears twice.
-    assert_eq!(converged, 2);
+    // The clean unplaced decoded Idle row is the sole fixed point; the reclaim
+    // bit is irrelevant outside Malformed and the retained entry epoch is
+    // orthogonal to placement, so that row appears four times (epoch present or
+    // absent x reclaim-safe or not).
+    assert_eq!(converged, 4);
 }

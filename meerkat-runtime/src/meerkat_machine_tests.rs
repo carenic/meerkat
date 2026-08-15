@@ -1130,18 +1130,37 @@ impl crate::composition::SignalConsumerSurface for RejectingMeerkatSignalSurface
     }
 }
 
+/// A placement for a session already registered under `runtime_epoch_id`.
+///
+/// The epoch is an assertion against the registration, never a write, so a
+/// placement helper cannot invent one: callers read the registered value off the
+/// authority with [`registered_runtime_epoch_id`].
 fn prepare_bindings_input(
     session_id: &SessionId,
     runtime_id: &str,
     fence_token: u64,
+    runtime_epoch_id: dsl::RuntimeEpochId,
 ) -> dsl::MeerkatMachineInput {
     dsl::MeerkatMachineInput::PrepareBindings {
         agent_runtime_id: dsl::AgentRuntimeId::from(runtime_id.to_string()),
         fence_token: dsl::FenceToken(fence_token),
         generation: Some(dsl::Generation(0)),
-        runtime_epoch_id: None,
+        runtime_epoch_id: Some(runtime_epoch_id),
         session_id: dsl::SessionId::from_domain(session_id),
     }
+}
+
+/// The entry runtime epoch a registered session's authority carries.
+async fn registered_runtime_epoch_id(
+    machine: &MeerkatMachine,
+    session_id: &SessionId,
+) -> dsl::RuntimeEpochId {
+    machine
+        .session_dsl_state(session_id)
+        .await
+        .expect("registered authority exists")
+        .active_runtime_epoch_id
+        .expect("registration installs the entry runtime epoch")
 }
 
 fn install_recording_meerkat_signal_dispatcher(
@@ -1194,10 +1213,11 @@ async fn provisional_dsl_stage_does_not_emit_routed_signal_until_authoritative_a
         .expect("register session");
     let signal_surface = install_recording_meerkat_signal_dispatcher(&machine);
 
+    let registered_epoch = registered_runtime_epoch_id(&machine, &session_id).await;
     let previous_snapshot = machine
         .stage_session_dsl_input(
             &session_id,
-            prepare_bindings_input(&session_id, "rt-provisional", 7),
+            prepare_bindings_input(&session_id, "rt-provisional", 7, registered_epoch.clone()),
             "PrepareBindings(test provisional)",
         )
         .await
@@ -1215,7 +1235,7 @@ async fn provisional_dsl_stage_does_not_emit_routed_signal_until_authoritative_a
     let (_, effects) = machine
         .apply_session_dsl_input(
             &session_id,
-            prepare_bindings_input(&session_id, "rt-authoritative", 11),
+            prepare_bindings_input(&session_id, "rt-authoritative", 11, registered_epoch),
             "PrepareBindings(test authoritative)",
         )
         .await
@@ -1245,10 +1265,11 @@ async fn provisional_dsl_rollback_after_shell_failure_leaks_no_routed_signal_or_
         .expect("register session");
     let signal_surface = install_recording_meerkat_signal_dispatcher(&machine);
 
+    let registered_epoch = registered_runtime_epoch_id(&machine, &session_id).await;
     let previous_snapshot = machine
         .stage_session_dsl_input(
             &session_id,
-            prepare_bindings_input(&session_id, "rt-rolled-back", 17),
+            prepare_bindings_input(&session_id, "rt-rolled-back", 17, registered_epoch),
             "PrepareBindings(test rollback)",
         )
         .await
@@ -1274,10 +1295,11 @@ async fn authoritative_dsl_apply_preserves_committed_state_when_effect_dispatch_
         .expect("register session");
     install_rejecting_meerkat_signal_dispatcher(&machine);
 
+    let registered_epoch = registered_runtime_epoch_id(&machine, &session_id).await;
     let err = match machine
         .apply_session_dsl_input(
             &session_id,
-            prepare_bindings_input(&session_id, "rt-dispatch-fails", 23),
+            prepare_bindings_input(&session_id, "rt-dispatch-fails", 23, registered_epoch),
             "PrepareBindings(test dispatch failure)",
         )
         .await
@@ -5036,6 +5058,13 @@ async fn unregister_session_unsupported_atomic_finalization_fails_closed() {
         .register_session(session_id.clone())
         .await
         .expect("register session");
+    let entry_runtime_epoch_id = adapter
+        .session_dsl_state(&session_id)
+        .await
+        .expect("registered authority exists")
+        .active_runtime_epoch_id
+        .expect("registration installs the entry runtime epoch")
+        .0;
     let lifecycle_before = crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id)
         .await
         .unwrap()
@@ -5066,10 +5095,30 @@ async fn unregister_session_unsupported_atomic_finalization_fails_closed() {
         RuntimeState::Stopped,
         "external cleanup cannot be rolled back to live Idle when finalization is unsupported"
     );
+    // The PLACEMENT must be untouched. The row's runtime epoch is a different
+    // fact: registration owns it, and any authority-projecting persist records
+    // it, so the retryable anchor written here legitimately carries the entry
+    // epoch that the registration-time row (committed before the authority
+    // existed) did not.
     assert_eq!(
-        lifecycle_after.binding(),
-        lifecycle_before.binding(),
-        "failed finalization must not rewrite the runtime binding"
+        lifecycle_after.binding().agent_runtime_id(),
+        lifecycle_before.binding().agent_runtime_id(),
+        "failed finalization must not rewrite the runtime owner"
+    );
+    assert_eq!(
+        lifecycle_after.binding().fence_token(),
+        lifecycle_before.binding().fence_token(),
+        "failed finalization must not rewrite the fence"
+    );
+    assert_eq!(
+        lifecycle_after.binding().runtime_generation(),
+        lifecycle_before.binding().runtime_generation(),
+        "failed finalization must not rewrite the generation"
+    );
+    assert_eq!(
+        lifecycle_after.binding().runtime_epoch_id(),
+        Some(entry_runtime_epoch_id.as_str()),
+        "the retryable anchor projects the registered entry epoch"
     );
     let unregister_progress = lifecycle_after
         .unregister_progress()
@@ -8260,13 +8309,16 @@ async fn durable_unregister_then_prepare_bindings_starts_fresh_epoch() {
     assert!(adapter.contains_session(&session_id).await);
 }
 
-/// Machine-level revival semantics: the revival arms preserve session
-/// identity and hydrated LLM/capability state while clearing the
-/// epoch-scoped runtime binding tuple (Stopped proves the bound epoch's
-/// executor exited; the next `PrepareBindings` binds the new epoch), and
-/// both revival arms refuse while an unregister drain window is open.
+/// Machine-level revival semantics: the revival arms preserve session identity
+/// and hydrated LLM/capability state while clearing the PLACEMENT triple
+/// (Stopped proves the bound executor exited; the next `PrepareBindings`
+/// re-places the session). The entry runtime epoch is registration-owned, so
+/// `RegisterSession` revival INSTALLS the epoch it registers under, while
+/// `EnsureSessionWithExecutor` - which is not a registration - PRESERVES the
+/// registered one. Both revival arms refuse while an unregister drain window is
+/// open.
 #[test]
-fn revival_arms_preserve_identity_clear_epoch_binding_and_refuse_while_draining() {
+fn revival_arms_preserve_identity_reset_placement_and_refuse_while_draining() {
     use crate::meerkat_machine::dsl as mm_dsl;
 
     let stopped_state = || mm_dsl::MeerkatMachineState {
@@ -8277,11 +8329,11 @@ fn revival_arms_preserve_identity_clear_epoch_binding_and_refuse_while_draining(
         active_runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-1".to_string())),
         ..Default::default()
     };
-    let assert_epoch_binding_cleared = |state: &mm_dsl::MeerkatMachineState, arc: &str| {
+    let assert_placement_cleared = |state: &mm_dsl::MeerkatMachineState, arc: &str| {
         assert_eq!(
             state.active_runtime_id, None,
-            "{arc}: the runtime binding is epoch-scoped; Stopped proves the bound \
-             epoch's executor exited, so revival must clear it (a preserved dead \
+            "{arc}: the placement triple is executor-scoped; Stopped proves the \
+             bound executor exited, so revival must clear it (a preserved dead \
              binding makes every PrepareBindings re-bind guard-rejected — the \
              0.7.25 identity-first cold-revival wedge)"
         );
@@ -8290,29 +8342,28 @@ fn revival_arms_preserve_identity_clear_epoch_binding_and_refuse_while_draining(
             state.active_runtime_generation, None,
             "{arc}: generation cleared"
         );
-        assert_eq!(
-            state.active_runtime_epoch_id, None,
-            "{arc}: epoch id cleared"
-        );
     };
-    // The new epoch's binding, as the shell/mob presents it after revival —
-    // deliberately different from the dead epoch's tuple in every field.
-    let rebind_input = || mm_dsl::MeerkatMachineInput::PrepareBindings {
+    // The replacement placement, as the shell/mob presents it after revival -
+    // deliberately different from the dead executor's triple. Its epoch names
+    // the REGISTERED entry epoch, which placement asserts rather than writes.
+    let rebind_input = |registered_epoch: &str| mm_dsl::MeerkatMachineInput::PrepareBindings {
         agent_runtime_id: mm_dsl::AgentRuntimeId("runtime-2".to_string()),
         fence_token: mm_dsl::FenceToken(4),
         generation: None,
-        runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-2".to_string())),
+        runtime_epoch_id: Some(mm_dsl::RuntimeEpochId(registered_epoch.to_string())),
         session_id: mm_dsl::SessionId("session-revive".to_string()),
     };
 
-    // RegisterSession revival: Stopped → Idle preserving identity, clearing
-    // the dead epoch's binding tuple; the new epoch then binds cleanly.
+    // RegisterSession revival: Stopped → Idle preserving identity, clearing the
+    // dead executor's placement, and installing the epoch this re-registration
+    // carries (a cold revival mints a fresh one).
     let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(stopped_state())
         .expect("stopped state must be recoverable");
     mm_dsl::MeerkatMachineMutator::apply(
         &mut authority,
         mm_dsl::MeerkatMachineInput::RegisterSession {
             session_id: mm_dsl::SessionId("session-revive".to_string()),
+            runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-2".to_string())),
         },
     )
     .expect("same-session re-registration must revive a stopped machine");
@@ -8325,21 +8376,34 @@ fn revival_arms_preserve_identity_clear_epoch_binding_and_refuse_while_draining(
         Some(mm_dsl::SessionId("session-revive".to_string())),
         "revival must preserve the session identity"
     );
-    assert_epoch_binding_cleared(authority.state(), "RegisterSession revival");
-    mm_dsl::MeerkatMachineMutator::apply(&mut authority, rebind_input()).expect(
-        "the fresh epoch's PrepareBindings must bind a revived session — a \
-         rejected re-bind is the cold-revival wedge class",
+    assert_placement_cleared(authority.state(), "RegisterSession revival");
+    assert_eq!(
+        authority.state().active_runtime_epoch_id,
+        Some(mm_dsl::RuntimeEpochId("epoch-2".to_string())),
+        "re-registration installs the epoch it registers under; a cleared epoch \
+         is the state in which durable compaction persistence can never be \
+         authorized again"
+    );
+    mm_dsl::MeerkatMachineMutator::apply(&mut authority, rebind_input("epoch-2")).expect(
+        "the re-registered epoch's PrepareBindings must bind a revived session - \
+         a rejected re-bind is the cold-revival wedge class",
     );
     assert_eq!(
         authority.state().active_runtime_epoch_id,
         Some(mm_dsl::RuntimeEpochId("epoch-2".to_string())),
-        "re-bind must adopt the new epoch's tuple"
+        "placement asserts the registered epoch and leaves it intact"
+    );
+    // A placement naming any other epoch is refused: the assertion is the whole
+    // point of keeping the field on PrepareBindings.
+    mm_dsl::MeerkatMachineMutator::apply(&mut authority, rebind_input("epoch-3")).expect_err(
+        "a placement that disagrees with the registered entry epoch must be a \
+         typed rejection, never a silent overwrite",
     );
 
-    // EnsureSessionWithExecutor revival: Stopped → Attached + Active, with
-    // the same epoch-binding clear; the re-bind is admissible AT ATTACHED —
-    // the exact field rejection signature (PrepareBindings GuardRejected
-    // { phase: Attached }).
+    // EnsureSessionWithExecutor revival: Stopped → Attached + Active, clearing
+    // the same placement but PRESERVING the registered epoch (this arm is not a
+    // registration). The re-bind is admissible AT ATTACHED - the exact field
+    // rejection signature (PrepareBindings GuardRejected { phase: Attached }).
     let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(stopped_state())
         .expect("stopped state must be recoverable");
     mm_dsl::MeerkatMachineMutator::apply(
@@ -8358,10 +8422,17 @@ fn revival_arms_preserve_identity_clear_epoch_binding_and_refuse_while_draining(
         mm_dsl::RegistrationPhase::Active,
         "executor revival must grant the active registration claim"
     );
-    assert_epoch_binding_cleared(authority.state(), "EnsureSessionWithExecutor revival");
-    mm_dsl::MeerkatMachineMutator::apply(&mut authority, rebind_input()).expect(
-        "the fresh epoch's PrepareBindings must bind at Attached after executor \
-         revival — the exact field rejection this class test kills",
+    assert_placement_cleared(authority.state(), "EnsureSessionWithExecutor revival");
+    assert_eq!(
+        authority.state().active_runtime_epoch_id,
+        Some(mm_dsl::RuntimeEpochId("epoch-1".to_string())),
+        "a non-registering revival must preserve the registered entry epoch - \
+         mob-internal revival never re-registers, so clearing it here would \
+         silently disarm durable compaction for exactly that population"
+    );
+    mm_dsl::MeerkatMachineMutator::apply(&mut authority, rebind_input("epoch-1")).expect(
+        "the registered epoch's PrepareBindings must bind at Attached after \
+         executor revival - the exact field rejection this class test kills",
     );
     assert_eq!(
         authority.state().lifecycle_phase,
@@ -8382,6 +8453,7 @@ fn revival_arms_preserve_identity_clear_epoch_binding_and_refuse_while_draining(
         &mut authority,
         mm_dsl::MeerkatMachineInput::RegisterSession {
             session_id: mm_dsl::SessionId("session-revive".to_string()),
+            runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-2".to_string())),
         },
     )
     .expect_err("revival must refuse while the unregister drain window is open");
@@ -8399,6 +8471,603 @@ fn revival_arms_preserve_identity_clear_epoch_binding_and_refuse_while_draining(
         },
     )
     .expect_err("executor revival must refuse while the unregister drain window is open");
+}
+
+/// Leg B, fail-closed half: re-admission (`EnsureSessionWithExecutorStopped`)
+/// and `Recycle` both act under an epoch authority they INHERIT rather than
+/// install - neither input carries one - so neither may proceed on a registered
+/// entry that has none.
+///
+/// This is the loud form of the 0.8.23 wedge. A registered-but-epochless entry
+/// can only come from a lane that bypassed the registered-authority
+/// constructors; putting it back to work produces a live session that takes
+/// turns and can never authorize a durable compaction projection, because the
+/// projection coordinator asserts a minted epoch the entry does not hold and the
+/// mismatch is permanent rather than racy. Refusal moves the discovery from "a
+/// member went quiet" to the boundary that still owns the fact. Honestly
+/// epochless authorities (the mob host and supervisor-bridge peer projections)
+/// register and claim their executor from Idle and never recycle, so they reach
+/// neither arm.
+#[test]
+fn readmission_and_recycle_refuse_without_registered_epoch_authority() {
+    use crate::meerkat_machine::dsl as mm_dsl;
+
+    let session_id = mm_dsl::SessionId("session-readmit".to_string());
+    let epoch = mm_dsl::RuntimeEpochId("epoch-readmit".to_string());
+    // Every pair below differs in the entry epoch and nothing else, so a
+    // refusal cannot be attributed to any other fact.
+    let registered_state =
+        |phase: mm_dsl::MeerkatPhase, registered_epoch: Option<mm_dsl::RuntimeEpochId>| {
+            mm_dsl::MeerkatMachineState {
+                lifecycle_phase: phase,
+                session_id: Some(session_id.clone()),
+                active_runtime_epoch_id: registered_epoch,
+                ..Default::default()
+            }
+        };
+    let ensure = || mm_dsl::MeerkatMachineInput::EnsureSessionWithExecutor {
+        session_id: session_id.clone(),
+    };
+
+    let mut epochless = mm_dsl::MeerkatMachineAuthority::recover_from_state(registered_state(
+        mm_dsl::MeerkatPhase::Stopped,
+        None,
+    ))
+    .expect("a registered epochless entry stays a recoverable shape (oracle authorities are one)");
+    mm_dsl::MeerkatMachineMutator::apply(&mut epochless, ensure()).expect_err(
+        "a re-admission that cannot name the entry's epoch authority must refuse, \
+         not attach a session whose compaction projections can only be rejected",
+    );
+    assert_eq!(
+        epochless.state().lifecycle_phase,
+        mm_dsl::MeerkatPhase::Stopped,
+        "a refused re-admission leaves the session stopped, not half-attached"
+    );
+    assert_eq!(
+        epochless.state().registration_phase,
+        mm_dsl::RegistrationPhase::Queuing,
+        "a refused re-admission must not grant the active executor registration claim"
+    );
+
+    let mut registered = mm_dsl::MeerkatMachineAuthority::recover_from_state(registered_state(
+        mm_dsl::MeerkatPhase::Stopped,
+        Some(epoch.clone()),
+    ))
+    .expect("registered-unplaced stopped state must be recoverable");
+    mm_dsl::MeerkatMachineMutator::apply(&mut registered, ensure())
+        .expect("the same re-admission under a registered epoch must be admitted");
+    assert_eq!(
+        registered.state().active_runtime_epoch_id,
+        Some(epoch.clone()),
+        "re-admission inherits the registered epoch unchanged"
+    );
+
+    // Recycle, both arms. Recycle is not a re-admission, but it hands the
+    // session to a replacement placement under the same inherited authority, so
+    // it fails closed the same way.
+    for phase in [
+        mm_dsl::MeerkatPhase::Idle,
+        mm_dsl::MeerkatPhase::Retired,
+        mm_dsl::MeerkatPhase::Attached,
+    ] {
+        let mut epochless =
+            mm_dsl::MeerkatMachineAuthority::recover_from_state(registered_state(phase, None))
+                .expect("registered epochless state must be recoverable");
+        mm_dsl::MeerkatMachineMutator::apply(&mut epochless, mm_dsl::MeerkatMachineInput::Recycle)
+            .expect_err(
+                "recycling an entry with no epoch authority must refuse: the \
+                 replacement placement would run under an authority nobody can name",
+            );
+        let mut registered = mm_dsl::MeerkatMachineAuthority::recover_from_state(registered_state(
+            phase,
+            Some(epoch.clone()),
+        ))
+        .expect("registered state must be recoverable");
+        mm_dsl::MeerkatMachineMutator::apply(&mut registered, mm_dsl::MeerkatMachineInput::Recycle)
+            .expect("the same recycle under a registered epoch must be admitted");
+        assert_eq!(
+            registered.state().active_runtime_epoch_id,
+            Some(epoch.clone()),
+            "recycle preserves the registered entry epoch"
+        );
+    }
+}
+
+/// Leg B, positive half: a re-admitted session admits routed work AND still
+/// holds the epoch the compaction projection coordinator asserts.
+///
+/// Before this release those two were mutually exclusive by construction for
+/// every seam-bound mob member: `Ingest`'s exact-match epoch guard admitted work
+/// only while the entry epoch was absent (the seam route owns no epoch and the
+/// re-admission arms nulled it), while the coordinator authorized only while it
+/// was present. This walks the whole revived-member lane at machine level:
+/// re-admission, the binding MobMachine now re-emits on revival, and work under
+/// the registered epoch.
+#[test]
+fn readmitted_session_admits_routed_work_under_the_registered_epoch() {
+    use crate::meerkat_machine::dsl as mm_dsl;
+
+    let session_id = mm_dsl::SessionId("session-revived-member".to_string());
+    let epoch = mm_dsl::RuntimeEpochId("epoch-revived-member".to_string());
+    let mut authority =
+        mm_dsl::MeerkatMachineAuthority::recover_from_state(mm_dsl::MeerkatMachineState {
+            lifecycle_phase: mm_dsl::MeerkatPhase::Stopped,
+            session_id: Some(session_id.clone()),
+            active_runtime_id: Some(mm_dsl::AgentRuntimeId("member-runtime-1".to_string())),
+            active_fence_token: Some(mm_dsl::FenceToken(7)),
+            active_runtime_generation: Some(mm_dsl::Generation(1)),
+            active_runtime_epoch_id: Some(epoch.clone()),
+            ..Default::default()
+        })
+        .expect("a stopped placed member session must be recoverable");
+
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::EnsureSessionWithExecutor {
+            session_id: session_id.clone(),
+        },
+    )
+    .expect("mob-internal revival re-admits the member's stopped session");
+
+    // The placement MobMachine re-emits on revival (`RequestRuntimeBinding` from
+    // its own membership maps), carrying the entry epoch the consumer resolves
+    // machine-side because the seam route owns no epoch.
+    let replacement_runtime = mm_dsl::AgentRuntimeId("member-runtime-2".to_string());
+    let replacement_fence = mm_dsl::FenceToken(8);
+    let replacement_generation = Some(mm_dsl::Generation(2));
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::PrepareBindings {
+            agent_runtime_id: replacement_runtime.clone(),
+            fence_token: replacement_fence,
+            generation: replacement_generation,
+            runtime_epoch_id: Some(epoch.clone()),
+            session_id: session_id.clone(),
+        },
+    )
+    .expect("the re-emitted binding must place the revived session");
+
+    let ingest =
+        |runtime_epoch_id: Option<mm_dsl::RuntimeEpochId>| mm_dsl::MeerkatMachineInput::Ingest {
+            session_id: session_id.clone(),
+            runtime_id: replacement_runtime.clone(),
+            fence_token: replacement_fence,
+            generation: replacement_generation,
+            runtime_epoch_id,
+            work_id: mm_dsl::WorkId("work-after-revival".to_string()),
+            origin: mm_dsl::WorkOrigin::Ingest,
+        };
+    mm_dsl::MeerkatMachineMutator::apply(&mut authority, ingest(Some(epoch.clone()))).expect(
+        "work must be admitted under the registered epoch: an epoch-Some session \
+         that cannot take work is the other half of the mutual exclusion this \
+         release removes",
+    );
+    mm_dsl::MeerkatMachineMutator::apply(&mut authority, ingest(None)).expect_err(
+        "the guard's design intent survives: a routed input that names no epoch is \
+         still refused, which is why the consumer fills the truthful one instead of \
+         the machine tolerating absence",
+    );
+    assert_eq!(
+        authority.state().active_runtime_epoch_id,
+        Some(epoch),
+        "the entry epoch the projection coordinator asserts survives re-admission, \
+         re-placement, and work admission"
+    );
+}
+
+/// The placement half of the epoch fence, in both directions. `PrepareBindings`
+/// only ever ASSERTS the registration-owned entry epoch, so:
+///   - a placement naming NO epoch against an epoch-registered entry is
+///     refused. Nothing else in the tree exercises this: every routed producer
+///     passes `None` and has the truthful epoch resolved machine-side before
+///     apply, and the stale-epoch tests state a `Some`. Without this pin a
+///     future None-passer (or a guard weakened back towards tolerating absence)
+///     re-opens the epoch-nulling wedge with CI green.
+///   - a placement STATING an epoch against an epochless entry is refused. This
+///     is the direction `epoch_binding_absent_or_same` admitted: it passed
+///     whenever the entry's epoch was absent, so with the epoch write removed
+///     it would accept the claim and silently drop it.
+#[test]
+fn placement_epoch_must_assert_the_registration_in_both_directions() {
+    use crate::meerkat_machine::dsl as mm_dsl;
+
+    let session_id = mm_dsl::SessionId("session-placement-epoch-fence".to_string());
+    let epoch = mm_dsl::RuntimeEpochId("epoch-registered".to_string());
+    let placement = |runtime_epoch_id: Option<mm_dsl::RuntimeEpochId>| {
+        mm_dsl::MeerkatMachineInput::PrepareBindings {
+            agent_runtime_id: mm_dsl::AgentRuntimeId("runtime-placed".to_string()),
+            fence_token: mm_dsl::FenceToken(4),
+            generation: Some(mm_dsl::Generation(1)),
+            runtime_epoch_id,
+            session_id: session_id.clone(),
+        }
+    };
+
+    // Direction 1: epoch-registered entry, epochless placement.
+    let mut registered = crate::meerkat_machine::dsl_authority::new_registered_authority_id(
+        session_id.clone(),
+        epoch.clone(),
+    )
+    .expect("registration under an entry epoch must be admitted");
+    let refusal = mm_dsl::MeerkatMachineMutator::apply(&mut registered, placement(None))
+        .expect_err(
+            "a placement naming no epoch must not be admitted against an epoch-registered entry: \
+         admitting it is what let an epochless lane leave a live entry unable to persist a \
+         compaction",
+        );
+    assert!(
+        matches!(
+            refusal,
+            mm_dsl::MeerkatMachineTransitionError::GuardRejected { .. }
+        ),
+        "the refusal must be the typed guard rejection, got {refusal:?}"
+    );
+    assert_eq!(
+        registered.state().active_runtime_id,
+        None,
+        "a refused placement must not bind"
+    );
+    assert_eq!(
+        registered.state().active_runtime_epoch_id,
+        Some(epoch.clone()),
+        "a refused placement must not touch the registered entry epoch"
+    );
+    mm_dsl::MeerkatMachineMutator::apply(&mut registered, placement(Some(epoch.clone()))).expect(
+        "the same placement asserting the registered epoch must bind: the rejection above is \
+         attributable to the epoch field alone",
+    );
+    assert_eq!(
+        registered.state().active_runtime_epoch_id,
+        Some(epoch.clone()),
+        "an admitted placement asserts the entry epoch, it does not rewrite it"
+    );
+
+    // Direction 2: epochless entry, epoch-stating placement.
+    let mut epochless =
+        crate::meerkat_machine::dsl_authority::new_registered_authority_with_optional_epoch(
+            session_id.clone(),
+            None,
+        )
+        .expect("an epochless registration (standalone/oracle) must be admitted");
+    let refusal = mm_dsl::MeerkatMachineMutator::apply(&mut epochless, placement(Some(epoch)))
+        .expect_err(
+            "a placement stating an epoch the entry does not have must be refused, not accepted \
+             and silently dropped",
+        );
+    assert!(
+        matches!(
+            refusal,
+            mm_dsl::MeerkatMachineTransitionError::GuardRejected { .. }
+        ),
+        "the refusal must be the typed guard rejection, got {refusal:?}"
+    );
+    assert_eq!(
+        epochless.state().active_runtime_id,
+        None,
+        "a refused placement must not bind"
+    );
+    assert_eq!(
+        epochless.state().active_runtime_epoch_id,
+        None,
+        "a refused placement must not install an epoch registration never owned"
+    );
+    mm_dsl::MeerkatMachineMutator::apply(&mut epochless, placement(None))
+        .expect("the truthful epochless placement on an epochless entry must bind");
+    assert_eq!(
+        epochless.state().active_runtime_epoch_id,
+        None,
+        "placement is not the epoch's writer in either direction"
+    );
+}
+
+/// The population where `typed_binding_identity_present` is still the only
+/// thing standing between a placement and an untyped binding: an
+/// epochless-registered entry (standalone sessions, projection oracles,
+/// durable-tail probes). `epoch_binding_matches_registration` forces the input
+/// epoch to `None` there, so `generation` is what discriminates the placement,
+/// and a placement carrying neither would bind a runtime that no typed identity
+/// fact names - the shape `runtime_binding_identity_is_typed` forbids.
+///
+/// The property is over the machine's admitted input space, not over the
+/// current caller census: no production lane places on an epochless entry
+/// today (all three epochless registrars prepare no placement at all), so this
+/// test is the population's only exerciser. The guard is what keeps the
+/// untyped shape unreachable; a caller convention is not.
+#[test]
+fn epochless_placement_without_a_typed_generation_is_refused() {
+    use crate::meerkat_machine::dsl as mm_dsl;
+
+    let session_id = mm_dsl::SessionId("session-epochless-placement".to_string());
+    let mut authority =
+        crate::meerkat_machine::dsl_authority::new_registered_authority_with_optional_epoch(
+            session_id.clone(),
+            None,
+        )
+        .expect("an epochless registration must be admitted");
+
+    let placement =
+        |generation: Option<mm_dsl::Generation>| mm_dsl::MeerkatMachineInput::PrepareBindings {
+            agent_runtime_id: mm_dsl::AgentRuntimeId("runtime-untyped".to_string()),
+            fence_token: mm_dsl::FenceToken(2),
+            generation,
+            runtime_epoch_id: None,
+            session_id: session_id.clone(),
+        };
+
+    let refusal = mm_dsl::MeerkatMachineMutator::apply(&mut authority, placement(None)).expect_err(
+        "a placement with neither a generation nor an epoch must be refused at admission, not \
+         caught later as an invariant violation",
+    );
+    assert!(
+        matches!(
+            refusal,
+            mm_dsl::MeerkatMachineTransitionError::GuardRejected { .. }
+        ),
+        "the refusal must be the typed guard rejection, got {refusal:?}"
+    );
+    assert_eq!(
+        authority.state().active_runtime_id,
+        None,
+        "a refused placement must not bind"
+    );
+
+    mm_dsl::MeerkatMachineMutator::apply(&mut authority, placement(Some(mm_dsl::Generation(0))))
+        .expect(
+            "the same placement carrying a generation must bind: the generation is the only \
+             typed identity fact an epochless placement can carry, so the refusal above is \
+             attributable to its absence alone",
+        );
+    assert_eq!(
+        authority.state().active_runtime_generation,
+        Some(mm_dsl::Generation(0)),
+        "the admitted placement's typed identity fact is the generation"
+    );
+}
+
+/// Registered-unplaced ({entry epoch Some, placement None}) is a legal steady
+/// state in BOTH directions: reachable by applying a registration, and
+/// recoverable from durable state.
+///
+/// This is the replacement for `runtime_epoch_requires_bound_runtime`, which
+/// tied the epoch to a bound runtime. That invariant is rendered as a
+/// `debug_assert` after every apply AND as a hard
+/// `RecoveredStateInvariantRejected` in `recover_from_state` in all builds, so
+/// under registration-owned epochs it would have panicked every test build at
+/// registration and failed durable recovery of any registered-unplaced entry.
+#[test]
+fn registered_unplaced_epoch_is_legal_on_apply_and_on_recovery() {
+    use crate::meerkat_machine::dsl as mm_dsl;
+
+    let session_id = mm_dsl::SessionId("session-registered-unplaced".to_string());
+    let epoch = mm_dsl::RuntimeEpochId("epoch-registered".to_string());
+
+    // Forward: a plain registration produces {epoch Some, placement None}.
+    let mut authority = crate::meerkat_machine::dsl_authority::new_registered_authority_id(
+        session_id.clone(),
+        epoch.clone(),
+    )
+    .expect("registration under an entry epoch must be admitted");
+    let registered_state = authority.state().clone();
+    assert_eq!(
+        registered_state.active_runtime_epoch_id,
+        Some(epoch.clone())
+    );
+    assert_eq!(registered_state.active_runtime_id, None);
+    assert_eq!(registered_state.active_fence_token, None);
+    assert_eq!(registered_state.active_runtime_generation, None);
+
+    // Recovery: the same shape must survive `recover_from_state`, which
+    // enforces the invariant set in all builds.
+    let recovered = mm_dsl::MeerkatMachineAuthority::recover_from_state(registered_state)
+        .expect("registered-unplaced durable state must be recoverable");
+    assert_eq!(
+        recovered.state().active_runtime_epoch_id,
+        Some(epoch.clone())
+    );
+
+    // An epoch with no session binding at all remains illegal: the epoch is a
+    // fact about a registered session entry, and unregistration clears both.
+    assert!(
+        mm_dsl::MeerkatMachineAuthority::recover_from_state(mm_dsl::MeerkatMachineState {
+            lifecycle_phase: mm_dsl::MeerkatPhase::Idle,
+            session_id: None,
+            active_runtime_epoch_id: Some(epoch.clone()),
+            ..Default::default()
+        })
+        .is_err(),
+        "an entry epoch without a registered session is not a legal shape"
+    );
+
+    // Recycle keeps the registered epoch while discarding placement.
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::PrepareBindings {
+            agent_runtime_id: mm_dsl::AgentRuntimeId("runtime-placed".to_string()),
+            fence_token: mm_dsl::FenceToken(5),
+            generation: Some(mm_dsl::Generation(1)),
+            runtime_epoch_id: Some(epoch.clone()),
+            session_id: session_id.clone(),
+        },
+    )
+    .expect("placement asserting the registered epoch must bind");
+    mm_dsl::MeerkatMachineMutator::apply(&mut authority, mm_dsl::MeerkatMachineInput::Recycle)
+        .expect("recycle must be admitted for a registered session");
+    let recycled = authority.state();
+    assert_eq!(recycled.active_runtime_id, None, "recycle drops placement");
+    assert_eq!(
+        recycled.active_runtime_epoch_id,
+        Some(epoch),
+        "recycle preserves the registered entry epoch: the entry is not \
+         re-registered, so its registration-owned epoch is still the truth"
+    );
+}
+
+/// C2: same-epoch re-registration is the idempotent no-op; a different-epoch
+/// re-registration is an EXPLICIT typed verdict (the entry was replaced
+/// underneath the caller), not a bare guard rejection the shell would have to
+/// classify. `Stopped` is deliberately excluded from the conflict arm: cold
+/// revival legitimately re-registers under a freshly minted epoch.
+#[test]
+fn re_registration_is_idempotent_on_same_epoch_and_a_typed_verdict_on_a_different_one() {
+    use crate::meerkat_machine::dsl as mm_dsl;
+
+    let session_id = mm_dsl::SessionId("session-reregister".to_string());
+    let epoch = mm_dsl::RuntimeEpochId("epoch-a".to_string());
+    let mut authority = crate::meerkat_machine::dsl_authority::new_registered_authority_id(
+        session_id.clone(),
+        epoch.clone(),
+    )
+    .expect("initial registration");
+
+    let same = mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::RegisterSession {
+            session_id: session_id.clone(),
+            runtime_epoch_id: Some(epoch.clone()),
+        },
+    )
+    .expect("same-session, same-epoch re-registration is the machine-owned no-op");
+    assert!(
+        same.into_effects().is_empty(),
+        "an idempotent re-registration emits nothing"
+    );
+    assert_eq!(authority.state().active_runtime_epoch_id, Some(epoch));
+
+    let conflict = mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::RegisterSession {
+            session_id: session_id.clone(),
+            runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-b".to_string())),
+        },
+    )
+    .expect("the conflict verdict is a machine-owned outcome, not a guard rejection");
+    assert_eq!(
+        conflict.into_effects(),
+        vec![mm_dsl::MeerkatMachineEffect::SessionRegistrationRejected {
+            session_id: session_id.clone(),
+            reason: mm_dsl::SessionRegistrationRejectReasonKind::RuntimeEpochConflict,
+            registered_runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-a".to_string())),
+            attempted_runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-b".to_string())),
+        }],
+        "the refusal must name both epochs so the surface can align its error"
+    );
+    assert_eq!(
+        authority.state().active_runtime_epoch_id,
+        Some(mm_dsl::RuntimeEpochId("epoch-a".to_string())),
+        "a refused re-registration must not move the registered epoch"
+    );
+
+    // An epochless re-registration of an epoch-registered entry is the same
+    // conflict: it would otherwise null the entry's epoch silently.
+    let absent = mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::RegisterSession {
+            session_id,
+            runtime_epoch_id: None,
+        },
+    )
+    .expect("epochless re-registration resolves to the same typed verdict");
+    assert!(matches!(
+        absent.into_effects().as_slice(),
+        [mm_dsl::MeerkatMachineEffect::SessionRegistrationRejected {
+            attempted_runtime_epoch_id: None,
+            ..
+        }]
+    ));
+    assert_eq!(
+        authority.state().active_runtime_epoch_id,
+        Some(mm_dsl::RuntimeEpochId("epoch-a".to_string()))
+    );
+}
+
+/// A new tenant registering over a `Stopped` entry gets the placement reset AND
+/// the new registration's epoch. Clearing it (as this arm did through 0.8.22)
+/// would leave the new tenant epochless and unable to persist a compaction
+/// projection.
+#[test]
+fn new_binding_from_stopped_sets_the_new_registration_epoch() {
+    use crate::meerkat_machine::dsl as mm_dsl;
+
+    let mut authority =
+        mm_dsl::MeerkatMachineAuthority::recover_from_state(mm_dsl::MeerkatMachineState {
+            lifecycle_phase: mm_dsl::MeerkatPhase::Stopped,
+            session_id: Some(mm_dsl::SessionId("previous-tenant".to_string())),
+            active_runtime_id: Some(mm_dsl::AgentRuntimeId("runtime-previous".to_string())),
+            active_fence_token: Some(mm_dsl::FenceToken(9)),
+            active_runtime_generation: Some(mm_dsl::Generation(2)),
+            active_runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-previous".to_string())),
+            ..Default::default()
+        })
+        .expect("stopped previous tenant must be recoverable");
+
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::RegisterSession {
+            session_id: mm_dsl::SessionId("new-tenant".to_string()),
+            runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-new".to_string())),
+        },
+    )
+    .expect("a new session binding over Stopped must be admitted");
+
+    let state = authority.state();
+    assert_eq!(
+        state.session_id,
+        Some(mm_dsl::SessionId("new-tenant".to_string()))
+    );
+    assert_eq!(state.active_runtime_id, None, "placement must not leak");
+    assert_eq!(state.active_fence_token, None);
+    assert_eq!(state.active_runtime_generation, None);
+    assert_eq!(
+        state.active_runtime_epoch_id,
+        Some(mm_dsl::RuntimeEpochId("epoch-new".to_string())),
+        "the new tenant carries the epoch it registered under"
+    );
+}
+
+/// The durable interaction-terminal outbox adoption authority must remain
+/// satisfiable in the registered-unplaced window: after this change a recovered
+/// shell holds {entry epoch Some, placement None}, which is exactly the state
+/// terminal publication replays into.
+#[test]
+fn outbox_adoption_is_authorized_in_the_registered_unplaced_window() {
+    use crate::meerkat_machine::dsl as mm_dsl;
+
+    let session_id = mm_dsl::SessionId("session-outbox-adoption".to_string());
+    let authority_epoch = mm_dsl::RuntimeEpochId("epoch-registered".to_string());
+    let mut authority = crate::meerkat_machine::dsl_authority::new_registered_authority_id(
+        session_id.clone(),
+        authority_epoch.clone(),
+    )
+    .expect("registration under an entry epoch");
+
+    let adoption = mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::AuthorizeInteractionTerminalOutboxAdoption {
+            batch_key: "batch-1".to_string(),
+            candidate_digest: "digest-1".to_string(),
+            session_id,
+            previous_agent_runtime_id: mm_dsl::AgentRuntimeId("runtime-previous".to_string()),
+            previous_fence_token: mm_dsl::FenceToken(3),
+            previous_runtime_generation: mm_dsl::Generation(1),
+            previous_runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-previous".to_string())),
+        },
+    )
+    .expect(
+        "a registered-unplaced shell must still authorize durable terminal \
+         adoption - requiring an absent entry epoch made this guard \
+         unsatisfiable exactly in the new window",
+    );
+    let effects = adoption.into_effects();
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [mm_dsl::MeerkatMachineEffect::InteractionTerminalOutboxAdoptionAuthorized {
+                next_runtime_epoch_id,
+                ..
+            }] if next_runtime_epoch_id.as_ref() == Some(&authority_epoch)
+        ),
+        "the emitted CAS target carries the current entry epoch: {effects:?}"
+    );
 }
 
 /// `Queuing` is only the recovered registration default; it is not evidence
@@ -30273,6 +30942,7 @@ fn registered_dsl_authority_for_session(session_id: &str) -> mm_dsl::MeerkatMach
         &mut authority,
         mm_dsl::MeerkatMachineInput::RegisterSession {
             session_id: mm_dsl::SessionId(session_id.to_string()),
+            runtime_epoch_id: None,
         },
     )
     .expect("register session");

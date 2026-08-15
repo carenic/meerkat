@@ -84,10 +84,12 @@ pub(super) fn machine_lifecycle_has_runtime_archive_residue(
 
     let binding = lifecycle.binding();
     let run = lifecycle.run();
+    // Placement-only, matching the generated reconciliation classifier: a
+    // persisted entry epoch is a registration fact of the process that wrote the
+    // row, not unfinished realization, so it is not archive residue.
     let clean_unbound_idle = binding.agent_runtime_id().is_none()
         && binding.fence_token().is_none()
         && binding.runtime_generation().is_none()
-        && binding.runtime_epoch_id().is_none()
         && run.current_run_id().is_none()
         && run.pre_run_phase().is_none()
         && lifecycle.unregister_progress().is_none()
@@ -623,8 +625,13 @@ impl RegisterSessionInnerOutcome {
     }
 }
 
+/// Register a fresh entry authority under the entry's runtime epoch. The epoch
+/// is non-optional for the same reason as in
+/// [`super::dsl_authority::new_registered_authority`]: this constructor only
+/// serves lanes that own a runtime session entry.
 fn fresh_registered_runtime_authority(
     session_id: &SessionId,
+    runtime_epoch_id: &meerkat_core::RuntimeEpochId,
     context: &'static str,
 ) -> Result<crate::meerkat_machine::dsl::MeerkatMachineAuthority, RuntimeDriverError> {
     let mut authority = super::dsl_authority::new_initialized_authority(context);
@@ -632,6 +639,9 @@ fn fresh_registered_runtime_authority(
         &mut authority,
         crate::meerkat_machine::dsl::MeerkatMachineInput::RegisterSession {
             session_id: crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
+            runtime_epoch_id: Some(crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(
+                runtime_epoch_id,
+            )),
         },
     )
     .map_err(|err| {
@@ -727,6 +737,7 @@ mod unregister_progress_recovery_tests {
         let session_id = SessionId::new();
         let mut authority = fresh_registered_runtime_authority(
             &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
             "durable unregister progress replay test",
         )
         .expect("fresh authority");
@@ -769,6 +780,7 @@ mod unregister_progress_recovery_tests {
 
         let mut authority = fresh_registered_runtime_authority(
             &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
             "crash-recovered unregister process-loss test",
         )
         .expect("fresh authority");
@@ -1155,21 +1167,53 @@ impl MeerkatMachine {
         }
     }
 
+    /// Acquire the entry's ops-lifecycle authority, runtime epoch, and cursor
+    /// state BEFORE the session authority is registered.
+    ///
+    /// The runtime epoch is a registration-time fact, so it must be known
+    /// before registration builds the authority. On the persistent path this
+    /// means registration touches the store (ops-lifecycle initialization)
+    /// first; a competing cold registrar that wins that boundary therefore
+    /// decides the epoch this entry carries, which is exactly the epoch the
+    /// entry owns.
+    async fn ops_state_for_registration(
+        &self,
+        session_id: &SessionId,
+        runtime_id: &LogicalRuntimeId,
+    ) -> Result<
+        (
+            Arc<crate::ops_lifecycle::RuntimeOpsLifecycleRegistry>,
+            meerkat_core::RuntimeEpochId,
+            Arc<meerkat_core::EpochCursorState>,
+        ),
+        RuntimeDriverError,
+    > {
+        if self.store.is_some() {
+            self.recover_or_create_ops_state(session_id, runtime_id)
+                .await
+        } else {
+            Ok(Self::fresh_ops_state())
+        }
+    }
+
     async fn runtime_authority_for_registration(
         &self,
         runtime_id: &LogicalRuntimeId,
         session_id: &SessionId,
+        runtime_epoch_id: &meerkat_core::RuntimeEpochId,
     ) -> Result<super::driver::ReconciledRuntimeAuthority, RuntimeDriverError> {
         let Some(store) = self.store.as_ref() else {
             return Ok(super::driver::ReconciledRuntimeAuthority {
-                authority: super::dsl_authority::new_registered_authority(session_id).map_err(
-                    |error| {
-                        RuntimeDriverError::Internal(super::dsl_authority::map_error(
-                            error,
-                            "fresh session registration",
-                        ))
-                    },
-                )?,
+                authority: super::dsl_authority::new_registered_authority(
+                    session_id,
+                    runtime_epoch_id,
+                )
+                .map_err(|error| {
+                    RuntimeDriverError::Internal(super::dsl_authority::map_error(
+                        error,
+                        "fresh session registration",
+                    ))
+                })?,
                 unregister_progress: None,
             });
         };
@@ -1177,6 +1221,7 @@ impl MeerkatMachine {
             store.as_ref(),
             runtime_id,
             session_id,
+            runtime_epoch_id,
         )
         .await
     }
@@ -1374,8 +1419,22 @@ impl MeerkatMachine {
                 version,
             },
         );
+        // The entry's runtime epoch is a registration fact, so it is acquired
+        // before the authority that registers under it.
+        let ops_state = match self
+            .ops_state_for_registration(&session_id, &runtime_id)
+            .await
+        {
+            Ok(ops_state) => ops_state,
+            Err(error) => {
+                return RuntimeSessionRegistrationOutcome::Backoff {
+                    reason: error.to_string(),
+                };
+            }
+        };
         let recovery = match super::driver::registered_runtime_authority_from_converged_record(
             &session_id,
+            &ops_state.1,
             &record,
         ) {
             Ok(recovery) => recovery,
@@ -1408,6 +1467,7 @@ impl MeerkatMachine {
                 &session_id,
                 &runtime_id,
                 recovery,
+                ops_state,
                 None,
                 Some(Arc::clone(&write_fence)),
             )
@@ -1656,8 +1716,14 @@ impl MeerkatMachine {
         >,
     ) -> Result<(LogicalRuntimeId, RuntimeSessionEntry), RuntimeDriverError> {
         let runtime_id = Self::logical_runtime_id(session_id);
-        let recovered_authority =
-            fresh_registered_runtime_authority(session_id, "fresh storeless session registration")?;
+        // Mint the entry's ops state (and with it the runtime epoch) before the
+        // authority: registration owns the epoch.
+        let (ops_lifecycle, epoch_id, cursor_state) = Self::fresh_ops_state();
+        let recovered_authority = fresh_registered_runtime_authority(
+            session_id,
+            &epoch_id,
+            "fresh storeless session registration",
+        )?;
         let initial_runtime_state =
             super::dsl_authority::runtime_phase_from_authority(&recovered_authority);
         let dsl_authority = Arc::new(std::sync::Mutex::new(recovered_authority));
@@ -1668,7 +1734,6 @@ impl MeerkatMachine {
             None,
         )?;
         let control_projection = entry.control_projection_handle();
-        let (ops_lifecycle, epoch_id, cursor_state) = Self::fresh_ops_state();
         let handle_teardown_gate = crate::handles::HandleTeardownGate::open();
         let tool_visibility_owner = Arc::new(MachineToolVisibilityOwner::new());
         tool_visibility_owner.bind_dsl_authority(Arc::clone(&dsl_authority));
@@ -1818,8 +1883,12 @@ impl MeerkatMachine {
         }
 
         let runtime_id = Self::logical_runtime_id(&session_id);
+        // Mint the entry's ops state (and with it the runtime epoch) before the
+        // authority: registration owns the epoch.
+        let (ops_lifecycle, epoch_id, cursor_state) = Self::fresh_ops_state();
         let recovered_authority = fresh_registered_runtime_authority(
             &session_id,
+            &epoch_id,
             "fresh storeless session registration",
         )?;
         let initial_runtime_state =
@@ -1842,7 +1911,6 @@ impl MeerkatMachine {
         }
         let control_projection = entry.control_projection_handle();
 
-        let (ops_lifecycle, epoch_id, cursor_state) = Self::fresh_ops_state();
         let handle_teardown_gate = crate::handles::HandleTeardownGate::open();
         let tool_visibility_owner = Arc::new(MachineToolVisibilityOwner::new());
         tool_visibility_owner.bind_dsl_authority(Arc::clone(&dsl_authority));
@@ -1949,11 +2017,19 @@ impl MeerkatMachine {
         }
     }
 
+    /// Build the entry around an authority that is ALREADY registered under
+    /// `ops_state`'s runtime epoch (see [`Self::ops_state_for_registration`]):
+    /// the epoch cannot be minted here, because registration already needed it.
     async fn prepare_registered_session_entry(
         &self,
         session_id: &SessionId,
         runtime_id: &LogicalRuntimeId,
         mut recovery: super::driver::ReconciledRuntimeAuthority,
+        ops_state: (
+            Arc<crate::ops_lifecycle::RuntimeOpsLifecycleRegistry>,
+            meerkat_core::RuntimeEpochId,
+            Arc<meerkat_core::EpochCursorState>,
+        ),
         materialization_claim_state: Option<
             Arc<std::sync::Mutex<crate::RuntimeActorMaterializationClaimState>>,
         >,
@@ -2038,22 +2114,12 @@ impl MeerkatMachine {
                 == crate::meerkat_machine::dsl::RegistrationPhase::Draining;
         let control_projection = entry.control_projection_handle();
 
-        tracing::debug!(
-            %session_id,
-            %runtime_id,
-            "MeerkatMachine::register_session_inner recovering ops state"
-        );
-        let (ops_lifecycle, epoch_id, cursor_state) = if self.store.is_some() {
-            self.recover_or_create_ops_state(session_id, runtime_id)
-                .await?
-        } else {
-            Self::fresh_ops_state()
-        };
+        let (ops_lifecycle, epoch_id, cursor_state) = ops_state;
         tracing::debug!(
             %session_id,
             %runtime_id,
             %epoch_id,
-            "MeerkatMachine::register_session_inner recovered ops state"
+            "MeerkatMachine::register_session_inner adopted pre-registration ops state"
         );
 
         let tool_visibility_owner = Arc::new(MachineToolVisibilityOwner::new());
@@ -2125,11 +2191,21 @@ impl MeerkatMachine {
         operation_preservation: Option<meerkat_core::OperationRetentionRequest>,
     ) -> Result<super::PreparedArchiveSessionRegistration, RuntimeDriverError> {
         let runtime_id = Self::logical_runtime_id(&session_id);
+        let ops_state = self
+            .ops_state_for_registration(&session_id, &runtime_id)
+            .await?;
         let recovery = self
-            .runtime_authority_for_registration(&runtime_id, &session_id)
+            .runtime_authority_for_registration(&runtime_id, &session_id, &ops_state.1)
             .await?;
         let (mut entry, cold_recovered_generated_draining) = self
-            .prepare_registered_session_entry(&session_id, &runtime_id, recovery, None, None)
+            .prepare_registered_session_entry(
+                &session_id,
+                &runtime_id,
+                recovery,
+                ops_state,
+                None,
+                None,
+            )
             .await?;
         if let Some(preservation) = operation_preservation {
             let store = self.store.as_ref().ok_or_else(|| {
@@ -2283,8 +2359,11 @@ impl MeerkatMachine {
             %runtime_id,
             "MeerkatMachine::register_session_inner loading durable lifecycle"
         );
+        let ops_state = self
+            .ops_state_for_registration(&session_id, &runtime_id)
+            .await?;
         let recovery = self
-            .runtime_authority_for_registration(&runtime_id, &session_id)
+            .runtime_authority_for_registration(&runtime_id, &session_id, &ops_state.1)
             .await?;
         tracing::debug!(
             %session_id,
@@ -2296,6 +2375,7 @@ impl MeerkatMachine {
                 &session_id,
                 &runtime_id,
                 recovery,
+                ops_state,
                 materialization_claim_state,
                 None,
             )
@@ -3347,6 +3427,12 @@ impl MeerkatMachine {
                 &mut authority,
                 dsl::MeerkatMachineInput::RegisterSession {
                     session_id: expected_session_id,
+                    // Re-admission is a registration, so it restates the
+                    // entry's epoch. It is the same epoch by construction (the
+                    // exact-epoch check above proved this call still owns this
+                    // entry), which makes the machine's idempotent arm the
+                    // verdict rather than its epoch-conflict arm.
+                    runtime_epoch_id: Some(dsl::RuntimeEpochId::from_domain(expected_epoch)),
                 },
                 "MissingLiveMaterializationReadmit",
             )
@@ -3359,6 +3445,12 @@ impl MeerkatMachine {
             }
 
             let repaired = authority.state();
+            // The PLACEMENT triple must be cleared; the entry epoch must be
+            // RETAINED and equal to this entry's epoch. Requiring an absent
+            // epoch here (as this check did through 0.8.22) encoded the epoch as
+            // a placement fact: normalization would then have to leave a live
+            // registered entry epochless, which is precisely the state in which
+            // durable compaction persistence can never be authorized again.
             if repaired.lifecycle_phase != dsl::MeerkatPhase::Idle
                 || repaired.registration_phase != dsl::RegistrationPhase::Queuing
                 || repaired.current_run_id.is_some()
@@ -3366,10 +3458,12 @@ impl MeerkatMachine {
                 || repaired.active_runtime_id.is_some()
                 || repaired.active_fence_token.is_some()
                 || repaired.active_runtime_generation.is_some()
-                || repaired.active_runtime_epoch_id.is_some()
+                || repaired.active_runtime_epoch_id.as_ref()
+                    != Some(&dsl::RuntimeEpochId::from_domain(expected_epoch))
             {
                 return Err(RuntimeDriverError::Internal(
-                    "missing-live normalization did not produce cleared Idle/Queuing executor authority"
+                    "missing-live normalization did not produce an unplaced Idle/Queuing authority \
+                     retaining the entry runtime epoch"
                         .into(),
                 ));
             }
@@ -3624,8 +3718,25 @@ impl MeerkatMachine {
                 }
 
                 let runtime_id = Self::logical_runtime_id(&session_id);
+                // Recover ops state OUTSIDE the sessions lock, and BEFORE the
+                // authority: the entry's runtime epoch is a registration fact,
+                // so registration must already know it.
+                let (recovered_ops, recovered_epoch, recovered_cursors) = match self
+                    .ops_state_for_registration(&session_id, &runtime_id)
+                    .await
+                {
+                    Ok(recovered) => recovered,
+                    Err(err) => {
+                        tracing::error!(
+                            %session_id,
+                            error = %err,
+                            "failed to recover ops lifecycle during executor registration"
+                        );
+                        return Err(err);
+                    }
+                };
                 let recovery = match self
-                    .runtime_authority_for_registration(&runtime_id, &session_id)
+                    .runtime_authority_for_registration(&runtime_id, &session_id, &recovered_epoch)
                     .await
                 {
                     Ok(recovery) => recovery,
@@ -3684,27 +3795,6 @@ impl MeerkatMachine {
                     );
                     return Err(err);
                 }
-                // Recover ops state OUTSIDE the sessions lock to avoid blocking
-                // other adapter operations behind potentially slow disk I/O.
-                let (recovered_ops, recovered_epoch, recovered_cursors) = if self.store.is_some() {
-                    match self
-                        .recover_or_create_ops_state(&session_id, &runtime_id)
-                        .await
-                    {
-                        Ok(recovered) => recovered,
-                        Err(err) => {
-                            tracing::error!(
-                                %session_id,
-                                error = %err,
-                                "failed to recover ops lifecycle during executor registration"
-                            );
-                            return Err(err);
-                        }
-                    }
-                } else {
-                    Self::fresh_ops_state()
-                };
-
                 let mutation_gate = Arc::new(Mutex::new(()));
                 let gate_guard = Arc::clone(&mutation_gate).lock_owned().await;
                 let mut sessions = self.sessions.write().await;

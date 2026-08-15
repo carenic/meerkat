@@ -475,6 +475,7 @@ pub fn estimate_request_bytes(messages: &[Message]) -> Result<u64, CompactionErr
 pub fn build_compaction_context(
     messages: &[Message],
     last_input_tokens: u64,
+    request_context_budget: Option<crate::ContextBudgetFact>,
     provider_request_pressure: Option<crate::ProviderRequestPressure>,
     last_compaction_boundary_index: Option<u64>,
     session_boundary_index: u64,
@@ -493,6 +494,7 @@ pub fn build_compaction_context(
         message_count: messages.len(),
         estimated_history_tokens,
         estimated_request_bytes,
+        request_context_budget,
         provider_request_pressure,
         last_compaction_boundary_index,
         session_boundary_index,
@@ -1148,7 +1150,7 @@ mod tests {
     #[test]
     fn build_compaction_context_populates_request_byte_estimate() {
         let messages = vec![Message::User(UserMessage::text("hello bytes"))];
-        let ctx = build_compaction_context(&messages, 42, None, None, 7);
+        let ctx = build_compaction_context(&messages, 42, None, None, None, 7);
         assert_eq!(
             ctx.estimated_request_bytes,
             estimate_request_bytes(&messages).unwrap(),

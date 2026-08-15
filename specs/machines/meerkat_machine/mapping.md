@@ -119,6 +119,18 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RegisterSessionIdempotentRetired`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `RegisterSessionEpochConflictRejectedIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RegisterSessionEpochConflictRejectedAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RegisterSessionEpochConflictRejectedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RegisterSessionEpochConflictRejectedRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `RegisterSessionResumesStopped`
   - anchors: `meerkat_machine`
   - scenarios: (unclaimed)
@@ -6277,6 +6289,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `OpRegistrationAdmissionResolved`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `SessionRegistrationRejected`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `OpLifecycleTransitionRejected`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -6504,7 +6519,7 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `runtime_generation_requires_bound_runtime`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
-- `runtime_epoch_requires_bound_runtime`
+- `runtime_epoch_requires_registered_session`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `runtime_binding_identity_is_typed`

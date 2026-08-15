@@ -212,8 +212,9 @@ pub fn standalone_session_runtime_authorities(
     model_profile: Option<&meerkat_core::model_profile::ModelProfile>,
     capability_base_filter: &ToolFilter,
 ) -> Result<StandaloneSessionRuntimeAuthorities, String> {
-    let mut authority = dsl_authority::new_registered_authority(session_id)
-        .map_err(|err| dsl_authority::map_error(err, "standalone visibility authority"))?;
+    let mut authority =
+        dsl_authority::new_registered_authority_without_runtime_entry(session_id)
+            .map_err(|err| dsl_authority::map_error(err, "standalone visibility authority"))?;
     let (current_capability_surface, current_capability_surface_status) = match model_profile {
         Some(profile) => (
             Some(dsl::SessionLlmCapabilitySurface {

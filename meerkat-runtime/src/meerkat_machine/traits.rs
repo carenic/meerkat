@@ -2636,9 +2636,13 @@ mod tests {
         session_id: &SessionId,
         runtime_id: &LogicalRuntimeId,
     ) {
-        let mut authority =
-            crate::meerkat_machine::dsl_authority::new_registered_authority(session_id)
-                .expect("register dispatch test authority");
+        let epoch_id =
+            crate::meerkat_machine::dsl::RuntimeEpochId::from("dispatch-test-epoch".to_string());
+        let mut authority = crate::meerkat_machine::dsl_authority::new_registered_authority_id(
+            crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
+            epoch_id.clone(),
+        )
+        .expect("register dispatch test authority");
         crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
             &mut authority,
             crate::meerkat_machine::dsl::MeerkatMachineInput::PrepareBindings {
@@ -2647,9 +2651,7 @@ mod tests {
                 ),
                 fence_token: crate::meerkat_machine::dsl::FenceToken::from(31),
                 generation: Some(crate::meerkat_machine::dsl::Generation::from(7)),
-                runtime_epoch_id: Some(crate::meerkat_machine::dsl::RuntimeEpochId::from(
-                    "dispatch-test-epoch".to_string(),
-                )),
+                runtime_epoch_id: Some(epoch_id),
                 session_id: crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
             },
         )

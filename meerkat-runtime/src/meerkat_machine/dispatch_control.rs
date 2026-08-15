@@ -2372,6 +2372,7 @@ mod tests {
             &mut authority,
             mm_dsl::MeerkatMachineInput::RegisterSession {
                 session_id: mm_dsl::SessionId::from("projection-session"),
+                runtime_epoch_id: None,
             },
         )
         .expect("register session");

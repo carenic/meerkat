@@ -817,6 +817,17 @@ pub enum RegistrationPhase {
     Draining,
 }
 
+/// Typed reason a session registration was refused by machine authority.
+/// Closed set; the surface must align its error with this verdict rather than
+/// classifying a guard rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum SessionRegistrationRejectReasonKind {
+    /// The same session id was re-registered naming a different entry runtime
+    /// epoch: the registered entry was replaced underneath the caller.
+    #[default]
+    RuntimeEpochConflict,
+}
+
 /// Typed comms drain substate. Mirrors the closed set of literals the DSL
 /// transitions assign to `drain_phase`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -3601,7 +3612,21 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         input MeerkatMachineInput {
             // Direct inputs
-            RegisterSession { session_id: SessionId },
+            //
+            // The entry runtime epoch is a REGISTRATION-time fact about the
+            // session entry's runtime generation, not a placement passenger:
+            // registration installs it and every `PrepareBindings` arm only
+            // asserts it. The field is optional because standalone/oracle
+            // authorities are a real epochless population (no runtime entry
+            // exists to own an epoch); the presence requirement for
+            // registered-entry lanes is a type-level fact of the shell's
+            // registered-authority constructors, which take a non-optional
+            // epoch. A machine guard cannot make that distinction: the
+            // machine cannot tell a registered-entry lane from an oracle one.
+            RegisterSession {
+                session_id: SessionId,
+                runtime_epoch_id: Option<RuntimeEpochId>,
+            },
             // Durable-tail recovery authorization (spec: SessionDocumentMachine
             // classifies, THIS machine authorizes, RuntimeStore realizes the
             // atomic boundary). The candidate run id comes from the tail's
@@ -5156,6 +5181,12 @@ macro_rules! meerkat_catalog_machine_dsl {
                 max_concurrent_limit: Option<u64>,
                 active_op_count: u64,
             },
+            SessionRegistrationRejected {
+                session_id: SessionId,
+                reason: Enum<SessionRegistrationRejectReasonKind>,
+                registered_runtime_epoch_id: Option<RuntimeEpochId>,
+                attempted_runtime_epoch_id: Option<RuntimeEpochId>,
+            },
             OpLifecycleTransitionRejected {
                 operation_id: String,
                 action: Enum<OpLifecycleActionKind>,
@@ -5624,6 +5655,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         disposition RuntimeObservedCompletionCursorAdvanced => local seam NoOwnerRealization,
         disposition RuntimeInjectedCompletionCursorAdvanced => local seam NoOwnerRealization,
         disposition OpRegistrationAdmissionResolved => local seam NoOwnerRealization,
+        disposition SessionRegistrationRejected => local seam SurfaceResultAlignment,
         disposition OpLifecycleTransitionRejected => local seam SurfaceResultAlignment,
         disposition WaitAllAdmissionResolved => local seam NoOwnerRealization,
         disposition WaitAllSatisfied => external handoff ops_barrier_satisfaction seam NoOwnerRealization,
@@ -5738,11 +5770,19 @@ macro_rules! meerkat_catalog_machine_dsl {
                         if observation_kind == RuntimeAuthorityObservationKind::Missing {
                             RuntimeAuthorityReconcileDecision::NormalizeOrReplace
                         } else {
+                            // A persisted epoch is not part of the clean
+                            // unbound projection: the entry epoch is a
+                            // per-process registration fact, so a decoded row
+                            // carrying one alongside no placement is exactly
+                            // the registered-unplaced shape a fresh
+                            // registration re-establishes. Demanding an absent
+                            // epoch here would classify every such row as
+                            // NormalizeOrReplace and churn a CAS write on
+                            // every cold recovery.
                             if state == Some(RuntimeLifecycleObservedState::Idle)
                                 && agent_runtime_id == None
                                 && fence_token == None
                                 && runtime_generation == None
-                                && runtime_epoch_id == None
                                 && current_run_id == None
                                 && pre_run_phase == None
                             {
@@ -6215,10 +6255,55 @@ macro_rules! meerkat_catalog_machine_dsl {
             self.active_runtime_generation == None || self.active_runtime_id != None
         }
 
-        invariant runtime_epoch_requires_bound_runtime {
-            self.active_runtime_epoch_id == None || self.active_runtime_id != None
+        // The entry epoch is a REGISTRATION fact, not a placement fact:
+        // registration installs it and unregistration clears it together with
+        // the session binding, so it is exactly as long-lived as the session
+        // entry. {epoch Some, runtime_id None} is therefore a legal steady
+        // state (registered-unplaced: freshly registered, revived, recycled),
+        // which is why this invariant no longer ties the epoch to a bound
+        // runtime - that form (through 0.8.22) would reject every registration
+        // under registration-owned epochs, both as the post-apply debug
+        // assertion and as a hard recovery rejection.
+        invariant runtime_epoch_requires_registered_session {
+            self.active_runtime_epoch_id == None || self.session_id != None
         }
 
+        // Placement identity: a bound runtime must carry at least one typed
+        // identity fact. Reviewed together with the invariant above when the
+        // epoch became registration-owned. Under registration-owned epochs the
+        // epoch disjunct is satisfied by registration for every epoch-bearing
+        // session, so this invariant is entailed by `PrepareBindings`'
+        // `typed_binding_identity_present` guard for every placement the
+        // machine admits. That entailment is the property, not a redundancy:
+        // it is rendered as a post-apply `debug_assert`, as a hard
+        // `RecoveredStateInvariantRejected` in `recover_from_state` (the one
+        // ingress that evaluates it with no guard in front of it), and as
+        // `THEOREM Spec => []runtime_binding_identity_is_typed` over the whole
+        // reachable state space. Weakening the guard therefore turns red here
+        // instead of silently binding a runtime nothing can name.
+        //
+        // The guard is likewise not entailed by
+        // `epoch_binding_matches_registration`: on an epochless-registered
+        // entry that guard forces the placement's epoch to `None`, which
+        // reduces `typed_binding_identity_present` to `generation != None`.
+        // Every arm admits an epochless entry, so {generation None, epoch
+        // None} is inside this input's admitted space and this guard is the
+        // only thing refusing it - which is what keeps
+        // `runtime_binding_identity_is_typed` true over the reachable state
+        // space the theorem quantifies over. The caller census is a separate,
+        // weaker fact and deliberately not the basis: the three lanes that
+        // register epochlessly today (standalone sessions, the projection
+        // oracle, durable-tail probes -
+        // `new_registered_authority_without_runtime_entry`) prepare no
+        // placement at all, and every epochless placement in the tree is
+        // `#[cfg(test)]`. See
+        // `epochless_placement_without_a_typed_generation_is_refused`.
+        //
+        // Narrowing either to generation-only would newly reject
+        // {runtime_id Some, generation None, epoch Some}, a placement all five
+        // arms admit today; no caller in the tree produces that shape, so the
+        // narrowing is available, but it fences a shape unrelated to the
+        // epoch-nulling defect and no failing case asks for it.
         invariant runtime_binding_identity_is_typed {
             self.active_runtime_id == None
             || self.active_runtime_generation != None
@@ -6949,11 +7034,14 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         transition RegisterSession {
             per_phase [Idle, Attached, Running, Retired]
-            on input RegisterSession { session_id }
+            on input RegisterSession { session_id, runtime_epoch_id }
             guard "not_draining" { self.registration_phase != RegistrationPhase::Draining }
             guard "new_session_binding" { self.session_id != Some(session_id) }
             update {
                 self.session_id = Some(session_id);
+                // The entry epoch is born here, with the registration that
+                // owns it. Placement (`PrepareBindings`) only asserts it.
+                self.active_runtime_epoch_id = runtime_epoch_id;
                 self.current_session_llm_identity = None;
                 self.current_session_capability_surface = None;
                 self.current_session_capability_surface_status =
@@ -6972,18 +7060,45 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         // 2b. RegisterSessionIdempotent: re-registering the SAME session
-        // binding is a machine-owned no-op verdict. The shell stages
-        // RegisterSession unconditionally (no "already registered?" probe);
-        // the machine decides whether this is a fresh binding (reset above),
-        // an idempotent re-registration (no state change here), or a revival
-        // of a stopped session (2c below).
+        // binding UNDER THE SAME entry epoch is a machine-owned no-op verdict.
+        // The shell stages RegisterSession unconditionally (no "already
+        // registered?" probe); the machine decides whether this is a fresh
+        // binding (reset above), an idempotent re-registration (no state
+        // change here), an epoch conflict (2b-conflict below), or a revival of
+        // a stopped session (2c below).
         transition RegisterSessionIdempotent {
             per_phase [Idle, Attached, Running, Retired]
-            on input RegisterSession { session_id }
+            on input RegisterSession { session_id, runtime_epoch_id }
             guard "not_draining" { self.registration_phase != RegistrationPhase::Draining }
             guard "same_session_binding" { self.session_id == Some(session_id) }
+            guard "same_registered_epoch" { self.active_runtime_epoch_id == runtime_epoch_id }
             update {}
             to Idle
+        }
+
+        // 2b-conflict. A same-session re-registration naming a DIFFERENT entry
+        // epoch is not idempotent: the entry this authority belongs to was
+        // replaced underneath the caller (or the caller lost track of which
+        // entry it holds). The machine owns that verdict explicitly - a typed
+        // rejection effect the surface must align with - instead of leaving it
+        // to guard-error classification (house precedent: the RegisterOp
+        // duplicate/capacity rejection arms below). Stopped is deliberately
+        // absent: a cold revival legitimately re-registers under a freshly
+        // minted epoch, which arms 2c/2d install.
+        transition RegisterSessionEpochConflictRejected {
+            per_phase [Idle, Attached, Running, Retired]
+            on input RegisterSession { session_id, runtime_epoch_id }
+            guard "not_draining" { self.registration_phase != RegistrationPhase::Draining }
+            guard "same_session_binding" { self.session_id == Some(session_id) }
+            guard "registered_epoch_differs" { self.active_runtime_epoch_id != runtime_epoch_id }
+            update {}
+            to Idle
+            emit SessionRegistrationRejected {
+                session_id: session_id,
+                reason: SessionRegistrationRejectReasonKind::RuntimeEpochConflict,
+                registered_runtime_epoch_id: self.active_runtime_epoch_id,
+                attempted_runtime_epoch_id: runtime_epoch_id
+            }
         }
 
         // 2c. RegisterSessionResumesStopped: the machine-owned re-admission
@@ -6999,19 +7114,27 @@ macro_rules! meerkat_catalog_machine_dsl {
         // phase for resume and every phase-gated build input wedges (the
         // 0.7.19–0.7.23 resume-strand class).
         //
-        // The runtime binding tuple is NOT preserved: it is epoch-scoped —
-        // Stopped proves the bound epoch's executor exited, and a cold
-        // revival registers under a freshly minted epoch, so every
-        // `PrepareBindings` arm (all guarded absent-or-same) would reject
-        // the re-bind by construction (field, 0.7.25 identity-first
-        // gateways: "DSL rejected PrepareBindings: GuardRejected { phase:
-        // Attached }", laundered upstream into "session not found in
-        // runtime adapter after registration"). Clearing the dead epoch's
-        // binding here is truthful and lets the very next PrepareBindings /
-        // mob RequestRuntimeBinding bind the new epoch; warm revivals
-        // re-bind the same way on their next bindings preparation.
+        // The PLACEMENT triple is not preserved: it is placement-scoped -
+        // Stopped proves the bound epoch's executor exited, and the revived
+        // session is re-placed by the next `PrepareBindings` / mob
+        // RequestRuntimeBinding. Keeping the dead executor's triple made every
+        // re-bind guard-rejected by construction (field, 0.7.25
+        // identity-first gateways: "DSL rejected PrepareBindings:
+        // GuardRejected { phase: Attached }", laundered upstream into "session
+        // not found in runtime adapter after registration").
+        //
+        // The ENTRY EPOCH is not cleared: it is a registration fact, and this
+        // arm IS a registration. Re-admission installs the epoch the caller
+        // registers under - the same value on a warm resume, the freshly
+        // minted one on a cold revival. Nulling it here (as this arm did
+        // through 0.8.22) left the entry's epoch absent until some later
+        // placement happened to carry it, which made durable compaction
+        // persistence deterministically impossible for every session whose
+        // placement lane owns no epoch (the mob seam route): the projection
+        // coordinator holds the real minted epoch, so absent-vs-minted is a
+        // permanent mismatch, not a race.
         transition RegisterSessionResumesStopped {
-            on input RegisterSession { session_id }
+            on input RegisterSession { session_id, runtime_epoch_id }
             guard { self.lifecycle_phase == Phase::Stopped }
             guard "same_session_binding" { self.session_id == Some(session_id) }
             guard "not_draining" { self.registration_phase != RegistrationPhase::Draining }
@@ -7021,7 +7144,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_runtime_id = None;
                 self.active_fence_token = None;
                 self.active_runtime_generation = None;
-                self.active_runtime_epoch_id = None;
+                self.active_runtime_epoch_id = runtime_epoch_id;
             }
             to Idle
             emit RuntimeNotice { kind: RuntimeNoticeKind::Recover, detail: "stopped session re-admitted for resume" }
@@ -7030,11 +7153,14 @@ macro_rules! meerkat_catalog_machine_dsl {
         // 2d. RegisterSessionNewBindingFromStopped: keeps RegisterSession
         // total over Stopped for a DIFFERENT session id. Entries are keyed by
         // session id so this is unreachable in the shipped shell, but the
-        // machine still owns the verdict: a new tenant gets the full LLM
-        // reset AND cleared runtime bindings — the previous tenant's binding
-        // facts must not leak into a new session identity.
+        // machine still owns the verdict: a new tenant gets the full LLM reset
+        // AND a cleared placement triple - the previous tenant's placement
+        // facts must not leak into a new session identity. The entry epoch is
+        // SET, not cleared: a new tenant is a new registration, so it carries
+        // the new registration's epoch (clearing it would leave the new tenant
+        // epochless and unable to persist compaction).
         transition RegisterSessionNewBindingFromStopped {
-            on input RegisterSession { session_id }
+            on input RegisterSession { session_id, runtime_epoch_id }
             guard { self.lifecycle_phase == Phase::Stopped }
             guard "new_session_binding" { self.session_id != Some(session_id) }
             guard "not_draining" { self.registration_phase != RegistrationPhase::Draining }
@@ -7043,7 +7169,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_runtime_id = None;
                 self.active_fence_token = None;
                 self.active_runtime_generation = None;
-                self.active_runtime_epoch_id = None;
+                self.active_runtime_epoch_id = runtime_epoch_id;
                 self.registration_phase = RegistrationPhase::Queuing;
                 self.runtime_stop_deferred = false;
                 self.current_session_llm_identity = None;
@@ -8910,6 +9036,25 @@ macro_rules! meerkat_catalog_machine_dsl {
         // Exact re-assertions of the current runtime binding are generated
         // idempotent no-ops with no RuntimeBound effect; new bindings emit
         // RuntimeBound from the generated authority path below.
+        // PrepareBindings writes the PLACEMENT triple only. Its
+        // `runtime_epoch_id` is an ASSERTION against the registration-owned
+        // entry epoch, never a write: placement must agree with the
+        // registration it is placing, in BOTH directions. A placement that
+        // names no epoch (or a stale one) for a session registered under an
+        // epoch is a typed rejection; so is a placement that states an epoch
+        // for a session registered without one.
+        //
+        // The `epoch_binding_absent_or_same` form this replaces made placement
+        // the epoch's WRITER: it admitted any stated epoch whenever the ENTRY's
+        // epoch was absent, and the arm then wrote the stated value into the
+        // entry. That is how an epochless placement lane kept a live entry at
+        // no epoch - with the re-admission arms clearing it, the entry could
+        // never regain one - which permanently disarmed durable compaction
+        // persistence. With the write removed, absent-or-same would still
+        // ADMIT a placement stating an epoch the entry does not have and then
+        // silently drop the claim; asserting against the registration is what
+        // turns that into an immediate typed error. See
+        // `placement_epoch_must_assert_the_registration_in_both_directions`.
         // Stopped is deliberately absent from the PrepareBindings family:
         // the canonical seam stages RegisterSession (revival) before any
         // bindings preparation, so a PrepareBindings arriving at a Stopped
@@ -8940,19 +9085,17 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "runtime_binding_absent_or_same" { self.active_runtime_id == None || self.active_runtime_id == Some(agent_runtime_id) }
             guard "fence_binding_absent_or_same" { self.active_fence_token == None || self.active_fence_token == Some(fence_token) }
             guard "generation_binding_absent_or_same" { self.active_runtime_generation == None || self.active_runtime_generation == generation }
-            guard "epoch_binding_absent_or_same" { self.active_runtime_epoch_id == None || self.active_runtime_epoch_id == runtime_epoch_id }
+            guard "epoch_binding_matches_registration" { self.active_runtime_epoch_id == runtime_epoch_id }
             guard "typed_binding_identity_present" { generation != None || runtime_epoch_id != None }
             guard "runtime_binding_not_already_exact" {
                 self.active_runtime_id != Some(agent_runtime_id)
                 || self.active_fence_token != Some(fence_token)
                 || self.active_runtime_generation != generation
-                || self.active_runtime_epoch_id != runtime_epoch_id
             }
             update {
                 self.active_runtime_id = Some(agent_runtime_id);
                 self.active_fence_token = Some(fence_token);
                 self.active_runtime_generation = generation;
-                self.active_runtime_epoch_id = runtime_epoch_id;
             }
             to Initializing
             emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value") }
@@ -8966,19 +9109,17 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "runtime_binding_absent_or_same" { self.active_runtime_id == None || self.active_runtime_id == Some(agent_runtime_id) }
             guard "fence_binding_absent_or_same" { self.active_fence_token == None || self.active_fence_token == Some(fence_token) }
             guard "generation_binding_absent_or_same" { self.active_runtime_generation == None || self.active_runtime_generation == generation }
-            guard "epoch_binding_absent_or_same" { self.active_runtime_epoch_id == None || self.active_runtime_epoch_id == runtime_epoch_id }
+            guard "epoch_binding_matches_registration" { self.active_runtime_epoch_id == runtime_epoch_id }
             guard "typed_binding_identity_present" { generation != None || runtime_epoch_id != None }
             guard "runtime_binding_not_already_exact" {
                 self.active_runtime_id != Some(agent_runtime_id)
                 || self.active_fence_token != Some(fence_token)
                 || self.active_runtime_generation != generation
-                || self.active_runtime_epoch_id != runtime_epoch_id
             }
             update {
                 self.active_runtime_id = Some(agent_runtime_id);
                 self.active_fence_token = Some(fence_token);
                 self.active_runtime_generation = generation;
-                self.active_runtime_epoch_id = runtime_epoch_id;
             }
             to Attached
             emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value") }
@@ -8992,19 +9133,17 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "runtime_binding_absent_or_same" { self.active_runtime_id == None || self.active_runtime_id == Some(agent_runtime_id) }
             guard "fence_binding_absent_or_same" { self.active_fence_token == None || self.active_fence_token == Some(fence_token) }
             guard "generation_binding_absent_or_same" { self.active_runtime_generation == None || self.active_runtime_generation == generation }
-            guard "epoch_binding_absent_or_same" { self.active_runtime_epoch_id == None || self.active_runtime_epoch_id == runtime_epoch_id }
+            guard "epoch_binding_matches_registration" { self.active_runtime_epoch_id == runtime_epoch_id }
             guard "typed_binding_identity_present" { generation != None || runtime_epoch_id != None }
             guard "runtime_binding_not_already_exact" {
                 self.active_runtime_id != Some(agent_runtime_id)
                 || self.active_fence_token != Some(fence_token)
                 || self.active_runtime_generation != generation
-                || self.active_runtime_epoch_id != runtime_epoch_id
             }
             update {
                 self.active_runtime_id = Some(agent_runtime_id);
                 self.active_fence_token = Some(fence_token);
                 self.active_runtime_generation = generation;
-                self.active_runtime_epoch_id = runtime_epoch_id;
             }
             to Attached
             emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value") }
@@ -9018,19 +9157,17 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "runtime_binding_absent_or_same" { self.active_runtime_id == None || self.active_runtime_id == Some(agent_runtime_id) }
             guard "fence_binding_absent_or_same" { self.active_fence_token == None || self.active_fence_token == Some(fence_token) }
             guard "generation_binding_absent_or_same" { self.active_runtime_generation == None || self.active_runtime_generation == generation }
-            guard "epoch_binding_absent_or_same" { self.active_runtime_epoch_id == None || self.active_runtime_epoch_id == runtime_epoch_id }
+            guard "epoch_binding_matches_registration" { self.active_runtime_epoch_id == runtime_epoch_id }
             guard "typed_binding_identity_present" { generation != None || runtime_epoch_id != None }
             guard "runtime_binding_not_already_exact" {
                 self.active_runtime_id != Some(agent_runtime_id)
                 || self.active_fence_token != Some(fence_token)
                 || self.active_runtime_generation != generation
-                || self.active_runtime_epoch_id != runtime_epoch_id
             }
             update {
                 self.active_runtime_id = Some(agent_runtime_id);
                 self.active_fence_token = Some(fence_token);
                 self.active_runtime_generation = generation;
-                self.active_runtime_epoch_id = runtime_epoch_id;
             }
             to Running
             emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value") }
@@ -9044,19 +9181,17 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "runtime_binding_absent_or_same" { self.active_runtime_id == None || self.active_runtime_id == Some(agent_runtime_id) }
             guard "fence_binding_absent_or_same" { self.active_fence_token == None || self.active_fence_token == Some(fence_token) }
             guard "generation_binding_absent_or_same" { self.active_runtime_generation == None || self.active_runtime_generation == generation }
-            guard "epoch_binding_absent_or_same" { self.active_runtime_epoch_id == None || self.active_runtime_epoch_id == runtime_epoch_id }
+            guard "epoch_binding_matches_registration" { self.active_runtime_epoch_id == runtime_epoch_id }
             guard "typed_binding_identity_present" { generation != None || runtime_epoch_id != None }
             guard "runtime_binding_not_already_exact" {
                 self.active_runtime_id != Some(agent_runtime_id)
                 || self.active_fence_token != Some(fence_token)
                 || self.active_runtime_generation != generation
-                || self.active_runtime_epoch_id != runtime_epoch_id
             }
             update {
                 self.active_runtime_id = Some(agent_runtime_id);
                 self.active_fence_token = Some(fence_token);
                 self.active_runtime_generation = generation;
-                self.active_runtime_epoch_id = runtime_epoch_id;
             }
             to Retired
             emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value") }
@@ -10241,6 +10376,12 @@ macro_rules! meerkat_catalog_machine_dsl {
                 previous_fence_token, previous_runtime_generation, previous_runtime_epoch_id
             }
             guard "session_matches_current" { self.session_id == Some(session_id) }
+            // Placement coherence only: either a whole placement triple or no
+            // placement at all. The unbound branch deliberately says nothing
+            // about the entry epoch - a registered-unplaced session (epoch
+            // Some, placement None) is the ordinary shape a recovered shell
+            // adopts into, so requiring an absent epoch here would make the
+            // guard unsatisfiable exactly in that window.
             guard "current_runtime_binding_consistent" {
                 (
                     self.active_runtime_id != None
@@ -10250,7 +10391,6 @@ macro_rules! meerkat_catalog_machine_dsl {
                     self.active_runtime_id == None
                     && self.active_fence_token == None
                     && self.active_runtime_generation == None
-                    && self.active_runtime_epoch_id == None
                 )
             }
             guard "runtime_lineage_matches" {
@@ -11217,16 +11357,40 @@ macro_rules! meerkat_catalog_machine_dsl {
             on input EnsureSessionWithExecutor { session_id }
             guard { self.lifecycle_phase == Phase::Stopped }
             guard "not_draining" { self.registration_phase != RegistrationPhase::Draining }
+            // Fail-closed re-admission. This arm re-admits without
+            // re-registering, so the only epoch authority it can act under is
+            // the one registration installed; the input carries none. An
+            // epochless registered entry arriving here therefore cannot
+            // establish exact epoch authority for the incarnation it is about
+            // to attach, and re-admitting it anyway reproduces the wedge this
+            // release closes: a live session that takes work yet can never
+            // authorize a durable compaction projection, because the
+            // projection coordinator holds a minted epoch the entry does not.
+            // Refusing is the loud form of the same fact, at the earliest
+            // boundary that still owns it. Honestly epochless authorities
+            // (peer/comms projections) never reach Stopped: they register,
+            // claim an executor from Idle, and project peer interaction.
+            //
+            // This does NOT make Stopped absorbing again (the 0.7.19-0.7.23
+            // resume-strand class): the resume arc that CAN establish the
+            // authority stays open. `RegisterSessionResumesStopped` re-admits
+            // the same session and installs the epoch it registers under, so
+            // an epochless entry is recovered by re-registering it, which is
+            // the only arc that owns an epoch to install.
+            guard "readmission_requires_registered_epoch" { self.active_runtime_epoch_id != None }
             update {
                 self.registration_phase = RegistrationPhase::Active;
                 self.runtime_stop_deferred = false;
-                // Epoch-scoped binding facts of the exited executor's epoch
-                // are cleared on revival — see RegisterSessionResumesStopped.
-                // The next PrepareBindings binds the new epoch's tuple.
+                // The exited executor's PLACEMENT triple is cleared on revival
+                // - see RegisterSessionResumesStopped. The next PrepareBindings
+                // re-places the session. The registered entry epoch SURVIVES:
+                // this arm is not a registration, so it has no epoch to
+                // install, and clearing the registration's epoch here would
+                // silently disarm durable compaction persistence for every
+                // mob-internal revival (which never re-registers).
                 self.active_runtime_id = None;
                 self.active_fence_token = None;
                 self.active_runtime_generation = None;
-                self.active_runtime_epoch_id = None;
             }
             to Attached
             emit RuntimeNotice { kind: RuntimeNoticeKind::Recover, detail: "stopped session re-admitted for executor attach" }
@@ -17383,18 +17547,39 @@ macro_rules! meerkat_catalog_machine_dsl {
             to Retired
         }
 
-        // 34. Recycle: from Idle/Retired → Idle, from Attached → Attached
+        // 34. Recycle: from Idle/Retired → Idle, from Attached → Attached.
+        // Recycling discards the PLACEMENT triple (the recycled runtime is
+        // re-placed by the next binding preparation) and PRESERVES the
+        // registered entry epoch: the session entry is not re-registered here,
+        // so its registration-owned epoch remains the truth. Clearing it would
+        // leave a live registered session epochless and unable to persist a
+        // compaction projection.
+        //
+        // Both arms carry the same fail-closed requirement as the stopped
+        // re-admission above and for the same reason: recycling hands the
+        // session's work to a replacement placement while inheriting - never
+        // installing - the entry's epoch authority, so an entry that cannot
+        // name that authority is refused instead of recycled into a live
+        // session whose compaction projections can only ever be rejected.
+        // `Recycle` is a runtime-placement input by construction (it emits
+        // InitiateRecycle), which is what makes the requirement machine-visible
+        // rather than a claim about callers: a registered entry that reaches
+        // this input with no epoch came from a lane that bypassed the
+        // registered-authority constructors. Recovery for such an entry is
+        // unregistration followed by a fresh registration, which is the arc
+        // that installs an epoch; a same-session re-registration under a
+        // different epoch is the typed conflict verdict, not an install.
         transition RecycleFromIdleOrRetired {
             on input Recycle
             guard {
                 self.lifecycle_phase == Phase::Idle || self.lifecycle_phase == Phase::Retired
             }
             guard "session_registered" { self.session_id != None }
+            guard "recycle_requires_registered_epoch" { self.active_runtime_epoch_id != None }
             update {
                 self.active_runtime_id = None;
                 self.active_fence_token = None;
                 self.active_runtime_generation = None;
-                self.active_runtime_epoch_id = None;
                 self.current_run_id = None;
             }
             to Idle
@@ -17404,11 +17589,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             on input Recycle
             guard { self.lifecycle_phase == Phase::Attached }
             guard "session_registered" { self.session_id != None }
+            guard "recycle_requires_registered_epoch" { self.active_runtime_epoch_id != None }
             update {
                 self.active_runtime_id = None;
                 self.active_fence_token = None;
                 self.active_runtime_generation = None;
-                self.active_runtime_epoch_id = None;
                 self.current_run_id = None;
             }
             to Attached

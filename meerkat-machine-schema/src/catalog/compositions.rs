@@ -1809,14 +1809,19 @@ fn some_string(value: &str) -> Expr {
     Expr::Some(Box::new(Expr::String(value.into())))
 }
 
+// The seam route owns no runtime epoch (MobMachine holds no such fact), so the
+// witness registers the session epochless: the mob-owned route and the
+// epochless registration agree, which is what the routed binding then asserts.
+// Resolving the truthful entry epoch is the owning shell's job, outside this
+// composition.
 fn seam_runtime_session_registration_input() -> CompositionWitnessInput {
     witness_input(
         "meerkat",
         "RegisterSession",
-        vec![witness_field(
-            "session_id",
-            Expr::String("sessionid_1".into()),
-        )],
+        vec![
+            witness_field("session_id", Expr::String("sessionid_1".into())),
+            witness_field("runtime_epoch_id", Expr::None),
+        ],
     )
 }
 

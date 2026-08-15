@@ -6296,6 +6296,101 @@
               "message"
             ],
             "type": "object"
+          },
+          {
+            "description": "The runtime refused to authorize the durable transcript+memory handoff,\nso the original (uncompacted) history was preserved.\n\nDistinct from [`Self::MemoryIndexingFailed`]: the memory store never saw\nthe batch. The refusal is a runtime-authority fact, and\n`preserved_history` says whether the session can still make progress\nwhile it persists: a wedged member needs paging, a fitting one needs a\nlog line. When no authority could answer that at composed-request\nscope, it says so\n([`CompactionPreservedHistoryFit::Unclassified`]) rather than guessing.",
+            "properties": {
+              "attempted_entries": {
+                "description": "Number of discard entries that would have been projected.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "projection_handoff_refused",
+                "type": "string"
+              },
+              "message": {
+                "description": "Display projection of the refusal's exact facts.",
+                "type": "string"
+              },
+              "preserved_history": {
+                "$ref": "#/$defs/CompactionPreservedHistoryFit",
+                "description": "Whether the request the preserved history composes can still be\nsent to the provider."
+              },
+              "refusal": {
+                "$ref": "#/$defs/CompactionHandoffRefusal",
+                "description": "Typed cause of the runtime refusal."
+              }
+            },
+            "required": [
+              "kind",
+              "refusal",
+              "preserved_history",
+              "attempted_entries",
+              "message"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CompactionHandoffRefusal": {
+        "description": "Typed cause of a compaction projection-handoff refusal.\n\nThe runtime coordinator refuses for structurally different reasons, and a\nhost routing severity (page vs log) needs the cause, not a message\nsubstring. This is the wire-stable vocabulary carried by\n[`crate::event::CompactionFailureReason::ProjectionHandoffRefused`];\n[`CompactionCommitCoordinationError::refusal`] is its only producer.",
+        "oneOf": [
+          {
+            "const": "session_mismatch",
+            "description": "The projection belongs to a different session than the coordinator.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_epoch_rotated",
+            "description": "The runtime epoch that minted the coordinator is no longer the session's\nlive epoch, and one bounded re-derivation did not recover it.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_epoch_retired",
+            "description": "The coordinator's epoch is gone: its runtime was unregistered, retired,\nor its durability authority is not ready.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_binding_rotated",
+            "description": "The session's exact runtime placement (runtime id, fence token,\ngeneration) rotated after the coordinator latched it.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_binding_absent",
+            "description": "The session carries no authoritative runtime placement to commit\nagainst.",
+            "type": "string"
+          },
+          {
+            "const": "durable_projection_unsupported",
+            "description": "The runtime has no durable store, or its store cannot commit a\ntranscript rewrite and its memory projection atomically.",
+            "type": "string"
+          },
+          {
+            "const": "unclassified",
+            "description": "A host-supplied coordinator refused without a typed cause.",
+            "type": "string"
+          }
+        ]
+      },
+      "CompactionPreservedHistoryFit": {
+        "description": "Whether the history a failed compaction preserved can still be sent.\n\nThis is the severity discriminator for compaction-persistence failures: the\nsame refusal is a log line on a session that still fits its window and a\nhard wedge on one that does not (every subsequent turn is refused, and the\nonly path out is a compaction that persists). Classification reuses the\npre-dispatch authorities rather than a second limit table:\n[`ContextBudgetState`](crate::ContextBudgetState) over the active model\nprofile's window, and the compactor's effective request-byte cap over the\nexact provider-lowered body size.\n\nBoth authorities are read at composed-request scope, which is the scope the\nquestion is asked at: the transcript is not what crosses the provider\nboundary, the request built from it is. A transcript-only token measure\nunder-reports every request by the tool schemas that ride it, which is the\nexact shape that used to be reported as [`Self::StillFits`] while every\nturn died on the provider's context limit.",
+        "oneOf": [
+          {
+            "const": "unclassified",
+            "description": "Nothing proved an excess, and no axis established a fit at\ncomposed-request scope: the active model declares no context window,\nthe provider exposed no lowered-body witness or no request-byte cap is\nin force, or the only token evidence available was a preserved-history\nfloor that did not cross. One measured axis is not a fit either, so a\ncomposed request within the window with no cap comparison behind it\nlands here. Absence of evidence is reported as such rather than as a\nfit.",
+            "type": "string"
+          },
+          {
+            "const": "still_fits",
+            "description": "The composed request the preserved history produces remains within the\nactive context window and under the effective request-byte cap. Both\naxes measured and both fit; an axis that measured nothing yields\n[`Self::Unclassified`] instead. The run continues normally; the failed\npersistence costs a summary call and a retry, not progress.",
+            "type": "string"
+          },
+          {
+            "const": "over_window",
+            "description": "The composed request the preserved history produces already exceeds the\nactive context window, or the preserved history alone does, or the\nexact lowered body exceeds the effective request-byte cap. The session\ncannot make progress until a compaction persists.",
+            "type": "string"
           }
         ]
       },

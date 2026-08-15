@@ -2690,6 +2690,7 @@ mod tests {
                 store,
                 &driver.runtime_id,
                 session_id,
+                &meerkat_core::RuntimeEpochId::new(),
             )
             .await
             .expect("registration must converge durable runtime authority");

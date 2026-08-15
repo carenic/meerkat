@@ -179,6 +179,7 @@ pub async fn spawn_production_external_tcp_target(peer_name: &str) -> Production
     dsl.apply_input(
         machine_dsl::MeerkatMachineInput::RegisterSession {
             session_id: machine_dsl::SessionId::from(session_id.to_string()),
+            runtime_epoch_id: None,
         },
         "external_tcp_smoke_target::register",
     )

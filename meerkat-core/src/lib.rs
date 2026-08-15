@@ -180,7 +180,8 @@ pub use digest_observability::{
 pub use error::{AgentError, ToolError};
 pub use event::{
     AgentErrorClass, AgentErrorReport, AgentEvent, AssistantImageEvent, BudgetType,
-    CompactionFailureReason, EventEnvelope, EventSourceIdentity, ExternalToolDelta,
+    CompactionFailureReason, CompactionFitByteEvidence, CompactionFitTokenEvidence,
+    CompactionPreservedHistoryFit, EventEnvelope, EventSourceIdentity, ExternalToolDelta,
     ExternalToolDeltaPhase, InteractionFailureReason, ScopedAgentEvent,
     SkillResolutionFailureReason, StreamScopeFrame, StreamTruncationReason, ToolCallArguments,
     ToolCallArgumentsError, ToolConfigChangeOperation, ToolConfigChangeStatus,
@@ -254,13 +255,13 @@ pub use lifecycle::{
 };
 pub use mcp_config::{McpConfig, McpConfigError, McpScope, McpServerConfig, McpServerWithScope};
 pub use memory::{
-    CompactionCommitCoordinationError, CompactionCommitCoordinator, CompactionProjectionId,
-    CompactionProjectionIntent, CompactionProjectionPersistence, CompactionStageReceipt,
-    CompactionStageReconcileReceipt, EmbeddingModel, HnswParams, MemoryEnumerationPage,
-    MemoryEnumerationRequest, MemoryIndexBatch, MemoryIndexReceipt, MemoryIndexRequest,
-    MemoryIndexScope, MemoryMetadata, MemoryOwner, MemoryRankingPolicy, MemoryRecord, MemoryResult,
-    MemoryScopeDropReceipt, MemorySearchScope, MemorySource, MemoryStore, MemoryStoreError,
-    MessageRange, SESSION_COMPACTION_PROJECTION_INTENTS_KEY,
+    CompactionCommitCoordinationError, CompactionCommitCoordinator, CompactionHandoffRefusal,
+    CompactionProjectionId, CompactionProjectionIntent, CompactionProjectionPersistence,
+    CompactionStageReceipt, CompactionStageReconcileReceipt, EmbeddingModel, HnswParams,
+    MemoryEnumerationPage, MemoryEnumerationRequest, MemoryIndexBatch, MemoryIndexReceipt,
+    MemoryIndexRequest, MemoryIndexScope, MemoryMetadata, MemoryOwner, MemoryRankingPolicy,
+    MemoryRecord, MemoryResult, MemoryScopeDropReceipt, MemorySearchScope, MemorySource,
+    MemoryStore, MemoryStoreError, MessageRange, SESSION_COMPACTION_PROJECTION_INTENTS_KEY,
 };
 pub use model_defaults::ModelOperationalDefaultsResolver;
 pub use model_profile::{ModelCatalog, ModelProfile};

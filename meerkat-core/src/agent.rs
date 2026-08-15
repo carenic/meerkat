@@ -2014,6 +2014,12 @@ where
     pub(crate) pending_compaction_boundary_index: Option<u64>,
     /// Exact pressure witness attached to the parked compaction check.
     pub(crate) pending_compaction_request_pressure: Option<crate::ProviderRequestPressure>,
+    /// Whole-request token budget attached to the same parked compaction check.
+    ///
+    /// Parked and cleared together with the pressure witness above: both are
+    /// measurements of one fully composed request, and the trigger decision
+    /// needs the request in both units the model boundary is limited in.
+    pub(crate) pending_compaction_request_budget: Option<crate::ContextBudgetFact>,
     /// Pre-compaction pressure retained until the rebuilt request proves that
     /// compaction both decreased the body and brought it below the hard cap.
     pub(crate) post_compaction_pressure_check: Option<crate::ProviderRequestPressure>,

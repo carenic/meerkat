@@ -684,6 +684,7 @@ impl AgentBuilder {
             compaction_cadence,
             pending_compaction_boundary_index: None,
             pending_compaction_request_pressure: None,
+            pending_compaction_request_budget: None,
             post_compaction_pressure_check: None,
             memory_store: self.memory_store,
             compaction_commit_coordinator: self.compaction_commit_coordinator,

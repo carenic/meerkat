@@ -3124,6 +3124,14 @@ pub enum OpRegistrationRejectReasonKind {
     MaxConcurrentExceeded,
 }
 
+/// Typed reason a session registration was refused by machine authority.
+/// Bridging copy of the catalog type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum SessionRegistrationRejectReasonKind {
+    #[default]
+    RuntimeEpochConflict,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum OpLifecycleActionKind {
     #[default]

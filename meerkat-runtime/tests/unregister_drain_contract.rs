@@ -53,6 +53,7 @@ fn registered_authority() -> MeerkatMachineAuthority {
         &mut authority,
         MeerkatMachineInput::RegisterSession {
             session_id: mm_dsl::SessionId::from(TEST_SESSION),
+            runtime_epoch_id: None,
         },
     )
     .expect("RegisterSession input");

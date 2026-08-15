@@ -1329,6 +1329,10 @@ impl DriverEntry {
         let owner_session_id = outbox.owner_session_id.to_string();
         let session_matches = state.session_id.as_ref().map(|value| value.0.as_str())
             == Some(owner_session_id.as_str());
+        // Placement-only, matching the generated adoption guard
+        // `current_runtime_binding_consistent`: a registered-unplaced shell
+        // (entry epoch present, no placement) is the ordinary recovery shape,
+        // so the retained entry epoch must not disqualify it.
         let unbound_recovery_shell = matches!(
             state.lifecycle_phase,
             crate::meerkat_machine::dsl::MeerkatPhase::Idle
@@ -1336,8 +1340,7 @@ impl DriverEntry {
                 | crate::meerkat_machine::dsl::MeerkatPhase::Stopped
         ) && state.active_runtime_id.is_none()
             && state.active_fence_token.is_none()
-            && state.active_runtime_generation.is_none()
-            && state.active_runtime_epoch_id.is_none();
+            && state.active_runtime_generation.is_none();
         session_matches
             && (unbound_recovery_shell
                 || (state
@@ -6316,28 +6319,38 @@ pub(crate) fn runtime_authority_reconcile_decision_for_observation(
     runtime_authority_reconcile_decision(kind, decoded)
 }
 
+/// Re-register a converged durable row as a fresh in-process authority.
+///
+/// The recovered row's own epoch (if any) belonged to the dead process; this
+/// registration installs the epoch of the entry being built, which is why the
+/// caller must supply it.
 pub(crate) fn registered_runtime_authority_from_converged_record(
     session_id: &SessionId,
+    runtime_epoch_id: &meerkat_core::RuntimeEpochId,
     record: &crate::store::DecodedMachineLifecycleObservation,
 ) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
     registered_runtime_authority_from_converged_record_id(
         &crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
+        &crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(runtime_epoch_id),
         record,
     )
 }
 
 fn registered_runtime_authority_from_converged_record_id(
     session_id: &crate::meerkat_machine::dsl::SessionId,
+    runtime_epoch_id: &crate::meerkat_machine::dsl::RuntimeEpochId,
     record: &crate::store::DecodedMachineLifecycleObservation,
 ) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
-    let mut authority =
-        crate::meerkat_machine::dsl_authority::new_registered_authority_id(session_id.clone())
-            .map_err(|error| {
-                RuntimeDriverError::Internal(crate::meerkat_machine::dsl_authority::map_error(
-                    error,
-                    "fresh cold runtime registration",
-                ))
-            })?;
+    let mut authority = crate::meerkat_machine::dsl_authority::new_registered_authority_id(
+        session_id.clone(),
+        runtime_epoch_id.clone(),
+    )
+    .map_err(|error| {
+        RuntimeDriverError::Internal(crate::meerkat_machine::dsl_authority::map_error(
+            error,
+            "fresh cold runtime registration",
+        ))
+    })?;
     crate::meerkat_machine::dsl_authority::recover_supervisor_authority_snapshot(
         &mut authority,
         record.supervisor_authority().clone(),
@@ -6365,11 +6378,13 @@ pub(crate) async fn reconcile_runtime_authority_for_cold_recovery(
     store: &dyn crate::store::RuntimeStore,
     runtime_id: &LogicalRuntimeId,
     session_id: &SessionId,
+    runtime_epoch_id: &meerkat_core::RuntimeEpochId,
 ) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
     reconcile_runtime_authority_for_cold_recovery_id(
         store,
         runtime_id,
         &crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
+        &crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(runtime_epoch_id),
     )
     .await
 }
@@ -6378,6 +6393,7 @@ async fn reconcile_runtime_authority_for_cold_recovery_id(
     store: &dyn crate::store::RuntimeStore,
     runtime_id: &LogicalRuntimeId,
     session_id: &crate::meerkat_machine::dsl::SessionId,
+    runtime_epoch_id: &crate::meerkat_machine::dsl::RuntimeEpochId,
 ) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
     loop {
         let observed = match store.observe_machine_lifecycle(runtime_id).await {
@@ -6418,7 +6434,11 @@ async fn reconcile_runtime_authority_for_cold_recovery_id(
                         "runtime-authority classifier converged a non-decoded row".to_string(),
                     ));
                 };
-                return registered_runtime_authority_from_converged_record_id(session_id, &record);
+                return registered_runtime_authority_from_converged_record_id(
+                    session_id,
+                    runtime_epoch_id,
+                    &record,
+                );
             }
             crate::meerkat_machine::dsl::RuntimeAuthorityReconcileDecision::NormalizeOrReplace => {
                 let expected = match observed.version() {
@@ -6503,8 +6523,15 @@ pub(crate) async fn machine_recover_persistent_driver(
     driver: &mut crate::driver::ephemeral::EphemeralRuntimeDriver,
 ) -> Result<RecoveryReport, RuntimeDriverError> {
     let session_id = driver.session_authority_id_for_recovery();
-    let reconciled =
-        reconcile_runtime_authority_for_cold_recovery_id(store, runtime_id, &session_id).await?;
+    let reconciled = reconcile_runtime_authority_for_cold_recovery_id(
+        store,
+        runtime_id,
+        &session_id,
+        &crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(
+            &meerkat_core::RuntimeEpochId::new(),
+        ),
+    )
+    .await?;
     let recovered_unregister_progress = reconciled.unregister_progress;
     driver.replace_runtime_authority(reconciled.authority);
 
@@ -7826,15 +7853,16 @@ pub(crate) fn machine_resolve_pre_resolved_runtime_completion_result(
     let dsl_run_id = run_id.map(crate::meerkat_machine::dsl::RunId::from_domain);
     let session_id = SessionId::new();
     let dsl_session_id = crate::meerkat_machine::dsl::SessionId::from_domain(&session_id);
-    let mut authority = crate::meerkat_machine::dsl_authority::new_registered_authority(
-        &session_id,
-    )
-    .map_err(|error| RuntimeDriverError::ValidationFailed {
-        reason: crate::meerkat_machine::dsl_authority::map_error(
-            error,
-            "fresh pre-resolved completion authority",
-        ),
-    })?;
+    let mut authority =
+        crate::meerkat_machine::dsl_authority::new_registered_authority_without_runtime_entry(
+            &session_id,
+        )
+        .map_err(|error| RuntimeDriverError::ValidationFailed {
+            reason: crate::meerkat_machine::dsl_authority::map_error(
+                error,
+                "fresh pre-resolved completion authority",
+            ),
+        })?;
 
     if let Some(run_id) = dsl_run_id.clone() {
         apply_runtime_completion_authority_preview(
@@ -10188,10 +10216,14 @@ mod recovery_tests {
             .await
             .expect("persist cold lifecycle with independent custody");
 
-        let reconciled =
-            reconcile_runtime_authority_for_cold_recovery(&store, &runtime_id, &session_id)
-                .await
-                .expect("cold lifecycle should normalize without erasing custody");
+        let reconciled = reconcile_runtime_authority_for_cold_recovery(
+            &store,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+        )
+        .await
+        .expect("cold lifecycle should normalize without erasing custody");
         assert_eq!(
             reconciled.unregister_progress,
             Some(unregister_progress.clone())
@@ -10264,6 +10296,7 @@ mod recovery_tests {
                             &store,
                             &runtime_id,
                             &session_id,
+                            &meerkat_core::RuntimeEpochId::new(),
                         )
                         .await
                         .expect("every decoded torn tuple must converge through a typed decision");
@@ -10277,10 +10310,29 @@ mod recovery_tests {
                             panic!("reconciled lifecycle row must decode");
                         };
                         assert_eq!(record.runtime_state(), Some(RuntimeState::Idle));
-                        assert_eq!(
-                            record.binding(),
-                            &crate::store::MachineLifecycleBindingFacts::default()
-                        );
+                        // The clean UNPLACED Idle row is the classifier's fixed
+                        // point, so it is left byte-identical - including a
+                        // retained entry epoch, which is a registration fact of
+                        // the process that wrote the row rather than evidence of a
+                        // torn placement. Every other tuple is normalized to a
+                        // cleared placement.
+                        // `trailing_zeros() >= 3`: the three placement bits
+                        // (runtime id, fence token, generation) are all clear.
+                        let converged_fixed_point = state == Some(RuntimeState::Idle)
+                            && binding_bits.trailing_zeros() >= 3
+                            && !run_present
+                            && pre_run_phase.is_none();
+                        let expected_binding = if converged_fixed_point && binding_bits & 8 != 0 {
+                            crate::store::MachineLifecycleBindingFacts::new(
+                                None,
+                                None,
+                                None,
+                                Some("dead-process-epoch".to_string()),
+                            )
+                        } else {
+                            crate::store::MachineLifecycleBindingFacts::default()
+                        };
+                        assert_eq!(record.binding(), &expected_binding);
                         assert_eq!(
                             record.run(),
                             &crate::store::MachineLifecycleRunFacts::default()
@@ -10311,6 +10363,7 @@ mod recovery_tests {
                 &store,
                 &runtime_id,
                 &session_id,
+                &meerkat_core::RuntimeEpochId::new(),
             )
             .await
             {
@@ -10334,8 +10387,13 @@ mod recovery_tests {
         let unavailable = crate::store::InMemoryRuntimeStore::new();
         unavailable.fail_next_machine_lifecycle_observation();
         assert!(matches!(
-            reconcile_runtime_authority_for_cold_recovery(&unavailable, &runtime_id, &session_id,)
-                .await,
+            reconcile_runtime_authority_for_cold_recovery(
+                &unavailable,
+                &runtime_id,
+                &session_id,
+                &meerkat_core::RuntimeEpochId::new(),
+            )
+            .await,
             Err(RuntimeDriverError::RecoveryBackoff { .. })
         ));
 
@@ -10354,8 +10412,13 @@ mod recovery_tests {
             .unwrap();
         conflict.conflict_next_machine_lifecycle_cas();
         assert!(matches!(
-            reconcile_runtime_authority_for_cold_recovery(&conflict, &runtime_id, &session_id,)
-                .await,
+            reconcile_runtime_authority_for_cold_recovery(
+                &conflict,
+                &runtime_id,
+                &session_id,
+                &meerkat_core::RuntimeEpochId::new(),
+            )
+            .await,
             Err(RuntimeDriverError::RecoveryBackoff { .. })
         ));
         assert!(matches!(
@@ -10364,9 +10427,14 @@ mod recovery_tests {
                 if record.runtime_state() == Some(RuntimeState::Running)
         ));
 
-        reconcile_runtime_authority_for_cold_recovery(&conflict, &runtime_id, &session_id)
-            .await
-            .expect("requeued conflict must converge on its next pass");
+        reconcile_runtime_authority_for_cold_recovery(
+            &conflict,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+        )
+        .await
+        .expect("requeued conflict must converge on its next pass");
         let fixed_version = conflict
             .observe_machine_lifecycle(&runtime_id)
             .await
@@ -10374,9 +10442,14 @@ mod recovery_tests {
             .version()
             .cloned()
             .expect("fixed lifecycle row version");
-        reconcile_runtime_authority_for_cold_recovery(&conflict, &runtime_id, &session_id)
-            .await
-            .expect("fixed point must remain converged");
+        reconcile_runtime_authority_for_cold_recovery(
+            &conflict,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+        )
+        .await
+        .expect("fixed point must remain converged");
         assert_eq!(
             conflict
                 .observe_machine_lifecycle(&runtime_id)

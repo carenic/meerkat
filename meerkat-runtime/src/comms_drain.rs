@@ -7681,6 +7681,7 @@ mod tests {
                 session_id: crate::meerkat_machine::dsl::SessionId::from(
                     "comms-drain-test-projection-trust",
                 ),
+                runtime_epoch_id: None,
             },
             "test_projection_trust_register",
         )
@@ -7803,6 +7804,7 @@ mod tests {
             .apply_input(
                 crate::meerkat_machine::dsl::MeerkatMachineInput::RegisterSession {
                     session_id: crate::meerkat_machine::dsl::SessionId::from_domain(&session_id),
+                    runtime_epoch_id: None,
                 },
                 "running_test_peer_comms_handle_register",
             )

@@ -310,7 +310,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `mob_overlay_epoch`: `u64`
 
 ## Inputs
-- `RegisterSession`(session_id: SessionId)
+- `RegisterSession`(session_id: SessionId, runtime_epoch_id: Option<RuntimeEpochId>)
 - `UnregisterSession`(session_id: SessionId, agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>)
 - `ReconfigureSessionLlmIdentity`(previous_identity: SessionLlmIdentity, previous_visibility_state: SessionToolVisibilityState, previous_capability_surface: Option<SessionLlmCapabilitySurface>, previous_capability_surface_status: SessionLlmCapabilitySurfaceStatus, previous_capability_base_filter: ToolFilter, view_image_tool_available: Bool, previous_view_image_visible: Bool, next_view_image_visible: Bool, previous_active_visibility_revision: u64, previous_staged_visibility_revision: u64, target_identity: SessionLlmIdentity, target_capability_surface: SessionLlmCapabilitySurface, next_visibility_state: SessionToolVisibilityState, next_capability_base_filter: ToolFilter, next_active_visibility_revision: u64, tool_visibility_delta: SessionToolVisibilityDelta)
 - `PrepareBindings`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>, session_id: SessionId)
@@ -730,6 +730,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RuntimeObservedCompletionCursorAdvanced`(cursor: u64)
 - `RuntimeInjectedCompletionCursorAdvanced`(cursor: u64)
 - `OpRegistrationAdmissionResolved`(operation_id: String, result: OpRegistrationAdmissionResultKind, reject_reason: Option<OpRegistrationRejectReasonKind>, max_concurrent_limit: Option<u64>, active_op_count: u64)
+- `SessionRegistrationRejected`(session_id: SessionId, reason: SessionRegistrationRejectReasonKind, registered_runtime_epoch_id: Option<RuntimeEpochId>, attempted_runtime_epoch_id: Option<RuntimeEpochId>)
 - `OpLifecycleTransitionRejected`(operation_id: String, action: OpLifecycleActionKind, reason: OpLifecycleRejectReasonKind, status: Option<OperationStatus>)
 - `WaitAllAdmissionResolved`(wait_request_id: WaitRequestId, result: WaitAllAdmissionResultKind, reject_reason: Option<WaitAllRejectReasonKind>, rejected_operation_id: Option<String>)
 - `WaitAllSatisfied`(wait_request_id: WaitRequestId, run_id: RunId, operation_ids: Set<OperationId>)
@@ -1034,7 +1035,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ## Invariants
 - `fence_requires_bound_runtime`
 - `runtime_generation_requires_bound_runtime`
-- `runtime_epoch_requires_bound_runtime`
+- `runtime_epoch_requires_registered_session`
 - `runtime_binding_identity_is_typed`
 - `running_has_current_run`
 - `deferred_stop_requires_active_runtime_phase`
@@ -1298,7 +1299,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RegisterSessionIdle`
 - From: `Idle`
-- On: `RegisterSession`(session_id)
+- On: `RegisterSession`(session_id, runtime_epoch_id)
 - Guards:
   - `not_draining`
   - `new_session_binding`
@@ -1306,7 +1307,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RegisterSessionAttached`
 - From: `Attached`
-- On: `RegisterSession`(session_id)
+- On: `RegisterSession`(session_id, runtime_epoch_id)
 - Guards:
   - `not_draining`
   - `new_session_binding`
@@ -1314,7 +1315,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RegisterSessionRunning`
 - From: `Running`
-- On: `RegisterSession`(session_id)
+- On: `RegisterSession`(session_id, runtime_epoch_id)
 - Guards:
   - `not_draining`
   - `new_session_binding`
@@ -1322,7 +1323,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RegisterSessionRetired`
 - From: `Retired`
-- On: `RegisterSession`(session_id)
+- On: `RegisterSession`(session_id, runtime_epoch_id)
 - Guards:
   - `not_draining`
   - `new_session_binding`
@@ -1330,39 +1331,83 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RegisterSessionIdempotentIdle`
 - From: `Idle`
-- On: `RegisterSession`(session_id)
+- On: `RegisterSession`(session_id, runtime_epoch_id)
 - Guards:
   - `not_draining`
   - `same_session_binding`
+  - `same_registered_epoch`
 - To: `Idle`
 
 ### `RegisterSessionIdempotentAttached`
 - From: `Attached`
-- On: `RegisterSession`(session_id)
+- On: `RegisterSession`(session_id, runtime_epoch_id)
 - Guards:
   - `not_draining`
   - `same_session_binding`
+  - `same_registered_epoch`
 - To: `Attached`
 
 ### `RegisterSessionIdempotentRunning`
 - From: `Running`
-- On: `RegisterSession`(session_id)
+- On: `RegisterSession`(session_id, runtime_epoch_id)
 - Guards:
   - `not_draining`
   - `same_session_binding`
+  - `same_registered_epoch`
 - To: `Running`
 
 ### `RegisterSessionIdempotentRetired`
 - From: `Retired`
-- On: `RegisterSession`(session_id)
+- On: `RegisterSession`(session_id, runtime_epoch_id)
 - Guards:
   - `not_draining`
   - `same_session_binding`
+  - `same_registered_epoch`
+- To: `Retired`
+
+### `RegisterSessionEpochConflictRejectedIdle`
+- From: `Idle`
+- On: `RegisterSession`(session_id, runtime_epoch_id)
+- Guards:
+  - `not_draining`
+  - `same_session_binding`
+  - `registered_epoch_differs`
+- Emits: `SessionRegistrationRejected`
+- To: `Idle`
+
+### `RegisterSessionEpochConflictRejectedAttached`
+- From: `Attached`
+- On: `RegisterSession`(session_id, runtime_epoch_id)
+- Guards:
+  - `not_draining`
+  - `same_session_binding`
+  - `registered_epoch_differs`
+- Emits: `SessionRegistrationRejected`
+- To: `Attached`
+
+### `RegisterSessionEpochConflictRejectedRunning`
+- From: `Running`
+- On: `RegisterSession`(session_id, runtime_epoch_id)
+- Guards:
+  - `not_draining`
+  - `same_session_binding`
+  - `registered_epoch_differs`
+- Emits: `SessionRegistrationRejected`
+- To: `Running`
+
+### `RegisterSessionEpochConflictRejectedRetired`
+- From: `Retired`
+- On: `RegisterSession`(session_id, runtime_epoch_id)
+- Guards:
+  - `not_draining`
+  - `same_session_binding`
+  - `registered_epoch_differs`
+- Emits: `SessionRegistrationRejected`
 - To: `Retired`
 
 ### `RegisterSessionResumesStopped`
 - From: `Stopped`
-- On: `RegisterSession`(session_id)
+- On: `RegisterSession`(session_id, runtime_epoch_id)
 - Guards:
   - `same_session_binding`
   - `not_draining`
@@ -1371,7 +1416,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RegisterSessionNewBindingFromStopped`
 - From: `Stopped`
-- On: `RegisterSession`(session_id)
+- On: `RegisterSession`(session_id, runtime_epoch_id)
 - Guards:
   - `new_session_binding`
   - `not_draining`
@@ -2969,7 +3014,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_binding_absent_or_same`
   - `fence_binding_absent_or_same`
   - `generation_binding_absent_or_same`
-  - `epoch_binding_absent_or_same`
+  - `epoch_binding_matches_registration`
   - `typed_binding_identity_present`
   - `runtime_binding_not_already_exact`
 - Emits: `RuntimeBound`
@@ -2984,7 +3029,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_binding_absent_or_same`
   - `fence_binding_absent_or_same`
   - `generation_binding_absent_or_same`
-  - `epoch_binding_absent_or_same`
+  - `epoch_binding_matches_registration`
   - `typed_binding_identity_present`
   - `runtime_binding_not_already_exact`
 - Emits: `RuntimeBound`
@@ -2999,7 +3044,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_binding_absent_or_same`
   - `fence_binding_absent_or_same`
   - `generation_binding_absent_or_same`
-  - `epoch_binding_absent_or_same`
+  - `epoch_binding_matches_registration`
   - `typed_binding_identity_present`
   - `runtime_binding_not_already_exact`
 - Emits: `RuntimeBound`
@@ -3014,7 +3059,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_binding_absent_or_same`
   - `fence_binding_absent_or_same`
   - `generation_binding_absent_or_same`
-  - `epoch_binding_absent_or_same`
+  - `epoch_binding_matches_registration`
   - `typed_binding_identity_present`
   - `runtime_binding_not_already_exact`
 - Emits: `RuntimeBound`
@@ -3029,7 +3074,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_binding_absent_or_same`
   - `fence_binding_absent_or_same`
   - `generation_binding_absent_or_same`
-  - `epoch_binding_absent_or_same`
+  - `epoch_binding_matches_registration`
   - `typed_binding_identity_present`
   - `runtime_binding_not_already_exact`
 - Emits: `RuntimeBound`
@@ -6439,6 +6484,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `EnsureSessionWithExecutor`(session_id)
 - Guards:
   - `not_draining`
+  - `readmission_requires_registered_epoch`
 - Emits: `RuntimeNotice`
 - To: `Attached`
 
@@ -9877,6 +9923,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `Recycle`()
 - Guards:
   - `session_registered`
+  - `recycle_requires_registered_epoch`
 - Emits: `InitiateRecycle`
 - To: `Idle`
 
@@ -9885,6 +9932,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `Recycle`()
 - Guards:
   - `session_registered`
+  - `recycle_requires_registered_epoch`
 - Emits: `InitiateRecycle`
 - To: `Attached`
 

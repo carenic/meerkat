@@ -5600,6 +5600,7 @@ mod tests {
                     session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(
                         "mob-mcp-local-comms-test",
                     ),
+                    runtime_epoch_id: None,
                 },
             )
             .expect("RegisterSession input");

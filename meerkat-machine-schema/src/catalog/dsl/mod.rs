@@ -1293,6 +1293,10 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 &["AlreadyRegistered", "MaxConcurrentExceeded"],
             ),
             NamedTypeBinding::string_enum(
+                "SessionRegistrationRejectReasonKind",
+                &["RuntimeEpochConflict"],
+            ),
+            NamedTypeBinding::string_enum(
                 "OperationPublicResultClass",
                 &[
                     "MissingAuthority",

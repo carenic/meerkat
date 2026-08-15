@@ -7748,12 +7748,26 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `MemberLiveMaterializationClassified`
 - To: `Running`
 
-### `ResolveMemberRevivalSucceededRunning`
+### `ResolveMemberRevivalSucceededRunningLocal`
 - From: `Running`
 - On: `ResolveMemberRevivalSucceeded`(agent_identity)
 - Guards:
   - `revival_pending`
-  - `placed_carrier_binding_active_or_local`
+  - `member_is_local`
+  - `runtime_binding_present`
+  - `fence_binding_present`
+  - `generation_binding_present`
+  - `session_binding_present`
+- Emits: `RequestRuntimeBinding`
+- To: `Running`
+
+### `ResolveMemberRevivalSucceededRunningPlaced`
+- From: `Running`
+- On: `ResolveMemberRevivalSucceeded`(agent_identity)
+- Guards:
+  - `revival_pending`
+  - `member_is_placed`
+  - `placed_carrier_binding_active`
 - To: `Running`
 
 ### `ResolveMemberRevivalFailedRunning`

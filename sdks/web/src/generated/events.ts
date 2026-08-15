@@ -139,7 +139,17 @@ export type CompactionFailureReason = {
 } | {
   kind: "transcript_rewrite_failed";
   message: string;
+} | {
+  attempted_entries: number;
+  kind: "projection_handoff_refused";
+  message: string;
+  preserved_history: CompactionPreservedHistoryFit;
+  refusal: CompactionHandoffRefusal;
 };
+
+export type CompactionHandoffRefusal = "session_mismatch" | "runtime_epoch_rotated" | "runtime_epoch_retired" | "runtime_binding_rotated" | "runtime_binding_absent" | "durable_projection_unsupported" | "unclassified";
+
+export type CompactionPreservedHistoryFit = "unclassified" | "still_fits" | "over_window";
 
 export interface CompactionRewriteRange {
   end: number;

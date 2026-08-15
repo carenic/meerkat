@@ -1125,9 +1125,14 @@ mod tests {
         generation: u64,
         epoch_id: &str,
     ) {
-        let mut authority =
-            crate::meerkat_machine::dsl_authority::new_registered_authority(session_id)
-                .expect("test authority must register its session");
+        // The entry epoch is registration-owned; the placement below asserts
+        // the same value.
+        let epoch_id = crate::meerkat_machine::dsl::RuntimeEpochId::from(epoch_id.to_string());
+        let mut authority = crate::meerkat_machine::dsl_authority::new_registered_authority_id(
+            crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
+            epoch_id.clone(),
+        )
+        .expect("test authority must register its session");
         crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
             &mut authority,
             crate::meerkat_machine::dsl::MeerkatMachineInput::PrepareBindings {
@@ -1136,9 +1141,7 @@ mod tests {
                 ),
                 fence_token: crate::meerkat_machine::dsl::FenceToken::from(fence_token),
                 generation: Some(crate::meerkat_machine::dsl::Generation::from(generation)),
-                runtime_epoch_id: Some(crate::meerkat_machine::dsl::RuntimeEpochId::from(
-                    epoch_id.to_string(),
-                )),
+                runtime_epoch_id: Some(epoch_id),
                 session_id: crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
             },
         )

@@ -100,6 +100,21 @@ impl ContextBudgetFact {
         self.state.requires_dispatch_refusal()
             && self.estimate_provenance == ContextBudgetEstimateProvenance::ExactProviderTokenCount
     }
+
+    /// Effective input-side token count for this request: the exact
+    /// provider-issued count when one exists, otherwise the canonical
+    /// transcript-plus-tools forecast.
+    ///
+    /// The output reserve is subtracted rather than the components re-summed,
+    /// because summing `estimated_input_tokens + estimated_tool_tokens` would
+    /// silently discard an exact provider-issued count. Excluding the reserve
+    /// keeps this value comparable with an input-token threshold: what the
+    /// request presents to the model, not what the response may add.
+    #[must_use]
+    pub fn effective_input_tokens(&self) -> u64 {
+        self.estimated_total_tokens
+            .saturating_sub(u64::from(self.reserved_output_tokens))
+    }
 }
 
 /// Typed failure to construct a context-budget fact.
@@ -415,6 +430,48 @@ mod tests {
         assert_eq!(fact.estimated_total_tokens, 1_200);
         assert_eq!(fact.state, ContextBudgetState::Exceeded);
         assert!(fact.requires_dispatch_refusal());
+        Ok(())
+    }
+
+    #[test]
+    fn effective_input_tokens_prefers_exact_provider_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session = session_with_system_bytes(2_000);
+        let profile = profile_witness(Some(1_000_000))?;
+        let tools = [Arc::new(ToolDef::new(
+            "lookup",
+            "look up an exact record",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } }
+            }),
+        ))];
+
+        let forecast = context_budget_fact_for_session(&session, &tools, 8_192, &profile)?;
+        assert_eq!(
+            forecast.effective_input_tokens(),
+            forecast
+                .estimated_input_tokens
+                .saturating_add(forecast.estimated_tool_tokens),
+            "the forecast input side must include the visible tool definitions"
+        );
+        assert!(
+            forecast.effective_input_tokens() > forecast.estimated_input_tokens,
+            "tool definitions must be visible in the input-side total"
+        );
+
+        let counted = context_budget_fact_for_provider_request(
+            session.messages(),
+            &tools,
+            8_192,
+            &profile,
+            ProviderRequestPressure::new(2_400, None).with_provider_issued_input_tokens(640_000),
+        )?;
+        assert_eq!(
+            counted.effective_input_tokens(),
+            640_000,
+            "an exact provider-issued count must not be replaced by the component sum"
+        );
         Ok(())
     }
 

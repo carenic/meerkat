@@ -649,14 +649,20 @@ impl EphemeralRuntimeDriver {
         active_runtime_epoch_id: Option<mm_dsl::RuntimeEpochId>,
         supervisor_authority: crate::store::SupervisorAuthoritySnapshot,
     ) -> Result<(), RuntimeDriverError> {
+        // The seeded epoch is a REGISTRATION fact: install it here, and let the
+        // optional placement below assert it. Threading it only as a placement
+        // passenger would seed a shape the machine no longer admits.
         let mut recovered =
-            crate::meerkat_machine::dsl_authority::new_registered_authority_id(session_id.clone())
-                .map_err(|err| {
-                    RuntimeDriverError::Internal(crate::meerkat_machine::dsl_authority::map_error(
-                        err,
-                        "test runtime registration",
-                    ))
-                })?;
+            crate::meerkat_machine::dsl_authority::new_registered_authority_with_optional_epoch(
+                session_id.clone(),
+                active_runtime_epoch_id.clone(),
+            )
+            .map_err(|err| {
+                RuntimeDriverError::Internal(crate::meerkat_machine::dsl_authority::map_error(
+                    err,
+                    "test runtime registration",
+                ))
+            })?;
         if let (Some(runtime_id), Some(fence_token)) = (runtime_id, active_fence_token) {
             crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
                 &mut recovered,
@@ -1817,6 +1823,9 @@ impl EphemeralRuntimeDriver {
         self.dsl_apply(
             mm_dsl::MeerkatMachineInput::RegisterSession {
                 session_id: session_id.clone(),
+                // Contract-test authority: no runtime session entry exists, so
+                // there is no entry epoch to register under.
+                runtime_epoch_id: None,
             },
             "ContractRegisterSession",
         )?;

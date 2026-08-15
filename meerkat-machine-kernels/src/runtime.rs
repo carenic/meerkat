@@ -3691,10 +3691,16 @@ mod tests {
                 &initialized.next_state,
                 &KernelInput {
                     variant: input_id("RegisterSession"),
-                    fields: BTreeMap::from([(
-                        field_id("session_id"),
-                        named_string("SessionId", "session-1"),
-                    )]),
+                    // Every DECLARED field must be present: the kernel refuses an
+                    // input missing one, so the registration-owned runtime epoch
+                    // belongs in the fixture even when it registers epochlessly.
+                    fields: BTreeMap::from([
+                        (
+                            field_id("session_id"),
+                            named_string("SessionId", "session-1"),
+                        ),
+                        (field_id("runtime_epoch_id"), KernelValue::None),
+                    ]),
                 },
             )
             .expect("register session");
@@ -3736,10 +3742,16 @@ mod tests {
                 &initialized.next_state,
                 &KernelInput {
                     variant: input_id("RegisterSession"),
-                    fields: BTreeMap::from([(
-                        field_id("session_id"),
-                        named_string("SessionId", "session-1"),
-                    )]),
+                    // Every DECLARED field must be present: the kernel refuses an
+                    // input missing one, so the registration-owned runtime epoch
+                    // belongs in the fixture even when it registers epochlessly.
+                    fields: BTreeMap::from([
+                        (
+                            field_id("session_id"),
+                            named_string("SessionId", "session-1"),
+                        ),
+                        (field_id("runtime_epoch_id"), KernelValue::None),
+                    ]),
                 },
             )
             .expect("register session");
@@ -4198,10 +4210,13 @@ mod tests {
                 &initialized.next_state,
                 &KernelInput {
                     variant: input_id("RegisterSession"),
-                    fields: BTreeMap::from([(
-                        field_id("session_id"),
-                        named_string("SessionId", "session-a"),
-                    )]),
+                    fields: BTreeMap::from([
+                        (
+                            field_id("session_id"),
+                            named_string("SessionId", "session-a"),
+                        ),
+                        (field_id("runtime_epoch_id"), KernelValue::None),
+                    ]),
                 },
             )
             .expect("register typed session");
