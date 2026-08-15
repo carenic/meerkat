@@ -20025,6 +20025,14 @@
         ],
         "type": "object"
       },
+      "MobFlowNodeFailurePolicyInput": {
+        "description": "Authored tolerance for a flow node's failure.\n\n`Escalate` (the default) classifies the enclosing frame Failed when the node\nfails. `Continue` keeps the recorded node/step failure but lets the frame\nclassify on the remaining nodes.",
+        "enum": [
+          "escalate",
+          "continue"
+        ],
+        "type": "string"
+      },
       "MobFlowNodeInput": {
         "oneOf": [
           {
@@ -20045,6 +20053,11 @@
               "depends_on_mode": {
                 "$ref": "#/$defs/MobDependencyModeInput",
                 "default": "all"
+              },
+              "failure_policy": {
+                "$ref": "#/$defs/MobFlowNodeFailurePolicyInput",
+                "default": "escalate",
+                "description": "Tolerance for this node's failure; omitted means `escalate`."
               },
               "kind": {
                 "const": "step",
@@ -20075,6 +20088,11 @@
               "depends_on_mode": {
                 "$ref": "#/$defs/MobDependencyModeInput",
                 "default": "all"
+              },
+              "failure_policy": {
+                "$ref": "#/$defs/MobFlowNodeFailurePolicyInput",
+                "default": "escalate",
+                "description": "Tolerance for this loop node's failure; omitted means `escalate`."
               },
               "kind": {
                 "const": "repeat_until",
@@ -20193,6 +20211,11 @@
               "string",
               "null"
             ]
+          },
+          "failure_policy": {
+            "$ref": "#/$defs/MobFlowNodeFailurePolicyInput",
+            "default": "escalate",
+            "description": "Tolerance for this step's failure once compiled into the root frame;\nomitted means `escalate`."
           },
           "message": {
             "$ref": "#/$defs/WireContentInput"

@@ -205,6 +205,23 @@ impl MobEventEmitter {
         })
         .await
     }
+
+    /// Report that an escalation MobMachine decided on could not be delivered.
+    ///
+    /// Audit only: it never changes the run's terminal class.
+    pub async fn supervisor_escalation_failed(
+        &self,
+        run_id: RunId,
+        step_id: StepId,
+        reason: String,
+    ) -> Result<MobEvent, MobError> {
+        self.append(MobEventKind::SupervisorEscalationFailed {
+            run_id,
+            step_id,
+            reason,
+        })
+        .await
+    }
 }
 
 #[cfg(test)]

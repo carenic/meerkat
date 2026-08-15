@@ -578,6 +578,7 @@ mod tests {
                 allowed_tools: None,
                 blocked_tools: None,
                 output_format: Some(StepOutputFormat::Text),
+                failure_policy: Default::default(),
             },
         );
         FlowSpec::new(Some("sample".into()), steps, None)

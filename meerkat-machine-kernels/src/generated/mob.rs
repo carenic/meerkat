@@ -1129,6 +1129,56 @@ impl std::fmt::Display for FlowFrameReducerCommandKind {
         f.write_str(self.as_str())
     }
 }
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum FlowNodeFailurePolicy {
+    #[default]
+    #[serde(rename = "Escalate")]
+    Escalate,
+    #[serde(rename = "Continue")]
+    Continue,
+}
+impl FlowNodeFailurePolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Escalate => "Escalate",
+            Self::Continue => "Continue",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for FlowNodeFailurePolicy {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Escalate" => Ok(Self::Escalate),
+            "Continue" => Ok(Self::Continue),
+            other => Err(format!("invalid FlowNodeFailurePolicy value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for FlowNodeFailurePolicy {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for FlowNodeFailurePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 #[derive(
     Debug,
     Clone,
@@ -6335,6 +6385,10 @@ pub struct State {
         std::collections::BTreeMap<FrameId, std::collections::BTreeMap<FlowNodeId, LoopId>>,
     pub frame_node_status:
         std::collections::BTreeMap<FrameId, std::collections::BTreeMap<FlowNodeId, NodeRunStatus>>,
+    pub frame_node_failure_policy: std::collections::BTreeMap<
+        FrameId,
+        std::collections::BTreeMap<FlowNodeId, FlowNodeFailurePolicy>,
+    >,
     pub frame_ready_queue: std::collections::BTreeMap<FrameId, Vec<FlowNodeId>>,
     pub frame_output_recorded:
         std::collections::BTreeMap<FrameId, std::collections::BTreeMap<FlowNodeId, bool>>,
@@ -6665,6 +6719,7 @@ pub mod inputs {
         pub node_step_ids: std::collections::BTreeMap<FlowNodeId, StepId>,
         pub node_loop_ids: std::collections::BTreeMap<FlowNodeId, LoopId>,
         pub node_status: std::collections::BTreeMap<FlowNodeId, NodeRunStatus>,
+        pub node_failure_policy: std::collections::BTreeMap<FlowNodeId, FlowNodeFailurePolicy>,
         pub ready_queue: Vec<FlowNodeId>,
         pub output_recorded: std::collections::BTreeMap<FlowNodeId, bool>,
         pub node_condition_results: std::collections::BTreeMap<FlowNodeId, Option<bool>>,
@@ -11872,6 +11927,7 @@ pub fn initial_state() -> State {
         frame_node_step_ids: Default::default(),
         frame_node_loop_ids: Default::default(),
         frame_node_status: Default::default(),
+        frame_node_failure_policy: Default::default(),
         frame_ready_queue: Default::default(),
         frame_output_recorded: Default::default(),
         frame_last_admitted_node: Default::default(),

@@ -4461,6 +4461,7 @@ impl FaultInjectedMobEventStore {
             MobEventKind::StepSkipped { .. } => "StepSkipped",
             MobEventKind::TopologyViolation { .. } => "TopologyViolation",
             MobEventKind::SupervisorEscalation { .. } => "SupervisorEscalation",
+            MobEventKind::SupervisorEscalationFailed { .. } => "SupervisorEscalationFailed",
             MobEventKind::OperatorActionRecorded { .. } => "OperatorActionRecorded",
         }
     }
@@ -5857,6 +5858,7 @@ fn flow_step(role: impl Into<crate::ids::ProfileName>, message: &str) -> FlowSte
         allowed_tools: None,
         blocked_tools: None,
         output_format: Some(StepOutputFormat::Json),
+        failure_policy: Default::default(),
     }
 }
 
@@ -9480,6 +9482,7 @@ async fn seed_test_body_frame_in_mob_machine(
                 node_step_ids: Default::default(),
                 node_loop_ids: Default::default(),
                 node_status: Default::default(),
+                node_failure_policy: Default::default(),
                 ready_queue: Vec::new(),
                 output_recorded: Default::default(),
                 node_condition_results: Default::default(),
@@ -40875,6 +40878,12 @@ fn authority_backed_root_frame_run(
         )]
         .into_iter()
         .collect(),
+        node_failure_policy: [(
+            crate::machines::mob_machine::FlowNodeId::from(loop_node_id.as_str()),
+            crate::machines::mob_machine::FlowNodeFailurePolicy::Escalate,
+        )]
+        .into_iter()
+        .collect(),
         ready_queue: vec![crate::machines::mob_machine::FlowNodeId::from(
             loop_node_id.as_str(),
         )],
@@ -41015,6 +41024,7 @@ async fn test_flow_frame_store_plan_persists_authority_input_with_projection() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     let root_spec = FrameSpec { nodes };
@@ -41321,6 +41331,7 @@ async fn test_stale_flow_frame_store_plan_loses_cas_before_authority_prepare() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     let root_spec = FrameSpec { nodes };
@@ -57719,6 +57730,7 @@ async fn test_flow_with_root_frame_spec_executes_frame_nodes() {
                 depends_on: vec![],
                 depends_on_mode: crate::definition::DependencyMode::All,
                 branch: None,
+                failure_policy: Default::default(),
             }),
         );
         nodes.insert(
@@ -57728,6 +57740,7 @@ async fn test_flow_with_root_frame_spec_executes_frame_nodes() {
                 depends_on: vec![FlowNodeId::from("setup-node")],
                 depends_on_mode: crate::definition::DependencyMode::All,
                 branch: None,
+                failure_policy: Default::default(),
             }),
         );
         FrameSpec { nodes }
@@ -57817,6 +57830,7 @@ async fn test_root_frame_condition_skip_emits_single_skip_projection() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     flow.root = FrameSpec { nodes: root_nodes };
@@ -57907,6 +57921,7 @@ async fn test_step_condition_referencing_absent_root_skips_not_fails() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     flow.root = FrameSpec { nodes: root_nodes };
@@ -57967,6 +57982,7 @@ async fn test_root_frame_step_failure_does_not_abort_independent_siblings() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     root_nodes.insert(
@@ -57976,6 +57992,7 @@ async fn test_root_frame_step_failure_does_not_abort_independent_siblings() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
 
@@ -58059,6 +58076,7 @@ async fn test_root_frame_step_failure_records_failure_ledger_once() {
                 depends_on: Vec::new(),
                 depends_on_mode: DependencyMode::All,
                 branch: None,
+                failure_policy: Default::default(),
             }),
         )]),
     };
@@ -58109,6 +58127,7 @@ async fn test_root_frame_supervisor_threshold_is_respected_before_reset() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     flow.root = FrameSpec { nodes: root_nodes };
@@ -58152,6 +58171,281 @@ async fn test_root_frame_supervisor_threshold_is_respected_before_reset() {
     );
 }
 
+/// End-to-end F11: a `failure_policy: continue` node fails, the run still
+/// completes, the failure stays visible on a host-watched path, and the
+/// machine-emitted supervisor escalation is honored rather than dropped.
+#[tokio::test]
+async fn test_root_frame_continue_policy_completes_run_and_honors_escalation() {
+    use crate::definition::{
+        FlowNodeFailurePolicy, FlowNodeSpec, FrameSpec, FrameStepSpec, SupervisorSpec,
+    };
+    use crate::ids::FlowNodeId;
+
+    let mut definition = sample_definition();
+    definition.supervisor = Some(SupervisorSpec {
+        role: ProfileName::from("lead"),
+        escalation_threshold: 1,
+        escalation_turn_timeout_ms: None,
+    });
+
+    let mut steps = IndexMap::new();
+    steps.insert(
+        step_id("advisory"),
+        flow_step("worker", "Advisory analysis"),
+    );
+    steps.insert(step_id("primary"), flow_step("lead", "Primary work"));
+
+    let mut root_nodes = IndexMap::new();
+    root_nodes.insert(
+        FlowNodeId::from("advisory-node"),
+        FlowNodeSpec::Step(FrameStepSpec {
+            step_id: step_id("advisory"),
+            depends_on: Vec::new(),
+            depends_on_mode: DependencyMode::All,
+            branch: None,
+            failure_policy: FlowNodeFailurePolicy::Continue,
+        }),
+    );
+    root_nodes.insert(
+        FlowNodeId::from("primary-node"),
+        FlowNodeSpec::Step(FrameStepSpec {
+            step_id: step_id("primary"),
+            depends_on: Vec::new(),
+            depends_on_mode: DependencyMode::All,
+            branch: None,
+            failure_policy: Default::default(),
+        }),
+    );
+
+    definition.flows = BTreeMap::from([(
+        flow_id("demo"),
+        FlowSpec::new(
+            Some("advisory root node under continue policy".to_string()),
+            steps,
+            Some(FrameSpec { nodes: root_nodes }),
+        ),
+    )]);
+
+    let (handle, service) = create_test_mob(definition).await;
+    // The supervisor role must keep working turns: escalation dispatches a turn
+    // to it, so only the advisory member's session is made to fail.
+    handle
+        .spawn(ProfileName::from("lead"), AgentIdentity::from("l-1"), None)
+        .await
+        .expect("spawn lead supervisor");
+    let worker_session_id = handle
+        .spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-1"),
+            None,
+        )
+        .await
+        .expect("spawn worker")
+        .bridge_session_id()
+        .expect("session-backed worker")
+        .clone();
+    service
+        .set_flow_turn_fail_for_session(&worker_session_id, true)
+        .await;
+
+    let run_id = handle
+        .run_flow(FlowId::from("demo"), serde_json::json!({}))
+        .await
+        .expect("run flow");
+    let terminal = wait_for_run_terminal(&handle, &run_id, Duration::from_secs(3)).await;
+
+    assert_eq!(
+        terminal.status,
+        MobRunStatus::Completed,
+        "a Continue-policy node's failure must not fail the run"
+    );
+    assert!(
+        terminal.step_ledger.iter().any(|entry| {
+            entry.step_id.as_str() == "advisory" && entry.status == StepRunStatus::Failed
+        }),
+        "the tolerated failure must stay recorded as a failed step, not be laundered"
+    );
+    assert!(
+        terminal
+            .failure_ledger
+            .iter()
+            .any(|entry| entry.step_id.as_str() == "advisory"),
+        "the tolerated failure must still append a failure-ledger entry"
+    );
+    assert!(
+        terminal.failure_ledger.iter().any(|entry| {
+            entry.step_id.as_str() == "advisory" && entry.reason.contains("mock flow turn failure")
+        }),
+        "the ledger entry must carry the real failure reason, not a constant"
+    );
+
+    let events = handle.events().replay_all().await.expect("replay");
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::StepFailed { run_id: id, step_id, reason }
+                    if id == &run_id
+                        && step_id.as_str() == "advisory"
+                        && reason.contains("mock flow turn failure")
+            )
+        }),
+        "the tolerated failure must reach a host-watched event path with the real reason"
+    );
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::SupervisorEscalation { run_id: id, step_id, .. }
+                    if id == &run_id && step_id.as_str() == "advisory"
+            )
+        }),
+        "the machine-emitted EscalateSupervisor effect must be honored, not discarded"
+    );
+    assert_eq!(
+        handle.list_members().await.len(),
+        2,
+        "escalating on a completing run must not force_reset the mob"
+    );
+}
+
+/// F11 companion: failing to CARRY OUT the machine's escalation decision is not
+/// the machine deciding the run failed. When no member holds the supervisor
+/// role, MobMachine classifies the escalation `NoEligibleSupervisor` and
+/// `Supervisor::escalate` errors; the run must still terminalize with the class
+/// the machine assigned it, with the escalation failure reported rather than
+/// swallowed.
+#[tokio::test]
+async fn test_failed_escalation_leaves_continue_policy_run_completed() {
+    use crate::definition::{
+        FlowNodeFailurePolicy, FlowNodeSpec, FrameSpec, FrameStepSpec, SupervisorSpec,
+    };
+    use crate::ids::FlowNodeId;
+
+    let mut definition = sample_definition();
+    // A declared-but-never-spawned supervisor role: spec validation requires the
+    // role to exist as a profile, and `list_runnable_members()` then holds no
+    // member matching it, which is what drives MobMachine to classify the
+    // escalation `NoEligibleSupervisor`.
+    let auditor_profile = definition
+        .profiles
+        .get(&ProfileName::from("worker"))
+        .cloned()
+        .expect("worker profile is declared by sample_definition");
+    definition
+        .profiles
+        .insert(ProfileName::from("auditor"), auditor_profile);
+    definition.supervisor = Some(SupervisorSpec {
+        role: ProfileName::from("auditor"),
+        escalation_threshold: 1,
+        escalation_turn_timeout_ms: None,
+    });
+
+    let mut steps = IndexMap::new();
+    steps.insert(
+        step_id("advisory"),
+        flow_step("worker", "Advisory analysis"),
+    );
+    steps.insert(step_id("primary"), flow_step("lead", "Primary work"));
+
+    let mut root_nodes = IndexMap::new();
+    root_nodes.insert(
+        FlowNodeId::from("advisory-node"),
+        FlowNodeSpec::Step(FrameStepSpec {
+            step_id: step_id("advisory"),
+            depends_on: Vec::new(),
+            depends_on_mode: DependencyMode::All,
+            branch: None,
+            failure_policy: FlowNodeFailurePolicy::Continue,
+        }),
+    );
+    root_nodes.insert(
+        FlowNodeId::from("primary-node"),
+        FlowNodeSpec::Step(FrameStepSpec {
+            step_id: step_id("primary"),
+            depends_on: Vec::new(),
+            depends_on_mode: DependencyMode::All,
+            branch: None,
+            failure_policy: Default::default(),
+        }),
+    );
+
+    definition.flows = BTreeMap::from([(
+        flow_id("demo"),
+        FlowSpec::new(
+            Some("advisory root node with an undeliverable escalation".to_string()),
+            steps,
+            Some(FrameSpec { nodes: root_nodes }),
+        ),
+    )]);
+
+    let (handle, service) = create_test_mob(definition).await;
+    handle
+        .spawn(ProfileName::from("lead"), AgentIdentity::from("l-1"), None)
+        .await
+        .expect("spawn lead");
+    let worker_session_id = handle
+        .spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-1"),
+            None,
+        )
+        .await
+        .expect("spawn worker")
+        .bridge_session_id()
+        .expect("session-backed worker")
+        .clone();
+    service
+        .set_flow_turn_fail_for_session(&worker_session_id, true)
+        .await;
+
+    let run_id = handle
+        .run_flow(FlowId::from("demo"), serde_json::json!({}))
+        .await
+        .expect("run flow");
+    let terminal = wait_for_run_terminal(&handle, &run_id, Duration::from_secs(3)).await;
+
+    assert_eq!(
+        terminal.status,
+        MobRunStatus::Completed,
+        "an undeliverable escalation must not fail a run the machine classified completing"
+    );
+    assert!(
+        terminal.failure_ledger.iter().any(|entry| {
+            entry.step_id.as_str() == "advisory" && entry.reason.contains("mock flow turn failure")
+        }),
+        "the ledger entry must carry the real failure reason, not a constant"
+    );
+
+    let events = handle.events().replay_all().await.expect("replay");
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::SupervisorEscalationFailed { run_id: id, step_id, reason }
+                    if id == &run_id
+                        && step_id.as_str() == "advisory"
+                        && reason.contains("no active supervisor member for role 'auditor'")
+            )
+        }),
+        "the escalation failure must be reported on a host-watched path"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::SupervisorEscalation { run_id: id, .. } if id == &run_id
+            )
+        }),
+        "no escalation reached a supervisor, so no success event may be emitted"
+    );
+    assert_eq!(
+        handle.list_members().await.len(),
+        2,
+        "a failed escalation on a completing run must not force_reset the mob"
+    );
+}
+
 #[tokio::test]
 async fn test_root_frame_fan_in_persists_canonical_completed_aggregate_output() {
     use crate::definition::{FlowNodeSpec, FrameSpec, FrameStepSpec};
@@ -58171,6 +58465,7 @@ async fn test_root_frame_fan_in_persists_canonical_completed_aggregate_output() 
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     flow.root = FrameSpec { nodes: root_nodes };
@@ -58258,6 +58553,7 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
             depends_on: vec![],
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     let body_spec = FrameSpec { nodes: body_nodes };
@@ -58275,6 +58571,7 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
                     value: serde_json::json!(true),
                 },
                 max_iterations: 3,
+                failure_policy: Default::default(),
             }),
         );
         FrameSpec { nodes }
@@ -58447,6 +58744,7 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
             depends_on: vec![],
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     let body_spec = FrameSpec { nodes: body_nodes };
@@ -58464,6 +58762,7 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
                     value: serde_json::json!(true),
                 },
                 max_iterations: 3,
+                failure_policy: Default::default(),
             }),
         );
         FrameSpec { nodes }
@@ -58707,6 +59006,7 @@ async fn test_root_frame_timeout_cleans_up_inflight_node() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     flow.root = FrameSpec { nodes: root_nodes };
@@ -58812,6 +59112,7 @@ async fn test_root_frame_max_active_nodes_limits_nested_body_step_admission() {
                 depends_on: Vec::new(),
                 depends_on_mode: DependencyMode::All,
                 branch: None,
+                failure_policy: Default::default(),
             }),
         )]),
     };
@@ -58830,6 +59131,7 @@ async fn test_root_frame_max_active_nodes_limits_nested_body_step_admission() {
                         value: serde_json::json!(true),
                     },
                     max_iterations: 3,
+                    failure_policy: Default::default(),
                 }),
             ),
             (
@@ -58839,6 +59141,7 @@ async fn test_root_frame_max_active_nodes_limits_nested_body_step_admission() {
                     depends_on: Vec::new(),
                     depends_on_mode: DependencyMode::All,
                     branch: None,
+                    failure_policy: Default::default(),
                 }),
             ),
         ]),
@@ -58931,6 +59234,7 @@ async fn test_root_frame_cancel_cleans_up_inflight_node() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     flow.root = FrameSpec { nodes: root_nodes };
@@ -58997,6 +59301,7 @@ async fn test_root_loop_body_failure_stops_after_first_failed_iteration() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
 
@@ -59013,6 +59318,7 @@ async fn test_root_loop_body_failure_stops_after_first_failed_iteration() {
                 value: serde_json::json!(true),
             },
             max_iterations: 3,
+            failure_policy: Default::default(),
         }),
     );
 
@@ -62031,6 +62337,7 @@ fn mob_runtime_parity_field_value(
         | "frame_node_step_ids"
         | "frame_node_loop_ids"
         | "frame_node_status"
+        | "frame_node_failure_policy"
         | "frame_ready_queue"
         | "frame_output_recorded"
         | "frame_last_admitted_node"

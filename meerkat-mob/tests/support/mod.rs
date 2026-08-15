@@ -4360,6 +4360,7 @@ fn flow_from_step(
             allowed_tools,
             blocked_tools,
             output_format: None,
+            failure_policy: Default::default(),
         },
     );
     meerkat_mob::definition::FlowSpec::new(None, steps, None)

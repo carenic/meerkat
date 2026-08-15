@@ -23,7 +23,9 @@ use crate::run::{
     StepRunStatus, apply_mob_machine_flow_run_command, mob_machine_run_status_is_terminal,
     mob_machine_step_status_is_terminal,
 };
-use crate::runtime::flow_frame_engine::{FlowFrameTerminalPhase, FrameStepProjection};
+use crate::runtime::flow_frame_engine::{
+    FlowFrameTerminalPhase, FrameStepFailureProjection, FrameStepProjection,
+};
 use crate::store::{MobEventStore, MobRunStore, authority_validating_mob_run_store};
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
@@ -281,9 +283,10 @@ impl FlowEngine {
                     if let TerminalizationOutcome::Transitioned = self
                         .terminalize_completed_from_frame(
                             &run_id,
-                            config.flow_id.clone(),
+                            &config,
                             &frame_outcome.outputs,
                             &frame_outcome.step_projections,
+                            &frame_outcome.step_failures,
                         )
                         .await?
                     {
@@ -1819,9 +1822,10 @@ impl FlowEngine {
     async fn terminalize_completed_from_frame(
         &self,
         run_id: &RunId,
-        flow_id: FlowId,
+        config: &FlowRunConfig,
         outputs: &IndexMap<StepId, Value>,
         step_projections: &IndexMap<StepId, FrameStepProjection>,
+        step_failures: &IndexMap<StepId, FrameStepFailureProjection>,
     ) -> Result<TerminalizationOutcome, MobError> {
         for step_id in self.ordered_steps(run_id).await? {
             let projection_record = step_projections.get(&step_id).ok_or_else(|| {
@@ -1863,6 +1867,82 @@ impl FlowEngine {
                         )
                         .await?;
                 }
+                // A failed step under a Completed root frame can only be a
+                // tolerated failure: MobMachine classifies a frame Completed
+                // while a node is Failed exactly when that node's failure
+                // policy is Continue. The failure is recorded honestly (ledger
+                // entry plus `step_failed` event) rather than laundered into a
+                // completed step; only the run's terminal status is spared.
+                StepRunStatus::Failed => {
+                    // Report the genuine reason frame execution recorded for
+                    // this node, exactly as the failed-frame path does. The
+                    // constant is a fallback only, for a node that reached
+                    // Failed without a recorded reason.
+                    let reason = step_failures.get(&step_id).map_or_else(
+                        || "tolerated failure under continue policy".to_string(),
+                        |failure| failure.reason.clone(),
+                    );
+                    if self
+                        .apply_frame_step_projection(
+                            projection.effects,
+                            run_id,
+                            &step_id,
+                            None,
+                            Some(reason.clone()),
+                        )
+                        .await?
+                    {
+                        // MobMachine emitted EscalateSupervisor for this
+                        // tolerated failure (the run crossed its configured
+                        // escalation threshold). Tolerating the failure decides
+                        // the run's terminal class only; it does not license the
+                        // shell to drop a machine-emitted effect.
+                        //
+                        // `force_reset` is deliberately not paired here. It is
+                        // run-failure recovery: it retires every member, which
+                        // the failed-frame path can afford because the run dies
+                        // immediately afterwards. This run is terminalizing
+                        // Completed, so tearing the mob down would turn an
+                        // advisory failure into a destroyed mob.
+                        if let Err(error) =
+                            Supervisor::new(self.handle.clone(), self.emitter.clone())
+                                .escalate(config, run_id, &step_id, &reason)
+                                .await
+                        {
+                            // Cancellation is not an escalation failure: it is
+                            // the run's own terminal class asserting itself, and
+                            // the cancel path owns it (execute_flow's `Err` arm
+                            // and the actor's `RunCanceled` branch both route to
+                            // terminalize_canceled). Swallowing it here would
+                            // convert a canceled run into a completed one - the
+                            // mirror of the bug below.
+                            if matches!(error, MobError::RunCanceled(_)) {
+                                return Err(error);
+                            }
+                            // Failing to CARRY OUT the machine's escalation
+                            // decision is not the machine deciding the run
+                            // failed. Propagating here would fail a run the
+                            // machine classified Completed, which is exactly
+                            // what `failure_policy: continue` exists to prevent.
+                            // The failure is reported instead - typed event plus
+                            // error-level trace - and the terminal class stands.
+                            tracing::error!(
+                                run_id = %run_id,
+                                step_id = %step_id,
+                                error = %error,
+                                "supervisor escalation for a tolerated failure could not be \
+                                 carried out; run terminal class is unchanged"
+                            );
+                            self.emitter
+                                .supervisor_escalation_failed(
+                                    run_id.clone(),
+                                    step_id.clone(),
+                                    error.to_string(),
+                                )
+                                .await?;
+                        }
+                    }
+                }
                 other => {
                     return Err(MobError::Internal(format!(
                         "terminalize_completed_from_frame cannot project status {other:?} \
@@ -1874,7 +1954,7 @@ impl FlowEngine {
 
         self.terminalize_completed(
             run_id.clone(),
-            flow_id,
+            config.flow_id.clone(),
             flow_structured_output_from_outputs(outputs),
         )
         .await

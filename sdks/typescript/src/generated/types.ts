@@ -2029,6 +2029,7 @@ export interface MobFlowStepInput {
   depends_on_mode?: MobDependencyModeInput;
   dispatch_mode?: MobDispatchModeInput;
   expected_schema_ref?: string | null;
+  failure_policy?: MobFlowNodeFailurePolicyInput;
   message: WireContentInput;
   output_format?: MobStepOutputFormatInput | null;
   role: string;
@@ -2982,10 +2983,13 @@ export type MobDependencyModeInput = "all" | "any";
 
 export type MobDispatchModeInput = "fan_out" | "one_to_one" | "fan_in";
 
+export type MobFlowNodeFailurePolicyInput = "escalate" | "continue";
+
 export interface MobFlowNodeInputStep {
   branch?: string | null;
   depends_on?: string[];
   depends_on_mode?: MobDependencyModeInput;
+  failure_policy?: MobFlowNodeFailurePolicyInput;
   kind: "step";
   step_id: string;
 }
@@ -2994,6 +2998,7 @@ export interface MobFlowNodeInputRepeatUntil {
   body: MobFrameSpecInput;
   depends_on?: string[];
   depends_on_mode?: MobDependencyModeInput;
+  failure_policy?: MobFlowNodeFailurePolicyInput;
   kind: "repeat_until";
   loop_id: string;
   max_iterations: number;

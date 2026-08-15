@@ -462,6 +462,9 @@ pub struct MobFrameStepInput {
     pub depends_on_mode: MobDependencyModeInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Tolerance for this node's failure; omitted means `escalate`.
+    #[serde(default)]
+    pub failure_policy: MobFlowNodeFailurePolicyInput,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -476,6 +479,23 @@ pub struct MobRepeatUntilInput {
     pub body: MobFrameSpecInput,
     pub until: MobConditionExprInput,
     pub max_iterations: u32,
+    /// Tolerance for this loop node's failure; omitted means `escalate`.
+    #[serde(default)]
+    pub failure_policy: MobFlowNodeFailurePolicyInput,
+}
+
+/// Authored tolerance for a flow node's failure.
+///
+/// `Escalate` (the default) classifies the enclosing frame Failed when the node
+/// fails. `Continue` keeps the recorded node/step failure but lets the frame
+/// classify on the remaining nodes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MobFlowNodeFailurePolicyInput {
+    #[default]
+    Escalate,
+    Continue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -504,6 +524,10 @@ pub struct MobFlowStepInput {
     pub allowed_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_tools: Option<Vec<String>>,
+    /// Tolerance for this step's failure once compiled into the root frame;
+    /// omitted means `escalate`.
+    #[serde(default)]
+    pub failure_policy: MobFlowNodeFailurePolicyInput,
     /// Explicit output format; omitted resolves schema-aware at the
     /// definition layer (`json` with `expected_schema_ref`, `text` without).
     #[serde(default, skip_serializing_if = "Option::is_none")]

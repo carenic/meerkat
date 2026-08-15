@@ -3080,6 +3080,7 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
                     TypePathStructField::named("name", "PeerName"),
                 ],
             ),
+            NamedTypeBinding::string_enum("FlowNodeFailurePolicy", &["Escalate", "Continue"]),
             NamedTypeBinding::string("FlowNodeId"),
             NamedTypeBinding::string_enum("FlowNodeKind", &["Step", "Loop"]),
             NamedTypeBinding::string_enum(

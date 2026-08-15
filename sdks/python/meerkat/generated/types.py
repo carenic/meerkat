@@ -2727,6 +2727,7 @@ class MobFlowStepInput:
     depends_on_mode: Optional[MobDependencyModeInput] = None
     dispatch_mode: Optional[MobDispatchModeInput] = None
     expected_schema_ref: Optional[str] = None
+    failure_policy: Optional[MobFlowNodeFailurePolicyInput] = None
     output_format: Optional[MobStepOutputFormatInput] = None
     timeout_ms: Optional[int] = None
 
@@ -5519,11 +5520,19 @@ MobDependencyModeInput = Literal['all', 'any']
 # Mob RPC helper wire type for MobDispatchModeInput.
 MobDispatchModeInput = Literal['fan_out', 'one_to_one', 'fan_in']
 
+# Authored tolerance for a flow node's failure.
+#
+# `Escalate` (the default) classifies the enclosing frame Failed when the node
+# fails. `Continue` keeps the recorded node/step failure but lets the frame
+# classify on the remaining nodes.
+MobFlowNodeFailurePolicyInput = Literal['escalate', 'continue']
+
 # Mob RPC helper wire type for MobFlowNodeInput.
 class MobFlowNodeInputStep(TypedDict, total=False):
     branch: NotRequired[Optional[str]]
     depends_on: NotRequired[list[str]]
     depends_on_mode: NotRequired[MobDependencyModeInput]
+    failure_policy: NotRequired[MobFlowNodeFailurePolicyInput]
     kind: Required[Literal['step']]
     step_id: Required[str]
 
@@ -5531,6 +5540,7 @@ class MobFlowNodeInputRepeatUntil(TypedDict, total=False):
     body: Required[MobFrameSpecInput]
     depends_on: NotRequired[list[str]]
     depends_on_mode: NotRequired[MobDependencyModeInput]
+    failure_policy: NotRequired[MobFlowNodeFailurePolicyInput]
     kind: Required[Literal['repeat_until']]
     loop_id: Required[str]
     max_iterations: Required[int]

@@ -689,6 +689,31 @@ pub enum FlowNodeKind {
     Loop,
 }
 
+/// Authored tolerance for a single flow node's failure.
+///
+/// `Escalate` is the default and reproduces unconditional escalation: the
+/// node's failure classifies its frame Failed. `Continue` marks the node
+/// advisory - its failure stays recorded in the frame's typed node status but
+/// does not decide the frame's terminal classification.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum FlowNodeFailurePolicy {
+    #[default]
+    Escalate,
+    Continue,
+}
+
 /// Per-node execution status within a frame.
 #[derive(
     Debug,
@@ -3258,6 +3283,9 @@ mod tests {
             node_status: [(node_id.clone(), NodeRunStatus::Ready)]
                 .into_iter()
                 .collect(),
+            node_failure_policy: [(node_id.clone(), FlowNodeFailurePolicy::Escalate)]
+                .into_iter()
+                .collect(),
             ready_queue: vec![node_id.clone()],
             output_recorded: [(node_id.clone(), false)].into_iter().collect(),
             node_condition_results: [(node_id.clone(), None)].into_iter().collect(),
@@ -3431,6 +3459,7 @@ mod tests {
                 node_step_ids: Default::default(),
                 node_loop_ids: Default::default(),
                 node_status: Default::default(),
+                node_failure_policy: Default::default(),
                 ready_queue: Vec::new(),
                 output_recorded: Default::default(),
                 node_condition_results: Default::default(),
@@ -4698,6 +4727,9 @@ mod tests {
                     .collect(),
                 node_loop_ids: Default::default(),
                 node_status: [(node_id.clone(), NodeRunStatus::Ready)]
+                    .into_iter()
+                    .collect(),
+                node_failure_policy: [(node_id.clone(), FlowNodeFailurePolicy::Escalate)]
                     .into_iter()
                     .collect(),
                 ready_queue: vec![node_id.clone()],

@@ -506,6 +506,75 @@ are not separate public machines.
 }
 ```
 
+### Advisory nodes (`failure_policy`)
+
+By default every flow node escalates: if it fails, its frame is classified
+`Failed` and the run fails. Declare `"failure_policy": "continue"` on a step,
+a frame node, or a `repeat_until` node to mark it advisory. An advisory node's
+failure is still recorded - the node stays `Failed` in frame state and the step
+is still reported failed - but it no longer decides the frame's terminal
+classification.
+
+**`continue` does not keep that node's dependents running.** Dependency
+resolution is unchanged by `failure_policy`. With `depends_on_mode: "all"`, a
+single dependency ending `Failed`, `Skipped` or `Canceled` sets the dependent
+`Skipped`; with `depends_on_mode: "any"`, the dependent is set `Skipped` only
+when every dependency ends that way. Either way, a step whose only dependency is
+an advisory node does not run when that node fails: the run can still reach
+`completed`, but that dependent's step status is `skipped` and a `step_skipped`
+event is emitted for it. If you want work to happen after an advisory failure,
+the dependent must have a dependency that can still complete.
+
+That makes `continue` useful for one shape: an advisory node and a fallback node
+feeding a join with `depends_on_mode: "any"`. The advisory node's failure is
+tolerated, the fallback completes, and the join runs on the fallback's output.
+
+```json
+{
+  "flows": {
+    "triage": {
+      "steps": {
+        "advisory-analyst": {
+          "role": "analyst",
+          "message": "Optional deep analysis; best effort.",
+          "failure_policy": "continue"
+        },
+        "baseline-analyst": {
+          "role": "analyst",
+          "message": "Cheap baseline analysis that must succeed."
+        },
+        "write-up": {
+          "role": "writer",
+          "message": "Write the report from whatever evidence exists.",
+          "depends_on": ["advisory-analyst", "baseline-analyst"],
+          "depends_on_mode": "any"
+        }
+      }
+    }
+  }
+}
+```
+
+If `advisory-analyst` fails here, `baseline-analyst` still completes, so
+`write-up` is `Ready` rather than `Skipped` and the run completes with the
+report written. Drop `baseline-analyst` and `write-up` is skipped instead.
+
+Omitting `failure_policy` means `escalate`. Frame classification is owned by
+MobMachine, so a tolerated failure never becomes a fabricated success: the
+failed node remains visible in the frame's typed state, the step is recorded
+`failed` with a failure-ledger entry, and a `step_failed` event is emitted. Both
+the ledger entry and the event carry the step's real failure reason. If the
+run's supervisor `escalation_threshold` is crossed by that failure, the
+supervisor is still escalated.
+
+If that escalation cannot be delivered - no member currently holds the
+supervisor role, the supervisor's turn fails, or the escalation turn exceeds
+`escalation_turn_timeout_ms` - the run's terminal class is unchanged. Failing to
+carry out an escalation is not a decision that the run failed, so a tolerated
+failure still completes; the undelivered escalation is reported as a
+`supervisor_escalation_failed` event carrying the escalation error, and no
+`supervisor_escalation` event is emitted. The mob is not torn down.
+
 Run and inspect a flow:
 
 <Tabs>

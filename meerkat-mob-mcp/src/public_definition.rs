@@ -1,11 +1,12 @@
 use indexmap::IndexMap;
 use meerkat_contracts::wire::{
     MobBackendConfigInput, MobCollectionPolicyInput, MobConditionExprInput, MobDefinitionInput,
-    MobDependencyModeInput, MobDispatchModeInput, MobEventRouterConfigInput, MobFlowNodeInput,
-    MobFlowSpecInput, MobFlowStepInput, MobFrameSpecInput, MobFrameStepInput, MobLimitsSpecInput,
-    MobPolicyModeInput, MobProfileBindingInput, MobProfileInput, MobRepeatUntilInput,
-    MobSkillSourceInput, MobSpawnPolicyInput, MobStepOutputFormatInput, MobTopologySpecInput,
-    WireMobBackendKind, WireMobRuntimeMode,
+    MobDependencyModeInput, MobDispatchModeInput, MobEventRouterConfigInput,
+    MobFlowNodeFailurePolicyInput, MobFlowNodeInput, MobFlowSpecInput, MobFlowStepInput,
+    MobFrameSpecInput, MobFrameStepInput, MobLimitsSpecInput, MobPolicyModeInput,
+    MobProfileBindingInput, MobProfileInput, MobRepeatUntilInput, MobSkillSourceInput,
+    MobSpawnPolicyInput, MobStepOutputFormatInput, MobTopologySpecInput, WireMobBackendKind,
+    WireMobRuntimeMode,
 };
 use meerkat_core::types::ContentInput;
 use meerkat_mob::{
@@ -13,10 +14,11 @@ use meerkat_mob::{
     Profile, ProfileBinding, ProfileName, StepId, ToolConfig,
     definition::{
         BackendConfig, CollectionPolicy, ConditionExpr, DependencyMode, DispatchMode,
-        EventRouterConfig, ExternalBackendConfig, FlowNodeSpec, FlowSchemaRef, FlowSpec,
-        FlowStepSpec, FrameSpec, FrameStepSpec, LimitsSpec, OrchestratorConfig, PolicyMode,
-        RepeatUntilSpec, RoleWiringRule, SkillSource, SpawnPolicyConfig, StepOutputFormat,
-        SupervisorBridgeEndpointConfig, SupervisorSpec, TopologyRule, TopologySpec, WiringRules,
+        EventRouterConfig, ExternalBackendConfig, FlowNodeFailurePolicy, FlowNodeSpec,
+        FlowSchemaRef, FlowSpec, FlowStepSpec, FrameSpec, FrameStepSpec, LimitsSpec,
+        OrchestratorConfig, PolicyMode, RepeatUntilSpec, RoleWiringRule, SkillSource,
+        SpawnPolicyConfig, StepOutputFormat, SupervisorBridgeEndpointConfig, SupervisorSpec,
+        TopologyRule, TopologySpec, WiringRules,
     },
 };
 use std::convert::TryFrom;
@@ -226,6 +228,7 @@ fn decode_flow_step(
             depends_on_mode: decode_dependency_mode(input.depends_on_mode),
             allowed_tools: input.allowed_tools,
             blocked_tools: input.blocked_tools,
+            failure_policy: decode_failure_policy(input.failure_policy),
             output_format: input.output_format.map(decode_step_output_format),
         },
     ))
@@ -251,6 +254,13 @@ fn decode_dependency_mode(input: MobDependencyModeInput) -> DependencyMode {
     match input {
         MobDependencyModeInput::All => DependencyMode::All,
         MobDependencyModeInput::Any => DependencyMode::Any,
+    }
+}
+
+fn decode_failure_policy(input: MobFlowNodeFailurePolicyInput) -> FlowNodeFailurePolicy {
+    match input {
+        MobFlowNodeFailurePolicyInput::Escalate => FlowNodeFailurePolicy::Escalate,
+        MobFlowNodeFailurePolicyInput::Continue => FlowNodeFailurePolicy::Continue,
     }
 }
 
@@ -316,6 +326,7 @@ fn decode_frame_step(input: MobFrameStepInput) -> FrameStepSpec {
         depends_on: input.depends_on.into_iter().map(FlowNodeId::from).collect(),
         depends_on_mode: decode_dependency_mode(input.depends_on_mode),
         branch: input.branch.map(BranchId::from),
+        failure_policy: decode_failure_policy(input.failure_policy),
     }
 }
 
@@ -327,6 +338,7 @@ fn decode_repeat_until(input: MobRepeatUntilInput) -> Result<RepeatUntilSpec, St
         body: decode_frame_spec(input.body)?,
         until: decode_condition(input.until)?,
         max_iterations: input.max_iterations,
+        failure_policy: decode_failure_policy(input.failure_policy),
     })
 }
 
@@ -447,6 +459,7 @@ mod tests {
                 depends_on_mode: MobDependencyModeInput::All,
                 allowed_tools: Some(vec!["comms/send".to_string()]),
                 blocked_tools: Some(vec!["mob_create".to_string()]),
+                failure_policy: MobFlowNodeFailurePolicyInput::Escalate,
                 output_format: Some(MobStepOutputFormatInput::Text),
             },
         );
@@ -459,6 +472,7 @@ mod tests {
                 depends_on: Vec::new(),
                 depends_on_mode: MobDependencyModeInput::All,
                 branch: Some("winner".to_string()),
+                failure_policy: MobFlowNodeFailurePolicyInput::Continue,
             }),
         );
         nodes.insert(
@@ -475,6 +489,7 @@ mod tests {
                             depends_on: Vec::new(),
                             depends_on_mode: MobDependencyModeInput::All,
                             branch: None,
+                            failure_policy: MobFlowNodeFailurePolicyInput::Escalate,
                         }),
                     )]),
                 },
@@ -483,6 +498,7 @@ mod tests {
                     value: serde_json::json!(true),
                 },
                 max_iterations: 3,
+                failure_policy: MobFlowNodeFailurePolicyInput::Escalate,
             }),
         );
 
@@ -532,5 +548,19 @@ mod tests {
         assert_eq!(step.branch, Some(BranchId::from("winner")));
         assert_eq!(step.output_format, Some(StepOutputFormat::Text));
         assert_eq!(step.effective_output_format(), StepOutputFormat::Text);
+        assert_eq!(step.failure_policy, FlowNodeFailurePolicy::Escalate);
+        let root_node = flow
+            .root
+            .nodes
+            .get(&FlowNodeId::from("step-1"))
+            .expect("root step node");
+        assert!(
+            matches!(
+                root_node,
+                FlowNodeSpec::Step(root_step)
+                    if root_step.failure_policy == FlowNodeFailurePolicy::Continue
+            ),
+            "an authored advisory frame node must decode as Continue: {root_node:?}"
+        );
     }
 }

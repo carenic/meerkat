@@ -1513,6 +1513,11 @@ pub struct FlowFrameSeedAuthorityRecord {
     pub node_step_ids: BTreeMap<mob_dsl::FlowNodeId, mob_dsl::StepId>,
     pub node_loop_ids: BTreeMap<mob_dsl::FlowNodeId, mob_dsl::LoopId>,
     pub node_status: BTreeMap<mob_dsl::FlowNodeId, mob_dsl::NodeRunStatus>,
+    /// Per-node failure tolerance seeded from the flow definition. Defaults to
+    /// an empty map when replaying a record persisted before the policy
+    /// existed; the machine reads absence as `Escalate`.
+    #[serde(default)]
+    pub node_failure_policy: BTreeMap<mob_dsl::FlowNodeId, mob_dsl::FlowNodeFailurePolicy>,
     pub ready_queue: Vec<mob_dsl::FlowNodeId>,
     #[serde(default)]
     pub output_recorded: BTreeMap<mob_dsl::FlowNodeId, bool>,
@@ -1699,6 +1704,7 @@ impl FlowAuthorityInputRecord {
                 node_step_ids,
                 node_loop_ids,
                 node_status,
+                node_failure_policy,
                 ready_queue,
                 output_recorded,
                 node_condition_results,
@@ -1718,6 +1724,7 @@ impl FlowAuthorityInputRecord {
                 node_step_ids,
                 node_loop_ids,
                 node_status,
+                node_failure_policy,
                 ready_queue,
                 output_recorded,
                 node_condition_results,
@@ -2104,6 +2111,7 @@ impl FlowAuthorityInputRecord {
                 node_step_ids: record.node_step_ids,
                 node_loop_ids: record.node_loop_ids,
                 node_status: record.node_status,
+                node_failure_policy: record.node_failure_policy,
                 ready_queue: record.ready_queue,
                 output_recorded: record.output_recorded,
                 node_condition_results: record.node_condition_results,
@@ -5351,6 +5359,7 @@ impl MobRun {
                     allowed_tools: None,
                     blocked_tools: None,
                     output_format: Some(crate::definition::StepOutputFormat::Json),
+                    failure_policy: Default::default(),
                 },
             );
         }
@@ -5699,6 +5708,7 @@ impl MobRun {
         let mut node_branches = BTreeMap::new();
         let mut node_step_ids = BTreeMap::new();
         let mut node_loop_ids = BTreeMap::new();
+        let mut node_failure_policy = BTreeMap::new();
 
         for (node_id, node_spec) in &spec.nodes {
             let key = mob_dsl::FlowNodeId::from(node_id.as_str());
@@ -5722,6 +5732,8 @@ impl MobRun {
                             .as_ref()
                             .map(|branch| mob_dsl::BranchId::from(branch.as_str())),
                     );
+                    node_failure_policy
+                        .insert(key.clone(), failure_policy_seed_value(step.failure_policy));
                     node_step_ids.insert(key, mob_dsl::StepId::from(step.step_id.as_str()));
                 }
                 FlowNodeSpec::RepeatUntil(loop_spec) => {
@@ -5739,6 +5751,10 @@ impl MobRun {
                         dependency_mode_seed_value(loop_spec.depends_on_mode.clone()),
                     );
                     node_branches.insert(key.clone(), None);
+                    node_failure_policy.insert(
+                        key.clone(),
+                        failure_policy_seed_value(loop_spec.failure_policy),
+                    );
                     node_loop_ids.insert(key, mob_dsl::LoopId::from(loop_spec.loop_id.as_str()));
                 }
             }
@@ -5770,6 +5786,7 @@ impl MobRun {
             node_step_ids,
             node_loop_ids,
             node_status,
+            node_failure_policy,
             ready_queue,
             output_recorded,
             node_condition_results,
@@ -5859,6 +5876,7 @@ impl MobRun {
                     allowed_tools: None,
                     blocked_tools: None,
                     output_format: Some(crate::definition::StepOutputFormat::Json),
+                    failure_policy: Default::default(),
                 },
             );
         }
@@ -5922,6 +5940,19 @@ fn dependency_mode_seed_value(mode: crate::definition::DependencyMode) -> mob_ds
     match mode {
         crate::definition::DependencyMode::All => mob_dsl::DependencyMode::All,
         crate::definition::DependencyMode::Any => mob_dsl::DependencyMode::Any,
+    }
+}
+
+fn failure_policy_seed_value(
+    policy: crate::definition::FlowNodeFailurePolicy,
+) -> mob_dsl::FlowNodeFailurePolicy {
+    match policy {
+        crate::definition::FlowNodeFailurePolicy::Escalate => {
+            mob_dsl::FlowNodeFailurePolicy::Escalate
+        }
+        crate::definition::FlowNodeFailurePolicy::Continue => {
+            mob_dsl::FlowNodeFailurePolicy::Continue
+        }
     }
 }
 
@@ -6521,6 +6552,7 @@ mod tests {
             node_step_ids: Default::default(),
             node_loop_ids: Default::default(),
             node_status: Default::default(),
+            node_failure_policy: Default::default(),
             ready_queue: Default::default(),
             output_recorded: Default::default(),
             node_condition_results: Default::default(),
@@ -6862,6 +6894,7 @@ mod tests {
                 allowed_tools: None,
                 blocked_tools: None,
                 output_format: Some(crate::definition::StepOutputFormat::Json),
+                failure_policy: Default::default(),
             },
         );
 
@@ -7424,6 +7457,7 @@ mod tests {
                 allowed_tools: None,
                 blocked_tools: None,
                 output_format: Some(crate::definition::StepOutputFormat::Json),
+                failure_policy: Default::default(),
             },
         );
         let spec = FlowSpec::new(None, steps, None);

@@ -3200,6 +3200,7 @@ fn compile_flow(plan: &LayerPlan, registry: &SchemaRegistry) -> Result<FlowSpec,
                     allowed_tools: None,
                     blocked_tools: None,
                     output_format: Some(StepOutputFormat::Json),
+                    failure_policy: Default::default(),
                 },
             );
             steps.insert(
@@ -3223,6 +3224,7 @@ fn compile_flow(plan: &LayerPlan, registry: &SchemaRegistry) -> Result<FlowSpec,
                     allowed_tools: None,
                     blocked_tools: None,
                     output_format: Some(StepOutputFormat::Json),
+                    failure_policy: Default::default(),
                 },
             );
         }
@@ -3243,6 +3245,7 @@ fn compile_flow(plan: &LayerPlan, registry: &SchemaRegistry) -> Result<FlowSpec,
                     allowed_tools: None,
                     blocked_tools: None,
                     output_format: Some(StepOutputFormat::Json),
+                    failure_policy: Default::default(),
                 },
             );
         }

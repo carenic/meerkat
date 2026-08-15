@@ -66,6 +66,13 @@ macro_rules! mob_catalog_machine_dsl {
             frame_node_step_ids: Map<FrameId, Map<FlowNodeId, StepId>>,
             frame_node_loop_ids: Map<FrameId, Map<FlowNodeId, LoopId>>,
             frame_node_status: Map<FrameId, Map<FlowNodeId, Enum<NodeRunStatus>>>,
+            // Per-node failure policy seeded from the flow definition. A node
+            // whose policy is Continue is tolerated: its Failed status stays
+            // recorded in `frame_node_status`, but it does not force the frame
+            // terminal classification to Failed. Absence is Escalate, so a
+            // frame recovered from state persisted before this field existed
+            // keeps the unconditional-escalation classification.
+            frame_node_failure_policy: Map<FrameId, Map<FlowNodeId, Enum<FlowNodeFailurePolicy>>>,
             frame_ready_queue: Map<FrameId, Seq<FlowNodeId>>,
             frame_output_recorded: Map<FrameId, Map<FlowNodeId, bool>>,
             frame_last_admitted_node: Map<FrameId, Option<FlowNodeId>>,
@@ -538,6 +545,7 @@ macro_rules! mob_catalog_machine_dsl {
             frame_node_step_ids = EmptyMap,
             frame_node_loop_ids = EmptyMap,
             frame_node_status = EmptyMap,
+            frame_node_failure_policy = EmptyMap,
             frame_ready_queue = EmptyMap,
             frame_output_recorded = EmptyMap,
             frame_last_admitted_node = EmptyMap,
@@ -823,6 +831,7 @@ macro_rules! mob_catalog_machine_dsl {
                 node_step_ids: Map<FlowNodeId, StepId>,
                 node_loop_ids: Map<FlowNodeId, LoopId>,
                 node_status: Map<FlowNodeId, Enum<NodeRunStatus>>,
+                node_failure_policy: Map<FlowNodeId, Enum<FlowNodeFailurePolicy>>,
                 ready_queue: Seq<FlowNodeId>,
                 output_recorded: Map<FlowNodeId, bool>,
                 node_condition_results: Map<FlowNodeId, Option<bool>>,
@@ -3505,9 +3514,16 @@ macro_rules! mob_catalog_machine_dsl {
                     || self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(NodeRunStatus::Skipped)
                     || self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(NodeRunStatus::Canceled))
             }
-            guard "any_node_failed" {
+            // Only an escalating failure poisons the frame. A Continue-policy
+            // node that failed stays Failed in `frame_node_status` (the failure
+            // is never erased) but is not a frame-terminal fault. Polarity is
+            // deliberately "not Continue" rather than "is Escalate": a missing
+            // policy entry - a legacy frame recovered from state seeded before
+            // the policy map existed - must escalate exactly as before.
+            guard "any_escalating_node_failed" {
                 for_all(seal_node_id in self.frame_tracked_nodes.get_cloned(frame_id).get("value"),
-                    self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Failed)) == false
+                    self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Failed)
+                    || self.frame_node_failure_policy.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(FlowNodeFailurePolicy::Continue)) == false
             }
             update {}
             to Running
@@ -3531,9 +3547,10 @@ macro_rules! mob_catalog_machine_dsl {
                     || self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(NodeRunStatus::Skipped)
                     || self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(NodeRunStatus::Canceled))
             }
-            guard "no_node_failed" {
+            guard "no_escalating_node_failed" {
                 for_all(seal_node_id in self.frame_tracked_nodes.get_cloned(frame_id).get("value"),
-                    self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Failed))
+                    self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Failed)
+                    || self.frame_node_failure_policy.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(FlowNodeFailurePolicy::Continue))
             }
             guard "any_node_canceled" {
                 for_all(seal_node_id in self.frame_tracked_nodes.get_cloned(frame_id).get("value"),
@@ -3561,9 +3578,10 @@ macro_rules! mob_catalog_machine_dsl {
                     || self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(NodeRunStatus::Skipped)
                     || self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(NodeRunStatus::Canceled))
             }
-            guard "no_node_failed" {
+            guard "no_escalating_node_failed" {
                 for_all(seal_node_id in self.frame_tracked_nodes.get_cloned(frame_id).get("value"),
-                    self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Failed))
+                    self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Failed)
+                    || self.frame_node_failure_policy.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(FlowNodeFailurePolicy::Continue))
             }
             guard "no_node_canceled" {
                 for_all(seal_node_id in self.frame_tracked_nodes.get_cloned(frame_id).get("value"),
@@ -16706,7 +16724,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition CreateFrameSeedRunning {
-            on input CreateFrameSeed { run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, ready_queue, output_recorded, node_condition_results, last_admitted_node }
+            on input CreateFrameSeed { run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, node_failure_policy, ready_queue, output_recorded, node_condition_results, last_admitted_node }
             guard { self.lifecycle_phase == Phase::Running }
             guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
             guard "frame_seed_is_new" { self.frame_phase.contains_key(frame_id) == false }
@@ -16726,6 +16744,11 @@ macro_rules! mob_catalog_machine_dsl {
                     output_recorded.get_cloned(candidate) == Some(false)
                     && node_condition_results.get_cloned(candidate) == Some(None))
             }
+            // `node_failure_policy` is deliberately NOT required to cover every
+            // tracked node. Absence is the Escalate default, so a seed record
+            // persisted before the policy existed replays with unchanged
+            // semantics instead of being rejected. Only unknown keys are
+            // refused (`frame_seed_map_keys_are_tracked`).
             guard "frame_seed_maps_cover_tracked_nodes" {
                 for_all(candidate in tracked_nodes,
                     node_dependencies.contains_key(candidate)
@@ -16738,6 +16761,7 @@ macro_rules! mob_catalog_machine_dsl {
                 && for_all(candidate in node_condition_results.keys(), tracked_nodes.contains(candidate))
                 && for_all(candidate in node_dependencies.keys(), tracked_nodes.contains(candidate))
                 && for_all(candidate in node_dependency_modes.keys(), tracked_nodes.contains(candidate))
+                && for_all(candidate in node_failure_policy.keys(), tracked_nodes.contains(candidate))
                 && for_all(candidate in node_branches.keys(), tracked_nodes.contains(candidate))
             }
             guard "frame_seed_ready_queue_nodes_are_tracked" {
@@ -16804,6 +16828,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.frame_node_step_ids.insert(frame_id, node_step_ids);
                 self.frame_node_loop_ids.insert(frame_id, node_loop_ids);
                 self.frame_node_status.insert(frame_id, node_status);
+                self.frame_node_failure_policy.insert(frame_id, node_failure_policy);
                 self.frame_ready_queue.insert(frame_id, ready_queue);
                 self.frame_output_recorded.insert(frame_id, output_recorded);
                 self.frame_node_condition_results.insert(frame_id, node_condition_results);
@@ -16825,7 +16850,7 @@ macro_rules! mob_catalog_machine_dsl {
         // `error.to_string().contains("frame_seed_is_new")` string folklore).
         transition CreateFrameSeedAlreadySeeded {
             per_phase [Running, Stopped, Completed, Destroyed]
-            on input CreateFrameSeed { run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, ready_queue, output_recorded, node_condition_results, last_admitted_node }
+            on input CreateFrameSeed { run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, node_failure_policy, ready_queue, output_recorded, node_condition_results, last_admitted_node }
             guard "frame_seed_already_tracked" { self.frame_phase.contains_key(frame_id) == true }
             update {}
             to Running
@@ -17674,18 +17699,35 @@ macro_rules! mob_catalog_machine_dsl {
                     || self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(NodeRunStatus::Skipped)
                     || self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(NodeRunStatus::Canceled))
             }
+            // The three disjuncts below are, by construction, the same three
+            // predicates as the `ClassifyFlowFrameTerminalStatus{Failed,
+            // Canceled,Completed}` arms, so for any state where `frame_running`
+            // and `all_nodes_terminal` hold, whatever the classifier projects is
+            // sealable. The shell has exactly one source for `terminal_status`
+            // (`generated_frame_terminal_status_candidate`), so a divergence
+            // here is not a rejected seal, it is a wedged frame: the seal is the
+            // only transition out of Running.
+            //
+            // That is why the failure-policy read is duplicated rather than
+            // dropped: a node whose failure is tolerated (`Continue`) must be
+            // invisible to the class match in exactly the way it is invisible
+            // to the classifier. Absence of a policy entry means Escalate, so a
+            // frame recovered from pre-policy state seals exactly as before.
             guard "terminal_class_matches_nodes" {
                 (terminal_status == Some(FrameStatus::Failed)
                     && for_all(seal_node_id in self.frame_tracked_nodes.get_cloned(frame_id).get("value"),
-                        self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Failed)) == false)
+                        self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Failed)
+                        || self.frame_node_failure_policy.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(FlowNodeFailurePolicy::Continue)) == false)
                 || (terminal_status == Some(FrameStatus::Canceled)
                     && for_all(seal_node_id in self.frame_tracked_nodes.get_cloned(frame_id).get("value"),
-                        self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Failed))
+                        self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Failed)
+                        || self.frame_node_failure_policy.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(FlowNodeFailurePolicy::Continue))
                     && for_all(seal_node_id in self.frame_tracked_nodes.get_cloned(frame_id).get("value"),
                         self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Canceled)) == false)
                 || (terminal_status == Some(FrameStatus::Completed)
                     && for_all(seal_node_id in self.frame_tracked_nodes.get_cloned(frame_id).get("value"),
-                        self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Failed))
+                        self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Failed)
+                        || self.frame_node_failure_policy.get_cloned(frame_id).get("value").get_cloned(seal_node_id) == Some(FlowNodeFailurePolicy::Continue))
                     && for_all(seal_node_id in self.frame_tracked_nodes.get_cloned(frame_id).get("value"),
                         self.frame_node_status.get_cloned(frame_id).get("value").get_cloned(seal_node_id) != Some(NodeRunStatus::Canceled)))
             }
@@ -21102,6 +21144,20 @@ pub enum FlowNodeKind {
     #[default]
     Step,
     Loop,
+}
+
+/// Authored tolerance for a single flow node's failure.
+///
+/// `Escalate` is the default and today's unconditional behavior: the node's
+/// failure classifies its frame Failed. `Continue` marks the node advisory -
+/// its failure stays recorded in the frame's typed node status but does not
+/// decide the frame's terminal classification, so a fallback branch and the
+/// join can still complete the frame honestly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum FlowNodeFailurePolicy {
+    #[default]
+    Escalate,
+    Continue,
 }
 
 /// Per-node execution status within a frame.

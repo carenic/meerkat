@@ -3919,6 +3919,519 @@ mod tests {
         .expect("completion lifecycle must enter exact quiesce intent before terminalization");
     }
 
+    /// Seed a run whose only step ids are `advisory`, `fallback` and `join`.
+    fn seed_advisory_run(authority: &mut mob_dsl::MobMachineAuthority, run_key: &mob_dsl::RunId) {
+        let steps: Vec<mob_dsl::StepId> = ["advisory", "fallback", "join"]
+            .into_iter()
+            .map(mob_dsl::StepId::from)
+            .collect();
+        mob_dsl::MobMachineMutator::apply(
+            authority,
+            mob_dsl::MobMachineInput::CreateRunSeed {
+                run_id: run_key.clone(),
+                step_ids: steps.iter().cloned().collect(),
+                ordered_steps: steps.clone(),
+                step_status: steps.iter().cloned().map(|step| (step, None)).collect(),
+                output_recorded: steps.iter().cloned().map(|step| (step, false)).collect(),
+                step_condition_results: steps.iter().cloned().map(|step| (step, None)).collect(),
+                step_has_conditions: steps.iter().cloned().map(|step| (step, false)).collect(),
+                step_dependencies: steps
+                    .iter()
+                    .cloned()
+                    .map(|step| (step, Vec::new()))
+                    .collect(),
+                step_dependency_modes: steps
+                    .iter()
+                    .cloned()
+                    .map(|step| (step, mob_dsl::DependencyMode::All))
+                    .collect(),
+                step_branches: steps.iter().cloned().map(|step| (step, None)).collect(),
+                step_collection_policies: steps
+                    .iter()
+                    .cloned()
+                    .map(|step| (step, mob_dsl::CollectionPolicyKind::All))
+                    .collect(),
+                step_quorum_thresholds: steps.iter().cloned().map(|step| (step, 0)).collect(),
+                step_target_counts: steps.iter().cloned().map(|step| (step, 0)).collect(),
+                step_target_success_counts: steps.iter().cloned().map(|step| (step, 0)).collect(),
+                step_target_terminal_failure_counts: steps
+                    .iter()
+                    .cloned()
+                    .map(|step| (step, 0))
+                    .collect(),
+                escalation_threshold: 0,
+                max_step_retries: 0,
+                max_active_nodes: 0,
+                max_active_frames: 0,
+                max_frame_depth: 0,
+            },
+        )
+        .expect("generated run seed should be accepted");
+    }
+
+    /// Seed the F11 shape: an advisory node, a fallback node that succeeds, and
+    /// a join that depends on either of them (`DependencyMode::Any`).
+    ///
+    /// `advisory_policy` is the only variable between the tolerated case and
+    /// the default-escalation case.
+    fn seed_advisory_root_frame(
+        authority: &mut mob_dsl::MobMachineAuthority,
+        run_key: &mob_dsl::RunId,
+        frame_key: &mob_dsl::FrameId,
+        advisory_policy: mob_dsl::FlowNodeFailurePolicy,
+    ) {
+        let advisory = mob_dsl::FlowNodeId::from("advisory");
+        let fallback = mob_dsl::FlowNodeId::from("fallback");
+        let join = mob_dsl::FlowNodeId::from("join");
+        let nodes = vec![advisory.clone(), fallback.clone(), join.clone()];
+
+        mob_dsl::MobMachineMutator::apply(
+            authority,
+            mob_dsl::MobMachineInput::CreateFrameSeed {
+                run_id: run_key.clone(),
+                frame_id: frame_key.clone(),
+                frame_scope: mob_dsl::FrameScope::Root,
+                loop_instance_id: None,
+                iteration: 0,
+                tracked_nodes: nodes.iter().cloned().collect(),
+                ordered_nodes: nodes.clone(),
+                node_kind: nodes
+                    .iter()
+                    .cloned()
+                    .map(|node| (node, mob_dsl::FlowNodeKind::Step))
+                    .collect(),
+                node_dependencies: vec![
+                    (advisory.clone(), Vec::new()),
+                    (fallback.clone(), Vec::new()),
+                    (join.clone(), vec![advisory.clone(), fallback.clone()]),
+                ]
+                .into_iter()
+                .collect(),
+                node_dependency_modes: vec![
+                    (advisory.clone(), mob_dsl::DependencyMode::All),
+                    (fallback.clone(), mob_dsl::DependencyMode::All),
+                    (join.clone(), mob_dsl::DependencyMode::Any),
+                ]
+                .into_iter()
+                .collect(),
+                node_branches: nodes.iter().cloned().map(|node| (node, None)).collect(),
+                node_step_ids: vec![
+                    (advisory.clone(), mob_dsl::StepId::from("advisory")),
+                    (fallback.clone(), mob_dsl::StepId::from("fallback")),
+                    (join.clone(), mob_dsl::StepId::from("join")),
+                ]
+                .into_iter()
+                .collect(),
+                node_loop_ids: Default::default(),
+                node_status: vec![
+                    (advisory.clone(), mob_dsl::NodeRunStatus::Ready),
+                    (fallback.clone(), mob_dsl::NodeRunStatus::Ready),
+                    (join.clone(), mob_dsl::NodeRunStatus::Pending),
+                ]
+                .into_iter()
+                .collect(),
+                node_failure_policy: vec![
+                    (advisory.clone(), advisory_policy),
+                    (fallback.clone(), mob_dsl::FlowNodeFailurePolicy::Escalate),
+                    (join.clone(), mob_dsl::FlowNodeFailurePolicy::Escalate),
+                ]
+                .into_iter()
+                .collect(),
+                ready_queue: vec![advisory.clone(), fallback.clone()],
+                output_recorded: nodes.iter().cloned().map(|node| (node, false)).collect(),
+                node_condition_results: nodes.iter().cloned().map(|node| (node, None)).collect(),
+                last_admitted_node: None,
+            },
+        )
+        .expect("generated frame seed should be accepted");
+    }
+
+    fn apply_frame_node_command(
+        authority: &mut mob_dsl::MobMachineAuthority,
+        frame_key: &mob_dsl::FrameId,
+        command: mob_dsl::FlowFrameReducerCommandKind,
+        node_id: &mob_dsl::FlowNodeId,
+        node_status: mob_dsl::NodeRunStatus,
+    ) {
+        mob_dsl::MobMachineMutator::apply(
+            authority,
+            mob_dsl::MobMachineInput::AuthorizeFlowFrameReducerCommand {
+                frame_id: frame_key.clone(),
+                command,
+                node_id: Some(node_id.clone()),
+                node_status: Some(node_status),
+                terminal_status: None,
+            },
+        )
+        .expect("generated frame command should be accepted");
+    }
+
+    /// Drive the F11 shape to all-terminal: the advisory node fails, the
+    /// fallback branch succeeds, the join then completes.
+    fn run_advisory_failure_to_terminal(
+        advisory_policy: mob_dsl::FlowNodeFailurePolicy,
+    ) -> (mob_dsl::MobMachineAuthority, FrameId) {
+        run_advisory_failure_with_join_outcome(
+            advisory_policy,
+            mob_dsl::FlowFrameReducerCommandKind::CompleteNode,
+            mob_dsl::NodeRunStatus::Completed,
+        )
+    }
+
+    /// Drive the F11 shape to all-terminal with a caller-chosen terminal
+    /// outcome for the join node, so the same advisory-failure prefix can be
+    /// steered into either the Completed or the Canceled frame class.
+    fn run_advisory_failure_with_join_outcome(
+        advisory_policy: mob_dsl::FlowNodeFailurePolicy,
+        join_command: mob_dsl::FlowFrameReducerCommandKind,
+        join_status: mob_dsl::NodeRunStatus,
+    ) -> (mob_dsl::MobMachineAuthority, FrameId) {
+        let mut authority = mob_dsl::MobMachineAuthority::new();
+        let frame_id = FrameId::from("frame-advisory");
+        let frame_key = mob_dsl::FrameId::from(frame_id.as_str());
+        let run_key = mob_dsl::RunId::from("run-advisory");
+        let advisory = mob_dsl::FlowNodeId::from("advisory");
+        let fallback = mob_dsl::FlowNodeId::from("fallback");
+        let join = mob_dsl::FlowNodeId::from("join");
+
+        seed_advisory_run(&mut authority, &run_key);
+        seed_advisory_root_frame(&mut authority, &run_key, &frame_key, advisory_policy);
+
+        for (node_id, command, node_status) in [
+            (
+                &advisory,
+                mob_dsl::FlowFrameReducerCommandKind::AdmitNextReadyNode,
+                mob_dsl::NodeRunStatus::Running,
+            ),
+            (
+                &advisory,
+                mob_dsl::FlowFrameReducerCommandKind::FailNode,
+                mob_dsl::NodeRunStatus::Failed,
+            ),
+            (
+                &fallback,
+                mob_dsl::FlowFrameReducerCommandKind::AdmitNextReadyNode,
+                mob_dsl::NodeRunStatus::Running,
+            ),
+            (
+                &fallback,
+                mob_dsl::FlowFrameReducerCommandKind::CompleteNode,
+                mob_dsl::NodeRunStatus::Completed,
+            ),
+            (
+                &join,
+                mob_dsl::FlowFrameReducerCommandKind::AdmitNextReadyNode,
+                mob_dsl::NodeRunStatus::Running,
+            ),
+            (&join, join_command, join_status),
+        ] {
+            apply_frame_node_command(&mut authority, &frame_key, command, node_id, node_status);
+        }
+
+        (authority, frame_id)
+    }
+
+    /// Seal a frame through exactly the production mapping: the same
+    /// `MobMachineFlowFrameCommand::SealFrame` -> `authority_input` path that
+    /// `seal_frame_if_ready` and `FlowFrameKernel::terminalize_frame` use, so a
+    /// guard that rejects here rejects at runtime too.
+    fn apply_seal_frame(
+        authority: &mut mob_dsl::MobMachineAuthority,
+        frame_id: &FrameId,
+        terminal_status: flow_frame::FrameTerminalStatus,
+    ) -> Result<(), String> {
+        let command = MobMachineFlowFrameCommand::SealFrame(flow_frame::inputs::SealFrame {
+            terminal_status,
+        });
+        mob_dsl::MobMachineMutator::apply(authority, command.authority_input(frame_id))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn frame_phase(
+        state: &mob_dsl::MobMachineState,
+        frame_id: &FrameId,
+    ) -> Option<mob_dsl::FrameStatus> {
+        state
+            .frame_phase
+            .get(&mob_dsl::FrameId::from(frame_id.as_str()))
+            .copied()
+    }
+
+    /// BLOCKING manifestation 1: a Continue-policy node failed, the classifier
+    /// answers Completed, and the seal transition must accept that class.
+    /// Without a policy-aware seal guard the frame cannot be sealed at all and
+    /// the run dies with an opaque `MobError::Internal`.
+    #[test]
+    fn tolerated_advisory_failure_seals_root_frame_completed() {
+        let (mut authority, frame_id) =
+            run_advisory_failure_to_terminal(mob_dsl::FlowNodeFailurePolicy::Continue);
+        let classified = generated_frame_terminal_status_candidate(authority.state(), &frame_id)
+            .expect("generated classifier should classify terminal frame")
+            .expect("all-terminal frame must have a terminal class");
+        assert_eq!(classified, flow_frame::FrameTerminalStatus::Completed);
+
+        apply_seal_frame(&mut authority, &frame_id, classified)
+            .expect("the seal transition must accept the class the classifier just produced");
+
+        assert_eq!(
+            frame_phase(authority.state(), &frame_id),
+            Some(mob_dsl::FrameStatus::Completed),
+            "a tolerated advisory failure must leave the frame sealed Completed"
+        );
+    }
+
+    /// BLOCKING manifestation 2: a Continue-policy failure plus a canceled node
+    /// classifies Canceled, and the seal must accept Canceled for the same
+    /// reason - its Canceled disjunct also has to tolerate the Continue node.
+    #[test]
+    fn tolerated_advisory_failure_seals_root_frame_canceled() {
+        let (mut authority, frame_id) = run_advisory_failure_with_join_outcome(
+            mob_dsl::FlowNodeFailurePolicy::Continue,
+            mob_dsl::FlowFrameReducerCommandKind::CancelNode,
+            mob_dsl::NodeRunStatus::Canceled,
+        );
+        let classified = generated_frame_terminal_status_candidate(authority.state(), &frame_id)
+            .expect("generated classifier should classify terminal frame")
+            .expect("all-terminal frame must have a terminal class");
+        assert_eq!(classified, flow_frame::FrameTerminalStatus::Canceled);
+
+        apply_seal_frame(&mut authority, &frame_id, classified)
+            .expect("the seal transition must accept the class the classifier just produced");
+
+        assert_eq!(
+            frame_phase(authority.state(), &frame_id),
+            Some(mob_dsl::FrameStatus::Canceled),
+            "a canceled join alongside a tolerated failure must seal Canceled"
+        );
+    }
+
+    /// The seal guard must stay a real gate rather than become policy-blind in
+    /// the other direction: an Escalate-policy failure still forces Failed, and
+    /// a shell that asked for Completed anyway must still be refused.
+    #[test]
+    fn escalating_failure_seals_failed_and_refuses_completed() {
+        let (mut authority, frame_id) =
+            run_advisory_failure_to_terminal(mob_dsl::FlowNodeFailurePolicy::Escalate);
+        let classified = generated_frame_terminal_status_candidate(authority.state(), &frame_id)
+            .expect("generated classifier should classify terminal frame")
+            .expect("all-terminal frame must have a terminal class");
+        assert_eq!(classified, flow_frame::FrameTerminalStatus::Failed);
+
+        let (mut rejecting, rejecting_frame_id) =
+            run_advisory_failure_to_terminal(mob_dsl::FlowNodeFailurePolicy::Escalate);
+        assert!(
+            apply_seal_frame(
+                &mut rejecting,
+                &rejecting_frame_id,
+                flow_frame::FrameTerminalStatus::Completed,
+            )
+            .is_err(),
+            "an escalating node failure must not be sealable as Completed"
+        );
+        assert_eq!(
+            frame_phase(rejecting.state(), &rejecting_frame_id),
+            Some(mob_dsl::FrameStatus::Running),
+            "a refused seal must not advance the frame phase"
+        );
+
+        apply_seal_frame(&mut authority, &frame_id, classified)
+            .expect("the Escalate default must still seal Failed");
+        assert_eq!(
+            frame_phase(authority.state(), &frame_id),
+            Some(mob_dsl::FrameStatus::Failed)
+        );
+    }
+
+    fn frame_node_statuses(
+        state: &mob_dsl::MobMachineState,
+        frame_id: &FrameId,
+    ) -> std::collections::BTreeMap<mob_dsl::FlowNodeId, mob_dsl::NodeRunStatus> {
+        state
+            .frame_node_status
+            .get(&mob_dsl::FrameId::from(frame_id.as_str()))
+            .cloned()
+            .expect("seeded frame must carry machine-owned node status")
+    }
+
+    #[test]
+    fn tolerated_advisory_failure_classifies_root_frame_completed() {
+        let (authority, frame_id) =
+            run_advisory_failure_to_terminal(mob_dsl::FlowNodeFailurePolicy::Continue);
+
+        assert_eq!(
+            generated_frame_terminal_status_candidate(authority.state(), &frame_id)
+                .expect("generated classifier should classify terminal frame"),
+            Some(flow_frame::FrameTerminalStatus::Completed),
+            "an advisory failure must not poison a frame whose fallback and join completed"
+        );
+
+        // The failure is tolerated, never erased: the advisory node is still
+        // Failed in the frame's machine-owned typed state.
+        let statuses = frame_node_statuses(authority.state(), &frame_id);
+        assert_eq!(
+            statuses.get(&mob_dsl::FlowNodeId::from("advisory")),
+            Some(&mob_dsl::NodeRunStatus::Failed),
+            "tolerated failure must remain visible in typed frame state"
+        );
+        assert_eq!(
+            statuses.get(&mob_dsl::FlowNodeId::from("fallback")),
+            Some(&mob_dsl::NodeRunStatus::Completed)
+        );
+        assert_eq!(
+            statuses.get(&mob_dsl::FlowNodeId::from("join")),
+            Some(&mob_dsl::NodeRunStatus::Completed)
+        );
+        assert_eq!(
+            authority
+                .state()
+                .frame_node_failure_policy
+                .get(&mob_dsl::FrameId::from(frame_id.as_str()))
+                .and_then(|policies| policies.get(&mob_dsl::FlowNodeId::from("advisory"))),
+            Some(&mob_dsl::FlowNodeFailurePolicy::Continue)
+        );
+    }
+
+    #[test]
+    fn escalating_failure_still_classifies_root_frame_failed() {
+        let (authority, frame_id) =
+            run_advisory_failure_to_terminal(mob_dsl::FlowNodeFailurePolicy::Escalate);
+
+        assert_eq!(
+            generated_frame_terminal_status_candidate(authority.state(), &frame_id)
+                .expect("generated classifier should classify terminal frame"),
+            Some(flow_frame::FrameTerminalStatus::Failed),
+            "the Escalate default must keep the pre-F11 unconditional classification"
+        );
+    }
+
+    #[test]
+    fn absent_failure_policy_escalates_like_a_legacy_frame() {
+        // A frame seeded before the policy map existed decodes with an empty
+        // policy map. Absence must behave exactly like Escalate so recovering a
+        // pre-upgrade run cannot launder a real failure into a success.
+        let mut authority = mob_dsl::MobMachineAuthority::new();
+        let frame_id = FrameId::from("frame-legacy");
+        let frame_key = mob_dsl::FrameId::from(frame_id.as_str());
+        let run_key = mob_dsl::RunId::from("run-legacy");
+        let advisory = mob_dsl::FlowNodeId::from("advisory");
+        let fallback = mob_dsl::FlowNodeId::from("fallback");
+        let join = mob_dsl::FlowNodeId::from("join");
+
+        seed_advisory_run(&mut authority, &run_key);
+        seed_advisory_root_frame(
+            &mut authority,
+            &run_key,
+            &frame_key,
+            mob_dsl::FlowNodeFailurePolicy::Continue,
+        );
+        let mut legacy_state = authority.state().clone();
+        legacy_state.frame_node_failure_policy.remove(&frame_key);
+        let mut authority = mob_dsl::MobMachineAuthority::recover_from_state(legacy_state)
+            .expect("generated authority should recover a frame with no policy map");
+
+        for (node_id, command, node_status) in [
+            (
+                &advisory,
+                mob_dsl::FlowFrameReducerCommandKind::AdmitNextReadyNode,
+                mob_dsl::NodeRunStatus::Running,
+            ),
+            (
+                &advisory,
+                mob_dsl::FlowFrameReducerCommandKind::FailNode,
+                mob_dsl::NodeRunStatus::Failed,
+            ),
+            (
+                &fallback,
+                mob_dsl::FlowFrameReducerCommandKind::AdmitNextReadyNode,
+                mob_dsl::NodeRunStatus::Running,
+            ),
+            (
+                &fallback,
+                mob_dsl::FlowFrameReducerCommandKind::CompleteNode,
+                mob_dsl::NodeRunStatus::Completed,
+            ),
+            (
+                &join,
+                mob_dsl::FlowFrameReducerCommandKind::AdmitNextReadyNode,
+                mob_dsl::NodeRunStatus::Running,
+            ),
+            (
+                &join,
+                mob_dsl::FlowFrameReducerCommandKind::CompleteNode,
+                mob_dsl::NodeRunStatus::Completed,
+            ),
+        ] {
+            apply_frame_node_command(&mut authority, &frame_key, command, node_id, node_status);
+        }
+
+        assert_eq!(
+            generated_frame_terminal_status_candidate(authority.state(), &frame_id)
+                .expect("generated classifier should classify terminal frame"),
+            Some(flow_frame::FrameTerminalStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn frame_seed_carries_authored_failure_policy_from_the_flow_definition() {
+        use crate::definition::{
+            DependencyMode as SpecDependencyMode, FlowNodeFailurePolicy as SpecFailurePolicy,
+            FlowNodeSpec, FrameSpec, FrameStepSpec,
+        };
+
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            FlowNodeId::from("advisory"),
+            FlowNodeSpec::Step(FrameStepSpec {
+                step_id: StepId::from("advisory"),
+                depends_on: Vec::new(),
+                depends_on_mode: SpecDependencyMode::All,
+                branch: None,
+                failure_policy: SpecFailurePolicy::Continue,
+            }),
+        );
+        nodes.insert(
+            FlowNodeId::from("fallback"),
+            FlowNodeSpec::Step(FrameStepSpec {
+                step_id: StepId::from("fallback"),
+                depends_on: Vec::new(),
+                depends_on_mode: SpecDependencyMode::All,
+                branch: None,
+                failure_policy: SpecFailurePolicy::Escalate,
+            }),
+        );
+        let spec = FrameSpec { nodes };
+        let ordered = topological_order(&spec).expect("acyclic frame spec");
+
+        let seed = crate::run::MobRun::create_frame_seed_input(
+            &RunId::new(),
+            &FrameId::from("frame-seed"),
+            None,
+            0,
+            mob_dsl::FrameScope::Root,
+            &spec,
+            &ordered,
+        )
+        .expect("frame seed input");
+
+        let mob_dsl::MobMachineInput::CreateFrameSeed {
+            node_failure_policy,
+            ..
+        } = &seed
+        else {
+            panic!("create_frame_seed_input always returns CreateFrameSeed");
+        };
+        assert_eq!(
+            node_failure_policy.get(&mob_dsl::FlowNodeId::from("advisory")),
+            Some(&mob_dsl::FlowNodeFailurePolicy::Continue),
+            "an authored advisory node must reach the machine seed as Continue"
+        );
+        assert_eq!(
+            node_failure_policy.get(&mob_dsl::FlowNodeId::from("fallback")),
+            Some(&mob_dsl::FlowNodeFailurePolicy::Escalate)
+        );
+    }
+
     fn loop_completed_effect() -> loop_iteration::Effect {
         loop_iteration::Effect::LoopCompleted(loop_iteration::effects::LoopCompleted {
             loop_instance_id: LoopInstanceId::from("loop-1"),
@@ -4041,6 +4554,11 @@ mod tests {
                     .iter()
                     .cloned()
                     .map(|node| (node, mob_dsl::NodeRunStatus::Ready))
+                    .collect(),
+                node_failure_policy: nodes
+                    .iter()
+                    .cloned()
+                    .map(|node| (node, mob_dsl::FlowNodeFailurePolicy::Escalate))
                     .collect(),
                 ready_queue: nodes.clone(),
                 output_recorded: nodes.iter().cloned().map(|node| (node, false)).collect(),

@@ -476,6 +476,7 @@ MOB_RPC_CONTRACT_ALIAS_TYPES = [
     "MobConditionExprInput",
     "MobDependencyModeInput",
     "MobDispatchModeInput",
+    "MobFlowNodeFailurePolicyInput",
     "MobFlowNodeInput",
     "MobPolicyModeInput",
     "MobProfileBindingInput",
