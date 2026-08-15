@@ -24,22 +24,32 @@ via cargo-semver-checks against the published baselines).
   The enum is not `#[non_exhaustive]`, so a downstream matching it exhaustively
   must add an arm. It is returned where an exhausted WAL-conversion retry
   budget previously surfaced as a bare rusqlite "database is locked".
+- `meerkat_comms::RegistrationOutcome` loses the `EvictedName` and
+  `ReplacedPubkeyAndEvictedName` variants and the `displaced_existing()` method,
+  and gains `ReboundOwnName`. The enum is not `#[non_exhaustive]`, so both
+  matches and constructions break.
+- `meerkat_comms::RegistrationRejection` gains `#[non_exhaustive]` (a break for
+  exhaustive matchers by itself) and a `NameOccupied` variant.
+- In-process registration that previously SUCCEEDED by displacing a live
+  foreign route now fails closed. An embedder that relied on displacement gets
+  `CommsRuntimeError::InprocRegistrationRejected` where it used to get a working
+  runtime. This is the intended fix, and it is a behaviour break.
+- `meerkat_core::ops::ToolAccessPolicy` gains a `ReadOnly` variant. The enum is
+  not `#[non_exhaustive]`, so exhaustive matches break. It is also serde-closed
+  and persisted in durable session metadata, which carries a forward-compat
+  consequence worth planning around: a session launched with read-only intent
+  cannot have its metadata decoded by a pre-0.8.23 binary, so that session is
+  unresumable there until the binary is upgraded.
 
 ### Fixed
 
-- A failed turn no longer silently disarms a member. When a turn failed, its
-  staged input was rolled back to queued and nothing re-armed the runtime loop:
-  the input was immediately selectable again and nobody ever took the next lap,
-  so it sat until unrelated traffic happened to wake the loop, or forever. The
-  loop can no longer park while machine-owned lane truth still holds selectable
-  queued work, which makes returning work to a lane inseparable from coming back
-  for it. Consequence worth planning for: the shell was under-delivering the
-  machine's declared `max_stage_attempts = 3`, effectively granting one attempt.
-  A persistently failing turn now issues up to three applies and then
-  terminalizes as `Abandoned { MaxAttemptsExhausted }` rather than going quiet.
 - An accepted input can no longer be starved indefinitely behind a backlog: a
   refused head is re-minted behind the queue with its attempt counted, and the
-  attempt budget ends in a typed terminal rather than an unbounded retry.
+  attempt budget ends in a typed terminal rather than an unbounded retry. Two
+  consequences an operator will meet: at the cap the WHOLE refused batch
+  terminalizes, not only the culpable member, so innocent inputs can appear as
+  `Abandoned { MaxAttemptsExhausted }`; and those terminals are observable today
+  in durable input rows and through completion waiters, not on the event stream.
 - A provider-authored cache breakpoint that cannot bind to the committed
   transcript head no longer kills the turn. The unbindable claim is discarded
   and reported; the turn proceeds. Previously this failed the whole turn with an
@@ -52,10 +62,13 @@ via cargo-semver-checks against the published baselines).
   under a name another identity holds is a typed `NameOccupied` rejection
   instead of silently displacing the incumbent. A generation rebinding its own
   name is still allowed and now reports that it superseded a predecessor.
-- A durable read-write SQLite store can no longer be opened non-WAL without
-  failing closed. `JournalPolicy` states per profile whether an open establishes
-  WAL or preserves the mode it finds, so a profile added later must choose
-  rather than inherit the answer from the shape of a match arm.
+- A durable read-write store opened through the `Primary` profile, the profile
+  every production constructor uses, can no longer end up non-WAL without
+  failing closed. `ReadOnly` and `Maintenance` deliberately preserve the mode
+  they find, including `Maintenance { write: true }`, which is the offline
+  surgeon's profile and must not convert a database another step is about to
+  relocate. `JournalPolicy` states that choice per profile, so a profile added
+  later has to make it rather than inherit an answer from a match arm's shape.
 
 ### Changed
 
@@ -78,12 +91,13 @@ via cargo-semver-checks against the published baselines).
   and an existing session with an empty durable log exports an empty trajectory
   that names the session. A genuinely missing session still fails with
   `SESSION_NOT_FOUND`.
-- Mob run accounting reports missing usage as missing. A member whose usage
-  could not be read contributes `usage_unavailable` naming the reason, and the
-  run carries `members_usage_unavailable`, so a total is a documented floor
-  rather than a number quietly short by however many members failed to report.
-- Event rows carry the model and provider that produced them, so a session
-  whose model changed mid-run can be attributed per turn instead of per session.
+- Usage aggregation semantics are documented and pinned by test, and the Python
+  and TypeScript SDKs now expose the per-call model and provider attribution
+  that `turn_completed.usage.accounting` already carried. The scope matters for
+  cost accounting: attribution covers run-closing calls, so intermediate
+  tool-loop, extraction and compaction calls publish no row, and
+  `run_completed.usage` stays cumulative and session-scoped and must NOT be
+  summed against the per-turn rows.
 
 ### Added
 
@@ -106,11 +120,19 @@ via cargo-semver-checks against the published baselines).
   outcome: durable acceptance, a typed refusal, or a timeout that states
   whether the work is durably queued or its fate is unknown. Admission collapses
   on the idempotency key at the durable admission point, so a bounded submit
-  retried after a timeout cannot become two deliveries.
+  retried after a timeout does not become two deliveries on a persistent
+  runtime. On a store-less runtime the collapse holds only while the admission
+  is retained in live machine state, and a timeout with no durable witness does
+  not promise exactly-once across a process death - which is what the `Unknown`
+  disposition is for. This is a Rust library API; no RPC or REST surface serves
+  it yet.
 - `AgentEvent::ProviderCacheBreakpointsDiscarded`: the session event stream now
-  reports discarded provider cache breakpoints, distinguishing claims inherited
-  from a fork from claims authored this turn. Present in the wire catalog and
-  all three SDK event inventories.
+  reports discarded provider cache breakpoints, distinguishing claims persisted
+  by an earlier turn (which includes fork-inherited evidence) from claims
+  authored this turn. Present in the wire catalog and all three SDK event
+  inventories. Consumers match on `DiscardedCacheBreakpoint`,
+  `CacheBreakpointDiscardOrigin` and `CacheBreakpointDiscardReason`; a retained
+  count of 0 means caching was lost outright for that turn.
 - `meerkat_sqlite::JournalPolicy` and `ConnectionProfile::journal_policy()`:
   whether an open establishes WAL or preserves the mode it finds is now stated
   per profile rather than implied by a match arm.
@@ -120,6 +142,20 @@ via cargo-semver-checks against the published baselines).
   fails closed on tools whose mutation class is unknown. The boundary is
   documented explicitly: a read-only launch is only truthful when the host also
   disables provider-native tool capabilities.
+  The seam a host must implement: `AgentToolDispatcher::tool_mutation_class`
+  defaults to `ToolMutationClass::Unknown`, and unknown is denied under
+  read-only intent, so a host with its own dispatcher that does not override it
+  will see EVERY one of its tools refused on a read-only launch.
+- Mob run accounting on the run result, including per-member usage. A member
+  whose usage could not be read contributes `usage_unavailable` naming the
+  reason, and the run carries `members_usage_unavailable`, so a total is a
+  documented floor rather than a number quietly short by however many members
+  failed to report. Nothing reported usage here before. When the projection
+  itself fails, the CLI omits the whole accounting block with a warning on
+  stderr, so an absent block is also a signal.
+- `meerkat_comms::CommsRuntime::retire_inproc_route` and
+  `PreparedCommsRuntime::publish_replacing`, for hosts that need to hand a name
+  over deliberately now that displacement is refused.
 
 ## [0.8.22] - 2026-08-09
 
