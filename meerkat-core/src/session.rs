@@ -4146,9 +4146,13 @@ impl Session {
             //
             // Known consequence, accepted: `authored_cache_breakpoints` stays
             // strict, so a fork attempted while a stale row is still parked in
-            // metadata hard-fails until that next authoring turn. That fails a
-            // fork, not a turn, and the fork proof path is required to be
-            // fail-closed.
+            // metadata cannot inherit until that next authoring turn. The
+            // strictness is a refusal to inherit, not a refusal to fork: the
+            // production caller maps the error to
+            // `ForkCacheInheritance::Unavailable { AuthoredEvidenceInvalid }`
+            // (meerkat-session/src/persistent.rs), so the fork proceeds with
+            // no inherited cache rather than failing. A turn is never affected
+            // either way.
             return Ok(retention);
         }
 
