@@ -5084,11 +5084,24 @@ async fn maybe_inject_feed_wake(
 /// What the runtime loop should do with the backlog after a batch failed
 /// terminally and its surviving members were rolled back to their lanes.
 enum FailedBatchBacklogOutcome {
-    /// The failed batch was deferred behind the backlog — keep draining so
-    /// other queued work runs before the failed payload is retried.
+    /// Keep draining. Two producers reach this, and they differ:
+    ///
+    /// - Other queued work exists, so the failed batch was deferred behind
+    ///   the backlog and that other work runs before the failed payload is
+    ///   retried.
+    /// - The failed batch is the ONLY queued work, so nothing was deferred
+    ///   (there is no backlog to defer behind) and the failed payload itself
+    ///   is what runs next, immediately. Parking here is what left members
+    ///   disarmed; the machine's stage-attempt budget is what bounds it.
+    ///
+    /// Both mean "do not park", which is the decision the caller acts on.
     ContinueProcessing,
-    /// Nothing else is queued: leave the failed batch queued for a future
-    /// wake instead of hot-looping on the same payload indefinitely.
+    /// Machine-owned lane truth holds no queued work at all, so there is
+    /// nothing left for anyone to come back for and parking is honest.
+    ///
+    /// Parking while a lane still holds work is the general form of the
+    /// disarmed-member defect: "queued work exists" and "no wake pending"
+    /// true at the same time.
     Park,
     /// Deferring the batch hit a genuine projection invariant break. The loop
     /// was stopped through the canonical executor-stop path (a silent return
@@ -5108,6 +5121,12 @@ enum FailedBatchBacklogOutcome {
 /// Callers must drop any driver-authority guard before invoking this: a stop
 /// hook may re-enter machine control, while required cleanup is handed off
 /// only after the loop exits.
+///
+/// The park decision is derived from machine-owned lane truth and nothing
+/// else. Returning work to a lane therefore owns its own re-arm: the loop
+/// cannot park while the machine still holds selectable queued work, which is
+/// a stronger guarantee than a re-arm flag a future rollback path could
+/// forget to set.
 async fn resolve_failed_batch_backlog(
     driver: &crate::meerkat_machine::SharedDriver,
     completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
@@ -5120,16 +5139,25 @@ async fn resolve_failed_batch_backlog(
 ) -> FailedBatchBacklogOutcome {
     let defer_error = {
         let mut d = driver.lock().await;
-        if !d.has_queued_input_outside(input_ids) {
+        if !d.has_queued_input_in_any_lane() {
             return FailedBatchBacklogOutcome::Park;
         }
-        match d.defer_queued_inputs_behind_backlog(input_ids) {
-            Ok(()) => {
-                d.take_wake_requested();
-                None
-            }
-            Err(err) => Some(err),
+        if !d.has_queued_input_outside(input_ids) {
+            // The only queued work left is exactly what this failure rolled
+            // back, and no wake producer will ask for it: wakes come from
+            // ingress admission, attachment commit, the completion feed and
+            // retire, and a rollback triggers none of them. Field evidence
+            // (2026-08-12, household fleet): a rolled-back input sat queued
+            // for 21 minutes with no attempts and no refusals until an app
+            // restart re-armed the loop, while its sibling moved only because
+            // unrelated ingress happened to wake the loop 288 seconds later.
+            // Keep draining instead. There is nothing to defer behind an
+            // empty backlog, and the machine's own stage-attempt budget bounds
+            // the retry: the payload either succeeds or `ResolveStagedRollback`
+            // terminalizes it as MaxAttemptsExhausted.
+            return FailedBatchBacklogOutcome::ContinueProcessing;
         }
+        d.defer_queued_inputs_behind_backlog(input_ids).err()
     };
     let Some(err) = defer_error else {
         return FailedBatchBacklogOutcome::ContinueProcessing;
@@ -8642,6 +8670,13 @@ mod tests {
     /// backlog stranded until an unrelated external wake (~13 minutes in the
     /// field). Post-fix the same wake keeps draining: the poison terminalizes
     /// as machine policy and the next queued input still gets its attempt.
+    ///
+    /// 0.8.23 strengthens the tail of the same wake. This executor fails every
+    /// apply, so the backlog input's own rollback returns it to a lane with
+    /// nothing else queued. Parking there was the disarmed-member defect, so
+    /// the wake now carries that input through its remaining machine-owned
+    /// stage attempts to the same typed terminal instead of leaving it queued
+    /// for a wake nobody owes it.
     #[tokio::test]
     async fn max_attempts_abandonment_does_not_wedge_the_backlog() {
         let driver = make_shared_ephemeral_driver("defer-wedge-class");
@@ -8704,22 +8739,25 @@ mod tests {
                 assert_eq!(d.input_attempt_count(&poison_id), 3);
                 assert_eq!(
                     d.input_attempt_count(&innocent_id),
-                    1,
-                    "the same wake must keep draining past the abandoned poison — a zero \
-                     attempt count means the backlog wedged behind a dropped wake"
+                    3,
+                    "the same wake must keep draining past the abandoned poison and spend the \
+                     backlog input's own machine-owned budget; a zero attempt count means the \
+                     backlog wedged behind a dropped wake, and stopping at one means it parked \
+                     queued with nobody coming back for it"
                 );
                 assert_eq!(
                     d.input_phase(&innocent_id),
-                    Some(crate::input_state::InputLifecycleState::Queued),
-                    "the innocent input keeps its remaining machine-policy retries"
+                    Some(crate::input_state::InputLifecycleState::Abandoned),
+                    "an input that spends every machine-policy retry terminalizes typed"
                 );
             }
             _ => panic!("expected ephemeral driver"),
         }
         assert_eq!(
             apply_calls.load(Ordering::SeqCst),
-            2,
-            "one wake must attempt both the poison batch and the innocent batch"
+            4,
+            "one wake must attempt the poison batch and then every remaining attempt the \
+             backlog input is owed"
         );
     }
 

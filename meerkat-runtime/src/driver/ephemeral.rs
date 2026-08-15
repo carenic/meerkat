@@ -1989,6 +1989,17 @@ impl EphemeralRuntimeDriver {
         })
     }
 
+    /// Whether machine-owned lane truth still holds any queued input.
+    ///
+    /// `input_lane` is the singular ordered-membership authority, so an empty
+    /// lane is the only state in which no queued work can be selected. This is
+    /// the total question the runtime loop must answer before it parks:
+    /// parking with a non-empty lane is the "queued work exists, nobody is
+    /// coming back for it" state that silently disarms a live member.
+    pub(crate) fn has_queued_input_in_any_lane(&self) -> bool {
+        self.with_dsl_state(|state| !state.input_lane.is_empty())
+    }
+
     pub(crate) fn defer_queued_inputs_behind_backlog(
         &mut self,
         input_ids: &[InputId],

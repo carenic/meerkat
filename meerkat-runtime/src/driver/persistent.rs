@@ -1598,6 +1598,10 @@ impl PersistentRuntimeDriver {
         self.inner.has_queued_input_outside(excluded)
     }
 
+    pub(crate) fn has_queued_input_in_any_lane(&self) -> bool {
+        self.inner.has_queued_input_in_any_lane()
+    }
+
     pub(crate) fn defer_queued_inputs_behind_backlog(
         &mut self,
         input_ids: &[InputId],

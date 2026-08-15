@@ -2722,38 +2722,482 @@ async fn failed_executor_stops_retrying_after_stage_budget_exhausted() {
         "failing executor should be called before retry-budget assertions",
     )
     .await;
+    // The budget is exhausted only by attempts that actually accrue. Waiting
+    // for "any non-in-flight phase" would also accept a rolled-back input that
+    // parked in Queued after a single attempt, which is the disarmed-member
+    // defect wearing a passing assertion.
     let state = wait_for_input_state(
         &adapter,
         &sid,
         &input_id,
-        "failed input should leave in-flight lifecycle state after retry exhaustion",
-        |state| {
-            !matches!(
-                state.seed.phase,
-                InputLifecycleState::Staged | InputLifecycleState::AppliedPendingConsumption
-            )
-        },
+        "failed input should terminalize typed once its stage budget is spent",
+        |state| state.seed.phase == InputLifecycleState::Abandoned,
     )
     .await;
-    let call_count = calls.load(Ordering::SeqCst);
-    assert!(
-        (1..=3).contains(&call_count),
-        "retry budget should remain bounded; expected 1-3 attempts, saw {call_count}"
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "retry budget should be spent exactly once per stage attempt"
     );
-    assert!(
-        !matches!(
-            state.seed.phase,
-            InputLifecycleState::Staged | InputLifecycleState::AppliedPendingConsumption
-        ),
-        "failed inputs must not remain stuck in an in-flight lifecycle state"
+    assert_eq!(state.seed.attempt_count, 3);
+    assert_eq!(
+        state.seed.terminal_outcome,
+        Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::MaxAttemptsExhausted { attempts: 3 },
+        }),
+        "the generated retry policy owns the terminal outcome"
     );
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        call_count,
+        3,
         "failed inputs must not keep spinning through fresh run ids"
+    );
+}
+
+/// Field regression (household fleet, 2026-08-12, domain:home): a turn failed,
+/// its staged input was rolled back to Queued, and nothing re-armed the runtime
+/// loop. The input sat queued for 21 minutes with zero further attempts and
+/// zero refusals; only an app restart - which wakes on
+/// `!active_input_ids().is_empty()` at attachment commit - re-staged it. A
+/// sibling input on the same member moved 288 seconds after its own rollback,
+/// but only because an unrelated input arrived and woke the loop: the wake was
+/// incidental, never owned by the rollback.
+///
+/// The particular provider error that failed that turn is irrelevant. This
+/// drives a deliberately generic turn failure and then supplies NO further
+/// stimulus: no second input, no wake, no completion traffic, no restart. The
+/// machine's own stage-attempt policy must carry the input to a typed terminal.
+#[tokio::test]
+async fn generic_turn_failure_re_arms_its_own_rolled_back_input_without_external_stimulus() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    struct GenericTurnFailureExecutor {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for GenericTurnFailureExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(CoreExecutorError::apply_failed_runtime_turn(
+                "generic turn failure",
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = SessionId::new();
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(GenericTurnFailureExecutor {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+
+    let input = make_prompt("generic failure with nothing else happening");
+    let input_id = input.id().clone();
+    adapter.accept_input(&sid, input).await.unwrap();
+
+    // Nothing else touches this session from here on.
+    let state = wait_for_input_state(
+        &adapter,
+        &sid,
+        &input_id,
+        "a failed turn must own the re-arm for the input it rolled back; \
+         without it the input parks in Queued until unrelated activity wakes the loop",
+        |state| state.seed.phase == InputLifecycleState::Abandoned,
+    )
+    .await;
+
+    assert_eq!(
+        state.seed.attempt_count, 3,
+        "every re-arm must accrue a machine-owned stage attempt"
+    );
+    assert_eq!(
+        state.seed.terminal_outcome,
+        Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::MaxAttemptsExhausted { attempts: 3 },
+        }),
+        "the generated retry policy owns the terminal, not the shell"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "the re-arm must be bounded by the machine's stage-attempt budget"
+    );
+
+    // The budget is the bound: once the lane is empty the loop parks for real.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "a terminalized input must not keep spinning through fresh run ids"
+    );
+    assert!(
+        adapter.list_active_inputs(&sid).await.unwrap().is_empty(),
+        "a terminalized input must not remain active work"
+    );
+}
+
+/// Sibling of the re-arm regression: the caller's completion waiter must still
+/// resolve on the attempt that failed, AND the durable input must still reach a
+/// typed terminal. Converting "caller hangs, input queued forever" into
+/// "caller hangs, input abandoned" would be a worse lie than the defect.
+#[tokio::test]
+async fn generic_turn_failure_resolves_its_completion_waiter_and_terminalizes_the_input() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    struct GenericTurnFailureExecutor;
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for GenericTurnFailureExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            Err(CoreExecutorError::apply_failed_runtime_turn(
+                "generic turn failure",
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = SessionId::new();
+    adapter
+        .register_session_with_executor(sid.clone(), Box::new(GenericTurnFailureExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+
+    let input = make_prompt("generic failure with a waiting caller");
+    let input_id = input.id().clone();
+    let (outcome, handle) = adapter
+        .accept_input_with_completion(&sid, input)
+        .await
+        .unwrap();
+    assert!(outcome.is_accepted());
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        handle
+            .expect("accepted input should carry a completion handle")
+            .wait(),
+    )
+    .await
+    .expect("completion waiter must resolve after a failed turn")
+    .expect("completion waiter should resolve");
+    assert!(
+        matches!(
+            result,
+            meerkat_runtime::completion::CompletionOutcome::AbandonedWithError { .. }
+                | meerkat_runtime::completion::CompletionOutcome::Abandoned { .. }
+        ),
+        "a failed turn must report typed failure metadata to its caller, got {result:?}"
+    );
+
+    let state = wait_for_input_state(
+        &adapter,
+        &sid,
+        &input_id,
+        "a resolved caller waiter must not leave the durable input parked in Queued",
+        |state| state.seed.phase == InputLifecycleState::Abandoned,
+    )
+    .await;
+    assert_eq!(
+        state.seed.terminal_outcome,
+        Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::MaxAttemptsExhausted { attempts: 3 },
+        }),
+    );
+}
+
+/// Wake coalescing contract. `wake_tx` is a bounded `mpsc(16)` written with
+/// `try_send`, so wakes are silently dropped when the channel is full and
+/// merged whenever several arrive while the loop is inside `process_queue`.
+/// That is only sound because ONE wake drains the queue to empty. Prompts never
+/// batch with each other (the generated queue batcher breaks after a prompt),
+/// so these three inputs are three separate runs from exactly one wake.
+#[tokio::test]
+async fn one_wake_drains_every_queued_input_so_a_merged_wake_cannot_park_work() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::{RunApplyBoundary, RunPrimitive};
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    struct CountingExecutor {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for CountingExecutor {
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = SessionId::new();
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(CountingExecutor {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+
+    let mut input_ids = Vec::new();
+    for index in 0..3 {
+        let input = make_prompt(&format!("queued without a wake {index}"));
+        input_ids.push(input.id().clone());
+        adapter
+            .accept_input_without_wake(&sid, input)
+            .await
+            .expect("queued-only admission should succeed");
+    }
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "queued-only admission must not process work before a wake"
+    );
+
+    assert!(
+        adapter
+            .wake_runtime_if_active_inputs(&sid)
+            .await
+            .expect("wake should reach the attached loop"),
+        "a single wake must be delivered while queued work exists"
+    );
+
+    for input_id in &input_ids {
+        let state = wait_for_input_state(
+            &adapter,
+            &sid,
+            input_id,
+            "one wake must drain every queued input; a dropped or merged wake \
+             must not leave queued work parked",
+            |state| state.seed.phase == InputLifecycleState::Consumed,
+        )
+        .await;
+        assert_eq!(state.seed.phase, InputLifecycleState::Consumed);
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "each prompt is its own run, all reached from one wake"
+    );
+}
+
+/// FIFO head contract for the re-arm: work queued behind a failing head must
+/// still make progress, and the head itself must still terminalize typed. The
+/// backlog input is the last external stimulus in this test.
+#[tokio::test]
+async fn queued_backlog_progresses_while_the_failing_head_terminalizes() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::{RunApplyBoundary, RunPrimitive};
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    struct HeadFailsExecutor {
+        head_id: InputId,
+        head_calls: Arc<AtomicUsize>,
+        backlog_calls: Arc<AtomicUsize>,
+        first_apply_started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for HeadFailsExecutor {
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            if primitive.contributing_input_ids().contains(&self.head_id) {
+                if self.head_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.first_apply_started.notify_one();
+                    // Hold the head's first run open long enough for the
+                    // backlog input to be admitted behind it.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                return Err(CoreExecutorError::apply_failed_runtime_turn(
+                    "generic turn failure",
+                ));
+            }
+            self.backlog_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let head = make_prompt("failing head");
+    let head_id = head.id().clone();
+    let head_calls = Arc::new(AtomicUsize::new(0));
+    let backlog_calls = Arc::new(AtomicUsize::new(0));
+    let first_apply_started = Arc::new(tokio::sync::Notify::new());
+
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = SessionId::new();
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(HeadFailsExecutor {
+                head_id: head_id.clone(),
+                head_calls: Arc::clone(&head_calls),
+                backlog_calls: Arc::clone(&backlog_calls),
+                first_apply_started: Arc::clone(&first_apply_started),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+
+    adapter.accept_input(&sid, head).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), first_apply_started.notified())
+        .await
+        .expect("the head run should start before the backlog input is queued");
+
+    let backlog = make_prompt("backlog behind the failing head");
+    let backlog_id = backlog.id().clone();
+    adapter.accept_input(&sid, backlog).await.unwrap();
+
+    let backlog_state = wait_for_input_state(
+        &adapter,
+        &sid,
+        &backlog_id,
+        "work queued behind a failing head must still drain",
+        |state| state.seed.phase == InputLifecycleState::Consumed,
+    )
+    .await;
+    assert_eq!(backlog_state.seed.phase, InputLifecycleState::Consumed);
+
+    let head_state = wait_for_input_state(
+        &adapter,
+        &sid,
+        &head_id,
+        "the failing head must terminalize typed instead of parking in Queued \
+         once the backlog behind it is empty",
+        |state| state.seed.phase == InputLifecycleState::Abandoned,
+    )
+    .await;
+    assert_eq!(
+        head_state.seed.terminal_outcome,
+        Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::MaxAttemptsExhausted { attempts: 3 },
+        }),
+    );
+    assert_eq!(
+        head_calls.load(Ordering::SeqCst),
+        3,
+        "the head must consume exactly its machine-owned stage budget"
+    );
+    assert_eq!(
+        backlog_calls.load(Ordering::SeqCst),
+        1,
+        "the backlog input must run exactly once"
     );
 }
 

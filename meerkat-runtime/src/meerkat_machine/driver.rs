@@ -3630,14 +3630,6 @@ impl DriverEntry {
         }
     }
 
-    /// Check and clear the wake flag (backward-compat wrapper).
-    pub(crate) fn take_wake_requested(&mut self) -> bool {
-        match self {
-            DriverEntry::Ephemeral(d) => d.take_wake_requested(),
-            DriverEntry::Persistent(d) => d.take_wake_requested(),
-        }
-    }
-
     pub(crate) fn hydrate_authorized_batch(
         &mut self,
         batch: &AuthorizedRuntimeLoopBatch,
@@ -3858,6 +3850,13 @@ impl DriverEntry {
         match self {
             DriverEntry::Ephemeral(d) => d.has_queued_input_outside(excluded),
             DriverEntry::Persistent(d) => d.has_queued_input_outside(excluded),
+        }
+    }
+
+    pub(crate) fn has_queued_input_in_any_lane(&self) -> bool {
+        match self {
+            DriverEntry::Ephemeral(d) => d.has_queued_input_in_any_lane(),
+            DriverEntry::Persistent(d) => d.has_queued_input_in_any_lane(),
         }
     }
 
