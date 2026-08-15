@@ -58,6 +58,23 @@ filter = 'test(~test_wire_members_batch_materializes_300_by_150_dense_topology_i
 threads-required = "num-cpus"
 
 [[profile.fast.overrides]]
+# A staged-run choreography case: it waits on machine-owned state transitions
+# through Tokio notifications, so every wait is for a STRUCTURAL property that
+# either happens or never does. Under a saturated lane its executor can be
+# starved past the bound, which measures runner load rather than the property.
+# Raising the bound was tried first and did not hold - it failed again at 60s
+# while passing standalone in 0.03s - so reserve the lane instead, matching the
+# treatment the other wall-clock-sensitive cases in this file already get.
+filter = 'test(~mixed_directed_max_attempt_failure_terminalizes_only_exhausted_contributor)'
+threads-required = "num-cpus"
+
+[[profile.default.overrides]]
+# The workspace unit lane uses the default profile and discovers this lib test
+# too, and that is where it has actually been failing.
+filter = 'test(~mixed_directed_max_attempt_failure_terminalizes_only_exhausted_contributor)'
+threads-required = "num-cpus"
+
+[[profile.fast.overrides]]
 # These process-backed monitor tests are normally sub-second, but a
 # concurrently saturating topology/codegen case can starve their Tokio/process
 # readers until the contract timeout. Reserve the lane; each command still

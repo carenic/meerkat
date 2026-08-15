@@ -143,6 +143,49 @@ via cargo-semver-checks against the published baselines).
 
 ### Fixed
 
+- **`runtime/health` reported a healthy host on the strength of one job-backlog
+  reading; it now measures three dimensions and states the one it does not.**
+  The handler computed exactly one check, job delivery backlog, and reported
+  top-level `status: ok` whenever it passed. A session's runtime loop, its
+  durability state, and its progress were never looked at, so a wedged session
+  returned `ok` and every operator alert built on the endpoint was watching a
+  dimension it did not care about. `GET /runtime/health` was worse: it served a
+  hardcoded `ok` with an empty `checks` map.
+  Two things changed. First, the rule is enforced where the projection is
+  built: a diagnostic may only assert the scope it measured, so a surface passes
+  in what it measured and every declared dimension it did not measure is
+  published as `unmeasured:<dimension>` at `degraded`. Second, `runtime/health`
+  actually measures two more dimensions, read straight off live runtime state
+  with non-blocking probes that cannot park behind the wedge they are reporting:
+  - `session_durability` - `degraded` while any registered session's shared
+    durability gate demands a cold reload before it may execute or mutate
+    durable state. Storeless sessions carry no durability contract and are
+    never counted.
+  - `session_runtime_loop` - `degraded` while any registered session still
+    claims a runtime loop whose task is gone or whose channels are closed. Until
+    now a dead loop and an idle one were indistinguishable from outside.
+  **What an operator does with this.** `status` is the worst rung over the
+  MEASURED checks, so `status != "ok"` is a usable alert predicate: on a healthy
+  host it is `ok`, and it moves to `degraded` when a real session goes
+  reload-required or a real runtime loop dies. Unmeasured coverage is published
+  in `checks` and deliberately does NOT set `status`, because a `status` that is
+  permanently `degraded` on every healthy host is muted within a week and then
+  the real incident arrives to a silenced alert. Read `checks` for the coverage
+  claim; alert on `status`.
+  **What is still not covered, stated plainly:** `session_liveness` remains
+  `unmeasured:session_liveness`. Nothing here observes whether a live session is
+  *progressing* - a session whose loop task is alive and whose channels are open,
+  but which is parked while machine-owned lane truth still holds selectable
+  queued work, moves no value this endpoint reads. That is the signature of the
+  disarmed-member defect fixed elsewhere in this release, and detecting it needs
+  a watchdog bridge that is 0.8.24 work. An alert on `status` will not fire on
+  that class today.
+  The `checks` map is an open string map on the wire, so the added keys are
+  additive: no wire break, no schema change, no SDK regeneration.
+  `GET /runtime/health` in `meerkat-rest` measures nothing at all and therefore
+  reports `status: "degraded"` with four `unmeasured:*` entries, rather than the
+  hardcoded `ok` it used to serve: a caller that measured nothing may not mint a
+  clean bill of health.
 - A failed turn no longer silently disarms a member. When a turn failed, its
   staged input was rolled back to queued and nothing re-armed the runtime loop.
   The input stayed immediately selectable and nobody took the next lap, so it

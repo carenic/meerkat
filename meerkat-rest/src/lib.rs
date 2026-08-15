@@ -3830,6 +3830,55 @@ fn rest_runtime_host_surface_options(
     options
 }
 
+/// A session-population probe's answer, as a health observation.
+///
+/// `None` from the probe means the session registry was not readable, not that
+/// the count was zero. Deliberately mirrors
+/// `meerkat_rpc::handlers::runtime_host::observed_session_population`, which
+/// carries the full argument for why the two must not share a representation
+/// and is pinned arm by arm there. The duplication is two surfaces reading the
+/// same machine accessors through their own crates; if a third appears, hoist
+/// this into `meerkat::surface` beside the observation type.
+fn rest_observed_session_population(
+    count: Option<usize>,
+) -> meerkat::surface::RuntimeHealthObservation {
+    match count {
+        Some(0) => meerkat::surface::RuntimeHealthObservation::Measured(
+            meerkat_contracts::RuntimeHostHealthStatus::Ok,
+        ),
+        Some(_) => meerkat::surface::RuntimeHealthObservation::Measured(
+            meerkat_contracts::RuntimeHostHealthStatus::Degraded,
+        ),
+        None => meerkat::surface::RuntimeHealthObservation::Unreadable,
+    }
+}
+
+/// What THIS surface's probes established about runtime host health.
+///
+/// REST reads the two session dimensions straight off the `MeerkatMachine` it
+/// already holds; both accessors are synchronous non-blocking reads, so a
+/// health scrape cannot park behind the wedge it is trying to report.
+///
+/// `jobs` is not probed here. REST holds no `DetachedJobService`, so it is
+/// published as `unmeasured:jobs`: a coverage statement in the payload rather
+/// than a fault claim, and out of the `status` rollup because no probe exists
+/// to clear it and a permanently amber endpoint is a muted one. Wiring the job
+/// probe into REST is the way to move that key, not deleting it.
+fn rest_runtime_health(state: &AppState) -> meerkat_contracts::RuntimeHostHealth {
+    meerkat::surface::build_runtime_host_health_from_observations([
+        (
+            "session_durability".to_string(),
+            rest_observed_session_population(state.runtime_adapter.reload_required_session_count()),
+        ),
+        (
+            "session_runtime_loop".to_string(),
+            rest_observed_session_population(
+                state.runtime_adapter.dead_runtime_loop_session_count(),
+            ),
+        ),
+    ])
+}
+
 async fn get_runtime_host_info(
     State(state): State<AppState>,
 ) -> Json<meerkat_contracts::RuntimeHostInfo> {
@@ -3838,11 +3887,19 @@ async fn get_runtime_host_info(
     let metadata = metadata
         .as_ref()
         .map(meerkat::surface::RuntimeHostMetadataProjection::from);
-    Json(meerkat::surface::build_runtime_host_info(
+    let mut info = meerkat::surface::build_runtime_host_info(
         &options,
         metadata.as_ref(),
         state.context_root.clone(),
-    ))
+    );
+    // `build_runtime_host_info` is a pure projection over surface options and
+    // config metadata: it holds no runtime and can observe no health dimension,
+    // so the rollup it embeds is the probed-nothing one. A surface that CAN
+    // probe owes the payload what it actually measured, and this one can. The
+    // equality with `GET /runtime/health` is pinned by
+    // `test_runtime_host_routes_report_read_only_projection`.
+    info.health = rest_runtime_health(&state);
+    Json(info)
 }
 
 async fn get_runtime_capabilities(
@@ -3852,8 +3909,10 @@ async fn get_runtime_capabilities(
     Json(meerkat::surface::build_runtime_host_capabilities(&options))
 }
 
-async fn get_runtime_health() -> Json<meerkat_contracts::RuntimeHostHealth> {
-    Json(meerkat::surface::build_runtime_host_health())
+async fn get_runtime_health(
+    State(state): State<AppState>,
+) -> Json<meerkat_contracts::RuntimeHostHealth> {
+    Json(rest_runtime_health(&state))
 }
 
 /// Get the effective model catalog for the current config.
@@ -12595,7 +12654,102 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let health: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(health["status"], "ok");
+        // Measured. REST reads both session dimensions off the runtime machine
+        // it already holds, so their presence here is the wiring pin: a route
+        // that forgot to probe would publish `unmeasured:*` instead and fail
+        // the next block.
+        for measured in ["session_durability", "session_runtime_loop"] {
+            assert_eq!(
+                health["checks"][measured], "ok",
+                "GET /runtime/health must publish `{measured}` as measured: {health}"
+            );
+            assert!(
+                health["checks"]
+                    .get(format!("unmeasured:{measured}"))
+                    .is_none(),
+                "a measured dimension must not also be published as unmeasured: {health}"
+            );
+        }
+        // Unmeasured, and named rather than omitted. REST holds no
+        // `DetachedJobService`, and nothing anywhere observes whether a live
+        // session is progressing.
+        for unmeasured in ["unmeasured:jobs", "unmeasured:session_liveness"] {
+            assert_eq!(
+                health["checks"][unmeasured], "degraded",
+                "GET /runtime/health must name `{unmeasured}` as unmeasured coverage: {health}"
+            );
+        }
+        // The third coverage vocabulary means a probe ran and could not read.
+        // Both probes answered on this host, so neither may claim it failed.
+        assert!(
+            !health["checks"]
+                .as_object()
+                .expect("health payload carries a checks map")
+                .keys()
+                .any(|key| key.starts_with("unreadable:")),
+            "no probe failed on this host, so none may claim it did: {health}"
+        );
+        // Unmeasured coverage is published, not folded into the rollup. A
+        // `status` that is permanently `degraded` on every healthy host is
+        // muted within a week, and then the real incident arrives to a silenced
+        // alert.
+        assert_eq!(
+            health["status"], "ok",
+            "a REST host with no measured fault must not stand permanently amber: {health}"
+        );
+        // The pin that would have caught this endpoint inheriting a rollup it
+        // never computed. `build_runtime_host_info` embeds the probed-nothing
+        // projection because it holds no runtime and can observe nothing; a
+        // surface that CAN probe owes `host_info` the same health its own
+        // health route publishes. Byte equality, not a spot check on `status`,
+        // so a partially-wired `host_info` fails here too.
+        assert_eq!(
+            payload["health"], health,
+            "GET /runtime/host_info must publish the health THIS surface \
+             measured, not the projection default: {payload}"
+        );
+    }
+
+    /// The single mapping that makes both REST runtime-host routes honest about
+    /// their two session dimensions, pinned arm by arm.
+    ///
+    /// The `None` arm is the load-bearing one. Both route-level tests run
+    /// against a host whose session registry answers, so `None` is reachable in
+    /// production and unreachable in those fixtures: changing it to
+    /// `Measured(Ok)` would republish `status: "ok"` on the strength of a
+    /// dimension REST never read, with the rest of the suite green.
+    ///
+    /// The sibling pin for the JSON-RPC copy of this mapping is
+    /// `meerkat_rpc::handlers::runtime_host::tests::a_session_population_probe_that_could_not_read_is_never_reported_as_measured`.
+    #[test]
+    fn rest_session_population_probe_that_could_not_read_is_never_reported_as_measured() {
+        use meerkat::surface::RuntimeHealthObservation;
+        use meerkat_contracts::RuntimeHostHealthStatus;
+
+        assert_eq!(
+            rest_observed_session_population(None),
+            RuntimeHealthObservation::Unreadable,
+            "an unreadable session registry is not a reading; publishing it as \
+             `Measured(Ok)` mints a health claim nobody established, and as \
+             `Measured(Degraded)` asserts a named population of bad sessions \
+             nobody observed"
+        );
+        assert_eq!(
+            rest_observed_session_population(Some(0)),
+            RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+            "a probe that read the registry and found nobody affected has \
+             earned its `ok`"
+        );
+        for count in [1usize, 2, 97] {
+            assert_eq!(
+                rest_observed_session_population(Some(count)),
+                RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Degraded),
+                "{count} affected session(s) is a measured fault, and it is \
+                 `Degraded` rather than `Unhealthy` because both conditions \
+                 this maps are per session and fenced: the host keeps serving \
+                 everything else"
+            );
+        }
     }
 
     #[test]

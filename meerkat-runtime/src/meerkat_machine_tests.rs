@@ -43720,3 +43720,327 @@ async fn empty_compaction_outbox_skips_the_identity_checkpoint_cycle_after_commi
     assert_eq!(store.session_snapshot_loads(), 1);
     assert_eq!(store.session_snapshot_commits(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Runtime host health probes.
+//
+// These two accessors exist so `runtime/health` can say something an operator
+// can page on. Both are tested against real registered sessions and the real
+// spawn path: a synthetic entry with hand-built channels would prove nothing,
+// because it is precisely the spawn path's ownership transfer that makes a
+// closed channel MEAN the loop is gone.
+// ---------------------------------------------------------------------------
+
+/// Executor that does nothing and never fails, so the only thing a test using
+/// it can observe is the runtime shell around it.
+struct HealthProbeNoopExecutor;
+
+#[async_trait::async_trait]
+impl CoreExecutor for HealthProbeNoopExecutor {
+    async fn apply(
+        &mut self,
+        run_id: RunId,
+        primitive: RunPrimitive,
+    ) -> Result<CoreApplyOutput, CoreExecutorError> {
+        Ok(CoreApplyOutput::with_untyped_snapshot(
+            RunBoundaryReceiptDraft {
+                run_id,
+                boundary: RunApplyBoundary::RunStart,
+                contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                conversation_digest: None,
+                message_count: 0,
+            },
+            None,
+            None,
+        ))
+    }
+
+    async fn cancel_after_boundary(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn stop_runtime_executor(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+}
+
+fn persistent_health_probe_machine() -> Arc<MeerkatMachine> {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    Arc::new(MeerkatMachine::persistent(store, memory_blob_store()))
+}
+
+#[tokio::test]
+async fn reload_required_session_count_tracks_the_real_durability_gate() {
+    let machine = persistent_health_probe_machine();
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register persistent session");
+
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(0),
+        "a registered persistent session whose cold install published readiness \
+         owes nothing"
+    );
+
+    // Degrade the exact shared gate the persistent driver degrades. No
+    // fabricated store outcome and no hand-built handle: this is the seam the
+    // cancellation batteries use to inject a real ReloadRequired.
+    assert!(
+        machine
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await,
+        "the seam must perform the Ready -> ReloadRequired transition"
+    );
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(1),
+        "a session that may no longer execute against durable state must be \
+         counted, or the endpoint reporting it is decorative"
+    );
+}
+
+#[tokio::test]
+async fn reload_required_session_count_never_counts_a_storeless_session() {
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register storeless session");
+
+    assert!(
+        machine
+            .session_durability_health(&session_id)
+            .await
+            .expect("registered session")
+            .is_none(),
+        "the fixture is only meaningful if this session genuinely has no gate"
+    );
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(0),
+        "a session with no durability contract cannot violate one; counting it \
+         would leave every ephemeral host permanently amber"
+    );
+    assert!(
+        !machine
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await,
+        "there is no gate here to degrade"
+    );
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(0),
+        "and nothing about a storeless session can move this number"
+    );
+}
+
+/// A dead runtime loop is invisible to every other read path on the machine: an
+/// idle session and a session whose executor task is gone look identical. This
+/// pins the difference against a real spawned loop.
+///
+/// The corpse is made durable rather than transient on purpose. Killing a loop
+/// normally wakes the teardown watcher, which retires the shell - that is the
+/// system working. The state worth detecting is the one the watcher *cannot*
+/// clear: `observe_runtime_loop_teardown` refuses a session whose durability
+/// gate demands a cold reload and logs "retained for retry", leaving a
+/// registered session pointing at a dead loop indefinitely. That is a real
+/// production wedge, and until now nothing could see it.
+#[tokio::test]
+async fn dead_runtime_loop_session_count_sees_a_real_corpse_and_not_a_clean_shutdown() {
+    let machine = persistent_health_probe_machine();
+    let session_id = SessionId::new();
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    machine
+        .ensure_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+
+    assert_eq!(
+        machine.dead_runtime_loop_session_count(),
+        Some(0),
+        "a session with a live spawned runtime loop is not a corpse"
+    );
+
+    // Block the teardown watcher through a real refusal, then prove the
+    // refusal alone is not what this accessor counts.
+    assert!(
+        machine
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await,
+        "the fixture needs a genuinely degraded durability gate"
+    );
+    assert_eq!(
+        machine.dead_runtime_loop_session_count(),
+        Some(0),
+        "a degraded durability gate is a different dimension; this accessor \
+         must not borrow its verdict"
+    );
+
+    // Kill the task WITHOUT touching the slot. The entry keeps its channels and
+    // its join handle, which is what makes this a corpse rather than a
+    // hand-built fixture.
+    {
+        let mut sessions = machine.sessions.write().await;
+        let entry = sessions
+            .get_mut(&session_id)
+            .expect("registered session entry");
+        match &entry.attachment_slot {
+            RuntimeLoopAttachmentSlot::Pending(attachment)
+            | RuntimeLoopAttachmentSlot::Attached(attachment) => attachment.loop_handle.abort(),
+            RuntimeLoopAttachmentSlot::Empty => {
+                panic!("the fixture must have attached a real runtime loop")
+            }
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let sessions = machine.sessions.read().await;
+                let entry = sessions
+                    .get(&session_id)
+                    .expect("teardown must not remove a reload-required entry");
+                let finished = match &entry.attachment_slot {
+                    RuntimeLoopAttachmentSlot::Pending(attachment)
+                    | RuntimeLoopAttachmentSlot::Attached(attachment) => {
+                        attachment.loop_handle.is_finished()
+                    }
+                    RuntimeLoopAttachmentSlot::Empty => {
+                        panic!("blocked teardown must leave the dead shell in place")
+                    }
+                };
+                if finished {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the aborted loop task must actually finish");
+
+    assert_eq!(
+        machine.dead_runtime_loop_session_count(),
+        Some(1),
+        "a registered session still claiming a dead runtime loop is exactly \
+         what this accessor exists to report"
+    );
+
+    // The deliberate failure direction, pinned. Stage B asks the generated
+    // authority whether it still claims this shell, and a caller that must not
+    // park can be refused. On a shell that is ALREADY dead, that refusal is
+    // itself suspicious - it is what a wedged holder of the authority looks
+    // like from outside - so it counts rather than disappears.
+    {
+        let authority = {
+            let sessions = machine.sessions.read().await;
+            Arc::clone(
+                &sessions
+                    .get(&session_id)
+                    .expect("registered session entry")
+                    .dsl_authority,
+            )
+        };
+        // Nothing below awaits, so this synchronous guard cannot be held across
+        // a suspension point and cannot deadlock the probe it is testing.
+        let held = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            machine.dead_runtime_loop_session_count(),
+            Some(1),
+            "an unreadable authority on an already-dead shell must count as \
+             suspect, not vanish"
+        );
+        drop(held);
+    }
+
+    // Negative pin: a clean shutdown empties the slot, so an orderly stop must
+    // not read as an incident. Without this, the accessor could count every
+    // shutting-down session and cry wolf on ordinary lifecycle traffic.
+    let clean = persistent_health_probe_machine();
+    let clean_session = SessionId::new();
+    clean
+        .prepare_bindings(clean_session.clone())
+        .await
+        .expect("bindings should prepare");
+    clean
+        .ensure_session_with_executor(clean_session.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+    clean
+        .unregister_session(&clean_session)
+        .await
+        .expect("orderly unregister");
+    assert_eq!(
+        clean.dead_runtime_loop_session_count(),
+        Some(0),
+        "a session torn down properly leaves no corpse behind"
+    );
+}
+
+/// `None` is the load-bearing half of both signatures, so it is pinned against
+/// the real condition it names rather than left as a documented intention.
+///
+/// A health caller must be able to tell "no sessions are in this state" from "I
+/// could not look", and this proves the accessors do make that distinction:
+/// with a registered session that would otherwise report a count, an
+/// unavailable registry yields `None` and not `Some(0)`. Publishing `Some(0)`
+/// here would be a health claim derived from a reading that never happened.
+#[tokio::test]
+async fn health_probes_answer_none_when_the_session_registry_cannot_be_read() {
+    let machine = persistent_health_probe_machine();
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register persistent session");
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(0),
+        "the fixture is only meaningful if this machine answers when readable"
+    );
+    assert_eq!(
+        machine.dead_runtime_loop_session_count(),
+        Some(0),
+        "the fixture is only meaningful if this machine answers when readable"
+    );
+
+    // Hold the registry the way a writer mid-mutation holds it. Nothing below
+    // awaits while the guard is alive, and both accessors are synchronous
+    // non-blocking reads, so this cannot deadlock the probes it is testing -
+    // which is itself the property that lets a health scrape survive a wedged
+    // holder instead of joining it.
+    let registry_guard = machine.sessions.write().await;
+    assert_eq!(
+        machine.reload_required_session_count(),
+        None,
+        "an unreadable registry is not an empty registry"
+    );
+    assert_eq!(
+        machine.dead_runtime_loop_session_count(),
+        None,
+        "an unreadable registry is not an empty registry"
+    );
+    drop(registry_guard);
+
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(0),
+        "and the refusal is per-probe, not sticky: it clears the moment the \
+         registry is readable again"
+    );
+    assert_eq!(
+        machine.dead_runtime_loop_session_count(),
+        Some(0),
+        "and the refusal is per-probe, not sticky: it clears the moment the \
+         registry is readable again"
+    );
+}

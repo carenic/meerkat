@@ -4256,6 +4256,110 @@ impl RuntimeSessionEntry {
         )
     }
 
+    /// [`Self::generated_executor_registration_active`], asked by a caller that
+    /// is not allowed to park.
+    ///
+    /// `None` means the authority could not be read right now. That is a fact
+    /// about the observation, not about the session, and the caller decides
+    /// what to do with it. A plain `lock()` here would let a session wedged
+    /// while holding this authority wedge its observer too, which is exactly
+    /// the failure the health probe exists to report rather than join; the same
+    /// reasoning as `run_progress.rs`'s `try_lock` on this authority.
+    ///
+    /// A poisoned authority is read through rather than treated as unreadable:
+    /// the registration phase behind it is still the last value some panicking
+    /// writer left, and dropping the reading is the silent direction.
+    fn try_generated_executor_registration_active(&self) -> Option<bool> {
+        let authority = match self.dsl_authority.try_lock() {
+            Ok(authority) => authority,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(matches!(
+            authority.state().registration_phase,
+            dsl::RegistrationPhase::Active
+        ))
+    }
+
+    /// True when this entry's runtime loop is a corpse: generated registration
+    /// still claims a live executor, but the shell backing it cannot run.
+    ///
+    /// Stage A (below) is deliberately lock-free. A session that is RUNNING -
+    /// however busy, however deep in a turn - fails the slot/channel/join test
+    /// without touching a single per-entry mutex, so load alone can never make
+    /// it a candidate. That is what keeps this probe from crying wolf under
+    /// contention, and it is a structural property rather than a tuning choice.
+    ///
+    /// What load does not cover, stated plainly rather than claimed away:
+    /// **ordinary teardown reaches Stage A too.** When a session shuts down
+    /// normally the loop task exits, its receivers drop, the channels report
+    /// closed and the join handle reports finished - which is the same
+    /// observation a corpse produces, because it is the same underlying fact.
+    /// Stage A cannot separate them and does not try. Stage B is what separates
+    /// them, by asking the one remaining question: does anything still claim
+    /// this dead shell? A completed teardown answers no. A scrape that lands
+    /// inside the teardown window, after the task has exited but before the
+    /// teardown watcher has cleared the registration, is answered yes and is
+    /// counted. That reading is wrong, it is bounded by the width of that
+    /// window, it is published at `Degraded` rather than `Unhealthy`, and it
+    /// clears on the next scrape. The alternative - suppressing the count until
+    /// some settling delay elapses - would trade a self-clearing amber blip for
+    /// a probe that goes quiet exactly when a shell stays dead.
+    fn runtime_loop_is_dead_shell(&self) -> bool {
+        // Stage A: no locks. An empty slot is not a corpse even under `Active`
+        // registration; that is the legitimate pre-spawn state that
+        // `generated_executor_registration_has_viable_attachment` also admits.
+        let dead_shell = match &self.attachment_slot {
+            RuntimeLoopAttachmentSlot::Pending(attachment)
+            | RuntimeLoopAttachmentSlot::Attached(attachment) => {
+                attachment.wake_tx.is_closed()
+                    || attachment.effect_tx.is_closed()
+                    || attachment.loop_handle.is_finished()
+            }
+            RuntimeLoopAttachmentSlot::Empty => false,
+        };
+        if !dead_shell {
+            return false;
+        }
+        // Stage B, candidates only.
+        //   Some(true)  -> registration still claims this dead shell: a corpse.
+        //   Some(false) -> teardown already owns it; not an incident.
+        //   None        -> the authority could not be read.
+        //
+        // Why `None` counts, rather than propagating an unreadable the way the
+        // session-registry read above this does. The two look like the same
+        // situation and are not.
+        //
+        // Stage A ALREADY ESTABLISHED THE FAULT, and established it without
+        // taking a lock: this shell cannot run. That observation does not
+        // depend on the authority read and is not in doubt here. So counting a
+        // `None` is not the "assert a fault nobody observed" move that the
+        // `Unreadable` vocabulary exists to prevent one layer up - the fault
+        // was observed, lock-free, before this line was reached. The only thing
+        // left unresolved is the narrower question of whether anything still
+        // claims the corpse.
+        //
+        // Given that, the direction is chosen rather than defaulted.
+        // `unwrap_or(false)` would drop precisely the reading that a wedged
+        // holder of this authority denies us, on a session whose loop is
+        // already dead - which is the exact shape of the incident this probe
+        // was added to make visible, silently discarded. `unwrap_or(true)`
+        // over-counts instead, in the same bounded way the teardown window
+        // described on this function's doc over-counts: `Degraded`, per scrape,
+        // self-clearing.
+        //
+        // And propagating unreadable from HERE would be strictly worse than
+        // either. This is a per-ENTRY lock miss inside a fold over every
+        // registered session; turning it into a whole-dimension `Unreadable`
+        // would let one uncooperative entry blank the reading for every other
+        // session on the host, at the moment a wedged holder exists - i.e. the
+        // dimension would go dark exactly when it matters. The registry read in
+        // `dead_runtime_loop_session_count` propagates unreadable because it
+        // loses the WHOLE population; this loses one entry's tiebreak.
+        self.try_generated_executor_registration_active()
+            .unwrap_or(true)
+    }
+
     fn generated_executor_registration_has_viable_attachment(&self) -> bool {
         self.generated_executor_registration_active()
             && match &self.attachment_slot {
@@ -4613,6 +4717,74 @@ impl RuntimeSessionEntry {
 }
 
 impl MeerkatMachine {
+    /// How many registered sessions currently refuse execution because their
+    /// durability gate demands a cold reload.
+    ///
+    /// `None` means the session registry could not be read at the moment of the
+    /// probe, which is a fact about the observation and not about the host. A
+    /// caller that publishes health must not translate it into a number, and
+    /// must not let it read as "nobody looked at this dimension" either: this
+    /// probe *did* run and *did* fail to observe, which is its own fact and one
+    /// that leaves the caller with no basis for reporting the host healthy.
+    ///
+    /// Two failure directions are chosen deliberately, in opposite directions,
+    /// and both are load-bearing:
+    ///
+    /// - **Storeless sessions are never counted.** They carry no durability
+    ///   contract, so there is nothing about them this number could be wrong
+    ///   about. Counting them would make an ephemeral host permanently amber.
+    /// - **A poisoned gate is read through, not skipped.** `require_ready`
+    ///   absorbs poison with `into_inner`; a session whose durability state was
+    ///   last written by a panicking task is exactly the session an operator
+    ///   wants counted.
+    ///
+    /// `n > 0` is `Degraded`, not `Unhealthy`: a reload-required session is
+    /// fenced and recoverable by a cold install, and the host still serves
+    /// every other session.
+    ///
+    /// Not `async` on purpose. Every lock this touches is a non-blocking try or
+    /// a short synchronous one, so the signature itself proves the probe cannot
+    /// park behind the wedge it is trying to report.
+    pub fn reload_required_session_count(&self) -> Option<usize> {
+        let sessions = self.sessions.try_read().ok()?;
+        Some(
+            sessions
+                .values()
+                .filter(|entry| {
+                    entry
+                        .durability_health
+                        .as_ref()
+                        .is_some_and(|health| health.require_ready().is_err())
+                })
+                .count(),
+        )
+    }
+
+    /// How many registered sessions still claim a runtime loop that is dead.
+    ///
+    /// A dead loop is indistinguishable from an idle one to every other read
+    /// path on this type, which is why this exists: without it, a session whose
+    /// executor task is gone looks exactly like a quiet healthy session.
+    ///
+    /// `None` carries the same meaning and the same obligation as on
+    /// [`Self::reload_required_session_count`]: the registry was not readable,
+    /// so a health caller must publish that failed read as such rather than
+    /// publish a zero or stay silent.
+    ///
+    /// See [`RuntimeSessionEntry::runtime_loop_is_dead_shell`] for why the
+    /// healthy path is lock-free and the candidate path uses `try_lock`.
+    ///
+    /// Not `async` on purpose, for the same reason as its sibling.
+    pub fn dead_runtime_loop_session_count(&self) -> Option<usize> {
+        let sessions = self.sessions.try_read().ok()?;
+        Some(
+            sessions
+                .values()
+                .filter(|entry| entry.runtime_loop_is_dead_shell())
+                .count(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) async fn model_routing_handle_for_test(
         &self,

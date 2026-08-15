@@ -76,6 +76,11 @@ tokio-tungstenite = "0.28"
 meerkat-comms = { workspace = true }
 meerkat-mcp = { workspace = true, features = ["test-support"] }
 meerkat-mob = { workspace = true, features = ["test-support"] }
+# `runtime/health` publishes a `session_durability` check computed from live
+# runtime state. Proving that a degraded session actually turns that check
+# amber needs the machine's deterministic degradation seam, which is
+# test-support-gated so it cannot exist in a shipped binary.
+meerkat-runtime = { workspace = true, features = ["test-support"] }
 
 [package.metadata.cargo-machete]
 ignored = [
