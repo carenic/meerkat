@@ -41,6 +41,22 @@ via cargo-semver-checks against the published baselines).
   cannot have its metadata decoded by a pre-0.8.23 binary, so that session is
   unresumable there until the binary is upgraded.
 
+### Known issues
+
+- An input that exhausts its staging attempts is durably terminalized as
+  `Abandoned { MaxAttemptsExhausted }`, but on the mob side a DIRECTED
+  interaction for that input stays Pending for the life of the process. The
+  runtime store and the mob disagree, and only a restart reconciles them. The
+  terminal is observable in durable input rows and through completion waiters;
+  it does not reach the event stream, so a host that watches events rather than
+  tailing logs learns nothing.
+  A fix was written for this release and withdrawn. It was correct about the
+  diagnosis and wrong about the risk: the repair could convert this silent,
+  single-interaction stall into a stopped runtime loop taking out every session
+  on that runtime, on a path no test exercised. A wider blast radius than the
+  defect is not an improvement, so the change waits for 0.8.24 rather than
+  shipping on a deadline.
+
 ### Fixed
 
 - A failed turn no longer silently disarms a member. When a turn failed, its
