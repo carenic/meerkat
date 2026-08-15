@@ -71,19 +71,41 @@ via cargo-semver-checks against the published baselines).
 
 ### Known issues
 
-- An input that exhausts its staging attempts is durably terminalized as
-  `Abandoned { MaxAttemptsExhausted }`, but on the mob side a DIRECTED
-  interaction for that input stays Pending for the life of the process. The
-  runtime store and the mob disagree, and only a restart reconciles them. The
-  terminal is observable in durable input rows and through completion waiters;
-  it does not reach the event stream, so a host that watches events rather than
-  tailing logs learns nothing.
-  A fix was written for this release and withdrawn. It was correct about the
-  diagnosis and wrong about the risk: the repair could convert this silent,
-  single-interaction stall into a stopped runtime loop taking out every session
-  on that runtime, on a path no test exercised. A wider blast radius than the
-  defect is not an improvement, so the change waits for 0.8.24 rather than
-  shipping on a deadline.
+- An input REFUSED STAGING until it exhausts its attempt budget is durably
+  terminalized as `Abandoned { MaxAttemptsExhausted }`, and that terminal is
+  never delivered anywhere in typed form. The waiter receives a mechanical
+  "authority unavailable" string naming neither abandonment nor attempts, and
+  the mob's directed-turn watcher correctly treats that as plumbing noise and
+  records nothing. The refusal terminalizes the WHOLE batch, so innocent
+  sibling inputs are abandoned alongside the culpable one.
+  Three costs, none of them a hang. A directed flow step fails after its
+  30-second step timeout with `FlowTurnTimedOut` instead of failing at once
+  with an abandonment reason, so the failure is misattributed rather than
+  stalled. The mob's tracked-turn journal keeps a Pending row that **a restart
+  does NOT clear** (recovery requires a `Consumed` terminal and this row is
+  `Abandoned`). And one `runtime_input_states` row per affected input retains
+  its full ingress payload permanently: never archived, never retired, and
+  invisible to the sweep that would otherwise find it. The storage growth is
+  the only cost that compounds.
+  Reachability is believed very low. Provider flakiness, tool errors and model
+  failures do NOT consume the staging budget; only a staging refusal does, and
+  the commit that introduced this path also removed the only refusal cause ever
+  observed in the field. Every remaining refusal predicate was checked against
+  the shipped tree without finding a reachable one, which is exhaustion of a
+  predicate set rather than a proof. If a refusal does occur it reaches the cap
+  within a single wake, since the laps carry no backoff.
+  Operators can measure it directly. `"generated staging authority refused an
+  accepted input batch"` is the denominator, `"queued input refused by
+  generated staging authority; deferred behind the backlog"` is a survivable
+  deferral, and `"queued input abandoned after generated max stage attempts of
+  refused staging"` means this defect fired.
+  A fix was written for this release and withdrawn twice. The diagnosis was
+  right; both repairs were not. The second could convert a bounded
+  misattribution into a stopped runtime loop taking out every session on that
+  runtime, on a path no test exercised. A wider blast radius than the defect is
+  not an improvement. The full fix also needs a migration for rows already
+  committed, which are invisible to every sweep that could reach them, so it
+  waits for 0.8.24 rather than shipping on a deadline.
 
 ### Fixed
 
