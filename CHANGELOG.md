@@ -35,11 +35,35 @@ via cargo-semver-checks against the published baselines).
   `CommsRuntimeError::InprocRegistrationRejected` where it used to get a working
   runtime. This is the intended fix, and it is a behaviour break.
 - `meerkat_core::ops::ToolAccessPolicy` gains a `ReadOnly` variant. The enum is
-  not `#[non_exhaustive]`, so exhaustive matches break. It is also serde-closed
-  and persisted in durable session metadata, which carries a forward-compat
-  consequence worth planning around: a session launched with read-only intent
-  cannot have its metadata decoded by a pre-0.8.23 binary, so that session is
-  unresumable there until the binary is upgraded. The wire mirrors
+  not `#[non_exhaustive]`, so exhaustive matches break.
+  **READ THIS BEFORE ENABLING READ-ONLY ANYWHERE: it makes rollback one-way for
+  the sessions it touches.** Stated as a precondition rather than a footnote,
+  because the trigger is a one-line config change that reads as trivially
+  reversible and is not.
+  - **Trigger.** Setting `read_only: true` on a mob profile's tool config
+    (`MobToolConfigInput.read_only`, `PortableToolConfig.read_only`) resolves
+    that member's policy to `ReadOnly` at build time. It is a floor, not a
+    default: a read-only profile REPLACES whatever the spawn site asked for
+    rather than being overridden by it, so every member built from that profile
+    acquires the marker. The RPC session-create and fork paths accept it
+    directly as well.
+  - **Sticky.** The policy is persisted RESOLVED into
+    `SessionMetadata.tooling.tool_access_policy` when the session is created.
+    Turning the profile flag back off changes what NEW sessions get; it does not
+    rewrite metadata already written. The property is "ever carried", not
+    "currently carries".
+  - **Blast radius is per session, not per fleet.** A partial rollout leaves a
+    mixed estate in which some sessions are pinned forward and others are not,
+    and the pinned ones are exactly those a read-only profile touched.
+  - **You can ask rather than infer.** The marker is a field on the persisted
+    session metadata document, so a host can query its own session store for a
+    non-null `tooling.tool_access_policy` to enumerate which sessions have
+    walked through the door. Do that before planning a downgrade rather than
+    reconstructing it from deployment history.
+  - Failing to decode is the INTENDED outcome. A downgrade that silently read
+    the marker as `Inherit` would drop the enforcement, which is worse than
+    refusing to resume.
+  The wire mirrors
   `meerkat_contracts::WireToolAccessPolicy` and `WireResolvedToolAccessPolicy`
   gain the same variant.
 - `meerkat_mob::MobEventKind` gains `SupervisorEscalationFailed`. The enum is not
