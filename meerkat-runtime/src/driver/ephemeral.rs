@@ -2846,7 +2846,26 @@ impl EphemeralRuntimeDriver {
         &mut self,
         input_ids: &[InputId],
     ) -> Result<Vec<InputId>, RuntimeDriverError> {
-        let mut abandoned = Vec::new();
+        // ALL-OR-NOTHING PRECONDITION.
+        //
+        // The disposition below is applied to the WHOLE batch, and one member
+        // can be unresolvable while its siblings are perfectly healthy. Applied
+        // member-by-member, a batch of [healthy-at-cap, corrupt] abandons the
+        // HEALTHY input and only then errors on the corrupt one - so a corrupt
+        // sibling costs a legitimate input its work, and the loss is durable
+        // while the error is not.
+        //
+        // A healthy row really can sit at the cap: `RecoverInputLifecycle`
+        // restores `input_attempt_counts` absolutely from the persisted seed
+        // with no cap bound on a Queued row, so a restart can hand this loop a
+        // member one refusal away from terminalization.
+        //
+        // So every member is verified BEFORE any member is applied. If any
+        // member fails, nothing is applied and the existing typed error stands.
+        // The failure mode becomes a stuck member with an explicit error naming
+        // the input - visible, and clearable by an operator - instead of a
+        // silent abandonment of work nobody asked to lose.
+        let mut resolvable = Vec::with_capacity(input_ids.len());
         for input_id in input_ids {
             // Skip anything the machine already resolved out of the queued
             // world (terminalized, or staged by a concurrent path). This is a
@@ -2872,6 +2891,11 @@ impl EphemeralRuntimeDriver {
                     "generated recovery lane missing for unstageable queued input '{input_id}'"
                 ))
             })?;
+            resolvable.push((input_id, lane));
+        }
+
+        let mut abandoned = Vec::new();
+        for (input_id, lane) in resolvable {
             self.dsl_apply(
                 mm_dsl::MeerkatMachineInput::ResolveUnstageableQueuedInput {
                     input_id: Self::dsl_key(input_id),
@@ -2891,7 +2915,14 @@ impl EphemeralRuntimeDriver {
                 }
                 InputLifecycleState::Abandoned => {
                     let attempts = self.input_attempt_count(input_id);
-                    tracing::warn!(
+                    // ERROR, not WARN: this is durable work loss, and the log
+                    // is the only channel that carries it. The typed
+                    // `InputLifecycleEvent::Abandoned` pushed below goes into
+                    // `self.events`, whose only `drain_events` caller in the
+                    // workspace is a unit test, and the waiter receives a
+                    // stringly `AuthorityUnavailable` that consumers correctly
+                    // read as plumbing noise rather than a terminal fact.
+                    tracing::error!(
                         input_id = %input_id,
                         attempts,
                         "queued input abandoned after generated max stage attempts of refused staging"
