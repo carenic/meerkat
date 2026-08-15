@@ -20,6 +20,42 @@ via cargo-semver-checks against the published baselines).
   `meerkat-mob/atif`). Hosts that referenced `meerkat::atif` or
   `meerkat_mob::atif` must enable the feature; `rkat` and `rkat-rpc` depend on
   `meerkat-atif` directly and are unaffected.
+- `meerkat_sqlite::SqliteStoreError` gains a `WalConversionContended` variant.
+  The enum is not `#[non_exhaustive]`, so a downstream matching it exhaustively
+  must add an arm. It is returned where an exhausted WAL-conversion retry
+  budget previously surfaced as a bare rusqlite "database is locked".
+
+### Fixed
+
+- A failed turn no longer silently disarms a member. When a turn failed, its
+  staged input was rolled back to queued and nothing re-armed the runtime loop:
+  the input was immediately selectable again and nobody ever took the next lap,
+  so it sat until unrelated traffic happened to wake the loop, or forever. The
+  loop can no longer park while machine-owned lane truth still holds selectable
+  queued work, which makes returning work to a lane inseparable from coming back
+  for it. Consequence worth planning for: the shell was under-delivering the
+  machine's declared `max_stage_attempts = 3`, effectively granting one attempt.
+  A persistently failing turn now issues up to three applies and then
+  terminalizes as `Abandoned { MaxAttemptsExhausted }` rather than going quiet.
+- An accepted input can no longer be starved indefinitely behind a backlog: a
+  refused head is re-minted behind the queue with its attempt counted, and the
+  attempt budget ends in a typed terminal rather than an unbounded retry.
+- A provider-authored cache breakpoint that cannot bind to the committed
+  transcript head no longer kills the turn. The unbindable claim is discarded
+  and reported; the turn proceeds. Previously this failed the whole turn with an
+  internal error, which is how a live member could wedge on every attempt.
+- Synthetic notice refresh no longer refuses beside an audited transcript
+  prefix. The guard tested whether any audited row was touched by scanning the
+  whole prefix; it now tests whether the lowest mutated index actually falls
+  inside it.
+- In-process comms registration is identity-keyed, so a second registration
+  under a name another identity holds is a typed `NameOccupied` rejection
+  instead of silently displacing the incumbent. A generation rebinding its own
+  name is still allowed and now reports that it superseded a predecessor.
+- A durable read-write SQLite store can no longer be opened non-WAL without
+  failing closed. `JournalPolicy` states per profile whether an open establishes
+  WAL or preserves the mode it finds, so a profile added later must choose
+  rather than inherit the answer from the shape of a match arm.
 
 ### Changed
 
@@ -42,6 +78,12 @@ via cargo-semver-checks against the published baselines).
   and an existing session with an empty durable log exports an empty trajectory
   that names the session. A genuinely missing session still fails with
   `SESSION_NOT_FOUND`.
+- Mob run accounting reports missing usage as missing. A member whose usage
+  could not be read contributes `usage_unavailable` naming the reason, and the
+  run carries `members_usage_unavailable`, so a total is a documented floor
+  rather than a number quietly short by however many members failed to report.
+- Event rows carry the model and provider that produced them, so a session
+  whose model changed mid-run can be attributed per turn instead of per session.
 
 ### Added
 
@@ -55,6 +97,29 @@ via cargo-semver-checks against the published baselines).
   (`handle_export_atif_bounded`, `AtifExportBounds`) is `#[doc(hidden)]`
   test-facing surface, not a supported way to serve `session/export_atif`;
   `handle_export_atif` is the wire path and supplies the host bounds.
+- `meerkat_runtime::submit_bounded` and its outcome vocabulary
+  (`BoundedSubmitOutcome`, `BoundedSubmission`, `BoundedSubmitReport`,
+  `SubmitBound`, `DEFAULT_SUBMIT_BOUND`, `SubmitRefusal`, `SubmitTimeoutCause`,
+  `SubmitTimeoutDisposition`, `SubmitUnknownCause`, `AdmissionDurability`,
+  `AdmittedWorkState`): a submit that cannot wait forever. The caller supplies
+  the bound (there is no unbounded variant), and every path lands on a typed
+  outcome: durable acceptance, a typed refusal, or a timeout that states
+  whether the work is durably queued or its fate is unknown. Admission collapses
+  on the idempotency key at the durable admission point, so a bounded submit
+  retried after a timeout cannot become two deliveries.
+- `AgentEvent::ProviderCacheBreakpointsDiscarded`: the session event stream now
+  reports discarded provider cache breakpoints, distinguishing claims inherited
+  from a fork from claims authored this turn. Present in the wire catalog and
+  all three SDK event inventories.
+- `meerkat_sqlite::JournalPolicy` and `ConnectionProfile::journal_policy()`:
+  whether an open establishes WAL or preserves the mode it finds is now stated
+  per profile rather than implied by a match arm.
+- Read-only tool enforcement is first-class: `ToolExecutionPolicy` gates at the
+  call level while preserving the tool list, so a denied call is an ordinary
+  `access_denied` tool error in the transcript rather than a vanished tool. It
+  fails closed on tools whose mutation class is unknown. The boundary is
+  documented explicitly: a read-only launch is only truthful when the host also
+  disables provider-native tool capabilities.
 
 ## [0.8.22] - 2026-08-09
 
