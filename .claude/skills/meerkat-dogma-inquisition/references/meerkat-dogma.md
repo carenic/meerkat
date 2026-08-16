@@ -281,6 +281,88 @@ Faults that affect semantics must be modeled or fail closed. This includes:
 - cascading failure across seams
 - test-mode behavior that differs from production semantics
 
+Fail closed on semantics. Degrade on accounting.
+
+"Modeled or fail closed" is a requirement about faults that affect SEMANTICS.
+It is not a licence to refuse on facts that do not. Refusing work that is
+already correct, over a fact that does not change what is true, is its own
+Rule 8 violation: it reports failure for an execution that succeeded, which is
+"success means truthful completion" read backwards.
+
+A fault must fail closed when the fact it concerns is semantic:
+
+- what the model said, and what the committed transcript contains
+- which tools ran, and with what arguments
+- what was durably committed, and whether that evidence is provable
+- who holds authority, and whether a transition is legal
+- whether declared authority was exercised, such as a hook verdict
+- what a set of bytes means, when we cannot authenticate the claim
+
+A fault must degrade when the fact it concerns is accounting, observability, or
+advisory: token counts and billing attribution, cache breakpoints and other
+optimization artifacts, telemetry, provider metadata, derived counters, and
+rebuildable projections. Billing metadata is not a domain model. An artifact
+about the transcript is not the transcript.
+
+THE OPERATIONAL TEST, when classification is contested: ASK WHETHER THE CALLER
+HAS AN ACTION THAT CLEARS THE REFUSAL. If none exists, the refusal is not a
+verdict the caller can act on; it is a dead end wearing a verdict's clothes.
+A member that is briefly "attached" cannot be made less attached by the caller
+asking it to stop, so refusing the stop strands them. This test is easier to
+apply at review time than classifying the fact, and it usually agrees.
+
+Three clauses govern, and all three must hold.
+
+CLASSIFY THE FACT, NOT THE SITE. The question is never "did something fail
+here" but "what does this fault make untrue". If the answer is "a number
+nobody's correctness depends on", it may not terminalize work that is already
+correct. Two faults in the same function may have opposite correct verdicts.
+
+BLAST RADIUS MAY NOT EXCEED THE FACT'S SCOPE. A per-record fault refuses that
+record, not the collection. A per-artifact fault refuses that artifact, not the
+turn. A per-realm fault refuses that realm, not the inventory. The carve-out is
+exact and must be quoted whenever this clause is applied: degrade is legitimate
+for a collection whose members are independent, and illegitimate for a
+collection whose MEMBERSHIP is the fact being witnessed, because dropping a
+member there mints false absence. An exact-set witness, such as a recovery
+input set deciding whether queued user work is redelivered, is refused whole or
+not at all.
+
+ABSENCE MUST BE REPRESENTABLE, NEVER SUBSTITUTED. A degrade that fabricates the
+missing value is worse than the refusal it replaces, because it converts "no
+answer" into "a wrong answer that looks right". A zero token count, a saturated
+message count, an assumed identity, and a reported identity silently rewritten
+to the expected one are all forbidden. Where two sources disagree, the
+disagreement is the fact: record it as disputed, and do not elect a winner. If
+the type cannot express "unmeasured", the degrade is not implementable until it
+can, and widening the type is the first task, not an afterthought. A degraded
+value must not advance an axis that enforcement reads: an unmeasured turn does
+not move the budget.
+
+Every degrade carries a typed marker on the outcome it degrades, visible on the
+wire and to the operator. The vocabulary is fixed: UNMEASURED means nobody
+produced the observation, UNREADABLE means an attempt was made and returned
+nothing, DISPUTED means two sources disagree and neither was elected, and
+DISCARDED means a named artifact was dropped and the work continued without it.
+None of these is a claim of health. The marker rides a typed carrier on the
+outcome. A tracing log is not a marker, a string prefix is not a typed carrier
+outside a presentation projection, and a new bespoke event per degrade is
+carrier proliferation that Rule 9 forbids: extend the advisory carrier the
+outcome already owns, and let the domain reason enums stay domain-specific.
+
+A degrade is a behavioural contract, so it is tested as one. The negative test
+required of fail-closed rejection machinery has a mirror here: feed the
+triggering fact, then assert both that the work completes AND that it carries
+the marker. A test asserting only completion certifies a silent degrade, which
+is the failure this section exists to prevent.
+
+Where a degrade is correct, the guard that refuses is not always the fix site.
+If a correct fail-closed guard strands a user, the defect may be downstream of
+it: an error that lost its type at a reporting seam, a failure observed and
+reported to no one, or an entry never evicted. Relaxing a semantic guard to
+unstick a reporting defect reintroduces the confusion the guard exists to
+prevent.
+
 Batching must preserve causality without inventing consensus. Transcript
 interaction, run, and objective identities are merged independently; agreement
 on one field survives disagreement on another. A conflicting field remains
@@ -384,6 +466,15 @@ Reject these during review:
 - compatibility mirrors introduced without Highest Dogma Authority approval
 - compatibility mirrors without date or version expiry
 - compatibility paths that can still affect meaning
+- terminalizing a completed execution on an accounting, telemetry, or
+  optimization-artifact fault
+- a collection read that propagates a per-record refusal to the whole
+  collection, outside an exact-set witness
+- a degrade that substitutes a fabricated value for an absent one, or that
+  advances an enforcement axis from a degraded reading
+- a degrade whose only trace is a log line, rather than a typed marker on the
+  outcome it degraded
+- a refusal the caller has no action to clear
 
 ## Final Test
 
