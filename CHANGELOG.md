@@ -156,6 +156,29 @@ checks that this section EXISTS, not that it covers every break.**
   declares that no offline bridge recovers the domain at all. It exists
   because the same question was previously answered twice - once by the bridge
   and once by the message an operator reads - and the two disagreed.
+- Seven more externally-constructible structs gain fields, so any out-of-tree
+  struct literal must supply them. All are additive at the wire level; the
+  break is to Rust construction, and none of them appear in the
+  `cargo-semver-checks` summary in a form that names the owning type:
+  - `meerkat_mob::profile::ToolConfig` and
+    `meerkat_contracts::wire::WireMobToolConfig` gain `read_only: bool`. These
+    are the two the read-only entry below did NOT name; it named
+    `MobToolConfigInput` and `PortableToolConfig` only.
+  - `meerkat_mob::definition::FrameStepSpec`, `RepeatUntilSpec` and
+    `FlowStepSpec` gain `failure_policy: FlowNodeFailurePolicy`. Three structs,
+    not one.
+  - `meerkat_contracts::wire::WireMobRunResultEnvelope` gains
+    `accounting: Option<WireMobRunAccounting>`.
+  - `meerkat::PreV0810RealmBridgeReport` gains
+    `failures: Vec<PreV0810DomainBridgeFailure>`.
+- BEHAVIOUR-ONLY, NO TOOL WILL CATCH THIS, AND IT IS THE LIBRARY TWIN OF THE
+  CLI CHANGE BELOW: `meerkat::bridge_pre_0_8_10_realm_storage_in` still returns
+  `Ok(PreV0810RealmBridgeReport)` with an unchanged signature, but `Ok` NO
+  LONGER MEANS EVERY DOMAIN BRIDGED. The call attempts every domain and reports
+  per-domain refusals in the new `failures` field instead of returning `Err` on
+  the first one. A library caller that treated `Ok` as success now treats a
+  partial bridge as a complete one. Check `failures.is_empty()`, or the
+  `all_landed()` helper, rather than matching on `Ok`.
 
 ### Known issues
 
@@ -197,6 +220,27 @@ checks that this section EXISTS, not that it covers every break.**
 
 ### Fixed
 
+- **A compaction whose projection handoff was refused could not be persisted,
+  because the runtime epoch a session registered under was being overwritten at
+  placement time.** This is the lane the release was opened for, and it had no
+  entry here until a downstream reviewer pointed out that the headline fix was
+  the only one with no narrative.
+  The entry epoch is now a REGISTRATION-TIME FACT: it is installed when the
+  session registers and is never written by a placement arm, so a placement can
+  only assert the epoch it was registered with. The five placement guards moved
+  from "absent or equal" to exact equality against the registration. That
+  matters more than it sounds: under the old guard a caller passing `None`
+  satisfied the check and silently wedged the session, and the seam did exactly
+  that. Under exact equality the same caller gets an immediate typed rejection.
+  A silent wedge became a loud refusal.
+  A new machine-owned rejection effect carries that verdict to BOTH staging
+  sites. Previously it was dropped by a non-exhaustive effect read at one of
+  them, which is why the failure presented as a stuck session rather than an
+  error: the verdict existed and had nowhere to go.
+  **Wire-visible:** compaction failures of this shape now surface as
+  `CompactionFailureReason::projection_handoff_refused` rather than as a
+  generic failure, so a host can tell a refused handoff from an LLM or budget
+  failure without parsing a message string.
 - **`runtime/health` reported a healthy host on the strength of one job-backlog
   reading; it now measures three dimensions and states the one it does not.**
   The handler computed exactly one check, job delivery backlog, and reported
