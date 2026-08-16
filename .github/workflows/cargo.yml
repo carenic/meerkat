@@ -630,6 +630,42 @@ jobs:
             meerkat-machine-kernels/src/generated
           if-no-files-found: error
           retention-days: 1
+
+      # protocol-codegen emits a different artifact set than machine-codegen
+      # (handoff protocol helpers, terminal surface mapping, generated
+      # authority contracts) through a different renderer. Before this step
+      # nothing in a blocking lane re-rendered that set as a whole, so a stale
+      # committed artifact could ship. Both this check and the writer read the
+      # same emission set, so a newly added artifact is gated on arrival.
+      - name: Verify generated protocol artifacts are not stale
+        id: protocol_drift
+        shell: bash
+        run: |
+          if make protocol-check-drift; then
+            exit 0
+          fi
+          # Preserve the exact generated side of the failed comparison, same
+          # rationale as the machine-kernel drift step above.
+          make protocol-codegen
+          exit 1
+
+      - name: Upload fresh protocol artifacts after drift failure
+        if: ${{ failure() && steps.protocol_drift.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fresh-protocol-artifacts
+          # The six crates protocol-codegen emits into. Kept in sync with the
+          # emission set in xtask/src/protocol_codegen.rs; a missing directory
+          # fails the upload rather than silently shipping partial evidence.
+          path: |
+            meerkat-core/src/generated
+            meerkat-session/src/generated
+            meerkat-mob/src/generated
+            meerkat-mcp/src/generated
+            meerkat-runtime/src/generated
+            meerkat-workgraph/src/generated
+          if-no-files-found: error
+          retention-days: 1
       # check-rust-release-packaging dry-run-packages every release crate
       # (each `cargo package` compiles the crate in isolation) — ~1h on a
       # 4-core runner. It is release hygiene, re-verified by release_validate

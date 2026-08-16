@@ -15,16 +15,40 @@ use meerkat_machine_schema::{
 
 use crate::public_contracts::repo_root;
 
-/// Run protocol codegen: read all canonical compositions, generate Rust helpers
-/// for each declared `EffectHandoffProtocol`, plus the terminal surface mapping.
-pub fn run_protocol_codegen() -> Result<()> {
+/// One artifact emitted by protocol codegen: the committed destination and the
+/// rustfmt-normalized source that belongs there.
+#[derive(Debug)]
+pub struct GeneratedProtocolFile {
+    /// Absolute path of the committed artifact.
+    pub path: std::path::PathBuf,
+    /// Rendered, rustfmt-normalized source for that path.
+    pub contents: String,
+}
+
+/// THE canonical protocol-codegen emission set.
+///
+/// Both consumers read this one list: `run_protocol_codegen` writes it to
+/// disk, `check_protocol_codegen_drift` compares it against disk. Adding an
+/// emission here is the only way to emit one, so a new artifact is gated the
+/// moment it exists. A hand-maintained mirror of this set in the drift checker
+/// would let emission N+1 escape the gate; deriving both from this function
+/// makes that structurally impossible.
+pub fn protocol_emission_set() -> Result<Vec<GeneratedProtocolFile>> {
     let root = repo_root()?;
     let compositions = canonical_composition_schemas();
     let machines = canonical_machine_schemas();
     let machine_by_name: std::collections::BTreeMap<&str, &MachineSchema> =
         machines.iter().map(|m| (m.machine.as_str(), m)).collect();
 
-    let mut generated_count = 0;
+    let mut emitted: Vec<GeneratedProtocolFile> = Vec::new();
+
+    let mut push = |path: std::path::PathBuf, code: &str| -> Result<()> {
+        emitted.push(GeneratedProtocolFile {
+            path,
+            contents: rustfmt_source(code)?,
+        });
+        Ok(())
+    };
 
     for composition in &compositions {
         if composition.handoff_protocols.is_empty() {
@@ -44,126 +68,73 @@ pub fn run_protocol_codegen() -> Result<()> {
                 composition,
                 &machine_by_name,
             )?;
-            let code = rustfmt_source(&code)?;
-            let output_path = protocol_output_path(&root, protocol);
-
-            if let Some(parent) = output_path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("create dir {}", parent.display()))?;
-            }
-
-            fs::write(&output_path, &code)
-                .with_context(|| format!("write {}", output_path.display()))?;
-            println!("  generated: {}", output_path.display());
-            generated_count += 1;
+            push(protocol_output_path(&root, protocol), &code)?;
         }
     }
 
-    // Generate terminal surface mapping for MeerkatMachine turn outcomes.
-    let turn_machine = machine_by_name.get("MeerkatMachine");
-    if let Some(machine) = turn_machine {
+    // Terminal surface mapping for MeerkatMachine turn outcomes.
+    if let Some(machine) = machine_by_name.get("MeerkatMachine") {
         let code = generate_terminal_surface_mapping(machine)?;
-        let code = rustfmt_source(&code)?;
-        let output_path = root.join("meerkat-core/src/generated/terminal_surface_mapping.rs");
-        if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create dir {}", parent.display()))?;
-        }
-        fs::write(&output_path, &code)
-            .with_context(|| format!("write {}", output_path.display()))?;
-        println!("  generated: {}", output_path.display());
-        generated_count += 1;
+        push(
+            root.join("meerkat-core/src/generated/terminal_surface_mapping.rs"),
+            &code,
+        )?;
     }
 
     let code = generate_comms_trust_authority_sources(&compositions)?;
-    let code = rustfmt_source(&code)?;
-    let output_path = root.join("meerkat-core/src/generated/comms_trust_authority_sources.rs");
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
-    }
-    fs::write(&output_path, &code).with_context(|| format!("write {}", output_path.display()))?;
-    println!("  generated: {}", output_path.display());
-    generated_count += 1;
+    push(
+        root.join("meerkat-core/src/generated/comms_trust_authority_sources.rs"),
+        &code,
+    )?;
 
     let code = generate_auth_lease_transition_authority_sources(&compositions)?;
-    let code = rustfmt_source(&code)?;
-    let output_path =
-        root.join("meerkat-core/src/generated/auth_lease_transition_authority_sources.rs");
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
-    }
-    fs::write(&output_path, &code).with_context(|| format!("write {}", output_path.display()))?;
-    println!("  generated: {}", output_path.display());
-    generated_count += 1;
+    push(
+        root.join("meerkat-core/src/generated/auth_lease_transition_authority_sources.rs"),
+        &code,
+    )?;
 
     let code = generate_tool_visibility_owner_protocol()?;
-    let code = rustfmt_source(&code)?;
-    let output_path = root.join("meerkat-core/src/generated/protocol_tool_visibility_owner.rs");
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
-    }
-    fs::write(&output_path, &code).with_context(|| format!("write {}", output_path.display()))?;
-    println!("  generated: {}", output_path.display());
-    generated_count += 1;
+    push(
+        root.join("meerkat-core/src/generated/protocol_tool_visibility_owner.rs"),
+        &code,
+    )?;
 
     let code = generate_auth_lease_durable_lifecycle_marker_contract(&compositions)?;
-    let code = rustfmt_source(&code)?;
-    let output_path =
-        root.join("meerkat-core/src/generated/auth_lease_durable_lifecycle_marker.rs");
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
-    }
-    fs::write(&output_path, &code).with_context(|| format!("write {}", output_path.display()))?;
-    println!("  generated: {}", output_path.display());
-    generated_count += 1;
+    push(
+        root.join("meerkat-core/src/generated/auth_lease_durable_lifecycle_marker.rs"),
+        &code,
+    )?;
 
     let session_persistence_version_machine =
         dsl::dsl_session_persistence_version_authority_machine_production_schema();
     let code =
         generate_session_persistence_version_authority(&session_persistence_version_machine)?;
-    let code = rustfmt_source(&code)?;
-    let output_path =
-        root.join("meerkat-core/src/generated/session_persistence_version_authority.rs");
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
-    }
-    fs::write(&output_path, &code).with_context(|| format!("write {}", output_path.display()))?;
-    println!("  generated: {}", output_path.display());
-    generated_count += 1;
+    push(
+        root.join("meerkat-core/src/generated/session_persistence_version_authority.rs"),
+        &code,
+    )?;
 
     let approval_machine = dsl::dsl_approval_lifecycle_machine_production_schema();
     let code = generate_approval_lifecycle_authority(&approval_machine)?;
-    let code = rustfmt_source(&code)?;
-    let output_path = root.join("meerkat-core/src/generated/approval_lifecycle.rs");
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
-    }
-    fs::write(&output_path, &code).with_context(|| format!("write {}", output_path.display()))?;
-    println!("  generated: {}", output_path.display());
-    generated_count += 1;
+    push(
+        root.join("meerkat-core/src/generated/approval_lifecycle.rs"),
+        &code,
+    )?;
 
     let session_document_machine = dsl::dsl_session_document_machine_production_schema();
     let code = generate_session_document_authority(&session_document_machine)?;
-    let code = rustfmt_source(&code)?;
-    let output_path = root.join("meerkat-core/src/generated/session_document.rs");
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
-    }
-    fs::write(&output_path, &code).with_context(|| format!("write {}", output_path.display()))?;
-    println!("  generated: {}", output_path.display());
-    generated_count += 1;
+    push(
+        root.join("meerkat-core/src/generated/session_document.rs"),
+        &code,
+    )?;
 
     let session_turn_admission_machine =
         dsl::dsl_session_turn_admission_machine_production_schema();
     let code = generate_session_turn_admission_authority(&session_turn_admission_machine)?;
-    let code = rustfmt_source(&code)?;
-    let output_path = root.join("meerkat-session/src/generated/session_turn_admission.rs");
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
-    }
-    fs::write(&output_path, &code).with_context(|| format!("write {}", output_path.display()))?;
-    println!("  generated: {}", output_path.display());
-    generated_count += 1;
+    push(
+        root.join("meerkat-session/src/generated/session_turn_admission.rs"),
+        &code,
+    )?;
 
     // Per-machine `CatalogInput` mirrors (keystone-A generalization). Each
     // mirror is derived from the owning machine's `schema.inputs.variants` and
@@ -173,14 +144,10 @@ pub fn run_protocol_codegen() -> Result<()> {
     // exactly those two prefixes rather than fanning out over every machine.
     let mob_machine = dsl::dsl_mob_machine_production_schema();
     let code = generate_mob_machine_catalog_input(&mob_machine)?;
-    let code = rustfmt_source(&code)?;
-    let output_path = root.join("meerkat-mob/src/generated/catalog_input.rs");
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
-    }
-    fs::write(&output_path, &code).with_context(|| format!("write {}", output_path.display()))?;
-    println!("  generated: {}", output_path.display());
-    generated_count += 1;
+    push(
+        root.join("meerkat-mob/src/generated/catalog_input.rs"),
+        &code,
+    )?;
     // NOTE: MeerkatMachineCatalogInput is NOT generated yet. Meerkat's hand
     // CatalogInput is a curated public-command SUBSET (48), but the meerkat
     // schema's runtime_internal_inputs is empty (its runtime-internal set lives
@@ -189,13 +156,89 @@ pub fn run_protocol_codegen() -> Result<()> {
     // classification is moved into the schema (then catalog = inputs - surface_only
     // - runtime_internal). See .claude/keystone-a-gen-design.md.
 
-    if generated_count == 0 {
-        println!("protocol-codegen: no handoff protocols declared — nothing to generate");
+    Ok(emitted)
+}
+
+/// Run protocol codegen: read all canonical compositions, generate Rust helpers
+/// for each declared `EffectHandoffProtocol`, plus the terminal surface mapping.
+pub fn run_protocol_codegen() -> Result<()> {
+    let emitted = protocol_emission_set()?;
+
+    for file in &emitted {
+        if let Some(parent) = file.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create dir {}", parent.display()))?;
+        }
+        fs::write(&file.path, &file.contents)
+            .with_context(|| format!("write {}", file.path.display()))?;
+        println!("  generated: {}", file.path.display());
+    }
+
+    if emitted.is_empty() {
+        println!("protocol-codegen: no artifacts declared - nothing to generate");
     } else {
-        println!("protocol-codegen: generated {generated_count} protocol helper(s)");
+        println!(
+            "protocol-codegen: generated {} protocol helper(s)",
+            emitted.len()
+        );
     }
 
     Ok(())
+}
+
+/// Normalize line endings and trailing whitespace before comparing rendered
+/// output with a committed file. Rendered output always uses LF; a checkout
+/// under `core.autocrlf = true` has CRLF on disk. Without this the gate would
+/// fire on every Windows contributor instead of on real drift.
+fn normalize_for_compare(source: &str) -> String {
+    source.replace("\r\n", "\n").trim_end().to_string()
+}
+
+/// Drift gate for protocol codegen: re-render the canonical emission set and
+/// compare it against what is committed, WITHOUT touching the working tree.
+///
+/// This is the protocol-codegen mirror of `machine-check-drift`. It is
+/// non-mutating on purpose so it is safe to run inside `make ci` on a dirty
+/// developer tree: a stale generated file fails, unrelated local edits do not.
+pub fn check_protocol_codegen_drift() -> Result<()> {
+    let emitted = protocol_emission_set()?;
+
+    let mut drifted: Vec<String> = Vec::new();
+    for file in &emitted {
+        let expected = normalize_for_compare(&file.contents);
+        match fs::read_to_string(&file.path) {
+            Ok(committed) => {
+                if normalize_for_compare(&committed) != expected {
+                    drifted.push(format!(
+                        "  {} (committed content differs from codegen output)",
+                        file.path.display()
+                    ));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                drifted.push(format!("  {} (missing on disk)", file.path.display()));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("read {}", file.path.display()));
+            }
+        }
+    }
+
+    if drifted.is_empty() {
+        println!(
+            "protocol-check-drift: {} generated artifact(s) match codegen output",
+            emitted.len()
+        );
+        return Ok(());
+    }
+
+    let listing = drifted.join("\n");
+    bail!(
+        "protocol-check-drift: {} of {} generated artifact(s) drifted from codegen output:\n{listing}\n\
+         Run `cargo xtask protocol-codegen` and commit the result.",
+        drifted.len(),
+        emitted.len(),
+    );
 }
 
 /// Emit the generated `MobMachineCatalogInput` mirror for `meerkat-mob`.

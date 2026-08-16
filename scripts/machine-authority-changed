@@ -95,7 +95,10 @@ machine_authority_path() {
     meerkat-runtime/src/meerkat_machine/*|meerkat-runtime/src/auth_machine/*|meerkat-mob/src/ids.rs|meerkat-mob/src/machines/*|meerkat-mob/src/runtime/*|meerkat-schedule/src/machines/*)
       return 0
       ;;
-    meerkat-machine-kernels/src/generated/*|meerkat-core/src/generated/*|meerkat-mob/src/generated/*|meerkat-runtime/src/generated/*|meerkat-schedule/src/generated/*|*/src/generated/protocol_*.rs)
+    # meerkat-session is listed explicitly: protocol-codegen emits
+    # session_turn_admission.rs there, and that name carries no `protocol_`
+    # prefix, so the trailing glob does not reach it.
+    meerkat-machine-kernels/src/generated/*|meerkat-core/src/generated/*|meerkat-mob/src/generated/*|meerkat-runtime/src/generated/*|meerkat-schedule/src/generated/*|meerkat-session/src/generated/*|*/src/generated/protocol_*.rs)
       return 0
       ;;
     xtask/Cargo.toml|xtask/BUILD.bazel|xtask/src/lib.rs|xtask/src/main.rs|xtask/src/machines*.rs|xtask/src/protocol_codegen.rs|xtask/src/audit_generated_headers.rs|xtask/src/public_contracts.rs|xtask/src/runtime_authority_bypass.rs)

@@ -45,6 +45,20 @@ if [[ -n "$worktree_status" ]]; then
     "$GIT_BIN" status --short --untracked-files=all >&2
     exit 1
 fi
+# protocol-codegen is a second renderer over the same authority catalog, with
+# its own artifact set (handoff protocol helpers, terminal surface mapping,
+# generated authority contracts). Regenerate it under the same clean-tree
+# contract so a DSL edit cannot be pushed without its emitted counterpart.
+"$CARGO" xtask protocol-codegen
+if ! worktree_status="$("$GIT_BIN" status --porcelain=v1 --untracked-files=all)"; then
+    echo "Failed to determine exact-tree cleanliness after protocol codegen." >&2
+    exit 1
+fi
+if [[ -n "$worktree_status" ]]; then
+    echo "Protocol codegen changed the exact pushed tree; commit generated artifacts and retry." >&2
+    "$GIT_BIN" status --short --untracked-files=all >&2
+    exit 1
+fi
 # Route verification through the canonical TLC lane: it owns the documented
 # over-budget composition skips (meerkat_mob_seam / adaptive_mob_bundle full
 # sweeps) and the bounded adaptive witness proof. A bare `machine-verify --all`
