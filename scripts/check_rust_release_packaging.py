@@ -64,6 +64,7 @@ def main() -> int:
     bazel_errors = bazel_release_binary_version_env_errors(root, workspace_version)
     patch_errors = patch_config_errors(root, expected_order)
     docs_errors = documented_release_order_errors(root, expected_order)
+    docs_errors += documented_count_claim_errors(root, expected_order, workspace)
     if (
         missing
         or unexpected
@@ -101,7 +102,7 @@ def main() -> int:
             for err in patch_errors:
                 print(f"  - {err}", file=sys.stderr)
         if docs_errors:
-            print("Documented release crate enumeration is stale:", file=sys.stderr)
+            print("Documented enumeration is stale:", file=sys.stderr)
             for err in docs_errors:
                 print(f"  - {err}", file=sys.stderr)
         return 1
@@ -161,12 +162,14 @@ def patch_config_errors(root: pathlib.Path, expected_order: list[str]) -> list[s
 
 
 def documented_release_order_errors(root: pathlib.Path, expected_order: list[str]) -> list[str]:
-    """CLAUDE.md documents the publish order and its crate count; both must match.
+    """CLAUDE.md documents the publish order; it must match the canonical list.
 
     The order itself carries dependency knowledge that no tool derives, so it
     stays hand-written - but a hand-written list that nothing compares against
     is how a new crate stayed invisible in the documented contract while three
     gates disagreed about how many crates exist.
+
+    Counts are checked separately, by `documented_count_claim_errors`.
     """
 
     docs_path = root / "CLAUDE.md"
@@ -209,20 +212,105 @@ def documented_release_order_errors(root: pathlib.Path, expected_order: list[str
                     "right crates in a different order than scripts/release-rust-crates.sh"
                 )
 
-    expected_count = len(expected_order)
-    count_claims = (
-        re.compile(r"\((\d+) crates, dependency order\)"),
-        re.compile(r"Publishes (\d+) Rust crates"),
-        re.compile(r"all (\d+) publishable Rust crates"),
+    return errors
+
+
+# Any bare integer that quantifies crates or path deps in CLAUDE.md. A leading
+# `~` marks the number as deliberately approximate and exempts it.
+COUNT_CLAIM_SHAPE = re.compile(r"(?<!~)\b(\d+)\s+(?:\S+\s+){0,2}?(?:crates|path deps)\b")
+
+
+def internal_path_dependency_count(workspace: dict) -> int:
+    """Internal workspace deps that pin a version alongside their path.
+
+    `version` is the load-bearing part: it is what must track
+    `workspace.package.version`, and it is what a published crate resolves
+    against once the path is stripped. A path-only dep (`[patch.crates-io]`
+    vendoring, for instance) is not part of that contract.
+    """
+
+    dependencies = workspace.get("workspace", {}).get("dependencies", {})
+    return sum(
+        1
+        for value in dependencies.values()
+        if isinstance(value, dict) and "version" in value and "path" in value
     )
+
+
+def documented_count_claim_errors(
+    root: pathlib.Path,
+    expected_order: list[str],
+    workspace: dict,
+) -> list[str]:
+    """Every documented count must be bound to the artifact that derives it.
+
+    Two distinct quantities are documented in CLAUDE.md and they are not the
+    same number: the release crate count is owned by
+    scripts/release-rust-crates.sh, the internal path dependency count is owned
+    by Cargo.toml's [workspace.dependencies]. They were equal once, which is
+    precisely how `42 path deps` survived a crate addition looking correct.
+
+    So this is fail-closed on shape, not just on value: a count claim that no
+    registered pattern binds to a derived quantity is itself an error. A fourth
+    hardcoded pattern would fix one stale line; refusing unbound claims fixes
+    the class.
+    """
+
+    docs_path = root / "CLAUDE.md"
+    try:
+        lines = docs_path.read_text().splitlines()
+    except FileNotFoundError:
+        return [f"{docs_path}: file is missing"]
+
+    bound_claims = (
+        # pattern, derived value, what is being counted, deriving authority
+        (
+            re.compile(r"\((\d+) crates, dependency order\)"),
+            len(expected_order),
+            "release crates",
+            "scripts/release-rust-crates.sh",
+        ),
+        (
+            re.compile(r"Publishes (\d+) Rust crates"),
+            len(expected_order),
+            "release crates",
+            "scripts/release-rust-crates.sh",
+        ),
+        (
+            re.compile(r"all (\d+) publishable Rust crates"),
+            len(expected_order),
+            "release crates",
+            "scripts/release-rust-crates.sh",
+        ),
+        (
+            re.compile(r"\((\d+) path deps\)"),
+            internal_path_dependency_count(workspace),
+            "internal path deps",
+            "Cargo.toml [workspace.dependencies]",
+        ),
+    )
+
+    errors: list[str] = []
     for line_number, line in enumerate(lines, start=1):
-        for pattern in count_claims:
-            match = pattern.search(line)
-            if match and int(match.group(1)) != expected_count:
-                errors.append(
-                    f"{docs_path.name}:{line_number}: claims {match.group(1)} release crates, "
-                    f"scripts/release-rust-crates.sh lists {expected_count}"
-                )
+        bound_offsets = set()
+        for pattern, derived, noun, authority in bound_claims:
+            for match in pattern.finditer(line):
+                bound_offsets.add(match.start(1))
+                claimed = int(match.group(1))
+                if claimed != derived:
+                    errors.append(
+                        f"{docs_path.name}:{line_number}: claims {claimed} {noun}, "
+                        f"{authority} lists {derived}"
+                    )
+        for match in COUNT_CLAIM_SHAPE.finditer(line):
+            if match.start(1) in bound_offsets:
+                continue
+            errors.append(
+                f"{docs_path.name}:{line_number}: count claim "
+                f"`{match.group(0).strip()}` is bound to no derived quantity; "
+                "register it in check_rust_release_packaging.py or write it as "
+                "an approximation with a leading `~`"
+            )
 
     return errors
 

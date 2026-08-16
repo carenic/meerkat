@@ -326,7 +326,7 @@ make audit       # Security audit via cargo-deny
 - `unit` ×8 — `cargo unit` sharded via nextest hash partitions
 - `int-heavy` ×3 / `int-rest` ×7 — integration tests split by build scope: `-p meerkat-integration-tests` shards plus crate-group lanes (mob ×2, core-machine, client-session, complement group ×3), so no job links every integration binary
 - `e2e-fast` — deterministic end-to-end lane
-- `ratchets` — docs-check, version parity, schema/SDK codegen freshness, SDK event inventory, RPC/REST surface alignment, SDK wrapper freshness, machine-kernel staleness
+- `ratchets` — docs-check, version parity, schema/SDK codegen freshness, SDK event inventory, RPC/REST surface alignment, SDK wrapper freshness, Rust release configuration (crate enumeration + documented counts) and its contract test, machine-kernel staleness
 - `wasm-check` — wasm32 cargo check + clippy `--all-targets` (every code change)
 - `wasm-contract` — executes the browser contract test via `wasm-pack test --headless --chrome` (only when wasm-relevant paths changed: meerkat-web-runtime, meerkat-contracts, sdks/web, the workflow itself)
 - `sdk-web` — full Web SDK suite (only when SDK-relevant paths changed)
@@ -409,7 +409,7 @@ Six files must agree on the same version:
 | `sdks/web/package.json` | `version` |
 | `artifacts/schemas/version.json` | `contract_version` |
 
-Additionally, all internal crate dependencies in `Cargo.toml` (42 path deps) must match the workspace version.
+Additionally, all internal crate dependencies in `Cargo.toml` (43 path deps) must match the workspace version.
 
 **`make verify-version-parity`** runs in CI and fails on any drift. After changing versions or wire types:
 
@@ -488,6 +488,7 @@ The canonical publish order lives in `scripts/release-rust-crates.sh` (42 crates
 - **`ContractVersion::CURRENT` must equal `workspace.package.version`** — they are lock-stepped
 - **Never change `Cargo.lock` without refreshing `MODULE.bazel.lock`** - the lock is a crate_universe extension input; `make buildbuddy-lock-update` regenerates it, and `make verify-bazel-locks` proves it
 - **Never hand-maintain a second list of workspace crates** - `scripts/release-rust-crates.sh` is the one hand-ordered enumeration; the patch config derives from it and `make check-rust-release-config` fails when the documented order, count, or patch map disagrees
+- **Never write a bare crate count in this file that nothing derives** - `make check-rust-release-config` rejects any `N crates` / `N path deps` claim it cannot bind to a computed quantity. Register the new claim in `documented_count_claim_errors` (`scripts/check_rust_release_packaging.py`) alongside the artifact that owns the number, or write it as an approximation with a leading `~`. Release crate count and internal path-dep count are different facts with different owners; they are not interchangeable even when they happen to be equal
 - **Use `cargo release patch` for releases** — never manually bump versions or create tags; the release hook handles SDK sync, schema regen, and parity verification automatically
 
 ## Testing with Multiple Providers

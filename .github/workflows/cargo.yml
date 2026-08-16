@@ -597,6 +597,12 @@ jobs:
       - name: Verify Rust release configuration
         run: make check-rust-release-config
 
+      # The gate above is only worth its runtime if it still fails on the
+      # defects it was written for. This contract test asserts that on a
+      # scratch workspace and costs no build; pre-push alone is bypassable.
+      - name: Verify release crate enumeration gate still fails closed
+        run: scripts/test-crate-enumeration-gate.sh
+
       - name: Verify generated machine kernels are not stale
         id: machine_drift
         shell: bash
