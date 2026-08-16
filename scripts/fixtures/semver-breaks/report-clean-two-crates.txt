@@ -1,0 +1,24 @@
+    Building meerkat v0.8.23 (current)
+       Built [ 137.353s] (current)
+     Parsing meerkat v0.8.23 (current)
+      Parsed [   0.107s] (current)
+    Building meerkat v0.8.23 (baseline)
+       Built [  89.945s] (baseline)
+     Parsing meerkat v0.8.23 (baseline)
+      Parsed [   0.075s] (baseline)
+    Checking meerkat v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.033s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 241.389s] meerkat
+    Building meerkat-agent-build-authority v0.8.23 (current)
+       Built [   0.690s] (current)
+     Parsing meerkat-agent-build-authority v0.8.23 (current)
+      Parsed [   0.001s] (current)
+    Building meerkat-agent-build-authority v0.8.23 (baseline)
+       Built [   0.715s] (baseline)
+     Parsing meerkat-agent-build-authority v0.8.23 (baseline)
+      Parsed [   0.001s] (baseline)
+    Checking meerkat-agent-build-authority v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.003s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [   2.686s] meerkat-agent-build-authority

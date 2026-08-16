@@ -1,0 +1,63 @@
+    Building meerkat-sqlite v0.8.23 (current)
+       Built [   7.468s] (current)
+     Parsing meerkat-sqlite v0.8.23 (current)
+      Parsed [   0.004s] (current)
+    Building meerkat-sqlite v0.8.22 (baseline)
+       Built [   0.301s] (baseline)
+     Parsing meerkat-sqlite v0.8.22 (baseline)
+      Parsed [   0.002s] (baseline)
+    Checking meerkat-sqlite v0.8.22 -> v0.8.23 (minor change)
+     Checked [   0.011s] 196 checks: 192 pass, 4 fail, 0 warn, 57 skip
+
+--- failure constructible_struct_adds_field: externally-constructible struct adds field ---
+
+Description:
+A pub struct constructible with a struct literal has a new pub field. Existing struct literals must be updated to include the new field.
+        ref: https://doc.rust-lang.org/reference/expressions/struct-expr.html
+       impl: https://github.com/obi1kenobi/cargo-semver-checks/tree/v0.48.0/src/lints/constructible_struct_adds_field.ron
+
+Failed in:
+  field MaintenanceBridgeReport.refused in /repo/meerkat-sqlite/src/ledger.rs:435
+  field MaintenanceBridgeReport.refused in /repo/meerkat-sqlite/src/ledger.rs:435
+  field MaintenancePrepareReport.refused in /repo/meerkat-sqlite/src/ledger.rs:410
+  field MaintenancePrepareReport.refused in /repo/meerkat-sqlite/src/ledger.rs:410
+  field SchemaDomain.bridge_recoverable_versions in /repo/meerkat-sqlite/src/ledger.rs:159
+  field SchemaDomain.bridge_recoverable_versions in /repo/meerkat-sqlite/src/ledger.rs:159
+
+--- failure derive_trait_impl_removed: built-in derived trait no longer implemented ---
+
+Description:
+A public type has stopped deriving one or more traits. This can break downstream code that depends on those types implementing those traits.
+        ref: https://doc.rust-lang.org/reference/attributes/derive.html#derive
+       impl: https://github.com/obi1kenobi/cargo-semver-checks/tree/v0.48.0/src/lints/derive_trait_impl_removed.ron
+
+Failed in:
+  type MaintenanceBridgeReport no longer derives Copy, in /repo/meerkat-sqlite/src/ledger.rs:425
+  type MaintenanceBridgeReport no longer derives Copy, in /repo/meerkat-sqlite/src/ledger.rs:425
+  type MaintenancePrepareReport no longer derives Copy, in /repo/meerkat-sqlite/src/ledger.rs:404
+  type MaintenancePrepareReport no longer derives Copy, in /repo/meerkat-sqlite/src/ledger.rs:404
+
+--- failure enum_struct_variant_field_added: pub enum struct variant field added ---
+
+Description:
+An enum's exhaustive struct variant has a new field, which has to be included when constructing or matching on this variant.
+        ref: https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute
+       impl: https://github.com/obi1kenobi/cargo-semver-checks/tree/v0.48.0/src/lints/enum_struct_variant_field_added.ron
+
+Failed in:
+  field bridgeable of variant SqliteStoreError::UnledgeredDomainObjects in /repo/meerkat-sqlite/src/error.rs:145
+  field bridgeable of variant SqliteStoreError::UnledgeredDomainObjects in /repo/meerkat-sqlite/src/error.rs:145
+
+--- failure enum_variant_added: enum variant added on exhaustive enum ---
+
+Description:
+A publicly-visible enum without #[non_exhaustive] has a new variant.
+        ref: https://doc.rust-lang.org/cargo/reference/semver.html#enum-variant-new
+       impl: https://github.com/obi1kenobi/cargo-semver-checks/tree/v0.48.0/src/lints/enum_variant_added.ron
+
+Failed in:
+  variant SqliteStoreError:WalConversionContended in /repo/meerkat-sqlite/src/error.rs:233
+  variant SqliteStoreError:WalConversionContended in /repo/meerkat-sqlite/src/error.rs:233
+
+     Summary semver requires new major version: 4 major and 0 minor checks failed
+    Finished [   9.668s] meerkat-sqlite

@@ -1,0 +1,468 @@
+    Building meerkat v0.8.23 (current)
+       Built [ 137.353s] (current)
+     Parsing meerkat v0.8.23 (current)
+      Parsed [   0.107s] (current)
+    Building meerkat v0.8.23 (baseline)
+       Built [  89.945s] (baseline)
+     Parsing meerkat v0.8.23 (baseline)
+      Parsed [   0.075s] (baseline)
+    Checking meerkat v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.033s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 241.389s] meerkat
+    Building meerkat-agent-build-authority v0.8.23 (current)
+       Built [   0.690s] (current)
+     Parsing meerkat-agent-build-authority v0.8.23 (current)
+      Parsed [   0.001s] (current)
+    Building meerkat-agent-build-authority v0.8.23 (baseline)
+       Built [   0.715s] (baseline)
+     Parsing meerkat-agent-build-authority v0.8.23 (baseline)
+      Parsed [   0.001s] (baseline)
+    Checking meerkat-agent-build-authority v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.003s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [   2.686s] meerkat-agent-build-authority
+    Building meerkat-anthropic v0.8.23 (current)
+       Built [  58.339s] (current)
+     Parsing meerkat-anthropic v0.8.23 (current)
+      Parsed [   0.011s] (current)
+    Building meerkat-anthropic v0.8.23 (baseline)
+       Built [  51.215s] (baseline)
+     Parsing meerkat-anthropic v0.8.23 (baseline)
+      Parsed [   0.012s] (baseline)
+    Checking meerkat-anthropic v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.003s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 116.808s] meerkat-anthropic
+    Building meerkat-atif v0.8.23 (current)
+       Built [  20.098s] (current)
+     Parsing meerkat-atif v0.8.23 (current)
+      Parsed [   0.010s] (current)
+    Building meerkat-atif v0.8.23 (baseline)
+       Built [  26.584s] (baseline)
+     Parsing meerkat-atif v0.8.23 (baseline)
+      Parsed [   0.011s] (baseline)
+    Checking meerkat-atif v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.011s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [  49.936s] meerkat-atif
+    Building meerkat-auth-core v0.8.23 (current)
+       Built [   1.670s] (current)
+     Parsing meerkat-auth-core v0.8.23 (current)
+      Parsed [   0.032s] (current)
+    Building meerkat-auth-core v0.8.23 (baseline)
+       Built [   1.535s] (baseline)
+     Parsing meerkat-auth-core v0.8.23 (baseline)
+      Parsed [   0.031s] (baseline)
+    Checking meerkat-auth-core v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.015s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [   9.199s] meerkat-auth-core
+    Building meerkat-capabilities v0.8.23 (current)
+       Built [   0.706s] (current)
+     Parsing meerkat-capabilities v0.8.23 (current)
+      Parsed [   0.007s] (current)
+    Building meerkat-capabilities v0.8.23 (baseline)
+       Built [   0.691s] (baseline)
+     Parsing meerkat-capabilities v0.8.23 (baseline)
+      Parsed [   0.007s] (baseline)
+    Checking meerkat-capabilities v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.005s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [   3.264s] meerkat-capabilities
+    Building meerkat-client v0.8.23 (current)
+       Built [  75.034s] (current)
+     Parsing meerkat-client v0.8.23 (current)
+      Parsed [   0.010s] (current)
+    Building meerkat-client v0.8.23 (baseline)
+       Built [  73.976s] (baseline)
+     Parsing meerkat-client v0.8.23 (baseline)
+      Parsed [   0.013s] (baseline)
+    Checking meerkat-client v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.003s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 152.404s] meerkat-client
+    Building meerkat-comms v0.8.23 (current)
+       Built [  63.448s] (current)
+     Parsing meerkat-comms v0.8.23 (current)
+      Parsed [   0.034s] (current)
+    Building meerkat-comms v0.8.23 (baseline)
+       Built [  72.504s] (baseline)
+     Parsing meerkat-comms v0.8.23 (baseline)
+      Parsed [   0.035s] (baseline)
+    Checking meerkat-comms v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.032s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 141.741s] meerkat-comms
+    Building meerkat-contracts v0.8.23 (current)
+       Built [  77.043s] (current)
+     Parsing meerkat-contracts v0.8.23 (current)
+      Parsed [   0.234s] (current)
+    Building meerkat-contracts v0.8.23 (baseline)
+       Built [  52.036s] (baseline)
+     Parsing meerkat-contracts v0.8.23 (baseline)
+      Parsed [   0.211s] (baseline)
+    Checking meerkat-contracts v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.458s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 138.960s] meerkat-contracts
+    Building meerkat-core v0.8.23 (current)
+       Built [   9.831s] (current)
+     Parsing meerkat-core v0.8.23 (current)
+      Parsed [   0.427s] (current)
+    Building meerkat-core v0.8.23 (baseline)
+       Built [   7.477s] (baseline)
+     Parsing meerkat-core v0.8.23 (baseline)
+      Parsed [   0.325s] (baseline)
+    Checking meerkat-core v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.671s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [  24.633s] meerkat-core
+    Building meerkat-gemini v0.8.23 (current)
+       Built [  76.841s] (current)
+     Parsing meerkat-gemini v0.8.23 (current)
+      Parsed [   0.019s] (current)
+    Building meerkat-gemini v0.8.23 (baseline)
+       Built [  62.528s] (baseline)
+     Parsing meerkat-gemini v0.8.23 (baseline)
+      Parsed [   0.019s] (baseline)
+    Checking meerkat-gemini v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.004s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 148.297s] meerkat-gemini
+    Building meerkat-hooks v0.8.23 (current)
+       Built [  95.321s] (current)
+     Parsing meerkat-hooks v0.8.23 (current)
+      Parsed [   0.006s] (current)
+    Building meerkat-hooks v0.8.23 (baseline)
+       Built [  72.733s] (baseline)
+     Parsing meerkat-hooks v0.8.23 (baseline)
+      Parsed [   0.011s] (baseline)
+    Checking meerkat-hooks v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.003s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 176.294s] meerkat-hooks
+    Building meerkat-jobs v0.8.23 (current)
+       Built [  38.080s] (current)
+     Parsing meerkat-jobs v0.8.23 (current)
+      Parsed [   0.029s] (current)
+    Building meerkat-jobs v0.8.23 (baseline)
+       Built [  39.973s] (baseline)
+     Parsing meerkat-jobs v0.8.23 (baseline)
+      Parsed [   0.026s] (baseline)
+    Checking meerkat-jobs v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.026s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [  85.191s] meerkat-jobs
+    Building meerkat-live v0.8.23 (current)
+       Built [  60.530s] (current)
+     Parsing meerkat-live v0.8.23 (current)
+      Parsed [   0.021s] (current)
+    Building meerkat-live v0.8.23 (baseline)
+       Built [  85.053s] (baseline)
+     Parsing meerkat-live v0.8.23 (baseline)
+      Parsed [   0.026s] (baseline)
+    Checking meerkat-live v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.022s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 162.995s] meerkat-live
+    Building meerkat-llm-core v0.8.23 (current)
+       Built [ 107.883s] (current)
+     Parsing meerkat-llm-core v0.8.23 (current)
+      Parsed [   0.015s] (current)
+    Building meerkat-llm-core v0.8.23 (baseline)
+       Built [  94.218s] (baseline)
+     Parsing meerkat-llm-core v0.8.23 (baseline)
+      Parsed [   0.016s] (baseline)
+    Checking meerkat-llm-core v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.042s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 222.937s] meerkat-llm-core
+    Building meerkat-machine-dsl-core v0.8.23 (current)
+       Built [   7.863s] (current)
+     Parsing meerkat-machine-dsl-core v0.8.23 (current)
+      Parsed [   0.003s] (current)
+    Building meerkat-machine-dsl-core v0.8.23 (baseline)
+       Built [   1.547s] (baseline)
+     Parsing meerkat-machine-dsl-core v0.8.23 (baseline)
+      Parsed [   0.003s] (baseline)
+    Checking meerkat-machine-dsl-core v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.028s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [  17.129s] meerkat-machine-dsl-core
+    Building meerkat-machine-kernels v0.8.23 (current)
+       Built [  22.257s] (current)
+     Parsing meerkat-machine-kernels v0.8.23 (current)
+      Parsed [   0.589s] (current)
+    Building meerkat-machine-kernels v0.8.23 (baseline)
+       Built [   9.757s] (baseline)
+     Parsing meerkat-machine-kernels v0.8.23 (baseline)
+      Parsed [   0.497s] (baseline)
+    Checking meerkat-machine-kernels v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   1.091s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [  42.399s] meerkat-machine-kernels
+    Building meerkat-machine-schema v0.8.23 (current)
+       Built [  17.296s] (current)
+     Parsing meerkat-machine-schema v0.8.23 (current)
+      Parsed [   0.299s] (current)
+    Building meerkat-machine-schema v0.8.23 (baseline)
+       Built [   9.161s] (baseline)
+     Parsing meerkat-machine-schema v0.8.23 (baseline)
+      Parsed [   0.278s] (baseline)
+    Checking meerkat-machine-schema v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.460s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [  34.644s] meerkat-machine-schema
+    Building meerkat-mcp v0.8.23 (current)
+       Built [  70.583s] (current)
+     Parsing meerkat-mcp v0.8.23 (current)
+      Parsed [   0.031s] (current)
+    Building meerkat-mcp v0.8.23 (baseline)
+       Built [  60.247s] (baseline)
+     Parsing meerkat-mcp v0.8.23 (baseline)
+      Parsed [   0.036s] (baseline)
+    Checking meerkat-mcp v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.011s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 139.099s] meerkat-mcp
+    Building meerkat-mcp-server v0.8.23 (current)
+       Built [ 331.544s] (current)
+     Parsing meerkat-mcp-server v0.8.23 (current)
+      Parsed [   0.027s] (current)
+    Building meerkat-mcp-server v0.8.23 (baseline)
+       Built [ 260.710s] (baseline)
+     Parsing meerkat-mcp-server v0.8.23 (baseline)
+      Parsed [   0.038s] (baseline)
+    Checking meerkat-mcp-server v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.016s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 605.190s] meerkat-mcp-server
+    Building meerkat-memory v0.8.23 (current)
+       Built [ 131.980s] (current)
+     Parsing meerkat-memory v0.8.23 (current)
+      Parsed [   0.008s] (current)
+    Building meerkat-memory v0.8.23 (baseline)
+       Built [  77.411s] (baseline)
+     Parsing meerkat-memory v0.8.23 (baseline)
+      Parsed [   0.006s] (baseline)
+    Checking meerkat-memory v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.003s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 216.719s] meerkat-memory
+    Building meerkat-mob v0.8.23 (current)
+       Built [ 104.601s] (current)
+     Parsing meerkat-mob v0.8.23 (current)
+      Parsed [   0.292s] (current)
+    Building meerkat-mob v0.8.23 (baseline)
+       Built [ 197.622s] (baseline)
+     Parsing meerkat-mob v0.8.23 (baseline)
+      Parsed [   0.732s] (baseline)
+    Checking meerkat-mob v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.334s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 310.382s] meerkat-mob
+    Building meerkat-mob-adaptive v0.8.23 (current)
+       Built [ 126.967s] (current)
+     Parsing meerkat-mob-adaptive v0.8.23 (current)
+      Parsed [   0.008s] (current)
+    Building meerkat-mob-adaptive v0.8.23 (baseline)
+       Built [  59.099s] (baseline)
+     Parsing meerkat-mob-adaptive v0.8.23 (baseline)
+      Parsed [   0.018s] (baseline)
+    Checking meerkat-mob-adaptive v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.002s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 195.299s] meerkat-mob-adaptive
+    Building meerkat-mob-mcp v0.8.23 (current)
+       Built [  98.275s] (current)
+     Parsing meerkat-mob-mcp v0.8.23 (current)
+      Parsed [   0.031s] (current)
+    Building meerkat-mob-mcp v0.8.23 (baseline)
+       Built [ 112.981s] (baseline)
+     Parsing meerkat-mob-mcp v0.8.23 (baseline)
+      Parsed [   0.045s] (baseline)
+    Checking meerkat-mob-mcp v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.013s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 218.493s] meerkat-mob-mcp
+    Building meerkat-mob-pack v0.8.23 (current)
+       Built [   3.268s] (current)
+     Parsing meerkat-mob-pack v0.8.23 (current)
+      Parsed [   0.026s] (current)
+    Building meerkat-mob-pack v0.8.23 (baseline)
+       Built [   2.799s] (baseline)
+     Parsing meerkat-mob-pack v0.8.23 (baseline)
+      Parsed [   0.027s] (baseline)
+    Checking meerkat-mob-pack v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.015s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [  12.522s] meerkat-mob-pack
+    Building meerkat-models v0.8.23 (current)
+       Built [   1.135s] (current)
+     Parsing meerkat-models v0.8.23 (current)
+      Parsed [   0.005s] (current)
+    Building meerkat-models v0.8.23 (baseline)
+       Built [   1.024s] (baseline)
+     Parsing meerkat-models v0.8.23 (baseline)
+      Parsed [   0.004s] (baseline)
+    Checking meerkat-models v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.004s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [   3.628s] meerkat-models
+    Building meerkat-openai v0.8.23 (current)
+       Built [ 103.184s] (current)
+     Parsing meerkat-openai v0.8.23 (current)
+      Parsed [   0.026s] (current)
+    Building meerkat-openai v0.8.23 (baseline)
+       Built [  58.303s] (baseline)
+     Parsing meerkat-openai v0.8.23 (baseline)
+      Parsed [   0.015s] (baseline)
+    Checking meerkat-openai v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.008s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 165.712s] meerkat-openai
+    Building meerkat-providers v0.8.23 (current)
+       Built [   3.379s] (current)
+     Parsing meerkat-providers v0.8.23 (current)
+      Parsed [   0.008s] (current)
+    Building meerkat-providers v0.8.23 (baseline)
+       Built [   2.491s] (baseline)
+     Parsing meerkat-providers v0.8.23 (baseline)
+      Parsed [   0.006s] (baseline)
+    Checking meerkat-providers v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.002s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [   8.847s] meerkat-providers
+    Building meerkat-rest v0.8.23 (current)
+       Built [ 189.119s] (current)
+     Parsing meerkat-rest v0.8.23 (current)
+      Parsed [   0.016s] (current)
+    Building meerkat-rest v0.8.23 (baseline)
+       Built [ 165.960s] (baseline)
+     Parsing meerkat-rest v0.8.23 (baseline)
+      Parsed [   0.016s] (baseline)
+    Checking meerkat-rest v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.008s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 366.822s] meerkat-rest
+    Building meerkat-rpc v0.8.23 (current)
+       Built [ 183.302s] (current)
+     Parsing meerkat-rpc v0.8.23 (current)
+      Parsed [   0.042s] (current)
+    Building meerkat-rpc v0.8.23 (baseline)
+       Built [ 139.450s] (baseline)
+     Parsing meerkat-rpc v0.8.23 (baseline)
+      Parsed [   0.039s] (baseline)
+    Checking meerkat-rpc v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.010s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 333.611s] meerkat-rpc
+    Building meerkat-runtime v0.8.23 (current)
+       Built [  58.221s] (current)
+     Parsing meerkat-runtime v0.8.23 (current)
+      Parsed [   0.211s] (current)
+    Building meerkat-runtime v0.8.23 (baseline)
+       Built [  48.804s] (baseline)
+     Parsing meerkat-runtime v0.8.23 (baseline)
+      Parsed [   0.205s] (baseline)
+    Checking meerkat-runtime v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.199s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 115.799s] meerkat-runtime
+    Building meerkat-schedule v0.8.23 (current)
+       Built [  52.043s] (current)
+     Parsing meerkat-schedule v0.8.23 (current)
+      Parsed [   0.040s] (current)
+    Building meerkat-schedule v0.8.23 (baseline)
+       Built [  54.840s] (baseline)
+     Parsing meerkat-schedule v0.8.23 (baseline)
+      Parsed [   0.055s] (baseline)
+    Checking meerkat-schedule v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.047s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 112.524s] meerkat-schedule
+    Building meerkat-session v0.8.23 (current)
+       Built [ 113.459s] (current)
+     Parsing meerkat-session v0.8.23 (current)
+      Parsed [   0.050s] (current)
+    Building meerkat-session v0.8.23 (baseline)
+       Built [  53.741s] (baseline)
+     Parsing meerkat-session v0.8.23 (baseline)
+      Parsed [   0.037s] (baseline)
+    Checking meerkat-session v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.011s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 171.728s] meerkat-session
+    Building meerkat-skills v0.8.23 (current)
+       Built [  12.369s] (current)
+     Parsing meerkat-skills v0.8.23 (current)
+      Parsed [   0.007s] (current)
+    Building meerkat-skills v0.8.23 (baseline)
+       Built [  10.074s] (baseline)
+     Parsing meerkat-skills v0.8.23 (baseline)
+      Parsed [   0.011s] (baseline)
+    Checking meerkat-skills v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.003s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [  25.682s] meerkat-skills
+    Building meerkat-sqlite v0.8.23 (current)
+       Built [   0.252s] (current)
+     Parsing meerkat-sqlite v0.8.23 (current)
+      Parsed [   0.002s] (current)
+    Building meerkat-sqlite v0.8.23 (baseline)
+       Built [   0.228s] (baseline)
+     Parsing meerkat-sqlite v0.8.23 (baseline)
+      Parsed [   0.002s] (baseline)
+    Checking meerkat-sqlite v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.004s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [   0.938s] meerkat-sqlite
+    Building meerkat-store v0.8.23 (current)
+       Built [  32.001s] (current)
+     Parsing meerkat-store v0.8.23 (current)
+      Parsed [   0.019s] (current)
+    Building meerkat-store v0.8.23 (baseline)
+       Built [  25.835s] (baseline)
+     Parsing meerkat-store v0.8.23 (baseline)
+      Parsed [   0.019s] (baseline)
+    Checking meerkat-store v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.008s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [  61.866s] meerkat-store
+    Building meerkat-store-conformance v0.8.23 (current)
+       Built [   0.745s] (current)
+     Parsing meerkat-store-conformance v0.8.23 (current)
+      Parsed [   0.005s] (current)
+    Building meerkat-store-conformance v0.8.23 (baseline)
+       Built [   0.797s] (baseline)
+     Parsing meerkat-store-conformance v0.8.23 (baseline)
+      Parsed [   0.005s] (baseline)
+    Checking meerkat-store-conformance v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.003s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [   4.809s] meerkat-store-conformance
+    Building meerkat-tools v0.8.23 (current)
+       Built [  68.661s] (current)
+     Parsing meerkat-tools v0.8.23 (current)
+      Parsed [   0.037s] (current)
+    Building meerkat-tools v0.8.23 (baseline)
+       Built [  62.947s] (baseline)
+     Parsing meerkat-tools v0.8.23 (baseline)
+      Parsed [   0.039s] (baseline)
+    Checking meerkat-tools v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.017s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [ 139.689s] meerkat-tools
+    Building meerkat-workgraph v0.8.23 (current)
+       Built [   1.328s] (current)
+     Parsing meerkat-workgraph v0.8.23 (current)
+      Parsed [   0.026s] (current)
+    Building meerkat-workgraph v0.8.23 (baseline)
+       Built [   1.209s] (baseline)
+     Parsing meerkat-workgraph v0.8.23 (baseline)
+      Parsed [   0.025s] (baseline)
+    Checking meerkat-workgraph v0.8.23 -> v0.8.23 (assume patch change)
+     Checked [   0.020s] 223 checks: 223 pass, 30 skip
+     Summary no semver update required
+    Finished [   7.262s] meerkat-workgraph
