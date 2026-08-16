@@ -13,6 +13,8 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+## [0.8.23] - 2026-08-16
+
 ### Breaking
 
 **Some entries below are BEHAVIOUR-ONLY: a public function keeps its signature
@@ -5568,7 +5570,8 @@ Meerkat 0.5 is a large architecture and surface cutover. It formalizes runtime o
 
 Initial development release.
 
-[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.12...HEAD
+[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.23...HEAD
+[0.8.23]: https://github.com/lukacf/meerkat/compare/v0.8.22...v0.8.23
 [0.8.12]: https://github.com/lukacf/meerkat/compare/v0.8.11...v0.8.12
 [0.8.11]: https://github.com/lukacf/meerkat/compare/v0.8.10...v0.8.11
 [0.7.0]: https://github.com/lukacf/meerkat/compare/alpha/v0.7.0-alpha.0...v0.7.0
