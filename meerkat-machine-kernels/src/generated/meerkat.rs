@@ -9075,11 +9075,14 @@ pub enum SessionRegistrationRejectReasonKind {
     #[default]
     #[serde(rename = "RuntimeEpochConflict")]
     RuntimeEpochConflict,
+    #[serde(rename = "UnregisterTeardownInProgress")]
+    UnregisterTeardownInProgress,
 }
 impl SessionRegistrationRejectReasonKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::RuntimeEpochConflict => "RuntimeEpochConflict",
+            Self::UnregisterTeardownInProgress => "UnregisterTeardownInProgress",
         }
     }
 }
@@ -9088,6 +9091,7 @@ impl std::convert::TryFrom<&str> for SessionRegistrationRejectReasonKind {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
             "RuntimeEpochConflict" => Ok(Self::RuntimeEpochConflict),
+            "UnregisterTeardownInProgress" => Ok(Self::UnregisterTeardownInProgress),
             other => Err(format!(
                 "invalid SessionRegistrationRejectReasonKind value `{other}`"
             )),
@@ -14758,6 +14762,9 @@ pub mod effects {
         pub reason: SessionRegistrationRejectReasonKind,
         pub registered_runtime_epoch_id: Option<RuntimeEpochId>,
         pub attempted_runtime_epoch_id: Option<RuntimeEpochId>,
+        pub unregister_runtime_loop_drain_pending: bool,
+        pub unregister_comms_drain_exit_pending: bool,
+        pub unregister_completion_waiter_drain_pending: bool,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct OpLifecycleTransitionRejected {
@@ -15998,6 +16005,11 @@ pub enum TransitionId {
     RegisterSessionEpochConflictRejectedAttached,
     RegisterSessionEpochConflictRejectedRunning,
     RegisterSessionEpochConflictRejectedRetired,
+    RegisterSessionRefusedUnregisterDrainingIdle,
+    RegisterSessionRefusedUnregisterDrainingAttached,
+    RegisterSessionRefusedUnregisterDrainingRunning,
+    RegisterSessionRefusedUnregisterDrainingRetired,
+    RegisterSessionRefusedUnregisterDrainingStopped,
     RegisterSessionResumesStopped,
     RegisterSessionNewBindingFromStopped,
     StageDeferredSession,
