@@ -27,38 +27,6 @@ pub(crate) struct SessionRegistrationRefusal {
     reason: dsl::SessionRegistrationRejectReasonKind,
     registered_runtime_epoch_id: Option<dsl::RuntimeEpochId>,
     attempted_runtime_epoch_id: Option<dsl::RuntimeEpochId>,
-    unregister_runtime_loop_drain_pending: bool,
-    unregister_comms_drain_exit_pending: bool,
-    unregister_completion_waiter_drain_pending: bool,
-}
-
-impl SessionRegistrationRefusal {
-    /// Convert the machine's verdict into the caller-facing typed error.
-    ///
-    /// The reason kind decides the error, not the call site: an epoch conflict
-    /// means the entry was replaced underneath the caller and retrying from the
-    /// same in-memory state is forbidden (`StaleAuthority`), while a teardown
-    /// refusal is RETRYABLE and must map to `UnregisterInProgress`, whose
-    /// contract is "join the same saga". Collapsing the second into the first
-    /// would tell the host its session is permanently unusable because cleanup
-    /// had not finished.
-    pub(crate) fn into_runtime_driver_error(
-        self,
-        session_id: &SessionId,
-    ) -> crate::RuntimeDriverError {
-        match self.reason {
-            dsl::SessionRegistrationRejectReasonKind::UnregisterTeardownInProgress => {
-                crate::RuntimeDriverError::UnregisterInProgress {
-                    runtime_id: LogicalRuntimeId::for_session(session_id),
-                }
-            }
-            dsl::SessionRegistrationRejectReasonKind::RuntimeEpochConflict => {
-                crate::RuntimeDriverError::StaleAuthority {
-                    reason: format!("session {session_id}: {self}"),
-                }
-            }
-        }
-    }
 }
 
 impl std::fmt::Display for SessionRegistrationRefusal {
@@ -74,29 +42,6 @@ impl std::fmt::Display for SessionRegistrationRefusal {
                 format_epoch(&self.registered_runtime_epoch_id),
                 format_epoch(&self.attempted_runtime_epoch_id)
             ),
-            dsl::SessionRegistrationRejectReasonKind::UnregisterTeardownInProgress => {
-                let mut open: Vec<&'static str> = Vec::new();
-                if self.unregister_runtime_loop_drain_pending {
-                    open.push("runtime loop");
-                }
-                if self.unregister_comms_drain_exit_pending {
-                    open.push("comms drain");
-                }
-                if self.unregister_completion_waiter_drain_pending {
-                    open.push("completion waiters");
-                }
-                let open = if open.is_empty() {
-                    "none (awaiting final unregister commit)".to_string()
-                } else {
-                    open.join(", ")
-                };
-                write!(
-                    f,
-                    "session registration refused: unregister teardown still draining \
-                     (epoch {}, still open: {open}); retry once teardown concludes",
-                    format_epoch(&self.registered_runtime_epoch_id)
-                )
-            }
         }
     }
 }
@@ -118,18 +63,11 @@ impl DslTransitionEffects {
                 reason,
                 registered_runtime_epoch_id,
                 attempted_runtime_epoch_id,
-                unregister_runtime_loop_drain_pending,
-                unregister_comms_drain_exit_pending,
-                unregister_completion_waiter_drain_pending,
                 ..
             } => Some(SessionRegistrationRefusal {
                 reason: *reason,
                 registered_runtime_epoch_id: registered_runtime_epoch_id.clone(),
                 attempted_runtime_epoch_id: attempted_runtime_epoch_id.clone(),
-                unregister_runtime_loop_drain_pending: *unregister_runtime_loop_drain_pending,
-                unregister_comms_drain_exit_pending: *unregister_comms_drain_exit_pending,
-                unregister_completion_waiter_drain_pending:
-                    *unregister_completion_waiter_drain_pending,
             }),
             _ => None,
         })

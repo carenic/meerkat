@@ -2554,7 +2554,7 @@ meerkat_RegisterSessionEpochConflictRejectedIdle(arg_session_id, arg_runtime_epo
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "SessionRegistrationRejected", payload |-> [attempted_runtime_epoch_id |-> packet.payload.runtime_epoch_id, reason |-> "RuntimeEpochConflict", registered_runtime_epoch_id |-> meerkat_active_runtime_epoch_id, session_id |-> packet.payload.session_id, unregister_comms_drain_exit_pending |-> meerkat_unregister_comms_drain_exit_pending, unregister_completion_waiter_drain_pending |-> meerkat_unregister_completion_waiter_drain_pending, unregister_runtime_loop_drain_pending |-> meerkat_unregister_runtime_loop_drain_pending], effect_id |-> (model_step_count + 1), source_transition |-> "RegisterSessionEpochConflictRejectedIdle"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "SessionRegistrationRejected", payload |-> [attempted_runtime_epoch_id |-> packet.payload.runtime_epoch_id, reason |-> "RuntimeEpochConflict", registered_runtime_epoch_id |-> meerkat_active_runtime_epoch_id, session_id |-> packet.payload.session_id], effect_id |-> (model_step_count + 1), source_transition |-> "RegisterSessionEpochConflictRejectedIdle"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "RegisterSessionEpochConflictRejectedIdle", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Idle"]}
        /\ UnchangedFrame_d2e65ac0b2ee17fd
        /\ model_step_count' = model_step_count + 1
@@ -2577,7 +2577,7 @@ meerkat_RegisterSessionEpochConflictRejectedAttached(arg_session_id, arg_runtime
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "SessionRegistrationRejected", payload |-> [attempted_runtime_epoch_id |-> packet.payload.runtime_epoch_id, reason |-> "RuntimeEpochConflict", registered_runtime_epoch_id |-> meerkat_active_runtime_epoch_id, session_id |-> packet.payload.session_id, unregister_comms_drain_exit_pending |-> meerkat_unregister_comms_drain_exit_pending, unregister_completion_waiter_drain_pending |-> meerkat_unregister_completion_waiter_drain_pending, unregister_runtime_loop_drain_pending |-> meerkat_unregister_runtime_loop_drain_pending], effect_id |-> (model_step_count + 1), source_transition |-> "RegisterSessionEpochConflictRejectedAttached"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "SessionRegistrationRejected", payload |-> [attempted_runtime_epoch_id |-> packet.payload.runtime_epoch_id, reason |-> "RuntimeEpochConflict", registered_runtime_epoch_id |-> meerkat_active_runtime_epoch_id, session_id |-> packet.payload.session_id], effect_id |-> (model_step_count + 1), source_transition |-> "RegisterSessionEpochConflictRejectedAttached"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "RegisterSessionEpochConflictRejectedAttached", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Attached"]}
        /\ UnchangedFrame_d2e65ac0b2ee17fd
        /\ model_step_count' = model_step_count + 1
@@ -2600,7 +2600,7 @@ meerkat_RegisterSessionEpochConflictRejectedRunning(arg_session_id, arg_runtime_
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "SessionRegistrationRejected", payload |-> [attempted_runtime_epoch_id |-> packet.payload.runtime_epoch_id, reason |-> "RuntimeEpochConflict", registered_runtime_epoch_id |-> meerkat_active_runtime_epoch_id, session_id |-> packet.payload.session_id, unregister_comms_drain_exit_pending |-> meerkat_unregister_comms_drain_exit_pending, unregister_completion_waiter_drain_pending |-> meerkat_unregister_completion_waiter_drain_pending, unregister_runtime_loop_drain_pending |-> meerkat_unregister_runtime_loop_drain_pending], effect_id |-> (model_step_count + 1), source_transition |-> "RegisterSessionEpochConflictRejectedRunning"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "SessionRegistrationRejected", payload |-> [attempted_runtime_epoch_id |-> packet.payload.runtime_epoch_id, reason |-> "RuntimeEpochConflict", registered_runtime_epoch_id |-> meerkat_active_runtime_epoch_id, session_id |-> packet.payload.session_id], effect_id |-> (model_step_count + 1), source_transition |-> "RegisterSessionEpochConflictRejectedRunning"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "RegisterSessionEpochConflictRejectedRunning", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Running"]}
        /\ UnchangedFrame_d2e65ac0b2ee17fd
        /\ model_step_count' = model_step_count + 1
@@ -2623,113 +2623,8 @@ meerkat_RegisterSessionEpochConflictRejectedRetired(arg_session_id, arg_runtime_
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "SessionRegistrationRejected", payload |-> [attempted_runtime_epoch_id |-> packet.payload.runtime_epoch_id, reason |-> "RuntimeEpochConflict", registered_runtime_epoch_id |-> meerkat_active_runtime_epoch_id, session_id |-> packet.payload.session_id, unregister_comms_drain_exit_pending |-> meerkat_unregister_comms_drain_exit_pending, unregister_completion_waiter_drain_pending |-> meerkat_unregister_completion_waiter_drain_pending, unregister_runtime_loop_drain_pending |-> meerkat_unregister_runtime_loop_drain_pending], effect_id |-> (model_step_count + 1), source_transition |-> "RegisterSessionEpochConflictRejectedRetired"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "SessionRegistrationRejected", payload |-> [attempted_runtime_epoch_id |-> packet.payload.runtime_epoch_id, reason |-> "RuntimeEpochConflict", registered_runtime_epoch_id |-> meerkat_active_runtime_epoch_id, session_id |-> packet.payload.session_id], effect_id |-> (model_step_count + 1), source_transition |-> "RegisterSessionEpochConflictRejectedRetired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "RegisterSessionEpochConflictRejectedRetired", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Retired"]}
-       /\ UnchangedFrame_d2e65ac0b2ee17fd
-       /\ model_step_count' = model_step_count + 1
-
-
-meerkat_RegisterSessionRefusedUnregisterDrainingIdle(arg_session_id, arg_runtime_epoch_id) ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "meerkat"
-       /\ packet.variant = "RegisterSession"
-       /\ packet.payload.session_id = arg_session_id
-       /\ packet.payload.runtime_epoch_id = arg_runtime_epoch_id
-       /\ ~HigherPriorityReady("meerkat_kernel")
-       /\ meerkat_phase = "Idle"
-       /\ (meerkat_registration_phase = "Draining")
-       /\ meerkat_phase' = "Idle"
-       /\ UnchangedFrame_cbead9e7e431aa67
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "SessionRegistrationRejected", payload |-> [attempted_runtime_epoch_id |-> packet.payload.runtime_epoch_id, reason |-> "UnregisterTeardownInProgress", registered_runtime_epoch_id |-> meerkat_active_runtime_epoch_id, session_id |-> packet.payload.session_id, unregister_comms_drain_exit_pending |-> meerkat_unregister_comms_drain_exit_pending, unregister_completion_waiter_drain_pending |-> meerkat_unregister_completion_waiter_drain_pending, unregister_runtime_loop_drain_pending |-> meerkat_unregister_runtime_loop_drain_pending], effect_id |-> (model_step_count + 1), source_transition |-> "RegisterSessionRefusedUnregisterDrainingIdle"] }
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "RegisterSessionRefusedUnregisterDrainingIdle", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Idle"]}
-       /\ UnchangedFrame_d2e65ac0b2ee17fd
-       /\ model_step_count' = model_step_count + 1
-
-
-meerkat_RegisterSessionRefusedUnregisterDrainingAttached(arg_session_id, arg_runtime_epoch_id) ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "meerkat"
-       /\ packet.variant = "RegisterSession"
-       /\ packet.payload.session_id = arg_session_id
-       /\ packet.payload.runtime_epoch_id = arg_runtime_epoch_id
-       /\ ~HigherPriorityReady("meerkat_kernel")
-       /\ meerkat_phase = "Attached"
-       /\ (meerkat_registration_phase = "Draining")
-       /\ meerkat_phase' = "Attached"
-       /\ UnchangedFrame_cbead9e7e431aa67
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "SessionRegistrationRejected", payload |-> [attempted_runtime_epoch_id |-> packet.payload.runtime_epoch_id, reason |-> "UnregisterTeardownInProgress", registered_runtime_epoch_id |-> meerkat_active_runtime_epoch_id, session_id |-> packet.payload.session_id, unregister_comms_drain_exit_pending |-> meerkat_unregister_comms_drain_exit_pending, unregister_completion_waiter_drain_pending |-> meerkat_unregister_completion_waiter_drain_pending, unregister_runtime_loop_drain_pending |-> meerkat_unregister_runtime_loop_drain_pending], effect_id |-> (model_step_count + 1), source_transition |-> "RegisterSessionRefusedUnregisterDrainingAttached"] }
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "RegisterSessionRefusedUnregisterDrainingAttached", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Attached"]}
-       /\ UnchangedFrame_d2e65ac0b2ee17fd
-       /\ model_step_count' = model_step_count + 1
-
-
-meerkat_RegisterSessionRefusedUnregisterDrainingRunning(arg_session_id, arg_runtime_epoch_id) ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "meerkat"
-       /\ packet.variant = "RegisterSession"
-       /\ packet.payload.session_id = arg_session_id
-       /\ packet.payload.runtime_epoch_id = arg_runtime_epoch_id
-       /\ ~HigherPriorityReady("meerkat_kernel")
-       /\ meerkat_phase = "Running"
-       /\ (meerkat_registration_phase = "Draining")
-       /\ meerkat_phase' = "Running"
-       /\ UnchangedFrame_cbead9e7e431aa67
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "SessionRegistrationRejected", payload |-> [attempted_runtime_epoch_id |-> packet.payload.runtime_epoch_id, reason |-> "UnregisterTeardownInProgress", registered_runtime_epoch_id |-> meerkat_active_runtime_epoch_id, session_id |-> packet.payload.session_id, unregister_comms_drain_exit_pending |-> meerkat_unregister_comms_drain_exit_pending, unregister_completion_waiter_drain_pending |-> meerkat_unregister_completion_waiter_drain_pending, unregister_runtime_loop_drain_pending |-> meerkat_unregister_runtime_loop_drain_pending], effect_id |-> (model_step_count + 1), source_transition |-> "RegisterSessionRefusedUnregisterDrainingRunning"] }
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "RegisterSessionRefusedUnregisterDrainingRunning", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Running"]}
-       /\ UnchangedFrame_d2e65ac0b2ee17fd
-       /\ model_step_count' = model_step_count + 1
-
-
-meerkat_RegisterSessionRefusedUnregisterDrainingRetired(arg_session_id, arg_runtime_epoch_id) ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "meerkat"
-       /\ packet.variant = "RegisterSession"
-       /\ packet.payload.session_id = arg_session_id
-       /\ packet.payload.runtime_epoch_id = arg_runtime_epoch_id
-       /\ ~HigherPriorityReady("meerkat_kernel")
-       /\ meerkat_phase = "Retired"
-       /\ (meerkat_registration_phase = "Draining")
-       /\ meerkat_phase' = "Retired"
-       /\ UnchangedFrame_cbead9e7e431aa67
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "SessionRegistrationRejected", payload |-> [attempted_runtime_epoch_id |-> packet.payload.runtime_epoch_id, reason |-> "UnregisterTeardownInProgress", registered_runtime_epoch_id |-> meerkat_active_runtime_epoch_id, session_id |-> packet.payload.session_id, unregister_comms_drain_exit_pending |-> meerkat_unregister_comms_drain_exit_pending, unregister_completion_waiter_drain_pending |-> meerkat_unregister_completion_waiter_drain_pending, unregister_runtime_loop_drain_pending |-> meerkat_unregister_runtime_loop_drain_pending], effect_id |-> (model_step_count + 1), source_transition |-> "RegisterSessionRefusedUnregisterDrainingRetired"] }
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "RegisterSessionRefusedUnregisterDrainingRetired", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Retired"]}
-       /\ UnchangedFrame_d2e65ac0b2ee17fd
-       /\ model_step_count' = model_step_count + 1
-
-
-meerkat_RegisterSessionRefusedUnregisterDrainingStopped(arg_session_id, arg_runtime_epoch_id) ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "meerkat"
-       /\ packet.variant = "RegisterSession"
-       /\ packet.payload.session_id = arg_session_id
-       /\ packet.payload.runtime_epoch_id = arg_runtime_epoch_id
-       /\ ~HigherPriorityReady("meerkat_kernel")
-       /\ meerkat_phase = "Stopped"
-       /\ (meerkat_registration_phase = "Draining")
-       /\ meerkat_phase' = "Stopped"
-       /\ UnchangedFrame_cbead9e7e431aa67
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "SessionRegistrationRejected", payload |-> [attempted_runtime_epoch_id |-> packet.payload.runtime_epoch_id, reason |-> "UnregisterTeardownInProgress", registered_runtime_epoch_id |-> meerkat_active_runtime_epoch_id, session_id |-> packet.payload.session_id, unregister_comms_drain_exit_pending |-> meerkat_unregister_comms_drain_exit_pending, unregister_completion_waiter_drain_pending |-> meerkat_unregister_completion_waiter_drain_pending, unregister_runtime_loop_drain_pending |-> meerkat_unregister_runtime_loop_drain_pending], effect_id |-> (model_step_count + 1), source_transition |-> "RegisterSessionRefusedUnregisterDrainingStopped"] }
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "RegisterSessionRefusedUnregisterDrainingStopped", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Stopped"]}
        /\ UnchangedFrame_d2e65ac0b2ee17fd
        /\ model_step_count' = model_step_count + 1
 
@@ -91516,11 +91411,6 @@ EntryPacketAdmissible_meerkat(packet) ==
     \/ /\ (packet.variant = "RegisterSession") /\ (meerkat_phase = "Attached") /\ ((meerkat_registration_phase # "Draining")) /\ ((meerkat_session_id = Some(packet.payload.session_id))) /\ ((meerkat_active_runtime_epoch_id # packet.payload.runtime_epoch_id))
     \/ /\ (packet.variant = "RegisterSession") /\ (meerkat_phase = "Running") /\ ((meerkat_registration_phase # "Draining")) /\ ((meerkat_session_id = Some(packet.payload.session_id))) /\ ((meerkat_active_runtime_epoch_id # packet.payload.runtime_epoch_id))
     \/ /\ (packet.variant = "RegisterSession") /\ (meerkat_phase = "Retired") /\ ((meerkat_registration_phase # "Draining")) /\ ((meerkat_session_id = Some(packet.payload.session_id))) /\ ((meerkat_active_runtime_epoch_id # packet.payload.runtime_epoch_id))
-    \/ /\ (packet.variant = "RegisterSession") /\ (meerkat_phase = "Idle") /\ ((meerkat_registration_phase = "Draining"))
-    \/ /\ (packet.variant = "RegisterSession") /\ (meerkat_phase = "Attached") /\ ((meerkat_registration_phase = "Draining"))
-    \/ /\ (packet.variant = "RegisterSession") /\ (meerkat_phase = "Running") /\ ((meerkat_registration_phase = "Draining"))
-    \/ /\ (packet.variant = "RegisterSession") /\ (meerkat_phase = "Retired") /\ ((meerkat_registration_phase = "Draining"))
-    \/ /\ (packet.variant = "RegisterSession") /\ (meerkat_phase = "Stopped") /\ ((meerkat_registration_phase = "Draining"))
     \/ /\ (packet.variant = "RegisterSession") /\ (meerkat_phase = "Stopped") /\ ((meerkat_session_id = Some(packet.payload.session_id))) /\ ((meerkat_registration_phase # "Draining"))
     \/ /\ (packet.variant = "RegisterSession") /\ (meerkat_phase = "Stopped") /\ ((meerkat_session_id # Some(packet.payload.session_id))) /\ ((meerkat_registration_phase # "Draining"))
     \/ /\ (packet.variant = "StageDeferredSession") /\ (meerkat_phase = "Initializing") /\ ((meerkat_staged_session_phase = "NotStaged")) /\ ((meerkat_staged_session_id = None)) /\ ((IF ~(packet.payload.keep_alive) THEN TRUE ELSE packet.payload.has_comms_name))
@@ -95347,11 +95237,6 @@ CoreNext ==
     \/ \E arg_session_id \in SessionIdValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : meerkat_RegisterSessionEpochConflictRejectedAttached(arg_session_id, arg_runtime_epoch_id)
     \/ \E arg_session_id \in SessionIdValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : meerkat_RegisterSessionEpochConflictRejectedRunning(arg_session_id, arg_runtime_epoch_id)
     \/ \E arg_session_id \in SessionIdValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : meerkat_RegisterSessionEpochConflictRejectedRetired(arg_session_id, arg_runtime_epoch_id)
-    \/ \E arg_session_id \in SessionIdValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : meerkat_RegisterSessionRefusedUnregisterDrainingIdle(arg_session_id, arg_runtime_epoch_id)
-    \/ \E arg_session_id \in SessionIdValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : meerkat_RegisterSessionRefusedUnregisterDrainingAttached(arg_session_id, arg_runtime_epoch_id)
-    \/ \E arg_session_id \in SessionIdValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : meerkat_RegisterSessionRefusedUnregisterDrainingRunning(arg_session_id, arg_runtime_epoch_id)
-    \/ \E arg_session_id \in SessionIdValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : meerkat_RegisterSessionRefusedUnregisterDrainingRetired(arg_session_id, arg_runtime_epoch_id)
-    \/ \E arg_session_id \in SessionIdValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : meerkat_RegisterSessionRefusedUnregisterDrainingStopped(arg_session_id, arg_runtime_epoch_id)
     \/ \E arg_session_id \in SessionIdValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : meerkat_RegisterSessionResumesStopped(arg_session_id, arg_runtime_epoch_id)
     \/ \E arg_session_id \in SessionIdValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : meerkat_RegisterSessionNewBindingFromStopped(arg_session_id, arg_runtime_epoch_id)
     \/ \E arg_session_id \in SessionIdValues : \E arg_keep_alive \in BOOLEAN : \E arg_has_comms_name \in BOOLEAN : \E arg_llm_identity \in SessionLlmIdentityValues : \E arg_machine_archived_resume_authorized \in BOOLEAN : meerkat_StageDeferredSession(arg_session_id, arg_keep_alive, arg_has_comms_name, arg_llm_identity, arg_machine_archived_resume_authorized)

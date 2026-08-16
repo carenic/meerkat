@@ -1549,18 +1549,20 @@ impl MeerkatMachine {
         }
     }
 
+    pub(super) async fn register_session_inner(
+        &self,
+        session_id: SessionId,
+    ) -> Result<RegisterSessionInnerOutcome, RuntimeDriverError> {
+        self.register_session_inner_with_materialization_origin(session_id, None)
+            .await
+    }
+
     pub(super) async fn register_session_inner_for_actor_materialization(
         &self,
         session_id: SessionId,
         claim_state: Arc<std::sync::Mutex<crate::RuntimeActorMaterializationClaimState>>,
     ) -> Result<bool, RuntimeDriverError> {
-        // Settle a cold-recovered unregister drain before reporting the
-        // registration. Collapsing the witness to a bool here (as this did
-        // through 0.8.23) hid `InsertedColdRecoveredDraining` from actor
-        // materialization, which then staged RegisterSession into a Draining
-        // authority and got a bare guard rejection - the permanent
-        // resume wedge.
-        self.register_session_settling_cold_recovered_drain(&session_id, Some(claim_state))
+        self.register_session_inner_with_materialization_origin(session_id, Some(claim_state))
             .await
             .map(RegisterSessionInnerOutcome::inserted)
     }
@@ -2421,82 +2423,6 @@ impl MeerkatMachine {
                 Ok(RegisterSessionInnerOutcome::Inserted)
             }
         }
-    }
-
-    /// Register, concluding a cold-recovered unregister drain window first.
-    ///
-    /// A `Draining` image reconstructed from the durable unregister retry
-    /// record names producer obligations that belonged to a process which is
-    /// gone; `UnregisterTeardownMechanicalObservations::
-    /// from_durable_process_recovery` already records closing them as a
-    /// forced, process-loss disposition rather than clean quiescence. So the
-    /// escape from `Draining` is to CONCLUDE the teardown through its owning
-    /// authority, never to re-admit past open obligations: the three drain
-    /// feedback inputs are each guarded on `unregister_draining`, so moving
-    /// `registration_phase` off `Draining` while any obligation is open would
-    /// make a late producer's own completion unroutable.
-    ///
-    /// Through 0.8.23 no caller concluded it. A first turn that failed
-    /// terminally left the CLI unable to finish teardown, and every later
-    /// registration - resume included - was guard-rejected by construction,
-    /// which is why an incomplete cleanup read as a permanent verdict on the
-    /// session. This is the same settlement `ensure_runtime_executor_attachment`
-    /// already performs through `ExistingExecutorClaim::JoinUnregister`; it is
-    /// reused, not reimplemented.
-    ///
-    /// Called with NO session mutation gate held: the teardown takes the
-    /// session registration transaction and the exact mutation gate itself.
-    pub(super) async fn register_session_settling_cold_recovered_drain(
-        &self,
-        session_id: &SessionId,
-        materialization_claim_state: Option<
-            Arc<std::sync::Mutex<crate::RuntimeActorMaterializationClaimState>>,
-        >,
-    ) -> Result<RegisterSessionInnerOutcome, RuntimeDriverError> {
-        let outcome = self
-            .register_session_inner_with_materialization_origin(
-                session_id.clone(),
-                materialization_claim_state.clone(),
-            )
-            .await?;
-        if outcome != RegisterSessionInnerOutcome::InsertedColdRecoveredDraining {
-            return Ok(outcome);
-        }
-        let epoch_id = {
-            let sessions = self.sessions.read().await;
-            sessions
-                .get(session_id)
-                .map(|entry| entry.epoch_id.clone())
-                .ok_or(RuntimeDriverError::NotReady {
-                    state: RuntimeState::Destroyed,
-                })?
-        };
-        self.join_or_start_unregister_teardown_with_admission(
-            session_id,
-            Some(&epoch_id),
-            UnregisterTeardownCaller::Explicit,
-            UnregisterTeardownAdmission::AnyCurrentRegistration,
-            None,
-            UnregisterTeardownWait::UntilTerminal,
-        )
-        .await?;
-        // The settled teardown removed the exact entry, so this registration
-        // starts on a fresh authority. One retry only: a second cold-recovered
-        // drain here would mean the settlement did not remove what it just
-        // concluded, which is an authority defect and not something to spin on.
-        let readmitted = self
-            .register_session_inner_with_materialization_origin(
-                session_id.clone(),
-                materialization_claim_state,
-            )
-            .await?;
-        if readmitted == RegisterSessionInnerOutcome::InsertedColdRecoveredDraining {
-            return Err(RuntimeDriverError::Internal(format!(
-                "session {session_id} re-entered a cold-recovered unregister drain window \
-                 immediately after its teardown was concluded"
-            )));
-        }
-        Ok(readmitted)
     }
 
     pub(super) async fn unregister_session_inner_if_epoch(

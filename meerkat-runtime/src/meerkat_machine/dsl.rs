@@ -3130,9 +3130,6 @@ pub enum OpRegistrationRejectReasonKind {
 pub enum SessionRegistrationRejectReasonKind {
     #[default]
     RuntimeEpochConflict,
-    /// The entry is inside its two-phase unregister drain window. Retryable:
-    /// the caller may join or settle the owning teardown and register again.
-    UnregisterTeardownInProgress,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]

@@ -1137,46 +1137,6 @@ RegisterSessionEpochConflictRejectedRetired(arg_session_id, runtime_epoch_id) ==
     /\ UnchangedFrame_011502f7a27026ba
 
 
-RegisterSessionRefusedUnregisterDrainingIdle(arg_session_id, runtime_epoch_id) ==
-    /\ phase = "Idle"
-    /\ (registration_phase = "Draining")
-    /\ phase' = "Idle"
-    /\ model_step_count' = model_step_count + 1
-    /\ UnchangedFrame_011502f7a27026ba
-
-
-RegisterSessionRefusedUnregisterDrainingAttached(arg_session_id, runtime_epoch_id) ==
-    /\ phase = "Attached"
-    /\ (registration_phase = "Draining")
-    /\ phase' = "Attached"
-    /\ model_step_count' = model_step_count + 1
-    /\ UnchangedFrame_011502f7a27026ba
-
-
-RegisterSessionRefusedUnregisterDrainingRunning(arg_session_id, runtime_epoch_id) ==
-    /\ phase = "Running"
-    /\ (registration_phase = "Draining")
-    /\ phase' = "Running"
-    /\ model_step_count' = model_step_count + 1
-    /\ UnchangedFrame_011502f7a27026ba
-
-
-RegisterSessionRefusedUnregisterDrainingRetired(arg_session_id, runtime_epoch_id) ==
-    /\ phase = "Retired"
-    /\ (registration_phase = "Draining")
-    /\ phase' = "Retired"
-    /\ model_step_count' = model_step_count + 1
-    /\ UnchangedFrame_011502f7a27026ba
-
-
-RegisterSessionRefusedUnregisterDrainingStopped(arg_session_id, runtime_epoch_id) ==
-    /\ phase = "Stopped"
-    /\ (registration_phase = "Draining")
-    /\ phase' = "Stopped"
-    /\ model_step_count' = model_step_count + 1
-    /\ UnchangedFrame_011502f7a27026ba
-
-
 RegisterSessionResumesStopped(arg_session_id, runtime_epoch_id) ==
     /\ phase = "Stopped"
     /\ (session_id = Some(arg_session_id))
@@ -26503,11 +26463,6 @@ Next ==
     \/ \E arg_session_id \in SessionIdValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : RegisterSessionEpochConflictRejectedAttached(arg_session_id, runtime_epoch_id)
     \/ \E arg_session_id \in SessionIdValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : RegisterSessionEpochConflictRejectedRunning(arg_session_id, runtime_epoch_id)
     \/ \E arg_session_id \in SessionIdValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : RegisterSessionEpochConflictRejectedRetired(arg_session_id, runtime_epoch_id)
-    \/ \E arg_session_id \in SessionIdValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : RegisterSessionRefusedUnregisterDrainingIdle(arg_session_id, runtime_epoch_id)
-    \/ \E arg_session_id \in SessionIdValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : RegisterSessionRefusedUnregisterDrainingAttached(arg_session_id, runtime_epoch_id)
-    \/ \E arg_session_id \in SessionIdValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : RegisterSessionRefusedUnregisterDrainingRunning(arg_session_id, runtime_epoch_id)
-    \/ \E arg_session_id \in SessionIdValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : RegisterSessionRefusedUnregisterDrainingRetired(arg_session_id, runtime_epoch_id)
-    \/ \E arg_session_id \in SessionIdValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : RegisterSessionRefusedUnregisterDrainingStopped(arg_session_id, runtime_epoch_id)
     \/ \E arg_session_id \in SessionIdValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : RegisterSessionResumesStopped(arg_session_id, runtime_epoch_id)
     \/ \E arg_session_id \in SessionIdValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : RegisterSessionNewBindingFromStopped(arg_session_id, runtime_epoch_id)
     \/ \E arg_session_id \in SessionIdValues : \E keep_alive \in BOOLEAN : \E has_comms_name \in BOOLEAN : \E llm_identity \in SessionLlmIdentityValues : \E machine_archived_resume_authorized \in BOOLEAN : StageDeferredSession(arg_session_id, keep_alive, has_comms_name, llm_identity, machine_archived_resume_authorized)
