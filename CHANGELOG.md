@@ -23,6 +23,38 @@ via cargo-semver-checks against the published baselines).
 
 ### Added
 
+- **`runtime/health` measures `session_liveness` on both surfaces** - the
+  dimension 0.8.23 shipped honestly unmeasured, closed by the incident that
+  proved it out: a household member wrote no transcript row for five days,
+  resumed ACTIVE on every boot, and read 17/17 green on every board, because
+  every existing probe measured registration state while the wedge lived in
+  lane truth. The new probe reports `degraded` while any registered session is
+  PARKED ON QUEUED WORK, on either of two axes, both requiring the executor
+  registration `Active` and no run in flight. The AGED axis: an input in the
+  machine's queued phase whose `updated_at` - the instant it entered its
+  current state - is older than the notice bound (120s, deliberately the same
+  constant as `session_run_start` so "overdue" means one thing across the
+  pipeline). The STAGE-CHURN axis: an input the machine has staged and rolled
+  back at least twice (`input_attempt_counts`, the DSL's own count) that is
+  queued again, with a `created_at` floor of the same bound. The second axis
+  exists because the first is structurally defeated by exactly the state it
+  most needs to see: every Staged -> Queued rollback re-stamps `updated_at`,
+  so an input flapping through stage -> fail -> rollback faster than the
+  bound reads as forever-fresh on the age axis - and the flapping member is
+  the more alarming one. Queued work behind a live turn is a backlog, not a
+  wedge, and is never counted; a session whose registration cannot stage
+  anything is not accused of failing to. The verdict is recomputed per scrape
+  from existing owners only - machine lane truth (`input_phases`,
+  `input_attempt_counts`) and the ledger's per-input clocks; no new state
+  exists anywhere for this probe, so there is nothing to go stale. Both reads
+  are non-blocking tries taken strictly in sequence, never nested; a miss on
+  either publishes `unreadable:session_liveness`, never a rung. With this,
+  every declared dimension is measured on the RPC surface (REST still
+  publishes `unmeasured:jobs`), and the remaining coverage boundary is stated
+  in the handler doc rather than left to be discovered: a turn that BEGINS and
+  then produces nothing (mid-turn progress) is a distinct dimension with no
+  probe and no declared name yet.
+
 - **`runtime/health` measures `session_run_start` on both surfaces** (JSON-RPC
   `runtime/health` and REST `GET /runtime/health`): `degraded` while any
   registered session holds a staged run that is overdue to begin executing -
@@ -32,13 +64,19 @@ via cargo-semver-checks against the published baselines).
   scrape via the same classification the staged-run watchdog logs, so the wire
   claim and that log line cannot disagree; there is no latched flag anywhere,
   which is what makes a stale window degrade to clear instead of into a false
-  or missing alarm. Runs whose execution start is honestly unobservable (the
-  appends-empty and retired-drain classes, or an unbound runtime) are never
-  counted, matching the watchdog's own refusal to escalate them. A past-bound
-  window whose authority cannot be read without blocking publishes
-  `unreadable:session_run_start` rather than a rung - the holder of that
-  authority is the prime suspect for the wedge itself, so "could not look" must
-  reach the operator instead of rolling up as `ok`. The observation is
+  or missing alarm. A window whose run is no longer current is positively
+  resolved and never counted - including the appends-empty and retired-drain
+  classes that never signal a turn start, whose stale windows must not stand a
+  healthy idle session amber. A past-bound window whose run IS still current
+  but cannot be interpreted (unbound runtime, unsignalled turn start), or
+  whose authority cannot be read without blocking, publishes
+  `unreadable:session_run_start` rather than a rung: an absence of observation
+  may not publish as health, and the holder of an unreadable authority is the
+  prime suspect for the wedge itself, so "could not look" must reach the
+  operator instead of rolling up as `ok`. (The watchdog's own refusal to
+  ESCALATE on unobservable classes is deliberately not copied here - dropping
+  an apply future on an unproven condition is forbidden, but health has no
+  such constraint and the opposite duty.) The observation is
   mechanical and read-only by declared contract: the moment anything other
   than the health census branches on it, it becomes a semantic fact needing a
   machine owner, and a source-grep test

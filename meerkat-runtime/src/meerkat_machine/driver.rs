@@ -3795,6 +3795,14 @@ impl DriverEntry {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_input_state_for_test(&mut self, state: crate::input_state::InputState) {
+        match self {
+            DriverEntry::Ephemeral(d) => d.insert_input_state_for_test(state),
+            DriverEntry::Persistent(d) => d.inner_mut().insert_input_state_for_test(state),
+        }
+    }
+
     pub(crate) fn ledger(&self) -> &crate::input_ledger::InputLedger {
         match self {
             DriverEntry::Ephemeral(d) => d.ledger(),

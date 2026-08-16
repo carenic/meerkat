@@ -3030,6 +3030,16 @@ impl SessionRuntime {
         self.runtime_adapter.overdue_run_start_session_count()
     }
 
+    /// Sessions parked on queued work: input in the machine's queued phase
+    /// past the notice bound, registration `Active`, no run in flight.
+    ///
+    /// Pass-through to the runtime adapter, which is private to this type.
+    /// `None` carries the same report-it-as-unreadable obligation as its
+    /// siblings.
+    pub(crate) fn parked_queued_input_session_count(&self) -> Option<usize> {
+        self.runtime_adapter.parked_queued_input_session_count()
+    }
+
     /// Active instance id for this runtime, if configured.
     pub fn instance_id(&self) -> Option<String> {
         self.inner.instance_id()

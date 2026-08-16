@@ -4388,6 +4388,24 @@ impl RuntimeSessionEntry {
         )
     }
 
+    /// Recompute this session's parked-queued-work health from machine lane
+    /// truth plus the ledger's per-input clock.
+    ///
+    /// Nothing is latched and no new state exists for this probe at all: both
+    /// halves of the predicate live in structures this entry already owns
+    /// (the generated authority for lane truth, the driver's ledger for
+    /// timestamps), each read with a non-blocking try in strict sequence. See
+    /// [`crate::run_progress::observe_parked_queued_work`] for the locking
+    /// story and the void condition.
+    fn parked_queued_work_health(&self) -> crate::run_progress::ParkedQueuedWorkHealth {
+        crate::run_progress::observe_parked_queued_work(
+            &self.dsl_authority,
+            &self.driver,
+            crate::run_progress::QUEUED_INPUT_START_NOTICE,
+            chrono::Utc::now(),
+        )
+    }
+
     fn generated_executor_registration_has_viable_attachment(&self) -> bool {
         self.generated_executor_registration_active()
             && match &self.attachment_slot {
@@ -4864,6 +4882,54 @@ impl MeerkatMachine {
             None
         } else {
             Some(overdue)
+        }
+    }
+
+    /// How many registered sessions hold queued work they have parked: input
+    /// in the machine's queued phase older than
+    /// [`crate::run_progress::QUEUED_INPUT_START_NOTICE`], with the executor
+    /// registration `Active` and no run in flight.
+    ///
+    /// This is the PRE-staging census - the class where a session resumes
+    /// cleanly, keeps its loop alive, and simply never starts the work it was
+    /// handed, which under `queue_mode: fifo` is a total outage for that
+    /// session. Its post-staging sibling is
+    /// [`Self::overdue_run_start_session_count`]; between them the pipeline
+    /// from admission to first primitive application is covered. What NEITHER
+    /// sees is a turn that begins and then produces nothing after
+    /// `PrimitiveApplied` - mid-turn progress is a separate dimension with no
+    /// probe yet, and no caller may read this count as covering it.
+    ///
+    /// `None` carries the same meaning and obligation as on its siblings: the
+    /// registry, a session's authority, or a session's driver ledger was not
+    /// readable, and nothing was positively parked - so a health caller must
+    /// publish the failed read rather than a zero nobody measured. The
+    /// per-entry miss propagates (rather than counting, as the dead-shell
+    /// probe does) for the same reason as the run-start census: nothing here
+    /// is established lock-free first, and a queued input is also what a
+    /// healthy just-admitted input looks like, so counting an unread entry
+    /// would assert a wedge nobody observed. When some other session IS
+    /// positively parked, the observed fault wins and publishes.
+    ///
+    /// Not `async` on purpose, like its siblings: every lock this touches is
+    /// a non-blocking try (including the driver's `tokio` mutex, whose
+    /// `try_lock` is synchronous), so the signature proves the probe cannot
+    /// park behind the wedge it is trying to report.
+    pub fn parked_queued_input_session_count(&self) -> Option<usize> {
+        let sessions = self.sessions.try_read().ok()?;
+        let mut parked = 0_usize;
+        let mut entry_unreadable = false;
+        for entry in sessions.values() {
+            match entry.parked_queued_work_health() {
+                crate::run_progress::ParkedQueuedWorkHealth::Parked(_) => parked += 1,
+                crate::run_progress::ParkedQueuedWorkHealth::Unreadable => entry_unreadable = true,
+                crate::run_progress::ParkedQueuedWorkHealth::Clear => {}
+            }
+        }
+        if parked == 0 && entry_unreadable {
+            None
+        } else {
+            Some(parked)
         }
     }
 

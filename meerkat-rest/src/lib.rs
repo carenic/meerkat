@@ -3855,8 +3855,8 @@ fn rest_observed_session_population(
 
 /// What THIS surface's probes established about runtime host health.
 ///
-/// REST reads the three session dimensions straight off the `MeerkatMachine`
-/// it already holds; all three accessors are synchronous non-blocking reads,
+/// REST reads the four session dimensions straight off the `MeerkatMachine`
+/// it already holds; all four accessors are synchronous non-blocking reads,
 /// so a health scrape cannot park behind the wedge it is trying to report.
 ///
 /// `jobs` is not probed here. REST holds no `DetachedJobService`, so it is
@@ -3880,6 +3880,12 @@ fn rest_runtime_health(state: &AppState) -> meerkat_contracts::RuntimeHostHealth
             "session_run_start".to_string(),
             rest_observed_session_population(
                 state.runtime_adapter.overdue_run_start_session_count(),
+            ),
+        ),
+        (
+            "session_liveness".to_string(),
+            rest_observed_session_population(
+                state.runtime_adapter.parked_queued_input_session_count(),
             ),
         ),
     ])
@@ -12668,6 +12674,7 @@ mod tests {
             "session_durability",
             "session_runtime_loop",
             "session_run_start",
+            "session_liveness",
         ] {
             assert_eq!(
                 health["checks"][measured], "ok",
@@ -12681,16 +12688,21 @@ mod tests {
             );
         }
         // Unmeasured, and named rather than omitted. REST holds no
-        // `DetachedJobService`, and nothing anywhere observes whether a live
-        // session is progressing.
-        for unmeasured in ["unmeasured:jobs", "unmeasured:session_liveness"] {
-            assert_eq!(
-                health["checks"][unmeasured], "degraded",
-                "GET /runtime/health must name `{unmeasured}` as unmeasured coverage: {health}"
-            );
-        }
+        // `DetachedJobService`, so `jobs` is the one dimension this surface
+        // still cannot probe.
+        assert_eq!(
+            health["checks"]["unmeasured:jobs"], "degraded",
+            "GET /runtime/health must name `unmeasured:jobs` as unmeasured coverage: {health}"
+        );
+        assert!(
+            health["checks"]
+                .get("unmeasured:session_liveness")
+                .is_none(),
+            "session_liveness is measured here now; a leftover unmeasured key \
+             would double-publish the dimension: {health}"
+        );
         // The third coverage vocabulary means a probe ran and could not read.
-        // Both probes answered on this host, so neither may claim it failed.
+        // The probes answered on this host, so none may claim it failed.
         assert!(
             !health["checks"]
                 .as_object()

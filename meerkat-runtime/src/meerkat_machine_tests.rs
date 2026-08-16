@@ -44034,6 +44034,11 @@ async fn health_probes_answer_none_when_the_session_registry_cannot_be_read() {
         None,
         "an unreadable registry is not an empty registry"
     );
+    assert_eq!(
+        machine.parked_queued_input_session_count(),
+        None,
+        "an unreadable registry is not an empty registry"
+    );
     drop(registry_guard);
 
     assert_eq!(
@@ -44054,6 +44059,223 @@ async fn health_probes_answer_none_when_the_session_registry_cannot_be_read() {
         "and the refusal is per-probe, not sticky: it clears the moment the \
          registry is readable again"
     );
+    assert_eq!(
+        machine.parked_queued_input_session_count(),
+        Some(0),
+        "and the refusal is per-probe, not sticky: it clears the moment the \
+         registry is readable again"
+    );
+}
+
+/// The `session_liveness` census end to end: the exact field shape of the
+/// five-day outage. A session that registered cleanly, attached a real
+/// executor (registration `Active`, loop alive, channels open), holds an
+/// input in the machine's queued phase past the notice bound, and is running
+/// nothing. Every prior dimension reads this session as healthy - which is
+/// the point; this one must not.
+///
+/// Also pins the production key correspondence the census relies on: the DSL
+/// keys `input_phases` by `InputId::to_string()`, and the ledger keys rows by
+/// `InputId`, so a real accepted input must be visible to both reads under
+/// the same identity.
+///
+/// Count assertions POLL rather than read once. On this test's current-thread
+/// runtime the post-turn terminal commit can sit parked holding a registry
+/// guard across an await until the test next yields, and a scrape landing on
+/// that instant correctly answers `None` - the per-scrape unreadable blip the
+/// protocol documents, frozen in place by the single-threaded scheduler. The
+/// polls therefore admit `None` as a legal transient and assert two things: a
+/// count other than the expected one is NEVER observed (a `Some(0)` while the
+/// wedge exists would be the real lie), and the expected count arrives.
+#[tokio::test]
+async fn parked_queued_input_session_count_sees_the_five_day_wedge_shape() {
+    /// Poll until the census publishes `expected`, admitting only `None`
+    /// (transient unreadable) on the way; any other count is a wrong reading
+    /// and fails immediately.
+    async fn census_settles_at(machine: &Arc<MeerkatMachine>, expected: usize, claim: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match machine.parked_queued_input_session_count() {
+                    Some(count) if count == expected => break,
+                    Some(count) => {
+                        panic!("census read {count} while exactly {expected} was true: {claim}")
+                    }
+                    None => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("census never settled at {expected}: {claim}"));
+    }
+    let machine = persistent_health_probe_machine();
+    let session_id = SessionId::new();
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    machine
+        .ensure_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+
+    census_settles_at(
+        &machine,
+        0,
+        "a freshly attached session with no work owes nothing",
+    )
+    .await;
+
+    // Key-correspondence pin on a REAL accepted input: the same identity must
+    // appear in the DSL phase map (as `to_string()`) and in the ledger.
+    let (accept_outcome, completion_handle) = machine
+        .accept_input_with_completion(&session_id, make_prompt("parked census key pin"))
+        .await
+        .expect("input should be accepted");
+    assert!(matches!(accept_outcome, AcceptOutcome::Accepted { .. }));
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("registered session entry");
+        // The turn is live, so the loop may legitimately hold the driver;
+        // the TEST waits for it (only the census itself must never block).
+        let driver = entry.driver.lock().await;
+        let ledger_ids: Vec<_> = driver.ledger().iter().map(|(id, _)| id.clone()).collect();
+        assert!(
+            !ledger_ids.is_empty(),
+            "a real accepted input must have a ledger row"
+        );
+        let phase_keys: std::collections::BTreeSet<String> = entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state()
+            .input_phases
+            .keys()
+            .cloned()
+            .collect();
+        for input_id in &ledger_ids {
+            assert!(
+                phase_keys.contains(&input_id.to_string()),
+                "the DSL phase map must key this ledger row as `InputId::to_string()`; \
+                 the parked census depends on that correspondence"
+            );
+        }
+    }
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        completion_handle
+            .expect("accepted input should register a completion waiter")
+            .wait(),
+    )
+    .await
+    .expect("completion waiter should resolve")
+    .expect("the noop turn should complete");
+    census_settles_at(&machine, 0, "a consumed input is not parked work").await;
+
+    // Manufacture the wedge: a queued phase entry in the shared authority
+    // (written through the same recover path production uses for projection
+    // previews) paired with a ledger row whose clock is past the bound. The
+    // session's real registration stays Active and no run is in flight -
+    // exactly the field state.
+    let parked_input = meerkat_core::lifecycle::InputId::new();
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("registered session entry");
+        {
+            // Post-turn bookkeeping may still hold the driver briefly; the
+            // fixture waits for it rather than racing it.
+            let mut driver = entry.driver.lock().await;
+            let mut state = crate::input_state::InputState::new_accepted(parked_input.clone());
+            state.updated_at = chrono::Utc::now() - chrono::Duration::seconds(3_660);
+            driver.insert_input_state_for_test(state);
+        }
+        let mut state = entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state()
+            .clone();
+        assert_eq!(
+            state.registration_phase,
+            mm_dsl::RegistrationPhase::Active,
+            "the fixture is only the field shape if registration is genuinely Active"
+        );
+        assert!(
+            state.current_run_id.is_none(),
+            "the fixture is only the field shape if nothing is running"
+        );
+        state
+            .input_phases
+            .insert(parked_input.to_string(), mm_dsl::InputPhase::Queued);
+        state
+            .input_lane
+            .insert(parked_input.to_string(), mm_dsl::InputLane::Queue);
+        *entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            crate::meerkat_machine::recover_projected_authority(
+                state,
+                "parked census state must recover",
+            );
+    }
+    census_settles_at(
+        &machine,
+        1,
+        "an Active session holding hour-old queued work while running nothing \
+         is exactly what this accessor exists to report",
+    )
+    .await;
+
+    // Both unreadable directions, at the accessor level: each of the two
+    // locks the probe reads, held the way the wedged party holds it, must
+    // propagate as None - never block, never publish a rung nobody read.
+    {
+        let authority = {
+            let sessions = machine.sessions.read().await;
+            Arc::clone(
+                &sessions
+                    .get(&session_id)
+                    .expect("registered session entry")
+                    .dsl_authority,
+            )
+        };
+        let held = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            machine.parked_queued_input_session_count(),
+            None,
+            "a held authority with nothing positively parked elsewhere must \
+             propagate as unreadable"
+        );
+        drop(held);
+    }
+    {
+        let driver = {
+            let sessions = machine.sessions.read().await;
+            Arc::clone(
+                &sessions
+                    .get(&session_id)
+                    .expect("registered session entry")
+                    .driver,
+            )
+        };
+        let held = driver.lock().await;
+        assert_eq!(
+            machine.parked_queued_input_session_count(),
+            None,
+            "a held driver ledger with nothing positively parked elsewhere \
+             must propagate as unreadable"
+        );
+        drop(held);
+    }
+    census_settles_at(
+        &machine,
+        1,
+        "and the refusal is per-probe, not sticky: the wedge is visible again \
+         the moment both locks are readable",
+    )
+    .await;
 }
 
 /// The loop-side arming pin for `session_run_start`: a real turn through the
