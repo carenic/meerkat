@@ -62792,6 +62792,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::FlowStepDispatchRejected { kind, .. } => {
             format!("flow_step_dispatch_rejected:{kind}")
         }
+        MobError::ParticipantNameOccupied {
+            participant_name, ..
+        } => format!("participant_name_occupied:{participant_name}"),
     }
 }
 

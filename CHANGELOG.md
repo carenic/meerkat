@@ -13,6 +13,37 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+### Breaking
+
+- Three `meerkat-mob` error enums gain a `ParticipantNameOccupied {
+  participant_name: String, holder_pubkey: meerkat_comms::PubKey }` variant.
+  NONE of the three is `#[non_exhaustive]`, so any downstream `match` without a
+  wildcard arm stops compiling:
+  - `meerkat_mob::MobError` (also `meerkat_mob::error::MobError`)
+  - `meerkat_mob::runtime::host_actor::MobHostActorError`
+  - `meerkat_mob::runtime::host_materialize::MaterializeServeError`
+- BEHAVIOUR-ONLY, NO TOOL WILL CATCH THIS: the three publish/construct sites
+  that previously flattened a comms name-occupancy refusal into a string now
+  return the typed variant instead, so the OLD MESSAGE TEXT IS GONE. Code that
+  matched prose must match the variant.
+  - `MobError::Internal("failed to publish prepared mob supervisor comms
+    runtime: ...")` (supervisor bridge publish)
+  - `MobHostActorError::Comms { detail: "failed to construct host comms runtime
+    '<name>': ..." }` (host comms runtime construction)
+  - `MaterializeServeError::Comms { detail: <CommsRuntimeError display> }`
+    (member materialize)
+
+  Only the name-occupancy case changes; every other comms failure still lands
+  on the same string variant it did before. The new message is remedy-first
+  ("retire the incumbent ... before publishing this name again") and explicitly
+  disclaims the crypto reading that the 0.8.23 wording invited.
+- NOT changed: `MaterializeServeError::wire_cause()` still projects the
+  name-occupancy case to `BridgeRejectionCause::Internal`, exactly as the
+  flattened `Comms` variant did. Remote bridge controllers see no wire change;
+  the typed fact is available to in-process embedders only. Minting a dedicated
+  `BridgeRejectionCause` is a `meerkat-contracts` change and was deliberately
+  left out of this item.
+
 ## [0.8.23] - 2026-08-16
 
 ### Breaking

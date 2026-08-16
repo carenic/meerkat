@@ -2046,6 +2046,14 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         // required ControlScope, so the spawn was refused at admission — the
         // same denied-admission family as SpawnMemberAdmissionDenied above.
         MobError::ScopeDenied(_) => mob_dsl::MobSpawnManyFailureObservationKind::InvalidTransition,
+        // Comms participant-name occupancy is refused when a supervisor
+        // bridge or host runtime publishes its route, never on a spawn-many
+        // row (spawn-many provisioning publishes no participant name). Classify
+        // as Internal to keep the match total, rather than laundering it into
+        // CommsError and inventing a spawn cause MobMachine never observed.
+        MobError::ParticipantNameOccupied { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::Internal
+        }
     }
 }
 

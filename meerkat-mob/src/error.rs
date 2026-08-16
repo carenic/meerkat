@@ -709,9 +709,79 @@ pub enum MobError {
         kind: FlowStepDispatchRejectKind,
     },
 
+    /// Publishing a comms participant name was refused because a *different*
+    /// live public key already holds that route.
+    ///
+    /// `meerkat_comms` owns this fact as
+    /// [`meerkat_comms::RegistrationRejection::NameOccupied`]; this variant
+    /// re-carries the owner's `holder_pubkey` verbatim instead of flattening
+    /// the refusal into `Internal(String)` and forcing embedders to match
+    /// prose. Construct it only from `comms_name_occupancy_holder` (crate
+    /// private), never by inference from an error's display text.
+    ///
+    /// Deliberate non-mappings: this variant has no
+    /// [`Self::wire_detail`]/[`Self::wire_error_code`] projection and no
+    /// [`Self::bridge_rejection_cause`]. There is no wire code today that
+    /// means "participant name held by a live incumbent", and minting one is
+    /// a `meerkat-contracts` change (schema regen + SDK codegen + version
+    /// parity), so surfaces keep their existing rendering with the remedy in
+    /// the message rather than getting a fabricated code.
+    #[error(
+        "{}",
+        participant_name_occupied_message(participant_name, holder_pubkey)
+    )]
+    ParticipantNameOccupied {
+        participant_name: String,
+        holder_pubkey: meerkat_comms::PubKey,
+    },
+
     /// An internal error (unexpected state, logic errors).
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+/// THE single owner of the operator-facing name-occupancy remedy text, shared
+/// by every mob-layer `ParticipantNameOccupied` variant so the three surfaces
+/// cannot drift into three different instructions.
+///
+/// Remedy first, evidence second, and an explicit disclaimer of the reading
+/// that cost an adopter an hour in 0.8.23: a refused claim that names a public
+/// key reads as a crypto/trust failure when it is almost always a second
+/// runtime under the same participant name in one process.
+pub(crate) fn participant_name_occupied_message(
+    participant_name: &str,
+    holder_pubkey: &meerkat_comms::PubKey,
+) -> String {
+    format!(
+        "participant name '{participant_name}' already has a live route held by public key {}; \
+         the incumbent has not released this route, so retire the incumbent (or drop its runtime) \
+         before publishing this name again. The usual cause is a second runtime rendering the same \
+         participant name in one process - commonly leftover state from an earlier build, not a key \
+         or trust failure",
+        holder_pubkey.to_pubkey_string()
+    )
+}
+
+/// Re-carry [`meerkat_comms::RegistrationRejection::NameOccupied`]'s holder key
+/// out of a comms construction/publication failure.
+///
+/// This is the ONLY seam that reads the comms-owned rejection at the mob layer.
+/// Every mob-layer conversion of a `CommsRuntimeError` routes through it, so
+/// the knowledge of the rejection's shape lives in exactly one place and no
+/// call site re-derives occupancy from display text.
+pub(crate) fn comms_name_occupancy_holder(
+    error: &meerkat_comms::CommsRuntimeError,
+) -> Option<meerkat_comms::PubKey> {
+    // `RegistrationRejection` is `#[non_exhaustive]`: an `if let` states that
+    // this seam recognises exactly one shape, where a wildcard match arm would
+    // look total and silently absorb a future rejection kind.
+    if let meerkat_comms::CommsRuntimeError::InprocRegistrationRejected(
+        meerkat_comms::RegistrationRejection::NameOccupied { holder_pubkey },
+    ) = error
+    {
+        return Some(*holder_pubkey);
+    }
+    None
 }
 
 /// Why `ClassifyFlowStepDispatch` refused a flow-step dispatch.
@@ -1026,7 +1096,14 @@ impl MobError {
                     MobFailureClass::Internal
                 }
             },
-            Self::MemberAlreadyExists(_) => MobFailureClass::TargetBusy,
+            // Named explicitly rather than left to the `_` arm below: the
+            // route exists and is held by a live incumbent, which is the
+            // "target exists but cannot accept this right now" shape, not a
+            // mob-authority rejection. Classified here as a decision, because
+            // `MobFailureClass` is what schedule delivery records.
+            Self::MemberAlreadyExists(_) | Self::ParticipantNameOccupied { .. } => {
+                MobFailureClass::TargetBusy
+            }
             Self::StorageError(_)
             | Self::SessionError(_)
             | Self::MemberProvisionFailed { .. }
@@ -1192,6 +1269,65 @@ mod tests {
     fn test_profile_not_found_display() {
         let err = MobError::ProfileNotFound(ProfileName::from("missing"));
         assert!(format!("{err}").contains("missing"));
+    }
+
+    /// The name-occupancy extractor recognises exactly the comms-owned
+    /// `NameOccupied` rejection and re-carries its holder key byte-for-byte.
+    /// Anything else - including the sibling `ZeroPubkey` rejection, which is
+    /// the same enum and the same wrapping variant - must return `None`, so no
+    /// call site can turn an unrelated comms fault into a false occupancy
+    /// claim naming a key that holds nothing.
+    #[test]
+    fn comms_name_occupancy_holder_recognises_only_the_name_occupied_rejection() {
+        let holder = meerkat_comms::PubKey([7u8; 32]);
+        let occupied = meerkat_comms::CommsRuntimeError::InprocRegistrationRejected(
+            meerkat_comms::RegistrationRejection::NameOccupied {
+                holder_pubkey: holder,
+            },
+        );
+        assert_eq!(
+            comms_name_occupancy_holder(&occupied),
+            Some(holder),
+            "the holder key must be re-carried verbatim from the comms owner"
+        );
+
+        let zero_pubkey = meerkat_comms::CommsRuntimeError::InprocRegistrationRejected(
+            meerkat_comms::RegistrationRejection::ZeroPubkey,
+        );
+        assert!(
+            comms_name_occupancy_holder(&zero_pubkey).is_none(),
+            "a sibling registration rejection is not a name-occupancy fact"
+        );
+
+        let unrelated = meerkat_comms::CommsRuntimeError::AlreadyStarted;
+        assert!(
+            comms_name_occupancy_holder(&unrelated).is_none(),
+            "an unrelated comms fault is not a name-occupancy fact"
+        );
+    }
+
+    /// The operator-facing remedy text is what an adopter reads at 3am. Pin
+    /// that it leads with the action (retire the incumbent) and explicitly
+    /// disclaims the crypto reading that cost a fleet an hour in 0.8.23,
+    /// rather than only naming a public key.
+    #[test]
+    fn participant_name_occupied_message_states_the_remedy_not_just_the_refusal() {
+        let message = participant_name_occupied_message(
+            "mob/x/__mob_supervisor__",
+            &meerkat_comms::PubKey([3u8; 32]),
+        );
+        assert!(
+            message.contains("retire the incumbent"),
+            "the message must name the remedy, got: {message}"
+        );
+        assert!(
+            message.contains("not a key or trust failure"),
+            "the message must disclaim the crypto reading, got: {message}"
+        );
+        assert!(
+            message.contains("mob/x/__mob_supervisor__"),
+            "the message must name the refused participant name, got: {message}"
+        );
     }
 
     /// DELETE_ME A2 + B8 regression: the `Meerkat*` variant prefix and
@@ -1467,6 +1603,15 @@ mod tests {
         let cases = [
             (
                 MobError::MemberAlreadyExists(AgentIdentity::from("m")),
+                MobFailureClass::TargetBusy,
+            ),
+            // Classified deliberately, not by the `_ => MobRejected` wildcard:
+            // the route exists and a live incumbent holds it.
+            (
+                MobError::ParticipantNameOccupied {
+                    participant_name: "mob/x/__mob_supervisor__".to_string(),
+                    holder_pubkey: meerkat_comms::PubKey([1u8; 32]),
+                },
                 MobFailureClass::TargetBusy,
             ),
             (

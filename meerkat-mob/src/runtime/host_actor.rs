@@ -196,6 +196,21 @@ pub enum MobHostActorError {
     /// Host comms runtime composition or trust seam failed.
     #[error("host comms runtime fault: {detail}")]
     Comms { detail: String },
+    /// The host participant name could not be published because a *different*
+    /// live public key already holds that route.
+    ///
+    /// Re-carries [`meerkat_comms::RegistrationRejection::NameOccupied`]'s
+    /// `holder_pubkey` verbatim rather than flattening it into
+    /// [`Self::Comms`]'s prose. Construct only from
+    /// `crate::error::comms_name_occupancy_holder`.
+    #[error(
+        "{}",
+        crate::error::participant_name_occupied_message(participant_name, holder_pubkey)
+    )]
+    ParticipantNameOccupied {
+        participant_name: String,
+        holder_pubkey: meerkat_comms::PubKey,
+    },
     /// Descriptor publication (file sink or pairing watch) failed.
     #[error("host binding descriptor publication failed: {detail}")]
     Descriptor { detail: String },
@@ -4845,9 +4860,19 @@ pub fn build_host_comms_runtime(
         keypair,
         Arc::new(std::collections::HashSet::new()),
     )
-    .map_err(|err| MobHostActorError::Comms {
-        detail: format!("failed to construct host comms runtime '{participant_name}': {err}"),
-    })?;
+    .map_err(
+        |err| match crate::error::comms_name_occupancy_holder(&err) {
+            Some(holder_pubkey) => MobHostActorError::ParticipantNameOccupied {
+                participant_name: participant_name.to_string(),
+                holder_pubkey,
+            },
+            None => MobHostActorError::Comms {
+                detail: format!(
+                    "failed to construct host comms runtime '{participant_name}': {err}"
+                ),
+            },
+        },
+    )?;
     let runtime = Arc::new(runtime);
 
     let dsl = Arc::new(meerkat_runtime::HandleDslAuthority::ephemeral());
