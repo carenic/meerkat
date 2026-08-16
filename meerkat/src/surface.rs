@@ -568,13 +568,233 @@ pub fn build_runtime_host_capabilities(
     }
 }
 
-/// Build a read-only runtime health projection.
-pub fn build_runtime_host_health() -> RuntimeHostHealth {
+/// Prefix on a `checks` key that names a dimension **nobody probed**.
+///
+/// The value carried under such a key describes the *coverage*, not the
+/// dimension: `Degraded` means "this was not looked at", never "this was
+/// looked at and found broken".
+///
+/// This coverage class is deliberately kept **out** of the `status` rollup, and
+/// its sibling [`RUNTIME_HEALTH_UNREADABLE_PREFIX`] is deliberately kept **in**.
+/// The asymmetry is the whole design and is not an oversight to be tidied away:
+/// an unmeasured dimension is a *permanent structural* fact - no probe exists,
+/// and none will until someone writes one - so folding it into `status` pins
+/// every healthy host at `Degraded` forever and disarms the alarm. An
+/// unreadable dimension is a *transient runtime* fact - a probe ran and lost a
+/// race - so folding it in costs at most one amber scrape, which any alert
+/// window absorbs.
+pub const RUNTIME_HEALTH_UNMEASURED_PREFIX: &str = "unmeasured:";
+
+/// Prefix on a `checks` key that names a dimension a probe **tried and failed
+/// to observe**.
+///
+/// Like [`RUNTIME_HEALTH_UNMEASURED_PREFIX`] the value describes the
+/// observation rather than the dimension, but it makes the opposite claim:
+/// something ran, and it came back without a reading.
+///
+/// This class **does** enter the `status` rollup, at `Degraded`. A scrape that
+/// could not look at a dimension has not established that the dimension is
+/// healthy, and `status: ok` in that payload would be exactly the "one reading
+/// stands in for the whole host" defect this projection exists to remove,
+/// reached by a different route. Folding it in is affordable precisely because
+/// it is transient: the condition clears on the next successful read, so a
+/// one-off blip dies inside any `for:` window, and a dimension that stays
+/// unreadable across scrapes is itself the incident (something is holding the
+/// authority a probe must not block on).
+///
+/// The reason this is a separate key rather than a `Degraded` under the plain
+/// dimension name: a plain `session_durability: degraded` is a *specific and
+/// actionable* claim - some session needs a cold reload - and publishing it
+/// from a failed read would be asserting a fault nobody observed. A diagnostic
+/// that can report faults it did not see is back to being noise.
+pub const RUNTIME_HEALTH_UNREADABLE_PREFIX: &str = "unreadable:";
+
+/// Dimensions a runtime host health projection is expected to cover.
+///
+/// A caller reports one [`RuntimeHealthObservation`] per dimension it probed;
+/// [`build_runtime_host_health_from_observations`] names every remaining one as
+/// unmeasured rather than leaving it out, so an operator reading `checks` sees
+/// the coverage instead of inferring it from absence.
+///
+/// Deleting a name from this list asserts the dimension is out of scope for
+/// this projection. It does not assert the dimension is healthy, and it is not
+/// a way to quiet a report: the way to move a dimension out of
+/// `unmeasured:<name>` is to probe it and pass the observation in.
+pub const RUNTIME_HEALTH_DIMENSIONS: [&str; 4] = [
+    "jobs",
+    "session_liveness",
+    "session_durability",
+    "session_runtime_loop",
+];
+
+/// What one probe established about one health dimension.
+///
+/// Three facts are possible about a dimension and all three are different, so
+/// all three get their own representation rather than sharing one:
+///
+/// - **nobody probed it** - the dimension is simply absent from the observation
+///   set handed to [`build_runtime_host_health_from_observations`], and is
+///   published as `unmeasured:<dimension>`;
+/// - **a probe ran and observed it** - [`Self::Measured`], published under the
+///   plain dimension name at the rung it saw;
+/// - **a probe ran and could not observe it** - [`Self::Unreadable`], published
+///   as `unreadable:<dimension>`.
+///
+/// The distinction between the first and the last is the one this type exists
+/// to make impossible to lose. "Never measured" and "attempted and failed" are
+/// not the same fact: the first is a gap in what this host was ever built to
+/// see, the second is a gap in what this particular scrape saw. Collapsing them
+/// into one key would force a single rollup rule onto two facts that need
+/// opposite ones, and whichever rule won, one of the two would be reported as a
+/// lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RuntimeHealthObservation {
+    /// The probe read the dimension. This is what it found.
+    Measured(RuntimeHostHealthStatus),
+    /// The probe ran and could not read the dimension at that instant.
+    ///
+    /// This is a fact about the observation, not about the dimension: it says
+    /// nothing at all about whether the underlying dimension is healthy, which
+    /// is exactly why it may not leave `status` at `Ok`.
+    Unreadable,
+}
+
+/// Worse-wins fold over two health rungs.
+///
+/// [`RuntimeHostHealthStatus`] carries no ordering, so the severity ladder is
+/// spelled out here rather than derived on the wire type.
+fn worse_runtime_health(
+    left: RuntimeHostHealthStatus,
+    right: RuntimeHostHealthStatus,
+) -> RuntimeHostHealthStatus {
+    match (left, right) {
+        (RuntimeHostHealthStatus::Unhealthy, _) | (_, RuntimeHostHealthStatus::Unhealthy) => {
+            RuntimeHostHealthStatus::Unhealthy
+        }
+        (RuntimeHostHealthStatus::Degraded, _) | (_, RuntimeHostHealthStatus::Degraded) => {
+            RuntimeHostHealthStatus::Degraded
+        }
+        (RuntimeHostHealthStatus::Ok, RuntimeHostHealthStatus::Ok) => RuntimeHostHealthStatus::Ok,
+    }
+}
+
+/// Build a read-only runtime health projection from what a caller's probes
+/// actually established.
+///
+/// The rule this function exists to enforce: **a diagnostic may only assert the
+/// scope it observed.** Callers hand in one [`RuntimeHealthObservation`] per
+/// dimension of [`RUNTIME_HEALTH_DIMENSIONS`] they probed. Every dimension with
+/// no entry is named as `unmeasured:<dimension>` at
+/// [`RuntimeHostHealthStatus::Degraded`] so the gap is legible in the payload
+/// instead of being inferred from a missing key.
+///
+/// ## The three key shapes in `checks`
+///
+/// | shape | meaning | in the rollup? |
+/// |---|---|---|
+/// | `<dimension>` | a probe ran and saw this | yes, at the rung it saw |
+/// | `unreadable:<dimension>` | a probe ran and could not see | yes, at `Degraded` |
+/// | `unmeasured:<dimension>` | no probe exists | no |
+///
+/// ## What `status` means, and why only one coverage class sets it
+///
+/// `status` is the worst rung over the dimensions this caller **attempted**:
+/// "everything I looked at is ok" (`Ok`), or "something I looked at is not, or
+/// I could not look" (`Degraded` / `Unhealthy`). Dimensions nobody probed are
+/// reported in `checks` and are deliberately excluded from that fold.
+///
+/// The alternative - folding unmeasured coverage in too - is more literal and
+/// strictly worse in practice: as long as one declared dimension has no probe,
+/// every healthy host publishes `Degraded` forever, so `status != ok` carries
+/// no incident signal and the first thing an operator does is mute it. A
+/// permanently amber light is not honesty; it is a disabled alarm with a good
+/// excuse. That argument turns entirely on the condition being *permanent*, so
+/// it does not extend to [`RuntimeHealthObservation::Unreadable`], which clears
+/// itself on the next successful read.
+///
+/// This is emphatically not the defect this projection was built to fix. That
+/// one published a single `ok` derived from a single reading, with no statement
+/// anywhere of what had been looked at, so a caller could not distinguish full
+/// coverage from a fifth of it. Here the coverage claim is in the same payload,
+/// enumerated against a declared dimension list, and it is impossible for a
+/// caller to read `status: ok` as "everything is fine" without also being
+/// handed the list of things nobody checked.
+///
+/// Four properties keep that boundary from eroding:
+///
+/// - a caller that probed **nothing** still reports `Degraded`, so an empty
+///   fold can never mint an unearned `Ok`;
+/// - a measured `Unhealthy` still escalates;
+/// - a probe that **ran and could not read** still reaches `status`, so a
+///   scrape that failed to observe a dimension can never publish `ok` on the
+///   strength of the dimensions it did read;
+/// - every unprobed dimension is still named, so shrinking coverage is visible
+///   in the payload rather than silent.
+///
+/// Keys outside [`RUNTIME_HEALTH_DIMENSIONS`] are accepted and rolled up like
+/// any other observation; they simply do not clear an unmeasured dimension.
+pub fn build_runtime_host_health_from_observations(
+    observations: impl IntoIterator<Item = (String, RuntimeHealthObservation)>,
+) -> RuntimeHostHealth {
+    // Collected first so a duplicate dimension resolves last-wins into a single
+    // entry, rather than publishing one dimension under two coverage keys.
+    let attempted: BTreeMap<String, RuntimeHealthObservation> = observations.into_iter().collect();
+    let mut checks: BTreeMap<String, RuntimeHostHealthStatus> = BTreeMap::new();
+    // Folded over the attempted set only, so `status` speaks for what this
+    // caller tried to observe. Nothing attempted is not health, so an empty
+    // fold is `Degraded` rather than the `Ok` identity.
+    let mut rollup: Option<RuntimeHostHealthStatus> = None;
+    for (dimension, observation) in &attempted {
+        let rung = match observation {
+            RuntimeHealthObservation::Measured(status) => {
+                checks.insert(dimension.clone(), *status);
+                *status
+            }
+            RuntimeHealthObservation::Unreadable => {
+                checks.insert(
+                    format!("{RUNTIME_HEALTH_UNREADABLE_PREFIX}{dimension}"),
+                    RuntimeHostHealthStatus::Degraded,
+                );
+                RuntimeHostHealthStatus::Degraded
+            }
+        };
+        rollup = Some(match rollup {
+            Some(previous) => worse_runtime_health(previous, rung),
+            None => rung,
+        });
+    }
+    let status = rollup.unwrap_or(RuntimeHostHealthStatus::Degraded);
+    for dimension in RUNTIME_HEALTH_DIMENSIONS {
+        if !attempted.contains_key(dimension) {
+            checks.insert(
+                format!("{RUNTIME_HEALTH_UNMEASURED_PREFIX}{dimension}"),
+                RuntimeHostHealthStatus::Degraded,
+            );
+        }
+    }
     RuntimeHostHealth {
         contract_version: ContractVersion::CURRENT,
-        status: RuntimeHostHealthStatus::Ok,
-        checks: BTreeMap::new(),
+        status,
+        checks,
     }
+}
+
+/// Build a read-only runtime health projection that probed nothing.
+///
+/// Every dimension of [`RUNTIME_HEALTH_DIMENSIONS`] is reported unmeasured and
+/// `status` is `Degraded`, because a caller that probed nothing has nothing to
+/// roll up and may not mint an unearned `Ok`. This is the one case where
+/// `Degraded` names coverage rather than an observed fault, and it exists so
+/// the empty fold cannot be mistaken for a clean bill of health.
+/// A surface that probes something must call
+/// [`build_runtime_host_health_from_observations`] with what its probes
+/// established.
+pub fn build_runtime_host_health() -> RuntimeHostHealth {
+    build_runtime_host_health_from_observations(std::iter::empty::<(
+        String,
+        RuntimeHealthObservation,
+    )>())
 }
 
 /// Build host information from existing surface/runtime facts.
@@ -582,6 +802,33 @@ pub fn build_runtime_host_health() -> RuntimeHostHealth {
 /// This projection intentionally does not expose topology, lease, project, or
 /// host-registry authority. Callers can rebuild it from the config-store
 /// metadata and surface options.
+///
+/// # `health` is a placeholder every probing caller must replace
+///
+/// `RuntimeHostInfo::health` is a required wire field and this function is a
+/// pure projection: it is handed surface options and config metadata, holds no
+/// runtime, and can therefore observe no health dimension. It cannot omit the
+/// field and it may not invent a reading, so it publishes
+/// [`build_runtime_host_health`] - the probed-nothing projection, `Degraded`
+/// with every declared dimension named `unmeasured:*`.
+///
+/// That is the deliberate failure direction. A caller that forgets to replace
+/// it now ships a payload that visibly names everything nobody looked at,
+/// instead of the `status: ok, checks: {}` this used to publish, which was an
+/// invisible clean bill of health from a function that had measured nothing.
+/// **A surface that can probe owes `host_info` the health it actually
+/// measured**, and every in-tree surface does exactly that:
+/// `meerkat_rpc::handlers::runtime_host::handle_info` and
+/// `meerkat_rest`'s `get_runtime_host_info` both overwrite `health` with their
+/// own probe results, each pinned by a test asserting the embedded value equals
+/// what that surface's own health route publishes.
+///
+/// Taking the health as a parameter would make that obligation a type rather
+/// than a convention. It is deliberately not done here: it is a breaking change
+/// to a published signature, and it would change zero published bytes, since
+/// every caller that can probe already replaces the value. Worth doing on the
+/// next release that is already taking breaks; not worth doing for its own
+/// sake.
 pub fn build_runtime_host_info(
     options: &RuntimeHostSurfaceOptions,
     metadata: Option<&RuntimeHostMetadataProjection>,
@@ -1013,6 +1260,309 @@ mod tests {
         let capabilities = build_runtime_host_capabilities(&options);
         assert!(capabilities.features.mobs);
         assert!(capabilities.features.multi_host_mobs);
+    }
+
+    /// The dimension names below are typed out rather than read from
+    /// [`RUNTIME_HEALTH_DIMENSIONS`], so emptying that list fails these tests
+    /// instead of trivially satisfying them.
+    #[test]
+    fn runtime_health_that_probed_nothing_does_not_report_ok() {
+        let health = build_runtime_host_health();
+
+        for dimension in [
+            "unmeasured:jobs",
+            "unmeasured:session_liveness",
+            "unmeasured:session_durability",
+            "unmeasured:session_runtime_loop",
+        ] {
+            assert_eq!(
+                health.checks.get(dimension),
+                Some(&RuntimeHostHealthStatus::Degraded),
+                "a projection that measured nothing must name `{dimension}`: {:?}",
+                health.checks
+            );
+        }
+        assert_eq!(
+            health.status,
+            RuntimeHostHealthStatus::Degraded,
+            "nothing measured is not health: {health:?}"
+        );
+    }
+
+    /// Unmeasured coverage is published, and is deliberately kept out of the
+    /// rollup so `status != ok` stays an incident predicate rather than a
+    /// standing amber light nobody can act on.
+    #[test]
+    fn runtime_health_names_unmeasured_dimensions_without_spending_the_rollup_on_them() {
+        let health = build_runtime_host_health_from_observations([(
+            "jobs".to_string(),
+            RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+        )]);
+
+        assert_eq!(
+            health.checks.get("jobs"),
+            Some(&RuntimeHostHealthStatus::Ok),
+            "a measured dimension keeps its measured rung: {:?}",
+            health.checks
+        );
+        assert_eq!(
+            health.checks.get("unmeasured:jobs"),
+            None,
+            "a measured dimension must not also be reported unmeasured: {:?}",
+            health.checks
+        );
+        assert_eq!(
+            health.checks.get("unmeasured:session_liveness"),
+            Some(&RuntimeHostHealthStatus::Degraded),
+            "an unmeasured dimension must be named, not omitted: {:?}",
+            health.checks
+        );
+        assert_eq!(
+            health.status,
+            RuntimeHostHealthStatus::Ok,
+            "everything measured was ok, so the rollup says so and `checks` \
+             carries the coverage gap: {health:?}"
+        );
+    }
+
+    /// The rollup is over measurements, so a fault in one dimension is not
+    /// laundered by healthy readings elsewhere or by unmeasured coverage.
+    #[test]
+    fn runtime_health_rollup_takes_the_worst_measured_rung() {
+        let health = build_runtime_host_health_from_observations([
+            (
+                "jobs".to_string(),
+                RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+            ),
+            (
+                "session_runtime_loop".to_string(),
+                RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Degraded),
+            ),
+        ]);
+
+        assert_eq!(
+            health.status,
+            RuntimeHostHealthStatus::Degraded,
+            "one measured fault must survive beside a healthy sibling: {health:?}"
+        );
+        assert_eq!(
+            health.checks.get("unmeasured:session_liveness"),
+            Some(&RuntimeHostHealthStatus::Degraded),
+            "the coverage gap is still published beside the fault: {:?}",
+            health.checks
+        );
+    }
+
+    #[test]
+    fn runtime_health_publishes_a_measured_unhealthy_beside_unmeasured_coverage() {
+        let health = build_runtime_host_health_from_observations([(
+            "jobs".to_string(),
+            RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Unhealthy),
+        )]);
+
+        assert_eq!(
+            health.status,
+            RuntimeHostHealthStatus::Unhealthy,
+            "a measured failure reaches the rollup on its own, without needing \
+             unmeasured coverage to carry it: {health:?}"
+        );
+        assert_eq!(
+            health.checks.get("unmeasured:session_liveness"),
+            Some(&RuntimeHostHealthStatus::Degraded),
+            "and the coverage gap is still named beside it: {:?}",
+            health.checks
+        );
+    }
+
+    #[test]
+    fn runtime_health_full_coverage_leaves_no_unmeasured_key_behind() {
+        let health = build_runtime_host_health_from_observations([
+            (
+                "jobs".to_string(),
+                RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+            ),
+            (
+                "session_liveness".to_string(),
+                RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+            ),
+            (
+                "session_durability".to_string(),
+                RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+            ),
+            (
+                "session_runtime_loop".to_string(),
+                RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+            ),
+        ]);
+
+        assert!(
+            !health
+                .checks
+                .keys()
+                .any(|key| key.starts_with(RUNTIME_HEALTH_UNMEASURED_PREFIX)),
+            "full coverage leaves nothing unmeasured: {:?}",
+            health.checks
+        );
+        assert_eq!(
+            health.status,
+            RuntimeHostHealthStatus::Ok,
+            "every declared dimension measured and ok: {health:?}"
+        );
+
+        // Drop one dimension entirely - nobody probes it, as opposed to a probe
+        // failing. The rollup is unchanged, because nothing that was observed
+        // got worse. What changes is the published coverage, which is the whole
+        // point of naming the gap rather than folding it in.
+        let partial = build_runtime_host_health_from_observations([
+            (
+                "jobs".to_string(),
+                RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+            ),
+            (
+                "session_liveness".to_string(),
+                RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+            ),
+            (
+                "session_durability".to_string(),
+                RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+            ),
+        ]);
+        assert_eq!(
+            partial.checks.get("unmeasured:session_runtime_loop"),
+            Some(&RuntimeHostHealthStatus::Degraded),
+            "the dropped dimension is named: {:?}",
+            partial.checks
+        );
+        assert_eq!(
+            partial.checks.get("session_runtime_loop"),
+            None,
+            "a dropped dimension must not keep a measured key: {:?}",
+            partial.checks
+        );
+        assert_eq!(
+            partial.status,
+            RuntimeHostHealthStatus::Ok,
+            "narrower coverage is reported in `checks`, not smuggled into \
+             `status` as a fault nobody can act on: {partial:?}"
+        );
+    }
+
+    /// The exact shape of the original defect, reached by the other route: a
+    /// scrape where the only dimension that answered was `jobs`, because both
+    /// session probes ran and could not read.
+    ///
+    /// If an unreadable probe were treated like an unbuilt one, this payload
+    /// would be `status: ok` on the strength of a single reading while two
+    /// dimensions went unobserved. That is the defect this whole projection
+    /// exists to remove.
+    #[test]
+    fn runtime_health_that_could_not_read_a_dimension_does_not_report_ok() {
+        let health = build_runtime_host_health_from_observations([
+            (
+                "jobs".to_string(),
+                RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+            ),
+            (
+                "session_durability".to_string(),
+                RuntimeHealthObservation::Unreadable,
+            ),
+            (
+                "session_runtime_loop".to_string(),
+                RuntimeHealthObservation::Unreadable,
+            ),
+        ]);
+
+        assert_eq!(
+            health.status,
+            RuntimeHostHealthStatus::Degraded,
+            "a scrape that could not look at two dimensions has not established \
+             that this host is healthy: {health:?}"
+        );
+        for dimension in ["session_durability", "session_runtime_loop"] {
+            assert_eq!(
+                health.checks.get(&format!("unreadable:{dimension}")),
+                Some(&RuntimeHostHealthStatus::Degraded),
+                "a failed read must be named as a failed read: {:?}",
+                health.checks
+            );
+            assert_eq!(
+                health.checks.get(dimension),
+                None,
+                "a failed read must not publish a rung under the plain \
+                 dimension name, which would assert a fault nobody observed: \
+                 {:?}",
+                health.checks
+            );
+            // The two coverage vocabularies are exclusive. A dimension that was
+            // attempted is not also unbuilt, and publishing both would let a
+            // reader pick whichever claim suited them.
+            assert_eq!(
+                health.checks.get(&format!("unmeasured:{dimension}")),
+                None,
+                "an attempted dimension must not also be published as \
+                 unmeasured: {:?}",
+                health.checks
+            );
+        }
+        assert_eq!(
+            health.checks.get("unmeasured:session_liveness"),
+            Some(&RuntimeHostHealthStatus::Degraded),
+            "the genuinely unbuilt dimension keeps its own vocabulary: {:?}",
+            health.checks
+        );
+    }
+
+    /// The asymmetry stated as an executable claim, so a future simplification
+    /// that unifies the two coverage classes fails here rather than in
+    /// production.
+    ///
+    /// Both fixtures below are states a real surface can be in: the only
+    /// difference between them is whether the two probed dimensions came back
+    /// with a reading. `session_liveness` is absent from both, because a
+    /// dimension with no probe cannot have had a probe fail and a fixture that
+    /// claimed otherwise would be modelling a state nothing can produce.
+    #[test]
+    fn runtime_health_folds_a_failed_read_into_status_but_never_an_unbuilt_probe() {
+        let unbuilt = build_runtime_host_health_from_observations([(
+            "jobs".to_string(),
+            RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+        )]);
+        let failed_read = build_runtime_host_health_from_observations([
+            (
+                "jobs".to_string(),
+                RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+            ),
+            (
+                "session_durability".to_string(),
+                RuntimeHealthObservation::Unreadable,
+            ),
+            (
+                "session_runtime_loop".to_string(),
+                RuntimeHealthObservation::Unreadable,
+            ),
+        ]);
+
+        assert_eq!(
+            unbuilt.checks.get("unmeasured:session_liveness"),
+            failed_read.checks.get("unmeasured:session_liveness"),
+            "the unbuilt dimension is reported identically on both sides, so \
+             the only thing that differs is the failed read: {:?} vs {:?}",
+            unbuilt.checks,
+            failed_read.checks
+        );
+        assert_eq!(
+            unbuilt.status,
+            RuntimeHostHealthStatus::Ok,
+            "a host whose unbuilt dimensions are simply unbuilt must not stand \
+             permanently amber; that is a muted alarm, not honesty: {unbuilt:?}"
+        );
+        assert_eq!(
+            failed_read.status,
+            RuntimeHostHealthStatus::Degraded,
+            "a host whose probes ran and lost has observed nothing about those \
+             dimensions this scrape, and one amber scrape is affordable because \
+             the condition clears itself: {failed_read:?}"
+        );
     }
 
     #[test]

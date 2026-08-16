@@ -551,6 +551,7 @@ mod tests {
             allowed_tools: None,
             blocked_tools: None,
             output_format: None,
+            failure_policy: Default::default(),
         }
     }
 
@@ -800,6 +801,7 @@ mod tests {
                 depends_on: Vec::new(),
                 depends_on_mode: DependencyMode::All,
                 branch: None,
+                failure_policy: Default::default(),
             }),
         );
 

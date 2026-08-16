@@ -864,6 +864,19 @@ pub enum MobEventKind {
         step_id: StepId,
         escalated_to: AgentIdentity,
     },
+    /// A supervisor escalation the machine decided on could not be carried out.
+    ///
+    /// Provenance/audit only. It records that the shell failed to deliver an
+    /// escalation MobMachine asked for; it never reclassifies the run. A
+    /// tolerated failure under `failure_policy: continue` keeps its Completed
+    /// terminal class even when its escalation cannot be delivered, because
+    /// failing to execute the machine's decision is not the machine deciding
+    /// the run failed.
+    SupervisorEscalationFailed {
+        run_id: RunId,
+        step_id: StepId,
+        reason: String,
+    },
     /// Dispatcher-owned projection of a successful operator mutation/control action.
     ///
     /// This event is provenance/audit only. It is never authorization truth.
@@ -1780,9 +1793,14 @@ mod tests {
             to_role: ProfileName::from("worker"),
         });
         roundtrip(&MobEventKind::SupervisorEscalation {
+            run_id: run_id.clone(),
+            step_id: step_id.clone(),
+            escalated_to: escalated_identity,
+        });
+        roundtrip(&MobEventKind::SupervisorEscalationFailed {
             run_id,
             step_id,
-            escalated_to: escalated_identity,
+            reason: "no active supervisor member for role 'auditor'".to_string(),
         });
     }
 

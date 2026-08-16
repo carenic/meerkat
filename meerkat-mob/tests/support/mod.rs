@@ -179,6 +179,7 @@ pub async fn spawn_production_external_tcp_target(peer_name: &str) -> Production
     dsl.apply_input(
         machine_dsl::MeerkatMachineInput::RegisterSession {
             session_id: machine_dsl::SessionId::from(session_id.to_string()),
+            runtime_epoch_id: None,
         },
         "external_tcp_smoke_target::register",
     )
@@ -3841,6 +3842,7 @@ pub fn sample_portable_member_spec(
                 mob: false,
                 schedule: false,
                 image_generation: false,
+                read_only: false,
                 mcp_servers: std::collections::BTreeMap::new(),
                 non_portable_disabled: Vec::new(),
             },
@@ -4359,6 +4361,7 @@ fn flow_from_step(
             allowed_tools,
             blocked_tools,
             output_format: None,
+            failure_policy: Default::default(),
         },
     );
     meerkat_mob::definition::FlowSpec::new(None, steps, None)

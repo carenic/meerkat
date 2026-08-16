@@ -92,6 +92,12 @@ pub enum WireToolAccessPolicy {
     Inherit,
     AllowList(Vec<String>),
     DenyList(Vec<String>),
+    /// Read-only intent: only tools their owning dispatcher declares
+    /// read-only may execute. Name-independent and fail-closed, so tools that
+    /// appear after the launch cannot widen it. The guarantee covers only
+    /// dispatcher-traversing tools (see
+    /// `meerkat_core::tool_execution_policy`).
+    ReadOnly,
 }
 
 impl WireToolAccessPolicy {
@@ -110,6 +116,7 @@ impl WireToolAccessPolicy {
             Self::DenyList(names) => {
                 meerkat_core::ops::ToolAccessPolicy::DenyList(names.into_iter().collect())
             }
+            Self::ReadOnly => meerkat_core::ops::ToolAccessPolicy::ReadOnly,
         }
     }
 }
@@ -145,8 +152,23 @@ pub struct WireMobToolConfig {
     pub schedule: bool,
     #[serde(default)]
     pub image_generation: bool,
+    /// Declare the profile read-only: the execution gate admits only tools
+    /// their owning dispatcher declares read-only, and a spawn cannot widen
+    /// it. Enforcement, not prompt guidance.
+    ///
+    /// Omitted when false, unlike its sibling toggles: this struct is
+    /// `deny_unknown_fields`, so a projection that always carried the key would
+    /// be rejected by clients built before the field existed. Emitting it only
+    /// when a profile actually declares read-only keeps old clients working and
+    /// makes the new-intent case fail closed and loudly instead of silently.
+    #[serde(default, skip_serializing_if = "read_only_is_false")]
+    pub read_only: bool,
     #[serde(default)]
     pub mcp: Vec<String>,
+}
+
+fn read_only_is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Profile fields that win over durable session metadata on resume.
@@ -257,6 +279,11 @@ pub struct MobToolConfigInput {
     pub schedule: bool,
     #[serde(default)]
     pub image_generation: bool,
+    /// Declare the profile read-only: the execution gate admits only tools
+    /// their owning dispatcher declares read-only, and a spawn cannot widen
+    /// it. Enforcement, not prompt guidance.
+    #[serde(default)]
+    pub read_only: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<String>,
 }
@@ -435,6 +462,9 @@ pub struct MobFrameStepInput {
     pub depends_on_mode: MobDependencyModeInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Tolerance for this node's failure; omitted means `escalate`.
+    #[serde(default)]
+    pub failure_policy: MobFlowNodeFailurePolicyInput,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -449,6 +479,23 @@ pub struct MobRepeatUntilInput {
     pub body: MobFrameSpecInput,
     pub until: MobConditionExprInput,
     pub max_iterations: u32,
+    /// Tolerance for this loop node's failure; omitted means `escalate`.
+    #[serde(default)]
+    pub failure_policy: MobFlowNodeFailurePolicyInput,
+}
+
+/// Authored tolerance for a flow node's failure.
+///
+/// `Escalate` (the default) classifies the enclosing frame Failed when the node
+/// fails. `Continue` keeps the recorded node/step failure but lets the frame
+/// classify on the remaining nodes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MobFlowNodeFailurePolicyInput {
+    #[default]
+    Escalate,
+    Continue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -477,6 +524,10 @@ pub struct MobFlowStepInput {
     pub allowed_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_tools: Option<Vec<String>>,
+    /// Tolerance for this step's failure once compiled into the root frame;
+    /// omitted means `escalate`.
+    #[serde(default)]
+    pub failure_policy: MobFlowNodeFailurePolicyInput,
     /// Explicit output format; omitted resolves schema-aware at the
     /// definition layer (`json` with `expected_schema_ref`, `text` without).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1824,6 +1875,21 @@ pub enum WireMobRunStatus {
     Canceled,
 }
 
+impl WireMobRunStatus {
+    /// Whether the run has reached a terminal lifecycle state.
+    ///
+    /// Owned here so every surface that gates work on terminality (run-result
+    /// accounting collection, for one) branches on the same closed set instead
+    /// of each re-listing the variants.
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        match self {
+            Self::Pending | Self::Running => false,
+            Self::Completed | Self::Failed | Self::Canceled => true,
+        }
+    }
+}
+
 /// Typed public projection of a single flow run for `mob/flow_status`.
 ///
 /// The canonical identity and lifecycle fields (`run_id`, `mob_id`, `flow_id`,
@@ -1931,7 +1997,113 @@ pub struct WireMobRunResultEnvelope {
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub outputs: BTreeMap<String, Value>,
+    /// Token accounting and transcript pointers for the mob that ran this
+    /// flow. Absent when the surface did not collect it (the run projection
+    /// itself owns no usage: see [`WireMobRunAccounting`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting: Option<WireMobRunAccounting>,
 }
+
+/// How a usage number in [`WireMobRunAccounting`] was attributed.
+///
+/// A closed vocabulary rather than a doc comment because the difference is
+/// load-bearing for an auditor: nothing in the mob run projection records
+/// per-run token usage, so these numbers come from the members' bridge
+/// sessions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WireMobRunUsageAttribution {
+    /// Each number is the lifetime total of the member's current bridge
+    /// session, which is the run's usage only when that session served this
+    /// run alone. On a mob that has executed more than one run, or whose
+    /// members took turns outside a flow, the totals include those turns.
+    ///
+    /// The member set is scoped the same way: it is the mob's current roster
+    /// at collection time, not the run's participant set (the run aggregate
+    /// records no participation). A member that took no part in this run is
+    /// still listed, and its session id still rides in
+    /// `member_session_ids`, so an auditor exporting that pointer set may get
+    /// transcripts unrelated to this run.
+    SessionCumulative,
+}
+
+/// Per-member token accounting and the session pointer an auditor exports.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct WireMobRunMemberAccounting {
+    pub agent_identity: String,
+    pub role: String,
+    /// Session id to feed `rkat session export-atif` for this member's full
+    /// transcript. Absent when the member has no current bridge session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<meerkat_core::Provider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<u64>,
+    /// Session-cumulative usage, present only when the session was readable
+    /// from this host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::wire::WireUsage>,
+    /// Why `usage` is absent, when it is (remote member, archived session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_unavailable: Option<String>,
+}
+
+/// Token accounting projection attached to a mob run envelope.
+///
+/// This is deliberately NOT a second transcript authority. Full messages,
+/// tool calls, tool results, and per-turn usage live in the session event
+/// stream and are exported by `rkat session export-atif <session_id>` (or the
+/// `--export-atif` flag on a run); `member_session_ids` is the pointer set for
+/// that export. What rides here is only what is cheap and canonical at the
+/// point a run terminalizes: the per-member session usage totals and their
+/// attribution.
+///
+/// Cost is structurally absent: the model catalog carries no price data, so
+/// no truthful monetary number can be produced in-tree. `unpriced_reason`
+/// states that instead of emitting a zero or a guess.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct WireMobRunAccounting {
+    pub attribution: WireMobRunUsageAttribution,
+    /// The mob's current member roster, not this run's participants: see
+    /// [`WireMobRunUsageAttribution::SessionCumulative`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<WireMobRunMemberAccounting>,
+    /// Sum of the per-member usage that was readable. Members with
+    /// `usage_unavailable` contribute nothing, so this is a floor, not a
+    /// claim of completeness.
+    ///
+    /// Input and output tokens only: the cache counters are absent here even
+    /// when members report them, because their relation to `input_tokens` is
+    /// provider-specific and this aggregate may span providers. Read cache
+    /// numbers per member, never off this total.
+    pub usage_total: crate::wire::WireUsage,
+    /// Number of members whose usage could not be read.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub members_usage_unavailable: usize,
+    /// Session ids for `rkat session export-atif`, in member order. Scoped to
+    /// the current roster, so this may include members that took no part in
+    /// this run (see [`WireMobRunUsageAttribution::SessionCumulative`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_session_ids: Vec<String>,
+    /// Why no monetary cost is reported.
+    pub unpriced_reason: String,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+/// Stable reason string for the absent cost fields.
+pub const MOB_RUN_ACCOUNTING_UNPRICED_REASON: &str =
+    "no price data in the model catalog; token counts are exact, monetary cost is not computed";
 
 /// Response payload for `mob/run_result`.
 ///

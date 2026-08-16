@@ -351,12 +351,19 @@ These accessors always reflect the most recent completed turn:
 
 ```typescript
 session.text            // assistant text from the last turn
-session.usage           // Usage from the last turn
+session.usage           // RunResult usage: the session-cumulative token total
 session.turns           // number of LLM turns in the last run
 session.toolCalls       // number of tool calls in the last run
 session.structuredOutput // structured output from the last run (unknown | undefined)
 session.lastResult      // the full RunResult object
 ```
+
+<Warning>
+`session.usage` is the cumulative token account for the whole session to date,
+not the last turn's usage, and it keeps growing across turns. Never add
+successive readings together. See
+[Usage accounting](/reference/usage-accounting).
+</Warning>
 
 ### turn()
 
@@ -605,7 +612,12 @@ for await (const event of session.stream("Explain Rust lifetimes in two sentence
       break;
     case "turn_completed":
       console.log(`\nStop reason: ${event.stopReason}`);
-      console.log(`Tokens: ${event.usage.inputTokens} in / ${event.usage.outputTokens} out`);
+      // `accounting` names the resolved model and the normalized presented
+      // input for this one call; `inputTokens` is the raw provider counter.
+      console.log(
+        `${event.usage.accounting?.model}: ` +
+          `${event.usage.accounting?.presentedTokens} in / ${event.usage.outputTokens} out`,
+      );
       break;
   }
 }

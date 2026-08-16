@@ -2776,7 +2776,49 @@ pub enum SecurityMode {
     DenyList,
 }
 
-/// Token usage statistics
+/// Token usage statistics.
+///
+/// # The same field names carry two different denominators
+///
+/// This shape is reused for two semantically different accounts, and
+/// `input_tokens` does not mean the same thing in both:
+///
+/// - **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw
+///   provider counters for exactly one provider request. For Anthropic
+///   `input_tokens` is the *uncached* input only, with cache-write and
+///   cache-read input reported separately in `cache_creation_tokens` and
+///   `cache_read_tokens`. The normalized presented-input total for that one
+///   call is [`TurnUsage::presented_tokens`].
+/// - **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a
+///   running total over every provider call recorded on the *session*, not on
+///   one run. Its `input_tokens` is the saturating sum of each call's
+///   *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache
+///   detail fields are always `None` because their relationship to the input
+///   total is provider-specific.
+///
+/// # What consumers must not sum
+///
+/// - Never sum `run_completed.usage` with per-call usage, and never sum
+///   `run_completed.usage` across runs: each value is already the whole
+///   session's total to date, so adding two of them double-counts everything
+///   before the later one. Take the latest value.
+/// - Never sum per-call `input_tokens` and expect it to match
+///   `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the
+///   two use different denominators and will not agree. Sum
+///   `turn_completed.usage.accounting.presented_tokens` (that is,
+///   [`TurnUsage::presented_tokens`]) instead, which is exactly what
+///   [`CumulativeUsage::add_turn`] does.
+/// - Do not expect the per-call rows to reconcile with the cumulative account
+///   either. Intermediate tool-loop calls, the structured-output extraction
+///   call, and the compaction summary call are all charged to the cumulative
+///   account and publish no `turn_completed` row, so the rows cover a strict
+///   subset of the tokens.
+///
+/// The worked example lives in `docs/reference/usage-accounting.mdx`. Its
+/// numbers are pinned against the agent loop by
+/// `turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`
+/// (`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's
+/// arithmetic by `cumulative_usage_matches_documented_aggregation_example`.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -2798,6 +2840,11 @@ pub struct Usage {
 impl Usage {
     /// Raw provider counters plus output. Shared provider policy must use a
     /// validated [`TurnUsage`] instead.
+    ///
+    /// On a per-call usage this is the raw (for Anthropic: uncached-only) input
+    /// plus output, so it is not comparable with
+    /// [`TurnUsage::normalized_total_tokens`]. On a cumulative usage the input
+    /// component is already a presented-token sum, so the two agree.
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
     }
@@ -2830,6 +2877,20 @@ impl Usage {
 ///
 /// This is deliberately distinct from cumulative [`Usage`] on event
 /// boundaries, while retaining the existing flat wire shape.
+///
+/// # Model and provider attribution
+///
+/// `accounting` is the single owner of per-call attribution: it carries the
+/// [`crate::Provider`] and the model string of the request that produced these
+/// counters, minted by the provider adapter from the lowered request rather than
+/// from configuration intent. A consumer reading only the event stream can
+/// therefore attribute one `turn_completed` row to a model without joining
+/// against session metadata:
+/// `turn_completed.usage.accounting.provider` /
+/// `turn_completed.usage.accounting.model`.
+///
+/// There is deliberately no second copy of the model or provider beside
+/// `accounting` on the event: attribution has one owner.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -2903,6 +2964,16 @@ impl std::ops::Deref for TurnUsage {
 
 /// Cumulative usage across committed turns. Cache detail counters are not
 /// aggregated because their relationship to input totals is provider-specific.
+///
+/// This value is **already a total**, and the total is session-scoped: on the
+/// event stream it is `Session::total_usage()`, which is persisted with the
+/// session and restored on resume, so `run_completed.usage` on the second run of
+/// a session already contains the first run's calls. Adding it to per-call
+/// usage, or summing the values observed on two runs, double-counts. It also
+/// intentionally carries no [`crate::ProviderTokenAccounting`], because one
+/// session may span providers and models and so cannot truthfully claim a
+/// single per-call convention; per-model attribution is read from the per-call
+/// `turn_completed` rows, which cover only the calls that closed a run.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(transparent)]
@@ -2916,6 +2987,13 @@ impl CumulativeUsage {
         Self(usage)
     }
 
+    /// Fold one committed provider call into the run total.
+    ///
+    /// The input component accumulates [`TurnUsage::presented_tokens`], the
+    /// provider-normalized presented-input total, never the raw per-call
+    /// `input_tokens`. This is the reference aggregation consumers should
+    /// reproduce; see the worked example in
+    /// `docs/reference/usage-accounting.mdx`.
     pub fn add_turn(&mut self, turn: &TurnUsage) {
         self.0.input_tokens = self.0.input_tokens.saturating_add(turn.presented_tokens());
         self.0.output_tokens = self.0.output_tokens.saturating_add(turn.output_tokens);

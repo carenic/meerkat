@@ -113,21 +113,22 @@ v1 (recorded v2 hardening).
 ```toml
 # Minimal: just the agent loop
 [dependencies]
-meerkat = { version = "0.8.22", default-features = false, features = ["anthropic"] }
+meerkat = { version = "0.8.23", default-features = false, features = ["anthropic"] }
 
 # Add persistence
-meerkat = { version = "0.8.22", default-features = false, features = ["anthropic", "session-store"] }
+meerkat = { version = "0.8.23", default-features = false, features = ["anthropic", "session-store"] }
 
 # Add compaction
-meerkat = { version = "0.8.22", default-features = false, features = ["anthropic", "session-store", "session-compaction"] }
+meerkat = { version = "0.8.23", default-features = false, features = ["anthropic", "session-store", "session-compaction"] }
 
 # Add scheduling
-meerkat = { version = "0.8.22", default-features = false, features = ["anthropic", "session-store", "schedule"] }
+meerkat = { version = "0.8.23", default-features = false, features = ["anthropic", "session-store", "schedule"] }
 
 # Kitchen sink
-meerkat = { version = "0.8.22", features = [
+meerkat = { version = "0.8.23", features = [
   "all-providers", "openai-realtime", "session-store", "session-compaction",
-  "memory-store-session", "comms", "mcp", "skills", "schedule", "workgraph", "live"
+  "memory-store-session", "comms", "mcp", "skills", "schedule", "workgraph", "live",
+  "atif", # 0.8.23+
 ] }
 ```
 
@@ -246,9 +247,15 @@ MCP server connections are **non-blocking across all surfaces**. Servers connect
 When `session-compaction` is enabled:
 
 - **Trigger**: `last_input_tokens >= threshold` OR `estimated_history_tokens >= threshold`
+  OR the measured request budget for the boundary (hydrated messages + exact
+  visible tool definitions + effective output reserve) crosses the threshold on
+  its input side
 - **Guards**: Never on first turn. Ordinary compactions wait at least 3 turns;
   a live history-token or exact provider-byte capacity crossing bypasses that
-  cost guard so an already-oversized request can recover immediately.
+  cost guard so an already-oversized request can recover immediately. A
+  request-budget crossing does not bypass it: tool definitions and the output
+  reserve survive compaction, so a crossing they cause is a cost decision, not a
+  recovery one.
 - **Failure**: Non-fatal. `CompactionFailed` event emitted, agent continues with uncompacted history.
 - **Budget**: Compaction LLM call draws from the same token budget as regular turns.
 

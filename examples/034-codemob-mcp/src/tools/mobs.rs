@@ -206,6 +206,7 @@ impl UserMobConfig {
                             allowed_tools: None,
                             blocked_tools: None,
                             output_format: Some(StepOutputFormat::Text),
+                            failure_policy: Default::default(),
                         },
                     );
                 }
@@ -244,6 +245,7 @@ impl UserMobConfig {
                         allowed_tools: None,
                         blocked_tools: None,
                         output_format: Some(StepOutputFormat::Text),
+                        failure_policy: Default::default(),
                     },
                 );
                 flows.insert(
@@ -279,6 +281,7 @@ impl UserMobConfig {
                             allowed_tools: None,
                             blocked_tools: None,
                             output_format: Some(StepOutputFormat::Text),
+                            failure_policy: Default::default(),
                         },
                     );
                 }

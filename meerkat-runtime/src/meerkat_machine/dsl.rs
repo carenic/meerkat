@@ -3124,6 +3124,14 @@ pub enum OpRegistrationRejectReasonKind {
     MaxConcurrentExceeded,
 }
 
+/// Typed reason a session registration was refused by machine authority.
+/// Bridging copy of the catalog type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum SessionRegistrationRejectReasonKind {
+    #[default]
+    RuntimeEpochConflict,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum OpLifecycleActionKind {
     #[default]
@@ -3190,6 +3198,10 @@ pub enum InputAbandonReason {
     Destroyed,
     Cancelled,
     MaxAttemptsExhausted,
+    /// The input was staged onto a run that never began executing. Distinct
+    /// from `Cancelled` because nobody asked for the work to stop; the runtime
+    /// refused a run it could not prove had started.
+    NeverExecuted,
 }
 
 impl From<&crate::input_state::InputAbandonReason> for InputAbandonReason {
@@ -3203,6 +3215,7 @@ impl From<&crate::input_state::InputAbandonReason> for InputAbandonReason {
             crate::input_state::InputAbandonReason::MaxAttemptsExhausted { .. } => {
                 Self::MaxAttemptsExhausted
             }
+            crate::input_state::InputAbandonReason::NeverExecuted => Self::NeverExecuted,
         }
     }
 }
@@ -3219,6 +3232,7 @@ impl InputAbandonReason {
             Self::Destroyed => "destroyed",
             Self::Cancelled => "cancelled",
             Self::MaxAttemptsExhausted => "max_attempts_exhausted",
+            Self::NeverExecuted => "never_executed",
         }
     }
 }

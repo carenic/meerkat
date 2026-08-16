@@ -160,6 +160,21 @@ pub enum DependencyMode {
     Any,
 }
 
+/// Authored tolerance for a flow node's failure.
+///
+/// `Escalate` is the default: the node's failure classifies its frame Failed,
+/// which fails the run. `Continue` declares the node advisory - its failure is
+/// still recorded in the frame's typed node status and still reported as a
+/// failed step, but it does not decide the frame's terminal classification, so
+/// a fallback branch and the join can complete the frame honestly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowNodeFailurePolicy {
+    #[default]
+    Escalate,
+    Continue,
+}
+
 /// How to parse a step target's terminal output.
 ///
 /// There is deliberately no `Default` impl: an omitted `output_format` is a
@@ -234,6 +249,7 @@ impl FrameSpec {
                             .collect(),
                         depends_on_mode: step.depends_on_mode.clone(),
                         branch: step.branch.clone(),
+                        failure_policy: step.failure_policy,
                     }),
                 )
             })
@@ -257,6 +273,10 @@ pub struct FrameStepSpec {
     pub depends_on: Vec<FlowNodeId>,
     pub depends_on_mode: DependencyMode,
     pub branch: Option<BranchId>,
+    /// Tolerance for this node's failure. Omitted means
+    /// [`FlowNodeFailurePolicy::Escalate`].
+    #[serde(default)]
+    pub failure_policy: FlowNodeFailurePolicy,
 }
 
 /// A repeat_until loop node within a frame.
@@ -268,6 +288,10 @@ pub struct RepeatUntilSpec {
     pub body: FrameSpec,
     pub until: ConditionExpr,
     pub max_iterations: u32,
+    /// Tolerance for this loop node's failure. Omitted means
+    /// [`FlowNodeFailurePolicy::Escalate`].
+    #[serde(default)]
+    pub failure_policy: FlowNodeFailurePolicy,
 }
 
 /// Named (non-inline) reference to a step output schema.
@@ -418,6 +442,10 @@ pub struct FlowStepSpec {
     pub allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     pub blocked_tools: Option<Vec<String>>,
+    /// Tolerance for this step's failure when it is compiled into the root
+    /// frame. Omitted means [`FlowNodeFailurePolicy::Escalate`].
+    #[serde(default)]
+    pub failure_policy: FlowNodeFailurePolicy,
     /// Explicit output format, when the author chose one. `None` means
     /// "omitted" and resolves schema-aware via
     /// [`FlowStepSpec::effective_output_format`]; the parsed shape keeps the
@@ -1479,6 +1507,7 @@ include_patterns = ["text_complete"]
             depends_on: vec![FlowNodeId::from("node-1")],
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         };
         let encoded = serde_json::to_string(&spec).expect("serialize");
         let decoded: FrameStepSpec = serde_json::from_str(&encoded).expect("deserialize");
@@ -1499,6 +1528,7 @@ include_patterns = ["text_complete"]
                 value: serde_json::json!(true),
             },
             max_iterations: 5,
+            failure_policy: Default::default(),
         };
         let encoded = serde_json::to_string(&spec).expect("serialize");
         let decoded: RepeatUntilSpec = serde_json::from_str(&encoded).expect("deserialize");
@@ -1512,6 +1542,7 @@ include_patterns = ["text_complete"]
             depends_on: vec![],
             depends_on_mode: DependencyMode::Any,
             branch: Some(BranchId::from("branch-1")),
+            failure_policy: Default::default(),
         });
         let encoded = serde_json::to_string(&spec).expect("serialize");
         let decoded: FlowNodeSpec = serde_json::from_str(&encoded).expect("deserialize");
@@ -1528,6 +1559,7 @@ include_patterns = ["text_complete"]
                 depends_on: vec![],
                 depends_on_mode: DependencyMode::All,
                 branch: None,
+                failure_policy: Default::default(),
             }),
         );
         let spec = FrameSpec { nodes };
@@ -1571,6 +1603,7 @@ include_patterns = ["text_complete"]
                 allowed_tools: None,
                 blocked_tools: None,
                 output_format: None,
+                failure_policy: Default::default(),
             },
         );
         let mut value =

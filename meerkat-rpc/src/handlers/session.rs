@@ -41,11 +41,143 @@ use meerkat::surface::RequestContext;
 // Param types
 // ---------------------------------------------------------------------------
 
-/// Export the complete durable event log as an ATIF trajectory.
+/// Replay-work bound on one `session/export_atif` request.
+///
+/// This counts events, and events are not the unit the response costs: measured
+/// against real durable logs ~95% of events are streaming deltas carrying ~7
+/// bytes of retained text each, while a non-delta event retains ~1,672, a ratio
+/// that varies by two orders of magnitude with content mix. So this bound is
+/// what guards a pathological all-delta log, where half a million events still
+/// fold into a small document; the accumulated-byte bound below is what guards a
+/// tool-heavy one, where the document outgrows the response long before the
+/// event count does.
+pub const ATIF_EXPORT_MAX_EVENTS: usize = 500_000;
+
+/// Bounds one export replay. Both bounds are parameters of the operation rather
+/// than constants buried in the replay loop, so each refusal is reachable
+/// without a half-million-event fixture.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtifExportBounds {
+    /// Events this replay may read.
+    pub max_events: usize,
+    /// Retained document bytes this replay may accumulate. The wire path sets
+    /// this to the outbound message limit, which is the size the finished
+    /// response is admitted against anyway.
+    pub max_retained_bytes: usize,
+}
+
+impl AtifExportBounds {
+    /// The bounds the wire path serves `session/export_atif` under.
+    pub fn host_default() -> Self {
+        Self {
+            max_events: ATIF_EXPORT_MAX_EVENTS,
+            max_retained_bytes: crate::protocol::RPC_OUTBOUND_MAX_MESSAGE_BYTES,
+        }
+    }
+}
+
+/// One export replay passed a bound. Crate-internal: each refusal reaches
+/// callers as a wire code and message, not as a type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtifExportRefusal {
+    /// The durable log holds more events than one response may replay. A
+    /// property of the request, so it answers as a param rejection.
+    TooManyEvents { limit: usize },
+    /// The document the fold has already accumulated cannot be delivered. A
+    /// property of the response, so it answers the way outbound admission
+    /// answers an oversized result, only before the rest of the log is folded.
+    ResultTooLarge { limit: usize, accumulated: usize },
+}
+
+impl AtifExportRefusal {
+    fn error_code(&self) -> i32 {
+        match self {
+            Self::TooManyEvents { .. } => error::INVALID_PARAMS,
+            Self::ResultTooLarge { .. } => error::BUDGET_EXHAUSTED,
+        }
+    }
+}
+
+impl std::fmt::Display for AtifExportRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyEvents { limit } => write!(
+                f,
+                "session_id names a session whose durable event log exceeds the \
+                 {limit}-event bound for a single session/export_atif response; \
+                 page the log with events/list_since, or export it to a file \
+                 with `rkat session export-atif`"
+            ),
+            Self::ResultTooLarge { limit, accumulated } => write!(
+                f,
+                "session_id names a session whose exported trajectory passed the \
+                 {limit}-byte outbound response limit after {accumulated} bytes \
+                 of retained content, so the finished document could not be \
+                 delivered; page the log with events/list_since, or export it to \
+                 a file with `rkat session export-atif`"
+            ),
+        }
+    }
+}
+
+/// Budget for one export replay: the only place the export bounds are applied.
+struct AtifExportBudget {
+    bounds: AtifExportBounds,
+    consumed_events: usize,
+}
+
+impl AtifExportBudget {
+    fn new(bounds: AtifExportBounds) -> Self {
+        Self {
+            bounds,
+            consumed_events: 0,
+        }
+    }
+
+    fn admit_events(&mut self, events: usize) -> Result<(), AtifExportRefusal> {
+        self.consumed_events = self.consumed_events.saturating_add(events);
+        if self.consumed_events > self.bounds.max_events {
+            return Err(AtifExportRefusal::TooManyEvents {
+                limit: self.bounds.max_events,
+            });
+        }
+        Ok(())
+    }
+
+    /// Admit the document folded so far. `retained_bytes` is a lower bound on
+    /// the serialized document, so passing this bound proves the finished
+    /// response would be refused by outbound admission: refusing here is the
+    /// same answer, before the rest of the log is folded into memory.
+    fn admit_document(&mut self, retained_bytes: usize) -> Result<(), AtifExportRefusal> {
+        if retained_bytes > self.bounds.max_retained_bytes {
+            return Err(AtifExportRefusal::ResultTooLarge {
+                limit: self.bounds.max_retained_bytes,
+                accumulated: retained_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Export the complete durable event log as an ATIF trajectory under this
+/// host's replay bounds.
 pub async fn handle_export_atif(
     id: Option<RpcId>,
     params: Option<&RawValue>,
     runtime: &SessionRuntime,
+) -> RpcResponse {
+    handle_export_atif_bounded(id, params, runtime, AtifExportBounds::host_default()).await
+}
+
+/// Export under explicit replay bounds. Test-facing: the wire path is
+/// `handle_export_atif`, which supplies the host bounds.
+#[doc(hidden)]
+pub async fn handle_export_atif_bounded(
+    id: Option<RpcId>,
+    params: Option<&RawValue>,
+    runtime: &SessionRuntime,
+    bounds: AtifExportBounds,
 ) -> RpcResponse {
     let params: ExportAtifParams = match parse_params(params) {
         Ok(params) => params,
@@ -59,7 +191,11 @@ pub async fn handle_export_atif(
         session_id: session_id.clone(),
     };
     let mut cursor = None;
-    let mut events = Vec::new();
+    // The trajectory is folded page by page: a large durable log is never
+    // materialized as a second in-memory copy of itself.
+    let mut trajectory =
+        meerkat_atif::TrajectoryBuilder::new().with_session_id(session_id.to_string());
+    let mut budget = AtifExportBudget::new(bounds);
     loop {
         let page = match runtime
             .event_list_since(EventsListSinceParams {
@@ -70,11 +206,14 @@ pub async fn handle_export_atif(
             .await
         {
             Ok(Some(page)) => page,
+            // No durable replay projection is installed on this host. The
+            // session's existence is not in question here, so this must not
+            // masquerade as a missing session.
             Ok(None) => {
                 return RpcResponse::error(
                     id,
-                    error::SESSION_NOT_FOUND,
-                    format!("Session not found: {session_id}"),
+                    crate::error::INVALID_REQUEST,
+                    "event replay is not enabled for this runtime host",
                 );
             }
             Err(error) => return RpcResponse::error(id, error.code, error.message),
@@ -93,6 +232,9 @@ pub async fn handle_export_atif(
             );
         }
         cursor = next_cursor;
+        if let Err(refusal) = budget.admit_events(page_events.len()) {
+            return RpcResponse::error(id, refusal.error_code(), refusal.to_string());
+        }
         for event in page_events {
             let mut envelope = EventEnvelope::new_with_source(
                 EventSourceIdentity::session(session_id.clone()),
@@ -101,14 +243,14 @@ pub async fn handle_export_atif(
                 event.event,
             );
             envelope.timestamp_ms = event.timestamp_ms;
-            events.push(envelope);
-            if events.len() > 100_000 {
-                return RpcResponse::error(
-                    id,
-                    crate::error::INTERNAL_ERROR,
-                    "ATIF export exceeds the 100000-event limit",
-                );
+            if let Err(error) = trajectory.push(&envelope) {
+                return RpcResponse::error(id, crate::error::INTERNAL_ERROR, error.to_string());
             }
+        }
+        // Checked per page, so an undeliverable document is refused while the
+        // fold still holds one page of it rather than all of it.
+        if let Err(refusal) = budget.admit_document(trajectory.retained_bytes()) {
+            return RpcResponse::error(id, refusal.error_code(), refusal.to_string());
         }
         if !has_more {
             break;
@@ -121,9 +263,9 @@ pub async fn handle_export_atif(
             Err(error) => return RpcResponse::error(id, error.code, error.message),
         },
     };
-    let trajectory = match meerkat_atif::trajectory_from_events(
-        &events,
-        meerkat_atif::Agent {
+    RpcResponse::success(
+        id,
+        trajectory.finish(meerkat_atif::Agent {
             name: params.agent_name.unwrap_or_else(|| "meerkat".to_string()),
             version: params
                 .agent_version
@@ -131,14 +273,8 @@ pub async fn handle_export_atif(
             model_name,
             tool_definitions: None,
             extra: None,
-        },
-    ) {
-        Ok(trajectory) => trajectory,
-        Err(error) => {
-            return RpcResponse::error(id, crate::error::INTERNAL_ERROR, error.to_string());
-        }
-    };
-    RpcResponse::success(id, trajectory)
+        }),
+    )
 }
 
 fn parse_provider_param(provider: &str) -> Result<Provider, String> {
@@ -806,10 +942,108 @@ pub async fn handle_read(
 )]
 mod tests {
     use super::{
+        ATIF_EXPORT_MAX_EVENTS, AtifExportBounds, AtifExportBudget, AtifExportRefusal,
         CreateSessionResult, create_session_model_resolution_error_code,
         resolve_rpc_create_session_model,
     };
     use std::collections::BTreeMap;
+
+    fn test_bounds(max_events: usize) -> AtifExportBounds {
+        AtifExportBounds {
+            max_events,
+            max_retained_bytes: usize::MAX,
+        }
+    }
+
+    /// The bounds the wire path serves under are the reviewed numbers. Both are
+    /// pinned here because every other test interpolates them symbolically, so
+    /// nothing else notices if a bound moves.
+    #[test]
+    fn atif_export_host_bounds_are_the_reviewed_numbers() {
+        assert_eq!(ATIF_EXPORT_MAX_EVENTS, 500_000);
+        assert_eq!(
+            AtifExportBounds::host_default(),
+            AtifExportBounds {
+                max_events: 500_000,
+                max_retained_bytes: 32 * 1024 * 1024,
+            },
+            "the byte bound is the outbound message limit the response is admitted against"
+        );
+    }
+
+    #[test]
+    fn atif_export_budget_admits_up_to_the_limit_and_refuses_past_it() {
+        let mut budget = AtifExportBudget::new(test_bounds(4));
+        assert!(budget.admit_events(3).is_ok());
+        assert!(
+            budget.admit_events(1).is_ok(),
+            "the limit itself is admissible"
+        );
+        let refusal = budget
+            .admit_events(1)
+            .expect_err("one event past the limit must be refused");
+        assert_eq!(refusal, AtifExportRefusal::TooManyEvents { limit: 4 });
+    }
+
+    #[test]
+    fn atif_export_refusal_names_the_limit_and_points_at_pagination() {
+        let refusal = AtifExportBudget::new(test_bounds(ATIF_EXPORT_MAX_EVENTS))
+            .admit_events(ATIF_EXPORT_MAX_EVENTS + 1)
+            .expect_err("one event past the export ceiling must be refused");
+        assert_eq!(refusal.error_code(), super::error::INVALID_PARAMS);
+        let message = refusal.to_string();
+        assert!(
+            message.contains(&ATIF_EXPORT_MAX_EVENTS.to_string()),
+            "refusal must name the limit: {message}"
+        );
+        assert!(
+            message.contains("events/list_since"),
+            "refusal must point at durable replay pagination: {message}"
+        );
+        assert!(
+            message.contains("session_id"),
+            "refusal must name the offending param: {message}"
+        );
+    }
+
+    /// The accumulated-document bound is what guards a tool-heavy log, where the
+    /// event count is nowhere near its own bound.
+    #[test]
+    fn atif_export_budget_refuses_an_undeliverable_document_mid_fold() {
+        let mut budget = AtifExportBudget::new(AtifExportBounds {
+            max_events: ATIF_EXPORT_MAX_EVENTS,
+            max_retained_bytes: 1_024,
+        });
+        assert!(budget.admit_events(8).is_ok());
+        assert!(
+            budget.admit_document(1_024).is_ok(),
+            "the byte bound itself is admissible"
+        );
+        let refusal = budget
+            .admit_document(1_025)
+            .expect_err("a document past the response limit must be refused");
+        assert_eq!(
+            refusal,
+            AtifExportRefusal::ResultTooLarge {
+                limit: 1_024,
+                accumulated: 1_025,
+            }
+        );
+        assert_eq!(
+            refusal.error_code(),
+            super::error::BUDGET_EXHAUSTED,
+            "an undeliverable result is the answer outbound admission gives"
+        );
+        let message = refusal.to_string();
+        assert!(
+            message.contains("1024") && message.contains("1025"),
+            "refusal must name the limit it enforced and what it saw: {message}"
+        );
+        assert!(
+            message.contains("rkat session export-atif"),
+            "refusal must point at the unbounded file export: {message}"
+        );
+    }
 
     #[test]
     fn create_session_result_preserves_skill_diagnostics() {

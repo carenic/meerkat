@@ -99,35 +99,46 @@ enum LlmRetryOutcome {
     RepollAfterCompaction,
 }
 
+/// Promote this turn's provider claims into authored evidence, discarding any
+/// claim whose reported identity does not match the active lowering.
+///
+/// A claim is provider-reported metadata ABOUT the request, never the
+/// request's content. An adapter that reports a claim for a different
+/// provider/model has produced untrustworthy evidence, so the artifact is
+/// dropped - the turn's actual content is unaffected and must still commit.
+/// This is the commit-time binding rule applied one door earlier: a mismatch
+/// here can only mean a lying or confused adapter, and no shape of it implies
+/// the committed transcript is corrupt.
 fn promote_cache_breakpoint_claims(
     claims: &[crate::ProviderCacheBreakpointClaim],
     active_provider: crate::Provider,
     active_model: &str,
-) -> Result<Vec<crate::AuthoredCacheBreakpoint>, AgentError> {
-    if let Some(mismatch) = claims
-        .iter()
-        .find(|claim| claim.provider() != active_provider || claim.model() != active_model)
-    {
-        return Err(AgentError::llm(
-            active_provider.as_str(),
-            LlmFailureReason::ProviderError(crate::error::LlmProviderError::non_retryable(
-                crate::error::LlmProviderErrorKind::IncompleteResponse,
-                serde_json::json!({
-                    "reason": "cache_breakpoint_claim_identity_mismatch",
-                    "expected_provider": active_provider,
-                    "expected_model": active_model,
-                    "reported_provider": mismatch.provider(),
-                    "reported_model": mismatch.model(),
-                }),
-            )),
-            "provider cache-breakpoint claim did not match the active provider/model identity",
-        ));
+) -> (
+    Vec<crate::AuthoredCacheBreakpoint>,
+    Vec<crate::DiscardedCacheBreakpoint>,
+) {
+    let mut authored = Vec::with_capacity(claims.len());
+    let mut discarded = Vec::new();
+    for claim in claims {
+        let breakpoint = crate::AuthoredCacheBreakpoint::from_provider_claim(claim.clone());
+        if breakpoint.provider() != active_provider || breakpoint.model() != active_model {
+            let detail = format!(
+                "claim reported provider={} model={} but the active lowering is provider={} model={}",
+                breakpoint.provider().as_str(),
+                breakpoint.model(),
+                active_provider.as_str(),
+                active_model
+            );
+            discarded.push(crate::DiscardedCacheBreakpoint::proof(
+                crate::CacheBreakpointDiscardOrigin::AuthoredThisTurn,
+                &breakpoint,
+                crate::CacheBreakpointDiscardReason::EvidenceUnusable { detail },
+            ));
+            continue;
+        }
+        authored.push(breakpoint);
     }
-    Ok(claims
-        .iter()
-        .cloned()
-        .map(crate::AuthoredCacheBreakpoint::from_provider_claim)
-        .collect())
+    (authored, discarded)
 }
 
 type AppliedModelFallbackSwitch = (
@@ -212,6 +223,36 @@ impl<'a> EphemeralCompactionRewriteGuard<'a> {
         // live attempted cadence in place so the normal guard prevents an
         // immediate retry; only cancellation restores the pre-attempt cadence.
         self.rollback_cadence = None;
+    }
+}
+
+/// Typed outcome of a failed compaction projection commit.
+///
+/// A runtime handoff refusal and a memory-store rejection are different facts
+/// with different host severity, and the runtime's typed cause used to be
+/// flattened into a store-error string. Keeping them apart here is what lets
+/// the emitted event carry the typed refusal.
+enum CompactionProjectionFailure {
+    /// The memory store rejected the projection (or the agent could not build
+    /// it).
+    Store(crate::memory::MemoryStoreError),
+    /// The runtime refused to authorize the durable handoff. The store never
+    /// saw the batch.
+    HandoffRefused(crate::memory::CompactionCommitCoordinationError),
+}
+
+impl From<crate::memory::MemoryStoreError> for CompactionProjectionFailure {
+    fn from(error: crate::memory::MemoryStoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl std::fmt::Display for CompactionProjectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(error) => error.fmt(f),
+            Self::HandoffRefused(error) => error.fmt(f),
+        }
     }
 }
 
@@ -1496,12 +1537,14 @@ where
                         None
                     }
                 });
-                let context_budget_error = self.context_budget_preflight_error(
+                let request_context_budget = self.context_budget_fact_for_request(
                     &current_messages,
                     &current_tools,
                     current_max_tokens,
                     request_pressure,
                 )?;
+                let context_budget_error =
+                    self.context_budget_refusal_error(request_context_budget.as_ref());
                 let preflight_error = request_byte_error.or(context_budget_error);
                 if preflight_error.is_some() {
                     // RetryRequested parked one ordinary machine-authorized
@@ -1516,6 +1559,7 @@ where
                         let prior_completed_boundary =
                             self.compaction_cadence.last_compaction_boundary_index;
                         self.pending_compaction_request_pressure = request_pressure;
+                        self.pending_compaction_request_budget = request_context_budget.clone();
                         let transition = TurnExecutionTransition {
                             prev_phase: TurnPhase::CallingLlm,
                             next_phase: TurnPhase::CallingLlm,
@@ -2161,6 +2205,7 @@ where
             ) {
                 self.pending_compaction_boundary_index = None;
                 self.pending_compaction_request_pressure = None;
+                self.pending_compaction_request_budget = None;
                 self.post_compaction_pressure_check = None;
             }
             match effect {
@@ -2231,6 +2276,7 @@ where
                     continue;
                 };
                 let provider_request_pressure = self.pending_compaction_request_pressure.take();
+                let request_context_budget = self.pending_compaction_request_budget.take();
                 if let Some(compactor) = self.compactor.clone() {
                     let model_messages = self.session.messages_for_model_boundary();
                     let last_guarded_boundary = [
@@ -2244,6 +2290,7 @@ where
                     let ctx = crate::agent::compact::build_compaction_context(
                         &model_messages,
                         self.last_input_tokens,
+                        request_context_budget,
                         provider_request_pressure,
                         last_guarded_boundary,
                         current_boundary_index,
@@ -2254,6 +2301,18 @@ where
                             rollback_last_input_tokens: self.last_input_tokens,
                             rollback_compaction_cadence: self.compaction_cadence.clone(),
                         };
+                        // Cadence for every failure path below, including a
+                        // runtime handoff refusal: the attempt is recorded
+                        // before the attempt runs and no failure branch rolls
+                        // it back, so the next boundary sees it through
+                        // `last_guarded_boundary` and an ordinary trigger
+                        // cannot retry immediately. This is the same policy as
+                        // `rollback_index_error_preserving_attempt` and
+                        // `abort_uncommitted_compaction_projections`. A
+                        // capacity crossing deliberately bypasses the guard
+                        // (`Compactor::should_compact` owns that rule): a
+                        // session that cannot make progress must keep trying,
+                        // which is how a cleared refusal self-heals.
                         self.compaction_cadence
                             .last_compaction_attempt_boundary_index = Some(current_boundary_index);
                         // The accumulator serves the parent revision in
@@ -2375,7 +2434,8 @@ where
                                                 projection_failure = Some(
                                                     crate::memory::MemoryStoreError::Unsupported {
                                                         operation: "compaction_projection",
-                                                    },
+                                                    }
+                                                    .into(),
                                                 );
                                                 (false, false)
                                             }
@@ -2413,7 +2473,7 @@ where
                                                     Err(error) => {
                                                         rewrite_guard
                                                             .rollback_index_error_preserving_attempt();
-                                                        projection_failure = Some(error);
+                                                        projection_failure = Some(error.into());
                                                         (false, false)
                                                     }
                                                 }
@@ -2494,7 +2554,8 @@ where
                                                                                 ),
                                                                                 None => "compaction transaction is not awaiting runtime commit".to_string(),
                                                                             },
-                                                                        ),
+                                                                        )
+                                                                        .into(),
                                                                     );
                                                                     (false, false)
                                                                 }
@@ -2516,7 +2577,8 @@ where
                                                                                 "failed to carry compaction projection intent: {error}"
                                                                             ),
                                                                         },
-                                                                    ),
+                                                                    )
+                                                                    .into(),
                                                                 );
                                                                 (false, false)
                                                             }
@@ -2533,26 +2595,69 @@ where
                             } else {
                                 (false, false)
                             };
-                            if let Some(error) = projection_failure {
-                                tracing::warn!(
-                                    error = %error,
-                                    attempted_entries = outcome.discarded.len(),
-                                    "memory store rejected compaction projection; preserving original session history"
-                                );
+                            if let Some(failure) = projection_failure {
+                                let attempted_entries = outcome.discarded.len();
+                                let reason = match &failure {
+                                    CompactionProjectionFailure::Store(error) => {
+                                        tracing::warn!(
+                                            error = %error,
+                                            attempted_entries,
+                                            "memory store rejected compaction projection; preserving original session history"
+                                        );
+                                        crate::event::CompactionFailureReason::memory_indexing_failed(
+                                            attempted_entries,
+                                            error.to_string(),
+                                        )
+                                    }
+                                    CompactionProjectionFailure::HandoffRefused(error) => {
+                                        // The preserved history is the one the
+                                        // turn continues on. Whether the
+                                        // request it composes still fits
+                                        // decides whether this refusal is a
+                                        // cost note or a stuck member, so the
+                                        // verdict reads the same composed
+                                        // budget this boundary handed the
+                                        // trigger.
+                                        let preserved_history = self.preserved_history_fit(
+                                            compactor.as_ref(),
+                                            &model_messages,
+                                            provider_request_pressure,
+                                            ctx.request_context_budget.as_ref(),
+                                        );
+                                        if preserved_history
+                                            == crate::event::CompactionPreservedHistoryFit::OverWindow
+                                        {
+                                            tracing::error!(
+                                                error = %error,
+                                                refusal = ?error.refusal(),
+                                                attempted_entries,
+                                                "runtime refused the durable compaction projection handoff for an over-window session; the preserved history cannot be sent and no compaction can persist until the refusal clears"
+                                            );
+                                        } else {
+                                            tracing::warn!(
+                                                error = %error,
+                                                refusal = ?error.refusal(),
+                                                attempted_entries,
+                                                preserved_history = ?preserved_history,
+                                                "runtime refused the durable compaction projection handoff; preserving original session history"
+                                            );
+                                        }
+                                        crate::event::CompactionFailureReason::projection_handoff_refused(
+                                            error,
+                                            preserved_history,
+                                            attempted_entries,
+                                        )
+                                    }
+                                };
                                 if !crate::event_tap::tap_emit(
                                     &self.event_tap,
                                     event_tx.as_ref(),
-                                    AgentEvent::CompactionFailed {
-                                        reason: crate::event::CompactionFailureReason::memory_indexing_failed(
-                                            outcome.discarded.len(),
-                                            error.to_string(),
-                                        ),
-                                    },
+                                    AgentEvent::CompactionFailed { reason },
                                 )
                                 .await
                                 {
                                     tracing::warn!(
-                                        "compaction event stream receiver dropped before memory-indexing CompactionFailed"
+                                        "compaction event stream receiver dropped before projection-failure CompactionFailed"
                                     );
                                 }
                             }
@@ -2682,7 +2787,7 @@ where
         commit: &crate::TranscriptRewriteCommit,
         authority: &crate::agent::compact::ValidatedCompactionRewrite,
         discarded: &[crate::compact::CompactionDiscard],
-    ) -> Result<crate::memory::CompactionProjectionId, crate::memory::MemoryStoreError> {
+    ) -> Result<crate::memory::CompactionProjectionId, CompactionProjectionFailure> {
         let projection = crate::memory::CompactionProjectionId::from_validated_transcript_rewrite(
             self.session.id().clone(),
             commit,
@@ -2698,9 +2803,12 @@ where
                 operation: "durable_compaction_without_runtime_coordinator",
             },
         )?;
+        // The refusal keeps its typed cause here. Flattening it into a store
+        // error made every runtime-authority refusal indistinguishable from a
+        // memory-store fault on the wire.
         coordinator
             .authorize_projection(&projection)
-            .map_err(|error| crate::memory::MemoryStoreError::Storage(error.to_string()))?;
+            .map_err(CompactionProjectionFailure::HandoffRefused)?;
         // Stable retry payload: the rewrite commit timestamp, not a fresh
         // wall-clock read, owns the staged metadata identity.
         let batch = self.compaction_memory_batch_at(discarded, commit.committed_at)?;
@@ -2708,7 +2816,8 @@ where
             return Err(crate::memory::MemoryStoreError::Storage(
                 "cannot stage compaction while another exact stage identity is in flight"
                     .to_string(),
-            ));
+            )
+            .into());
         }
         // Install the deterministic identity before the cancellation point.
         // If this await is dropped after the store commits, hard-interrupt
@@ -2732,7 +2841,8 @@ where
                         "memory store returned a stage receipt for a different compaction rewrite"
                             .to_string()
                     }
-                }))
+                })
+                .into())
             }
             Err(error) => {
                 let cleanup = self
@@ -2744,7 +2854,8 @@ where
                         "failed to stage compaction projection: {error}; additionally failed exact-stage cleanup: {cleanup}"
                     ),
                     None => format!("failed to stage compaction projection: {error}"),
-                }))
+                })
+                .into())
             }
         }
     }
@@ -4541,9 +4652,33 @@ where
             }
         }
 
+        // One measurement of this exact composed request serves both the parked
+        // compaction check and the pre-dispatch refusal below. A committed
+        // rewrite returns `Repoll` and recomposes everything, so the fact can
+        // never outlive the request it describes.
+        //
+        // A measurement failure is deliberately not raised here. It stays owned
+        // by the refusal site further down, which is where it terminalized
+        // before the compaction check needed the same measurement: an
+        // unserializable tool definition must not preempt the byte-cap terminal
+        // and replace its typed `RequestTooLarge` cause with an internal error.
+        // The trigger sees an absent budget for that boundary and falls back to
+        // its other measures.
+        let request_context_budget_result = self.context_budget_fact_for_request(
+            &request_messages,
+            call_tool_defs,
+            prepared.effective_max_tokens,
+            request_pressure,
+        );
+
         if self.pending_compaction_boundary_index.is_some() {
             let prior_completed_boundary = self.compaction_cadence.last_compaction_boundary_index;
             self.pending_compaction_request_pressure = request_pressure;
+            self.pending_compaction_request_budget = request_context_budget_result
+                .as_ref()
+                .ok()
+                .cloned()
+                .flatten();
             let transition = TurnExecutionTransition {
                 prev_phase: TurnPhase::CallingLlm,
                 next_phase: TurnPhase::CallingLlm,
@@ -4592,20 +4727,15 @@ where
         // produce a fitting rewrite. Only the fully rebuilt request that would
         // otherwise cross the provider boundary is classified against the
         // active model's context authority.
-        let context_budget_error = match self.context_budget_preflight_error(
-            &request_messages,
-            call_tool_defs,
-            prepared.effective_max_tokens,
-            request_pressure,
-        ) {
-            Ok(error) => error,
+        let request_context_budget = match request_context_budget_result {
+            Ok(fact) => fact,
             Err(error) => {
                 return self
                     .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
                     .await;
             }
         };
-        if let Some(error) = context_budget_error {
+        if let Some(error) = self.context_budget_refusal_error(request_context_budget.as_ref()) {
             return self
                 .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
                 .await;
@@ -4730,36 +4860,28 @@ where
         ))
     }
 
-    /// Classify the fully hydrated request against the active model profile
-    /// before any provider dispatch.
+    /// Classify one already-measured request budget against the active model
+    /// profile before any provider dispatch.
     ///
     /// The effective model registry owns the context-window limit. Exact
     /// provider-lowered bytes remain observational. Only an exact
     /// provider-issued token count may authorize a typed pre-dispatch
     /// `ContextExceeded` terminal; otherwise provider rejection remains the
-    /// authoritative typed failure.
-    fn context_budget_preflight_error(
+    /// authoritative typed failure. The fact is taken as a parameter because
+    /// the same measurement also feeds the parked compaction check at this
+    /// boundary, and measuring a multi-megabyte transcript twice per boundary is
+    /// exactly the hot-path cost the estimator exists to avoid.
+    fn context_budget_refusal_error(
         &self,
-        messages: &[Message],
-        tools: &[Arc<ToolDef>],
-        max_output_tokens: u32,
-        provider_request_pressure: Option<crate::ProviderRequestPressure>,
-    ) -> Result<Option<AgentError>, AgentError> {
-        let Some(fact) = self.context_budget_fact_for_request(
-            messages,
-            tools,
-            max_output_tokens,
-            provider_request_pressure,
-        )?
-        else {
-            return Ok(None);
-        };
+        fact: Option<&crate::ContextBudgetFact>,
+    ) -> Option<AgentError> {
+        let fact = fact?;
         if !fact.requires_dispatch_refusal() {
-            return Ok(None);
+            return None;
         }
 
         let requested = u32::try_from(fact.estimated_total_tokens).unwrap_or(u32::MAX);
-        Ok(Some(AgentError::llm(
+        Some(AgentError::llm(
             self.client.provider().as_str(),
             LlmFailureReason::ContextExceeded {
                 max: fact.context_window_tokens,
@@ -4770,7 +4892,84 @@ where
                 self.client.model(),
                 fact.context_window_tokens,
             ),
-        )))
+        ))
+    }
+
+    /// Classify the history a failed compaction preserved against the same
+    /// pre-dispatch authorities the request preflight uses, at the same scope.
+    ///
+    /// The token axis reads the composed-request budget this boundary already
+    /// parked - the exact [`crate::CompactionContext::request_context_budget`]
+    /// fact the trigger consumed, measured over the request messages, the
+    /// visible tool definitions and the effective output reserve. The trigger
+    /// moved onto that fact because a transcript-only measure under-reports
+    /// every request by the tool schemas that ride it; an escalation verdict
+    /// that answered a narrower question than the trigger asked would report a
+    /// wedged strand as a cost note.
+    ///
+    /// Reading the parked budget is sound on THIS path specifically. An earlier
+    /// form of this classifier rejected it as "measured before the
+    /// summarization call"; that objection describes a committed rewrite, and
+    /// on this path the durable handoff was refused, so no rewrite landed and
+    /// the preserved history is byte-for-byte the transcript that budget was
+    /// measured over. The composed request also only grows from here: the next
+    /// turn recomposes it from this same history plus whatever that turn adds.
+    ///
+    /// Without that fact (no context-window authority, or a composed request
+    /// that could not be measured), the preserved history is measured alone as
+    /// a floor - no tools, no reserve - so it can prove an excess and never a
+    /// fit. An exact provider-issued input-token count, when the provider
+    /// exposes one, overrides the forecast inside either fact. A classification
+    /// failure is not a turn failure - the caller is on a path that must
+    /// survive - so an unmeasurable transcript degrades to `Unclassified`.
+    ///
+    /// The byte axis measures the exact provider-lowered body of that same
+    /// composed request against the effective request-byte cap. It has no
+    /// floor to fall back on, and unlike the token axis it exists only when
+    /// the client produced a witness and a cap is in force:
+    /// [`crate::AgentLlmClient::request_pressure`] defaults to no witness, so
+    /// every host client that does not override it reaches here with the byte
+    /// axis unmeasured. That absence is passed through as absence rather than
+    /// mapped to a fit, because `StillFits` states both axes - a preserved
+    /// history whose composed request fits the window can still be a body no
+    /// provider will accept.
+    fn preserved_history_fit(
+        &self,
+        compactor: &dyn crate::compact::Compactor,
+        preserved_messages: &[Message],
+        provider_request_pressure: Option<crate::ProviderRequestPressure>,
+        composed_request_budget: Option<&crate::ContextBudgetFact>,
+    ) -> crate::event::CompactionPreservedHistoryFit {
+        let byte_evidence = provider_request_pressure.and_then(|pressure| {
+            compactor
+                .request_byte_cap(pressure)
+                .or(pressure.max_bytes)
+                .map(|max_bytes| {
+                    if pressure.encoded_bytes > max_bytes {
+                        crate::event::CompactionFitByteEvidence::LoweredBodyOverCap
+                    } else {
+                        crate::event::CompactionFitByteEvidence::LoweredBodyWithinCap
+                    }
+                })
+        });
+        let token_evidence = match composed_request_budget {
+            Some(budget) => Some(crate::event::CompactionFitTokenEvidence::ComposedRequest(
+                budget.state,
+            )),
+            None => self
+                .context_budget_fact_for_request(
+                    preserved_messages,
+                    &[],
+                    0,
+                    provider_request_pressure,
+                )
+                .ok()
+                .flatten()
+                .map(|fact| {
+                    crate::event::CompactionFitTokenEvidence::PreservedHistoryFloor(fact.state)
+                }),
+        };
+        crate::event::CompactionPreservedHistoryFit::classify(byte_evidence, token_evidence)
     }
 
     fn context_budget_fact_for_request(
@@ -4846,11 +5045,12 @@ where
         in_extraction: bool,
         result: LlmStreamResult,
     ) -> Result<CallingLlmGate<CallingLlmAssistantTurn>, AgentError> {
-        let authored_cache_breakpoints = promote_cache_breakpoint_claims(
-            result.cache_breakpoint_claims(),
-            self.client.provider(),
-            self.client.model(),
-        )?;
+        let (authored_cache_breakpoints, mut cache_breakpoint_discards) =
+            promote_cache_breakpoint_claims(
+                result.cache_breakpoint_claims(),
+                self.client.provider(),
+                self.client.model(),
+            );
         let turn_usage = TurnUsage::try_from_usage(result.usage.clone()).map_err(|error| {
             AgentError::llm(
                 self.client.provider().as_str(),
@@ -4869,13 +5069,57 @@ where
             self.client.provider(),
             self.client.model(),
         )?;
-        self.session
-            .record_authored_cache_breakpoints(&authored_cache_breakpoints)
+        // A provider-authored cache breakpoint is an optimization artifact
+        // anchored to one exact transcript head. It must never be able to fail
+        // a completed provider turn: an anchor the committed transcript has
+        // moved past is discarded and observed, and only a fault in the
+        // transcript itself still terminalizes.
+        let cache_breakpoint_retention = self
+            .session
+            .retain_authored_cache_breakpoints(&authored_cache_breakpoints)
             .map_err(|error| {
                 AgentError::InternalError(format!(
-                    "provider-authored cache breakpoint did not bind to the committed transcript head: {error}"
+                    "committed transcript could not carry provider-authored cache evidence: {error}"
                 ))
             })?;
+        let retained_cache_breakpoints =
+            if authored_cache_breakpoints.is_empty() && !cache_breakpoint_discards.is_empty() {
+                // `retained` is the severity axis a host pages on, so it must not
+                // understate. The retention seam deliberately leaves durable
+                // evidence untouched when a turn authors nothing, reporting `0` by
+                // construction, and this is the one path that can report a discard
+                // without having authored anything: every claim was rejected as
+                // unusable one door earlier. Count the durable set here rather than
+                // making every ordinary turn pay for the same walk.
+                self.session.bound_authored_cache_breakpoint_count()
+            } else {
+                cache_breakpoint_retention.retained()
+            };
+        cache_breakpoint_discards.extend(cache_breakpoint_retention.into_discarded());
+        if !cache_breakpoint_discards.is_empty() {
+            for discard in &cache_breakpoint_discards {
+                tracing::warn!(
+                    session_id = %self.session.id(),
+                    origin = discard.origin().as_str(),
+                    reason = discard.reason().code(),
+                    discarded = %discard,
+                    retained = retained_cache_breakpoints,
+                    "provider-authored cache breakpoint discarded; the turn proceeds with less caching"
+                );
+            }
+            // A discard that only reaches tracing is an unrouted signal. The
+            // same fact rides the ordinary event stream so a host can page on
+            // it without scraping logs.
+            emit_phase_event!(
+                self,
+                ctx,
+                AgentEvent::ProviderCacheBreakpointsDiscarded {
+                    session_id: self.session.id().clone(),
+                    retained: retained_cache_breakpoints,
+                    discarded: cache_breakpoint_discards,
+                }
+            );
+        }
         // Update budget + session usage only from normalized provider evidence.
         self.budget.record_turn_usage(&turn_usage);
         self.last_input_tokens = turn_usage.presented_tokens();
@@ -6322,16 +6566,355 @@ mod tests {
             })
             .expect("claim shape");
 
-        let error =
-            promote_cache_breakpoint_claims(&[claim], crate::Provider::OpenAI, "active-model")
-                .expect_err("mismatched custom-client claim must fail closed");
+        // A lying adapter yields untrustworthy EVIDENCE, not a corrupt
+        // transcript: the claim is discarded and the turn's content still
+        // commits. The proof is never promoted into durable evidence.
+        let (authored, discarded) =
+            promote_cache_breakpoint_claims(&[claim], crate::Provider::OpenAI, "active-model");
+        assert!(
+            authored.is_empty(),
+            "a mismatched claim must never be promoted into durable evidence"
+        );
+        let [discard] = discarded.as_slice() else {
+            panic!("expected exactly one discard, got {discarded:?}");
+        };
+        assert_eq!(
+            discard.origin(),
+            crate::CacheBreakpointDiscardOrigin::AuthoredThisTurn
+        );
         assert!(matches!(
-            error,
-            AgentError::Llm {
-                reason: LlmFailureReason::ProviderError(ref provider_error),
-                ..
-            } if provider_error.kind == LlmProviderErrorKind::IncompleteResponse
+            discard.reason(),
+            crate::CacheBreakpointDiscardReason::EvidenceUnusable { .. }
         ));
+        assert_eq!(
+            discard
+                .identity()
+                .expect("a decoded claim has an identity")
+                .model,
+            "forged-model",
+            "the discard must name what the adapter claimed, not the active model"
+        );
+    }
+
+    // ========================================================================
+    // Provider cache-breakpoint degradation at the agent layer.
+    //
+    // The session-layer tests prove the drop. These prove the RULING: the
+    // turn that produced real model output still completes, and the discard
+    // reaches a routed, host-observable event rather than only a log line.
+    // ========================================================================
+
+    fn anthropic_agent_claim(
+        messages: &[Message],
+        message_count: u64,
+    ) -> crate::ProviderCacheBreakpointClaim {
+        anthropic_agent_claim_for_model("claude-opus-5", messages, message_count)
+    }
+
+    fn anthropic_agent_claim_for_model(
+        model: &str,
+        messages: &[Message],
+        message_count: u64,
+    ) -> crate::ProviderCacheBreakpointClaim {
+        crate::provider_cache_breakpoint_claim(crate::ProviderCacheBreakpointClaimRequest {
+            provider: crate::Provider::Anthropic,
+            model,
+            messages,
+            boundary: crate::CacheBreakpointBoundary::TranscriptAfter { message_count },
+            ttl: crate::ProviderCacheTtl::ProviderDefault,
+            rendered_prefix: br#"{"renderer_mode":"agent-test"}"#,
+            lowered_request_encoding: crate::LoweredRequestEncoding::AnthropicMessagesJson,
+            lowered_request_body: br#"{"model":"claude-opus-5"}"#,
+        })
+        .expect("agent test claim shape")
+    }
+
+    /// How far past the lowered transcript the overhanging shape anchors.
+    const OVERHANGING_ANCHOR_ROWS: usize = 4;
+
+    /// How the test client anchors its cache-breakpoint claim.
+    #[derive(Clone, Copy)]
+    enum CacheClaimShape {
+        /// Anchored to exactly the messages the lowering was handed, so the
+        /// proof binds to the committed transcript.
+        Binding,
+        /// Anchored past the end of the committed transcript, the way a
+        /// request-local injected-context row does.
+        Overhanging,
+        /// In range, but over a prefix the committed transcript does not have.
+        MovedPrefix,
+        /// Binds perfectly, but the adapter labels it with a model that is not
+        /// the active lowering: untrustworthy evidence, rejected one door
+        /// before the retention seam.
+        MismatchedIdentity,
+    }
+
+    struct CacheClaimingLlmClient {
+        /// One shape per call, in order. The last entry repeats.
+        shapes: Vec<CacheClaimShape>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CacheClaimingLlmClient {
+        fn next_shape(&self) -> CacheClaimShape {
+            let call = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.shapes[call.min(self.shapes.len().saturating_sub(1))]
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentLlmClient for CacheClaimingLlmClient {
+        async fn stream_response(
+            &self,
+            messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            let claim = match self.next_shape() {
+                CacheClaimShape::Binding => anthropic_agent_claim(messages, messages.len() as u64),
+                CacheClaimShape::Overhanging => {
+                    // Overhang by several rows, not one, so the anchor is past
+                    // the committed length no matter how many rows this turn
+                    // commits. A one-row overhang would land as a moved prefix
+                    // the moment commit ordering changes, and the reason is
+                    // exactly what this test asserts.
+                    let mut lowered = messages.to_vec();
+                    for index in 0..OVERHANGING_ANCHOR_ROWS {
+                        lowered.push(Message::User(UserMessage::text(format!(
+                            "request-local context {index}"
+                        ))));
+                    }
+                    let count = lowered.len() as u64;
+                    anthropic_agent_claim(&lowered, count)
+                }
+                CacheClaimShape::MovedPrefix => {
+                    // Anchor at the first row, which is always in range: the
+                    // committed transcript holds at least the user turn. Only
+                    // the content underneath the anchor differs, so this is
+                    // unambiguously a moved prefix and never an overhang.
+                    let mut doctored = messages.to_vec();
+                    doctored.truncate(1);
+                    let moved = Message::User(UserMessage::text(
+                        "a prefix the session does not have".to_string(),
+                    ));
+                    match doctored.first_mut() {
+                        Some(first) => *first = moved,
+                        None => doctored.push(moved),
+                    }
+                    anthropic_agent_claim(&doctored, 1)
+                }
+                CacheClaimShape::MismatchedIdentity => {
+                    anthropic_agent_claim_for_model("forged-model", messages, messages.len() as u64)
+                }
+            };
+            Ok(super::LlmStreamResult::new(
+                vec![AssistantBlock::Text {
+                    text: "ok".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+                normalized_test_usage(self, Usage::default()),
+            )
+            .with_cache_breakpoint_claims(vec![claim]))
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::Anthropic
+        }
+
+        fn model(&self) -> &'static str {
+            "claude-opus-5"
+        }
+    }
+
+    /// Discards routed by one turn: the retained count plus the discarded set.
+    type ObservedCacheDiscards = Vec<(usize, Vec<crate::DiscardedCacheBreakpoint>)>;
+
+    async fn run_turn_with_cache_claim(
+        shape: CacheClaimShape,
+    ) -> (crate::Session, ObservedCacheDiscards) {
+        let (session, mut per_turn) = run_turns_with_cache_claims(&[shape]).await;
+        (session, per_turn.remove(0))
+    }
+
+    /// Run one turn per shape against a single agent, returning the routed
+    /// discard events observed in each turn.
+    async fn run_turns_with_cache_claims(
+        shapes: &[CacheClaimShape],
+    ) -> (crate::Session, Vec<ObservedCacheDiscards>) {
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .build_standalone(
+                Arc::new(CacheClaimingLlmClient {
+                    shapes: shapes.to_vec(),
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                Arc::new(NoTools),
+                Arc::new(NoopStore),
+            )
+            .await;
+
+        let mut per_turn = Vec::with_capacity(shapes.len());
+        for turn in 0..shapes.len() {
+            let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+            agent
+                .run_with_events(format!("hello {turn}").into(), tx)
+                .await
+                .expect("a cache-breakpoint artifact must never fail a completed turn");
+
+            let mut observed = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if let crate::event::AgentEvent::ProviderCacheBreakpointsDiscarded {
+                    retained,
+                    discarded,
+                    ..
+                } = event
+                {
+                    observed.push((retained, discarded));
+                }
+            }
+            per_turn.push(observed);
+        }
+        (agent.session().clone(), per_turn)
+    }
+
+    /// Root-cause shape A, end to end: the turn COMPLETES and the discard is
+    /// routed onto the ordinary event stream a host already watches.
+    #[tokio::test]
+    async fn overhanging_cache_anchor_is_discarded_and_the_turn_completes() {
+        let (session, observed) = run_turn_with_cache_claim(CacheClaimShape::Overhanging).await;
+
+        let [(retained, discarded)] = observed.as_slice() else {
+            panic!("expected exactly one routed discard event, got {observed:?}");
+        };
+        assert_eq!(*retained, 0);
+        let [discard] = discarded.as_slice() else {
+            panic!("expected exactly one discard, got {discarded:?}");
+        };
+        assert_eq!(
+            discard.origin(),
+            crate::CacheBreakpointDiscardOrigin::AuthoredThisTurn
+        );
+        assert!(
+            matches!(
+                discard.reason(),
+                crate::CacheBreakpointDiscardReason::BoundaryOutsideCommittedTranscript { .. }
+            ),
+            "unexpected reason: {:?}",
+            discard.reason()
+        );
+        // The turn's real output is committed; only the artifact was dropped.
+        assert!(
+            session
+                .messages()
+                .iter()
+                .any(|message| matches!(message, Message::BlockAssistant(_))),
+            "the completed turn's assistant output must be committed"
+        );
+        assert!(
+            session
+                .authored_cache_breakpoints()
+                .expect("no evidence was persisted")
+                .is_empty()
+        );
+    }
+
+    /// Root-cause shape B, end to end.
+    #[tokio::test]
+    async fn moved_prefix_cache_anchor_is_discarded_and_the_turn_completes() {
+        let (session, observed) = run_turn_with_cache_claim(CacheClaimShape::MovedPrefix).await;
+
+        let [(_, discarded)] = observed.as_slice() else {
+            panic!("expected exactly one routed discard event, got {observed:?}");
+        };
+        let [discard] = discarded.as_slice() else {
+            panic!("expected exactly one discard, got {discarded:?}");
+        };
+        assert!(
+            matches!(
+                discard.reason(),
+                crate::CacheBreakpointDiscardReason::CanonicalPrefixMoved
+            ),
+            "unexpected reason: {:?}",
+            discard.reason()
+        );
+        assert!(
+            session
+                .messages()
+                .iter()
+                .any(|message| matches!(message, Message::BlockAssistant(_))),
+            "the completed turn's assistant output must be committed"
+        );
+    }
+
+    /// The other half of the ruling: a proof that DOES bind is preserved and
+    /// stays usable. Without this, "never fails a turn" would be satisfied by
+    /// simply discarding every breakpoint.
+    #[tokio::test]
+    async fn binding_cache_anchor_is_preserved_and_emits_no_discard() {
+        let (session, observed) = run_turn_with_cache_claim(CacheClaimShape::Binding).await;
+
+        assert!(
+            observed.is_empty(),
+            "a binding proof must not emit a discard event: {observed:?}"
+        );
+        let retained = session
+            .authored_cache_breakpoints()
+            .expect("a binding proof must survive the strict read");
+        assert_eq!(
+            retained.len(),
+            1,
+            "the binding proof must remain durable, revalidated evidence"
+        );
+        assert_eq!(retained[0].provider(), crate::Provider::Anthropic);
+    }
+
+    /// `retained` is the severity axis a host pages on: `0` means this turn
+    /// lost caching outright. It must therefore never understate. A turn whose
+    /// every claim is rejected as unusable authors nothing, so the retention
+    /// seam reports `0` by construction - the boundary has to count the
+    /// durable set that is still binding instead of forwarding that `0`.
+    #[tokio::test]
+    async fn discard_event_reports_durable_evidence_that_still_binds() {
+        let (session, per_turn) = run_turns_with_cache_claims(&[
+            CacheClaimShape::Binding,
+            CacheClaimShape::MismatchedIdentity,
+        ])
+        .await;
+
+        let [first, second] = per_turn.as_slice() else {
+            panic!("expected one observation set per turn, got {per_turn:?}");
+        };
+        assert!(
+            first.is_empty(),
+            "the binding turn must not emit a discard event: {first:?}"
+        );
+        let [(retained, discarded)] = second.as_slice() else {
+            panic!("expected exactly one routed discard event, got {second:?}");
+        };
+        let [discard] = discarded.as_slice() else {
+            panic!("expected exactly one discard, got {discarded:?}");
+        };
+        assert!(matches!(
+            discard.reason(),
+            crate::CacheBreakpointDiscardReason::EvidenceUnusable { .. }
+        ));
+        assert_eq!(
+            *retained, 1,
+            "caching was weakened, not lost: the first turn's proof still binds"
+        );
+        assert_eq!(
+            session
+                .authored_cache_breakpoints()
+                .expect("durable evidence must still be readable")
+                .len(),
+            1,
+            "a rejected claim must not disturb durable evidence that still binds"
+        );
     }
 
     #[test]
@@ -6986,12 +7569,43 @@ mod tests {
 
     struct CompactionAwareLlmClient {
         last_user_messages: Mutex<Vec<String>>,
+        /// Exact provider-lowered pressure to report once the transcript has
+        /// grown past `over_cap_from_messages` rows.
+        over_cap_from_messages: Option<usize>,
+        /// Report an exact lowered body that sits comfortably under the
+        /// provider cap, so the byte axis answers `Some(false)` on every call.
+        fitting_lowered_body: bool,
     }
 
     impl CompactionAwareLlmClient {
         fn new() -> Self {
             Self {
                 last_user_messages: Mutex::new(Vec::new()),
+                over_cap_from_messages: None,
+                fitting_lowered_body: false,
+            }
+        }
+
+        /// A client whose exact lowered body exceeds the provider cap from the
+        /// second run onwards: the shape of a strand that has outgrown its
+        /// window, where a refused compaction persistence is a wedge rather
+        /// than a cost note.
+        fn over_cap_from_second_run() -> Self {
+            Self {
+                last_user_messages: Mutex::new(Vec::new()),
+                over_cap_from_messages: Some(3),
+                fitting_lowered_body: false,
+            }
+        }
+
+        /// A client whose exact lowered body is real and far under the provider
+        /// cap - the production shape of a session wedged on TOKENS, where the
+        /// byte axis truthfully reports a fit and decides nothing.
+        fn with_fitting_lowered_body() -> Self {
+            Self {
+                last_user_messages: Mutex::new(Vec::new()),
+                over_cap_from_messages: None,
+                fitting_lowered_body: true,
             }
         }
 
@@ -7003,6 +7617,30 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl AgentLlmClient for CompactionAwareLlmClient {
+        fn request_pressure(
+            &self,
+            messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<Option<crate::ProviderRequestPressure>, AgentError> {
+            if let Some(pressure) = self
+                .over_cap_from_messages
+                .filter(|threshold| messages.len() >= *threshold)
+                .map(|_| crate::ProviderRequestPressure::new(2_000_000, Some(1_000)))
+            {
+                return Ok(Some(pressure));
+            }
+            if self.fitting_lowered_body {
+                return Ok(Some(crate::ProviderRequestPressure::new(
+                    3_750_000,
+                    Some(50_000_000),
+                )));
+            }
+            Ok(None)
+        }
+
         async fn stream_response(
             &self,
             messages: &[Message],
@@ -7085,6 +7723,10 @@ mod tests {
                 .iter()
                 .map(|ctx| ctx.session_boundary_index)
                 .collect()
+        }
+
+        fn seen_contexts(&self) -> Vec<CompactionContext> {
+            self.seen_contexts.lock().unwrap().clone()
         }
     }
 
@@ -7823,6 +8465,42 @@ mod tests {
                     },
                 )
             }
+        }
+    }
+
+    /// A runtime coordinator that refuses every handoff with a typed cause,
+    /// standing in for the production refusal (a rotated/retired runtime epoch)
+    /// that the agent loop must survive.
+    struct RefusingCompactionCoordinator {
+        refusal: crate::memory::CompactionHandoffRefusal,
+        detail: &'static str,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RefusingCompactionCoordinator {
+        fn epoch_rotated() -> Self {
+            Self {
+                refusal: crate::memory::CompactionHandoffRefusal::RuntimeEpochRotated,
+                detail: "runtime epoch changed (expected RuntimeEpochId(\"019f\"), current None)",
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::memory::CompactionCommitCoordinator for RefusingCompactionCoordinator {
+        fn authorize_projection(
+            &self,
+            _projection: &crate::memory::CompactionProjectionId,
+        ) -> Result<(), crate::memory::CompactionCommitCoordinationError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::memory::CompactionCommitCoordinationError::refused(
+                self.refusal,
+                self.detail,
+            ))
         }
     }
 
@@ -8781,6 +9459,25 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .into();
+
+            Self {
+                tools,
+                dispatched_names: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// One tool whose serialized definition dominates the request. Tool
+        /// schemas are counted by the provider in full on every call, so this
+        /// is the lever for a composed request that exceeds the context window
+        /// while the transcript alone stays well inside it.
+        fn with_wide_tool(name: &str, description_bytes: usize) -> Self {
+            let tools = vec![Arc::new(ToolDef {
+                name: name.into(),
+                description: "d".repeat(description_bytes),
+                input_schema: serde_json::json!({ "type": "object" }),
+                provenance: None,
+            })]
+            .into();
 
             Self {
                 tools,
@@ -9869,6 +10566,383 @@ mod tests {
         assert_eq!(cadence.session_boundary_index, 2);
         assert_eq!(cadence.last_compaction_boundary_index, None);
         assert_eq!(cadence.last_compaction_attempt_boundary_index, Some(1));
+    }
+
+    /// A refused durable handoff is not a memory-store fault, and it must not
+    /// be reported as one: the store never saw the batch. The typed refusal
+    /// reaches the wire so an adopter can route it, the turn survives, and the
+    /// attempted cadence stays in place so the next ordinary boundary does not
+    /// retry immediately.
+    #[tokio::test]
+    async fn refused_durable_projection_handoff_reports_its_typed_cause_and_keeps_the_turn() {
+        let memory_store = Arc::new(AbortRetryMemoryStore::new());
+        let coordinator = Arc::new(RefusingCompactionCoordinator::epoch_rotated());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(DiscardingCompactor::new(1)))
+            .memory_store(memory_store.clone())
+            .with_compaction_commit_coordinator(coordinator.clone())
+            .build_standalone(
+                Arc::new(CompactionAwareLlmClient::new()),
+                Arc::new(NoTools),
+                Arc::new(NoopStore),
+            )
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+        agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect("a refused durable handoff must preserve history and continue the turn");
+
+        assert_eq!(coordinator.calls(), 1);
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        let refused = events
+            .iter()
+            .find_map(|event| match event {
+                crate::event::AgentEvent::CompactionFailed {
+                    reason:
+                        crate::event::CompactionFailureReason::ProjectionHandoffRefused {
+                            refusal,
+                            preserved_history,
+                            attempted_entries,
+                            message,
+                        },
+                } => Some((*refusal, *preserved_history, *attempted_entries, message)),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("a refused handoff must surface its own typed reason, got: {events:?}")
+            });
+        assert_eq!(
+            refused.0,
+            crate::memory::CompactionHandoffRefusal::RuntimeEpochRotated,
+            "the runtime's typed cause must survive the boundary instead of becoming a string"
+        );
+        assert_eq!(
+            refused.1,
+            crate::event::CompactionPreservedHistoryFit::Unclassified,
+            "no context window and no provider pressure witness must not be reported as a fit"
+        );
+        assert_eq!(refused.2, 2, "both discarded rows were attempted");
+        assert!(
+            refused.3.contains("runtime epoch changed"),
+            "the diagnostic detail must reach the event: {}",
+            refused.3
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                crate::event::AgentEvent::CompactionFailed {
+                    reason: crate::event::CompactionFailureReason::MemoryIndexingFailed { .. }
+                }
+            )),
+            "a runtime refusal must never masquerade as memory indexing failure"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, crate::event::AgentEvent::CompactionCompleted { .. })),
+            "a refused handoff must not report a completed compaction"
+        );
+
+        assert!(
+            memory_store.staged.lock().unwrap().is_empty(),
+            "the refusal precedes staging, so nothing durable is left behind"
+        );
+        assert!(
+            agent
+                .session()
+                .messages()
+                .iter()
+                .any(|message| message.as_indexable_text().contains("first")),
+            "the refused rewrite must leave the authoritative history in place"
+        );
+        assert!(agent.compaction_transaction.is_none());
+
+        let cadence: crate::compact::SessionCompactionCadence = serde_json::from_value(
+            agent
+                .session()
+                .metadata()
+                .get(crate::compact::SESSION_COMPACTION_CADENCE_KEY)
+                .expect("refused handoff cadence must be persisted")
+                .clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            cadence.last_compaction_boundary_index, None,
+            "no rewrite committed, so the completed boundary must not advance"
+        );
+        assert_eq!(
+            cadence.last_compaction_attempt_boundary_index,
+            Some(1),
+            "the attempted boundary is the retry guard for this failure path, exactly as for a \
+             rejected ephemeral publication"
+        );
+
+        // Recreate the agent from the durable session value: the restored
+        // attempt boundary must keep an ordinary cadence-honouring trigger from
+        // retrying at the very next boundary.
+        let resumed_client = Arc::new(FailingCompactionLlmClient::new());
+        let resumed_compactor = Arc::new(CadenceAwareFailingCompactor::new());
+        let mut resumed_agent =
+            with_test_turn_state_handle_for_session(AgentBuilder::new(), agent.session().clone())
+                .compactor(resumed_compactor.clone())
+                .build_standalone(
+                    resumed_client.clone(),
+                    Arc::new(NoTools),
+                    Arc::new(NoopStore),
+                )
+                .await;
+        resumed_agent
+            .run("third after refused handoff".into())
+            .await
+            .expect("restored attempt cadence should guard the next turn");
+        assert_eq!(
+            resumed_compactor
+                .seen_contexts()
+                .iter()
+                .map(|ctx| (
+                    ctx.session_boundary_index,
+                    ctx.last_compaction_boundary_index
+                ))
+                .collect::<Vec<_>>(),
+            vec![(2, Some(1))],
+            "the refused attempt must feed the cadence guard on the next boundary"
+        );
+        assert_eq!(
+            resumed_client.seen_last_user_messages(),
+            vec!["third after refused handoff".to_string()],
+            "a refused handoff must not retrigger compaction on the next ordinary boundary"
+        );
+    }
+
+    /// The severity discriminator: the same refusal on a strand that no longer
+    /// fits its provider cap is reported as over-window, because that session
+    /// cannot make progress until a compaction persists. The provider then
+    /// refuses the oversized request, which is exactly the production shape.
+    #[tokio::test]
+    async fn refused_handoff_on_an_over_window_strand_is_reported_as_over_window() {
+        let memory_store = Arc::new(AbortRetryMemoryStore::new());
+        let coordinator = Arc::new(RefusingCompactionCoordinator::epoch_rotated());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(DiscardingCompactor::new(1)))
+            .memory_store(memory_store.clone())
+            .with_compaction_commit_coordinator(coordinator.clone())
+            .build_standalone(
+                Arc::new(CompactionAwareLlmClient::over_cap_from_second_run()),
+                Arc::new(NoTools),
+                Arc::new(NoopStore),
+            )
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+        let error = agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect_err("an over-cap request that compaction could not repair must fail the turn");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the active provider cap"),
+            "unexpected turn failure: {error}"
+        );
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        let preserved_history = events
+            .iter()
+            .find_map(|event| match event {
+                crate::event::AgentEvent::CompactionFailed {
+                    reason:
+                        crate::event::CompactionFailureReason::ProjectionHandoffRefused {
+                            preserved_history,
+                            ..
+                        },
+                } => Some(*preserved_history),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("the refused handoff must be reported before the turn fails: {events:?}")
+            });
+        assert_eq!(
+            preserved_history,
+            crate::event::CompactionPreservedHistoryFit::OverWindow,
+            "a preserved history over the provider cap is a wedge, not a warn-level cost note"
+        );
+    }
+
+    /// The production shape this discriminator exists for, and the one a
+    /// transcript-only measure answers wrong: a preserved history that fits its
+    /// window on its own, inside a composed request that does not. Tool schemas
+    /// ride every request in full and the provider counts them, so this member
+    /// dies on the provider's context limit every turn - while both narrower
+    /// axes truthfully report a fit (the exact lowered body is far under the
+    /// provider's byte cap, and the transcript alone is far under the window).
+    ///
+    /// The trigger side of this release moved onto the composed-request budget
+    /// for exactly this reason; the escalation verdict must measure the same
+    /// request, or the two halves of one boundary disagree about what fits.
+    #[tokio::test]
+    async fn refused_handoff_over_the_composed_request_window_is_not_reported_as_still_fits() {
+        let registry = fallback_activation_test_registry();
+        let memory_store = Arc::new(AbortRetryMemoryStore::new());
+        let coordinator = Arc::new(RefusingCompactionCoordinator::epoch_rotated());
+        // ~125k tool tokens against the profile's 128k window: the transcript
+        // is nowhere near the window, the composed request is over it.
+        let tools = Arc::new(FullToolDispatcher::with_wide_tool("wide", 500_000));
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(8_192)
+                .compactor(Arc::new(DiscardingCompactor::new(1)))
+                .memory_store(memory_store.clone())
+                .with_compaction_commit_coordinator(coordinator.clone())
+                .with_effective_model_registry(Arc::clone(&registry)),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(
+            Arc::new(CompactionAwareLlmClient::with_fitting_lowered_body()),
+            Arc::clone(&tools) as Arc<dyn AgentToolDispatcher>,
+            Arc::new(NoopStore),
+        )
+        .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+        agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect("a forecast-exceeded request is still dispatched, which is why the wedge is silent without this verdict");
+
+        assert_eq!(coordinator.calls(), 1);
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        let preserved_history = events
+            .iter()
+            .find_map(|event| match event {
+                crate::event::AgentEvent::CompactionFailed {
+                    reason:
+                        crate::event::CompactionFailureReason::ProjectionHandoffRefused {
+                            preserved_history,
+                            ..
+                        },
+                } => Some(*preserved_history),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the refused handoff must reach the wire: {events:?}"));
+
+        // Both halves of the shape under test, measured against the same
+        // profile the loop used, so this can never pass by degenerating into an
+        // ordinary over-window transcript.
+        let profile = registry
+            .profile_witness_for_provider(crate::Provider::OpenAI, "primary")
+            .expect("the test registry owns the active model profile");
+        let preserved_messages = agent.session().messages_for_model_boundary();
+        let history_only =
+            crate::context_budget_fact_for_messages(&preserved_messages, &[], 0, &profile)
+                .expect("the preserved transcript must be measurable");
+        assert_eq!(
+            history_only.state,
+            crate::ContextBudgetState::Within,
+            "the shape under test is a transcript that fits on its own: {history_only:?}"
+        );
+        let composed = crate::context_budget_fact_for_messages(
+            &preserved_messages,
+            &tools.tools(),
+            8_192,
+            &profile,
+        )
+        .expect("the composed request must be measurable");
+        assert_eq!(
+            composed.state,
+            crate::ContextBudgetState::ForecastExceeded,
+            "the shape under test is a composed request that does not fit: {composed:?}"
+        );
+
+        assert_ne!(
+            preserved_history,
+            crate::event::CompactionPreservedHistoryFit::StillFits,
+            "a member whose every composed turn exceeds the window is not a cost note"
+        );
+        assert_eq!(
+            preserved_history,
+            crate::event::CompactionPreservedHistoryFit::OverWindow,
+            "the escalation verdict must measure the composed request the trigger measured"
+        );
+    }
+
+    /// The byte half of the escalation verdict, exercised through the wiring
+    /// that builds it rather than through `classify` with hand-built inputs:
+    /// `StillFits` states a fit on both axes, so the byte half has to come
+    /// from a witness the client actually produced.
+    ///
+    /// `AgentLlmClient::request_pressure` defaults to no witness, so the
+    /// unmeasured shape is the ordinary one for every host-implemented client,
+    /// not an edge case. Both directions are pinned: a wiring that stopped
+    /// building byte evidence would make `StillFits` unreachable and no
+    /// loop-level assertion would notice, and a wiring that built it
+    /// regardless of the witness would restore the over-claim - a session
+    /// reported as a cost note while every request it composes is a body the
+    /// provider refuses.
+    #[tokio::test]
+    async fn preserved_history_fit_claims_a_byte_fit_only_from_a_measured_witness() {
+        let registry = fallback_activation_test_registry();
+        let agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(8_192)
+                .with_effective_model_registry(Arc::clone(&registry)),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(
+            Arc::new(HotSwapLimitRecordingClient::new("primary")),
+            Arc::new(NoTools),
+            Arc::new(NoopStore),
+        )
+        .await;
+
+        let compactor = DiscardingCompactor::new(1);
+        let profile = registry
+            .profile_witness_for_provider(crate::Provider::OpenAI, "primary")
+            .expect("the test registry owns the active model profile");
+        let composed = crate::context_budget_fact_for_messages(&[], &[], 0, &profile)
+            .expect("the composed request must be measurable");
+        assert_eq!(
+            composed.state,
+            crate::ContextBudgetState::Within,
+            "the token axis of this fixture fits, so the byte axis is what decides: {composed:?}"
+        );
+
+        let fit = |pressure: Option<crate::ProviderRequestPressure>| {
+            agent.preserved_history_fit(&compactor, &[], pressure, Some(&composed))
+        };
+
+        assert_eq!(
+            fit(Some(crate::ProviderRequestPressure::new(512, Some(4_096)))),
+            crate::event::CompactionPreservedHistoryFit::StillFits,
+            "an exact lowered body measured under the cap is the byte half of the fit"
+        );
+        assert_eq!(
+            fit(None),
+            crate::event::CompactionPreservedHistoryFit::Unclassified,
+            "a client that exposes no lowered-body witness never measured the byte axis, so the \
+             verdict must not assert a byte fit on its behalf"
+        );
+        assert_eq!(
+            fit(Some(crate::ProviderRequestPressure::new(512, None))),
+            crate::event::CompactionPreservedHistoryFit::Unclassified,
+            "a witness with no cap in force performed no comparison either"
+        );
+        assert_eq!(
+            fit(Some(crate::ProviderRequestPressure::new(
+                8_192,
+                Some(4_096)
+            ))),
+            crate::event::CompactionPreservedHistoryFit::OverWindow,
+            "an excess on the byte axis stays decisive through the same wiring"
+        );
     }
 
     #[tokio::test]
@@ -15892,6 +16966,104 @@ mod tests {
                 requested,
             }) if *requested > 128_000
         ));
+    }
+
+    /// Trigger-side accounting plumbing: every compaction check the loop runs
+    /// must carry the measured budget of the request that boundary would send,
+    /// including the exact visible tool set and the effective output reserve.
+    ///
+    /// The failure mode this guards is an absent fact in production, which would
+    /// silently restore transcript-only token accounting: tool schemas ride
+    /// every request in full and the provider counts them, so a trigger that
+    /// cannot see them under-reports the request by exactly that amount.
+    #[tokio::test]
+    async fn compaction_check_carries_the_measured_request_budget() {
+        let registry = fallback_activation_test_registry();
+        let client = Arc::new(HotSwapLimitRecordingClient::new("primary"));
+        let compactor = Arc::new(TrackingCompactor::new(None));
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(8_192)
+                .compactor(compactor.clone())
+                .with_effective_model_registry(Arc::clone(&registry)),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(
+            client.clone(),
+            Arc::new(FullToolDispatcher::new(&["visible", "secret"])),
+            Arc::new(NoopStore),
+        )
+        .await;
+        agent.config.max_turns = Some(1);
+
+        agent
+            .run("first".into())
+            .await
+            .expect("a healthy request must dispatch");
+
+        let contexts = compactor.seen_contexts();
+        assert_eq!(
+            contexts.len(),
+            1,
+            "one LLM boundary must produce exactly one compaction check"
+        );
+        let budget = contexts[0]
+            .request_context_budget
+            .as_ref()
+            .expect("a declared context window must reach the compaction trigger");
+        assert_eq!(budget.context_window_tokens, 128_000);
+        assert!(
+            budget.estimated_tool_tokens > 0,
+            "the exact visible tool set must be measured into the trigger budget"
+        );
+        assert_eq!(
+            budget.reserved_output_tokens, 8_192,
+            "the effective output reserve must be the request's own, not a nominal fraction"
+        );
+        assert!(
+            budget.effective_input_tokens() > contexts[0].estimated_history_tokens,
+            "the whole-request measure must exceed the transcript-only estimate it replaces"
+        );
+        assert_eq!(
+            budget.estimate_provenance,
+            crate::ContextBudgetEstimateProvenance::CanonicalForecast,
+            "a client without a token-counting API must not claim exact provider truth"
+        );
+    }
+
+    /// The degradation path: a model with no declared context window mints no
+    /// budget, and the compaction check must still run on exactly the measures
+    /// it used before. An absent window is truthful, never a substitute
+    /// ceiling, and it must not make the boundary fail.
+    #[tokio::test]
+    async fn compaction_check_without_a_declared_window_carries_no_request_budget() {
+        let compactor = Arc::new(TrackingCompactor::new(None));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(compactor.clone())
+            .build_standalone(
+                Arc::new(CompactionAwareLlmClient::new()),
+                Arc::new(NoTools),
+                Arc::new(NoopStore),
+            )
+            .await;
+
+        agent
+            .run("first".into())
+            .await
+            .expect("an unmeasurable window must not fail the boundary");
+
+        let contexts = compactor.seen_contexts();
+        assert_eq!(contexts.len(), 1);
+        assert!(
+            contexts[0].request_context_budget.is_none(),
+            "no context-window authority must leave the trigger on its prior measures"
+        );
+        assert!(
+            contexts[0].estimated_history_tokens > 0,
+            "the transcript estimate remains the live measure on this path"
+        );
     }
 
     #[tokio::test]

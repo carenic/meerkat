@@ -46,6 +46,11 @@ impl BuiltinTool for DateTimeTool {
         true // Utility tools enabled by default
     }
 
+    /// Clock read: no state outside the session changes.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::ReadOnly
+    }
+
     async fn call(&self, _args: Value) -> Result<ToolOutput, BuiltinToolError> {
         use meerkat_core::time_compat::{SystemTime, UNIX_EPOCH};
 

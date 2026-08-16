@@ -61,6 +61,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `frame_node_step_ids`: `Map<FrameId, Map<FlowNodeId, StepId>>`
 - `frame_node_loop_ids`: `Map<FrameId, Map<FlowNodeId, LoopId>>`
 - `frame_node_status`: `Map<FrameId, Map<FlowNodeId, NodeRunStatus>>`
+- `frame_node_failure_policy`: `Map<FrameId, Map<FlowNodeId, FlowNodeFailurePolicy>>`
 - `frame_ready_queue`: `Map<FrameId, Seq<FlowNodeId>>`
 - `frame_output_recorded`: `Map<FrameId, Map<FlowNodeId, Bool>>`
 - `frame_last_admitted_node`: `Map<FrameId, Option<FlowNodeId>>`
@@ -330,7 +331,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ## Runtime-Internal Inputs
 - `CreateRunSeed`(run_id: RunId, step_ids: Set<StepId>, ordered_steps: Seq<StepId>, step_status: Map<StepId, Option<StepRunStatus>>, output_recorded: Map<StepId, Bool>, step_condition_results: Map<StepId, Option<Bool>>, step_has_conditions: Map<StepId, Bool>, step_dependencies: Map<StepId, Seq<StepId>>, step_dependency_modes: Map<StepId, DependencyMode>, step_branches: Map<StepId, Option<BranchId>>, step_collection_policies: Map<StepId, CollectionPolicyKind>, step_quorum_thresholds: Map<StepId, u32>, step_target_counts: Map<StepId, u64>, step_target_success_counts: Map<StepId, u64>, step_target_terminal_failure_counts: Map<StepId, u64>, escalation_threshold: u64, max_step_retries: u32, max_active_nodes: u64, max_active_frames: u64, max_frame_depth: u64)
-- `CreateFrameSeed`(run_id: RunId, frame_id: FrameId, frame_scope: FrameScope, loop_instance_id: Option<LoopInstanceId>, iteration: u32, tracked_nodes: Set<FlowNodeId>, ordered_nodes: Seq<FlowNodeId>, node_kind: Map<FlowNodeId, FlowNodeKind>, node_dependencies: Map<FlowNodeId, Seq<FlowNodeId>>, node_dependency_modes: Map<FlowNodeId, DependencyMode>, node_branches: Map<FlowNodeId, Option<BranchId>>, node_step_ids: Map<FlowNodeId, StepId>, node_loop_ids: Map<FlowNodeId, LoopId>, node_status: Map<FlowNodeId, NodeRunStatus>, ready_queue: Seq<FlowNodeId>, output_recorded: Map<FlowNodeId, Bool>, node_condition_results: Map<FlowNodeId, Option<Bool>>, last_admitted_node: Option<FlowNodeId>)
+- `CreateFrameSeed`(run_id: RunId, frame_id: FrameId, frame_scope: FrameScope, loop_instance_id: Option<LoopInstanceId>, iteration: u32, tracked_nodes: Set<FlowNodeId>, ordered_nodes: Seq<FlowNodeId>, node_kind: Map<FlowNodeId, FlowNodeKind>, node_dependencies: Map<FlowNodeId, Seq<FlowNodeId>>, node_dependency_modes: Map<FlowNodeId, DependencyMode>, node_branches: Map<FlowNodeId, Option<BranchId>>, node_step_ids: Map<FlowNodeId, StepId>, node_loop_ids: Map<FlowNodeId, LoopId>, node_status: Map<FlowNodeId, NodeRunStatus>, node_failure_policy: Map<FlowNodeId, FlowNodeFailurePolicy>, ready_queue: Seq<FlowNodeId>, output_recorded: Map<FlowNodeId, Bool>, node_condition_results: Map<FlowNodeId, Option<Bool>>, last_admitted_node: Option<FlowNodeId>)
 - `CreateLoopSeed`(loop_instance_id: LoopInstanceId, parent_frame_id: FrameId, parent_node_id: FlowNodeId, loop_id: LoopId, depth: u32, max_iterations: u64)
 - `RecordLoopBodyFrameCompleted`(loop_instance_id: LoopInstanceId, iteration: u64)
 - `RecordLoopUntilConditionMet`(loop_instance_id: LoopInstanceId, iteration: u64)
@@ -893,7 +894,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `frame_node_status_known`
   - `frame_running`
   - `all_nodes_terminal`
-  - `any_node_failed`
+  - `any_escalating_node_failed`
 - Emits: `FlowFrameTerminalStatusClassified`
 - To: `Running`
 
@@ -906,7 +907,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `frame_node_status_known`
   - `frame_running`
   - `all_nodes_terminal`
-  - `any_node_failed`
+  - `any_escalating_node_failed`
 - Emits: `FlowFrameTerminalStatusClassified`
 - To: `Stopped`
 
@@ -919,7 +920,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `frame_node_status_known`
   - `frame_running`
   - `all_nodes_terminal`
-  - `any_node_failed`
+  - `any_escalating_node_failed`
 - Emits: `FlowFrameTerminalStatusClassified`
 - To: `Completed`
 
@@ -932,7 +933,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `frame_node_status_known`
   - `frame_running`
   - `all_nodes_terminal`
-  - `no_node_failed`
+  - `no_escalating_node_failed`
   - `any_node_canceled`
 - Emits: `FlowFrameTerminalStatusClassified`
 - To: `Running`
@@ -946,7 +947,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `frame_node_status_known`
   - `frame_running`
   - `all_nodes_terminal`
-  - `no_node_failed`
+  - `no_escalating_node_failed`
   - `any_node_canceled`
 - Emits: `FlowFrameTerminalStatusClassified`
 - To: `Stopped`
@@ -960,7 +961,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `frame_node_status_known`
   - `frame_running`
   - `all_nodes_terminal`
-  - `no_node_failed`
+  - `no_escalating_node_failed`
   - `any_node_canceled`
 - Emits: `FlowFrameTerminalStatusClassified`
 - To: `Completed`
@@ -974,7 +975,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `frame_node_status_known`
   - `frame_running`
   - `all_nodes_terminal`
-  - `no_node_failed`
+  - `no_escalating_node_failed`
   - `no_node_canceled`
 - Emits: `FlowFrameTerminalStatusClassified`
 - To: `Running`
@@ -988,7 +989,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `frame_node_status_known`
   - `frame_running`
   - `all_nodes_terminal`
-  - `no_node_failed`
+  - `no_escalating_node_failed`
   - `no_node_canceled`
 - Emits: `FlowFrameTerminalStatusClassified`
 - To: `Stopped`
@@ -1002,7 +1003,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `frame_node_status_known`
   - `frame_running`
   - `all_nodes_terminal`
-  - `no_node_failed`
+  - `no_escalating_node_failed`
   - `no_node_canceled`
 - Emits: `FlowFrameTerminalStatusClassified`
 - To: `Completed`
@@ -7747,12 +7748,26 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `MemberLiveMaterializationClassified`
 - To: `Running`
 
-### `ResolveMemberRevivalSucceededRunning`
+### `ResolveMemberRevivalSucceededRunningLocal`
 - From: `Running`
 - On: `ResolveMemberRevivalSucceeded`(agent_identity)
 - Guards:
   - `revival_pending`
-  - `placed_carrier_binding_active_or_local`
+  - `member_is_local`
+  - `runtime_binding_present`
+  - `fence_binding_present`
+  - `generation_binding_present`
+  - `session_binding_present`
+- Emits: `RequestRuntimeBinding`
+- To: `Running`
+
+### `ResolveMemberRevivalSucceededRunningPlaced`
+- From: `Running`
+- On: `ResolveMemberRevivalSucceeded`(agent_identity)
+- Guards:
+  - `revival_pending`
+  - `member_is_placed`
+  - `placed_carrier_binding_active`
 - To: `Running`
 
 ### `ResolveMemberRevivalFailedRunning`
@@ -11777,7 +11792,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CreateFrameSeedRunning`
 - From: `Running`
-- On: `CreateFrameSeed`(run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, ready_queue, output_recorded, node_condition_results, last_admitted_node)
+- On: `CreateFrameSeed`(run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, node_failure_policy, ready_queue, output_recorded, node_condition_results, last_admitted_node)
 - Guards:
   - `lifecycle_origin_open`
   - `frame_seed_is_new`
@@ -11803,7 +11818,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CreateFrameSeedAlreadySeededRunning`
 - From: `Running`
-- On: `CreateFrameSeed`(run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, ready_queue, output_recorded, node_condition_results, last_admitted_node)
+- On: `CreateFrameSeed`(run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, node_failure_policy, ready_queue, output_recorded, node_condition_results, last_admitted_node)
 - Guards:
   - `frame_seed_already_tracked`
 - Emits: `FrameSeedConfirmed`
@@ -11811,7 +11826,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CreateFrameSeedAlreadySeededStopped`
 - From: `Stopped`
-- On: `CreateFrameSeed`(run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, ready_queue, output_recorded, node_condition_results, last_admitted_node)
+- On: `CreateFrameSeed`(run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, node_failure_policy, ready_queue, output_recorded, node_condition_results, last_admitted_node)
 - Guards:
   - `frame_seed_already_tracked`
 - Emits: `FrameSeedConfirmed`
@@ -11819,7 +11834,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CreateFrameSeedAlreadySeededCompleted`
 - From: `Completed`
-- On: `CreateFrameSeed`(run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, ready_queue, output_recorded, node_condition_results, last_admitted_node)
+- On: `CreateFrameSeed`(run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, node_failure_policy, ready_queue, output_recorded, node_condition_results, last_admitted_node)
 - Guards:
   - `frame_seed_already_tracked`
 - Emits: `FrameSeedConfirmed`
@@ -11827,7 +11842,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CreateFrameSeedAlreadySeededDestroyed`
 - From: `Destroyed`
-- On: `CreateFrameSeed`(run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, ready_queue, output_recorded, node_condition_results, last_admitted_node)
+- On: `CreateFrameSeed`(run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, node_failure_policy, ready_queue, output_recorded, node_condition_results, last_admitted_node)
 - Guards:
   - `frame_seed_already_tracked`
 - Emits: `FrameSeedConfirmed`

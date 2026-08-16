@@ -119,14 +119,16 @@ pub enum StoreError {
     #[cfg(not(target_arch = "wasm32"))]
     #[error(
         "schema domain '{domain}' has no ledger row but already owns objects {objects:?}; \
-         refusing to infer or stamp an unversioned schema. For a realm last written before \
-         the 0.8.10 durable-state floor, run the explicit current-binary bridge once \
-         (`rkat --state-root <ROOT> --realm <REALM> storage migrate --apply \
-         --bridge-pre-0-8-10`), then retry the original command"
+         refusing to infer or stamp an unversioned schema.{}",
+        bridgeable.remedy_sentence()
     )]
     UnledgeredDomainObjects {
         domain: String,
         objects: Vec<String>,
+        /// Whether the explicit bridge can authenticate this exact on-disk
+        /// catalog. The remedy sentence is chosen from this, so a realm the
+        /// bridge cannot help is never told to run it.
+        bridgeable: meerkat_sqlite::BridgeEligibility,
     },
 
     /// The exclusive maintenance fence is held for this database; storage is
@@ -204,9 +206,15 @@ impl From<meerkat_sqlite::SqliteStoreError> for StoreError {
                 supported,
             },
             E::MaintenanceFenceHeld { path } => StoreError::MaintenanceFenceHeld { path },
-            E::UnledgeredDomainObjects { domain, objects } => {
-                StoreError::UnledgeredDomainObjects { domain, objects }
-            }
+            E::UnledgeredDomainObjects {
+                domain,
+                objects,
+                bridgeable,
+            } => StoreError::UnledgeredDomainObjects {
+                domain,
+                objects,
+                bridgeable,
+            },
             // A malformed ledger IS on-disk corruption of the file's
             // migration bookkeeping.
             E::LedgerMalformed { detail } => StoreError::CorruptLedger { detail },
@@ -216,7 +224,13 @@ impl From<meerkat_sqlite::SqliteStoreError> for StoreError {
             | E::SchemaFingerprintMismatch { .. }
             | E::UnledgeredSchemaNoMatch { .. }
             | E::UnledgeredSchemaAmbiguous { .. }
+            // Both WAL-establishment failures stay one typed refusal at this
+            // boundary: the open did not produce a durable read-write
+            // connection, and the Display carries the path plus whether the
+            // effective mode was wrong or the conversion stayed contended.
+            // Neither is a routine `Busy` a caller may quietly retry into.
             | E::WalNotEstablished { .. }
+            | E::WalConversionContended { .. }
             | E::InvalidMigrationList { .. }
             | E::OpenRefused { .. }) => StoreError::Internal(other.to_string()),
         }
@@ -319,13 +333,17 @@ mod tests {
         let err = meerkat_sqlite::SqliteStoreError::UnledgeredDomainObjects {
             domain: "session-store".to_string(),
             objects: vec!["table:sessions (expected table)".to_string()],
+            bridgeable: meerkat_sqlite::BridgeEligibility::CatalogAuthenticated,
         };
         let mapped = StoreError::from(err);
         assert!(matches!(
             &mapped,
-            StoreError::UnledgeredDomainObjects { domain, objects }
-                if domain == "session-store"
-                    && objects == &["table:sessions (expected table)".to_string()]
+            StoreError::UnledgeredDomainObjects {
+                domain,
+                objects,
+                bridgeable: meerkat_sqlite::BridgeEligibility::CatalogAuthenticated,
+            } if domain == "session-store"
+                && objects == &["table:sessions (expected table)".to_string()]
         ));
         let message = mapped.to_string();
         assert!(
@@ -333,6 +351,31 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("--bridge-pre-0-8-10"), "{message}");
+    }
+
+    /// A catalog the bridge cannot authenticate must not be told to run the
+    /// bridge. This is the dead end the 0.8.23 report hit: the remedy was
+    /// bolted on unconditionally and the named command then refused.
+    #[test]
+    fn unledgered_owned_objects_do_not_promise_an_unusable_bridge() {
+        let err = meerkat_sqlite::SqliteStoreError::UnledgeredDomainObjects {
+            domain: "runtime-store".to_string(),
+            objects: vec!["table:runtime_states (expected table)".to_string()],
+            bridgeable: meerkat_sqlite::BridgeEligibility::Unrecognized,
+        };
+        let message = StoreError::from(err).to_string();
+        assert!(
+            !message.contains("--apply"),
+            "an unrecognized catalog must not be handed a runnable apply command: {message}"
+        );
+        assert!(
+            message.contains("will not recover this domain"),
+            "the refusal must say plainly that the bridge cannot help: {message}"
+        );
+        assert!(
+            message.contains("storage migrate"),
+            "the refusal must still name the read-only diagnosis: {message}"
+        );
     }
 
     #[test]
@@ -346,6 +389,11 @@ mod tests {
             meerkat_sqlite::SqliteStoreError::WalNotEstablished {
                 path: std::path::PathBuf::from("/tmp/db.sqlite3"),
                 actual: "delete".to_string(),
+            },
+            meerkat_sqlite::SqliteStoreError::WalConversionContended {
+                path: std::path::PathBuf::from("/tmp/db.sqlite3"),
+                waited_ms: 250,
+                source: sqlite_failure(rusqlite::ErrorCode::DatabaseBusy),
             },
         ] {
             let display = err.to_string();

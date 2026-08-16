@@ -339,9 +339,9 @@ Handshake. Returns server capabilities.
   "result": {
     "server_info": {
       "name": "meerkat-rpc",
-      "version": "0.8.22"
+      "version": "0.8.23"
     },
-    "contract_version": "0.8.22",
+    "contract_version": "0.8.23",
     "methods": [
       "initialize", "initialized",
       "session/create", "session/list", "session/read",
@@ -606,8 +606,32 @@ Interchange Format) v1.7 trajectory document.
 
 `agent_name`, `agent_version`, and `model_name` are optional overrides for the
 trajectory's `agent` block; when `model_name` is omitted the session's model is
-used. The export replays the durable event log, so it requires a persistent
-session backend; exports are rejected past a 100,000-event replay bound.
+used.
+
+The export replays the durable event log page by page, so it requires a host
+with the durable event projection installed. Outcomes:
+
+- A host without durable event replay fails with `INVALID_REQUEST` and
+  `event replay is not enabled for this runtime host`.
+- An existing session whose durable log is empty (for example a session created
+  with a deferred first turn) returns a trajectory that names the session with
+  no steps and `final_metrics.total_steps` of `0`. It is not a missing session.
+- A session that does not exist fails with `SESSION_NOT_FOUND`.
+- A session whose durable log exceeds 500,000 events fails with
+  `INVALID_PARAMS` naming the bound; page the log with `events/list_since`, or
+  export it to a file with `rkat session export-atif`, which has no such bound.
+- A session whose trajectory outgrows the outbound message limit (32 MiB) fails
+  with `BUDGET_EXHAUSTED` naming that limit and the bytes it had accumulated.
+  The fold measures itself page by page, so the refusal arrives while the
+  document is still partial rather than after the whole log is in memory.
+
+The two bounds answer with different codes on purpose: the event bound is a
+property of the request (`INVALID_PARAMS`), the size bound is a property of the
+response, so it answers the way outbound admission answers any oversized result
+(`BUDGET_EXHAUSTED`). They cover different content mixes: an all-delta log can
+hold hundreds of thousands of events and still fold into a small document, which
+is what the event bound is for; a tool-heavy log outgrows the response long
+before that count, which is what the size bound is for.
 
 ### session/rewrite_transcript
 
@@ -1530,7 +1554,7 @@ Return the curated model catalog with provider profiles, capability metadata, an
   "jsonrpc": "2.0",
   "id": 17,
   "result": {
-    "contract_version": "0.8.22",
+    "contract_version": "0.8.23",
     "providers": [
       {
         "provider": "anthropic",
@@ -1588,7 +1612,7 @@ Return runtime capabilities with status resolved against config. This lists ever
   "jsonrpc": "2.0",
   "id": 8,
   "result": {
-    "contract_version": {"major": 0, "minor": 8, "patch": 22},
+    "contract_version": {"major": 0, "minor": 8, "patch": 23},
     "capabilities": [
       {
         "id": "sessions",

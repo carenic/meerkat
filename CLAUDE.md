@@ -312,7 +312,7 @@ make fmt         # Auto-fix formatting
 make audit       # Security audit via cargo-deny
 ```
 
-**`make ci` runs** (in order): `docs-check` → `fmt-check` → `legacy-surface-gate` → `session-control-gate` → `deprecated-backend-gate` → `bridge-no-responsestatus-gate` → `sync-meerkat-dogma-skill-docs` → `verify-version-parity` → `verify-schema-freshness` → `verify-sdk-codegen-freshness` → `verify-sdk-event-inventory` → `verify-rpc-surface-alignment` → `verify-rest-surface-alignment` → `verify-sdk-wrapper-freshness` → `verify-machine-poster-coverage` → `check-rust-release-packaging` → `machine-check-drift` → `machine-authority-docs-gate` → `runtime-authority-bypass` → `storage-ambient-gate` → `lint` → `lint-feature-matrix` → `test-unit` → `test-int` → `e2e-fast` → `e2e-system` → `test-minimal` → `test-feature-matrix` → `test-surface-modularity` → `seam-inventory` → `rmat-audit` → `audit-generated-headers` → `audit`
+**`make ci` runs** (in order): `docs-check` → `fmt-check` → `verify-lock-consistency` → `verify-bazel-locks` → `legacy-surface-gate` → `session-control-gate` → `deprecated-backend-gate` → `bridge-no-responsestatus-gate` → `sync-meerkat-dogma-skill-docs` → `verify-version-parity` → `verify-schema-freshness` → `verify-sdk-codegen-freshness` → `verify-sdk-event-inventory` → `verify-rpc-surface-alignment` → `verify-rest-surface-alignment` → `verify-sdk-wrapper-freshness` → `verify-machine-poster-coverage` → `check-rust-release-packaging` → `machine-check-drift` → `machine-authority-docs-gate` → `runtime-authority-bypass` → `storage-ambient-gate` → `lint` → `lint-feature-matrix` → `test-unit` → `test-int` → `e2e-fast` → `e2e-system` → `test-minimal` → `test-feature-matrix` → `test-surface-modularity` → `seam-inventory` → `rmat-audit` → `audit-generated-headers` → `audit`
 
 `rmat-audit` runs the typed governance gates: `xtask effect-authority`, `xtask ownership-ledger --check-drift`, and `xtask rmat-audit --strict` (RMAT read-seam enforcement is the `ForbiddenShellAuthorityReads` AST rule). The bridge gate is `xtask bridge-classifier` (`scripts/pre-push-bridge-no-responsestatus.sh` is a thin wrapper). The old `scripts/audit-effect-authority.sh` is deleted.
 
@@ -321,6 +321,7 @@ make audit       # Security audit via cargo-deny
 **CI** (`.github/workflows/ci.yml`) — runs on push to main, PRs, feature branches, and manual dispatch, entirely on free GitHub-hosted runners with a ~10-minute wall-clock target (sccache + mold + per-job rust-cache keys). It calls `cargo.yml` (the only lane), then `gate` aggregates status. `cargo.yml` runs parallel jobs:
 - `changes` — path classification (docs-only changes skip the Rust jobs; SDK-relevant paths enable `sdk-web`)
 - `fmt-governance` — fmt, surface/backend gates, dogma-docs mirror, rmat-audit set, seam-inventory, runtime-authority-bypass, machine-authority docs gate, poster coverage, generated-headers audit
+- `locks` - always-run (no `needs`, no path gate, `fetch-depth: 2`): `cargo metadata --locked` plus the structural dangling-reference read on Cargo.lock, and the offline MODULE.bazel.lock recorded-input check (the generated-BUILD half stays on pre-push and local `make ci`). On a `pull_request` run the checked-out tree is `refs/pull/N/merge`, which is where textual lock merges manufacture danglers; a release branch is always self-consistent, so checking the branch cannot catch that class
 - `clippy` — workspace clippy, all features, lib/bin targets (`--all-targets` runs nightly)
 - `unit` ×8 — `cargo unit` sharded via nextest hash partitions
 - `int-heavy` ×3 / `int-rest` ×7 — integration tests split by build scope: `-p meerkat-integration-tests` shards plus crate-group lanes (mob ×2, core-machine, client-session, complement group ×3), so no job links every integration binary
@@ -387,7 +388,8 @@ Installed via `make install-hooks`. Two stages:
 - `scripts/pre-push-machines.sh` (machine codegen drift verify)
 - `scripts/pre-push-audit-generated-headers.sh`
 - `scripts/pre-push-bridge-no-responsestatus.sh` (thin wrapper over `xtask bridge-classifier`)
-- `scripts/pre-push-bazel-locks.sh` (Bazel lockfile freshness)
+- `scripts/pre-push-bazel-locks.sh` (generated BUILD freshness, offline MODULE.bazel.lock recorded-input check, `bb mod deps --lockfile_mode=error` when the pinned CLI is present; `--require-bb` makes that last gate mandatory and the release preflight passes it)
+- `scripts/test-lock-consistency-gate.sh`, `scripts/test-bazel-module-lock-gate.sh`, `scripts/test-crate-enumeration-gate.sh` (contract tests: each new release-infra gate must still fail on the defect it was written for)
 - `scripts/pre-push-unit.sh` (deterministic local gate: Cargo `unit` plus `e2e-fast` by default, or matching BuildBuddy lanes when `MEERKAT_BUILDBUDDY=1`; includes per-tree cache, serialized runs, and timeout retry)
 
 **Manual local preflight**:
@@ -484,6 +486,8 @@ The canonical publish order lives in `scripts/release-rust-crates.sh` (42 crates
 - **Never change types in `meerkat-contracts` without running `make regen-schemas`** — schema artifacts and SDK types will be stale
 - **Always run `make test` or the narrower `make agent-gate` before committing** — set `MEERKAT_BUILDBUDDY=1` when BuildBuddy is available
 - **`ContractVersion::CURRENT` must equal `workspace.package.version`** — they are lock-stepped
+- **Never change `Cargo.lock` without refreshing `MODULE.bazel.lock`** - the lock is a crate_universe extension input; `make buildbuddy-lock-update` regenerates it, and `make verify-bazel-locks` proves it
+- **Never hand-maintain a second list of workspace crates** - `scripts/release-rust-crates.sh` is the one hand-ordered enumeration; the patch config derives from it and `make check-rust-release-config` fails when the documented order, count, or patch map disagrees
 - **Use `cargo release patch` for releases** — never manually bump versions or create tags; the release hook handles SDK sync, schema regen, and parity verification automatically
 
 ## Testing with Multiple Providers

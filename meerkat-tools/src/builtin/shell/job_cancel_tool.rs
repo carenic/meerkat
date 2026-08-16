@@ -68,6 +68,11 @@ impl BuiltinTool for ShellJobCancelTool {
         false
     }
 
+    /// Terminates a running process.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::Mutating
+    }
+
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
         let input: JobCancelInput = serde_json::from_value(args)
             .map_err(|e| BuiltinToolError::invalid_args(e.to_string()))?;

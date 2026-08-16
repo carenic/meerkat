@@ -91,6 +91,11 @@ mod tests {
     ///
     /// The constant is seeded from the first verified run: an empty pin
     /// fails with the actual value so it can be recorded once.
+    ///
+    /// It deliberately did NOT move when `PortableToolConfig.read_only` was
+    /// added in 0.8.23: that field is omitted when false, so a spec carrying no
+    /// read-only intent keeps its historical bytes and every recorded
+    /// `spec_digest` in existing host stores still matches.
     const FIXTURE_DIGEST_PIN: &str =
         "54c78bdb185b66b218d38e2f23f08055ceb9db8e6dd79dcb0dc0f7966b089e6b";
 
@@ -146,6 +151,17 @@ mod tests {
             baseline,
             portable_member_spec_digest(&nested_flip).expect("digest"),
             "nested tool-toggle flip must change the digest"
+        );
+
+        // A read-only declaration must be digest-covered: otherwise a
+        // placement host could strip the enforcement declaration and still
+        // present a spec whose digest the controlling host accepts.
+        let mut read_only_flip = sample_portable_member_spec();
+        read_only_flip.profile.tools.read_only = true;
+        assert_ne!(
+            baseline,
+            portable_member_spec_digest(&read_only_flip).expect("digest"),
+            "read-only intent must change the digest"
         );
     }
 

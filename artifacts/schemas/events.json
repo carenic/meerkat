@@ -461,6 +461,137 @@
         ],
         "type": "string"
       },
+      "CacheBreakpointBoundary": {
+        "description": "Stable provider-independent identity of an authored cache breakpoint.",
+        "oneOf": [
+          {
+            "description": "Stable leading system/profile prefix. `message_count` is the exclusive\ncanonical transcript boundary.",
+            "properties": {
+              "kind": {
+                "const": "system_profile_prefix",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Explicit breakpoint after one canonical transcript message.",
+            "properties": {
+              "kind": {
+                "const": "transcript_after",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardOrigin": {
+        "description": "Which side of a turn commit produced the discarded proof.\n\nLoad-bearing for hosts: `PersistedEvidence` is inherited poison from an\nearlier turn, `AuthoredThisTurn` is this turn's own lowering disagreeing\nwith the committed transcript. The two have different root causes and are\notherwise indistinguishable from the outside.",
+        "oneOf": [
+          {
+            "const": "authored_this_turn",
+            "description": "Freshly authored by the lowering that produced this turn's request.",
+            "type": "string"
+          },
+          {
+            "const": "persisted_evidence",
+            "description": "Persisted by an earlier turn and re-checked before the merge.",
+            "type": "string"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardReason": {
+        "description": "Why one provider-authored cache breakpoint was discarded instead of\nretained as durable session evidence.\n\nA cache breakpoint is an optimization artifact anchored to the exact\ntranscript head a provider lowered. Ordinary transcript motion - a\nsynthetic-notice refresh, a compaction, a re-materialized prefix - moves\nthat anchor without saying anything about the transcript's own integrity.\nEvery variant here therefore describes the ARTIFACT. Faults that describe\nthe committed TRANSCRIPT stay [`CacheBreakpointEvidenceError`].",
+        "oneOf": [
+          {
+            "description": "The anchored boundary is past the end of the committed transcript.",
+            "properties": {
+              "kind": {
+                "const": "boundary_outside_committed_transcript",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "message_len": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count",
+              "message_len"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The committed transcript prefix at the anchored boundary is no longer\nthe one the provider lowered.",
+            "properties": {
+              "kind": {
+                "const": "canonical_prefix_moved",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The proof itself is not usable evidence, independently of any\ntranscript: a malformed rendered identity, an incoherent\nprovider/encoding pairing, or an undecodable persisted row.",
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "evidence_unusable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Durable history retains superseded prompt versions, so the projected\nprovider boundary has no raw-to-projected map to rebind through.",
+            "properties": {
+              "kind": {
+                "const": "projected_boundary_unmappable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "CapabilityId": {
         "description": "Slug-validated capability identifier for skill requirements.\n\nReplaces the legacy `Vec<String>` capability lists with a typed\nnamespace. Parsed at construction, so callers cannot smuggle invalid\nidentifiers into descriptors or requirements.",
         "type": "string"
@@ -585,6 +716,101 @@
               "message"
             ],
             "type": "object"
+          },
+          {
+            "description": "The runtime refused to authorize the durable transcript+memory handoff,\nso the original (uncompacted) history was preserved.\n\nDistinct from [`Self::MemoryIndexingFailed`]: the memory store never saw\nthe batch. The refusal is a runtime-authority fact, and\n`preserved_history` says whether the session can still make progress\nwhile it persists: a wedged member needs paging, a fitting one needs a\nlog line. When no authority could answer that at composed-request\nscope, it says so\n([`CompactionPreservedHistoryFit::Unclassified`]) rather than guessing.",
+            "properties": {
+              "attempted_entries": {
+                "description": "Number of discard entries that would have been projected.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "projection_handoff_refused",
+                "type": "string"
+              },
+              "message": {
+                "description": "Display projection of the refusal's exact facts.",
+                "type": "string"
+              },
+              "preserved_history": {
+                "$ref": "#/$defs/CompactionPreservedHistoryFit",
+                "description": "Whether the request the preserved history composes can still be\nsent to the provider."
+              },
+              "refusal": {
+                "$ref": "#/$defs/CompactionHandoffRefusal",
+                "description": "Typed cause of the runtime refusal."
+              }
+            },
+            "required": [
+              "kind",
+              "refusal",
+              "preserved_history",
+              "attempted_entries",
+              "message"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CompactionHandoffRefusal": {
+        "description": "Typed cause of a compaction projection-handoff refusal.\n\nThe runtime coordinator refuses for structurally different reasons, and a\nhost routing severity (page vs log) needs the cause, not a message\nsubstring. This is the wire-stable vocabulary carried by\n[`crate::event::CompactionFailureReason::ProjectionHandoffRefused`];\n[`CompactionCommitCoordinationError::refusal`] is its only producer.",
+        "oneOf": [
+          {
+            "const": "session_mismatch",
+            "description": "The projection belongs to a different session than the coordinator.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_epoch_rotated",
+            "description": "The runtime epoch that minted the coordinator is no longer the session's\nlive epoch, and one bounded re-derivation did not recover it.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_epoch_retired",
+            "description": "The coordinator's epoch is gone: its runtime was unregistered, retired,\nor its durability authority is not ready.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_binding_rotated",
+            "description": "The session's exact runtime placement (runtime id, fence token,\ngeneration) rotated after the coordinator latched it.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_binding_absent",
+            "description": "The session carries no authoritative runtime placement to commit\nagainst.",
+            "type": "string"
+          },
+          {
+            "const": "durable_projection_unsupported",
+            "description": "The runtime has no durable store, or its store cannot commit a\ntranscript rewrite and its memory projection atomically.",
+            "type": "string"
+          },
+          {
+            "const": "unclassified",
+            "description": "A host-supplied coordinator refused without a typed cause.",
+            "type": "string"
+          }
+        ]
+      },
+      "CompactionPreservedHistoryFit": {
+        "description": "Whether the history a failed compaction preserved can still be sent.\n\nThis is the severity discriminator for compaction-persistence failures: the\nsame refusal is a log line on a session that still fits its window and a\nhard wedge on one that does not (every subsequent turn is refused, and the\nonly path out is a compaction that persists). Classification reuses the\npre-dispatch authorities rather than a second limit table:\n[`ContextBudgetState`](crate::ContextBudgetState) over the active model\nprofile's window, and the compactor's effective request-byte cap over the\nexact provider-lowered body size.\n\nBoth authorities are read at composed-request scope, which is the scope the\nquestion is asked at: the transcript is not what crosses the provider\nboundary, the request built from it is. A transcript-only token measure\nunder-reports every request by the tool schemas that ride it, which is the\nexact shape that used to be reported as [`Self::StillFits`] while every\nturn died on the provider's context limit.",
+        "oneOf": [
+          {
+            "const": "unclassified",
+            "description": "Nothing proved an excess, and no axis established a fit at\ncomposed-request scope: the active model declares no context window,\nthe provider exposed no lowered-body witness or no request-byte cap is\nin force, or the only token evidence available was a preserved-history\nfloor that did not cross. One measured axis is not a fit either, so a\ncomposed request within the window with no cap comparison behind it\nlands here. Absence of evidence is reported as such rather than as a\nfit.",
+            "type": "string"
+          },
+          {
+            "const": "still_fits",
+            "description": "The composed request the preserved history produces remains within the\nactive context window and under the effective request-byte cap. Both\naxes measured and both fit; an axis that measured nothing yields\n[`Self::Unclassified`] instead. The run continues normally; the failed\npersistence costs a summary call and a retry, not progress.",
+            "type": "string"
+          },
+          {
+            "const": "over_window",
+            "description": "The composed request the preserved history produces already exceeds the\nactive context window, or the preserved history alone does, or the\nexact lowered body exceeds the effective request-byte cap. The session\ncannot make progress until a compaction persists.",
+            "type": "string"
           }
         ]
       },
@@ -803,7 +1029,7 @@
       },
       "CumulativeUsage": {
         "$ref": "#/$defs/Usage",
-        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific."
+        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific.\n\nThis value is **already a total**, and the total is session-scoped: on the\nevent stream it is `Session::total_usage()`, which is persisted with the\nsession and restored on resume, so `run_completed.usage` on the second run of\na session already contains the first run's calls. Adding it to per-call\nusage, or summing the values observed on two runs, double-counts. It also\nintentionally carries no [`crate::ProviderTokenAccounting`], because one\nsession may span providers and models and so cannot truthfully claim a\nsingle per-call convention; per-model attribution is read from the per-call\n`turn_completed` rows, which cover only the calls that closed a run."
       },
       "DeferredCatalogDelta": {
         "description": "Additive hidden-catalog delta metadata for runtime notices.",
@@ -827,6 +1053,55 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "DiscardedCacheBreakpoint": {
+        "additionalProperties": false,
+        "description": "One provider-authored cache proof that could not be retained.",
+        "properties": {
+          "identity": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DiscardedCacheBreakpointIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Absent only when the persisted evidence row itself could not be\ndecoded, so no individual proof identity exists to name."
+          },
+          "origin": {
+            "$ref": "#/$defs/CacheBreakpointDiscardOrigin"
+          },
+          "reason": {
+            "$ref": "#/$defs/CacheBreakpointDiscardReason"
+          }
+        },
+        "required": [
+          "origin",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "DiscardedCacheBreakpointIdentity": {
+        "additionalProperties": false,
+        "description": "Identity of a discarded proof, when the proof itself could be decoded.",
+        "properties": {
+          "boundary": {
+            "$ref": "#/$defs/CacheBreakpointBoundary"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "boundary"
+        ],
         "type": "object"
       },
       "ExternalToolDeltaPhase": {
@@ -2508,7 +2783,7 @@
         "type": "string"
       },
       "TurnUsage": {
-        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.\n\n# Model and provider attribution\n\n`accounting` is the single owner of per-call attribution: it carries the\n[`crate::Provider`] and the model string of the request that produced these\ncounters, minted by the provider adapter from the lowered request rather than\nfrom configuration intent. A consumer reading only the event stream can\ntherefore attribute one `turn_completed` row to a model without joining\nagainst session metadata:\n`turn_completed.usage.accounting.provider` /\n`turn_completed.usage.accounting.model`.\n\nThere is deliberately no second copy of the model or provider beside\n`accounting` on the event: attribution has one owner.",
         "properties": {
           "accounting": {
             "$ref": "#/$defs/ProviderTokenAccounting"
@@ -2559,7 +2834,7 @@
         "type": "object"
       },
       "Usage": {
-        "description": "Token usage statistics",
+        "description": "Token usage statistics.\n\n# The same field names carry two different denominators\n\nThis shape is reused for two semantically different accounts, and\n`input_tokens` does not mean the same thing in both:\n\n- **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw\n  provider counters for exactly one provider request. For Anthropic\n  `input_tokens` is the *uncached* input only, with cache-write and\n  cache-read input reported separately in `cache_creation_tokens` and\n  `cache_read_tokens`. The normalized presented-input total for that one\n  call is [`TurnUsage::presented_tokens`].\n- **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a\n  running total over every provider call recorded on the *session*, not on\n  one run. Its `input_tokens` is the saturating sum of each call's\n  *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache\n  detail fields are always `None` because their relationship to the input\n  total is provider-specific.\n\n# What consumers must not sum\n\n- Never sum `run_completed.usage` with per-call usage, and never sum\n  `run_completed.usage` across runs: each value is already the whole\n  session's total to date, so adding two of them double-counts everything\n  before the later one. Take the latest value.\n- Never sum per-call `input_tokens` and expect it to match\n  `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the\n  two use different denominators and will not agree. Sum\n  `turn_completed.usage.accounting.presented_tokens` (that is,\n  [`TurnUsage::presented_tokens`]) instead, which is exactly what\n  [`CumulativeUsage::add_turn`] does.\n- Do not expect the per-call rows to reconcile with the cumulative account\n  either. Intermediate tool-loop calls, the structured-output extraction\n  call, and the compaction summary call are all charged to the cumulative\n  account and publish no `turn_completed` row, so the rows cover a strict\n  subset of the tokens.\n\nThe worked example lives in `docs/reference/usage-accounting.mdx`. Its\nnumbers are pinned against the agent loop by\n`turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`\n(`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's\narithmetic by `cumulative_usage_matches_documented_aggregation_example`.",
         "properties": {
           "cache_creation_tokens": {
             "format": "uint64",
@@ -3539,6 +3814,38 @@
           "type",
           "session_id",
           "receipt"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Provider-authored cache breakpoints were discarded at a turn commit.\n\nA cache breakpoint is an optimization artifact anchored to one exact\ncommitted transcript prefix. Ordinary transcript motion unbinds it, and\ndropping it costs caching for the turn - never the turn itself. This\nevent is the host-observable record of that cost, so a degraded turn is\na routed fact rather than a log line: the same turn still completes.\n\n`origin` on each discard separates inherited poison (persisted by an\nearlier turn) from this turn's own lowering disagreeing with the\ncommitted transcript. Those have different root causes and are\nindistinguishable without it.",
+        "properties": {
+          "discarded": {
+            "description": "Non-empty whenever this event is emitted.",
+            "items": {
+              "$ref": "#/$defs/DiscardedCacheBreakpoint"
+            },
+            "type": "array"
+          },
+          "retained": {
+            "description": "Proofs that still bind and remain durable evidence. A non-zero\nvalue means caching was weakened, not lost.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "$ref": "#/$defs/SessionId"
+          },
+          "type": {
+            "const": "provider_cache_breakpoints_discarded",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "session_id",
+          "retained",
+          "discarded"
         ],
         "type": "object"
       },
@@ -4908,6 +5215,38 @@
             "type": "object"
           },
           {
+            "description": "Provider-authored cache breakpoints were discarded at a turn commit.\n\nA cache breakpoint is an optimization artifact anchored to one exact\ncommitted transcript prefix. Ordinary transcript motion unbinds it, and\ndropping it costs caching for the turn - never the turn itself. This\nevent is the host-observable record of that cost, so a degraded turn is\na routed fact rather than a log line: the same turn still completes.\n\n`origin` on each discard separates inherited poison (persisted by an\nearlier turn) from this turn's own lowering disagreeing with the\ncommitted transcript. Those have different root causes and are\nindistinguishable without it.",
+            "properties": {
+              "discarded": {
+                "description": "Non-empty whenever this event is emitted.",
+                "items": {
+                  "$ref": "#/$defs/DiscardedCacheBreakpoint"
+                },
+                "type": "array"
+              },
+              "retained": {
+                "description": "Proofs that still bind and remain durable evidence. A non-zero\nvalue means caching was weakened, not lost.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "provider_cache_breakpoints_discarded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "retained",
+              "discarded"
+            ],
+            "type": "object"
+          },
+          {
             "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
               "kind": {
@@ -5039,6 +5378,137 @@
         ],
         "type": "string"
       },
+      "CacheBreakpointBoundary": {
+        "description": "Stable provider-independent identity of an authored cache breakpoint.",
+        "oneOf": [
+          {
+            "description": "Stable leading system/profile prefix. `message_count` is the exclusive\ncanonical transcript boundary.",
+            "properties": {
+              "kind": {
+                "const": "system_profile_prefix",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Explicit breakpoint after one canonical transcript message.",
+            "properties": {
+              "kind": {
+                "const": "transcript_after",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardOrigin": {
+        "description": "Which side of a turn commit produced the discarded proof.\n\nLoad-bearing for hosts: `PersistedEvidence` is inherited poison from an\nearlier turn, `AuthoredThisTurn` is this turn's own lowering disagreeing\nwith the committed transcript. The two have different root causes and are\notherwise indistinguishable from the outside.",
+        "oneOf": [
+          {
+            "const": "authored_this_turn",
+            "description": "Freshly authored by the lowering that produced this turn's request.",
+            "type": "string"
+          },
+          {
+            "const": "persisted_evidence",
+            "description": "Persisted by an earlier turn and re-checked before the merge.",
+            "type": "string"
+          }
+        ]
+      },
+      "CacheBreakpointDiscardReason": {
+        "description": "Why one provider-authored cache breakpoint was discarded instead of\nretained as durable session evidence.\n\nA cache breakpoint is an optimization artifact anchored to the exact\ntranscript head a provider lowered. Ordinary transcript motion - a\nsynthetic-notice refresh, a compaction, a re-materialized prefix - moves\nthat anchor without saying anything about the transcript's own integrity.\nEvery variant here therefore describes the ARTIFACT. Faults that describe\nthe committed TRANSCRIPT stay [`CacheBreakpointEvidenceError`].",
+        "oneOf": [
+          {
+            "description": "The anchored boundary is past the end of the committed transcript.",
+            "properties": {
+              "kind": {
+                "const": "boundary_outside_committed_transcript",
+                "type": "string"
+              },
+              "message_count": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "message_len": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "message_count",
+              "message_len"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The committed transcript prefix at the anchored boundary is no longer\nthe one the provider lowered.",
+            "properties": {
+              "kind": {
+                "const": "canonical_prefix_moved",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The proof itself is not usable evidence, independently of any\ntranscript: a malformed rendered identity, an incoherent\nprovider/encoding pairing, or an undecodable persisted row.",
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "evidence_unusable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Durable history retains superseded prompt versions, so the projected\nprovider boundary has no raw-to-projected map to rebind through.",
+            "properties": {
+              "kind": {
+                "const": "projected_boundary_unmappable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "CapabilityId": {
         "description": "Slug-validated capability identifier for skill requirements.\n\nReplaces the legacy `Vec<String>` capability lists with a typed\nnamespace. Parsed at construction, so callers cannot smuggle invalid\nidentifiers into descriptors or requirements.",
         "type": "string"
@@ -5163,6 +5633,101 @@
               "message"
             ],
             "type": "object"
+          },
+          {
+            "description": "The runtime refused to authorize the durable transcript+memory handoff,\nso the original (uncompacted) history was preserved.\n\nDistinct from [`Self::MemoryIndexingFailed`]: the memory store never saw\nthe batch. The refusal is a runtime-authority fact, and\n`preserved_history` says whether the session can still make progress\nwhile it persists: a wedged member needs paging, a fitting one needs a\nlog line. When no authority could answer that at composed-request\nscope, it says so\n([`CompactionPreservedHistoryFit::Unclassified`]) rather than guessing.",
+            "properties": {
+              "attempted_entries": {
+                "description": "Number of discard entries that would have been projected.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "projection_handoff_refused",
+                "type": "string"
+              },
+              "message": {
+                "description": "Display projection of the refusal's exact facts.",
+                "type": "string"
+              },
+              "preserved_history": {
+                "$ref": "#/$defs/CompactionPreservedHistoryFit",
+                "description": "Whether the request the preserved history composes can still be\nsent to the provider."
+              },
+              "refusal": {
+                "$ref": "#/$defs/CompactionHandoffRefusal",
+                "description": "Typed cause of the runtime refusal."
+              }
+            },
+            "required": [
+              "kind",
+              "refusal",
+              "preserved_history",
+              "attempted_entries",
+              "message"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CompactionHandoffRefusal": {
+        "description": "Typed cause of a compaction projection-handoff refusal.\n\nThe runtime coordinator refuses for structurally different reasons, and a\nhost routing severity (page vs log) needs the cause, not a message\nsubstring. This is the wire-stable vocabulary carried by\n[`crate::event::CompactionFailureReason::ProjectionHandoffRefused`];\n[`CompactionCommitCoordinationError::refusal`] is its only producer.",
+        "oneOf": [
+          {
+            "const": "session_mismatch",
+            "description": "The projection belongs to a different session than the coordinator.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_epoch_rotated",
+            "description": "The runtime epoch that minted the coordinator is no longer the session's\nlive epoch, and one bounded re-derivation did not recover it.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_epoch_retired",
+            "description": "The coordinator's epoch is gone: its runtime was unregistered, retired,\nor its durability authority is not ready.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_binding_rotated",
+            "description": "The session's exact runtime placement (runtime id, fence token,\ngeneration) rotated after the coordinator latched it.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_binding_absent",
+            "description": "The session carries no authoritative runtime placement to commit\nagainst.",
+            "type": "string"
+          },
+          {
+            "const": "durable_projection_unsupported",
+            "description": "The runtime has no durable store, or its store cannot commit a\ntranscript rewrite and its memory projection atomically.",
+            "type": "string"
+          },
+          {
+            "const": "unclassified",
+            "description": "A host-supplied coordinator refused without a typed cause.",
+            "type": "string"
+          }
+        ]
+      },
+      "CompactionPreservedHistoryFit": {
+        "description": "Whether the history a failed compaction preserved can still be sent.\n\nThis is the severity discriminator for compaction-persistence failures: the\nsame refusal is a log line on a session that still fits its window and a\nhard wedge on one that does not (every subsequent turn is refused, and the\nonly path out is a compaction that persists). Classification reuses the\npre-dispatch authorities rather than a second limit table:\n[`ContextBudgetState`](crate::ContextBudgetState) over the active model\nprofile's window, and the compactor's effective request-byte cap over the\nexact provider-lowered body size.\n\nBoth authorities are read at composed-request scope, which is the scope the\nquestion is asked at: the transcript is not what crosses the provider\nboundary, the request built from it is. A transcript-only token measure\nunder-reports every request by the tool schemas that ride it, which is the\nexact shape that used to be reported as [`Self::StillFits`] while every\nturn died on the provider's context limit.",
+        "oneOf": [
+          {
+            "const": "unclassified",
+            "description": "Nothing proved an excess, and no axis established a fit at\ncomposed-request scope: the active model declares no context window,\nthe provider exposed no lowered-body witness or no request-byte cap is\nin force, or the only token evidence available was a preserved-history\nfloor that did not cross. One measured axis is not a fit either, so a\ncomposed request within the window with no cap comparison behind it\nlands here. Absence of evidence is reported as such rather than as a\nfit.",
+            "type": "string"
+          },
+          {
+            "const": "still_fits",
+            "description": "The composed request the preserved history produces remains within the\nactive context window and under the effective request-byte cap. Both\naxes measured and both fit; an axis that measured nothing yields\n[`Self::Unclassified`] instead. The run continues normally; the failed\npersistence costs a summary call and a retry, not progress.",
+            "type": "string"
+          },
+          {
+            "const": "over_window",
+            "description": "The composed request the preserved history produces already exceeds the\nactive context window, or the preserved history alone does, or the\nexact lowered body exceeds the effective request-byte cap. The session\ncannot make progress until a compaction persists.",
+            "type": "string"
           }
         ]
       },
@@ -5381,7 +5946,7 @@
       },
       "CumulativeUsage": {
         "$ref": "#/$defs/Usage",
-        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific."
+        "description": "Cumulative usage across committed turns. Cache detail counters are not\naggregated because their relationship to input totals is provider-specific.\n\nThis value is **already a total**, and the total is session-scoped: on the\nevent stream it is `Session::total_usage()`, which is persisted with the\nsession and restored on resume, so `run_completed.usage` on the second run of\na session already contains the first run's calls. Adding it to per-call\nusage, or summing the values observed on two runs, double-counts. It also\nintentionally carries no [`crate::ProviderTokenAccounting`], because one\nsession may span providers and models and so cannot truthfully claim a\nsingle per-call convention; per-model attribution is read from the per-call\n`turn_completed` rows, which cover only the calls that closed a run."
       },
       "DeferredCatalogDelta": {
         "description": "Additive hidden-catalog delta metadata for runtime notices.",
@@ -5405,6 +5970,55 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "DiscardedCacheBreakpoint": {
+        "additionalProperties": false,
+        "description": "One provider-authored cache proof that could not be retained.",
+        "properties": {
+          "identity": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DiscardedCacheBreakpointIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Absent only when the persisted evidence row itself could not be\ndecoded, so no individual proof identity exists to name."
+          },
+          "origin": {
+            "$ref": "#/$defs/CacheBreakpointDiscardOrigin"
+          },
+          "reason": {
+            "$ref": "#/$defs/CacheBreakpointDiscardReason"
+          }
+        },
+        "required": [
+          "origin",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "DiscardedCacheBreakpointIdentity": {
+        "additionalProperties": false,
+        "description": "Identity of a discarded proof, when the proof itself could be decoded.",
+        "properties": {
+          "boundary": {
+            "$ref": "#/$defs/CacheBreakpointBoundary"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "boundary"
+        ],
         "type": "object"
       },
       "ExternalToolDeltaPhase": {
@@ -7129,7 +7743,7 @@
         "type": "string"
       },
       "TurnUsage": {
-        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.",
+        "description": "Usage for one provider turn.\n\nThis is deliberately distinct from cumulative [`Usage`] on event\nboundaries, while retaining the existing flat wire shape.\n\n# Model and provider attribution\n\n`accounting` is the single owner of per-call attribution: it carries the\n[`crate::Provider`] and the model string of the request that produced these\ncounters, minted by the provider adapter from the lowered request rather than\nfrom configuration intent. A consumer reading only the event stream can\ntherefore attribute one `turn_completed` row to a model without joining\nagainst session metadata:\n`turn_completed.usage.accounting.provider` /\n`turn_completed.usage.accounting.model`.\n\nThere is deliberately no second copy of the model or provider beside\n`accounting` on the event: attribution has one owner.",
         "properties": {
           "accounting": {
             "$ref": "#/$defs/ProviderTokenAccounting"
@@ -7180,7 +7794,7 @@
         "type": "object"
       },
       "Usage": {
-        "description": "Token usage statistics",
+        "description": "Token usage statistics.\n\n# The same field names carry two different denominators\n\nThis shape is reused for two semantically different accounts, and\n`input_tokens` does not mean the same thing in both:\n\n- **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw\n  provider counters for exactly one provider request. For Anthropic\n  `input_tokens` is the *uncached* input only, with cache-write and\n  cache-read input reported separately in `cache_creation_tokens` and\n  `cache_read_tokens`. The normalized presented-input total for that one\n  call is [`TurnUsage::presented_tokens`].\n- **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a\n  running total over every provider call recorded on the *session*, not on\n  one run. Its `input_tokens` is the saturating sum of each call's\n  *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache\n  detail fields are always `None` because their relationship to the input\n  total is provider-specific.\n\n# What consumers must not sum\n\n- Never sum `run_completed.usage` with per-call usage, and never sum\n  `run_completed.usage` across runs: each value is already the whole\n  session's total to date, so adding two of them double-counts everything\n  before the later one. Take the latest value.\n- Never sum per-call `input_tokens` and expect it to match\n  `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the\n  two use different denominators and will not agree. Sum\n  `turn_completed.usage.accounting.presented_tokens` (that is,\n  [`TurnUsage::presented_tokens`]) instead, which is exactly what\n  [`CumulativeUsage::add_turn`] does.\n- Do not expect the per-call rows to reconcile with the cumulative account\n  either. Intermediate tool-loop calls, the structured-output extraction\n  call, and the compaction summary call are all charged to the cumulative\n  account and publish no `turn_completed` row, so the rows cover a strict\n  subset of the tokens.\n\nThe worked example lives in `docs/reference/usage-accounting.mdx`. Its\nnumbers are pinned against the agent loop by\n`turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`\n(`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's\narithmetic by `cumulative_usage_matches_documented_aggregation_example`.",
         "properties": {
           "cache_creation_tokens": {
             "format": "uint64",
@@ -7289,7 +7903,8 @@
       "tool_config_changed",
       "background_job_completed",
       "transcript_rewrite_committed",
-      "peer_content_ingested"
+      "peer_content_ingested",
+      "provider_cache_breakpoints_discarded"
     ],
     "known_payloads": {
       "tool_config_changed": {

@@ -246,6 +246,21 @@ impl Compactor for DefaultCompactor {
         // operators can see which branch fired in production.
         let input_trigger = ctx.last_input_tokens >= self.config.auto_compact_threshold;
         let history_trigger = ctx.estimated_history_tokens >= self.config.auto_compact_threshold;
+        // Whole-request token forecast, in the same unit the threshold is
+        // derived from (4/5 of the model context window). Both token measures
+        // above are smaller than the request that window has to hold:
+        // `last_input_tokens` is a provider count that already includes tool
+        // schemas and framing but lags this boundary by whatever it appended,
+        // and `estimated_history_tokens` is current but measures the transcript
+        // alone - no tool definitions, no payload a later blob hydration
+        // inlines. A request that crosses only because of those components was
+        // invisible to the trigger and visible to the provider.
+        let request_forecast_tokens = ctx
+            .request_context_budget
+            .as_ref()
+            .map(|budget| budget.effective_input_tokens());
+        let forecast_trigger = request_forecast_tokens
+            .is_some_and(|tokens| tokens >= self.config.auto_compact_threshold);
         let (request_bytes, byte_threshold, request_measurement) =
             match ctx.provider_request_pressure {
                 Some(pressure) => (
@@ -268,6 +283,12 @@ impl Compactor for DefaultCompactor {
         // very next request impossible, including when the previous
         // compaction happened fewer than `min_turns_between_compactions`
         // boundaries ago.
+        //
+        // The whole-request forecast is deliberately NOT capacity recovery.
+        // Part of what it measures - tool definitions and the output reserve -
+        // survives compaction untouched, so a forecast crossing that cadence
+        // could not veto would compact on every boundary forever without
+        // reducing the crossing.
         let requires_capacity_recovery = history_trigger || byte_trigger;
         if !requires_capacity_recovery
             && let Some(last) = ctx.last_compaction_boundary_index
@@ -276,10 +297,16 @@ impl Compactor for DefaultCompactor {
         {
             return false;
         }
-        if input_trigger || history_trigger || byte_trigger {
+        if input_trigger || history_trigger || byte_trigger || forecast_trigger {
             tracing::trace!(
                 input_tokens = ctx.last_input_tokens,
                 estimated_history_tokens = ctx.estimated_history_tokens,
+                request_forecast_tokens,
+                request_forecast_provenance = ctx
+                    .request_context_budget
+                    .as_ref()
+                    .map(|budget| budget.estimate_provenance)
+                    .map(|provenance| format!("{provenance:?}")),
                 estimated_request_bytes = ctx.estimated_request_bytes,
                 provider_request_bytes = ctx
                     .provider_request_pressure
@@ -291,15 +318,17 @@ impl Compactor for DefaultCompactor {
                     "last_input_tokens"
                 } else if history_trigger {
                     "estimated_history_tokens_fallback"
-                } else if ctx.provider_request_pressure.is_some() {
+                } else if byte_trigger && ctx.provider_request_pressure.is_some() {
                     "provider_request_bytes"
-                } else {
+                } else if byte_trigger {
                     "estimated_request_bytes"
+                } else {
+                    "request_context_budget_forecast"
                 },
                 "compaction trigger fired",
             );
         }
-        input_trigger || history_trigger || byte_trigger
+        input_trigger || history_trigger || byte_trigger || forecast_trigger
     }
 
     fn prepare_for_summarization(&self, messages: &[Message]) -> Vec<Message> {
@@ -562,6 +591,7 @@ mod tests {
             message_count: 100,
             estimated_history_tokens: 200_000,
             estimated_request_bytes: 0,
+            request_context_budget: None,
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 0,
@@ -577,6 +607,7 @@ mod tests {
             message_count: 100,
             estimated_history_tokens: 50_000,
             estimated_request_bytes: 0,
+            request_context_budget: None,
             provider_request_pressure: None,
             last_compaction_boundary_index: Some(5),
             session_boundary_index: 7, // Only 2 boundaries since last compaction, threshold is 3
@@ -592,6 +623,7 @@ mod tests {
             message_count: 100,
             estimated_history_tokens: 100_000,
             estimated_request_bytes: 0,
+            request_context_budget: None,
             provider_request_pressure: None,
             last_compaction_boundary_index: Some(5),
             session_boundary_index: 6,
@@ -610,6 +642,7 @@ mod tests {
             message_count: 100,
             estimated_history_tokens: 200_000,
             estimated_request_bytes: 0,
+            request_context_budget: None,
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 1,
@@ -627,6 +660,7 @@ mod tests {
             message_count: 50,
             estimated_history_tokens: 50_000,
             estimated_request_bytes: 0,
+            request_context_budget: None,
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
@@ -639,6 +673,7 @@ mod tests {
             message_count: 50,
             estimated_history_tokens: 100_000,
             estimated_request_bytes: 0,
+            request_context_budget: None,
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
@@ -659,6 +694,7 @@ mod tests {
             message_count: 200,
             estimated_history_tokens: 150_000,
             estimated_request_bytes: 0,
+            request_context_budget: None,
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 42,
@@ -682,6 +718,7 @@ mod tests {
             message_count: 20,
             estimated_history_tokens: 50_000,
             estimated_request_bytes: 0,
+            request_context_budget: None,
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
@@ -703,6 +740,7 @@ mod tests {
             message_count: 40,
             estimated_history_tokens: 12_000,
             estimated_request_bytes: 7_200_000, // exactly 4/5 of the 9 MB cap
+            request_context_budget: None,
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
@@ -730,6 +768,7 @@ mod tests {
             message_count: 50,
             estimated_history_tokens: 50_000,
             estimated_request_bytes: u64::MAX,
+            request_context_budget: None,
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
@@ -756,6 +795,7 @@ mod tests {
             estimated_history_tokens: 1,
             // The transcript estimate cannot see a cold-resumed blob payload.
             estimated_request_bytes: 128,
+            request_context_budget: None,
             provider_request_pressure: Some(meerkat_core::ProviderRequestPressure::new(
                 7_200_000,
                 Some(9_000_000),
@@ -766,6 +806,192 @@ mod tests {
         assert!(
             c.should_compact(&ctx),
             "the active provider's exact lowered body and cap must override both the blind transcript estimate and cadence guard"
+        );
+    }
+
+    /// Model profile witness for a custom model with an exact declared window.
+    ///
+    /// The arithmetic is scale-free, so a small window keeps the synthetic
+    /// transcript cheap. Production shape it stands in for: a 1,050,000-token
+    /// window, a 840,000-token trigger, and a tool-heavy mob member.
+    fn windowed_profile_witness(window_tokens: u32) -> meerkat_core::ModelProfileWitness {
+        const MODEL: &str = "compaction-forecast-test-model";
+        let mut config = meerkat_core::Config::default();
+        config.models.custom.insert(
+            MODEL.to_string(),
+            meerkat_core::config::CustomModelConfig {
+                provider: meerkat_core::Provider::OpenAI,
+                display_name: None,
+                context_window: Some(window_tokens),
+                max_output_tokens: Some(2_048),
+                vision: None,
+                web_search: None,
+                call_timeout_secs: None,
+            },
+        );
+        let registry =
+            meerkat_core::ModelRegistry::from_config(&config, meerkat_models::canonical())
+                .expect("custom-model test registry");
+        registry
+            .profile_witness_for_provider(meerkat_core::Provider::OpenAI, MODEL)
+            .expect("custom model must mint an exact profile witness")
+    }
+
+    fn forecast_test_tools(count: usize) -> Vec<std::sync::Arc<meerkat_core::ToolDef>> {
+        (0..count)
+            .map(|index| {
+                std::sync::Arc::new(meerkat_core::ToolDef::new(
+                    format!("forecast_tool_{index}"),
+                    "a tool whose schema rides every single request in full",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string", "description": "what to look up" },
+                            "limit": { "type": "integer", "description": "row cap" }
+                        },
+                        "required": ["query"]
+                    }),
+                ))
+            })
+            .collect()
+    }
+
+    /// The trigger-side accounting pin: a request whose true token cost crosses
+    /// the threshold while the transcript estimate alone stays under it must
+    /// compact. Tool definitions ride every request in full and the provider
+    /// counts them; before the whole-request forecast reached the trigger, they
+    /// were invisible to it, so a strand could keep growing past the threshold
+    /// the model window was supposed to protect.
+    #[test]
+    fn whole_request_forecast_fires_when_the_transcript_estimate_stays_below_threshold() {
+        let threshold = 8_000;
+        let compactor = DefaultCompactor::new(CompactionConfig {
+            auto_compact_threshold: threshold,
+            ..make_config()
+        });
+        let profile = windowed_profile_witness(10_000);
+        let tools = forecast_test_tools(24);
+        // Just under the threshold on the transcript axis alone.
+        let messages = vec![Message::User(UserMessage::text("t".repeat(31_600)))];
+
+        let transcript_only =
+            meerkat_core::agent::compact::estimate_tokens(&messages).expect("transcript estimate");
+        assert!(
+            transcript_only < threshold,
+            "the synthetic transcript must stay below the threshold on its own: {transcript_only}"
+        );
+
+        let budget =
+            meerkat_core::context_budget_fact_for_messages(&messages, &tools, 2_048, &profile)
+                .expect("declared window must classify");
+        assert!(
+            budget.estimated_tool_tokens > 0,
+            "the visible tool set must contribute measured tokens"
+        );
+        assert!(
+            budget.effective_input_tokens() >= threshold,
+            "the whole request must cross the threshold the transcript alone does not: {}",
+            budget.effective_input_tokens()
+        );
+
+        let ctx = meerkat_core::agent::compact::build_compaction_context(
+            &messages,
+            0,
+            Some(budget),
+            None,
+            None,
+            5,
+        );
+        assert!(
+            ctx.estimated_history_tokens < threshold,
+            "the legacy history estimate must not be what fires here"
+        );
+        assert!(
+            compactor.should_compact(&ctx),
+            "a request whose measured cost crosses the threshold must compact before the window"
+        );
+
+        // With no declared window the forecast is absent, and the decision falls
+        // back to exactly the pre-existing measures.
+        let without_forecast = CompactionContext {
+            request_context_budget: None,
+            ..ctx
+        };
+        assert!(
+            !compactor.should_compact(&without_forecast),
+            "an unavailable forecast must leave the trigger decision unchanged"
+        );
+    }
+
+    /// An exact provider-issued input count inside the forecast is authoritative:
+    /// it must not be replaced by, or averaged with, the local estimate.
+    #[test]
+    fn exact_provider_issued_token_count_drives_the_forecast_trigger() {
+        let threshold = 8_000;
+        let compactor = DefaultCompactor::new(CompactionConfig {
+            auto_compact_threshold: threshold,
+            ..make_config()
+        });
+        let profile = windowed_profile_witness(10_000);
+        let messages = vec![Message::User(UserMessage::text("small transcript"))];
+
+        let budget = meerkat_core::context_budget_fact_for_provider_request(
+            &messages,
+            &[],
+            2_048,
+            &profile,
+            meerkat_core::ProviderRequestPressure::new(4_096, None)
+                .with_provider_issued_input_tokens(8_100),
+        )
+        .expect("declared window must classify");
+
+        let ctx = meerkat_core::agent::compact::build_compaction_context(
+            &messages,
+            0,
+            Some(budget),
+            None,
+            None,
+            5,
+        );
+        assert!(
+            ctx.estimated_history_tokens < threshold,
+            "the transcript is deliberately tiny on both legacy measures"
+        );
+        assert!(
+            compactor.should_compact(&ctx),
+            "an exact provider count above the threshold must fire the trigger"
+        );
+    }
+
+    /// The forecast crossing is a cost-guarded trigger, not capacity recovery.
+    /// Tool definitions and the output reserve survive compaction untouched, so
+    /// a forecast crossing that cadence could not veto would compact on every
+    /// boundary without ever clearing the crossing.
+    #[test]
+    fn forecast_crossing_still_respects_the_cadence_guard() {
+        let threshold = 8_000;
+        let compactor = DefaultCompactor::new(CompactionConfig {
+            auto_compact_threshold: threshold,
+            ..make_config()
+        });
+        let profile = windowed_profile_witness(10_000);
+        let tools = forecast_test_tools(24);
+        let messages = vec![Message::User(UserMessage::text("t".repeat(31_600)))];
+        let budget =
+            meerkat_core::context_budget_fact_for_messages(&messages, &tools, 2_048, &profile)
+                .expect("declared window must classify");
+
+        let ctx = meerkat_core::agent::compact::build_compaction_context(
+            &messages,
+            0,
+            Some(budget),
+            None,
+            Some(5),
+            6,
+        );
+        assert!(
+            !compactor.should_compact(&ctx),
+            "a forecast-only crossing must not bypass the cost guard"
         );
     }
 
@@ -782,6 +1008,7 @@ mod tests {
             message_count: 50,
             estimated_history_tokens: 50_000,
             estimated_request_bytes: 1_000_000,
+            request_context_budget: None,
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
@@ -790,7 +1017,7 @@ mod tests {
 
         let bytes_first = CompactionContext {
             estimated_request_bytes: 8_000_000,
-            ..neither
+            ..neither.clone()
         };
         assert!(
             c.should_compact(&bytes_first),

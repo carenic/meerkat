@@ -62,7 +62,7 @@ Controls when and how compaction runs.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `auto_compact_threshold` | `u64` | `100_000` | Compaction triggers when `last_input_tokens >= threshold` OR `estimated_history_tokens >= threshold`. |
+| `auto_compact_threshold` | `u64` | `100_000` | Compaction triggers when `last_input_tokens >= threshold` OR `estimated_history_tokens >= threshold` OR the measured whole-request token budget crosses the threshold. |
 | `recent_turn_budget` | `usize` | `4` | Number of recent complete turns to retain after compaction. A turn is a User message followed by all subsequent non-User messages until the next User message. |
 | `max_summary_tokens` | `u32` | `4096` | Maximum tokens the LLM may produce for the compaction summary. |
 | `min_turns_between_compactions` | `u32` | `3` | Minimum turns that must elapse between consecutive compactions (loop guard to prevent runaway compaction). |
@@ -80,10 +80,17 @@ The decision flow:
   <Step title="Loop guard check">
     If compaction occurred at turn N, no compaction until turn N + `min_turns_between_compactions`.
   </Step>
-  <Step title="Dual threshold evaluation">
-    Compaction triggers if EITHER:
+  <Step title="Threshold evaluation">
+    Compaction triggers if ANY of:
     - `last_input_tokens >= auto_compact_threshold` (input tokens from the last LLM response), OR
-    - `estimated_history_tokens >= auto_compact_threshold` (JSON bytes of all messages / 4).
+    - `estimated_history_tokens >= auto_compact_threshold` (JSON bytes of all messages / 4), OR
+    - the measured request budget for this boundary crosses the threshold on its
+      input side. This is the same measurement the pre-dispatch preflight
+      performs - fully hydrated request messages, the exact visible tool
+      definitions, and the effective output reserve - so tool schemas and
+      hydrated media, which the provider counts but a transcript-only estimate
+      cannot see, are visible to the trigger. It is available whenever the
+      active model declares a context window.
   </Step>
 </Steps>
 

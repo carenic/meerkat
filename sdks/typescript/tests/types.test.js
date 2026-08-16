@@ -285,6 +285,85 @@ describe("Typed Events", () => {
     }
   });
 
+  it("exposes per-call provider/model attribution on turn_completed", () => {
+    const event = parseEvent({
+      type: "turn_completed",
+      stop_reason: "end_turn",
+      usage: {
+        input_tokens: 120,
+        output_tokens: 90,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 4300,
+        accounting: {
+          provider: "anthropic",
+          model: "claude-opus-5",
+          presented_tokens: 4420,
+          convention: "anthropic_disjoint_input_components",
+          aggregation: "sum_disjoint_provider_components",
+        },
+      },
+    });
+    if (isTurnCompleted(event)) {
+      assert.equal(event.usage.accounting?.provider, "anthropic");
+      assert.equal(event.usage.accounting?.model, "claude-opus-5");
+      assert.equal(event.usage.accounting?.presentedTokens, 4420);
+      assert.equal(event.usage.accounting?.convention, "anthropic_disjoint_input_components");
+      assert.equal(event.usage.accounting?.aggregation, "sum_disjoint_provider_components");
+      // The raw per-call counter uses a different denominator than the
+      // normalized presented total; both must stay readable.
+      assert.equal(event.usage.inputTokens, 120);
+    } else {
+      assert.fail("Expected TurnCompletedEvent");
+    }
+  });
+
+  it("accepts turn_completed usage without attribution", () => {
+    // Rows written before 0.8.22 carry no `accounting` object.
+    const event = parseEvent({
+      type: "turn_completed",
+      stop_reason: "end_turn",
+      usage: { input_tokens: 1, output_tokens: 2 },
+    });
+    if (isTurnCompleted(event)) {
+      assert.equal(event.usage.accounting, undefined);
+    } else {
+      assert.fail("Expected TurnCompletedEvent");
+    }
+  });
+
+  it("rejects malformed turn_completed usage attribution", () => {
+    const malformed = [
+      { provider: "anthropic", model: "claude-opus-5", presented_tokens: 4420 },
+      {
+        provider: "anthropic",
+        model: 7,
+        presented_tokens: 4420,
+        convention: "c",
+        aggregation: "a",
+      },
+      {
+        provider: "anthropic",
+        model: "claude-opus-5",
+        presented_tokens: "4420",
+        convention: "c",
+        aggregation: "a",
+      },
+      "anthropic",
+    ];
+    for (const accounting of malformed) {
+      const event = parseEvent({
+        type: "turn_completed",
+        stop_reason: "end_turn",
+        usage: { input_tokens: 120, output_tokens: 90, accounting },
+      });
+      assert.equal(
+        event.type,
+        "malformed_event",
+        `malformed attribution must not become a typed event: ${JSON.stringify(accounting)}`,
+      );
+    }
+  });
+
   it("preserves run_failed typed terminal cause report", () => {
     const event = parseEvent({
       type: "run_failed",

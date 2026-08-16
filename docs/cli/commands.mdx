@@ -412,12 +412,24 @@ maintenance fence).
 `--bridge-pre-0-8-10` is an explicit `--apply`-only maintenance lane for
 SQLite realms. JSONL and memory realms are rejected before any database is
 mutated. While the realm fence is held, it runs a frozen importer before the
-normal store constructors. The importer accepts only authenticated, supported
-pre-floor schema and row shapes; unknown, ambiguous, or inconsistent state
-refuses instead of being inferred or stamped. The maintenance transaction preserves
-queued and nonterminal runtime inputs in the current representation without
-scheduling or replaying them. A later session activation follows normal
-recovery. Ordinary store opens never enter this bridge.
+normal store constructors. A domain is authenticated as exactly one
+caller-authorized source catalog; an unknown or ambiguous catalog refuses that
+domain instead of being inferred or stamped, and each domain owns its own
+transaction, so a domain that committed stays committed when a later one
+refuses. The same authentication answers the eligibility sentence an ordinary
+open prints, so a realm the bridge recovers is never described as
+unrecoverable and a realm it cannot recover is never handed this command.
+
+Row admission is per record, not per domain. Every runtime input row is
+carried forward when it decodes through the current typed contract and
+re-encodes without losing a field; a row that cannot be is left with its
+bytes exactly as found - never deleted, never blanked - and named in the
+output with the reason and the consequence. Rows are preserved in the current
+representation without being scheduled or replayed, and that includes their
+ingress payloads: a rescued realm keeps the operator's own prompt whatever
+lifecycle state its input reached. A later session activation follows normal
+recovery, which applies this binary's ordinary payload retirement to rows it
+writes itself. Ordinary store opens never enter this bridge.
 
 ```bash
 rkat storage prune [--apply] [--older-than-days N] [--json] [--root PATH]...

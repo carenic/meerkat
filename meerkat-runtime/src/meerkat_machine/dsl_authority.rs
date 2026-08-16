@@ -170,19 +170,52 @@ pub(crate) fn new_initialized_authority(context: &'static str) -> mm_dsl::Meerka
     authority
 }
 
+/// Register the authority of a runtime session ENTRY.
+///
+/// The entry's runtime epoch is a registration-time fact, so it is a
+/// non-optional parameter here: the machine cannot tell an entry lane from an
+/// epochless oracle lane, so the obligation lives at this type boundary.
+/// Authorities that own no runtime entry use
+/// [`new_registered_authority_without_runtime_entry`] instead.
 pub(crate) fn new_registered_authority(
     session_id: &SessionId,
+    runtime_epoch_id: &meerkat_core::RuntimeEpochId,
 ) -> Result<mm_dsl::MeerkatMachineAuthority, mm_dsl::MeerkatMachineTransitionError> {
-    new_registered_authority_id(mm_dsl::SessionId::from_domain(session_id))
+    new_registered_authority_id(
+        mm_dsl::SessionId::from_domain(session_id),
+        mm_dsl::RuntimeEpochId::from_domain(runtime_epoch_id),
+    )
 }
 
 pub(crate) fn new_registered_authority_id(
     session_id: mm_dsl::SessionId,
+    runtime_epoch_id: mm_dsl::RuntimeEpochId,
+) -> Result<mm_dsl::MeerkatMachineAuthority, mm_dsl::MeerkatMachineTransitionError> {
+    new_registered_authority_with_optional_epoch(session_id, Some(runtime_epoch_id))
+}
+
+/// Register an authority that owns NO runtime session entry: standalone
+/// sessions (no runtime loop), pure projection oracles, and durable-tail
+/// authorization probes. These are a real epochless population, not a gap - no
+/// entry exists whose runtime generation an epoch could name, and none of them
+/// prepares a placement.
+pub(crate) fn new_registered_authority_without_runtime_entry(
+    session_id: &SessionId,
+) -> Result<mm_dsl::MeerkatMachineAuthority, mm_dsl::MeerkatMachineTransitionError> {
+    new_registered_authority_with_optional_epoch(mm_dsl::SessionId::from_domain(session_id), None)
+}
+
+pub(crate) fn new_registered_authority_with_optional_epoch(
+    session_id: mm_dsl::SessionId,
+    runtime_epoch_id: Option<mm_dsl::RuntimeEpochId>,
 ) -> Result<mm_dsl::MeerkatMachineAuthority, mm_dsl::MeerkatMachineTransitionError> {
     let mut authority = new_initialized_authority("runtime authority must initialize");
     mm_dsl::MeerkatMachineMutator::apply(
         &mut authority,
-        mm_dsl::MeerkatMachineInput::RegisterSession { session_id },
+        mm_dsl::MeerkatMachineInput::RegisterSession {
+            session_id,
+            runtime_epoch_id,
+        },
     )?;
     Ok(authority)
 }
@@ -375,7 +408,8 @@ mod tests {
     #[test]
     fn new_registered_authority_builds_a_fresh_idle_shell() {
         let session_id = SessionId::from_uuid(uuid::Uuid::nil());
-        let authority = new_registered_authority(&session_id)
+        let runtime_epoch_id = meerkat_core::RuntimeEpochId::new();
+        let authority = new_registered_authority(&session_id, &runtime_epoch_id)
             .expect("initialize plus register must create fresh cold authority");
 
         assert_eq!(

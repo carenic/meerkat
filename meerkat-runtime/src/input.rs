@@ -146,6 +146,22 @@ impl Input {
         }
     }
 
+    /// Mutable access to the input header.
+    ///
+    /// Crate-internal on purpose: the only in-tree mutator is the bounded
+    /// submit path, which stamps the caller-supplied idempotency key so a
+    /// retryable hand-off cannot be built without one.
+    pub(crate) fn header_mut(&mut self) -> &mut InputHeader {
+        match self {
+            Input::Prompt(i) => &mut i.header,
+            Input::Peer(i) => &mut i.header,
+            Input::FlowStep(i) => &mut i.header,
+            Input::ExternalEvent(i) => &mut i.header,
+            Input::Continuation(i) => &mut i.header,
+            Input::Operation(i) => &mut i.header,
+        }
+    }
+
     /// Get the input ID.
     pub fn id(&self) -> &InputId {
         &self.header().id

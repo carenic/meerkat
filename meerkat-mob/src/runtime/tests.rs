@@ -126,6 +126,7 @@ fn initialized_test_peer_projection_dsl(session_id: String) -> TestMeerkatMachin
     dsl.apply_input(
         meerkat_runtime::meerkat_machine::dsl::MeerkatMachineInput::RegisterSession {
             session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(session_id.clone()),
+            runtime_epoch_id: None,
         },
         "test::register_session",
     )
@@ -4461,6 +4462,7 @@ impl FaultInjectedMobEventStore {
             MobEventKind::StepSkipped { .. } => "StepSkipped",
             MobEventKind::TopologyViolation { .. } => "TopologyViolation",
             MobEventKind::SupervisorEscalation { .. } => "SupervisorEscalation",
+            MobEventKind::SupervisorEscalationFailed { .. } => "SupervisorEscalationFailed",
             MobEventKind::OperatorActionRecorded { .. } => "OperatorActionRecorded",
         }
     }
@@ -5692,6 +5694,7 @@ fn sample_definition() -> MobDefinition {
                 mob: true,
                 schedule: false,
                 image_generation: false,
+                read_only: false,
                 mcp: vec![],
                 mcp_servers: vec![],
                 rust_bundles: vec![],
@@ -5856,6 +5859,7 @@ fn flow_step(role: impl Into<crate::ids::ProfileName>, message: &str) -> FlowSte
         allowed_tools: None,
         blocked_tools: None,
         output_format: Some(StepOutputFormat::Json),
+        failure_policy: Default::default(),
     }
 }
 
@@ -9479,6 +9483,7 @@ async fn seed_test_body_frame_in_mob_machine(
                 node_step_ids: Default::default(),
                 node_loop_ids: Default::default(),
                 node_status: Default::default(),
+                node_failure_policy: Default::default(),
                 ready_queue: Vec::new(),
                 output_recorded: Default::default(),
                 node_condition_results: Default::default(),
@@ -9691,6 +9696,28 @@ fn with_unique_mob_id(mut definition: MobDefinition, label: &str) -> MobDefiniti
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     definition.id = MobId::from(format!("test-mob-{label}-{suffix}"));
     definition
+}
+
+/// Await the release of a mob's process-global supervisor participant name.
+///
+/// A cold-restart test models a NEW process, where the predecessor's inproc
+/// route no longer exists. In one process the release starts at `shutdown` plus
+/// the last handle drop, and the actor task drops its own bridge reference on
+/// its own schedule, so a test that rebuilds the same mob id in-process must
+/// await the release instead of racing it. Publishing over a *live* route under
+/// another key is refused (`RegistrationRejection::NameOccupied`), which is the
+/// point: the refusal is what stops two live mobs from unbinding each other.
+async fn await_supervisor_route_release(mob_id: &MobId) {
+    let participant_name = format!("{mob_id}/__mob_supervisor__");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while meerkat_comms::InprocRegistry::global().contains_name(&participant_name) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "supervisor route '{participant_name}' was still published after the predecessor \
+             mob was shut down and dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 struct EchoBundleDispatcher;
@@ -15198,9 +15225,19 @@ async fn test_rotate_supervisor_reauthorizes_live_remote_members_and_rejects_sta
         address.clone(),
     )
     .expect("peer spec");
-    let old_bridge = crate::runtime::MobSupervisorBridge::new(&mob_id, original.clone(), None)
-        .await
-        .expect("build old supervisor bridge");
+    // A stale-epoch probe is a SECOND supervisor endpoint for this mob, which
+    // production never has (rotation replaces the live runtime in place through
+    // the exact-generation seam). The live bridge already holds
+    // `{mob_id}/__mob_supervisor__` under the rotated key, and a second key may
+    // not claim a live participant name, so the probe publishes under its own
+    // name while still presenting the pre-rotation authority record. The
+    // receiver's rejection is decided by the command's supervisor epoch and peer
+    // id, not by the participant name.
+    let probe_mob_id = crate::MobId::from(format!("{mob_id}-stale-epoch-probe"));
+    let old_bridge =
+        crate::runtime::MobSupervisorBridge::new(&probe_mob_id, original.clone(), None)
+            .await
+            .expect("build old supervisor bridge");
     old_bridge
         .trust_recipient(&peer)
         .await
@@ -16816,6 +16853,12 @@ async fn test_rotate_supervisor_final_commit_failure_preserves_attempted_authori
         .shutdown()
         .await
         .expect("shutdown original actor before restart-style retry");
+    // A restart-style retry models a new process: release the predecessor's
+    // process-global supervisor route before republishing the same mob id. The
+    // rotation left the live runtime on the attempted authority key, so a
+    // still-published predecessor would be a different key holding the name.
+    drop(handle);
+    await_supervisor_route_release(&mob_id).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata.clone(),
@@ -17512,6 +17555,12 @@ async fn test_v4_resume_is_effect_free_until_explicit_rotation_then_adopts_direc
         .await
         .expect("seed peer-only member under current authority");
     handle.shutdown().await.expect("stop original actor");
+    // The resume below publishes a *different* supervisor key (the released V4
+    // record) under this mob's supervisor name, which is exactly what a live
+    // predecessor route refuses. Model the cold restart: release the original
+    // process-global route first.
+    drop(handle);
+    await_supervisor_route_release(&mob_id).await;
 
     // Reconstruct the exact structural/identity store under a released V4
     // supervisor record. The receiver has also lost its supervisor state, so
@@ -32747,11 +32796,16 @@ async fn test_spawn_rollback_archive_failure_retains_cleanup_authority_until_ret
 
 #[tokio::test]
 async fn test_fault_injected_lifecycle_operations_preserve_transactional_invariants() {
-    // Spawn rollback invariants.
-    let (spawn_handle, spawn_service) = create_test_mob(sample_definition_with_auto_wire()).await;
+    // Spawn rollback invariants. Every mob in this test is live at the same
+    // time, so each gets its own mob id: two concurrently live mobs sharing one
+    // id would collide on the supervisor participant name.
+    let spawn_definition =
+        with_unique_mob_id(sample_definition_with_auto_wire(), "fault-injected-spawn");
+    let spawn_mob_id = spawn_definition.id.clone();
+    let (spawn_handle, spawn_service) = create_test_mob(spawn_definition).await;
     spawn_service
         .set_comms_behavior(
-            &test_comms_name("worker", "w-1"),
+            &test_comms_name_for(&spawn_mob_id, "worker", "w-1"),
             MockCommsBehavior {
                 missing_public_key: true,
                 ..MockCommsBehavior::default()
@@ -32792,13 +32846,17 @@ async fn test_fault_injected_lifecycle_operations_preserve_transactional_invaria
         !spawn_service
             .trusted_peer_names(&sid_l)
             .await
-            .contains(&test_comms_name("worker", "w-1")),
+            .contains(&test_comms_name_for(&spawn_mob_id, "worker", "w-1")),
         "spawn rollback should remove leaked trust edges"
     );
 
     // Retire cleanup invariants: archive failure is surfaced and the retiring
     // roster entry remains as a non-routable retry anchor.
-    let (retire_handle, retire_service) = create_test_mob(sample_definition()).await;
+    let (retire_handle, retire_service) = create_test_mob(with_unique_mob_id(
+        sample_definition(),
+        "fault-injected-retire",
+    ))
+    .await;
     let sid_r1 = retire_handle
         .spawn(
             ProfileName::from("worker"),
@@ -33748,25 +33806,24 @@ async fn test_reload_recovery_cancel_after_hook_reuses_terminal_receipt() {
         })
     };
     let hook_result = tokio::time::timeout(Duration::from_secs(3), hook_completed).await;
-    if hook_result.is_err() {
-        panic!(
-            "post-commit hook did not publish terminal receipt: first_finished={} first_result={:?} registration={:?} state={:?}",
-            first.is_finished(),
-            if first.is_finished() {
-                Some(first.await)
-            } else {
-                None
-            },
-            adapter
-                .current_session_registration_witness(&session_id)
-                .await,
-            meerkat_runtime::RuntimeControlPlane::runtime_state(
-                adapter.as_ref(),
-                &meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
-            )
+    assert!(
+        hook_result.is_ok(),
+        "post-commit hook did not publish terminal receipt: first_finished={} first_result={:?} registration={:?} state={:?}",
+        first.is_finished(),
+        if first.is_finished() {
+            Some(first.await)
+        } else {
+            None
+        },
+        adapter
+            .current_session_registration_witness(&session_id)
             .await,
-        );
-    }
+        meerkat_runtime::RuntimeControlPlane::runtime_state(
+            adapter.as_ref(),
+            &meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
+        )
+        .await,
+    );
     assert!(provisioner.ops_binding_present_for_test(&session_id));
     first.abort();
     let _ = first.await;
@@ -39812,8 +39869,14 @@ async fn test_branch_winner_is_selected_only_after_success_allowing_fallback() {
 #[tokio::test]
 async fn test_malformed_templates_fail_flow_explicitly() {
     for template in ["Bad {{", "Bad }}", "{{   }}"] {
-        let (handle, _service) =
-            create_test_mob(sample_definition_with_template_message(template)).await;
+        // Each iteration's mob is live while the previous one is still being
+        // released, so every iteration gets its own mob id rather than racing
+        // the previous supervisor participant name.
+        let (handle, _service) = create_test_mob(with_unique_mob_id(
+            sample_definition_with_template_message(template),
+            "malformed-template",
+        ))
+        .await;
         handle
             .spawn(
                 ProfileName::from("worker"),
@@ -40815,6 +40878,12 @@ fn authority_backed_root_frame_run(
         )]
         .into_iter()
         .collect(),
+        node_failure_policy: [(
+            crate::machines::mob_machine::FlowNodeId::from(loop_node_id.as_str()),
+            crate::machines::mob_machine::FlowNodeFailurePolicy::Escalate,
+        )]
+        .into_iter()
+        .collect(),
         ready_queue: vec![crate::machines::mob_machine::FlowNodeId::from(
             loop_node_id.as_str(),
         )],
@@ -40955,6 +41024,7 @@ async fn test_flow_frame_store_plan_persists_authority_input_with_projection() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     let root_spec = FrameSpec { nodes };
@@ -41261,6 +41331,7 @@ async fn test_stale_flow_frame_store_plan_loses_cas_before_authority_prepare() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     let root_spec = FrameSpec { nodes };
@@ -42618,8 +42689,11 @@ async fn test_schema_ref_file_path_validation_passes_and_fails() {
     .expect("write schema");
     let ok_path = schema_ok.path().to_string_lossy().to_string();
 
-    let (ok_handle, _ok_service) =
-        create_test_mob(sample_definition_with_schema_ref(&ok_path)).await;
+    let (ok_handle, _ok_service) = create_test_mob(with_unique_mob_id(
+        sample_definition_with_schema_ref(&ok_path),
+        "schema-ref-ok",
+    ))
+    .await;
     ok_handle
         .spawn(
             ProfileName::from("worker"),
@@ -42643,8 +42717,12 @@ async fn test_schema_ref_file_path_validation_passes_and_fails() {
     .expect("write schema");
     let bad_path = schema_bad.path().to_string_lossy().to_string();
 
-    let (bad_handle, _bad_service) =
-        create_test_mob(sample_definition_with_schema_ref(&bad_path)).await;
+    // Live alongside `ok_handle`, so it needs its own mob id.
+    let (bad_handle, _bad_service) = create_test_mob(with_unique_mob_id(
+        sample_definition_with_schema_ref(&bad_path),
+        "schema-ref-bad",
+    ))
+    .await;
     bad_handle
         .spawn(
             ProfileName::from("worker"),
@@ -49523,8 +49601,26 @@ async fn test_retire_saturated_actor_queue_reports_not_admitted_without_authorit
 
 #[tokio::test]
 async fn test_retirement_singleflight_scopes_identical_semantic_keys_to_exact_mob_store() {
-    let (first, _first_service) = create_test_mob(sample_definition()).await;
-    let (second, _second_service) = create_test_mob(sample_definition()).await;
+    // This is the one collision case that is load-bearing rather than
+    // incidental: proving that the STORE allocation discriminates the key
+    // requires two handles whose entire semantic id set - mob id included - is
+    // identical. Two live mobs under one mob id would collide on the supervisor
+    // participant name, so the second is built only after the first has
+    // released it. The first store's `events` allocation is pinned for the whole
+    // test so the pointer cannot be recycled into the second mob, which is the
+    // same guarantee production relies on (`retirement_operation_key`: "the
+    // detached leader retains `self.events`, preventing pointer reuse").
+    let definition = sample_definition();
+    let mob_id = definition.id.clone();
+    let first_storage = MobStorage::in_memory();
+    let _pinned_first_events = Arc::clone(&first_storage.events);
+    let first_service = Arc::new(MockSessionService::new());
+    let _ = first_service.enable_runtime_adapter();
+    let first = MobBuilder::new(definition.clone(), first_storage)
+        .with_session_service(first_service)
+        .create()
+        .await
+        .expect("create first mob");
     let identity = AgentIdentity::from("same-member");
     let generation = Generation::INITIAL;
     let expected = super::state::RetireMemberIncarnation {
@@ -49537,6 +49633,14 @@ async fn test_retirement_singleflight_scopes_identical_semantic_keys_to_exact_mo
 
     let first_key = first.retirement_operation_key(&expected);
     let reconstructed_same_store_key = first.clone().retirement_operation_key(&expected);
+    first
+        .shutdown()
+        .await
+        .expect("shut the first mob's actor down before rebuilding the same mob id");
+    drop(first);
+    await_supervisor_route_release(&mob_id).await;
+
+    let (second, _second_service) = create_test_mob(definition).await;
     let independent_store_key = second.retirement_operation_key(&expected);
     assert_eq!(
         first_key, reconstructed_same_store_key,
@@ -55642,6 +55746,87 @@ async fn test_supervisor_private_trust_failure_does_not_commit_spawn() {
     );
 }
 
+/// Reconstruction of ONE member identity inside ONE process, with real inproc
+/// comms. A member's participant name (`{mob}/{role}/{member}`) is
+/// session-independent while its signing identity is per session, so a respawn
+/// presents the same name under a brand new key - exactly the collision shape
+/// that ordinary registration now refuses. It has to keep working: the retired
+/// generation is released before the replacement publishes, so the successor
+/// gets the name and the predecessor route is gone.
+///
+/// Without this, closing the name-eviction defect would have converted a silent
+/// eviction into a hard failure on every rollback-retry and retire-respawn.
+#[tokio::test]
+async fn respawning_one_member_identity_rebinds_its_participant_name() {
+    let _serial = lock_real_comms_tests();
+    let definition = with_unique_mob_id(sample_definition(), "member-respawn-route");
+    let (handle, service) = create_test_mob_with_real_comms(definition).await;
+    let member_id = AgentIdentity::from("w-respawn");
+    let retired_session_id = handle
+        .spawn(ProfileName::from("worker"), member_id.clone(), None)
+        .await
+        .expect("spawn session-backed member")
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed member has bridge session id");
+
+    let (participant_name, retired_key) = {
+        let retired_comms = service
+            .real_comms(&retired_session_id)
+            .await
+            .expect("retired member comms runtime");
+        (
+            retired_comms.participant_name().to_string(),
+            retired_comms.public_key(),
+        )
+    };
+    assert_eq!(
+        meerkat_comms::InprocRegistry::global().get_name_by_pubkey_in_namespace("", &retired_key),
+        Some(participant_name.clone()),
+        "the first generation must own the member participant name"
+    );
+
+    let receipt = handle
+        .respawn(member_id.clone(), None)
+        .await
+        .expect("respawn must succeed: the retired generation is released before its replacement");
+    let replacement_session_id = handle
+        .member_status(&receipt.identity)
+        .await
+        .expect("respawned member snapshot")
+        .current_bridge_session_id
+        .clone()
+        .expect("respawned member has a replacement bridge session id");
+    assert_ne!(replacement_session_id, retired_session_id);
+
+    let replacement_comms = service
+        .real_comms(&replacement_session_id)
+        .await
+        .expect("respawned member comms runtime");
+    assert_eq!(
+        replacement_comms.participant_name(),
+        participant_name,
+        "a respawn keeps the member's session-independent participant name"
+    );
+    let replacement_key = replacement_comms.public_key();
+    assert_ne!(
+        replacement_key, retired_key,
+        "a respawn mints a new session-scoped signing identity"
+    );
+    assert_eq!(
+        meerkat_comms::InprocRegistry::global()
+            .get_name_by_pubkey_in_namespace("", &replacement_key),
+        Some(participant_name.clone()),
+        "the replacement generation must own the member participant name"
+    );
+    assert!(
+        meerkat_comms::InprocRegistry::global()
+            .get_by_pubkey_in_namespace("", &retired_key)
+            .is_none(),
+        "the retired generation must not still hold a route under this name"
+    );
+}
+
 #[tokio::test]
 async fn test_supervisor_private_trust_preserves_send_resolution() {
     // Fix 2 positive invariant: the private-trust seam must still keep
@@ -57545,6 +57730,7 @@ async fn test_flow_with_root_frame_spec_executes_frame_nodes() {
                 depends_on: vec![],
                 depends_on_mode: crate::definition::DependencyMode::All,
                 branch: None,
+                failure_policy: Default::default(),
             }),
         );
         nodes.insert(
@@ -57554,6 +57740,7 @@ async fn test_flow_with_root_frame_spec_executes_frame_nodes() {
                 depends_on: vec![FlowNodeId::from("setup-node")],
                 depends_on_mode: crate::definition::DependencyMode::All,
                 branch: None,
+                failure_policy: Default::default(),
             }),
         );
         FrameSpec { nodes }
@@ -57643,6 +57830,7 @@ async fn test_root_frame_condition_skip_emits_single_skip_projection() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     flow.root = FrameSpec { nodes: root_nodes };
@@ -57733,6 +57921,7 @@ async fn test_step_condition_referencing_absent_root_skips_not_fails() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     flow.root = FrameSpec { nodes: root_nodes };
@@ -57793,6 +57982,7 @@ async fn test_root_frame_step_failure_does_not_abort_independent_siblings() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     root_nodes.insert(
@@ -57802,6 +57992,7 @@ async fn test_root_frame_step_failure_does_not_abort_independent_siblings() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
 
@@ -57885,6 +58076,7 @@ async fn test_root_frame_step_failure_records_failure_ledger_once() {
                 depends_on: Vec::new(),
                 depends_on_mode: DependencyMode::All,
                 branch: None,
+                failure_policy: Default::default(),
             }),
         )]),
     };
@@ -57935,6 +58127,7 @@ async fn test_root_frame_supervisor_threshold_is_respected_before_reset() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     flow.root = FrameSpec { nodes: root_nodes };
@@ -57978,6 +58171,281 @@ async fn test_root_frame_supervisor_threshold_is_respected_before_reset() {
     );
 }
 
+/// End-to-end F11: a `failure_policy: continue` node fails, the run still
+/// completes, the failure stays visible on a host-watched path, and the
+/// machine-emitted supervisor escalation is honored rather than dropped.
+#[tokio::test]
+async fn test_root_frame_continue_policy_completes_run_and_honors_escalation() {
+    use crate::definition::{
+        FlowNodeFailurePolicy, FlowNodeSpec, FrameSpec, FrameStepSpec, SupervisorSpec,
+    };
+    use crate::ids::FlowNodeId;
+
+    let mut definition = sample_definition();
+    definition.supervisor = Some(SupervisorSpec {
+        role: ProfileName::from("lead"),
+        escalation_threshold: 1,
+        escalation_turn_timeout_ms: None,
+    });
+
+    let mut steps = IndexMap::new();
+    steps.insert(
+        step_id("advisory"),
+        flow_step("worker", "Advisory analysis"),
+    );
+    steps.insert(step_id("primary"), flow_step("lead", "Primary work"));
+
+    let mut root_nodes = IndexMap::new();
+    root_nodes.insert(
+        FlowNodeId::from("advisory-node"),
+        FlowNodeSpec::Step(FrameStepSpec {
+            step_id: step_id("advisory"),
+            depends_on: Vec::new(),
+            depends_on_mode: DependencyMode::All,
+            branch: None,
+            failure_policy: FlowNodeFailurePolicy::Continue,
+        }),
+    );
+    root_nodes.insert(
+        FlowNodeId::from("primary-node"),
+        FlowNodeSpec::Step(FrameStepSpec {
+            step_id: step_id("primary"),
+            depends_on: Vec::new(),
+            depends_on_mode: DependencyMode::All,
+            branch: None,
+            failure_policy: Default::default(),
+        }),
+    );
+
+    definition.flows = BTreeMap::from([(
+        flow_id("demo"),
+        FlowSpec::new(
+            Some("advisory root node under continue policy".to_string()),
+            steps,
+            Some(FrameSpec { nodes: root_nodes }),
+        ),
+    )]);
+
+    let (handle, service) = create_test_mob(definition).await;
+    // The supervisor role must keep working turns: escalation dispatches a turn
+    // to it, so only the advisory member's session is made to fail.
+    handle
+        .spawn(ProfileName::from("lead"), AgentIdentity::from("l-1"), None)
+        .await
+        .expect("spawn lead supervisor");
+    let worker_session_id = handle
+        .spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-1"),
+            None,
+        )
+        .await
+        .expect("spawn worker")
+        .bridge_session_id()
+        .expect("session-backed worker")
+        .clone();
+    service
+        .set_flow_turn_fail_for_session(&worker_session_id, true)
+        .await;
+
+    let run_id = handle
+        .run_flow(FlowId::from("demo"), serde_json::json!({}))
+        .await
+        .expect("run flow");
+    let terminal = wait_for_run_terminal(&handle, &run_id, Duration::from_secs(3)).await;
+
+    assert_eq!(
+        terminal.status,
+        MobRunStatus::Completed,
+        "a Continue-policy node's failure must not fail the run"
+    );
+    assert!(
+        terminal.step_ledger.iter().any(|entry| {
+            entry.step_id.as_str() == "advisory" && entry.status == StepRunStatus::Failed
+        }),
+        "the tolerated failure must stay recorded as a failed step, not be laundered"
+    );
+    assert!(
+        terminal
+            .failure_ledger
+            .iter()
+            .any(|entry| entry.step_id.as_str() == "advisory"),
+        "the tolerated failure must still append a failure-ledger entry"
+    );
+    assert!(
+        terminal.failure_ledger.iter().any(|entry| {
+            entry.step_id.as_str() == "advisory" && entry.reason.contains("mock flow turn failure")
+        }),
+        "the ledger entry must carry the real failure reason, not a constant"
+    );
+
+    let events = handle.events().replay_all().await.expect("replay");
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::StepFailed { run_id: id, step_id, reason }
+                    if id == &run_id
+                        && step_id.as_str() == "advisory"
+                        && reason.contains("mock flow turn failure")
+            )
+        }),
+        "the tolerated failure must reach a host-watched event path with the real reason"
+    );
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::SupervisorEscalation { run_id: id, step_id, .. }
+                    if id == &run_id && step_id.as_str() == "advisory"
+            )
+        }),
+        "the machine-emitted EscalateSupervisor effect must be honored, not discarded"
+    );
+    assert_eq!(
+        handle.list_members().await.len(),
+        2,
+        "escalating on a completing run must not force_reset the mob"
+    );
+}
+
+/// F11 companion: failing to CARRY OUT the machine's escalation decision is not
+/// the machine deciding the run failed. When no member holds the supervisor
+/// role, MobMachine classifies the escalation `NoEligibleSupervisor` and
+/// `Supervisor::escalate` errors; the run must still terminalize with the class
+/// the machine assigned it, with the escalation failure reported rather than
+/// swallowed.
+#[tokio::test]
+async fn test_failed_escalation_leaves_continue_policy_run_completed() {
+    use crate::definition::{
+        FlowNodeFailurePolicy, FlowNodeSpec, FrameSpec, FrameStepSpec, SupervisorSpec,
+    };
+    use crate::ids::FlowNodeId;
+
+    let mut definition = sample_definition();
+    // A declared-but-never-spawned supervisor role: spec validation requires the
+    // role to exist as a profile, and `list_runnable_members()` then holds no
+    // member matching it, which is what drives MobMachine to classify the
+    // escalation `NoEligibleSupervisor`.
+    let auditor_profile = definition
+        .profiles
+        .get(&ProfileName::from("worker"))
+        .cloned()
+        .expect("worker profile is declared by sample_definition");
+    definition
+        .profiles
+        .insert(ProfileName::from("auditor"), auditor_profile);
+    definition.supervisor = Some(SupervisorSpec {
+        role: ProfileName::from("auditor"),
+        escalation_threshold: 1,
+        escalation_turn_timeout_ms: None,
+    });
+
+    let mut steps = IndexMap::new();
+    steps.insert(
+        step_id("advisory"),
+        flow_step("worker", "Advisory analysis"),
+    );
+    steps.insert(step_id("primary"), flow_step("lead", "Primary work"));
+
+    let mut root_nodes = IndexMap::new();
+    root_nodes.insert(
+        FlowNodeId::from("advisory-node"),
+        FlowNodeSpec::Step(FrameStepSpec {
+            step_id: step_id("advisory"),
+            depends_on: Vec::new(),
+            depends_on_mode: DependencyMode::All,
+            branch: None,
+            failure_policy: FlowNodeFailurePolicy::Continue,
+        }),
+    );
+    root_nodes.insert(
+        FlowNodeId::from("primary-node"),
+        FlowNodeSpec::Step(FrameStepSpec {
+            step_id: step_id("primary"),
+            depends_on: Vec::new(),
+            depends_on_mode: DependencyMode::All,
+            branch: None,
+            failure_policy: Default::default(),
+        }),
+    );
+
+    definition.flows = BTreeMap::from([(
+        flow_id("demo"),
+        FlowSpec::new(
+            Some("advisory root node with an undeliverable escalation".to_string()),
+            steps,
+            Some(FrameSpec { nodes: root_nodes }),
+        ),
+    )]);
+
+    let (handle, service) = create_test_mob(definition).await;
+    handle
+        .spawn(ProfileName::from("lead"), AgentIdentity::from("l-1"), None)
+        .await
+        .expect("spawn lead");
+    let worker_session_id = handle
+        .spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-1"),
+            None,
+        )
+        .await
+        .expect("spawn worker")
+        .bridge_session_id()
+        .expect("session-backed worker")
+        .clone();
+    service
+        .set_flow_turn_fail_for_session(&worker_session_id, true)
+        .await;
+
+    let run_id = handle
+        .run_flow(FlowId::from("demo"), serde_json::json!({}))
+        .await
+        .expect("run flow");
+    let terminal = wait_for_run_terminal(&handle, &run_id, Duration::from_secs(3)).await;
+
+    assert_eq!(
+        terminal.status,
+        MobRunStatus::Completed,
+        "an undeliverable escalation must not fail a run the machine classified completing"
+    );
+    assert!(
+        terminal.failure_ledger.iter().any(|entry| {
+            entry.step_id.as_str() == "advisory" && entry.reason.contains("mock flow turn failure")
+        }),
+        "the ledger entry must carry the real failure reason, not a constant"
+    );
+
+    let events = handle.events().replay_all().await.expect("replay");
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::SupervisorEscalationFailed { run_id: id, step_id, reason }
+                    if id == &run_id
+                        && step_id.as_str() == "advisory"
+                        && reason.contains("no active supervisor member for role 'auditor'")
+            )
+        }),
+        "the escalation failure must be reported on a host-watched path"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::SupervisorEscalation { run_id: id, .. } if id == &run_id
+            )
+        }),
+        "no escalation reached a supervisor, so no success event may be emitted"
+    );
+    assert_eq!(
+        handle.list_members().await.len(),
+        2,
+        "a failed escalation on a completing run must not force_reset the mob"
+    );
+}
+
 #[tokio::test]
 async fn test_root_frame_fan_in_persists_canonical_completed_aggregate_output() {
     use crate::definition::{FlowNodeSpec, FrameSpec, FrameStepSpec};
@@ -57997,6 +58465,7 @@ async fn test_root_frame_fan_in_persists_canonical_completed_aggregate_output() 
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     flow.root = FrameSpec { nodes: root_nodes };
@@ -58084,6 +58553,7 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
             depends_on: vec![],
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     let body_spec = FrameSpec { nodes: body_nodes };
@@ -58101,6 +58571,7 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
                     value: serde_json::json!(true),
                 },
                 max_iterations: 3,
+                failure_policy: Default::default(),
             }),
         );
         FrameSpec { nodes }
@@ -58273,6 +58744,7 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
             depends_on: vec![],
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     let body_spec = FrameSpec { nodes: body_nodes };
@@ -58290,6 +58762,7 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
                     value: serde_json::json!(true),
                 },
                 max_iterations: 3,
+                failure_policy: Default::default(),
             }),
         );
         FrameSpec { nodes }
@@ -58533,6 +59006,7 @@ async fn test_root_frame_timeout_cleans_up_inflight_node() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     flow.root = FrameSpec { nodes: root_nodes };
@@ -58638,6 +59112,7 @@ async fn test_root_frame_max_active_nodes_limits_nested_body_step_admission() {
                 depends_on: Vec::new(),
                 depends_on_mode: DependencyMode::All,
                 branch: None,
+                failure_policy: Default::default(),
             }),
         )]),
     };
@@ -58656,6 +59131,7 @@ async fn test_root_frame_max_active_nodes_limits_nested_body_step_admission() {
                         value: serde_json::json!(true),
                     },
                     max_iterations: 3,
+                    failure_policy: Default::default(),
                 }),
             ),
             (
@@ -58665,6 +59141,7 @@ async fn test_root_frame_max_active_nodes_limits_nested_body_step_admission() {
                     depends_on: Vec::new(),
                     depends_on_mode: DependencyMode::All,
                     branch: None,
+                    failure_policy: Default::default(),
                 }),
             ),
         ]),
@@ -58757,6 +59234,7 @@ async fn test_root_frame_cancel_cleans_up_inflight_node() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
     flow.root = FrameSpec { nodes: root_nodes };
@@ -58823,6 +59301,7 @@ async fn test_root_loop_body_failure_stops_after_first_failed_iteration() {
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
+            failure_policy: Default::default(),
         }),
     );
 
@@ -58839,6 +59318,7 @@ async fn test_root_loop_body_failure_stops_after_first_failed_iteration() {
                 value: serde_json::json!(true),
             },
             max_iterations: 3,
+            failure_policy: Default::default(),
         }),
     );
 
@@ -61857,6 +62337,7 @@ fn mob_runtime_parity_field_value(
         | "frame_node_step_ids"
         | "frame_node_loop_ids"
         | "frame_node_status"
+        | "frame_node_failure_policy"
         | "frame_ready_queue"
         | "frame_output_recorded"
         | "frame_last_admitted_node"

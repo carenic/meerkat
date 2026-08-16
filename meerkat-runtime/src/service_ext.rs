@@ -111,6 +111,28 @@ pub trait SessionServiceRuntimeExt: Send + Sync {
         idempotency_key: &str,
     ) -> Result<Option<StoredInputState>, RuntimeDriverError>;
 
+    /// Durable-only witness for one caller-supplied idempotency key.
+    ///
+    /// Unlike [`Self::input_state_by_idempotency_key`], this never consults
+    /// live machine state: `Some` means a committed row exists in the
+    /// runtime's store-owned input index and therefore survives process
+    /// restart, so a retry under the same key collapses onto it even on a
+    /// fresh process. `None` means only that no such durable evidence is
+    /// observable - a store-less (ephemeral) runtime always answers `None`
+    /// because it retains nothing across restart.
+    ///
+    /// The default under-claims rather than over-claims: an adapter that
+    /// cannot offer durable evidence must never be read as proof of
+    /// durability. [`crate::bounded_submit::submit_bounded`] classifies an
+    /// expired caller bound with this read.
+    async fn durable_input_state_by_idempotency_key(
+        &self,
+        _session_id: &SessionId,
+        _idempotency_key: &str,
+    ) -> Result<Option<StoredInputState>, RuntimeDriverError> {
+        Ok(None)
+    }
+
     /// Durable terminal-status query for one interaction.
     ///
     /// Registered sessions answer from live DSL truth; unregistered sessions

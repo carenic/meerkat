@@ -817,15 +817,32 @@ fn explicit_pre_floor_bridge_rolls_back_malformed_session() {
         String::from_utf8_lossy(&apply.stderr)
     );
     let report = parse_json(&apply);
+    // The bridge reports PER DOMAIN rather than as one flat failure, so this
+    // pins the contract an operator actually acts on: which domain refused,
+    // under which typed classification, and why a dependent domain was not
+    // attempted. The previous assertion matched a single "bridge failed"
+    // string, which a report naming neither the domain nor the cause would
+    // still have satisfied.
+    let errors: Vec<&str> = report["realms"][0]["errors"]
+        .as_array()
+        .expect("errors")
+        .iter()
+        .filter_map(|error| error.as_str())
+        .collect();
     assert!(
-        report["realms"][0]["errors"]
-            .as_array()
-            .expect("errors")
-            .iter()
-            .any(|error| error
-                .as_str()
-                .is_some_and(|error| error.contains("pre-v0.8.10 bridge failed"))),
-        "{report:#}"
+        errors.iter().any(|error| {
+            error.contains("refused domain 'session-store'")
+                && error.contains("(migration-refused)")
+        }),
+        "the refusing domain and its classification must be named\n{report:#}"
+    );
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("refused domain 'runtime-store'")
+                && error.contains("(skipped-unsatisfied-prerequisite)")
+        }),
+        "a domain skipped for a prerequisite must say so rather than look refused on its own \
+         merits\n{report:#}"
     );
 
     let conn = Connection::open(&fixture.database).unwrap();

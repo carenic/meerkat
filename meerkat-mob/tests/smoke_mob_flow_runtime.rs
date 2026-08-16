@@ -318,6 +318,7 @@ fn json_step(role: &str, message: impl Into<String>) -> FlowStepSpec {
         allowed_tools: None,
         blocked_tools: None,
         output_format: Some(meerkat_mob::definition::StepOutputFormat::Json),
+        failure_policy: Default::default(),
     }
 }
 
@@ -442,6 +443,7 @@ fn frame_step(step_id: &str, depends_on: Vec<&str>) -> FlowNodeSpec {
             .collect(),
         depends_on_mode: DependencyMode::All,
         branch: None,
+        failure_policy: Default::default(),
     })
 }
 
@@ -465,6 +467,7 @@ fn repeat_until_node(
             value: serde_json::json!(true),
         },
         max_iterations,
+        failure_policy: Default::default(),
     })
 }
 
@@ -488,6 +491,7 @@ fn repeat_until_node_any(
             value: serde_json::json!(true),
         },
         max_iterations,
+        failure_policy: Default::default(),
     })
 }
 

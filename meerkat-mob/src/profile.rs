@@ -38,6 +38,19 @@ pub struct ToolConfig {
     /// Enable assistant image generation tools.
     #[serde(default)]
     pub image_generation: bool,
+    /// Declare this profile read-only: every tool call is admitted at the
+    /// execution gate only when the dispatcher that owns the tool declares it
+    /// read-only ([`meerkat_core::ToolMutationClass::ReadOnly`]).
+    ///
+    /// This is an enforcement declaration, not prompt guidance, and it wins
+    /// over the per-spawn tool access policy (a spawn cannot widen a
+    /// read-only profile). The category booleans above still decide what is
+    /// *visible*; this decides what may *execute*. The guarantee covers only
+    /// tools that traverse the dispatcher: see
+    /// `meerkat_core::tool_execution_policy` for the exact boundary
+    /// (provider-native tools, MCP tools, and `shell` are not read-only).
+    #[serde(default)]
+    pub read_only: bool,
     /// MCP server names this profile connects to.
     #[serde(default)]
     pub mcp: Vec<String>,
@@ -311,6 +324,7 @@ mod tests {
             mob: true,
             schedule: true,
             image_generation: true,
+            read_only: false,
             mcp: vec!["server-a".to_string(), "server-b".to_string()],
             mcp_servers: vec![],
             rust_bundles: vec!["custom-tools".to_string()],
@@ -331,6 +345,7 @@ mod tests {
             mob: false,
             schedule: false,
             image_generation: false,
+            read_only: false,
             mcp: vec!["mcp-server".to_string()],
             mcp_servers: vec![],
             rust_bundles: Vec::new(),
@@ -359,6 +374,7 @@ mod tests {
                 mob: true,
                 schedule: false,
                 image_generation: false,
+                read_only: false,
                 mcp: vec![],
                 mcp_servers: vec![],
                 rust_bundles: vec![],
@@ -395,6 +411,7 @@ mod tests {
                 mob: false,
                 schedule: false,
                 image_generation: false,
+                read_only: false,
                 mcp: vec!["code-server".to_string()],
                 mcp_servers: vec![],
                 rust_bundles: vec!["custom".to_string()],

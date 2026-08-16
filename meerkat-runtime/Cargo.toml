@@ -51,14 +51,24 @@ test-support = []
 # Path-only self-dependency (no version, stripped at publish): this crate's
 # own integration tests need the test-support hooks without relying on
 # feature unification from sibling crates in the same build graph.
-meerkat-runtime = { path = ".", features = ["test-support"] }
+#
+# `sqlite-store` is listed for the same reason. The release-boundary corpora
+# (`recovery_contract`, `pre_ledger_realm_bridge`) are gated on it, and without
+# this a package-scoped `-p meerkat-runtime` lane compiles those files away to
+# nothing and reports success over zero tests. Storage evidence must not depend
+# on which sibling crates happen to share the build graph.
+meerkat-runtime = { path = ".", features = ["test-support", "sqlite-store"] }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tempfile = { workspace = true }
-meerkat-store = { workspace = true, features = ["memory"] }
+meerkat-store = { workspace = true, features = ["memory", "sqlite"] }
 meerkat-machine-schema = { workspace = true }
 meerkat-machine-kernels = { workspace = true, features = ["test-oracle"] }
 meerkat-comms = { workspace = true }
+# Integration tests drive the offline schema bridge directly against realms
+# written by published pre-0.8.10 binaries.
+meerkat-sqlite = { workspace = true }
+rusqlite = { workspace = true }
 
 [lints]
 workspace = true

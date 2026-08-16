@@ -13,6 +13,467 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+## [0.8.23] - 2026-08-16
+
+### Breaking
+
+**Some entries below are BEHAVIOUR-ONLY: a public function keeps its signature
+and changes what it does. `cargo-semver-checks` cannot see those, so the
+`semver-breaks` gate stays green through them. They are declared here by hand
+and tagged inline. Read this section rather than trusting the gate - the gate
+checks that this section EXISTS, not that it covers every break.**
+
+- The facade's and `meerkat-mob`'s `atif` re-export moves behind a new
+  off-by-default `atif` feature on each crate (`meerkat/atif`,
+  `meerkat-mob/atif`). Hosts that referenced `meerkat::atif` or
+  `meerkat_mob::atif` must enable the feature; `rkat` and `rkat-rpc` depend on
+  `meerkat-atif` directly and are unaffected.
+- BEHAVIOUR-ONLY, NO TOOL WILL CATCH THIS:
+  `meerkat::surface::build_runtime_host_health()` now returns
+  `status: Degraded` with four `unmeasured:<dimension>` entries where it
+  previously returned `status: Ok` with an empty `checks` map. The signature is
+  unchanged. It is the "probed nothing" projection, and returning `Ok` from it
+  meant any caller that forgot to supply a real reading shipped an invisible
+  clean bill of health. An embedder calling it directly, or embedding it via
+  `build_runtime_host_info()`, gets the loud default instead; supply your own
+  measured value if you want a rollup that reflects a probe.
+- BEHAVIOUR-ONLY, NO TOOL WILL CATCH THIS:
+  `rkat storage migrate --apply --bridge-pre-0-8-10` no longer aborts the realm
+  on the first domain that cannot be authenticated. It attempts every domain,
+  commits the ones that succeed, and reports each refusal with a typed
+  classification. A script that treated a non-zero exit as "nothing changed" is
+  now wrong: read the per-domain report, which the CLI prints on failure as
+  well as on success.
+- `meerkat_sqlite::SchemaDomain` gains a `bridge_recoverable_versions` field.
+  Any out-of-tree construction of that struct literal must supply it; an empty
+  slice declares that no offline bridge recovers the domain.
+- `meerkat_sqlite::MaintenanceBridgeReport` and `MaintenancePrepareReport` NO
+  LONGER DERIVE `Copy`, because each gained a `refused` field listing the
+  records the bridge could not carry forward. This is the least visible break
+  in the release: code that relied on implicit copies (`let a = report;` and
+  then using `report` again) stops compiling without ever having named `Copy`,
+  and the compiler error points at the use rather than the change. Both types
+  still derive `Clone`.
+- `SqliteStoreError::UnledgeredDomainObjects` and
+  `StoreError::UnledgeredDomainObjects` gain a `bridgeable` field carrying
+  whether the pre-0.8.10 bridge can actually authenticate that domain's
+  on-disk shape. Exhaustive struct-variant patterns must bind or ignore it.
+- `meerkat_sqlite::SqliteStoreError` gains a `WalConversionContended` variant.
+  The enum is not `#[non_exhaustive]`, so a downstream matching it exhaustively
+  must add an arm. It is returned where an exhausted WAL-conversion retry
+  budget previously surfaced as a bare rusqlite "database is locked".
+- `meerkat_comms::RegistrationOutcome` loses the `EvictedName` and
+  `ReplacedPubkeyAndEvictedName` variants and the `displaced_existing()` method,
+  and gains `ReboundOwnName`. The enum is not `#[non_exhaustive]`, so both
+  matches and constructions break.
+- `meerkat_comms::RegistrationRejection` gains `#[non_exhaustive]` (a break for
+  exhaustive matchers by itself) and a `NameOccupied` variant.
+- In-process registration that previously SUCCEEDED by displacing a live
+  foreign route now fails closed. An embedder that relied on displacement gets
+  `CommsRuntimeError::InprocRegistrationRejected` where it used to get a working
+  runtime. This is the intended fix, and it is a behaviour break.
+- `meerkat_core::ops::ToolAccessPolicy` gains a `ReadOnly` variant. The enum is
+  not `#[non_exhaustive]`, so exhaustive matches break.
+  **READ THIS BEFORE ENABLING READ-ONLY ANYWHERE: it makes rollback one-way for
+  the sessions it touches.** Stated as a precondition rather than a footnote,
+  because the trigger is a one-line config change that reads as trivially
+  reversible and is not.
+  - **Trigger.** Setting `read_only: true` on a mob profile's tool config
+    (`MobToolConfigInput.read_only`, `PortableToolConfig.read_only`) resolves
+    that member's policy to `ReadOnly` at build time. It is a floor, not a
+    default: a read-only profile REPLACES whatever the spawn site asked for
+    rather than being overridden by it, so every member built from that profile
+    acquires the marker. The RPC session-create and fork paths accept it
+    directly as well.
+  - **Sticky.** The policy is persisted RESOLVED into
+    `SessionMetadata.tooling.tool_access_policy` when the session is created.
+    Turning the profile flag back off changes what NEW sessions get; it does not
+    rewrite metadata already written. The property is "ever carried", not
+    "currently carries".
+  - **Blast radius is per session, not per fleet.** A partial rollout leaves a
+    mixed estate in which some sessions are pinned forward and others are not,
+    and the pinned ones are exactly those a read-only profile touched.
+  - **You can ask rather than infer.** The marker is a field on the persisted
+    session metadata document, so a host can query its own session store for a
+    non-null `tooling.tool_access_policy` to enumerate which sessions have
+    walked through the door. Do that before planning a downgrade rather than
+    reconstructing it from deployment history.
+    Query the FIELD, never grep for the string `ReadOnly`. Validated against a
+    4,170-session production estate: the field matched zero sessions and the
+    bare string matched one, which was a ticket summary an agent had quoted
+    inside a transcript. Agents discuss the concept in ordinary work, so a
+    substring search returns false positives on real data at exactly the moment
+    someone is deciding whether a rollback is still available.
+  - **Capture the baseline BEFORE upgrading.** Run that query on the old binary
+    first. The field is new in this release, so a pre-upgrade count is trivially
+    zero - and that is the point: it establishes that any non-null appearing
+    later is attributable to a decision you made rather than inherited state.
+  - Failing to decode is the INTENDED outcome. A downgrade that silently read
+    the marker as `Inherit` would drop the enforcement, which is worse than
+    refusing to resume.
+  The wire mirrors
+  `meerkat_contracts::WireToolAccessPolicy` and `WireResolvedToolAccessPolicy`
+  gain the same variant.
+- `meerkat_mob::MobEventKind` gains `SupervisorEscalationFailed`. The enum is not
+  `#[non_exhaustive]`, so any consumer that mirrors every event kind needs the
+  arm.
+- `meerkat_core::CompactionCommitCoordinationError::Rejected` is renamed to
+  `Refused`.
+- `meerkat_core::agent::compact::build_compaction_context` takes a sixth
+  parameter (the composed-request budget the escalation side now measures).
+- Externally-constructible structs gain fields, so struct-literal construction
+  breaks: `CompactionContext.request_context_budget`;
+  `FlowStepSpec.failure_policy` and `FrameStepSpec.failure_policy`;
+  `FlowFrameSeedAuthorityRecord.node_failure_policy`; the wire inputs
+  `MobFlowStepInput.failure_policy`, `MobFrameStepInput.failure_policy`,
+  `MobRepeatUntilInput.failure_policy`, `MobToolConfigInput.read_only` and
+  `PortableToolConfig.read_only`.
+- Machine-authority vocabulary changes, which are public because the generated
+  kernels are published. `MeerkatMachineInput` / `Input` gain
+  `ResolveUnstageableQueuedInput`; `MeerkatMachineEffect` / `Effect` gain
+  `SessionRegistrationRejected`; `InputAbandonReason` gains `NeverExecuted`;
+  `MeerkatMachineInput::RegisterSession` gains a `runtime_epoch_id` field and
+  `MobMachineInput::CreateFrameSeed` gains `node_failure_policy`;
+  `TransitionId::ResolveMemberRevivalSucceededRunning` is replaced by
+  `...RunningLocal` and `...RunningPlaced`, and new `TransitionId` variants land
+  for the epoch-conflict and unstageable-input transitions. Because
+  `EffectKind`, `InputKind` and `TransitionId` are dense enums, adding variants
+  also SHIFTS the discriminants of later ones - anything persisting a
+  discriminant numerically rather than by name must re-derive it.
+- `meerkat_sqlite::BridgeEligibility::Recoverable` is renamed
+  `CatalogAuthenticated` and `is_recoverable()` is renamed
+  `catalog_authenticates()`. The old names claimed an outcome the check never
+  established: it reads catalog shape and never looks at a record.
+- `meerkat_sqlite::MaintenancePrepareReport` and `MaintenanceBridgeReport` gain
+  a `refused: Vec<MaintenanceRecordRefusal>` field and therefore lose `Copy`.
+  Struct-literal constructions break; `MaintenancePrepareReport::rewrote(n)`
+  builds the "nothing refused" form. `meerkat::PreV0810DomainBridgeReport`
+  likewise gains `refused_records`.
+- `meerkat_sqlite::SchemaDomain` gains a required
+  `bridge_recoverable_versions: &'static [i64]` field. Every domain literal
+  must add it. It declares the exact source versions the explicit offline
+  bridge may infer for an unledgered file of that domain, and an empty list
+  declares that no offline bridge recovers the domain at all. It exists
+  because the same question was previously answered twice - once by the bridge
+  and once by the message an operator reads - and the two disagreed.
+- Seven more externally-constructible structs gain fields, so any out-of-tree
+  struct literal must supply them. All are additive at the wire level; the
+  break is to Rust construction, and none of them appear in the
+  `cargo-semver-checks` summary in a form that names the owning type:
+  - `meerkat_mob::profile::ToolConfig` and
+    `meerkat_contracts::wire::WireMobToolConfig` gain `read_only: bool`. These
+    are the two the read-only entry below did NOT name; it named
+    `MobToolConfigInput` and `PortableToolConfig` only.
+  - `meerkat_mob::definition::FrameStepSpec`, `RepeatUntilSpec` and
+    `FlowStepSpec` gain `failure_policy: FlowNodeFailurePolicy`. Three structs,
+    not one.
+  - `meerkat_contracts::wire::WireMobRunResultEnvelope` gains
+    `accounting: Option<WireMobRunAccounting>`.
+  - `meerkat::PreV0810RealmBridgeReport` gains
+    `failures: Vec<PreV0810DomainBridgeFailure>`.
+- BEHAVIOUR-ONLY, NO TOOL WILL CATCH THIS, AND IT IS THE LIBRARY TWIN OF THE
+  CLI CHANGE BELOW: `meerkat::bridge_pre_0_8_10_realm_storage_in` still returns
+  `Ok(PreV0810RealmBridgeReport)` with an unchanged signature, but `Ok` NO
+  LONGER MEANS EVERY DOMAIN BRIDGED. The call attempts every domain and reports
+  per-domain refusals in the new `failures` field instead of returning `Err` on
+  the first one. A library caller that treated `Ok` as success now treats a
+  partial bridge as a complete one. Check `failures.is_empty()`, or the
+  `all_landed()` helper, rather than matching on `Ok`.
+
+### Known issues
+
+- An input REFUSED STAGING until it exhausts its attempt budget is durably
+  terminalized as `Abandoned { MaxAttemptsExhausted }`, and that terminal is
+  never delivered anywhere in typed form. The waiter receives a mechanical
+  "authority unavailable" string naming neither abandonment nor attempts, and
+  the mob's directed-turn watcher correctly treats that as plumbing noise and
+  records nothing. The refusal terminalizes the WHOLE batch, so innocent
+  sibling inputs are abandoned alongside the culpable one.
+  Three costs, none of them a hang. A directed flow step fails after its
+  30-second step timeout with `FlowTurnTimedOut` instead of failing at once
+  with an abandonment reason, so the failure is misattributed rather than
+  stalled. The mob's tracked-turn journal keeps a Pending row that **a restart
+  does NOT clear** (recovery requires a `Consumed` terminal and this row is
+  `Abandoned`). And one `runtime_input_states` row per affected input retains
+  its full ingress payload permanently: never archived, never retired, and
+  invisible to the sweep that would otherwise find it. The storage growth is
+  the only cost that compounds.
+  Reachability is believed very low. Provider flakiness, tool errors and model
+  failures do NOT consume the staging budget; only a staging refusal does, and
+  the commit that introduced this path also removed the only refusal cause ever
+  observed in the field. Every remaining refusal predicate was checked against
+  the shipped tree without finding a reachable one, which is exhaustion of a
+  predicate set rather than a proof. If a refusal does occur it reaches the cap
+  within a single wake, since the laps carry no backoff.
+  Operators can measure it directly. `"generated staging authority refused an
+  accepted input batch"` is the denominator, `"queued input refused by
+  generated staging authority; deferred behind the backlog"` is a survivable
+  deferral, and `"queued input abandoned after generated max stage attempts of
+  refused staging"` means this defect fired.
+  A fix was written for this release and withdrawn twice. The diagnosis was
+  right; both repairs were not. The second could convert a bounded
+  misattribution into a stopped runtime loop taking out every session on that
+  runtime, on a path no test exercised. A wider blast radius than the defect is
+  not an improvement. The full fix also needs a migration for rows already
+  committed, which are invisible to every sweep that could reach them, so it
+  waits for 0.8.24 rather than shipping on a deadline.
+
+### Fixed
+
+- **A compaction whose projection handoff was refused could not be persisted,
+  because the runtime epoch a session registered under was being overwritten at
+  placement time.** This is the lane the release was opened for, and it had no
+  entry here until a downstream reviewer pointed out that the headline fix was
+  the only one with no narrative.
+  The entry epoch is now a REGISTRATION-TIME FACT: it is installed when the
+  session registers and is never written by a placement arm, so a placement can
+  only assert the epoch it was registered with. The five placement guards moved
+  from "absent or equal" to exact equality against the registration. That
+  matters more than it sounds: under the old guard a caller passing `None`
+  satisfied the check and silently wedged the session, and the seam did exactly
+  that. Under exact equality the same caller gets an immediate typed rejection.
+  A silent wedge became a loud refusal.
+  A new machine-owned rejection effect carries that verdict to BOTH staging
+  sites. Previously it was dropped by a non-exhaustive effect read at one of
+  them, which is why the failure presented as a stuck session rather than an
+  error: the verdict existed and had nowhere to go.
+  **Wire-visible:** compaction failures of this shape now surface as
+  `CompactionFailureReason::projection_handoff_refused` rather than as a
+  generic failure, so a host can tell a refused handoff from an LLM or budget
+  failure without parsing a message string.
+- **`runtime/health` reported a healthy host on the strength of one job-backlog
+  reading; it now measures three dimensions and states the one it does not.**
+  The handler computed exactly one check, job delivery backlog, and reported
+  top-level `status: ok` whenever it passed. A session's runtime loop, its
+  durability state, and its progress were never looked at, so a wedged session
+  returned `ok` and every operator alert built on the endpoint was watching a
+  dimension it did not care about. `GET /runtime/health` was worse: it served a
+  hardcoded `ok` with an empty `checks` map.
+  Two things changed. First, the rule is enforced where the projection is
+  built: a diagnostic may only assert the scope it measured, so a surface passes
+  in what it measured and every declared dimension it did not measure is
+  published as `unmeasured:<dimension>` at `degraded`. Second, `runtime/health`
+  actually measures two more dimensions, read straight off live runtime state
+  with non-blocking probes that cannot park behind the wedge they are reporting:
+  - `session_durability` - `degraded` while any registered session's shared
+    durability gate demands a cold reload before it may execute or mutate
+    durable state. Storeless sessions carry no durability contract and are
+    never counted.
+  - `session_runtime_loop` - `degraded` while any registered session still
+    claims a runtime loop whose task is gone or whose channels are closed. Until
+    now a dead loop and an idle one were indistinguishable from outside.
+  **What an operator does with this.** `status` is the worst rung over the
+  MEASURED checks, so `status != "ok"` is a usable alert predicate: on a healthy
+  host it is `ok`, and it moves to `degraded` when a real session goes
+  reload-required or a real runtime loop dies. Unmeasured coverage is published
+  in `checks` and deliberately does NOT set `status`, because a `status` that is
+  permanently `degraded` on every healthy host is muted within a week and then
+  the real incident arrives to a silenced alert. Read `checks` for the coverage
+  claim; alert on `status`.
+  **What is still not covered, stated plainly:** `session_liveness` remains
+  `unmeasured:session_liveness`. Nothing here observes whether a live session is
+  *progressing* - a session whose loop task is alive and whose channels are open,
+  but which is parked while machine-owned lane truth still holds selectable
+  queued work, moves no value this endpoint reads. That is the signature of the
+  disarmed-member defect fixed elsewhere in this release, and detecting it needs
+  a watchdog bridge that is 0.8.24 work. An alert on `status` will not fire on
+  that class today.
+  The `checks` map is an open string map on the wire, so the added keys are
+  additive: no wire break, no schema change, no SDK regeneration.
+  `GET /runtime/health` in `meerkat-rest` measures nothing at all and therefore
+  reports `status: "degraded"` with four `unmeasured:*` entries, rather than the
+  hardcoded `ok` it used to serve: a caller that measured nothing may not mint a
+  clean bill of health.
+
+- **The pre-0.8.10 bridge now opens a real 0.7.x realm.** It shipped able to
+  authenticate a 0.7.x catalog and then refuse the rows inside it, so the
+  remedy the product prints (`storage migrate --apply --bridge-pre-0-8-10`)
+  half-bridged the realm and left it unopenable: session-store, schedule-store
+  and workgraph committed, runtime-store refused. The row gate had been written
+  from this repository's current source rather than from bytes any release
+  wrote, and it disagreed with released bytes on nearly every constant - it
+  required 16 fields where the 0.7.x writer emits 14 (two `Option::None` fields
+  are skipped), demanded `RollbackStaged` where 0.7.x records
+  `ResolveStagedRollback`, and demanded three attempts where a first-turn
+  failure records one. It refused every realm it existed to rescue.
+  The enumeration is deleted. A row is now admitted when it decodes through the
+  current typed contract, binds to its own row key, agrees with the generated
+  admission authority, and re-encodes without losing a field - a check derived
+  from the row's own bytes rather than from a list. Fields the current types do
+  not name are still refused, because serde would drop them silently.
+- A record the bridge cannot carry no longer costs the operator the realm.
+  Preparation refusals are per record: every other row is carried, the refused
+  row's bytes are left exactly as found (never deleted, never blanked), and
+  `storage migrate` names it, its reason, and the consequence. Only realm-level
+  conditions - an unreadable ledger, a storage failure - still refuse a domain.
+- **A successful bridge no longer deletes the operator's prompt.** On a realm
+  written by published 0.7.28, the ingress payload `persisted_input.content`
+  was present in `sessions.sqlite3` before the bridge and gone after it, while
+  the bridge printed success and said nothing. The cause was the runtime-store
+  v1 -> v2 released-row importer, which retires the ingress payload of a
+  terminal input: correct for an upgrade, because the binary that wrote the row
+  already retires payloads at the terminal transition, and wrong for a rescue,
+  which is carrying rows across from before the durable-state floor. The
+  released-row importers no longer run under the rescue at all, so the rescued
+  realm keeps its payloads. Verified on the real CLI: `"hello"` reads back
+  after the bridge, after `session list`, and after `session show`.
+- The remedy sentence for an unledgered pre-floor domain no longer promises an
+  outcome it did not check. It states that only the schema shape was verified
+  and that the bridge reports any record it cannot carry.
+- A record the preparation refuses is now genuinely untouched for the whole
+  bridge, which is what the CLI already claimed. The released-row importers ran
+  after the preparation and would re-decode a refused row, drop the field the
+  current types cannot name, and rewrite it; or, for a row that did not decode
+  at all, fail and refuse the entire domain after the operator had been told
+  the schema was recognized and to run the bridge. Both are gone with the same
+  change: under the rescue the preparation callback is the sole authority over
+  row content.
+- The eligibility answer an operator reads and the bridge that then runs are
+  now one function. The message was derived only from the frozen predecessor
+  verifiers while the bridge also accepts an exact code-derived migration
+  prefix, so an ordinary open told operators a realm this binary bridges
+  successfully was not recoverable - a false negative that replaced the earlier
+  false promise. Both directions are pinned against realms written by published
+  binaries, and every co-tenant domain of `sessions.sqlite3` is checked rather
+  than one of the three.
+- `SqliteStoreError::UnledgeredDomainObjects` carries the same remedy sentence
+  the `meerkat-store` rendering does. After a partial bridge the raw sqlite
+  Display reached operators with no next step at all.
+- The per-record refusal note no longer ships two stray runs of spaces from a
+  botched line continuation.
+- `storage migrate --apply --bridge-pre-0-8-10` reports records left behind as
+  notes and still exits 0 when every domain landed. The realm opens and the
+  operator is told, per record, what stayed behind and that a session depending
+  on it may not resume; a domain that actually refused is still an error.
+- A failed turn no longer silently disarms a member. When a turn failed, its
+  staged input was rolled back to queued and nothing re-armed the runtime loop.
+  The input stayed immediately selectable and nobody took the next lap, so it
+  sat until unrelated traffic happened to wake the loop, or forever. The loop
+  can no longer park while machine-owned lane truth still holds selectable
+  queued work, which makes returning work to a lane inseparable from coming back
+  for it.
+  Consequence to plan for, because it changes what a failing input costs: the
+  shell was under-delivering the machine's declared `max_stage_attempts = 3`,
+  granting one attempt per external wake with no wake owed, so a quiet member
+  spent one attempt and went dark. A persistently failing turn now spends three
+  applies BACK TO BACK WITHIN ONE WAKE and then terminalizes as
+  `Abandoned { MaxAttemptsExhausted }`. That is roughly three times the model
+  spend for a persistently failing input, in a burst, bought in exchange for a
+  typed terminal in seconds instead of silence.
+- An accepted input can no longer be starved indefinitely behind a backlog: a
+  refused head is re-minted behind the queue with its attempt counted, and the
+  attempt budget ends in a typed terminal rather than an unbounded retry. Two
+  consequences an operator will meet: at the cap the WHOLE refused batch
+  terminalizes, not only the culpable member, so innocent inputs can appear as
+  `Abandoned { MaxAttemptsExhausted }`; and those terminals are observable today
+  in durable input rows and through completion waiters, not on the event stream.
+- A provider-authored cache breakpoint that cannot bind to the committed
+  transcript head no longer kills the turn. The unbindable claim is discarded
+  and reported; the turn proceeds. Previously this failed the whole turn with an
+  internal error, which is how a live member could wedge on every attempt.
+- Synthetic notice refresh no longer refuses beside an audited transcript
+  prefix. The guard tested whether any audited row was touched by scanning the
+  whole prefix; it now tests whether the lowest mutated index actually falls
+  inside it.
+- In-process comms registration is identity-keyed, so a second registration
+  under a name another identity holds is a typed `NameOccupied` rejection
+  instead of silently displacing the incumbent. A generation rebinding its own
+  name is still allowed and now reports that it superseded a predecessor.
+- A durable read-write store opened through the `Primary` profile, the profile
+  every production constructor uses, can no longer end up non-WAL without
+  failing closed. `ReadOnly` and `Maintenance` deliberately preserve the mode
+  they find, including `Maintenance { write: true }`, which is the offline
+  surgeon's profile and must not convert a database another step is about to
+  relocate. `JournalPolicy` states that choice per profile, so a profile added
+  later has to make it rather than inherit an answer from a match arm's shape.
+
+### Changed
+
+- `session/export_atif` now folds the durable log into the trajectory page by
+  page instead of buffering every event, and its replay bound rises from
+  100,000 to 500,000 events. Passing that bound is a typed `INVALID_PARAMS`
+  rejection naming the bound and pointing at `events/list_since` or the
+  file-writing `rkat session export-atif`, replacing the previous
+  `INTERNAL_ERROR`.
+- `session/export_atif` also bounds what it accumulates, not just what it reads:
+  the fold measures its own retained document bytes per page and refuses with
+  `BUDGET_EXHAUSTED` once they pass the outbound message limit, naming the limit
+  and the bytes accumulated. Previously an oversized export built the whole
+  document before outbound admission refused it; the outcome is unchanged and
+  the transient cost is bounded. The event bound guards all-delta logs, the byte
+  bound guards tool-heavy ones.
+- `session/export_atif` stops reporting `SESSION_NOT_FOUND` for conditions that
+  are not a missing session: a host without the durable event projection fails
+  with `INVALID_REQUEST` (`event replay is not enabled for this runtime host`),
+  and an existing session with an empty durable log exports an empty trajectory
+  that names the session. A genuinely missing session still fails with
+  `SESSION_NOT_FOUND`.
+- Usage aggregation semantics are documented and pinned by test, and the Python
+  and TypeScript SDKs now expose the per-call model and provider attribution
+  that `turn_completed.usage.accounting` already carried. The scope matters for
+  cost accounting: attribution covers run-closing calls, so intermediate
+  tool-loop, extraction and compaction calls publish no row, and
+  `run_completed.usage` stays cumulative and session-scoped and must NOT be
+  summed against the per-turn rows.
+
+### Added
+
+- `meerkat_atif::TrajectoryBuilder`: incremental ATIF export that folds event
+  pages as they are read. `trajectory_from_events` is now a thin wrapper over
+  it and keeps its signature. `TrajectoryBuilder::retained_bytes` reports a
+  strict lower bound on the serialized size of the document folded so far, so a
+  paginating host can bound its accumulation without finishing the document.
+- `meerkat_rpc::handlers::session::ATIF_EXPORT_MAX_EVENTS`: the export's event
+  bound is public. The bounds-injecting entry point beside it
+  (`handle_export_atif_bounded`, `AtifExportBounds`) is `#[doc(hidden)]`
+  test-facing surface, not a supported way to serve `session/export_atif`;
+  `handle_export_atif` is the wire path and supplies the host bounds.
+- `meerkat_runtime::submit_bounded` and its outcome vocabulary
+  (`BoundedSubmitOutcome`, `BoundedSubmission`, `BoundedSubmitReport`,
+  `SubmitBound`, `DEFAULT_SUBMIT_BOUND`, `SubmitRefusal`, `SubmitTimeoutCause`,
+  `SubmitTimeoutDisposition`, `SubmitUnknownCause`, `AdmissionDurability`,
+  `AdmittedWorkState`): a submit that cannot wait forever. The caller supplies
+  the bound (there is no unbounded variant), and every path lands on a typed
+  outcome: durable acceptance, a typed refusal, or a timeout that states
+  whether the work is durably queued or its fate is unknown. Admission collapses
+  on the idempotency key at the durable admission point, so a bounded submit
+  retried after a timeout does not become two deliveries on a persistent
+  runtime. On a store-less runtime the collapse holds only while the admission
+  is retained in live machine state, and a timeout with no durable witness does
+  not promise exactly-once across a process death - which is what the `Unknown`
+  disposition is for. This is a Rust library API; no RPC or REST surface serves
+  it yet.
+- `AgentEvent::ProviderCacheBreakpointsDiscarded`: the session event stream now
+  reports discarded provider cache breakpoints, distinguishing claims persisted
+  by an earlier turn (which includes fork-inherited evidence) from claims
+  authored this turn. Present in the wire catalog and all three SDK event
+  inventories. Consumers match on `DiscardedCacheBreakpoint`,
+  `CacheBreakpointDiscardOrigin` and `CacheBreakpointDiscardReason`; a retained
+  count of 0 means caching was lost outright for that turn.
+- `meerkat_sqlite::JournalPolicy` and `ConnectionProfile::journal_policy()`:
+  whether an open establishes WAL or preserves the mode it finds is now stated
+  per profile rather than implied by a match arm.
+- Read-only tool enforcement is first-class: `ToolExecutionPolicy` gates at the
+  call level while preserving the tool list, so a denied call is an ordinary
+  `access_denied` tool error in the transcript rather than a vanished tool. It
+  fails closed on tools whose mutation class is unknown. The boundary is
+  documented explicitly: a read-only launch is only truthful when the host also
+  disables provider-native tool capabilities.
+  The seam a host must implement: `AgentToolDispatcher::tool_mutation_class`
+  defaults to `ToolMutationClass::Unknown`, and unknown is denied under
+  read-only intent, so a host with its own dispatcher that does not override it
+  will see EVERY one of its tools refused on a read-only launch.
+- Mob run accounting on the run result, including per-member usage. A member
+  whose usage could not be read contributes `usage_unavailable` naming the
+  reason, and the run carries `members_usage_unavailable`, so a total is a
+  documented floor rather than a number quietly short by however many members
+  failed to report. Nothing reported usage here before. When the projection
+  itself fails, the CLI omits the whole accounting block with a warning on
+  stderr, so an absent block is also a signal.
+- `meerkat_comms::CommsRuntime::retire_inproc_route` and
+  `PreparedCommsRuntime::publish_replacing`, for hosts that need to hand a name
+  over deliberately now that displacement is refused.
+
 ## [0.8.22] - 2026-08-09
 
 ### Breaking
@@ -5153,7 +5614,8 @@ Meerkat 0.5 is a large architecture and surface cutover. It formalizes runtime o
 
 Initial development release.
 
-[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.12...HEAD
+[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.23...HEAD
+[0.8.23]: https://github.com/lukacf/meerkat/compare/v0.8.22...v0.8.23
 [0.8.12]: https://github.com/lukacf/meerkat/compare/v0.8.11...v0.8.12
 [0.8.11]: https://github.com/lukacf/meerkat/compare/v0.8.10...v0.8.11
 [0.7.0]: https://github.com/lukacf/meerkat/compare/alpha/v0.7.0-alpha.0...v0.7.0

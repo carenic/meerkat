@@ -15,6 +15,8 @@ mod state;
 #[cfg(test)]
 #[doc(hidden)]
 pub(crate) mod test_turn_state_handle;
+#[cfg(test)]
+mod usage_accounting_tests;
 use crate::budget::Budget;
 use crate::comms::{
     CommsCommand, CommsTrustMutation, CommsTrustMutationResult, EventStream, PeerDirectoryEntry,
@@ -784,6 +786,19 @@ pub trait AgentToolDispatcher: Send + Sync {
             .into()
     }
 
+    /// Declared world-mutation semantics for one tool name this dispatcher
+    /// owns.
+    ///
+    /// The default is [`crate::ToolMutationClass::Unknown`]: a dispatcher that
+    /// has not made a declaration is never treated as read-only. Leaf
+    /// dispatchers declare their own tools; wrappers and composites forward to
+    /// the child that owns the name so
+    /// [`crate::tool_execution_policy::ExecutionPolicyGatedDispatcher`] reads
+    /// the owner's declaration and not the wrapper's default.
+    fn tool_mutation_class(&self, _tool_name: &str) -> crate::ToolMutationClass {
+        crate::ToolMutationClass::Unknown
+    }
+
     /// Live generation for one logical tool binding.
     ///
     /// Static dispatchers keep the default zero epoch. Mutable authorities
@@ -1245,6 +1260,13 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher for Filtered
         self.inner
             .dispatch_resolved_with_context(call, context, plan)
             .await
+    }
+
+    fn tool_mutation_class(&self, tool_name: &str) -> crate::ToolMutationClass {
+        // Visibility filtering never changes what a tool does: the owning
+        // dispatcher's declaration is forwarded unchanged, and a name this
+        // filter hides is denied by the allow-set check before dispatch.
+        self.inner.tool_mutation_class(tool_name)
     }
 
     fn tool_catalog_capabilities(&self) -> ToolCatalogCapabilities {
@@ -1992,6 +2014,12 @@ where
     pub(crate) pending_compaction_boundary_index: Option<u64>,
     /// Exact pressure witness attached to the parked compaction check.
     pub(crate) pending_compaction_request_pressure: Option<crate::ProviderRequestPressure>,
+    /// Whole-request token budget attached to the same parked compaction check.
+    ///
+    /// Parked and cleared together with the pressure witness above: both are
+    /// measurements of one fully composed request, and the trigger decision
+    /// needs the request in both units the model boundary is limited in.
+    pub(crate) pending_compaction_request_budget: Option<crate::ContextBudgetFact>,
     /// Pre-compaction pressure retained until the rebuilt request proves that
     /// compaction both decreased the body and brought it below the hard cap.
     pub(crate) post_compaction_pressure_check: Option<crate::ProviderRequestPressure>,

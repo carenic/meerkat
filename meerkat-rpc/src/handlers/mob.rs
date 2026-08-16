@@ -271,6 +271,7 @@ fn profile_from_wire(profile: WireMobProfile) -> Result<Profile, meerkat_core::S
             mob: tools.mob,
             schedule: tools.schedule,
             image_generation: tools.image_generation,
+            read_only: tools.read_only,
             mcp: tools.mcp,
             mcp_servers: vec![],
             rust_bundles: Vec::new(),
@@ -1444,7 +1445,26 @@ pub async fn handle_run_result(
     };
     match state.mob_flow_status(&mob_id, run_id).await {
         Ok(run) => match meerkat_mob::MobRun::public_run_result_value(run.as_ref()) {
-            Ok(run) => RpcResponse::success(id, MobRunResult { run }),
+            Ok(run) => {
+                let mut run = run;
+                // Same projection the CLI attaches, so both run-result
+                // surfaces report identical accounting. A collection failure
+                // omits the block rather than failing the call: the run
+                // result itself is already authoritative.
+                //
+                // Terminal runs only, matching the CLI (which collects after
+                // waiting for terminality). This method is polled: collecting
+                // mid-run would pay a member-status call plus a session read
+                // per member on every poll, and would report totals for a run
+                // that has not finished.
+                if let Some(envelope) = run.as_mut()
+                    && envelope.status.is_terminal()
+                    && let Ok(accounting) = state.mob_run_accounting(&mob_id).await
+                {
+                    envelope.accounting = Some(accounting);
+                }
+                RpcResponse::success(id, MobRunResult { run })
+            }
             Err(err) => mob_call_error(id, &err),
         },
         Err(err) => mob_call_error(id, &err),

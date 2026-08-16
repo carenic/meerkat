@@ -71,6 +71,7 @@ fn obligation(
         &mut authority,
         MeerkatMachineInput::RegisterSession {
             session_id: SessionId::from("trust-reconcile-concurrency-test"),
+            runtime_epoch_id: None,
         },
     )
     .expect("RegisterSession input");
@@ -289,6 +290,7 @@ async fn lower_epoch_overlay_is_rejected_by_generated_machine() {
         &mut authority,
         MeerkatMachineInput::RegisterSession {
             session_id: SessionId::from("trust-reconcile-lower-epoch-test"),
+            runtime_epoch_id: None,
         },
     )
     .expect("RegisterSession input");

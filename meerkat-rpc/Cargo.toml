@@ -65,6 +65,9 @@ live-webrtc = ["meerkat-live/webrtc", "meerkat/live-webrtc"]
 
 [dev-dependencies]
 meerkat-llm-core = { workspace = true }
+# Durable event-store trait for seeding a session's committed log in the ATIF
+# export contract battery.
+meerkat-session = { workspace = true, features = ["session-store"] }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 futures = { workspace = true }
 async-stream = { workspace = true }
@@ -73,6 +76,11 @@ tokio-tungstenite = "0.28"
 meerkat-comms = { workspace = true }
 meerkat-mcp = { workspace = true, features = ["test-support"] }
 meerkat-mob = { workspace = true, features = ["test-support"] }
+# `runtime/health` publishes a `session_durability` check computed from live
+# runtime state. Proving that a degraded session actually turns that check
+# amber needs the machine's deterministic degradation seam, which is
+# test-support-gated so it cannot exist in a shipped binary.
+meerkat-runtime = { workspace = true, features = ["test-support"] }
 
 [package.metadata.cargo-machete]
 ignored = [

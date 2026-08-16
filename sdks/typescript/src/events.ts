@@ -34,12 +34,51 @@ import { MeerkatError } from "./generated/errors.js";
 // Shared value types
 // ---------------------------------------------------------------------------
 
-/** Token usage for a single LLM turn. */
+/**
+ * Provider-authored attribution and normalized input total for one LLM call.
+ *
+ * `provider`/`model` name the resolved model the request was actually lowered
+ * to, so a `turn_completed` event attributes its own cost without a join
+ * against session metadata. `presentedTokens` is the provider-normalized input
+ * presented to the model for that one call, and is the value to sum across
+ * turns -- `Usage.inputTokens` is not.
+ */
+export interface ProviderTokenAccounting {
+  readonly provider: string;
+  readonly model: string;
+  readonly presentedTokens: number;
+  readonly convention: string;
+  readonly aggregation: string;
+}
+
+/**
+ * Token usage. The same shape carries two different denominators.
+ *
+ * Per-call (`turn_completed.usage`): raw provider counters for one request,
+ * plus `accounting`. For Anthropic `inputTokens` is the *uncached* input only,
+ * with cache-write/cache-read input in the separate cache fields; the
+ * normalized presented input is `accounting.presentedTokens`.
+ *
+ * Cumulative (`run_completed.usage`, `RunResult.usage`): a *session*-cumulative
+ * total whose `inputTokens` is already the sum of each recorded call's presented
+ * tokens, whose cache fields are always absent, and which carries no
+ * `accounting` because a session may span providers and models. It is persisted
+ * with the session, so on the second run of a session it already contains the
+ * first run's calls.
+ *
+ * Do not sum the cumulative value with anything - take the latest one - and do
+ * not sum per-call `inputTokens` (that undercounts on cache-heavy Anthropic
+ * sessions); sum `accounting.presentedTokens` instead. The per-call rows cover
+ * only the calls that closed a run, so they do not reconcile with the cumulative
+ * total.
+ */
 export interface Usage {
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly cacheCreationTokens?: number;
   readonly cacheReadTokens?: number;
+  /** Absent on cumulative usage and on rows written before 0.8.22. */
+  readonly accounting?: ProviderTokenAccounting;
 }
 
 /** Why an LLM turn ended. */
@@ -676,10 +715,27 @@ function requireOneOf<T extends string>(
   return value as T;
 }
 
+function parseAccounting(raw: unknown): ProviderTokenAccounting | undefined {
+  if (raw == null) {
+    return undefined;
+  }
+  if (!isPlainRecord(raw)) {
+    throw new Error("usage.accounting must be an object");
+  }
+  return {
+    provider: requireStringField(raw, "provider"),
+    model: requireStringField(raw, "model"),
+    presentedTokens: requireNumberField(raw, "presented_tokens"),
+    convention: requireStringField(raw, "convention"),
+    aggregation: requireStringField(raw, "aggregation"),
+  };
+}
+
 function parseUsage(raw: unknown): Usage {
   if (!isPlainRecord(raw)) {
     throw new Error("missing usage");
   }
+  const accounting = parseAccounting(raw.accounting);
   return {
     inputTokens: requireNumberField(raw, "input_tokens"),
     outputTokens: requireNumberField(raw, "output_tokens"),
@@ -689,6 +745,7 @@ function parseUsage(raw: unknown): Usage {
     cacheReadTokens: raw.cache_read_tokens != null
       ? requireNumberField(raw, "cache_read_tokens")
       : undefined,
+    ...(accounting !== undefined ? { accounting } : {}),
   };
 }
 

@@ -41,6 +41,7 @@ pub const TOOLS_TASKS_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::Sch
     }],
     initialize_current: migration_0001_tasks_schema,
     allowed_existing_versions: &[1],
+    bridge_recoverable_versions: &[1],
     released_predecessors: &[],
     owned_objects: &[
         meerkat_sqlite::SchemaObject {

@@ -3589,6 +3589,7 @@ pub const WORKGRAPH_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::Schem
     ],
     initialize_current: initialize_current_workgraph_schema,
     allowed_existing_versions: &[2, 3],
+    bridge_recoverable_versions: &[1, 2],
     released_predecessors: &[meerkat_sqlite::SchemaPredecessor {
         version: 2,
         verify: verify_released_0_8_15_workgraph_schema,
@@ -4120,7 +4121,7 @@ pub fn prepare_pre_0_8_10_workgraph_attention(
         }
     }
 
-    Ok(meerkat_sqlite::MaintenancePrepareReport { changed })
+    Ok(meerkat_sqlite::MaintenancePrepareReport::rewrote(changed))
 }
 
 /// Occupancy probe for the active-binding-per-target invariant, run INSIDE

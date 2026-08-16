@@ -51,7 +51,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.22",
+        "CARGO_PKG_VERSION": "0.8.23",
         "CARGO_MANIFEST_DIR": "./meerkat-tools",
     },
     proc_macro_deps = all_crate_deps(
@@ -108,7 +108,7 @@ rust_library(
         "//tests/integration:__pkg__",
     ],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.22",
+        "CARGO_PKG_VERSION": "0.8.23",
         "CARGO_MANIFEST_DIR": "./meerkat-tools",
     },
     proc_macro_deps = all_crate_deps(
@@ -158,7 +158,7 @@ rust_library(
         "//meerkat:__pkg__",
     ],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.22",
+        "CARGO_PKG_VERSION": "0.8.23",
         "CARGO_MANIFEST_DIR": "./meerkat-tools",
     },
     proc_macro_deps = all_crate_deps(
@@ -208,7 +208,7 @@ rust_library(
         "//meerkat:__pkg__",
     ],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.22",
+        "CARGO_PKG_VERSION": "0.8.23",
         "CARGO_MANIFEST_DIR": "./meerkat-tools",
     },
     proc_macro_deps = all_crate_deps(
@@ -262,7 +262,7 @@ rust_test(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.22",
+        "CARGO_PKG_VERSION": "0.8.23",
         "CARGO_MANIFEST_DIR": "./meerkat-tools",
     },
     tags = [
@@ -331,7 +331,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.22",
+        "CARGO_PKG_VERSION": "0.8.23",
         "CARGO_BIN_NAME": "browse_load_surface",
         "CARGO_MANIFEST_DIR": "./meerkat-tools",
     },
@@ -401,7 +401,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.22",
+        "CARGO_PKG_VERSION": "0.8.23",
         "CARGO_BIN_NAME": "builtin_skill_canonical_key",
         "CARGO_MANIFEST_DIR": "./meerkat-tools",
     },
@@ -471,7 +471,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.22",
+        "CARGO_PKG_VERSION": "0.8.23",
         "CARGO_BIN_NAME": "integration_shell_jobs",
         "CARGO_MANIFEST_DIR": "./meerkat-tools",
     },
@@ -538,7 +538,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.22",
+        "CARGO_PKG_VERSION": "0.8.23",
         "CARGO_BIN_NAME": "monitor_protocol",
         "CARGO_MANIFEST_DIR": "./meerkat-tools",
     },
@@ -606,7 +606,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.22",
+        "CARGO_PKG_VERSION": "0.8.23",
         "CARGO_BIN_NAME": "rct_contracts",
         "CARGO_MANIFEST_DIR": "./meerkat-tools",
     },
@@ -619,6 +619,76 @@ rust_test(
         "//:workspace_cargo_manifests",
         "//:workspace_metadata",
         "//:workspace_rust_sources",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-tools",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-jobs:meerkat_jobs",
+        "//meerkat-llm-core:meerkat_llm_core",
+        "//meerkat-mcp:meerkat_mcp_test_support",
+        "//meerkat-runtime:meerkat_runtime_test_support",
+        "//meerkat-skills:meerkat_skills",
+        "//meerkat-sqlite:meerkat_sqlite",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools_with_runtime_test_support",
+    ] + all_crate_deps(
+        package_name = "meerkat-tools",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "read_only_execution_gate_test",
+    aliases = aliases(
+        package_name = "meerkat-tools",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "read_only_execution_gate",
+    crate_root = "tests/read_only_execution_gate.rs",
+    crate_features = [
+        "comms",
+        "mcp",
+        "skills",
+        "sqlite",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+        "skills/builtin-utilities-workflow/SKILL.md",
+        "skills/shell-patterns/SKILL.md",
+        "skills/skill-discovery-workflow/SKILL.md",
+        "skills/task-workflow/SKILL.md",
+        "src/builtin/shell/tool.rs",
+    ],
+    srcs = [
+        "tests/read_only_execution_gate.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.8.23",
+        "CARGO_BIN_NAME": "read_only_execution_gate",
+        "CARGO_MANIFEST_DIR": "./meerkat-tools",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [
+        "//meerkat:package_runfiles",
     ],
     env = {
         "RUST_MIN_STACK": "16777216",
@@ -679,7 +749,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.22",
+        "CARGO_PKG_VERSION": "0.8.23",
         "CARGO_BIN_NAME": "schema_snapshot",
         "CARGO_MANIFEST_DIR": "./meerkat-tools",
     },
@@ -725,5 +795,6 @@ test_suite(
         ":meerkat_tools_unit_test",
         ":monitor_protocol_test",
         ":rct_contracts_test",
+        ":read_only_execution_gate_test",
     ],
 )

@@ -14,6 +14,7 @@
 //!   * the subscription third outcome and the SubscribeAll external set;
 //!   * member-operator upcall admission (admit + every typed reject cause);
 //!   * retirement disposal (typed field; destroy family clears placement);
+//!   * placed revival resolving without a local runtime-binding request;
 //!   * a 2-host × 3-member invariant walk.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -23,12 +24,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use meerkat_mob::machines::mob_machine::{
     AgentIdentity, AgentRuntimeId, AutonomousShutdownMemberActionKind, ControlScope, FenceToken,
     FlowStepDispatchKind, Generation, HostBindPhase, HostId, InputId, LiveWsEndpointUrl,
-    MemberOperatorRejectKind, MemberPeerEndpoint, MemberSessionDisposal, MobId,
-    MobLifecycleJournalKind, MobMachineAuthority, MobMachineEffect, MobMachineInput,
-    MobMachineMutator, MobMachineSignal, MobMachineState, MobPhase, MobSpawnMemberAdmissionKind,
-    PeerAddress, PeerId, PeerName, PeerSigningKey, PlacedCompletionLifecycleIntentKind,
-    PlacedSpawnId, PrincipalId, RemoteTurnObligation, RouteInstallObligation, RouteObligationKind,
-    RunId, SessionId, SpawnExecPhase, SpawnPolicyRuntimeMode, StepId, WiringEdge,
+    MemberLiveMaterializationObservationKind, MemberOperatorRejectKind, MemberPeerEndpoint,
+    MemberRevivalVerdictKind, MemberSessionDisposal, MobId, MobLifecycleJournalKind,
+    MobMachineAuthority, MobMachineEffect, MobMachineInput, MobMachineMutator, MobMachineSignal,
+    MobMachineState, MobPhase, MobSpawnMemberAdmissionKind, PeerAddress, PeerId, PeerName,
+    PeerSigningKey, PlacedCompletionLifecycleIntentKind, PlacedSpawnId, PrincipalId,
+    RemoteTurnObligation, RouteInstallObligation, RouteObligationKind, RunId, SessionId,
+    SpawnExecPhase, SpawnPolicyRuntimeMode, StepId, WiringEdge,
 };
 
 fn identity(name: &str) -> AgentIdentity {
@@ -4315,4 +4317,67 @@ fn grant_inputs_maintain_scope_and_expiry_key_parity_at_every_step() {
     .expect("absent revoke no-op");
     assert_key_parity(authority.state(), "absent revoke");
     assert!(authority.state().operator_grant_scopes.contains_key(&p2));
+}
+
+// ==========================================================================
+// Leg B - revival re-emits the runtime binding only on the LOCAL lane.
+//
+// The local half (exact tuple re-emitted, and the fail-closed refusal when the
+// tuple cannot be named) lives in `member_revival_rebinding.rs`; the placed
+// half needs the bound-host ladder, so it lives here.
+// ==========================================================================
+
+#[test]
+fn placed_member_revival_leaves_the_runtime_binding_to_its_member_host() {
+    let mut authority = MobMachineAuthority::new();
+    let host = host_id("host-revival");
+    bind_owner_bridge(&mut authority);
+    bind_host(&mut authority, &host, 1, HostCaps::FULL);
+    seed_remote_member(
+        &mut authority,
+        "remote-revive",
+        0,
+        &host,
+        SpawnPolicyRuntimeMode::TurnDriven,
+    );
+
+    let authorized = authority
+        .apply_signal(MobMachineSignal::ClassifyMemberLiveMaterialization {
+            agent_identity: identity("remote-revive"),
+            observation: MemberLiveMaterializationObservationKind::DurableSnapshotPresent,
+            reason: "live materialization missing at dispatch".to_string(),
+        })
+        .expect("a durable snapshot must authorize one revival attempt for a placed member");
+    assert!(
+        authorized.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::MemberLiveMaterializationClassified {
+                verdict: MemberRevivalVerdictKind::ReviveAuthorized,
+                ..
+            }
+        )),
+        "the placed fixture depends on the machine-owned revival authorization",
+    );
+
+    let resolved = authority
+        .apply_signal(MobMachineSignal::ResolveMemberRevivalSucceeded {
+            agent_identity: identity("remote-revive"),
+        })
+        .expect("a placed revival with an active carrier binding must resolve");
+    assert!(
+        !resolved
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, MobMachineEffect::RequestRuntimeBinding { .. })),
+        "the member host owns a placed member's runtime binding - the same reason \
+         CommitSpawnMembershipRemote emits no binding request",
+    );
+    assert!(
+        !authority
+            .state()
+            .member_revival_pending
+            .contains(&identity("remote-revive")),
+        "a resolved placed revival still clears the machine-owned obligation",
+    );
+    check_multi_host_invariants(authority.state());
 }

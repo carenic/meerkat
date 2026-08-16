@@ -131,6 +131,9 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "MobRunResultParams": schema_for!(crate::wire::MobRunResultParams),
         "MobRunResult": schema_for!(crate::wire::MobRunResult),
         "WireMobRunResultEnvelope": schema_for!(crate::wire::WireMobRunResultEnvelope),
+        "WireMobRunAccounting": schema_for!(crate::wire::WireMobRunAccounting),
+        "WireMobRunMemberAccounting": schema_for!(crate::wire::WireMobRunMemberAccounting),
+        "WireMobRunUsageAttribution": schema_for!(crate::wire::WireMobRunUsageAttribution),
         // #54/#159/#235/#313: typed mob run / member-connectivity / error wire types
         "WireMobRun": schema_for!(crate::wire::WireMobRun),
         "WireMobRunStatus": schema_for!(crate::wire::WireMobRunStatus),

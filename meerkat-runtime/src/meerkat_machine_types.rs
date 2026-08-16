@@ -332,6 +332,16 @@ pub(crate) enum MeerkatMachineCommand {
         session_id: SessionId,
         idempotency_key: String,
     },
+    // Durable-only variant of the read above: it never consults the live
+    // admission map, so `Some` is evidence that the admission is committed in
+    // the store-owned input index and survives process restart. A store-less
+    // (ephemeral) machine answers `None` because it retains nothing. This is
+    // the read a bounded submit classifies its timeout with: a live-first
+    // answer would let an in-memory-only admission be reported as durable.
+    DurableInputStateByIdempotencyKey {
+        session_id: SessionId,
+        idempotency_key: String,
+    },
     // Restart-first-class terminal-status read: same machine-owned authority
     // read as `InputState`, but when the session is not registered a
     // persistent machine answers from the durably committed input-state
@@ -713,6 +723,7 @@ meerkat_machine_runtime_internal_inputs!(
         ResolveTranscriptEditAdmission,
         RegisterAcceptedIdempotency,
         ResolveStagedRollback,
+        ResolveUnstageableQueuedInput,
         RetryRequested,
         RollbackStaged,
         StageForRun,
@@ -1691,6 +1702,9 @@ impl MeerkatMachineCommandVariant {
             // Same machine-owned read route as `InputState` (the key
             // resolves through the generated admission map first).
             Self::InputStateByIdempotencyKey => Some(MeerkatMachineCatalogInput::InputState),
+            // Durable-only key resolution reads the same machine-owned input
+            // witness; it just refuses the live map as a source.
+            Self::DurableInputStateByIdempotencyKey => Some(MeerkatMachineCatalogInput::InputState),
             // Terminal-status queries are the same machine-owned read route
             // as `InputState`: they evaluate the identical DSL-owned seed
             // facts (live snapshot or their durable store witnesses).
@@ -1866,7 +1880,8 @@ const fn meerkat_machine_command_classification(
         // Same machine-owned read route as `InputState`: the idempotency
         // key resolves through the generated admission map, then the stored
         // input state is read identically.
-        MeerkatMachineCommandVariant::InputStateByIdempotencyKey => {
+        MeerkatMachineCommandVariant::InputStateByIdempotencyKey
+        | MeerkatMachineCommandVariant::DurableInputStateByIdempotencyKey => {
             MeerkatMachineCommandClassification::CatalogInput(
                 MeerkatMachineCatalogInput::InputState,
             )

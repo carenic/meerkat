@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Generates [patch.crates-io] config for dry-run and CI publishing.
-# Canonical crate-to-directory mapping lives here; callers redirect to a file.
+#
+# The crate set is DERIVED from scripts/release-rust-crates.sh (which
+# check_rust_release_packaging.py already gates against the publishable
+# workspace members) and the directory for each crate is read from the
+# manifests themselves. A hand-maintained copy of the crate list used to live
+# here, so adding one workspace member silently produced a patch config missing
+# that crate and the omission only surfaced during package verification.
 #
 # Usage: generate-patch-config.sh [ROOT_DIR] [EXCLUDE_CRATE]
 #
@@ -9,60 +15,38 @@
 
 set -euo pipefail
 
-ROOT="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="${1:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 EXCLUDE="${2:-}"
 
-# Entries as "crate=path" pairs (bash 3.x compatible, no associative arrays).
-ENTRIES=(
-  "meerkat-sqlite=${ROOT}/meerkat-sqlite"
-  "meerkat-machine-derive=${ROOT}/meerkat-machine-derive"
-  "meerkat-machine-dsl-core=${ROOT}/meerkat-machine-dsl-core"
-  "meerkat-machine-dsl=${ROOT}/meerkat-machine-dsl"
-  "meerkat-machine-schema=${ROOT}/meerkat-machine-schema"
-  "meerkat-machine-kernels=${ROOT}/meerkat-machine-kernels"
-  "meerkat-core=${ROOT}/meerkat-core"
-  "meerkat-atif=${ROOT}/meerkat-atif"
-  "meerkat-models=${ROOT}/meerkat-models"
-  "meerkat-capabilities=${ROOT}/meerkat-capabilities"
-  "meerkat-llm-core=${ROOT}/meerkat-llm-core"
-  "meerkat-live=${ROOT}/meerkat-live"
-  "meerkat-agent-build-authority=${ROOT}/meerkat-agent-build-authority"
-  "meerkat-auth-core=${ROOT}/meerkat-auth-core"
-  "meerkat-anthropic=${ROOT}/meerkat-anthropic"
-  "meerkat-openai=${ROOT}/meerkat-openai"
-  "meerkat-gemini=${ROOT}/meerkat-gemini"
-  "meerkat-schedule=${ROOT}/meerkat-schedule"
-  "meerkat-jobs=${ROOT}/meerkat-jobs"
-  "meerkat-workgraph=${ROOT}/meerkat-workgraph"
-  "meerkat-client=${ROOT}/meerkat-client"
-  "meerkat-providers=${ROOT}/meerkat-providers"
-  "meerkat-store=${ROOT}/meerkat-store"
-  "meerkat-store-conformance=${ROOT}/meerkat-store-conformance"
-  "meerkat-tools=${ROOT}/meerkat-tools"
-  "meerkat-runtime=${ROOT}/meerkat-runtime"
-  "meerkat-session=${ROOT}/meerkat-session"
-  "meerkat-memory=${ROOT}/meerkat-memory"
-  "meerkat-mcp=${ROOT}/meerkat-mcp"
-  "meerkat-mcp-server=${ROOT}/meerkat-mcp-server"
-  "meerkat-hooks=${ROOT}/meerkat-hooks"
-  "meerkat-skills=${ROOT}/meerkat-skills"
-  "meerkat-comms=${ROOT}/meerkat-comms"
-  "meerkat-rpc=${ROOT}/meerkat-rpc"
-  "meerkat-rest=${ROOT}/meerkat-rest"
-  "meerkat-contracts=${ROOT}/meerkat-contracts"
-  "meerkat=${ROOT}/meerkat"
-  "meerkat-mob=${ROOT}/meerkat-mob"
-  "meerkat-mob-adaptive=${ROOT}/meerkat-mob-adaptive"
-  "meerkat-mob-mcp=${ROOT}/meerkat-mob-mcp"
-  "meerkat-mob-pack=${ROOT}/meerkat-mob-pack"
-  "rkat=${ROOT}/meerkat-cli"
-)
+# name<TAB>directory for every top-level workspace manifest. Only the [package]
+# section counts: several crates declare [[bin]] targets whose names collide
+# with other crates' package names.
+crate_table="$(
+  for manifest in "${ROOT}"/*/Cargo.toml; do
+    [[ -f "${manifest}" ]] || continue
+    awk -v dir="$(dirname "${manifest}")" '
+      /^[[:space:]]*\[/ { in_package = ($0 ~ /^[[:space:]]*\[package\][[:space:]]*$/) }
+      in_package && /^[[:space:]]*name[[:space:]]*=/ {
+        if (match($0, /"[^"]*"/)) {
+          printf "%s\t%s\n", substr($0, RSTART + 1, RLENGTH - 2), dir
+          exit
+        }
+      }
+    ' "${manifest}"
+  done
+)"
 
 echo "[patch.crates-io]"
-for entry in "${ENTRIES[@]}"; do
-  crate="${entry%%=*}"
-  path="${entry#*=}"
-  if [[ "$crate" != "$EXCLUDE" ]]; then
-    echo "${crate} = { path = \"${path}\" }"
+while IFS= read -r crate; do
+  [[ -n "${crate}" ]] || continue
+  crate_dir="$(awk -F '\t' -v want="${crate}" '$1 == want { print $2; exit }' <<<"${crate_table}")"
+  if [[ -z "${crate_dir}" ]]; then
+    echo "generate-patch-config.sh: no workspace directory under ${ROOT} declares package '${crate}'" >&2
+    echo "Release crate list and workspace members disagree; run: make check-rust-release-config" >&2
+    exit 1
   fi
-done
+  if [[ "${crate}" != "${EXCLUDE}" ]]; then
+    echo "${crate} = { path = \"${crate_dir}\" }"
+  fi
+done < <("${SCRIPT_DIR}/release-rust-crates.sh")

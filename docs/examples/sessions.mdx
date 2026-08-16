@@ -469,7 +469,13 @@ Cancel an in-flight turn. No-op if the session is idle.
             match event {
                 AgentEvent::TextDelta { delta } => print!("{}", delta),
                 AgentEvent::TurnCompleted { usage, .. } => {
-                    println!("\n[Tokens: {}]", usage.total_tokens());
+                    // Per-call usage: `accounting` names the resolved model and
+                    // the normalized presented input for this one call.
+                    println!(
+                        "\n[{}: {} tokens]",
+                        usage.accounting().model,
+                        usage.normalized_total_tokens()
+                    );
                 }
                 _ => {}
             }
@@ -480,6 +486,13 @@ Cancel an in-flight turn. No-op if the session is idle.
     ```
   </Tab>
 </Tabs>
+
+<Note>
+`turn_completed` carries usage for one provider call while `run_completed` and
+`RunResult.usage` carry the session-cumulative total, and their `input_tokens`
+fields use different denominators. Read
+[Usage accounting](/reference/usage-accounting) before aggregating either.
+</Note>
 
 ## Model and provider selection
 

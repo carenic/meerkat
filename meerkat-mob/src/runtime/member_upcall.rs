@@ -872,6 +872,7 @@ impl MemberUpcallToolDispatcher {
             Some(ToolAccessPolicy::DenyList(names)) => Some(
                 WireResolvedToolAccessPolicy::DenyList(sorted_tool_names(&names)),
             ),
+            Some(ToolAccessPolicy::ReadOnly) => Some(WireResolvedToolAccessPolicy::ReadOnly),
             // Inherit (explicit or absent) resolves against THIS member's
             // own sealed policy — the parent-realm resolution happened on
             // the controlling host at spec-mint (F-C.4 containment: no host

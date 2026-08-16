@@ -423,6 +423,8 @@ impl DesiredMemberMaterial {
                 | WireResolvedToolAccessPolicy::DenyList(names) => {
                     validate_string_set("tool_access_policy_name", names)?;
                 }
+                // Name-independent: there is no name set to validate.
+                WireResolvedToolAccessPolicy::ReadOnly => {}
             }
         }
 

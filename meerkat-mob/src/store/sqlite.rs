@@ -1252,6 +1252,7 @@ pub const MOB_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomai
     ],
     initialize_current: initialize_current_mob_schema,
     allowed_existing_versions: &[3, 4],
+    bridge_recoverable_versions: &[],
     released_predecessors: &[meerkat_sqlite::SchemaPredecessor {
         version: 3,
         verify: verify_released_0_8_10_mob_schema,

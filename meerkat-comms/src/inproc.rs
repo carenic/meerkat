@@ -47,50 +47,72 @@ pub struct InprocPeerInfo {
 
 /// Why a registration was rejected without mutating the registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RegistrationRejection {
     /// The supplied pubkey was the all-zero key, which can never identify a
     /// distinct peer and is refused fail-closed.
     ZeroPubkey,
+    /// This participant name already has a live route under a *different*
+    /// public key, so the registrant is a different peer claiming an occupied
+    /// name.
+    ///
+    /// Delivery is keyed by public key, so honouring the newcomer would make
+    /// `holder_pubkey` - a key that peers still hold, trust and address -
+    /// unreachable, with the incumbent finding out only by no longer receiving.
+    /// The registration is refused instead, without mutation, and the incumbent
+    /// keeps routing. A caller that legitimately succeeds a *known* predecessor
+    /// proves it through [`InprocRegistry::replace_sender_in_namespace`] rather
+    /// than by claiming the name.
+    NameOccupied { holder_pubkey: PubKey },
+}
+
+impl std::fmt::Display for RegistrationRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroPubkey => {
+                f.write_str("the all-zero public key can never identify a distinct peer")
+            }
+            Self::NameOccupied { holder_pubkey } => write!(
+                f,
+                "the participant name already has a live route under a different public key {}",
+                holder_pubkey.to_pubkey_string()
+            ),
+        }
+    }
 }
 
 /// Typed result of registering an inproc peer.
 ///
-/// Registration is not always a clean insert: re-registering an existing
-/// pubkey under a new name evicts the old name mapping, and re-registering an
-/// existing name with a new pubkey evicts the old pubkey entry. Both evictions
-/// can also happen at once. Callers (runtime constructors, metadata refresh)
-/// must observe these facts rather than assume a clean success.
+/// Registration is not always a clean insert, and every non-clean shape is
+/// named rather than silently applied. A registrant may move its own key to a
+/// free name ([`RegistrationOutcome::ReplacedPubkey`]) or rebind its own name to
+/// a newer inbox generation ([`RegistrationOutcome::ReboundOwnName`]); no
+/// registration path can unbind a route belonging to a *different* key
+/// ([`RegistrationRejection::NameOccupied`]). Callers (runtime constructors,
+/// metadata refresh) must observe these facts rather than assume a clean
+/// success.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistrationOutcome {
-    /// The peer was inserted without displacing any existing route.
+    /// The peer was inserted without touching any existing route.
     Registered,
     /// This pubkey was already registered under a different name; the old name
     /// mapping was removed and replaced with the new name.
     ReplacedPubkey { evicted_name: String },
-    /// This name was already bound to a different pubkey; the old pubkey entry
-    /// was evicted so the stale key is no longer reachable.
-    EvictedName { evicted_pubkey: PubKey },
-    /// Both evictions happened: this pubkey's old name was removed AND this
-    /// name's old pubkey was evicted in the same registration.
-    ReplacedPubkeyAndEvictedName {
-        evicted_name: String,
-        evicted_pubkey: PubKey,
-    },
+    /// This exact public key already held this exact name, and its route was
+    /// rebound to the registrant's newer inbox generation.
+    ///
+    /// This is one identity reconstructing itself, not a displacement: the key
+    /// peers address stays reachable throughout and now resolves to the newest
+    /// generation, and the predecessor's generation-checked unregistration
+    /// cannot unbind the successor. What does change is that the predecessor
+    /// generation stops receiving, so the outcome is reported rather than
+    /// folded into [`RegistrationOutcome::Registered`].
+    ReboundOwnName,
     /// The registration was refused without mutating the registry.
     Rejected { reason: RegistrationRejection },
 }
 
 impl RegistrationOutcome {
-    /// Whether the registration displaced an existing route (either eviction).
-    pub fn displaced_existing(&self) -> bool {
-        matches!(
-            self,
-            Self::ReplacedPubkey { .. }
-                | Self::EvictedName { .. }
-                | Self::ReplacedPubkeyAndEvictedName { .. }
-        )
-    }
-
     /// Whether the registration was rejected (no mutation occurred).
     pub fn is_rejected(&self) -> bool {
         matches!(self, Self::Rejected { .. })
@@ -209,14 +231,30 @@ impl InprocRegistry {
 
     /// Register an agent's inbox within an explicit namespace.
     ///
-    /// Returns a typed [`RegistrationOutcome`] that surfaces route displacement
-    /// explicitly: re-registering an existing pubkey under a new name evicts
-    /// the old name mapping ([`RegistrationOutcome::ReplacedPubkey`]); a name
-    /// rebound to a new pubkey evicts the old pubkey entry
-    /// ([`RegistrationOutcome::EvictedName`]); both can happen at once
-    /// ([`RegistrationOutcome::ReplacedPubkeyAndEvictedName`]). A zero pubkey is
-    /// refused without mutation ([`RegistrationOutcome::Rejected`]). Callers
-    /// must observe displacement/rejection rather than assume a clean success.
+    /// One rule, for every registrant with no exceptions: the public key is the
+    /// participant identity, so a name may only ever be bound or rebound by the
+    /// key that holds it.
+    ///
+    /// - a name held by a *different* live key belongs to another peer.
+    ///   Delivery is key-addressed, so honouring the newcomer would make that
+    ///   key unreachable; the registration is refused before any mutation
+    ///   ([`RegistrationRejection::NameOccupied`]) and the incumbent keeps
+    ///   routing. A caller that legitimately succeeds a known predecessor
+    ///   proves it through
+    ///   [`replace_sender_in_namespace`](Self::replace_sender_in_namespace),
+    ///   which authorizes replacement by the exact generation being replaced.
+    /// - a name held by the *same* key is that identity reconstructing itself.
+    ///   The route is rebound to the newer generation and reported as
+    ///   [`RegistrationOutcome::ReboundOwnName`]: the addressable identity never
+    ///   stops being reachable, and the predecessor's generation-checked
+    ///   unregistration cannot unbind the successor. Whether two live hosts of
+    ///   one identity may exist at all is not visible here and is not decided
+    ///   here (see `SessionClaimHandle` for session identities).
+    /// - re-registering an existing key under a *free* name is that
+    ///   registrant's own rename ([`RegistrationOutcome::ReplacedPubkey`]).
+    /// - a zero pubkey is refused ([`RegistrationRejection::ZeroPubkey`]).
+    ///
+    /// Callers must observe the outcome rather than assume a clean success.
     pub fn register_with_meta_in_namespace(
         &self,
         namespace: &str,
@@ -246,7 +284,30 @@ impl InprocRegistry {
         let mut state = self.state.write();
         let namespace_state = state.namespace_mut(namespace);
 
-        // If this pubkey was registered under a different name, remove old name mapping
+        // Fail closed before any mutation. A live route under this name is a
+        // serving peer's only inbox, and from here one participant rebuilding
+        // itself is indistinguishable from a second live instance of it, so
+        // neither is allowed to claim the name. Exact-generation replacement is
+        // the seam that can tell them apart, because the caller has to name the
+        // predecessor it is replacing.
+        let held_by = namespace_state.names.get(&name).copied();
+        if let Some(holder_pubkey) = held_by.filter(|&held_by| held_by != pubkey) {
+            tracing::warn!(
+                inproc_namespace = %namespace,
+                peer_name = %name,
+                holder_pubkey = %holder_pubkey.to_pubkey_string(),
+                registrant_pubkey = %pubkey.to_pubkey_string(),
+                "refusing inproc registration that would unbind a live route under this name"
+            );
+            return RegistrationOutcome::Rejected {
+                reason: RegistrationRejection::NameOccupied { holder_pubkey },
+            };
+        }
+        let rebound_own_name = held_by.is_some();
+
+        // This pubkey may hold a different name already. That route belongs to
+        // this same registrant, so the stale mapping is its own rename rather
+        // than a displacement of somebody else.
         let evicted_name = namespace_state
             .peers
             .get(&pubkey)
@@ -256,30 +317,13 @@ impl InprocRegistry {
             namespace_state.names.remove(old_name);
         }
 
-        // If this name was registered to a different pubkey, remove the old pubkey entry
-        // This prevents stale pubkeys from remaining reachable
-        let evicted_pubkey = namespace_state
-            .names
-            .get(&name)
-            .filter(|&&old_pk| old_pk != pubkey)
-            .copied();
-        if let Some(old_pubkey) = evicted_pubkey {
-            namespace_state.peers.remove(&old_pubkey);
-        }
-
         namespace_state.peers.insert(pubkey, peer);
         namespace_state.names.insert(name, pubkey);
 
-        match (evicted_name, evicted_pubkey) {
-            (None, None) => RegistrationOutcome::Registered,
-            (Some(evicted_name), None) => RegistrationOutcome::ReplacedPubkey { evicted_name },
-            (None, Some(evicted_pubkey)) => RegistrationOutcome::EvictedName { evicted_pubkey },
-            (Some(evicted_name), Some(evicted_pubkey)) => {
-                RegistrationOutcome::ReplacedPubkeyAndEvictedName {
-                    evicted_name,
-                    evicted_pubkey,
-                }
-            }
+        match (evicted_name, rebound_own_name) {
+            (Some(evicted_name), _) => RegistrationOutcome::ReplacedPubkey { evicted_name },
+            (None, true) => RegistrationOutcome::ReboundOwnName,
+            (None, false) => RegistrationOutcome::Registered,
         }
     }
 
@@ -877,8 +921,10 @@ mod tests {
         assert_eq!(registry.len(), 1);
     }
 
+    /// There is no takeover opt-in left: a name held by another live key is
+    /// refused and the incumbent's maps are untouched.
     #[test]
-    fn test_registry_replace_on_same_name_different_pubkey() {
+    fn test_registry_refuses_same_name_different_pubkey() {
         let registry = InprocRegistry::new();
         let keypair1 = make_keypair();
         let pubkey1 = keypair1.public_key();
@@ -894,26 +940,515 @@ mod tests {
         assert_eq!(registry.len(), 1);
 
         // Re-register same name with different pubkey
-        registry.register("my-agent", pubkey2, sender2);
-
-        // Old pubkey should be evicted, new pubkey should exist
-        assert!(!registry.contains(&pubkey1), "old pubkey should be evicted");
-        assert!(registry.contains(&pubkey2));
-        assert!(registry.contains_name("my-agent"));
-        assert_eq!(registry.len(), 1);
-
-        // The name maps to the new identity.
         assert_eq!(
-            registry.get_name_by_pubkey(&pubkey2).as_deref(),
+            registry.register("my-agent", pubkey2, sender2),
+            RegistrationOutcome::Rejected {
+                reason: RegistrationRejection::NameOccupied {
+                    holder_pubkey: pubkey1
+                }
+            }
+        );
+
+        // The incumbent keeps the route; the newcomer was never installed.
+        assert!(registry.contains(&pubkey1), "incumbent must keep its route");
+        assert!(!registry.contains(&pubkey2));
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.get_name_by_pubkey(&pubkey1).as_deref(),
             Some("my-agent")
         );
     }
 
-    /// ROW #292 gate: registration returns a typed [`RegistrationOutcome`] that
-    /// surfaces route displacement and zero-pubkey rejection, instead of
-    /// silently evicting and returning `()`.
+    fn probe_message(body: &str) -> MessageKind {
+        MessageKind::Message {
+            objective_id: None,
+            content_taint: None,
+            blocks: None,
+            body: body.to_string(),
+            handling_mode: None,
+        }
+    }
+
+    /// One participant name registered from two different identities in two
+    /// different namespaces is two peers that cannot see each other, so both
+    /// routes stay live and both deliver. Namespaces are the isolation seam;
+    /// nothing about a same-name neighbour in another namespace may unbind a
+    /// live route.
+    #[tokio::test]
+    async fn same_name_in_distinct_namespaces_keeps_both_routes_and_both_deliver() {
+        let registry = InprocRegistry::new();
+        let name = "mob.shared/lead/lead-1";
+        let first_keypair = make_keypair();
+        let first_pubkey = first_keypair.public_key();
+        let second_keypair = make_keypair();
+        let second_pubkey = second_keypair.public_key();
+        let (first_inbox, first_sender, first_finalizer) = classified_inbox_with_runtime();
+        let (second_inbox, second_sender, second_finalizer) = classified_inbox_with_runtime();
+
+        assert_eq!(
+            registry.register_with_meta_in_namespace(
+                "realm-one",
+                name,
+                first_pubkey,
+                first_sender,
+                PeerMeta::default(),
+            ),
+            RegistrationOutcome::Registered
+        );
+        assert_eq!(
+            registry.register_with_meta_in_namespace(
+                "realm-two",
+                name,
+                second_pubkey,
+                second_sender,
+                PeerMeta::default(),
+            ),
+            RegistrationOutcome::Registered,
+            "a same-name peer in another namespace must not displace anything"
+        );
+
+        assert!(
+            registry
+                .get_by_pubkey_in_namespace("realm-one", &first_pubkey)
+                .is_some()
+        );
+        assert!(
+            registry
+                .get_by_pubkey_in_namespace("realm-two", &second_pubkey)
+                .is_some()
+        );
+
+        let first_finalize = spawn_runtime_finalization(Arc::new(first_inbox), first_finalizer);
+        let second_finalize = spawn_runtime_finalization(Arc::new(second_inbox), second_finalizer);
+        let peer_keypair = make_keypair();
+        for (namespace, target, body) in [
+            ("realm-one", first_pubkey, "to realm one"),
+            ("realm-two", second_pubkey, "to realm two"),
+        ] {
+            let delivery = registry
+                .send_to_pubkey_in_namespace_with_id_wait(
+                    namespace,
+                    &peer_keypair,
+                    &target,
+                    Uuid::new_v4(),
+                    probe_message(body),
+                    true,
+                )
+                .await
+                .expect("both same-name peers must remain routable");
+            assert!(matches!(
+                delivery.outcome,
+                IngressDeliveryOutcome::DurablyResolved(
+                    meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
+                )
+            ));
+        }
+
+        let first_candidate = first_finalize.await.expect("first finalizer completes");
+        let second_candidate = second_finalize.await.expect("second finalizer completes");
+        for (candidate, expected) in [
+            (first_candidate, "to realm one"),
+            (second_candidate, "to realm two"),
+        ] {
+            match candidate.interaction.content {
+                meerkat_core::InteractionContent::Message { body, blocks: None } => {
+                    assert_eq!(body, expected);
+                }
+                other => panic!("expected Message interaction, got {other:?}"),
+            }
+        }
+    }
+
+    /// The carried 0.8.22 defect: one namespace, one name, two identities. The
+    /// newcomer used to silently unbind the incumbent's only route and the
+    /// incumbent only found out by no longer receiving peer messages. The
+    /// registration is now refused before any mutation, and there is no
+    /// takeover opt-in for any registrant to reach for.
+    #[tokio::test]
+    async fn same_name_in_one_namespace_refuses_takeover_and_incumbent_still_delivers() {
+        let registry = InprocRegistry::new();
+        let namespace = "mob.shared";
+        let name = "mob.shared/lead/lead-1";
+        let incumbent_keypair = make_keypair();
+        let incumbent_pubkey = incumbent_keypair.public_key();
+        let newcomer_keypair = make_keypair();
+        let newcomer_pubkey = newcomer_keypair.public_key();
+        let (incumbent_inbox, incumbent_sender, incumbent_finalizer) =
+            classified_inbox_with_runtime();
+        let (_newcomer_inbox, newcomer_sender) = classified_inbox();
+
+        assert_eq!(
+            registry.register_with_meta_in_namespace(
+                namespace,
+                name,
+                incumbent_pubkey,
+                incumbent_sender,
+                PeerMeta::default(),
+            ),
+            RegistrationOutcome::Registered
+        );
+
+        assert_eq!(
+            registry.register_with_meta_in_namespace(
+                namespace,
+                name,
+                newcomer_pubkey,
+                newcomer_sender,
+                PeerMeta::default(),
+            ),
+            RegistrationOutcome::Rejected {
+                reason: RegistrationRejection::NameOccupied {
+                    holder_pubkey: incumbent_pubkey
+                }
+            },
+            "a foreign identity must not silently take over a live name"
+        );
+        assert_eq!(registry.peers_in_namespace(namespace).len(), 1);
+        assert!(
+            registry
+                .get_by_pubkey_in_namespace(namespace, &newcomer_pubkey)
+                .is_none(),
+            "a refused registration must not install the newcomer route"
+        );
+        assert_eq!(
+            registry.get_name_by_pubkey_in_namespace(namespace, &incumbent_pubkey),
+            Some(name.to_string()),
+            "a refused registration must leave the incumbent name binding intact"
+        );
+
+        // The incumbent is still a live route, not just a surviving map entry.
+        let finalize = spawn_runtime_finalization(Arc::new(incumbent_inbox), incumbent_finalizer);
+        let peer_keypair = make_keypair();
+        let delivery = registry
+            .send_to_pubkey_in_namespace_with_id_wait(
+                namespace,
+                &peer_keypair,
+                &incumbent_pubkey,
+                Uuid::new_v4(),
+                probe_message("incumbent keeps routing"),
+                true,
+            )
+            .await
+            .expect("the refused registration must not have unbound the incumbent");
+        assert!(matches!(
+            delivery.outcome,
+            IngressDeliveryOutcome::DurablyResolved(
+                meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
+            )
+        ));
+        let candidate = finalize.await.expect("incumbent finalizer completes");
+        match candidate.interaction.content {
+            meerkat_core::InteractionContent::Message { body, blocks: None } => {
+                assert_eq!(body, "incumbent keeps routing");
+            }
+            other => panic!("expected Message interaction, got {other:?}"),
+        }
+
+        // The refusal is keyed on IDENTITY, not on the name being busy: the
+        // incumbent's own key may still rebind its own name, because that keeps
+        // the addressable identity reachable (see
+        // `same_identity_rebind_keeps_the_identity_addressable_and_survives_stale_drop`).
+        let (_rebuild_inbox, rebuild_sender) = classified_inbox();
+        assert_eq!(
+            registry.register_with_meta_in_namespace(
+                namespace,
+                name,
+                incumbent_pubkey,
+                rebuild_sender,
+                PeerMeta::default(),
+            ),
+            RegistrationOutcome::ReboundOwnName,
+            "the holder of a name may rebuild its own route"
+        );
+    }
+
+    /// The residual boundary of this design, stated as behaviour rather than as
+    /// a comment: a same-key rebind is admitted, so delivery to the identity
+    /// lands in the NEWEST generation's inbox and the still-live predecessor
+    /// generation is silently orphaned. Nothing at this layer prevents that,
+    /// because two live hosts of one identity are cryptographically the same
+    /// peer and the registry cannot see the difference. Excluding them belongs
+    /// to whoever owns the identity: `SessionClaimHandle` for session
+    /// identities (typed `SessionIdentityInUse`), the mob host binding and
+    /// supervisor authority records for mobs.
+    ///
+    /// The rebind is reported as [`RegistrationOutcome::ReboundOwnName`] so the
+    /// orphaning is at least never silent to the registrant.
+    #[tokio::test]
+    async fn same_identity_rebind_delivers_to_the_newest_generation_only() {
+        let registry = InprocRegistry::new();
+        let namespace = "realm-rebind-delivery";
+        let name = "mob.rebind/lead/lead-1";
+        let keypair = make_keypair();
+        let pubkey = keypair.public_key();
+        let (predecessor_inbox, predecessor_sender, _predecessor_finalizer) =
+            classified_inbox_with_runtime();
+        let (successor_inbox, successor_sender, successor_finalizer) =
+            classified_inbox_with_runtime();
+
+        assert_eq!(
+            registry.register_with_meta_in_namespace(
+                namespace,
+                name,
+                pubkey,
+                predecessor_sender,
+                PeerMeta::default(),
+            ),
+            RegistrationOutcome::Registered
+        );
+        assert_eq!(
+            registry.register_with_meta_in_namespace(
+                namespace,
+                name,
+                pubkey,
+                successor_sender,
+                PeerMeta::default(),
+            ),
+            RegistrationOutcome::ReboundOwnName,
+            "one identity rebuilding its own route is admitted, and reported"
+        );
+
+        let predecessor_inbox = Arc::new(predecessor_inbox);
+        let successor_finalize =
+            spawn_runtime_finalization(Arc::new(successor_inbox), successor_finalizer);
+        let peer_keypair = make_keypair();
+        let delivery = registry
+            .send_to_pubkey_in_namespace_with_id_wait(
+                namespace,
+                &peer_keypair,
+                &pubkey,
+                Uuid::new_v4(),
+                probe_message("after the rebind"),
+                true,
+            )
+            .await
+            .expect("the identity must stay addressable across the rebind");
+        assert!(matches!(
+            delivery.outcome,
+            IngressDeliveryOutcome::DurablyResolved(
+                meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
+            )
+        ));
+
+        let candidate = successor_finalize
+            .await
+            .expect("successor finalizer completes");
+        match candidate.interaction.content {
+            meerkat_core::InteractionContent::Message { body, blocks: None } => {
+                assert_eq!(body, "after the rebind");
+            }
+            other => panic!("expected Message interaction, got {other:?}"),
+        }
+        assert!(
+            predecessor_inbox.try_claim_one_classified().is_none(),
+            "the superseded generation is orphaned by the rebind: this layer routes one \
+             identity to exactly one inbox and cannot tell a rebuild from a second live host"
+        );
+    }
+
+    /// Same namespace, same name, same signing key, new inbox generation: one
+    /// identity reconstructing itself. This is permitted, and the two safety
+    /// properties that make it *not* a route displacement are what this test
+    /// pins:
+    ///
+    /// 1. the key peers address never stops resolving, and after the rebind it
+    ///    resolves to the newest generation;
+    /// 2. the predecessor generation's later unregistration (its `Drop`) is
+    ///    generation-checked, so it cannot unbind the successor.
+    ///
+    /// The outcome is reported as [`RegistrationOutcome::ReboundOwnName`] rather
+    /// than a clean `Registered`, because the predecessor generation does stop
+    /// receiving and that fact must not be silent.
     #[test]
-    fn registration_outcome_is_typed_for_displacement_and_rejection() {
+    fn same_identity_rebind_keeps_the_identity_addressable_and_survives_stale_drop() {
+        let registry = InprocRegistry::new();
+        let namespace = "realm-rebind";
+        let keypair = make_keypair();
+        let pubkey = keypair.public_key();
+        let (_first_inbox, first_sender) = classified_inbox();
+        let (_second_inbox, second_sender) = classified_inbox();
+
+        assert_eq!(
+            registry.register_with_meta_in_namespace(
+                namespace,
+                "agent",
+                pubkey,
+                first_sender.clone(),
+                PeerMeta::default(),
+            ),
+            RegistrationOutcome::Registered
+        );
+        assert_eq!(
+            registry.register_with_meta_in_namespace(
+                namespace,
+                "agent",
+                pubkey,
+                second_sender.clone(),
+                PeerMeta::default(),
+            ),
+            RegistrationOutcome::ReboundOwnName,
+            "re-registering the same identity is a rebind, and it is reported as one"
+        );
+        let live = registry
+            .get_by_pubkey_in_namespace(namespace, &pubkey)
+            .expect("the identity must never stop being addressable");
+        assert!(
+            live.same_inbox(&second_sender),
+            "the rebind must resolve to the newest inbox generation"
+        );
+        assert_eq!(registry.peers_in_namespace(namespace).len(), 1);
+
+        // The predecessor generation is torn down afterwards. Its
+        // generation-checked unregistration must not unbind the successor.
+        assert!(
+            !registry.unregister_sender_in_namespace(namespace, &pubkey, &first_sender),
+            "a stale generation must not be able to remove the live route"
+        );
+        let live = registry
+            .get_by_pubkey_in_namespace(namespace, &pubkey)
+            .expect("the successor route must survive the predecessor teardown");
+        assert!(live.same_inbox(&second_sender));
+        assert_eq!(
+            registry.get_name_by_pubkey_in_namespace(namespace, &pubkey),
+            Some("agent".to_string())
+        );
+    }
+
+    /// A name released by its holder is reusable by a *different* identity: the
+    /// refusal is a liveness boundary on the incumbent route, not a permanent
+    /// reservation of the name.
+    #[test]
+    fn a_released_name_is_claimable_by_a_different_identity() {
+        let registry = InprocRegistry::new();
+        let namespace = "realm-release";
+        let first = make_keypair().public_key();
+        let second = make_keypair().public_key();
+        let (_first_inbox, first_sender) = classified_inbox();
+        let (_second_inbox, second_sender) = classified_inbox();
+
+        assert_eq!(
+            registry.register_with_meta_in_namespace(
+                namespace,
+                "agent",
+                first,
+                first_sender.clone(),
+                PeerMeta::default(),
+            ),
+            RegistrationOutcome::Registered
+        );
+        assert_eq!(
+            registry.register_with_meta_in_namespace(
+                namespace,
+                "agent",
+                second,
+                second_sender.clone(),
+                PeerMeta::default(),
+            ),
+            RegistrationOutcome::Rejected {
+                reason: RegistrationRejection::NameOccupied {
+                    holder_pubkey: first
+                }
+            }
+        );
+
+        assert!(registry.unregister_sender_in_namespace(namespace, &first, &first_sender));
+        assert_eq!(
+            registry.register_with_meta_in_namespace(
+                namespace,
+                "agent",
+                second,
+                second_sender.clone(),
+                PeerMeta::default(),
+            ),
+            RegistrationOutcome::Registered,
+            "a released name must be claimable by the next identity"
+        );
+        assert!(
+            registry
+                .get_by_pubkey_in_namespace(namespace, &second)
+                .is_some_and(|live| live.same_inbox(&second_sender))
+        );
+        assert!(
+            registry
+                .get_by_pubkey_in_namespace(namespace, &first)
+                .is_none()
+        );
+    }
+
+    /// The exact-generation seam is the one reconstruction path that CAN take a
+    /// live name over, because the caller has to present the predecessor
+    /// generation it is replacing. A caller that presents a stale generation is
+    /// refused and the live route is untouched.
+    #[test]
+    fn exact_generation_replacement_is_the_authorized_reconstruction_seam() {
+        let registry = InprocRegistry::new();
+        let namespace = "realm-exact";
+        let name = "agent";
+        let incumbent = make_keypair().public_key();
+        let successor = make_keypair().public_key();
+        let (_incumbent_inbox, incumbent_sender) = classified_inbox();
+        let (_stale_inbox, stale_sender) = classified_inbox();
+        let (_successor_inbox, successor_sender) = classified_inbox();
+
+        assert_eq!(
+            registry.register_with_meta_in_namespace(
+                namespace,
+                name,
+                incumbent,
+                incumbent_sender.clone(),
+                PeerMeta::default(),
+            ),
+            RegistrationOutcome::Registered
+        );
+
+        // A witness that is not the live generation proves nothing.
+        assert_eq!(
+            registry.replace_sender_in_namespace(
+                namespace,
+                name,
+                (&incumbent, &stale_sender),
+                successor,
+                successor_sender.clone(),
+            ),
+            Err(InprocPublicationError::ExpectedGenerationNotCurrent)
+        );
+        assert!(
+            registry
+                .get_by_pubkey_in_namespace(namespace, &incumbent)
+                .is_some_and(|live| live.same_inbox(&incumbent_sender)),
+            "a refused replacement must leave the live generation in place"
+        );
+
+        // The live generation authorizes the takeover.
+        assert_eq!(
+            registry.replace_sender_in_namespace(
+                namespace,
+                name,
+                (&incumbent, &incumbent_sender),
+                successor,
+                successor_sender.clone(),
+            ),
+            Ok(())
+        );
+        assert!(
+            registry
+                .get_by_pubkey_in_namespace(namespace, &incumbent)
+                .is_none(),
+            "the replaced generation must no longer be reachable"
+        );
+        assert!(
+            registry
+                .get_by_pubkey_in_namespace(namespace, &successor)
+                .is_some_and(|live| live.same_inbox(&successor_sender))
+        );
+        assert_eq!(registry.peers_in_namespace(namespace).len(), 1);
+    }
+
+    /// ROW #292 gate: registration returns a typed [`RegistrationOutcome`] that
+    /// surfaces its own rename, name occupancy and zero-pubkey rejection,
+    /// instead of silently evicting and returning `()`.
+    #[test]
+    fn registration_outcome_is_typed_for_rename_and_rejection() {
         let registry = InprocRegistry::new();
         let keypair = make_keypair();
         let pubkey = keypair.public_key();
@@ -936,16 +1471,22 @@ mod tests {
             }
         );
 
-        // Re-registering an existing NAME with a NEW pubkey evicts the old
-        // pubkey and reports it typed.
+        // Re-registering an existing NAME with a NEW pubkey is refused and
+        // reports which key holds the live route.
         let other = make_keypair();
         let other_pubkey = other.public_key();
-        match registry.register("agent-v2", other_pubkey, sender3) {
-            RegistrationOutcome::EvictedName { evicted_pubkey } => {
-                assert_eq!(evicted_pubkey, pubkey);
+        assert_eq!(
+            registry.register("agent-v2", other_pubkey, sender3),
+            RegistrationOutcome::Rejected {
+                reason: RegistrationRejection::NameOccupied {
+                    holder_pubkey: pubkey
+                }
             }
-            other => panic!("expected EvictedName, got {other:?}"),
-        }
+        );
+        assert!(
+            registry.contains(&pubkey),
+            "the refused registration must leave the live route in place"
+        );
 
         // A zero pubkey is refused fail-closed with a typed rejection, no
         // mutation.
@@ -960,9 +1501,10 @@ mod tests {
         assert!(!registry.contains_name("zero"));
     }
 
-    /// Test that the ABA scenario is handled correctly:
-    /// When a new agent registers with the same name, the old agent's
-    /// unregister call (on Drop) should be a safe no-op.
+    /// Test that the ABA scenario is handled correctly: after a name has been
+    /// released and re-registered under a new identity, a late unregister from
+    /// the old owner (its `Drop`) must be a safe no-op rather than unbinding
+    /// the successor.
     #[test]
     fn test_registry_aba_scenario_safe() {
         let registry = InprocRegistry::new();
@@ -974,21 +1516,30 @@ mod tests {
         let (_, sender_new) = classified_inbox();
 
         // Step 1: Old runtime registers
-        registry.register("agent", pubkey_old, sender_old);
+        registry.register("agent", pubkey_old, sender_old.clone());
         assert!(registry.contains(&pubkey_old));
 
-        // Step 2: New runtime registers same name (evicts old)
-        registry.register("agent", pubkey_new, sender_new);
-        assert!(
-            !registry.contains(&pubkey_old),
-            "old pubkey should be evicted"
+        // Step 2: The old route is released, then a new runtime takes the freed
+        // name. A live name is never displaced, so release has to come first.
+        assert!(registry.unregister_sender_in_namespace(
+            DEFAULT_NAMESPACE,
+            &pubkey_old,
+            &sender_old
+        ));
+        assert_eq!(
+            registry.register("agent", pubkey_new, sender_new),
+            RegistrationOutcome::Registered
         );
+        assert!(!registry.contains(&pubkey_old));
         assert!(registry.contains(&pubkey_new));
 
         // Step 3: Old runtime drops and calls unregister(pubkey_old)
-        // This should be a no-op since pubkey_old was already evicted
+        // This should be a no-op since pubkey_old was already released
         let removed = registry.unregister(&pubkey_old);
-        assert!(!removed, "unregister of evicted pubkey should return false");
+        assert!(
+            !removed,
+            "unregister of released pubkey should return false"
+        );
 
         // New agent should still be registered (not affected by old unregister)
         assert!(

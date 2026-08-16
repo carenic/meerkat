@@ -211,6 +211,39 @@ pub trait CompactionCommitCoordinator: Send + Sync {
     ) -> Result<(), CompactionCommitCoordinationError>;
 }
 
+/// Typed cause of a compaction projection-handoff refusal.
+///
+/// The runtime coordinator refuses for structurally different reasons, and a
+/// host routing severity (page vs log) needs the cause, not a message
+/// substring. This is the wire-stable vocabulary carried by
+/// [`crate::event::CompactionFailureReason::ProjectionHandoffRefused`];
+/// [`CompactionCommitCoordinationError::refusal`] is its only producer.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CompactionHandoffRefusal {
+    /// The projection belongs to a different session than the coordinator.
+    SessionMismatch,
+    /// The runtime epoch that minted the coordinator is no longer the session's
+    /// live epoch, and one bounded re-derivation did not recover it.
+    RuntimeEpochRotated,
+    /// The coordinator's epoch is gone: its runtime was unregistered, retired,
+    /// or its durability authority is not ready.
+    RuntimeEpochRetired,
+    /// The session's exact runtime placement (runtime id, fence token,
+    /// generation) rotated after the coordinator latched it.
+    RuntimeBindingRotated,
+    /// The session carries no authoritative runtime placement to commit
+    /// against.
+    RuntimeBindingAbsent,
+    /// The runtime has no durable store, or its store cannot commit a
+    /// transcript rewrite and its memory projection atomically.
+    DurableProjectionUnsupported,
+    /// A host-supplied coordinator refused without a typed cause.
+    Unclassified,
+}
+
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum CompactionCommitCoordinationError {
     #[error(
@@ -220,8 +253,42 @@ pub enum CompactionCommitCoordinationError {
         expected: crate::types::SessionId,
         actual: crate::types::SessionId,
     },
-    #[error("compaction projection coordinator rejected the handoff: {0}")]
-    Rejected(String),
+    /// A typed refusal. `detail` is a diagnostic rendering of the exact facts
+    /// behind `refusal`; it is never the carrier of the cause itself.
+    #[error("compaction projection coordinator rejected the handoff: {detail}")]
+    Refused {
+        refusal: CompactionHandoffRefusal,
+        detail: String,
+    },
+}
+
+impl CompactionCommitCoordinationError {
+    /// Refusal without a typed cause, for coordinators outside this workspace.
+    #[must_use]
+    pub fn rejected(detail: impl Into<String>) -> Self {
+        Self::Refused {
+            refusal: CompactionHandoffRefusal::Unclassified,
+            detail: detail.into(),
+        }
+    }
+
+    /// Typed refusal carrying the exact cause.
+    #[must_use]
+    pub fn refused(refusal: CompactionHandoffRefusal, detail: impl Into<String>) -> Self {
+        Self::Refused {
+            refusal,
+            detail: detail.into(),
+        }
+    }
+
+    /// The wire-stable typed cause of this refusal.
+    #[must_use]
+    pub fn refusal(&self) -> CompactionHandoffRefusal {
+        match self {
+            Self::SessionMismatch { .. } => CompactionHandoffRefusal::SessionMismatch,
+            Self::Refused { refusal, .. } => *refusal,
+        }
+    }
 }
 
 /// Receipt for an invisible durable stage.

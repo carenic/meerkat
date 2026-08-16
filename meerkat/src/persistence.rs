@@ -471,6 +471,12 @@ pub struct PreV0810DomainBridgeReport {
     pub ledger_established: bool,
     /// Durable records rewritten by the domain's scoped preparation callback.
     pub prepared_rows: usize,
+    /// Durable records the preparation callback could not carry forward, each
+    /// named with its reason. The domain still landed and these records' bytes
+    /// were left exactly as found: nothing was deleted or blanked. A non-empty
+    /// list is not a domain failure, but it is state this binary cannot read,
+    /// so every caller must surface it rather than counting only what landed.
+    pub refused_records: Vec<meerkat_sqlite::MaintenanceRecordRefusal>,
 }
 
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
@@ -480,18 +486,233 @@ impl PreV0810DomainBridgeReport {
     pub fn changed(&self) -> bool {
         self.ledger_established || self.from_version != self.to_version || self.prepared_rows != 0
     }
+
+    /// True when some durable record in this domain was left behind.
+    pub fn left_records_behind(&self) -> bool {
+        !self.refused_records.is_empty()
+    }
+}
+
+/// Why one domain did not land during the explicit pre-0.8.10 bridge.
+///
+/// Every variant is fail-closed for the domain it names: nothing was stamped
+/// and no schema advanced. It exists so a refusal that only one domain earned
+/// cannot silently condemn its co-tenants, and so the operator sees which
+/// refusal they actually hit.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PreV0810DomainRefusal {
+    /// No frozen released catalog authenticates this domain's on-disk shape,
+    /// so the binary cannot prove which release wrote it. The realm predates
+    /// every source catalog this binary can bridge.
+    UnauthenticatedSourceCatalog,
+    /// The catalog authenticated but the migration chain refused to advance
+    /// it. The domain is left at its prior version.
+    MigrationRefused,
+    /// The database file holding this domain could not be opened for
+    /// maintenance, so the domain was never inspected.
+    DatabaseUnopenable,
+    /// Not attempted, because a domain this one reads from did not land.
+    SkippedUnsatisfiedPrerequisite,
+}
+
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+impl PreV0810DomainRefusal {
+    /// Stable operator-facing label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnauthenticatedSourceCatalog => "unauthenticated-source-catalog",
+            Self::MigrationRefused => "migration-refused",
+            Self::DatabaseUnopenable => "database-unopenable",
+            Self::SkippedUnsatisfiedPrerequisite => "skipped-unsatisfied-prerequisite",
+        }
+    }
+}
+
+/// One domain the explicit pre-0.8.10 bridge refused, with the reason.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreV0810DomainBridgeFailure {
+    /// Database file containing the domain.
+    pub database: PathBuf,
+    /// Stable ledger domain name.
+    pub domain: String,
+    /// Typed classification of the refusal.
+    pub refusal: PreV0810DomainRefusal,
+    /// Full text of the owning migration manifest's refusal.
+    pub detail: String,
 }
 
 /// Result of the explicit pre-0.8.10 bridge across the SQLite files that
 /// already exist in one realm.
+///
+/// Each domain owns its own transaction, so a domain that committed stays
+/// committed when a later domain refuses. `domains` therefore records durable
+/// progress and `failures` records refusals; both must be surfaced. A report
+/// with a non-empty `failures` is not a success, and callers decide policy
+/// through [`PreV0810RealmBridgeReport::is_complete`].
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PreV0810RealmBridgeReport {
     /// Domains considered, in dependency-safe bridge order.
     pub domains: Vec<PreV0810DomainBridgeReport>,
+    /// Domains this bridge refused, in the same order.
+    pub failures: Vec<PreV0810DomainBridgeFailure>,
     /// Existing SQLite companions skipped because the realm manifest names a
     /// different durable authority.
     pub inactive_databases: Vec<PathBuf>,
+}
+
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+impl PreV0810RealmBridgeReport {
+    /// True when every domain the bridge considered landed.
+    ///
+    /// Deliberately says nothing about individual records. A domain that
+    /// landed while leaving one record behind is complete *as a domain*: the
+    /// schema advanced, the ledger is stamped, and the realm opens. Whether
+    /// records stayed behind is a separate question with a separate answer,
+    /// [`Self::records_left_behind`], because conflating them is what made
+    /// one unrepresentable row cost an operator their whole realm.
+    pub fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// Every durable record the bridge could not carry forward, across all
+    /// domains that landed. Their bytes were left exactly as found.
+    pub fn records_left_behind(
+        &self,
+    ) -> impl Iterator<Item = (&str, &meerkat_sqlite::MaintenanceRecordRefusal)> {
+        self.domains.iter().flat_map(|domain| {
+            domain
+                .refused_records
+                .iter()
+                .map(|refusal| (domain.domain.as_str(), refusal))
+        })
+    }
+
+    /// True when some domain durably advanced, stamped, or rewrote payloads.
+    pub fn changed_anything(&self) -> bool {
+        self.domains.iter().any(PreV0810DomainBridgeReport::changed)
+    }
+}
+
+/// Classify a domain refusal without discarding its text.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+fn classify_pre_v0_8_10_refusal(error: &meerkat_sqlite::SqliteStoreError) -> PreV0810DomainRefusal {
+    match error {
+        meerkat_sqlite::SqliteStoreError::UnledgeredSchemaNoMatch { .. }
+        | meerkat_sqlite::SqliteStoreError::UnledgeredSchemaAmbiguous { .. }
+        | meerkat_sqlite::SqliteStoreError::UnledgeredDomainObjects { .. }
+        | meerkat_sqlite::SqliteStoreError::UnsupportedSchemaPredecessor { .. } => {
+            PreV0810DomainRefusal::UnauthenticatedSourceCatalog
+        }
+        _ => PreV0810DomainRefusal::MigrationRefused,
+    }
+}
+
+/// Record one domain's bridge outcome. Returns true when the domain landed,
+/// so a dependent domain can be skipped rather than run against a source its
+/// prerequisite did not establish.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+fn record_pre_v0_8_10_outcome(
+    report: &mut PreV0810RealmBridgeReport,
+    database: &Path,
+    domain: &meerkat_sqlite::SchemaDomain,
+    ledger_before: Option<i64>,
+    outcome: Result<meerkat_sqlite::MaintenanceBridgeReport, meerkat_sqlite::SqliteStoreError>,
+) -> bool {
+    match outcome {
+        Ok(result) => {
+            record_pre_v0_8_10_domain(report, database, domain, ledger_before, result);
+            true
+        }
+        Err(error) => {
+            report.failures.push(PreV0810DomainBridgeFailure {
+                database: database.to_path_buf(),
+                domain: domain.name.to_string(),
+                refusal: classify_pre_v0_8_10_refusal(&error),
+                detail: StoreError::from(error).to_string(),
+            });
+            false
+        }
+    }
+}
+
+/// Record every domain in a database the bridge could not open at all.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+fn record_pre_v0_8_10_unopenable(
+    report: &mut PreV0810RealmBridgeReport,
+    database: &Path,
+    domains: &[&meerkat_sqlite::SchemaDomain],
+    error: &meerkat_sqlite::SqliteStoreError,
+) {
+    let detail = error.to_string();
+    for domain in domains {
+        report.failures.push(PreV0810DomainBridgeFailure {
+            database: database.to_path_buf(),
+            domain: domain.name.to_string(),
+            refusal: PreV0810DomainRefusal::DatabaseUnopenable,
+            detail: detail.clone(),
+        });
+    }
+}
+
+/// Bridge one domain that owns its database file outright.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+fn bridge_pre_v0_8_10_single_domain_file(
+    report: &mut PreV0810RealmBridgeReport,
+    database: &Path,
+    domain: &meerkat_sqlite::SchemaDomain,
+    prepare: Option<meerkat_sqlite::MaintenancePrepareFn>,
+) {
+    if !database.is_file() {
+        return;
+    }
+    let mut conn = match meerkat_sqlite::open(
+        database,
+        meerkat_sqlite::ConnectionProfile::Maintenance { write: true },
+    ) {
+        Ok(conn) => conn,
+        Err(error) => {
+            record_pre_v0_8_10_unopenable(report, database, &[domain], &error);
+            return;
+        }
+    };
+    let ledger_before = match meerkat_sqlite::domain_version(&conn, domain.name) {
+        Ok(found) => found,
+        Err(error) => {
+            record_pre_v0_8_10_outcome(report, database, domain, None, Err(error));
+            return;
+        }
+    };
+    let outcome = meerkat_sqlite::bridge_unledgered_domain(
+        &mut conn,
+        domain,
+        domain.supported_version(),
+        domain.bridge_recoverable_versions,
+        prepare,
+    );
+    record_pre_v0_8_10_outcome(report, database, domain, ledger_before, outcome);
+}
+
+/// Record a domain the bridge deliberately did not attempt.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+fn record_pre_v0_8_10_skip(
+    report: &mut PreV0810RealmBridgeReport,
+    database: &Path,
+    domain: &meerkat_sqlite::SchemaDomain,
+    prerequisite: &str,
+) {
+    report.failures.push(PreV0810DomainBridgeFailure {
+        database: database.to_path_buf(),
+        domain: domain.name.to_string(),
+        refusal: PreV0810DomainRefusal::SkippedUnsatisfiedPrerequisite,
+        detail: format!(
+            "not attempted because prerequisite domain '{prerequisite}' did not land in the \
+             same database; this domain's migration reads state that domain owns"
+        ),
+    });
 }
 
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
@@ -509,6 +730,7 @@ fn record_pre_v0_8_10_domain(
         to_version: result.to_version,
         ledger_established: ledger_before.is_none() && result.to_version != 0,
         prepared_rows: result.prepared,
+        refused_records: result.refused,
     });
 }
 
@@ -660,146 +882,140 @@ pub fn bridge_pre_0_8_10_realm_storage_in(
     // The SQLite realm backend co-tenants these three domains in the session
     // database. Session migration runs first because runtime migration imports
     // session snapshots; scheduling follows both runtime authorities.
+    //
+    // Each domain owns its own transaction, so one domain's refusal is not
+    // evidence about its co-tenants: it is recorded and the next domain is
+    // still attempted. Only the true prerequisite edge is honoured - the
+    // runtime bridge imports session snapshots, so a failed session-store
+    // skips it. Schedule migrations read only schedule-owned objects, so they
+    // proceed regardless. The cross-file census above stays an all-or-nothing
+    // preflight on purpose: it runs before the first write, and a malformed or
+    // future-version ledger anywhere means this binary must not begin.
     if paths.sessions_sqlite_path.is_file() {
         let database = &paths.sessions_sqlite_path;
-        let mut conn = meerkat_sqlite::open(
+        let sessions_file_domains: &[&meerkat_sqlite::SchemaDomain] = &[
+            &meerkat_store::sqlite_store::SESSION_STORE_DOMAIN,
+            &meerkat_runtime::store::sqlite::RUNTIME_STORE_DOMAIN,
+            &meerkat_store::schedule_sqlite_store::SCHEDULE_STORE_DOMAIN,
+        ];
+        match meerkat_sqlite::open(
             database,
             meerkat_sqlite::ConnectionProfile::Maintenance { write: true },
-        )
-        .map_err(StoreError::from)?;
-
-        let domain = &meerkat_store::sqlite_store::SESSION_STORE_DOMAIN;
-        let ledger_before =
-            meerkat_sqlite::domain_version(&conn, domain.name).map_err(StoreError::from)?;
-        let result = meerkat_core::with_pre_floor_provider_image_metadata_import(|| {
-            meerkat_sqlite::bridge_unledgered_domain(
-                &mut conn,
-                domain,
-                domain.supported_version(),
-                &[1],
-                Some(meerkat_store::sqlite_store::prepare_pre_0_8_10_session_base_schema),
-            )
-        })
-        .map_err(StoreError::from)?;
-        record_pre_v0_8_10_domain(&mut report, database, domain, ledger_before, result);
-
-        let domain = &meerkat_runtime::store::sqlite::RUNTIME_STORE_DOMAIN;
-        let ledger_before =
-            meerkat_sqlite::domain_version(&conn, domain.name).map_err(StoreError::from)?;
-        let result = meerkat_core::with_pre_floor_provider_image_metadata_import(|| {
-            meerkat_sqlite::bridge_unledgered_domain(
-                &mut conn,
-                domain,
-                domain.supported_version(),
-                &[1],
-                Some(meerkat_runtime::store::sqlite::prepare_pre_0_8_10_runtime_input_states),
-            )
-        })
-        .map_err(StoreError::from)?;
-        record_pre_v0_8_10_domain(&mut report, database, domain, ledger_before, result);
-
-        let domain = &meerkat_store::schedule_sqlite_store::SCHEDULE_STORE_DOMAIN;
-        let ledger_before =
-            meerkat_sqlite::domain_version(&conn, domain.name).map_err(StoreError::from)?;
-        let result = meerkat_sqlite::bridge_unledgered_domain(
-            &mut conn,
-            domain,
-            domain.supported_version(),
-            &[1],
-            None,
-        )
-        .map_err(StoreError::from)?;
-        record_pre_v0_8_10_domain(&mut report, database, domain, ledger_before, result);
-    }
-
-    let workgraph_db = paths.root.join("workgraph.sqlite3");
-    if workgraph_db.is_file() {
-        let mut conn = meerkat_sqlite::open(
-            &workgraph_db,
-            meerkat_sqlite::ConnectionProfile::Maintenance { write: true },
-        )
-        .map_err(StoreError::from)?;
-        let domain = &meerkat_workgraph::WORKGRAPH_DOMAIN;
-        let ledger_before =
-            meerkat_sqlite::domain_version(&conn, domain.name).map_err(StoreError::from)?;
-        let result = meerkat_sqlite::bridge_unledgered_domain(
-            &mut conn,
-            domain,
-            domain.supported_version(),
-            &[1, 2],
-            Some(meerkat_workgraph::prepare_pre_0_8_10_workgraph_attention),
-        )
-        .map_err(StoreError::from)?;
-        record_pre_v0_8_10_domain(&mut report, &workgraph_db, domain, ledger_before, result);
-    }
-
-    if paths.jobs_sqlite_path.is_file() {
-        let database = &paths.jobs_sqlite_path;
-        let mut conn = meerkat_sqlite::open(
-            database,
-            meerkat_sqlite::ConnectionProfile::Maintenance { write: true },
-        )
-        .map_err(StoreError::from)?;
-        let domain = &meerkat_jobs::JOBS_DOMAIN;
-        let ledger_before =
-            meerkat_sqlite::domain_version(&conn, domain.name).map_err(StoreError::from)?;
-        let result = meerkat_sqlite::bridge_unledgered_domain(
-            &mut conn,
-            domain,
-            domain.supported_version(),
-            &[1],
-            None,
-        )
-        .map_err(StoreError::from)?;
-        record_pre_v0_8_10_domain(&mut report, database, domain, ledger_before, result);
-    }
-
-    #[cfg(feature = "memory-store-session")]
-    {
-        let memory_db = paths.root.join("memory").join("memory.sqlite3");
-        if memory_db.is_file() {
-            let mut conn = meerkat_sqlite::open(
-                &memory_db,
-                meerkat_sqlite::ConnectionProfile::Maintenance { write: true },
-            )
-            .map_err(StoreError::from)?;
-            let domain = &meerkat_memory::MEMORY_DOMAIN;
-            let ledger_before =
-                meerkat_sqlite::domain_version(&conn, domain.name).map_err(StoreError::from)?;
-            let result = meerkat_sqlite::bridge_unledgered_domain(
-                &mut conn,
-                domain,
-                domain.supported_version(),
-                &[1],
-                None,
-            )
-            .map_err(StoreError::from)?;
-            record_pre_v0_8_10_domain(&mut report, &memory_db, domain, ledger_before, result);
+        ) {
+            Ok(mut conn) => {
+                bridge_pre_v0_8_10_sessions_file(&mut report, database, &mut conn);
+            }
+            Err(error) => {
+                record_pre_v0_8_10_unopenable(&mut report, database, sessions_file_domains, &error);
+            }
         }
     }
 
-    let tasks_db = paths.root.join("tasks.db");
-    if tasks_db.is_file() {
-        let mut conn = meerkat_sqlite::open(
-            &tasks_db,
-            meerkat_sqlite::ConnectionProfile::Maintenance { write: true },
-        )
-        .map_err(StoreError::from)?;
-        let domain = &meerkat_tools::TOOLS_TASKS_DOMAIN;
-        let ledger_before =
-            meerkat_sqlite::domain_version(&conn, domain.name).map_err(StoreError::from)?;
-        let result = meerkat_sqlite::bridge_unledgered_domain(
-            &mut conn,
-            domain,
-            domain.supported_version(),
-            &[1],
-            None,
-        )
-        .map_err(StoreError::from)?;
-        record_pre_v0_8_10_domain(&mut report, &tasks_db, domain, ledger_before, result);
-    }
+    bridge_pre_v0_8_10_single_domain_file(
+        &mut report,
+        &paths.root.join("workgraph.sqlite3"),
+        &meerkat_workgraph::WORKGRAPH_DOMAIN,
+        Some(meerkat_workgraph::prepare_pre_0_8_10_workgraph_attention),
+    );
+
+    bridge_pre_v0_8_10_single_domain_file(
+        &mut report,
+        &paths.jobs_sqlite_path,
+        &meerkat_jobs::JOBS_DOMAIN,
+        None,
+    );
+
+    #[cfg(feature = "memory-store-session")]
+    bridge_pre_v0_8_10_single_domain_file(
+        &mut report,
+        &paths.root.join("memory").join("memory.sqlite3"),
+        &meerkat_memory::MEMORY_DOMAIN,
+        None,
+    );
+
+    bridge_pre_v0_8_10_single_domain_file(
+        &mut report,
+        &paths.root.join("tasks.db"),
+        &meerkat_tools::TOOLS_TASKS_DOMAIN,
+        None,
+    );
 
     Ok(report)
+}
+
+/// Bridge the three domains that co-tenant one realm's sessions database.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+fn bridge_pre_v0_8_10_sessions_file(
+    report: &mut PreV0810RealmBridgeReport,
+    database: &Path,
+    conn: &mut meerkat_sqlite::Connection,
+) {
+    let session_domain = &meerkat_store::sqlite_store::SESSION_STORE_DOMAIN;
+    let session_landed = match meerkat_sqlite::domain_version(conn, session_domain.name) {
+        Ok(ledger_before) => {
+            let outcome = meerkat_core::with_pre_floor_provider_image_metadata_import(|| {
+                meerkat_sqlite::bridge_unledgered_domain(
+                    conn,
+                    session_domain,
+                    session_domain.supported_version(),
+                    session_domain.bridge_recoverable_versions,
+                    Some(meerkat_store::sqlite_store::prepare_pre_0_8_10_session_base_schema),
+                )
+            });
+            record_pre_v0_8_10_outcome(report, database, session_domain, ledger_before, outcome)
+        }
+        Err(error) => {
+            record_pre_v0_8_10_outcome(report, database, session_domain, None, Err(error))
+        }
+    };
+
+    let runtime_domain = &meerkat_runtime::store::sqlite::RUNTIME_STORE_DOMAIN;
+    if session_landed {
+        match meerkat_sqlite::domain_version(conn, runtime_domain.name) {
+            Ok(ledger_before) => {
+                let outcome = meerkat_core::with_pre_floor_provider_image_metadata_import(|| {
+                    meerkat_sqlite::bridge_unledgered_domain(
+                        conn,
+                        runtime_domain,
+                        runtime_domain.supported_version(),
+                        runtime_domain.bridge_recoverable_versions,
+                        Some(
+                            meerkat_runtime::store::sqlite::prepare_pre_0_8_10_runtime_input_states,
+                        ),
+                    )
+                });
+                record_pre_v0_8_10_outcome(
+                    report,
+                    database,
+                    runtime_domain,
+                    ledger_before,
+                    outcome,
+                );
+            }
+            Err(error) => {
+                record_pre_v0_8_10_outcome(report, database, runtime_domain, None, Err(error));
+            }
+        }
+    } else {
+        record_pre_v0_8_10_skip(report, database, runtime_domain, session_domain.name);
+    }
+
+    let schedule_domain = &meerkat_store::schedule_sqlite_store::SCHEDULE_STORE_DOMAIN;
+    match meerkat_sqlite::domain_version(conn, schedule_domain.name) {
+        Ok(ledger_before) => {
+            let outcome = meerkat_sqlite::bridge_unledgered_domain(
+                conn,
+                schedule_domain,
+                schedule_domain.supported_version(),
+                schedule_domain.bridge_recoverable_versions,
+                None,
+            );
+            record_pre_v0_8_10_outcome(report, database, schedule_domain, ledger_before, outcome);
+        }
+        Err(error) => {
+            record_pre_v0_8_10_outcome(report, database, schedule_domain, None, Err(error));
+        }
+    }
 }
 
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
@@ -1157,6 +1373,722 @@ mod tests {
             ephemeral_domains: Vec::new(),
         };
         std::fs::write(&paths.manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+        Ok(())
+    }
+
+    /// Copy a whole realm tree, including the derived `.rkat` projection the
+    /// published writer left beside its databases.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn copy_realm_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let target = destination.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_realm_tree(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), target)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stage a realm written by a published pre-0.8.10 `rkat` into `state`.
+    ///
+    /// The corpus is owned by `meerkat-runtime` and minted from the release
+    /// assets; see `tests/fixtures/v0_7_x_pre_ledger_realm`. Copying the whole
+    /// directory keeps every byte the released writer left, including its own
+    /// realm manifest.
+    ///
+    /// `capture` selects which run of that release is staged.
+    /// `bootstrap-only` died before admitting any input and carries no
+    /// `runtime_input_states` rows; `attempted-turn` admitted the operator's
+    /// prompt and persisted it before the provider call failed, so it is the
+    /// only shape that reaches the runtime bridge's row-preparation callback.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn stage_published_pre_ledger_realm(
+        state_root: &Path,
+        realm_id: &str,
+        version: &str,
+        capture: &str,
+    ) -> Result<meerkat_store::RealmPaths, Box<dyn std::error::Error>> {
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../meerkat-runtime/tests/fixtures/v0_7_x_pre_ledger_realm/corpus/realms")
+            .join(version)
+            .join(capture);
+        assert!(
+            corpus.is_dir(),
+            "RELEASE BLOCKER: published pre-ledger realm corpus is missing at {}; re-mint it \
+             with meerkat-runtime/tests/fixtures/v0_7_x_pre_ledger_realm/mint_pre_ledger_fixture.py",
+            corpus.display()
+        );
+        let paths = realm_paths_in(state_root, realm_id);
+        copy_realm_tree(&corpus, &paths.root)?;
+        // The corpus realm is named `legacy-realm`; rewrite only the identity
+        // so one corpus can stage under any test realm id.
+        write_builtin_manifest(&paths, realm_id, RealmBackend::Sqlite)?;
+        Ok(paths)
+    }
+
+    /// Diverge one domain's catalog so no frozen released verifier can
+    /// authenticate it, without touching its co-tenants.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn diverge_catalog(database: &Path, statement: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = meerkat_sqlite::open(
+            database,
+            meerkat_sqlite::ConnectionProfile::Maintenance { write: true },
+        )?;
+        conn.execute_batch(statement)?;
+        Ok(())
+    }
+
+    /// A domain the bridge cannot authenticate must not condemn the domains
+    /// that share its file.
+    ///
+    /// This is the 0.8.23 shape: runtime-store refused, and because the loop
+    /// returned on the first failure, schedule-store was never attempted even
+    /// though it would have migrated cleanly. Two of three recoverable
+    /// domains landed zero.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn unbridgeable_domain_does_not_condemn_its_co_tenants()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let realm_id = "legacy-realm";
+        let paths =
+            stage_published_pre_ledger_realm(temp.path(), realm_id, "0.7.5", "bootstrap-only")?;
+        diverge_catalog(
+            &paths.sessions_sqlite_path,
+            "ALTER TABLE runtime_states ADD COLUMN unreleased_column TEXT",
+        )?;
+
+        let fence = meerkat_store::migrate::RealmMaintenanceFence::acquire(
+            &paths.root,
+            Duration::from_secs(1),
+        )?;
+        let report = bridge_pre_0_8_10_realm_storage_in(temp.path(), realm_id, &fence)?;
+        drop(fence);
+
+        assert!(
+            !report.is_complete(),
+            "a refused domain must leave the realm bridge incomplete"
+        );
+        let landed = report
+            .domains
+            .iter()
+            .filter(|domain| domain.changed())
+            .map(|domain| {
+                (
+                    domain.domain.as_str(),
+                    domain.from_version,
+                    domain.to_version,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            landed.contains(&("session-store", 1, 4)),
+            "session-store committed before the refusal and must be reported: {landed:?}"
+        );
+        assert!(
+            landed.contains(&("schedule-store", 1, 3)),
+            "schedule-store shares no state with runtime-store and must still land: {landed:?}"
+        );
+
+        let failures = report
+            .failures
+            .iter()
+            .map(|failure| (failure.domain.as_str(), failure.refusal))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failures,
+            vec![(
+                "runtime-store",
+                PreV0810DomainRefusal::UnauthenticatedSourceCatalog
+            )],
+            "exactly the diverged domain must be refused"
+        );
+
+        // Fail-closed for the refused domain: no ledger row was stamped.
+        let conn = meerkat_sqlite::open(
+            &paths.sessions_sqlite_path,
+            meerkat_sqlite::ConnectionProfile::ReadOnly,
+        )?;
+        assert_eq!(
+            meerkat_sqlite::domain_version(
+                &conn,
+                meerkat_runtime::store::sqlite::RUNTIME_STORE_DOMAIN.name
+            )?,
+            None,
+            "a refused domain must not be stamped"
+        );
+        assert_eq!(
+            meerkat_sqlite::domain_version(
+                &conn,
+                meerkat_store::schedule_sqlite_store::SCHEDULE_STORE_DOMAIN.name
+            )?,
+            Some(meerkat_store::schedule_sqlite_store::SCHEDULE_STORE_DOMAIN.supported_version()),
+            "schedule-store must be durably stamped"
+        );
+        Ok(())
+    }
+
+    /// The one real dependency edge is still honoured: the runtime bridge
+    /// imports session snapshots, so a failed session-store must skip it
+    /// rather than run it against a source that was never established.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn runtime_bridge_is_skipped_when_its_session_prerequisite_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let realm_id = "legacy-realm";
+        let paths =
+            stage_published_pre_ledger_realm(temp.path(), realm_id, "0.7.5", "bootstrap-only")?;
+        diverge_catalog(
+            &paths.sessions_sqlite_path,
+            "ALTER TABLE sessions ADD COLUMN unreleased_column TEXT",
+        )?;
+
+        let fence = meerkat_store::migrate::RealmMaintenanceFence::acquire(
+            &paths.root,
+            Duration::from_secs(1),
+        )?;
+        let report = bridge_pre_0_8_10_realm_storage_in(temp.path(), realm_id, &fence)?;
+        drop(fence);
+
+        assert!(!report.is_complete());
+        let failures = report
+            .failures
+            .iter()
+            .map(|failure| (failure.domain.as_str(), failure.refusal))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failures,
+            vec![
+                (
+                    "session-store",
+                    PreV0810DomainRefusal::UnauthenticatedSourceCatalog
+                ),
+                (
+                    "runtime-store",
+                    PreV0810DomainRefusal::SkippedUnsatisfiedPrerequisite
+                ),
+            ],
+            "runtime-store must be skipped, not attempted, when session-store fails"
+        );
+        assert!(
+            report
+                .domains
+                .iter()
+                .any(|domain| domain.domain == "schedule-store" && domain.to_version == 3),
+            "schedule-store depends on neither and must still land"
+        );
+        Ok(())
+    }
+
+    /// A realm written by a published pre-0.8.10 binary must bridge end to end
+    /// through the same facade entry point the CLI calls.
+    ///
+    /// Both captures of each release are staged. The `attempted-turn` capture
+    /// is the one an operator actually owns: it carries the durable rows a
+    /// real run left behind, and it is the only one that reaches the runtime
+    /// bridge's row-preparation callback.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn published_pre_ledger_realm_bridges_through_the_facade()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (version, capture) in [
+            ("0.7.5", "bootstrap-only"),
+            ("0.7.5", "attempted-turn"),
+            ("0.7.28", "bootstrap-only"),
+            ("0.7.28", "attempted-turn"),
+        ] {
+            let temp = TempDir::new()?;
+            let realm_id = "legacy-realm";
+            let paths = stage_published_pre_ledger_realm(temp.path(), realm_id, version, capture)?;
+
+            // What an ordinary open would tell this operator, for every domain
+            // the bridge below then lands - including the one that lives in its
+            // own file. The message and the command read the same authenticator
+            // now, and a domain checked in neither place is a domain where that
+            // could silently stop being true.
+            for (domain, database) in [
+                (
+                    &meerkat_store::sqlite_store::SESSION_STORE_DOMAIN,
+                    &paths.sessions_sqlite_path,
+                ),
+                (
+                    &meerkat_runtime::store::sqlite::RUNTIME_STORE_DOMAIN,
+                    &paths.sessions_sqlite_path,
+                ),
+                (
+                    &meerkat_store::schedule_sqlite_store::SCHEDULE_STORE_DOMAIN,
+                    &paths.sessions_sqlite_path,
+                ),
+                (
+                    &meerkat_workgraph::WORKGRAPH_DOMAIN,
+                    &paths.root.join("workgraph.sqlite3"),
+                ),
+            ] {
+                let conn =
+                    meerkat_sqlite::open(database, meerkat_sqlite::ConnectionProfile::ReadOnly)?;
+                assert_eq!(
+                    domain.bridge_eligibility(&conn),
+                    meerkat_sqlite::BridgeEligibility::CatalogAuthenticated,
+                    "rkat {version} ({capture}) domain {} is bridgeable and must be reported so",
+                    domain.name
+                );
+            }
+
+            let ingress_payloads_before = read_ingress_payloads(&paths.sessions_sqlite_path)?;
+            assert_eq!(
+                ingress_payloads_before.is_empty(),
+                capture == "bootstrap-only",
+                "rkat {version} ({capture}) does not carry the ingress payloads this capture \
+                 exists to witness"
+            );
+
+            let fence = meerkat_store::migrate::RealmMaintenanceFence::acquire(
+                &paths.root,
+                Duration::from_secs(1),
+            )?;
+            let report = bridge_pre_0_8_10_realm_storage_in(temp.path(), realm_id, &fence)?;
+            drop(fence);
+
+            assert!(
+                report.is_complete(),
+                "realm written by published rkat {version} ({capture}) was refused: {:?}",
+                report.failures
+            );
+            let landed = report
+                .domains
+                .iter()
+                .map(|domain| {
+                    (
+                        domain.domain.as_str(),
+                        domain.from_version,
+                        domain.to_version,
+                    )
+                })
+                .collect::<Vec<_>>();
+            // The three sessions-file co-tenants are pinned exactly: their
+            // source version is the fact this fix turns on.
+            for expected in [
+                ("session-store", 1, 4),
+                ("runtime-store", 1, 3),
+                ("schedule-store", 1, 3),
+            ] {
+                assert!(
+                    landed.contains(&expected),
+                    "rkat {version} ({capture}) realm missing {expected:?}: {landed:?}"
+                );
+            }
+            // workgraph's own schema advanced inside the 0.7.x line (0.7.5
+            // writes version 1, 0.7.28 writes version 2), so only its
+            // authenticated source range and landing version are contracted.
+            let workgraph = landed
+                .iter()
+                .find(|(domain, _, _)| *domain == "workgraph")
+                .unwrap_or_else(|| {
+                    panic!("rkat {version} ({capture}) realm has no workgraph domain")
+                });
+            assert!(
+                (1..=2).contains(&workgraph.1),
+                "rkat {version} ({capture}) workgraph source version {} is outside the authorized range",
+                workgraph.1
+            );
+            assert_eq!(
+                workgraph.2,
+                meerkat_workgraph::WORKGRAPH_DOMAIN.supported_version(),
+                "rkat {version} ({capture}) workgraph did not reach the current version"
+            );
+
+            // THE OPERATOR'S OWN PROMPT, through the entry point their command
+            // calls. A bridge that reports success while deleting the ingress
+            // payload it was run to rescue is worse than the refusal it
+            // replaced, and this is the assertion that would have caught it:
+            // the payload was read before, and it must read back after.
+            for (input_id, before) in &ingress_payloads_before {
+                let after = read_ingress_payload(&paths.sessions_sqlite_path, input_id)?;
+                assert_eq!(
+                    after.as_deref(),
+                    Some(before.as_str()),
+                    "rkat {version} ({capture}) input {input_id}: the operator's ingress payload \
+                     did not survive a bridge that reported success"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Every input row's ingress payload text, keyed by input id.
+    ///
+    /// Reading this BEFORE the bridge is the point: an assertion built from
+    /// what the bridge left behind can only prove self-consistency.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_ingress_payloads(
+        database: &Path,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+        let conn = meerkat_sqlite::open(database, meerkat_sqlite::ConnectionProfile::ReadOnly)?;
+        let mut statement = conn.prepare(
+            "SELECT input_id, json_extract(CAST(state_json AS TEXT), '$.persisted_input.content')
+             FROM runtime_input_states
+             ORDER BY runtime_id, input_id",
+        )?;
+        let rows = statement
+            .query_map((), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(input_id, content)| content.map(|content| (input_id, content)))
+            .collect())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_ingress_payload(
+        database: &Path,
+        input_id: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let conn = meerkat_sqlite::open(database, meerkat_sqlite::ConnectionProfile::ReadOnly)?;
+        Ok(conn.query_row(
+            "SELECT json_extract(CAST(state_json AS TEXT), '$.persisted_input.content')
+             FROM runtime_input_states WHERE input_id = ?1",
+            (input_id,),
+            |row| row.get::<_, Option<String>>(0),
+        )?)
+    }
+
+    /// THE PER-RECORD CONTRACT REACHES THE WHOLE BRIDGE, not just its first
+    /// step.
+    ///
+    /// Its predecessor pinned the opposite and called it a residual: the
+    /// row-preparation callback refused an undecodable terminal row per
+    /// record, and the runtime-store v1 -> v2 migration then re-decoded the
+    /// same row with a hard `?` and refused the entire domain. So an operator
+    /// who was told the schema was recognized and to run the bridge got
+    /// session-store, schedule-store and workgraph committed and runtime-store
+    /// refused - the promise they acted on was false, and one bad row still
+    /// cost them the domain.
+    ///
+    /// The released-row importers no longer run under the rescue at all (see
+    /// `pre_0_8_10_rescue_in_progress`), so the callback is the sole authority
+    /// over row content there and the ordinary ledgered v1 -> v2 upgrade keeps
+    /// failing closed on an undecodable durable row exactly as before. This
+    /// test contracts the operator-visible half: the domain lands, the record
+    /// is named, and its bytes are untouched.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_undecodable_terminal_row_costs_its_record_and_not_the_domain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let realm_id = "legacy-realm";
+        let paths =
+            stage_published_pre_ledger_realm(temp.path(), realm_id, "0.7.28", "attempted-turn")?;
+        let injected = "01a00703-278e-78b1-9207-ddd7a914abfd";
+        let injected_bytes = {
+            let conn = meerkat_sqlite::open(
+                &paths.sessions_sqlite_path,
+                meerkat_sqlite::ConnectionProfile::Maintenance { write: true },
+            )?;
+            let (runtime_id, source): (String, Vec<u8>) = conn.query_row(
+                "SELECT runtime_id, state_json FROM runtime_input_states LIMIT 1",
+                (),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let mut row: serde_json::Value = serde_json::from_slice(&source)?;
+            row["input_id"] = serde_json::json!(injected);
+            row["persisted_input"]["header"]["id"] = serde_json::json!(injected);
+            // Terminal (`abandoned`, inherited from the source row) and valid
+            // JSON, but not decodable by the current type.
+            row["attempt_count"] = serde_json::json!("three");
+            let bytes = serde_json::to_vec(&row)?;
+            conn.execute(
+                "INSERT INTO runtime_input_states (runtime_id, input_id, state_json)
+                 VALUES (?1, ?2, ?3)",
+                (&runtime_id, injected, &bytes),
+            )?;
+            bytes
+        };
+
+        let fence = meerkat_store::migrate::RealmMaintenanceFence::acquire(
+            &paths.root,
+            Duration::from_secs(1),
+        )?;
+        let report = bridge_pre_0_8_10_realm_storage_in(temp.path(), realm_id, &fence)?;
+        drop(fence);
+
+        assert!(
+            report.is_complete(),
+            "one undecodable record must not refuse the domain the operator was told to \
+             bridge: {:?}",
+            report.failures
+        );
+        let left_behind = report.records_left_behind().collect::<Vec<_>>();
+        assert!(
+            left_behind
+                .iter()
+                .any(|(domain, refusal)| *domain == "runtime-store"
+                    && refusal.record.contains(injected)),
+            "the undecodable record must be named to the operator: {left_behind:?}"
+        );
+
+        let conn = meerkat_sqlite::open(
+            &paths.sessions_sqlite_path,
+            meerkat_sqlite::ConnectionProfile::ReadOnly,
+        )?;
+        assert_eq!(
+            meerkat_sqlite::domain_version(
+                &conn,
+                meerkat_runtime::store::sqlite::RUNTIME_STORE_DOMAIN.name
+            )?,
+            Some(meerkat_runtime::store::sqlite::RUNTIME_STORE_DOMAIN.supported_version()),
+            "the domain named in the remedy must land"
+        );
+        let stored: Vec<u8> = conn.query_row(
+            "SELECT state_json FROM runtime_input_states WHERE input_id = ?1",
+            (injected,),
+            |row| row.get(0),
+        )?;
+        assert_eq!(stored, injected_bytes, "the refusal must not rewrite bytes");
+        Ok(())
+    }
+
+    /// A record the bridge cannot carry must not cost the operator the realm.
+    ///
+    /// THE OTHER HALF OF THE FIX, END TO END. Every other assertion in this
+    /// tree checks that nothing was refused; this one injects a row that
+    /// WILL be refused - a row carrying a field this binary cannot
+    /// represent, which is what a realm touched by a newer or unknown writer
+    /// looks like - and then requires all of: the domain lands, the ledger is
+    /// stamped, the refused row's bytes are untouched, the healthy sibling is
+    /// carried, the refusal is named through the accessor the CLI prints
+    /// from, and the realm afterwards OPENS.
+    ///
+    /// Asserting "refusal is per record" without ever producing a refusal
+    /// would leave the operator-facing promise - that the bridge inspects
+    /// records and prints the ones it cannot carry - backed by nothing, which
+    /// is the exact shape of unverified promise this P0 exists to remove.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn an_uncarriable_record_is_named_and_the_realm_still_opens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let realm_id = "legacy-realm";
+        let paths =
+            stage_published_pre_ledger_realm(temp.path(), realm_id, "0.7.28", "attempted-turn")?;
+
+        // Derive the injected row from the realm's own row so it belongs to a
+        // real runtime with real owning fragments. It is left NONTERMINAL on
+        // purpose: the runtime-store v1 -> v2 migration only touches terminal
+        // rows, so this row's bytes must survive the whole bridge untouched
+        // and the test can assert that literally.
+        let injected_input_id = "01a00703-278e-78b1-9207-ddd7a914abfe";
+        let (runtime_id, injected_bytes) = {
+            let conn = meerkat_sqlite::open(
+                &paths.sessions_sqlite_path,
+                meerkat_sqlite::ConnectionProfile::Maintenance { write: true },
+            )?;
+            let (runtime_id, source): (String, Vec<u8>) = conn.query_row(
+                "SELECT runtime_id, state_json FROM runtime_input_states LIMIT 1",
+                (),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let mut row: serde_json::Value = serde_json::from_slice(&source)?;
+            let first_history = row["history"][0].clone();
+            row["input_id"] = serde_json::json!(injected_input_id);
+            row["persisted_input"]["header"]["id"] = serde_json::json!(injected_input_id);
+            row["current_state"] = serde_json::json!("queued");
+            row["history"] = serde_json::json!([first_history]);
+            row["updated_at"] = row["history"][0]["timestamp"].clone();
+            row.as_object_mut()
+                .expect("row object")
+                .remove("terminal_outcome");
+            // The fact this binary cannot represent. serde would drop it
+            // silently on decode; the carry-forward oracle refuses instead.
+            row["unknown_future_field"] = serde_json::json!({"written_by": "a newer rkat"});
+            let bytes = serde_json::to_vec(&row)?;
+            conn.execute(
+                "INSERT INTO runtime_input_states (runtime_id, input_id, state_json)
+                 VALUES (?1, ?2, ?3)",
+                (&runtime_id, injected_input_id, &bytes),
+            )?;
+            (runtime_id, bytes)
+        };
+
+        let fence = meerkat_store::migrate::RealmMaintenanceFence::acquire(
+            &paths.root,
+            Duration::from_secs(1),
+        )?;
+        let report = bridge_pre_0_8_10_realm_storage_in(temp.path(), realm_id, &fence)?;
+        drop(fence);
+
+        // 1. One unrepresentable row does not abort the domain.
+        assert!(
+            report.is_complete(),
+            "one uncarriable row refused the whole realm: {:?}",
+            report.failures
+        );
+        let runtime = report
+            .domains
+            .iter()
+            .find(|domain| domain.domain == "runtime-store")
+            .expect("runtime-store domain report");
+        assert_eq!(
+            runtime.to_version,
+            meerkat_runtime::store::sqlite::RUNTIME_STORE_DOMAIN.supported_version(),
+            "the domain must still land at the current version"
+        );
+        assert_eq!(
+            runtime.prepared_rows, 1,
+            "the healthy sibling must still be carried"
+        );
+
+        // 2. The refusal is named, through the accessor `storage migrate`
+        //    prints from.
+        let left_behind = report.records_left_behind().collect::<Vec<_>>();
+        assert_eq!(
+            left_behind.len(),
+            1,
+            "expected exactly one named refusal, got {left_behind:?}"
+        );
+        let (domain, refusal) = left_behind[0];
+        assert_eq!(domain, "runtime-store");
+        assert!(
+            refusal.record.contains(injected_input_id),
+            "the refusal must name the record: {refusal:?}"
+        );
+        assert!(
+            refusal.reason.contains("unknown_future_field"),
+            "the refusal must name what could not be carried: {refusal:?}"
+        );
+        assert!(runtime.left_records_behind());
+
+        // 3. The refused row's bytes are exactly as found. Nothing deleted,
+        //    nothing blanked.
+        {
+            let conn = meerkat_sqlite::open(
+                &paths.sessions_sqlite_path,
+                meerkat_sqlite::ConnectionProfile::ReadOnly,
+            )?;
+            let stored: Vec<u8> = conn.query_row(
+                "SELECT state_json FROM runtime_input_states
+                 WHERE runtime_id = ?1 AND input_id = ?2",
+                (&runtime_id, injected_input_id),
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                stored, injected_bytes,
+                "a refused record must be left exactly as found"
+            );
+        }
+
+        // 4. And the realm opens anyway - which is the whole point.
+        let (_manifest, bundle) = open_realm_persistence_in(temp.path(), realm_id, None, None)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("realm did not open after a per-record refusal: {error}")
+            });
+        let sessions = bundle
+            .session_store()
+            .list(meerkat_core::SessionFilter::default())
+            .await?;
+        assert!(
+            !sessions.is_empty(),
+            "the realm's own session must still be readable"
+        );
+        Ok(())
+    }
+
+    /// THE OWNER'S QUESTION, END TO END: after the documented bridge, does
+    /// the realm actually OPEN?
+    ///
+    /// Bridging exit 0 is not the deliverable. The 0.8.23 report ends with an
+    /// operator whose realm is half-bridged and still unopenable, so the
+    /// evidence that the P0 is fixed has to be the ordinary open path
+    /// succeeding on the realm a published binary wrote - including the
+    /// `attempted-turn` captures, whose durable rows are the ones the bridge
+    /// used to refuse.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn bridged_pre_ledger_realm_opens_through_the_ordinary_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (version, capture) in [
+            ("0.7.5", "attempted-turn"),
+            ("0.7.28", "attempted-turn"),
+            ("0.7.28", "bootstrap-only"),
+        ] {
+            let temp = TempDir::new()?;
+            let realm_id = "legacy-realm";
+            let paths = stage_published_pre_ledger_realm(temp.path(), realm_id, version, capture)?;
+
+            // An ordinary open BEFORE the bridge must refuse: this is the
+            // state the operator starts in, and if it already opened, the
+            // test below would prove nothing.
+            let before = open_realm_persistence_in(temp.path(), realm_id, None, None).await;
+            assert!(
+                before.is_err(),
+                "rkat {version} ({capture}) realm opened without the bridge; \
+                 this test can no longer prove the bridge is what fixed it"
+            );
+
+            let fence = meerkat_store::migrate::RealmMaintenanceFence::acquire(
+                &paths.root,
+                Duration::from_secs(1),
+            )?;
+            let report = bridge_pre_0_8_10_realm_storage_in(temp.path(), realm_id, &fence)?;
+            drop(fence);
+            assert!(
+                report.is_complete(),
+                "rkat {version} ({capture}) realm was refused: {:?}",
+                report.failures
+            );
+            let left_behind = report.records_left_behind().collect::<Vec<_>>();
+            assert!(
+                left_behind.is_empty(),
+                "rkat {version} ({capture}) realm left records behind: {left_behind:?}"
+            );
+
+            let (manifest, bundle) = open_realm_persistence_in(temp.path(), realm_id, None, None)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "rkat {version} ({capture}) realm still does not open after the \
+                             documented bridge: {error}"
+                    )
+                });
+            assert_eq!(manifest.realm.as_str(), realm_id);
+            assert!(bundle.blob_store().is_persistent());
+
+            // The realm's own sessions must be readable, not merely present.
+            let sessions = bundle
+                .session_store()
+                .list(meerkat_core::SessionFilter::default())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("rkat {version} ({capture}) realm sessions unreadable: {error}")
+                });
+            if capture == "attempted-turn" {
+                assert!(
+                    !sessions.is_empty(),
+                    "rkat {version} ({capture}) realm carried a session before the bridge and \
+                     lists none after it"
+                );
+                for summary in &sessions {
+                    bundle
+                        .session_store()
+                        .load(&summary.id)
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "rkat {version} ({capture}) session {} does not load after the \
+                                 bridge: {error}",
+                                summary.id
+                            )
+                        });
+                }
+            }
+        }
         Ok(())
     }
 

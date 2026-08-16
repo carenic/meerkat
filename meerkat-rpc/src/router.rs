@@ -4299,6 +4299,7 @@ mod tests {
                 session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(
                     session.to_string(),
                 ),
+                runtime_epoch_id: None,
             },
             "test::register_session",
         )
@@ -4336,6 +4337,7 @@ mod tests {
                 session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(
                     session_id.clone(),
                 ),
+                runtime_epoch_id: None,
             },
             "test::register_session",
         )
@@ -4837,8 +4839,389 @@ mod tests {
             false
         );
         assert_eq!(capabilities["result"]["features"]["approvals"], false);
-        assert_eq!(health["result"]["status"], "ok");
         assert_eq!(health["result"]["checks"]["jobs"], "ok");
+        // Nothing is wrong with this host and every measurement says so, so the
+        // rollup is `ok`. What it is *not* saying is "everything is covered":
+        // `checks` still carries `unmeasured:session_liveness`, asserted in
+        // `runtime_health_names_unmeasured_dimensions_and_rolls_up_measured_ones`.
+        assert_eq!(
+            health["result"]["status"], "ok",
+            "a host with no measured fault must not stand permanently amber: {health}"
+        );
+    }
+
+    /// `runtime/host_info` must publish the health THIS surface measured, not
+    /// the projection default.
+    ///
+    /// `meerkat::surface::build_runtime_host_info` is a pure projection over
+    /// surface options and config metadata: it holds no runtime and can observe
+    /// no health dimension, so the rollup it embeds is the probed-nothing one -
+    /// `degraded` with every declared dimension named `unmeasured:*`. That is
+    /// the correct default for a required wire field a pure projection cannot
+    /// compute, because a caller that forgets to replace it ships a visibly
+    /// incomplete payload rather than a silent `ok`. But `host_info` is not
+    /// allowed to SHIP that default from a surface that can probe, and this
+    /// endpoint can.
+    ///
+    /// Byte equality against `runtime/health`, not a spot check on `status`, so
+    /// a partially-wired `host_info` fails here too. This is the assertion that
+    /// would have caught the defect it exists for: `handle_info` inheriting
+    /// whatever `build_runtime_host_health` happened to return.
+    #[tokio::test]
+    async fn runtime_host_info_publishes_the_health_this_surface_measured() {
+        let (router, _rx) = test_router_with_v9_runtime().await;
+        let info = serde_json::to_value(
+            router
+                .dispatch(RpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    method: "runtime/host_info".to_string(),
+                    params: None,
+                    id: Some(RpcId::Num(17)),
+                })
+                .await
+                .expect("host_info response"),
+        )
+        .expect("serialize host_info");
+        let health = serde_json::to_value(
+            router
+                .dispatch(RpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    method: "runtime/health".to_string(),
+                    params: None,
+                    id: Some(RpcId::Num(19)),
+                })
+                .await
+                .expect("health response"),
+        )
+        .expect("serialize health");
+
+        assert_eq!(
+            info["result"]["health"], health["result"],
+            "runtime/host_info must embed the measured health, not the \
+             probed-nothing projection: {info}"
+        );
+        // Named separately so the equality above cannot be satisfied by both
+        // sides being the default. `session_durability` is only ever published
+        // by a probe that ran.
+        assert_eq!(
+            info["result"]["health"]["checks"]["session_durability"], "ok",
+            "the embedded health must carry a MEASURED dimension: {info}"
+        );
+        assert!(
+            info["result"]["health"]["checks"]
+                .get("unmeasured:session_durability")
+                .is_none(),
+            "a measured dimension must not also be published as unmeasured: {info}"
+        );
+        assert_eq!(
+            info["result"]["health"]["status"], "ok",
+            "and a host with no measured fault must not stand permanently \
+             amber on this route either: {info}"
+        );
+    }
+
+    /// `runtime/health` may only assert the scope it measured, and must assert
+    /// the scope it did.
+    ///
+    /// The payload is produced by dispatching the real method against the real
+    /// router; the expectations below are literals, not values re-derived from
+    /// the same production constant, so dropping either the measured or the
+    /// unmeasured entries fails this test instead of quietly agreeing with it.
+    #[tokio::test]
+    async fn runtime_health_names_unmeasured_dimensions_and_rolls_up_measured_ones() {
+        let (router, _rx) = test_router_with_v9_runtime().await;
+        let response = router
+            .dispatch(RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "runtime/health".to_string(),
+                params: None,
+                id: Some(RpcId::Num(7)),
+            })
+            .await
+            .expect("health response");
+        let health = serde_json::to_value(response).expect("serialize health");
+        let result = &health["result"];
+        let checks = result["checks"]
+            .as_object()
+            .expect("health payload carries a checks map");
+
+        // Measured. `session_durability` and `session_runtime_loop` are read
+        // off live runtime state, so their presence here is the wiring pin: a
+        // handler that forgot to insert them would publish `unmeasured:*`
+        // instead and fail on the next assertion block.
+        for measured in ["jobs", "session_durability", "session_runtime_loop"] {
+            assert_eq!(
+                checks.get(measured).and_then(serde_json::Value::as_str),
+                Some("ok"),
+                "runtime/health must publish `{measured}` as measured: {result}"
+            );
+            assert!(
+                !checks.contains_key(&format!("unmeasured:{measured}")),
+                "a measured dimension must not also be published as unmeasured: {result}"
+            );
+        }
+
+        // Unmeasured, and named rather than omitted. Nothing here observes
+        // whether a live session is *progressing*: a session whose loop task
+        // is alive and whose channels are open, but which is parked on
+        // selectable queued work, moves no value this handler reads. That is
+        // 0.8.24 watchdog work and the payload says so rather than implying
+        // coverage.
+        assert_eq!(
+            checks
+                .get("unmeasured:session_liveness")
+                .and_then(serde_json::Value::as_str),
+            Some("degraded"),
+            "runtime/health must name `unmeasured:session_liveness`: {result}"
+        );
+
+        // The third coverage vocabulary, absent here on purpose. On a readable
+        // host both session probes return a reading, so neither may publish a
+        // failed read. This is the assertion that would catch a probe wired to
+        // report `unreadable:*` unconditionally.
+        assert!(
+            !checks.keys().any(|key| key.starts_with("unreadable:")),
+            "no probe failed on this host, so none may claim it did: {result}"
+        );
+
+        // The rollup speaks for the dimensions this handler ATTEMPTED. A host
+        // with no fault and no failed read reports `ok`; a permanently amber
+        // endpoint is a muted endpoint, and a muted endpoint is why this whole
+        // projection exists.
+        assert_eq!(
+            result["status"], "ok",
+            "unmeasured coverage is published, not folded into the rollup: {result}"
+        );
+        let worst_measured = ["jobs", "session_durability", "session_runtime_loop"]
+            .into_iter()
+            .filter_map(|key| checks.get(key).and_then(serde_json::Value::as_str))
+            .map(|status| match status {
+                "ok" => 0u8,
+                "degraded" => 1,
+                _ => 2,
+            })
+            .max()
+            .expect("at least one measured check");
+        assert_eq!(
+            result["status"].as_str(),
+            Some(match worst_measured {
+                0 => "ok",
+                1 => "degraded",
+                _ => "unhealthy",
+            }),
+            "status must equal the worst rung present among the MEASURED checks: {result}"
+        );
+    }
+
+    /// The alert-fires pin, and the only test in the tree that fails if the
+    /// handler stops inserting `session_durability`.
+    ///
+    /// A real session is created through `session/create`, then its shared
+    /// durability gate is degraded through the machine's own deterministic
+    /// seam - no fabricated store outcome, no hand-built handle. The endpoint
+    /// must move off `ok` on the strength of that, because an operator alert
+    /// built on `status != "ok"` is exactly what this release is asking them to
+    /// write.
+    #[tokio::test]
+    async fn runtime_health_turns_amber_when_a_real_session_needs_a_durability_reload() {
+        let (router, _rx) = test_router_with_v9_runtime().await;
+        let create = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({ "prompt": "hello" }),
+            ))
+            .await
+            .expect("session/create response");
+        let created = result_value(&create);
+        let session_id = meerkat_core::SessionId::parse(
+            created["session_id"]
+                .as_str()
+                .expect("session/create returns a session id"),
+        )
+        .expect("session id parses");
+
+        let health_request = || RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "runtime/health".to_string(),
+            params: None,
+            id: Some(RpcId::Num(11)),
+        };
+        let healthy = serde_json::to_value(
+            router
+                .dispatch(health_request())
+                .await
+                .expect("health response"),
+        )
+        .expect("serialize health");
+        assert_eq!(
+            healthy["result"]["checks"]["session_durability"], "ok",
+            "a freshly created session is durability-ready: {healthy}"
+        );
+        assert_eq!(
+            healthy["result"]["status"], "ok",
+            "the pin is worthless unless the endpoint was ok before the fault: {healthy}"
+        );
+
+        assert!(
+            router
+                .runtime_adapter
+                .force_session_durability_reload_required_for_test(&session_id)
+                .await,
+            "the created session must own a real persistent durability gate"
+        );
+
+        let degraded = serde_json::to_value(
+            router
+                .dispatch(health_request())
+                .await
+                .expect("health response"),
+        )
+        .expect("serialize health");
+        assert_eq!(
+            degraded["result"]["checks"]["session_durability"], "degraded",
+            "a session that needs a cold reload must be visible in `checks`: {degraded}"
+        );
+        assert_eq!(
+            degraded["result"]["status"], "degraded",
+            "a measured fault must reach the rollup an operator alerts on: {degraded}"
+        );
+        assert_eq!(
+            degraded["result"]["checks"]["jobs"], "ok",
+            "the fault must not smear across dimensions that are still fine: {degraded}"
+        );
+    }
+
+    /// The `session_runtime_loop` alert-fires pin: a real session with a real
+    /// spawned runtime loop is driven to a dead loop, and the endpoint's own
+    /// payload must move that key to `degraded`.
+    ///
+    /// Two fixture choices carry the test and both are deliberate.
+    ///
+    /// `ensure_runtime_executor` is the production spawn path - the router
+    /// itself calls it before any turn - so the loop being killed is the loop a
+    /// real session would have, with a real executor and real channels, not a
+    /// hand-built attachment.
+    ///
+    /// The durability fault is injected FIRST, and not as decoration: killing a
+    /// runtime loop normally wakes the teardown watcher, which retires the shell
+    /// and leaves nothing to detect - that is the system working. The state
+    /// worth alerting on is the one the watcher cannot clear, because
+    /// `observe_runtime_loop_teardown` refuses a session whose durability gate
+    /// demands a cold reload. That leaves a registered session pointing at a
+    /// dead loop indefinitely, which is a real production wedge.
+    ///
+    /// The consequence, stated rather than papered over: `status` is already
+    /// `degraded` from the durability fault by the time the loop dies, so this
+    /// test cannot pin a `status` transition attributable to the loop dimension
+    /// alone. What it does pin is that the loop dimension is measured, is `ok`
+    /// while the loop is alive - including while the durability gate is already
+    /// degraded, so the key demonstrably does not borrow its sibling's verdict -
+    /// and flips to `degraded` when and only when the loop actually dies. The
+    /// "an ok->degraded transition on this dimension alone" property is pinned
+    /// one level down, by
+    /// `dead_runtime_loop_session_count_sees_a_real_corpse_and_not_a_clean_shutdown`
+    /// in meerkat-runtime, which observes `Some(0)` with a degraded durability
+    /// gate and `Some(1)` after the abort.
+    #[tokio::test]
+    async fn runtime_health_turns_amber_when_a_real_session_runtime_loop_dies() {
+        let (router, _rx) = test_router_with_v9_runtime().await;
+        let create = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({ "prompt": "hello" }),
+            ))
+            .await
+            .expect("session/create response");
+        let created = result_value(&create);
+        let session_id = meerkat_core::SessionId::parse(
+            created["session_id"]
+                .as_str()
+                .expect("session/create returns a session id"),
+        )
+        .expect("session id parses");
+
+        let health_request = || RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "runtime/health".to_string(),
+            params: None,
+            id: Some(RpcId::Num(13)),
+        };
+        let health_now = || async {
+            serde_json::to_value(
+                router
+                    .dispatch(health_request())
+                    .await
+                    .expect("health response"),
+            )
+            .expect("serialize health")
+        };
+
+        // Spawn the real runtime loop the way a turn would.
+        router
+            .runtime
+            .ensure_runtime_executor(&session_id)
+            .await
+            .expect("the production spawn path must attach a runtime loop");
+
+        let live = health_now().await;
+        assert_eq!(
+            live["result"]["checks"]["session_runtime_loop"], "ok",
+            "a session with a live spawned runtime loop is not a corpse: {live}"
+        );
+        assert_eq!(
+            live["result"]["status"], "ok",
+            "the pin is worthless unless the endpoint was ok before the fault: {live}"
+        );
+
+        // Block the teardown watcher through a real refusal, then prove the
+        // refusal alone does not move the loop dimension. Without this
+        // assertion the final one would not mean the loop died; it would only
+        // mean something went wrong somewhere.
+        assert!(
+            router
+                .runtime_adapter
+                .force_session_durability_reload_required_for_test(&session_id)
+                .await,
+            "the created session must own a real persistent durability gate"
+        );
+        let durability_only = health_now().await;
+        assert_eq!(
+            durability_only["result"]["checks"]["session_runtime_loop"], "ok",
+            "a degraded durability gate is a different dimension; the loop key \
+             must not borrow its verdict: {durability_only}"
+        );
+        assert_eq!(
+            durability_only["result"]["checks"]["session_durability"], "degraded",
+            "the durability fault is real, or the teardown watcher is not \
+             actually blocked: {durability_only}"
+        );
+
+        // Kill the loop task without cooperative cleanup: a task panic or an
+        // early runtime-loop return, modelled by the machine's own fault
+        // injector, which returns only after the task has genuinely exited.
+        assert!(
+            router
+                .runtime_adapter
+                .test_abort_runtime_loop_without_cleanup(&session_id)
+                .await
+                .expect("abort the runtime loop without cooperative cleanup"),
+            "the fixture must have had a real runtime-loop task to abort"
+        );
+
+        let dead = health_now().await;
+        assert_eq!(
+            dead["result"]["checks"]["session_runtime_loop"], "degraded",
+            "a registered session still claiming a dead runtime loop must be \
+             visible in `checks`: {dead}"
+        );
+        assert_eq!(
+            dead["result"]["status"], "degraded",
+            "and the endpoint an operator alerts on must not read ok: {dead}"
+        );
+        assert_eq!(
+            dead["result"]["checks"]["jobs"], "ok",
+            "the fault must not smear across dimensions that are still fine: {dead}"
+        );
     }
 
     #[tokio::test]

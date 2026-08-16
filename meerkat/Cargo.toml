@@ -14,7 +14,7 @@ categories.workspace = true
 
 [dependencies]
 meerkat-capabilities = { workspace = true }
-meerkat-atif = { workspace = true }
+meerkat-atif = { workspace = true, optional = true }
 meerkat-core = { workspace = true, features = [
     "jsonschema",
     "__meerkat-facade-agent-factory-build",
@@ -121,6 +121,11 @@ session-store = [
 ]
 session-compaction = ["meerkat-session/session-compaction"]
 memory-store-session = ["dep:meerkat-memory"]
+
+# ATIF trajectory export vocabulary (`meerkat::atif`). Off by default: the
+# facade only re-exports it, so hosts that do not export trajectories do not
+# compile it. `rkat` and `rkat-rpc` depend on `meerkat-atif` directly.
+atif = ["dep:meerkat-atif"]
 
 # Optional subsystems
 comms = [

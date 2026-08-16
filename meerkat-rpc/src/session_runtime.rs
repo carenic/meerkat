@@ -3001,6 +3001,25 @@ impl SessionRuntime {
         self.inner.realm_id()
     }
 
+    /// Sessions whose durability gate currently demands a cold reload.
+    ///
+    /// Pass-through to the runtime adapter, which is private to this type.
+    /// `None` means the registry was not readable; a health caller must report
+    /// that as an unreadable dimension rather than publish a zero it did not
+    /// observe.
+    pub(crate) fn reload_required_session_count(&self) -> Option<usize> {
+        self.runtime_adapter.reload_required_session_count()
+    }
+
+    /// Sessions still claiming a runtime loop whose task is gone.
+    ///
+    /// Pass-through to the runtime adapter, which is private to this type.
+    /// `None` carries the same report-it-as-unreadable obligation as its
+    /// sibling.
+    pub(crate) fn dead_runtime_loop_session_count(&self) -> Option<usize> {
+        self.runtime_adapter.dead_runtime_loop_session_count()
+    }
+
     /// Active instance id for this runtime, if configured.
     pub fn instance_id(&self) -> Option<String> {
         self.inner.instance_id()
@@ -11260,6 +11279,7 @@ mod tests {
                 session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(
                     session.to_string(),
                 ),
+                runtime_epoch_id: None,
             },
             "test::register_session",
         )
@@ -11297,6 +11317,7 @@ mod tests {
                 session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(
                     session_id.clone(),
                 ),
+                runtime_epoch_id: None,
             },
             "test::register_session",
         )

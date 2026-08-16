@@ -10801,6 +10801,16 @@ impl MobActor {
     /// `ensure_member_not_broken` before any classification. There is no shell
     /// retry — one machine authorization, one materialization attempt, one
     /// typed terminal outcome.
+    ///
+    /// Resolving a LOCAL member's obligation also re-emits
+    /// `RequestRuntimeBinding` from MobMachine's own membership maps: revival
+    /// prepares local session resources, which never commit the consumer's
+    /// placement tuple, so without that request the revived member stays
+    /// registered-unplaced. The effect reaches `pending_routed_effects` through
+    /// `apply_dsl_signal` and is dispatched at the next actor boundary drain.
+    /// A revival whose exact tuple is no longer nameable is REFUSED by the
+    /// machine rather than resolved, so the obligation stays outstanding for a
+    /// later classification instead of leaving an unbindable member behind.
     async fn revive_member_live_materialization(
         &mut self,
         entry: &RosterEntry,
@@ -18449,11 +18459,14 @@ impl MobActor {
         // Supervisor custody is recovered by its owning runtime protocol. It
         // is not process-phase authority, so identity convergence must not
         // mirror or classify that record.
+        // Placement-only, matching the generated runtime-authority
+        // reconciliation classifier: the runtime epoch is a registration fact of
+        // the process that wrote the row, so a retained one is not evidence of a
+        // live or torn placement.
         record.runtime_state() == Some(meerkat_runtime::RuntimeState::Idle)
             && binding.agent_runtime_id().is_none()
             && binding.fence_token().is_none()
             && binding.runtime_generation().is_none()
-            && binding.runtime_epoch_id().is_none()
             && record.run().current_run_id().is_none()
             && record.run().pre_run_phase().is_none()
     }

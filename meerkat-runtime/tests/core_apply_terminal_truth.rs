@@ -357,16 +357,22 @@ fn core_apply_terminal_truth_has_one_authority() -> Result<(), String> {
     );
     let stage_for_run_transition =
         extract_braced_item(&meerkat_machine_schema, "transition StageForRun")?;
+    // No `input_not_run_associated` predicate: the run association is
+    // attribution that StageForRun's own update rebinds unconditionally, so
+    // guarding on its absence refused every input that had ever been staged.
+    // That is the 0.8.22 fifo-starvation wedge - do not restore it as
+    // "hardening"; `input_queued` + `input_lane_bound` already exclude inputs
+    // that belong to a live run.
     assert!(
         stage_for_run_transition.contains("guard \"input_queued\"")
             && stage_for_run_transition.contains("guard \"input_lane_bound\"")
             && stage_for_run_transition.contains("guard \"input_sequence_bound\"")
             && stage_for_run_transition.contains("guard \"input_recovery_lane_bound\"")
-            && stage_for_run_transition.contains("guard \"input_not_run_associated\"")
+            && !stage_for_run_transition.contains("guard \"input_not_run_associated\"")
             && stage_for_run_transition.contains("guard \"current_run_matches\"")
             && stage_for_run_transition
                 .contains("self.input_attempt_counts.increment(input_id, 1)"),
-        "StageForRun must own queued/lane/sequence/run-association/current-run predicates and fold attempt increment into staging"
+        "StageForRun must own queued/lane/sequence/current-run predicates, must NOT refuse a queued input for carrying run attribution, and must fold attempt increment into staging"
     );
     let stage_start = meerkat_machine_model
         .find("StageForRunIdle(input_id, run_id) ==")
@@ -412,7 +418,7 @@ fn core_apply_terminal_truth_has_one_authority() -> Result<(), String> {
             && command_plans.contains(
                 "`RuntimeCompletionResultResolved` via `RuntimeCompletionResultAuthority` (LocalSurfaceResultAlignment) states: `Authorized`, `Attempted`, `Realized`, `Failed`, `Cancelled`, `Abandoned`"
             )
-            && command_plans.contains("`StageForRunIdle`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `input_not_run_associated`, `current_run_matches`"),
+            && command_plans.contains("`StageForRunIdle`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`"),
         "generated contract must expose queue-to-run, run-commit, and completion-result closure command plans with expanded guards and effects"
     );
     let stage_realizer = extract_braced_item(&ephemeral_driver, "fn machine_realize_stage_batch")?;

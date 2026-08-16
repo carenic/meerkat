@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import pathlib
+import re
+import subprocess
 import sys
 
 try:
@@ -60,7 +62,17 @@ def main() -> int:
     unexpected = sorted(expected - publishable)
     order_errors = dependency_order_errors(workspace_packages, expected_order)
     bazel_errors = bazel_release_binary_version_env_errors(root, workspace_version)
-    if missing or unexpected or metadata_errors or order_errors or bazel_errors:
+    patch_errors = patch_config_errors(root, expected_order)
+    docs_errors = documented_release_order_errors(root, expected_order)
+    if (
+        missing
+        or unexpected
+        or metadata_errors
+        or order_errors
+        or bazel_errors
+        or patch_errors
+        or docs_errors
+    ):
         if missing:
             print("Publishable workspace crates missing from release list:", file=sys.stderr)
             for name in missing:
@@ -84,9 +96,135 @@ def main() -> int:
             print("BuildBuddy release binaries have invalid Cargo version metadata:", file=sys.stderr)
             for err in bazel_errors:
                 print(f"  - {err}", file=sys.stderr)
+        if patch_errors:
+            print("Publish patch configuration does not cover the release crates:", file=sys.stderr)
+            for err in patch_errors:
+                print(f"  - {err}", file=sys.stderr)
+        if docs_errors:
+            print("Documented release crate enumeration is stale:", file=sys.stderr)
+            for err in docs_errors:
+                print(f"  - {err}", file=sys.stderr)
         return 1
 
     return 0
+
+
+def patch_config_errors(root: pathlib.Path, expected_order: list[str]) -> list[str]:
+    """Every release crate must appear in the generated [patch.crates-io] config.
+
+    `cargo publish` verifies each package against the patched workspace, so a
+    crate absent here is resolved from crates.io at a version that does not
+    exist yet. That failure lands during package verification, several gates
+    downstream of the manifest edit that caused it.
+    """
+
+    generator = root / "scripts" / "generate-patch-config.sh"
+    if not generator.exists():
+        return [f"{generator}: patch config generator is missing"]
+
+    try:
+        rendered = subprocess.run(
+            [str(generator), str(root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except subprocess.CalledProcessError as error:
+        return [f"{generator.name} failed (exit {error.returncode}): {error.stderr.strip()}"]
+
+    patched: dict[str, str] = {}
+    errors: list[str] = []
+    for line in rendered.splitlines():
+        match = re.fullmatch(r'(\S+) = \{ path = "(.+)" \}', line.strip())
+        if match:
+            patched[match.group(1)] = match.group(2)
+
+    for crate in expected_order:
+        crate_path = patched.get(crate)
+        if crate_path is None:
+            errors.append(f"{crate}: release crate is absent from [patch.crates-io]")
+            continue
+        manifest = pathlib.Path(crate_path) / "Cargo.toml"
+        if not manifest.exists():
+            errors.append(f"{crate}: patched path {crate_path} has no Cargo.toml")
+            continue
+        patched_name = tomllib.loads(manifest.read_text()).get("package", {}).get("name")
+        if patched_name != crate:
+            errors.append(
+                f"{crate}: patched path {crate_path} declares package `{patched_name}`"
+            )
+
+    for crate in sorted(set(patched) - set(expected_order)):
+        errors.append(f"{crate}: patched but not a release crate")
+
+    return errors
+
+
+def documented_release_order_errors(root: pathlib.Path, expected_order: list[str]) -> list[str]:
+    """CLAUDE.md documents the publish order and its crate count; both must match.
+
+    The order itself carries dependency knowledge that no tool derives, so it
+    stays hand-written - but a hand-written list that nothing compares against
+    is how a new crate stayed invisible in the documented contract while three
+    gates disagreed about how many crates exist.
+    """
+
+    docs_path = root / "CLAUDE.md"
+    try:
+        lines = docs_path.read_text().splitlines()
+    except FileNotFoundError:
+        return [f"{docs_path}: file is missing"]
+
+    errors: list[str] = []
+    anchor = next(
+        (index for index, line in enumerate(lines) if "canonical publish order lives in" in line),
+        None,
+    )
+    if anchor is None:
+        errors.append(f"{docs_path.name}: no line documents the canonical publish order")
+    else:
+        listing_index = next(
+            (index for index in range(anchor + 1, len(lines)) if lines[index].strip()),
+            None,
+        )
+        listing = lines[listing_index] if listing_index is not None else ""
+        documented = re.findall(r"`([A-Za-z0-9_.-]+)`", listing)
+        if documented != expected_order:
+            documented_set = set(documented)
+            expected_set = set(expected_order)
+            for crate in expected_order:
+                if crate not in documented_set:
+                    errors.append(
+                        f"{docs_path.name}:{(listing_index or 0) + 1}: publish order omits `{crate}`"
+                    )
+            for crate in documented:
+                if crate not in expected_set:
+                    errors.append(
+                        f"{docs_path.name}:{(listing_index or 0) + 1}: publish order lists "
+                        f"`{crate}`, which is not a release crate"
+                    )
+            if not errors:
+                errors.append(
+                    f"{docs_path.name}:{(listing_index or 0) + 1}: publish order lists the "
+                    "right crates in a different order than scripts/release-rust-crates.sh"
+                )
+
+    expected_count = len(expected_order)
+    count_claims = (
+        re.compile(r"\((\d+) crates, dependency order\)"),
+        re.compile(r"Publishes (\d+) Rust crates"),
+        re.compile(r"all (\d+) publishable Rust crates"),
+    )
+    for line_number, line in enumerate(lines, start=1):
+        for pattern in count_claims:
+            match = pattern.search(line)
+            if match and int(match.group(1)) != expected_count:
+                errors.append(
+                    f"{docs_path.name}:{line_number}: claims {match.group(1)} release crates, "
+                    f"scripts/release-rust-crates.sh lists {expected_count}"
+                )
+
+    return errors
 
 
 def bazel_release_binary_version_env_errors(root: pathlib.Path, version: str) -> list[str]:

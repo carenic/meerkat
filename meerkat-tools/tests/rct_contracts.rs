@@ -188,6 +188,91 @@ fn test_rct_contracts_no_manual_tool_schema_literals() -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// Whether `path` is a whole-file module the PARENT declares under
+/// `#[cfg(test)]`.
+///
+/// The scanner needs this because such a file carries no in-file
+/// `#[cfg(test)]` for the line tracking below to observe. Answering it from
+/// the `_tests.rs` filename alone would be a permanent hole rather than an
+/// exemption: any production file that later adopts the name would leave this
+/// dogma gate silently, and nothing would say so. The declaration is cheap to
+/// verify, so it is verified.
+fn declared_as_cfg_test_module(path: &Path) -> std::io::Result<bool> {
+    let (Some(stem), Some(dir)) = (path.file_stem().and_then(|s| s.to_str()), path.parent()) else {
+        return Ok(false);
+    };
+
+    let mut parents: Vec<std::path::PathBuf> = ["mod.rs", "lib.rs", "main.rs"]
+        .iter()
+        .map(|name| dir.join(name))
+        .collect();
+    // The 2018-edition sibling form: `foo.rs` beside the `foo/` directory.
+    if let (Some(dir_name), Some(grandparent)) =
+        (dir.file_name().and_then(|name| name.to_str()), dir.parent())
+    {
+        parents.push(grandparent.join(format!("{dir_name}.rs")));
+    }
+
+    let declaration = format!("mod {stem};");
+    for parent in parents {
+        let Ok(contents) = std::fs::read_to_string(&parent) else {
+            continue;
+        };
+        // `#[cfg(test)]` must still be in force at the declaration: it may be
+        // followed by further attributes or comments, but any other item
+        // between the two means the attribute belonged to that item instead.
+        let mut cfg_test_in_force = false;
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.contains("#[cfg(test)]") {
+                cfg_test_in_force = true;
+                continue;
+            }
+            if line.ends_with(&declaration) {
+                return Ok(cfg_test_in_force);
+            }
+            if !line.is_empty() && !line.starts_with("//") && !line.starts_with("#[") {
+                cfg_test_in_force = false;
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+#[test]
+fn cfg_test_module_exemption_is_verified_not_inferred_from_the_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("declared_tests.rs"), "// test module\n").unwrap();
+    std::fs::write(root.join("undeclared_tests.rs"), "// not a test module\n").unwrap();
+    std::fs::write(root.join("adjacent_tests.rs"), "// not a test module\n").unwrap();
+    std::fs::write(
+        root.join("lib.rs"),
+        "#[cfg(test)]\nmod declared_tests;\n\n\
+         #[cfg(test)]\nstruct Fixture;\nmod adjacent_tests;\n\n\
+         mod undeclared_tests;\n",
+    )
+    .unwrap();
+
+    assert!(
+        declared_as_cfg_test_module(&root.join("declared_tests.rs")).unwrap(),
+        "a module the parent declares under #[cfg(test)] is exempt"
+    );
+    assert!(
+        !declared_as_cfg_test_module(&root.join("undeclared_tests.rs")).unwrap(),
+        "the `_tests.rs` name alone must not buy an exemption"
+    );
+    assert!(
+        !declared_as_cfg_test_module(&root.join("adjacent_tests.rs")).unwrap(),
+        "a #[cfg(test)] consumed by an intervening item does not reach the declaration"
+    );
+    assert!(
+        !declared_as_cfg_test_module(&root.join("declared.rs")).unwrap(),
+        "an undeclared file is scanned even when the parent exists"
+    );
+}
+
 fn scan_for_manual_input_schema_literals(
     root: &Path,
     dir: &Path,
@@ -210,6 +295,13 @@ fn scan_for_manual_input_schema_literals(
         }
 
         if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+
+        // Whole-file test modules are declared `#[cfg(test)] mod foo_tests;`
+        // in the PARENT, so the in-file `#[cfg(test)]` tracking below cannot
+        // observe that the file is test-only.
+        if declared_as_cfg_test_module(&path)? {
             continue;
         }
 

@@ -68,6 +68,7 @@ fn obligation(
         &mut authority,
         MeerkatMachineInput::RegisterSession {
             session_id: SessionId::from("trust-reconcile-add-failure-test"),
+            runtime_epoch_id: None,
         },
     )
     .expect("RegisterSession input");

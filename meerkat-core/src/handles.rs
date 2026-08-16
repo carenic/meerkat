@@ -562,7 +562,7 @@ mod sticky_model_fallback_control_delta_tests {
         target_visibility.staged_revision = 1;
         let plan = StickyModelFallbackVisibilityPlan {
             previous_state: previous_visibility.clone(),
-            next_state: target_visibility.clone(),
+            next_state: target_visibility,
             view_image_tool_available: true,
             previous_view_image_visible: true,
             next_view_image_visible: false,

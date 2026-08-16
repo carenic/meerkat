@@ -507,6 +507,7 @@ mod tests {
                     session_id: crate::meerkat_machine::dsl::SessionId::from(
                         "comms-trust-reconcile-test",
                     ),
+                    runtime_epoch_id: None,
                 },
             )
             .expect("RegisterSession input");
@@ -563,6 +564,7 @@ mod tests {
                     session_id: crate::meerkat_machine::dsl::SessionId::from(
                         "comms-trust-reconcile-stale-test",
                     ),
+                    runtime_epoch_id: None,
                 },
             )
             .expect("RegisterSession input");

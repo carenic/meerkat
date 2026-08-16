@@ -1160,6 +1160,7 @@ mod tests {
                 session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(
                     session_id.clone(),
                 ),
+                runtime_epoch_id: None,
             },
             "test::register_session",
         )

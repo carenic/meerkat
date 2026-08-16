@@ -583,6 +583,11 @@ impl BuiltinTool for ShellTool {
         false
     }
 
+    /// No in-tree classifier can prove a command line only reads, so there is no read-only shell.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::Mutating
+    }
+
     fn execution_contract(&self) -> meerkat_core::ToolExecutionContract {
         if !self.job_manager.exports_canonical_async_ops() {
             return meerkat_core::ToolExecutionContract::default();

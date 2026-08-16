@@ -56,20 +56,39 @@ use crate::meerkat_machine::{MeerkatMachine, dsl as mm_dsl};
 /// the matching [`MeerkatMachineInput`][mmi] and applies it against the
 /// session's shared DSL authority on the owning [`MeerkatMachine`].
 ///
-/// Session selection: routed effects prefer a projected `session_id`.
-/// `Ingest` may arrive without one, so the shared surface resolves its
-/// projected `runtime_id` through each registered session's DSL-owned
-/// `active_runtime_id`. Zero or multiple matches are refused rather than
-/// guessing.
+/// Session selection: every route the schema declares into this surface
+/// binds `session_id`, so the projected value is the only session source.
+/// An unpinned surface refuses a routed input that projects none instead of
+/// inferring the session from another projected field.
+///
+/// Runtime epoch: the seam projects MobMachine-owned facts only, and the
+/// entry runtime epoch is a meerkat-owned REGISTRATION fact, so no routed
+/// variant carries it and MobMachine must never learn it. The variants that
+/// declare the field are built here with `None` and resolved against the
+/// target session entry inside
+/// `MeerkatMachine::apply_routed_session_dsl_input`, under the same guard
+/// that resolved that entry. Resolving it in this surface instead would be
+/// either a peek that goes stale before the apply, or a self-deadlock on the
+/// non-reentrant per-session mutation gate the routed dispatch already
+/// holds.
+///
+/// What that means for stale writers on THIS lane: because the epoch is
+/// self-supplied from the entry, the machine's exact-epoch guard compares the
+/// entry against itself and cannot fence a stale mob-originated placement. The
+/// fence here is the placement triple plus the fence token - `session_id`,
+/// `agent_runtime_id`, `generation` and `fence_token` all come from the
+/// producer and are all matched by the machine. The epoch guard fences
+/// callers that STATE an epoch (every direct, non-routed producer does), which
+/// is why `resolve_routed_entry_runtime_epoch` fills only an absent value and
+/// a stated-but-stale epoch is still refused.
 ///
 /// [mmi]: crate::meerkat_machine::dsl::MeerkatMachineInput
 pub struct MeerkatConsumerSurface {
     machine: Arc<MeerkatMachine>,
-    /// Optional pinned session id. `None` means the surface infers the
-    /// session from the `agent_runtime_id` field of each routed input;
-    /// `Some(id)` means every routed input is applied against that
-    /// session and the surface refuses variants whose projected
-    /// `agent_runtime_id` disagrees.
+    /// Optional pinned session id. `None` means every routed input must
+    /// project its own `session_id`; `Some(id)` means every routed input is
+    /// applied against that session and the surface refuses variants whose
+    /// projected `session_id` disagrees.
     pinned_session: Option<SessionId>,
 }
 
@@ -353,6 +372,10 @@ impl ConsumerSurface for MeerkatConsumerSurface {
                 agent_runtime_id: mm_dsl::AgentRuntimeId::from(rt.to_string()),
                 fence_token: mm_dsl::FenceToken(fence),
                 generation: Some(mm_dsl::Generation(generation)),
+                // No seam field projects the entry epoch (see the type doc):
+                // `None` asks the routed apply to resolve the registered
+                // value this placement must assert. It never means "unbind
+                // the epoch".
                 runtime_epoch_id: None,
                 session_id: mm_dsl::SessionId::from(sid.to_string()),
             }
@@ -372,6 +395,9 @@ impl ConsumerSurface for MeerkatConsumerSurface {
                 runtime_id: mm_dsl::AgentRuntimeId::from(rt.to_string()),
                 fence_token: mm_dsl::FenceToken(fence),
                 generation: generation.map(mm_dsl::Generation),
+                // Same as PrepareBindings above: resolved from the entry by
+                // the routed apply, so the admission guard's exact epoch
+                // match compares two truthful values.
                 runtime_epoch_id: None,
                 work_id: mm_dsl::WorkId::from(work_id.to_string()),
                 origin,
@@ -717,9 +743,21 @@ mod tests {
             rebound.active_runtime_generation,
             Some(mm_dsl::Generation(replacement_generation))
         );
+        let entry_epoch_id = {
+            let sessions = machine.sessions.read().await;
+            sessions
+                .get(session_id)
+                .expect("rebound entry remains registered")
+                .epoch_id
+                .clone()
+        };
         assert_eq!(
-            rebound.active_runtime_epoch_id, None,
-            "the composition route does not project a runtime epoch id"
+            rebound.active_runtime_epoch_id,
+            Some(mm_dsl::RuntimeEpochId::from_domain(&entry_epoch_id)),
+            "the composition route projects no epoch, so the routed placement \
+             asserts the entry epoch the registration installed - a rebind must \
+             never leave a live entry epochless (that is the state in which the \
+             compaction projection coordinator can never authorize a handoff)"
         );
     }
 
@@ -762,6 +800,20 @@ mod tests {
         }
     }
 
+    /// The entry's registration-owned runtime epoch, as the DSL sees it.
+    async fn entry_runtime_epoch_id(
+        machine: &MeerkatMachine,
+        session_id: &SessionId,
+    ) -> mm_dsl::RuntimeEpochId {
+        let sessions = machine.sessions.read().await;
+        mm_dsl::RuntimeEpochId::from_domain(
+            &sessions
+                .get(session_id)
+                .expect("session entry exists")
+                .epoch_id,
+        )
+    }
+
     async fn bind_runtime(
         surface: &MeerkatConsumerSurface,
         session_id: &SessionId,
@@ -785,6 +837,225 @@ mod tests {
             )
             .await
             .expect("bind runtime");
+    }
+
+    /// Regression proof for the 0.8.23 compaction-persistence wedge: a
+    /// seam-routed member must end up with the entry's REAL runtime epoch on its
+    /// authority, because that is the epoch the compaction projection
+    /// coordinator holds as `expected`.
+    ///
+    /// The seam route projects only MobMachine-owned facts (runtime id, fence,
+    /// generation, session id) - by design it owns no epoch. Before this change
+    /// the consumer hardcoded `None` into routed `PrepareBindings`/`Ingest`, and
+    /// `PrepareBindings` wrote that `None` over the entry epoch: the coordinator
+    /// then compared a minted epoch against `None` forever ("runtime epoch
+    /// changed (expected ..., current None)"), warn-only, so a member whose
+    /// strand was already over-window became permanently unusable in silence.
+    /// The epoch now belongs to registration and routed inputs resolve it from
+    /// the entry, so both the routed placement and routed work admission agree
+    /// with it.
+    #[tokio::test]
+    async fn routed_seam_binding_and_ingest_preserve_the_entry_runtime_epoch() {
+        let machine = Arc::new(MeerkatMachine::ephemeral());
+        let surface = MeerkatConsumerSurface::new(Arc::clone(&machine));
+        let session_id = sid("00000000-0000-0000-0000-000000000042");
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+
+        let entry_epoch_id = {
+            let sessions = machine.sessions.read().await;
+            sessions
+                .get(&session_id)
+                .expect("registered entry exists")
+                .epoch_id
+                .clone()
+        };
+        let registered_epoch = mm_dsl::RuntimeEpochId::from_domain(&entry_epoch_id);
+        assert_eq!(
+            machine
+                .session_dsl_state(&session_id)
+                .await
+                .expect("registered authority exists")
+                .active_runtime_epoch_id,
+            Some(registered_epoch.clone()),
+            "registration installs the entry epoch"
+        );
+
+        bind_runtime(&surface, &session_id, "mob-runtime").await;
+        let bound = machine
+            .session_dsl_state(&session_id)
+            .await
+            .expect("bound authority exists");
+        assert!(matches!(&bound.active_runtime_id, Some(value) if value.0 == "mob-runtime"));
+        assert_eq!(
+            bound.active_runtime_epoch_id,
+            Some(registered_epoch.clone()),
+            "the routed placement must leave the registered entry epoch intact"
+        );
+
+        // Work admission takes the same lane: the routed Ingest carries no
+        // epoch either, and its exact-match guard now sees the truthful value.
+        surface
+            .apply_routed_input(
+                iv("Ingest"),
+                vec![
+                    (
+                        fld("runtime_id"),
+                        OwnedFieldValue::Str("mob-runtime".into()),
+                    ),
+                    (fld("fence_token"), OwnedFieldValue::U64(1)),
+                    (fld("generation"), OwnedFieldValue::U64(0)),
+                    (fld("work_id"), OwnedFieldValue::Str("work-1".into())),
+                    (
+                        fld("origin"),
+                        OwnedFieldValue::Opaque(Arc::new(mm_dsl::WorkOrigin::Ingest)),
+                    ),
+                    (
+                        fld("session_id"),
+                        OwnedFieldValue::Str(session_id.to_string()),
+                    ),
+                ],
+            )
+            .await
+            .expect(
+                "routed work admission must be admitted for an epoch-registered \
+                 seam member: epoch-Some sessions refusing routed Ingest is the \
+                 other half of the mutually exclusive trap",
+            );
+        assert_eq!(
+            machine
+                .session_dsl_state(&session_id)
+                .await
+                .expect("authority exists after admission")
+                .active_runtime_epoch_id,
+            Some(registered_epoch),
+            "admission must not disturb the entry epoch"
+        );
+    }
+
+    /// End of the wedge, at the seam the production defect ran through: a
+    /// seam-routed member with locally prepared session resources (the mob
+    /// provisioning shape) authorizes its durable compaction projection once the
+    /// routed placement lands. This is the acceptance half that regresses if the
+    /// routed epoch resolution breaks - the coordinator holds the entry epoch as
+    /// `expected`, and before the fix the routed placement wrote `None` over it,
+    /// so this authorization could never succeed for any mob member with
+    /// durable semantic memory.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn routed_seam_member_authorizes_its_durable_compaction_projection() {
+        let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let machine = Arc::new(MeerkatMachine::persistent_without_blobs(
+            store as Arc<dyn crate::store::RuntimeStore>,
+        ));
+        let surface = MeerkatConsumerSurface::new(Arc::clone(&machine));
+        let session_id = sid("00000000-0000-0000-0000-000000000043");
+        let bindings = machine
+            .prepare_local_session_bindings(session_id.clone())
+            .await
+            .expect("mob provisioning prepares local session resources");
+        let projection: meerkat_core::CompactionProjectionId =
+            serde_json::from_value(serde_json::json!({
+                "session_id": session_id,
+                "parent_revision": "parent",
+                "revision": "revision",
+                "commit_fingerprint": "sha256:routed-seam-member-fixture",
+            }))
+            .expect("persisted compaction projection fixture");
+
+        assert!(
+            bindings
+                .compaction_commit_coordinator()
+                .authorize_projection(&projection)
+                .is_err(),
+            "before the routed placement there is no authoritative binding to commit against"
+        );
+
+        bind_runtime(&surface, &session_id, "mob-runtime").await;
+
+        bindings
+            .compaction_commit_coordinator()
+            .authorize_projection(&projection)
+            .expect(
+                "a seam-routed member must be able to persist compaction: the routed placement \
+                 asserts the entry epoch the coordinator holds",
+            );
+    }
+
+    /// The epoch resolution above fills only an ABSENT epoch. A routed input
+    /// that states a stale epoch is still refused - the guard's original design
+    /// intent (fencing stale-epoch writers) survives, and the fill is not a
+    /// tautology against the machine's own state.
+    #[tokio::test]
+    async fn routed_input_stating_a_stale_runtime_epoch_is_still_refused() {
+        let machine = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+
+        let refusal = machine
+            .apply_routed_meerkat_input(
+                &session_id,
+                mm_dsl::MeerkatMachineInput::PrepareBindings {
+                    agent_runtime_id: mm_dsl::AgentRuntimeId("mob-runtime".into()),
+                    fence_token: mm_dsl::FenceToken(1),
+                    generation: Some(mm_dsl::Generation(0)),
+                    runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("stale-epoch".into())),
+                    session_id: mm_dsl::SessionId(session_id.to_string()),
+                },
+            )
+            .await
+            .expect_err("a stated stale epoch must not be silently replaced");
+        assert_eq!(refusal.error_code, "dsl_guard_rejected", "{refusal}");
+
+        let state = machine
+            .session_dsl_state(&session_id)
+            .await
+            .expect("authority remains available");
+        assert_eq!(
+            state.active_runtime_id, None,
+            "a refused placement must not bind"
+        );
+        assert!(
+            state.active_runtime_epoch_id.is_some(),
+            "the registered entry epoch survives a refused placement"
+        );
+    }
+
+    /// Same fencing on the work-admission half of the lane: `Ingest`'s exact
+    /// epoch match is what keeps a writer from a dead runtime generation out,
+    /// and filling only an absent epoch leaves that intact.
+    #[tokio::test]
+    async fn routed_ingest_stating_a_stale_runtime_epoch_is_still_refused() {
+        let machine = Arc::new(MeerkatMachine::ephemeral());
+        let surface = MeerkatConsumerSurface::new(Arc::clone(&machine));
+        let session_id = SessionId::new();
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+        bind_runtime(&surface, &session_id, "mob-runtime").await;
+
+        let refusal = machine
+            .apply_routed_meerkat_input(
+                &session_id,
+                mm_dsl::MeerkatMachineInput::Ingest {
+                    session_id: mm_dsl::SessionId(session_id.to_string()),
+                    runtime_id: mm_dsl::AgentRuntimeId("mob-runtime".into()),
+                    fence_token: mm_dsl::FenceToken(1),
+                    generation: Some(mm_dsl::Generation(0)),
+                    runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("stale-epoch".into())),
+                    work_id: mm_dsl::WorkId("work-1".into()),
+                    origin: mm_dsl::WorkOrigin::Ingest,
+                },
+            )
+            .await
+            .expect_err("work stated against a stale epoch must not be admitted");
+        assert_eq!(refusal.error_code, "dsl_guard_rejected", "{refusal}");
     }
 
     #[tokio::test]
@@ -1343,9 +1614,18 @@ mod tests {
             recovered.active_runtime_generation, None,
             "cold registration must release the stale generation"
         );
+        let entry_epoch = entry_runtime_epoch_id(&machine, &session_id).await;
+        assert_ne!(
+            recovered.active_runtime_epoch_id,
+            Some(mm_dsl::RuntimeEpochId("stale-runtime-epoch".into())),
+            "cold registration must release the DEAD process's runtime epoch"
+        );
         assert_eq!(
-            recovered.active_runtime_epoch_id, None,
-            "cold registration must release the stale runtime epoch"
+            recovered.active_runtime_epoch_id,
+            Some(entry_epoch.clone()),
+            "cold registration installs the epoch of the entry it just created: \
+             the epoch is a registration fact, and a live registered entry that \
+             carries none can never authorize a compaction projection"
         );
         assert!(
             signal_surface.log.lock().await.is_empty(),
@@ -1422,8 +1702,10 @@ mod tests {
             "missing-live preparation releases the stale generation"
         );
         assert_eq!(
-            normalized.active_runtime_epoch_id, None,
-            "missing-live preparation releases the stale runtime epoch"
+            normalized.active_runtime_epoch_id,
+            Some(entry_epoch.clone()),
+            "missing-live preparation releases the stale PLACEMENT and retains the \
+             registered entry epoch"
         );
         let after_revival = machine
             .meerkat_machine_spine_snapshot(&session_id)
@@ -1474,8 +1756,9 @@ mod tests {
             "stale generation released"
         );
         assert_eq!(
-            attached.active_runtime_epoch_id, None,
-            "stale epoch released"
+            attached.active_runtime_epoch_id,
+            Some(entry_epoch.clone()),
+            "stale placement released, registered entry epoch retained"
         );
         assert!(
             signal_surface.log.lock().await.is_empty(),
@@ -1494,6 +1777,10 @@ mod tests {
         assert_eq!(startup_persisted.binding().agent_runtime_id(), None);
         assert_eq!(startup_persisted.binding().fence_token(), None);
         assert_eq!(startup_persisted.binding().runtime_generation(), None);
+        // Startup commits the HEALED (fully cleared) tuple rather than a
+        // projection of the live authority, so this row carries no epoch even
+        // though the in-memory entry is registered under one. That is the
+        // Converged fixed point on the next cold recovery.
         assert_eq!(startup_persisted.binding().runtime_epoch_id(), None);
 
         route_successor_binding_and_finish_gated_attachment(
@@ -1523,7 +1810,12 @@ mod tests {
         );
         assert_eq!(healed_durable.binding().fence_token(), Some(42));
         assert_eq!(healed_durable.binding().runtime_generation(), Some(8));
-        assert_eq!(healed_durable.binding().runtime_epoch_id(), None);
+        assert_eq!(
+            healed_durable.binding().runtime_epoch_id(),
+            Some(entry_epoch.0.as_str()),
+            "the replacement placement asserts, and therefore preserves, the \
+             registered entry epoch"
+        );
 
         let log = signal_surface.log.lock().await;
         assert_eq!(log.len(), 1, "successor binding publishes readiness once");
@@ -1597,9 +1889,11 @@ mod tests {
                     ),
                     fence_token: mm_dsl::FenceToken(51),
                     generation: Some(mm_dsl::Generation(9)),
-                    runtime_epoch_id: Some(mm_dsl::RuntimeEpochId(
-                        "ownerless-stale-runtime-epoch".into(),
-                    )),
+                    // The stale facts under test are the PLACEMENT triple; the
+                    // epoch is registration-owned, so the fixture must state the
+                    // registered one (a placement naming any other epoch is a
+                    // typed rejection).
+                    runtime_epoch_id: Some(mm_dsl::RuntimeEpochId::from_domain(&epoch_before)),
                     session_id: mm_dsl::SessionId(session_id.to_string()),
                 },
                 "OwnerlessAttachedRegressionBinding",
@@ -1639,7 +1933,8 @@ mod tests {
             Some(mm_dsl::Generation(9))
         );
         assert!(
-            matches!(&ownerless.active_runtime_epoch_id, Some(value) if value.0 == "ownerless-stale-runtime-epoch")
+            ownerless.active_runtime_epoch_id
+                == Some(mm_dsl::RuntimeEpochId::from_domain(&epoch_before))
         );
         {
             let sessions = machine.sessions.read().await;
@@ -1676,7 +1971,12 @@ mod tests {
         assert_eq!(normalized.active_runtime_id, None);
         assert_eq!(normalized.active_fence_token, None);
         assert_eq!(normalized.active_runtime_generation, None);
-        assert_eq!(normalized.active_runtime_epoch_id, None);
+        assert_eq!(
+            normalized.active_runtime_epoch_id,
+            Some(mm_dsl::RuntimeEpochId::from_domain(&epoch_before)),
+            "normalization clears the ownerless placement and keeps the registered \
+             entry epoch"
+        );
         let after_revival = machine
             .meerkat_machine_spine_snapshot(&session_id)
             .await
@@ -1785,11 +2085,21 @@ mod tests {
         // Re-admit first, as the delivery path can do before its later local
         // bindings preparation. The subsequent idempotent preparation must
         // not turn the completed cleanup receipt into an in-progress owner.
+        let entry_epoch_id = {
+            let sessions = machine.sessions.read().await;
+            sessions
+                .get(&session_id)
+                .expect("stopped entry remains")
+                .epoch_id
+                .clone()
+        };
         machine
             .stage_session_dsl_input(
                 &session_id,
                 mm_dsl::MeerkatMachineInput::RegisterSession {
                     session_id: mm_dsl::SessionId(session_id.to_string()),
+                    // Re-admission restates the entry's registered epoch.
+                    runtime_epoch_id: Some(mm_dsl::RuntimeEpochId::from_domain(&entry_epoch_id)),
                 },
                 "CompletedStopRegressionReadmit",
             )

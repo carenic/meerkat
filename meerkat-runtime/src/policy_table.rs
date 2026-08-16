@@ -168,8 +168,10 @@ fn generated_admission_projection(
 fn projection_authority(runtime_idle: bool) -> Result<mm_dsl::MeerkatMachineAuthority, String> {
     let session_id = SessionId::new();
     let mut authority =
-        crate::meerkat_machine::dsl_authority::new_registered_authority(&session_id)
-            .map_err(|err| format!("generated admission authority registration failed: {err}"))?;
+        crate::meerkat_machine::dsl_authority::new_registered_authority_without_runtime_entry(
+            &session_id,
+        )
+        .map_err(|err| format!("generated admission authority registration failed: {err}"))?;
     if !runtime_idle {
         mm_dsl::MeerkatMachineMutator::apply(
             &mut authority,

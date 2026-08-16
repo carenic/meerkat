@@ -974,6 +974,10 @@ enum OwnedRuntimeLoopTerminalization {
     Failed {
         failure: CoreApplyFailureCause,
         completion_reason: String,
+        /// What the machine does with this run's staged contributors. Only the
+        /// loop knows whether the executor answered or whether the loop gave up
+        /// on it while an `apply` it can no longer observe may still land.
+        contributor_disposition: crate::meerkat_machine::FailedRunContributorDisposition,
     },
 }
 
@@ -1044,10 +1048,16 @@ async fn realize_runtime_loop_terminal_owned(
             OwnedRuntimeLoopTerminalization::Failed {
                 failure,
                 completion_reason,
+                contributor_disposition,
             } => (
-                crate::meerkat_machine::fail_runtime_loop_run(&driver, run_id.clone(), failure)
-                    .await
-                    .map_err(|error| error.to_string()),
+                crate::meerkat_machine::fail_runtime_loop_run(
+                    &driver,
+                    run_id.clone(),
+                    failure,
+                    contributor_disposition,
+                )
+                .await
+                .map_err(|error| error.to_string()),
                 completion_reason,
             ),
         };
@@ -2095,13 +2105,14 @@ fn resolve_process_local_failed_run_waiters(
     run_id: &RunId,
     reason: String,
 ) {
+    let finalization = machine_failed_completion_finalization(driver);
     let authorized = machine_terminal_completion_error(driver, reason)
         .and_then(|error_metadata| {
             crate::meerkat_machine::driver::machine_resolve_runtime_completion_result(
                 driver,
                 Some(run_id),
                 crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::MachineTerminal,
-                crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+                finalization,
             )
             .map(|authority| (authority, error_metadata))
         })
@@ -2220,13 +2231,14 @@ async fn resolve_machine_terminal_completion_waiters_under_authority(
                 return;
             }
         };
+    let finalization = machine_failed_completion_finalization(&driver_guard);
     let bundle = machine_terminal_completion_error(&driver_guard, reason)
         .and_then(|error_metadata| {
             crate::meerkat_machine::driver::machine_resolve_runtime_completion_result(
                 &driver_guard,
                 Some(&owned_run_id),
                 crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::MachineTerminal,
-                crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+                finalization,
             )
             .map(|authority| (authority, error_metadata))
         })
@@ -3651,19 +3663,123 @@ fn machine_terminal_completion_error(
     })?;
     match outcome {
         crate::meerkat_machine::dsl::TurnTerminalOutcome::Cancelled => {
-            match auth.state().terminal_cause_kind {
-                None | Some(crate::meerkat_machine::dsl::TurnTerminalCauseKind::Unknown) => {
-                    Ok(None)
-                }
-                Some(cause_kind) => Err(crate::RuntimeDriverError::Internal(format!(
-                    "generated cancelled terminal carried failure cause {cause_kind:?}"
-                ))),
-            }
+            // A cancelled terminal carries no failure cause, and
+            // `terminal_cause_kind` is not this run's fact to read here.
+            //
+            // Refusing a specific cause on this arm was the same defect the
+            // `Completed` arm below was written to fix, one arm over. The
+            // refusal returned `Err`, which
+            // [`realize_runtime_loop_terminal_owned`] turns into
+            // `OwnedRuntimeLoopTerminalizationOutcome::CleanupCarrierCorrupt`
+            // by short-circuiting its `and_then` chain, and that ends the
+            // runtime loop task for the remaining life of the process: the
+            // session cannot run another turn.
+            //
+            // IT IS REACHABLE, BY TWO ORDINARY ROUTES.
+            //
+            // - A cancel inheriting an earlier run's cause. `RunCancelled`
+            //   sets `terminal_outcome = Cancelled` and `turn_terminal_run_id`
+            //   and does not touch `terminal_cause_kind` at all; neither do
+            //   the other cancel-producing transitions
+            //   (`BoundaryCompleteCancelled`, `BoundaryContinueToCancelled`,
+            //   `PrimitiveAppliedImmediateCancelled`, `CancellationObserved`,
+            //   `ForceCancelNoRun`). Only `StartConversationRun*` /
+            //   `StartImmediate*` clear the cause at turn start, and the
+            //   skipped-turn-start classes documented on
+            //   [`completed_terminal_witness_before_failure_realization`] route
+            //   through `PrepareIdle` / `PrepareAttached` /
+            //   `DrainQueuedRunRetired`, which clear `turn_terminal_run_id` and
+            //   leave the cause standing.
+            // - A failed run inheriting an earlier run's cancelled outcome. The
+            //   generated `RunFailed` update replaces `terminal_outcome` only
+            //   when it is unset (`None`, or the `None` variant), so a stale
+            //   `Cancelled` survives while the independent cause branch fills
+            //   `terminal_cause_kind` with this run's own specific failure
+            //   cause. That state lands here too, carrying a cause the machine
+            //   itself wrote one transition earlier.
+            //
+            // THE MACHINE DOES NOT CONSIDER EITHER STATE IMPOSSIBLE.
+            // `ResolveRuntimeCompletionResultCancelled` guards on
+            // `terminal_outcome == Cancelled` and consults no cause at all, so
+            // it accepts exactly the states this arm used to refuse and
+            // resolves them as `RuntimeCompletionResultClass::Cancelled`. The
+            // shell was refusing a state its own authority classifies.
+            //
+            // `Ok(None)` is not a new answer: it is what every cancelled run
+            // already resolves to, so this only stops the stale-cause case
+            // from diverging from the ordinary one. No new metadata shape,
+            // staged candidate or payload digest is introduced by it.
+            //
+            // DO NOT DERIVE A CAUSE FROM `last_runtime_apply_failure_cause`
+            // HERE the way the `Completed` arm does. That field is run-scoped
+            // only because `RunFailed` assigns it; `RunCancelled` does not
+            // touch it either, so on a cancelled run it is exactly as stale as
+            // `terminal_cause_kind`.
+            Ok(None)
         }
         crate::meerkat_machine::dsl::TurnTerminalOutcome::Failed
         | crate::meerkat_machine::dsl::TurnTerminalOutcome::BudgetExhausted
         | crate::meerkat_machine::dsl::TurnTerminalOutcome::TimeBudgetExceeded
         | crate::meerkat_machine::dsl::TurnTerminalOutcome::StructuredOutputValidationFailed => {
+            // THIS ARM KEEPS READING `terminal_cause_kind`, ON PURPOSE. It is
+            // not left this way for symmetry with the arms above; on a failed
+            // outcome this field is the machine's own classifier, and the two
+            // properties that made it the wrong field on `Completed` and
+            // `Cancelled` do not hold here.
+            //
+            // IT IS WHAT THE MACHINE CLASSIFIES BY.
+            // [`machine_failed_completion_finalization`] answers `Succeeded`
+            // for every outcome in this arm, so the generated transitions that
+            // can accept the state are
+            // `ResolveRuntimeCompletionResult{RuntimeApplyFailed,MachineFailed}`,
+            // and they select between the `RuntimeApplyFailed` and `Abandoned`
+            // cleanup outcomes on `self.terminal_cause_kind` alone
+            // (`machine_runtime_apply_failed` /
+            // `machine_not_runtime_apply_failed`). Deriving some other cause
+            // here would hand the caller typed metadata that contradicts the
+            // cleanup outcome the machine emits for the very same state, which
+            // is classifying in the shell.
+            //
+            // NOTHING DECLARES THIS PAIR INCOHERENT. That is the difference
+            // from `Completed`, and it is the whole of the difference. There
+            // the machine states outright that a cause next to a completed
+            // outcome is not part of a coherent terminal
+            // (`completed_terminal_is_coherent` requires `terminal_cause_kind
+            // == None`), which is what proved the field wrong on that arm. A
+            // cause next to a failure outcome is the normal shape, and the
+            // transition that will actually fire here places no constraint
+            // between the two at all.
+            //
+            // THE TWO `Err` RETURNS BELOW ARE NOT THE CARRIER-WEDGE DEFECT.
+            // Every caller that can reach this arm runs after `RunFailed` (the
+            // caller table is on the `Completed` arm below), and `RunFailed`
+            // leaves `terminal_cause_kind` `Some` and specific: it preserves an
+            // existing specific cause, and otherwise fills from a table whose
+            // every branch is a specific cause. In the states where these would
+            // fire the machine refuses too, since both applicable transitions
+            // guard `machine_failure_cause_known` (`terminal_cause_kind != None
+            // && != Unknown`), so the caller is answered `AuthorityUnavailable`
+            // either way. These report machine authority rather than inventing
+            // a refusal of a state the machine accepts.
+            //
+            // WHAT REMAINS, STATED RATHER THAN WAVED AWAY. Two shapes survive
+            // on the skipped-turn-start classes. An earlier run's whole
+            // terminal can be reported for this run, because `RunFailed`
+            // preserves both facts when both are already set. And the pair can
+            // be mixed: `AcknowledgeTerminal` clears `terminal_cause_kind`
+            // while setting `terminal_outcome` from its input, so a later
+            // `RunFailed` can fill this run's cause next to that inherited
+            // outcome, which the `ServiceTurnCommitted*` guard
+            // `failed_terminal_outcome_matches_cause` would reject at the
+            // commit boundary even though nothing rejects it here.
+            //
+            // Neither is fixable by reading a different field in this shell
+            // function. In both shapes the machine's own result class is
+            // selected from the same `terminal_cause_kind` this arm reads, so
+            // a shell that answered differently would only disagree with the
+            // authority; the fix is to stop the terminal from outliving its run
+            // at turn start, which is schema work on the generated update
+            // blocks.
             let cause_kind = auth.state().terminal_cause_kind.ok_or_else(|| {
                 crate::RuntimeDriverError::Internal(
                     "missing generated terminal_cause_kind for failed runtime completion"
@@ -3682,13 +3798,279 @@ fn machine_terminal_completion_error(
                 detail,
             )))
         }
-        crate::meerkat_machine::dsl::TurnTerminalOutcome::None
-        | crate::meerkat_machine::dsl::TurnTerminalOutcome::Completed => {
+        crate::meerkat_machine::dsl::TurnTerminalOutcome::Completed => {
+            // A runtime-failed run may legitimately still hold a `Completed`
+            // machine terminal. The turn reached `BoundaryCompleteCompleted`
+            // and only the run-boundary persistence after it failed, and the
+            // generated `RunFailed` transition deliberately preserves a
+            // pre-existing terminal outcome instead of overwriting it. Every
+            // guard that would forbid the (Failed, Completed) pair is keyed on
+            // `machine_terminal_failure_observed`, which the runtime-loop
+            // failure path always passes as `false`.
+            //
+            // Refusing this pair corrupted the recovery carrier, which ended
+            // the loop task for the remaining life of the process and left the
+            // session unable to run another turn (field regression, household
+            // fleet, 0.8.23). Resolve the typed terminal instead of refusing
+            // it.
+            //
+            // DERIVE THE CAUSE, DO NOT ASSERT IT, AND DO NOT READ
+            // `terminal_cause_kind` HERE. `terminal_cause_kind` is the wrong
+            // field on this arm, and reading it would report a dead cause as
+            // this run's:
+            //
+            // - No generated transition ever sets a specific cause together
+            //   with a `Completed` outcome. `BoundaryCompleteCompleted`,
+            //   `PrimitiveAppliedImmediateCompleted`, `ExtractionValidationPassed`
+            //   and `RunCompleted` all set `terminal_outcome = Completed` while
+            //   leaving `terminal_cause_kind` exactly as they found it.
+            // - `Prepare*` / `DrainQueuedRunRetired` - the skipped-turn-start
+            //   classes documented on
+            //   [`completed_terminal_witness_before_failure_realization`] -
+            //   clear only `turn_terminal_run_id`, so an earlier run's cause
+            //   survives into this one.
+            // - The generated `RunFailed` update fills `terminal_cause_kind`
+            //   only when it is `None`/`Unknown`, and otherwise preserves it.
+            //
+            // The machine states the same thing directly in its own coherence
+            // rule: the `ServiceTurnCommitted*` guard `completed_terminal_is_coherent`
+            // requires a `Completed` terminal to carry `terminal_cause_kind ==
+            // None`. A cause sitting next to a `Completed` outcome is therefore
+            // not part of a coherent terminal at all, and reporting it would
+            // hand the host a confident wrong cause - the same defect class in
+            // the opposite direction.
+            //
+            // `last_runtime_apply_failure_cause` is the run-scoped fact.
+            // `RunFailed` assigns it unconditionally from this run's
+            // `runtime_apply_failure_cause`, so it is this run's ON THIS ARM.
+            //
+            // THE REASON IS THE ARM, NOT THE FUNCTION, AND THE DIFFERENCE
+            // MATTERS. `RunFailed` is the only terminal-realizing transition
+            // that preserves a pre-existing outcome, so it is the only one that
+            // can leave a `Completed` outcome standing on a failed runtime
+            // completion; every other route overwrites the outcome and lands on
+            // a different arm. Do not restate this as a property of the
+            // function: callers of this function do NOT all run after
+            // `RunFailed`. The caller table:
+            //
+            // - [`realize_runtime_loop_terminal_owned`] calls it after a
+            //   successful realization of either `OwnedRuntimeLoopTerminalization`
+            //   variant. `Failed` fires `RunFailed`. `Cancelled` fires
+            //   `RunCancelled`, which does NOT assign
+            //   `last_runtime_apply_failure_cause` - but it does set
+            //   `terminal_outcome = Cancelled` unconditionally, so that branch
+            //   lands on the `Cancelled` arm above and never here. That arm
+            //   reads neither field, for exactly this reason.
+            // - [`resolve_process_local_failed_run_waiters`] and
+            //   [`resolve_machine_terminal_completion_waiters_under_authority`]
+            //   are reached only from failed-run resolution sites that are
+            //   themselves past `RunFailed`: the three
+            //   [`resolve_machine_terminal_completion_waiters`] call sites in
+            //   `process_queue` (primitive rejection, turn-state preparation
+            //   failure, and the non-cancelled branch of the apply failure),
+            //   and the teardown recovery site, whose `failed_execution_attempt`
+            //   gate requires a `completion_error_metadata` that only a failed
+            //   realization ever stages.
+            //
+            // Its presence is also exactly the predicate `RunFailed`'s own cause
+            // table uses to select `RuntimeApplyFailure`, so mirroring it is
+            // reading machine authority rather than classifying in the shell.
+            //
+            // On that branch the metadata is byte-identical to the candidate
+            // the failed-run realization staged on the input terminal-completion
+            // batch - `TurnErrorMetadata::terminal(RuntimeApplyFailure, Failed,
+            // detail)` is the definition of `runtime_apply_failure(detail)`
+            // over the same apply-failure message - so the completion authority
+            // accepts the payload digest rather than answering
+            // `AuthorityUnavailable`.
+            //
+            // Absent that fact the machine holds no cause this run can claim.
+            // `Unknown` is the vocabulary's own "not classified", and the
+            // operator-facing `detail` still travels; a narrower true statement
+            // beats a confident wrong one. Neither delivery path turns it into
+            // durable truth, and they do not behave the same way, so do not
+            // read one guarantee onto the other. The durable batch fails
+            // closed: a payload that is not the staged `runtime_apply_failure`
+            // candidate is rejected by the digest check in
+            // `authorize_runtime_terminal_bundle` before any receipt is
+            // written, and a non-specific cause would also be refused by
+            // `InteractionTerminalCandidate::runtime_completion_terminal_recovery`
+            // on recovery. The process-local path in
+            // `resolve_process_local_failed_run_waiters` has no digest check
+            // and does deliver the unclassified-but-true cause to its waiters -
+            // it persists nothing either way.
+            //
+            // The outcome stays `Failed`. It describes the runtime completion
+            // being delivered, not the turn terminal the machine holds: this
+            // path resolves `AbandonedWithError`, and durable machine-terminal
+            // recovery rejects any non-failure outcome outright.
+            let cause_kind = match auth.state().last_runtime_apply_failure_cause {
+                Some(_) => meerkat_core::TurnTerminalCauseKind::RuntimeApplyFailure,
+                None => meerkat_core::TurnTerminalCauseKind::Unknown,
+            };
+            Ok(Some(meerkat_core::TurnErrorMetadata::terminal(
+                cause_kind,
+                meerkat_core::TurnTerminalOutcome::Failed,
+                detail,
+            )))
+        }
+        crate::meerkat_machine::dsl::TurnTerminalOutcome::None => {
+            // Unlike `Completed`, `None` is not preserved: the generated
+            // `RunFailed` update replaces a `None` outcome with a real failure
+            // outcome. Observing it here therefore means no failed-run terminal
+            // was realized at all, so keep failing closed rather than minting a
+            // terminal the machine does not hold.
             Err(crate::RuntimeDriverError::Internal(format!(
                 "generated terminal outcome {outcome:?} cannot resolve failed runtime completion"
             )))
         }
     }
+}
+
+/// The generated finalization observation a failed runtime completion must be
+/// resolved under.
+///
+/// The ordinary failed run carries a failed machine terminal, and `Succeeded`
+/// selects the generated `RuntimeApplyFailed` / `MachineFailed` result classes
+/// for it. A run that already reached its completed terminal carries
+/// `Completed` instead, and every `Succeeded` + `MachineTerminal` transition
+/// guards on a failed terminal outcome, so `Succeeded` matches nothing there
+/// and the caller would be answered `AuthorityUnavailable` rather than a typed
+/// terminal. `Failed` is both the matching and the honest observation for that
+/// run: the turn produced its result and the runtime finalization after it is
+/// exactly what failed. It selects the generated
+/// `FinalizationFailureWithoutResult` transition, whose result class is
+/// `AbandonedWithError` with a `RuntimeApplyFailed` cleanup outcome.
+///
+/// DELIBERATELY NOT THE SAME PREDICATE AS
+/// [`completed_terminal_witness_before_failure_realization`]. That one adds the
+/// exact-run witness (`turn_terminal_run_id`); this one reads the bare
+/// `terminal_outcome`. They look interchangeable and are not, so do not unify
+/// them - they answer different questions:
+///
+/// - Here: "which generated transition will accept the authority state as it
+///   stands right now". `ResolveRuntimeCompletionResult{RuntimeApplyFailed,
+///   MachineFailed}` both guard `finalization == Succeeded` together with a
+///   `machine_failed` guard over `terminal_outcome`, so a `Completed` outcome
+///   guard-rejects `Succeeded` no matter which run produced it. Provenance is
+///   irrelevant because the guard cannot see provenance either.
+/// - There: "did THIS run mutate and complete before it failed". Provenance is
+///   the whole question, because the answer decides whether to retire a live
+///   session.
+///
+/// The disagreement is observable, not theoretical. Two turn-start classes skip
+/// the turn-start transition and so never reset `terminal_outcome`: an
+/// appends-empty staged primitive (the transient-turn-context / live-steer
+/// class, where `primitive_turn_start_input` yields nothing) and the retired
+/// drain (where the phase is `Retired` and the generated turn-start transitions
+/// have no `Retired` variant). Both still route through `PrepareIdle` /
+/// `PrepareAttached` / `DrainQueuedRunRetired`, which reset
+/// `turn_terminal_run_id = None` but leave `terminal_outcome` untouched; only
+/// the `StartConversationRun*` / `StartImmediate*` transitions reset both. On
+/// those two classes a stale `Completed` from an earlier run is therefore
+/// visible while the exact-run witness is correctly false - and each function
+/// gives the right answer for its own question precisely because they differ.
+fn machine_failed_completion_finalization(
+    driver: &crate::meerkat_machine::driver::DriverEntry,
+) -> crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation {
+    // Deliberately keyed on the bare terminal outcome, not on the exact-run
+    // witness below. This answers "which generated transition will accept this
+    // state", which is a question about the state the authority is in right
+    // now, and `Succeeded` is guard-rejected for a `Completed` outcome however
+    // that outcome got there.
+    if machine_terminal_outcome_is_completed(driver) {
+        crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Failed
+    } else {
+        crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded
+    }
+}
+
+fn machine_terminal_outcome_is_completed(
+    driver: &crate::meerkat_machine::driver::DriverEntry,
+) -> bool {
+    let authority = driver.shared_dsl_authority();
+    let auth = authority
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    matches!(
+        auth.state().terminal_outcome,
+        Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::Completed)
+    )
+}
+
+/// Whether the machine recorded a completed turn terminal for THIS run before
+/// its runtime-level completion failed, captured while the pre-realization
+/// driver guard is still held and releasing that guard by consuming it.
+///
+/// WHAT THIS READS. `BoundaryCompleteCompleted` is applied only after the model
+/// call, the tool calls, the boundary effects and every terminal hook have run,
+/// and after `AgentEvent::TurnCompleted` has already been published to the host.
+/// A failure observed after that fact is a post-mutation failure: the turn's
+/// effects happened, the host was told the turn succeeded, and nothing marks the
+/// contributing inputs as applied. Returning such a contributor to its work lane
+/// re-appends its content and re-runs the whole turn, with tools free to fire a
+/// second time.
+///
+/// WHY THE EXACT-RUN WITNESS IS REQUIRED, NOT DECORATIVE. The turn-start signal
+/// is deliberately skipped for an appends-empty staged primitive (the
+/// transient-turn-context / live-steer class) and for the retired drain, and
+/// those two classes still run `PrepareIdle` / `PrepareAttached` /
+/// `DrainQueuedRunRetired`, which clear `turn_terminal_run_id` but leave
+/// `terminal_outcome` describing whatever ran before this run. Reading the
+/// outcome alone would classify a transient-context failure as post-mutation and
+/// tear the session down for a run that never mutated anything.
+///
+/// That is exactly why this must not be unified with
+/// [`machine_failed_completion_finalization`], which reads the bare outcome on
+/// purpose. The two are meant to disagree on those skipped-turn-start classes: a
+/// stale `Completed` still decides which generated transition can accept the
+/// state (its question), and still does not mean this run mutated anything (the
+/// question here). See that function's note for the full statement.
+///
+/// WHY IT MUST PRECEDE THE REALIZATION. The failed-run realization that follows
+/// (`realize_runtime_loop_terminal_owned`) fires the generated `RunFailed`
+/// update, which sets `turn_terminal_run_id = Some(run_id)` unconditionally
+/// while deliberately preserving a pre-existing `Completed` outcome. The two
+/// halves of the conjunction below are independent only before that update.
+/// After it the run-id half is true by construction for the run being failed, so
+/// the conjunction degenerates to "is the outcome `Completed`" - and on the
+/// skipped-turn-start classes above that outcome can be a stale `Completed` left
+/// by an earlier run.
+///
+/// WHAT BREAKS IF IT MOVES. Every failed run carrying a preserved or stale
+/// `Completed` outcome would be classified post-mutation and torn down, so an
+/// ordinary transient failure would retire a live session instead of retrying
+/// it. The correctness of the whole arming rests on this ordering.
+///
+/// HOW THE ORDERING IS HELD: by ownership, not by convention. This function
+/// consumes the driver guard, so the fact can only be captured while that guard
+/// is alive. There is deliberately no borrowing form of this predicate for a
+/// later statement to call: reading it again downstream requires acquiring a
+/// fresh driver lock, which is a deliberate act rather than a moved line.
+/// Relocating the capture past the realization does not silently work either -
+/// the realization takes the same driver mutex itself, so it cannot run while
+/// this guard is held.
+fn completed_terminal_witness_before_failure_realization(
+    driver_guard: crate::tokio::sync::MutexGuard<'_, crate::meerkat_machine::driver::DriverEntry>,
+    cancelled: bool,
+    run_id: &RunId,
+) -> bool {
+    // A cancellation is a caller-requested stop, not a post-mutation failure,
+    // and it has its own terminalization below. The guard is consumed on this
+    // path too, so the ownership argument above holds for both.
+    if cancelled {
+        return false;
+    }
+    let authority = driver_guard.shared_dsl_authority();
+    let auth = authority
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = auth.state();
+    matches!(
+        state.terminal_outcome,
+        Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::Completed)
+    ) && state.turn_terminal_run_id.as_ref()
+        == Some(&crate::meerkat_machine::dsl::RunId::from_domain(run_id))
 }
 
 fn primitive_admitted_content_shape(primitive: &RunPrimitive) -> TurnContentShape {
@@ -3746,16 +4128,25 @@ fn primitive_turn_start_input(
     }
 }
 
+/// Signal the machine's turn start for this run, and report whether it was
+/// actually signalled.
+///
+/// The two `NotSignalled` returns are deliberate skips, not failures, but they
+/// leave `TurnPhase` describing whatever ran before this run. The caller must
+/// therefore not read the shared phase as a fact about this run: see
+/// [`crate::run_progress::TurnStartSignal`].
 async fn prepare_turn_state_for_primitive(
     driver: &crate::meerkat_machine::SharedDriver,
     run_id: &RunId,
     primitive: &RunPrimitive,
-) -> Result<(), crate::RuntimeDriverError> {
+) -> Result<crate::run_progress::TurnStartSignal, crate::RuntimeDriverError> {
     if let Some(reason) = primitive.peer_response_terminal_apply_intent_violation() {
         return Err(crate::RuntimeDriverError::Internal(reason.to_string()));
     }
     let Some(input) = primitive_turn_start_input(run_id, primitive) else {
-        return Ok(());
+        // An appends-empty staged primitive (the transient-turn-context /
+        // live-steer class) has no turn-start transition to apply.
+        return Ok(crate::run_progress::TurnStartSignal::NotSignalled);
     };
     let authority = {
         let driver = driver.lock().await;
@@ -3773,15 +4164,45 @@ async fn prepare_turn_state_for_primitive(
     // signal during drain; shell-side `set_control_projection` has
     // already advanced control so `executor.apply` proceeds next.
     if auth.state().lifecycle_phase == crate::meerkat_machine::dsl::MeerkatPhase::Retired {
-        return Ok(());
+        return Ok(crate::run_progress::TurnStartSignal::NotSignalled);
     }
     crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(&mut *auth, input)
-        .map(|_| ())
+        .map(|_| crate::run_progress::TurnStartSignal::Signalled)
         .map_err(|err| {
             crate::RuntimeDriverError::Internal(format!(
                 "failed to start runtime turn state for run {run_id}: {err}"
             ))
         })
+}
+
+/// Decide what becomes of a failed run's staged contributors, from the typed
+/// apply failure alone.
+///
+/// Exactly one failure class refuses the release: a run whose consumer never
+/// began executing. There the loop dropped an `apply` whose in-flight fate it
+/// cannot observe, so returning a contributor to its work lane could have the
+/// instruction carried out twice. Every other failure - including every other
+/// teardown reason - is an answer the executor gave, with nothing in flight, so
+/// replay repeats nothing.
+///
+/// `CoreExecutorTeardownReason` is `#[non_exhaustive]`, so this stays a
+/// `matches!` on the one reason rather than a `match` that would silently
+/// re-classify a reason added later.
+fn failed_run_contributor_disposition(
+    error: &CoreExecutorError,
+) -> crate::meerkat_machine::FailedRunContributorDisposition {
+    if matches!(
+        error,
+        CoreExecutorError::TeardownRequired {
+            reason: meerkat_core::lifecycle::core_executor::
+                CoreExecutorTeardownReason::ExecutorNotProgressing,
+            ..
+        }
+    ) {
+        crate::meerkat_machine::FailedRunContributorDisposition::Terminalized
+    } else {
+        crate::meerkat_machine::FailedRunContributorDisposition::Replayed
+    }
 }
 
 #[cfg(test)]
@@ -5084,11 +5505,24 @@ async fn maybe_inject_feed_wake(
 /// What the runtime loop should do with the backlog after a batch failed
 /// terminally and its surviving members were rolled back to their lanes.
 enum FailedBatchBacklogOutcome {
-    /// The failed batch was deferred behind the backlog — keep draining so
-    /// other queued work runs before the failed payload is retried.
+    /// Keep draining. Two producers reach this, and they differ:
+    ///
+    /// - Other queued work exists, so the failed batch was deferred behind
+    ///   the backlog and that other work runs before the failed payload is
+    ///   retried.
+    /// - The failed batch is the ONLY queued work, so nothing was deferred
+    ///   (there is no backlog to defer behind) and the failed payload itself
+    ///   is what runs next, immediately. Parking here is what left members
+    ///   disarmed; the machine's stage-attempt budget is what bounds it.
+    ///
+    /// Both mean "do not park", which is the decision the caller acts on.
     ContinueProcessing,
-    /// Nothing else is queued: leave the failed batch queued for a future
-    /// wake instead of hot-looping on the same payload indefinitely.
+    /// Machine-owned lane truth holds no queued work at all, so there is
+    /// nothing left for anyone to come back for and parking is honest.
+    ///
+    /// Parking while a lane still holds work is the general form of the
+    /// disarmed-member defect: "queued work exists" and "no wake pending"
+    /// true at the same time.
     Park,
     /// Deferring the batch hit a genuine projection invariant break. The loop
     /// was stopped through the canonical executor-stop path (a silent return
@@ -5108,6 +5542,12 @@ enum FailedBatchBacklogOutcome {
 /// Callers must drop any driver-authority guard before invoking this: a stop
 /// hook may re-enter machine control, while required cleanup is handed off
 /// only after the loop exits.
+///
+/// The park decision is derived from machine-owned lane truth and nothing
+/// else. Returning work to a lane therefore owns its own re-arm: the loop
+/// cannot park while the machine still holds selectable queued work, which is
+/// a stronger guarantee than a re-arm flag a future rollback path could
+/// forget to set.
 async fn resolve_failed_batch_backlog(
     driver: &crate::meerkat_machine::SharedDriver,
     completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
@@ -5120,16 +5560,25 @@ async fn resolve_failed_batch_backlog(
 ) -> FailedBatchBacklogOutcome {
     let defer_error = {
         let mut d = driver.lock().await;
-        if !d.has_queued_input_outside(input_ids) {
+        if !d.has_queued_input_in_any_lane() {
             return FailedBatchBacklogOutcome::Park;
         }
-        match d.defer_queued_inputs_behind_backlog(input_ids) {
-            Ok(()) => {
-                d.take_wake_requested();
-                None
-            }
-            Err(err) => Some(err),
+        if !d.has_queued_input_outside(input_ids) {
+            // The only queued work left is exactly what this failure rolled
+            // back, and no wake producer will ask for it: wakes come from
+            // ingress admission, attachment commit, the completion feed and
+            // retire, and a rollback triggers none of them. Field evidence
+            // (2026-08-12, household fleet): a rolled-back input sat queued
+            // for 21 minutes with no attempts and no refusals until an app
+            // restart re-armed the loop, while its sibling moved only because
+            // unrelated ingress happened to wake the loop 288 seconds later.
+            // Keep draining instead. There is nothing to defer behind an
+            // empty backlog, and the machine's own stage-attempt budget bounds
+            // the retry: the payload either succeeds or `ResolveStagedRollback`
+            // terminalizes it as MaxAttemptsExhausted.
+            return FailedBatchBacklogOutcome::ContinueProcessing;
         }
+        d.defer_queued_inputs_behind_backlog(input_ids).err()
     };
     let Some(err) = defer_error else {
         return FailedBatchBacklogOutcome::ContinueProcessing;
@@ -5433,30 +5882,69 @@ async fn process_queue(
                 primitive,
                 batch,
             } => {
-                if let Err(err) = crate::meerkat_machine::prepare_runtime_loop_batch_start(
+                match crate::meerkat_machine::prepare_runtime_loop_batch_start(
                     driver,
                     run_id.clone(),
                     batch,
                 )
                 .await
                 {
-                    tracing::error!(%run_id, error = %err, "failed to prepare runtime loop batch");
-                    if let Some(completions) = completions.as_ref() {
-                        let mut completions = completions.lock().await;
-                        fail_completion_waiters(
-                            &mut completions,
-                            &input_ids,
-                            format!("runtime batch preparation failed: {err}"),
+                    Ok(crate::meerkat_machine::driver::RuntimeLoopBatchStart::Started) => {}
+                    Ok(crate::meerkat_machine::driver::RuntimeLoopBatchStart::StageRefused {
+                        reason,
+                        abandoned_input_ids,
+                    }) => {
+                        // The machine refused to stage an accepted batch. Its
+                        // members are already resolved (another attempt at the
+                        // back of the backlog, or terminalized at the retry
+                        // cap), so this wake keeps draining: returning here
+                        // dropped the wake and, under fifo, starved every input
+                        // behind the refused head indefinitely (field 0.8.22).
+                        tracing::warn!(
+                            %run_id,
+                            reason = %reason,
+                            abandoned = abandoned_input_ids.len(),
+                            "generated staging authority refused an accepted input batch; resolved through machine authority"
                         );
+                        if !abandoned_input_ids.is_empty()
+                            && let Some(completions) = completions.as_ref()
+                        {
+                            let mut completions = completions.lock().await;
+                            fail_completion_waiters(
+                                &mut completions,
+                                &abandoned_input_ids,
+                                format!("runtime batch staging refused: {reason}"),
+                            );
+                        }
+                        drop(queue_authority_guard);
+                        continue;
                     }
-                    return false;
+                    Err(err) => {
+                        tracing::error!(%run_id, error = %err, "failed to prepare runtime loop batch");
+                        if let Some(completions) = completions.as_ref() {
+                            let mut completions = completions.lock().await;
+                            fail_completion_waiters(
+                                &mut completions,
+                                &input_ids,
+                                format!("runtime batch preparation failed: {err}"),
+                            );
+                        }
+                        return false;
+                    }
                 }
-                let staged_directed_interaction_ids = {
+                // The input is durably `Staged` from here: it has left its work
+                // lane and is owned by exactly one consumer. Everything below
+                // is inside the staged -> executing window, so the window's
+                // clock and its watchdog start here rather than at `apply`.
+                let staged_at = crate::run_progress::Instant::now();
+                let turn_start_signal = crate::run_progress::TurnStartSignalCell::default();
+                let (staged_directed_interaction_ids, shared_dsl_authority) = {
                     let driver_guard = driver.lock().await;
+                    let shared_dsl_authority = driver_guard.shared_dsl_authority();
                     match crate::meerkat_machine::driver::machine_staged_directed_interaction_ids(
                         &driver_guard,
                     ) {
-                        Ok(interaction_ids) => interaction_ids,
+                        Ok(interaction_ids) => (interaction_ids, shared_dsl_authority),
                         Err(error) => {
                             drop(driver_guard);
                             drop(queue_authority_guard);
@@ -5474,6 +5962,28 @@ async fn process_queue(
                         }
                     }
                 };
+                // Read seam for the machine-owned "this run began executing"
+                // fact. Captured without the async driver lock - which the
+                // wedged party may itself be holding - so both supervisors can
+                // observe progress without joining the queue behind it.
+                let execution_progress =
+                    std::sync::Arc::new(crate::run_progress::AuthorityRunExecutionProgress::new(
+                        shared_dsl_authority,
+                        turn_start_signal.clone(),
+                    ));
+                // Reports, never terminalizes, and lives in its own task so a
+                // wedge anywhere in the window - including the blocking machine
+                // authority lock below, which no `select!` in this task could
+                // survive - still names the run and its inputs in the log. The
+                // guard retires it on every path out of this window.
+                let start_watchdog = crate::run_progress::StagedRunStartWatchdog::spawn(
+                    std::sync::Arc::clone(&execution_progress)
+                        as std::sync::Arc<dyn crate::run_progress::RunExecutionProgressSource>,
+                    run_id.clone(),
+                    input_ids.clone(),
+                    staged_at,
+                    crate::run_progress::RUN_EXECUTION_START_NOTICE,
+                );
                 let primitive = match *primitive {
                     Ok(primitive) => primitive,
                     Err(conflict) => {
@@ -5505,6 +6015,10 @@ async fn process_queue(
                                         conflict.to_string(),
                                     ),
                                     completion_reason: completion_reason.clone(),
+                                    // The executor was never called, so nothing
+                                    // is in flight and replay repeats nothing.
+                                    contributor_disposition:
+                                        crate::meerkat_machine::FailedRunContributorDisposition::Replayed,
                                 },
                             )
                             .await
@@ -5611,9 +6125,14 @@ async fn process_queue(
                         }
                     }
                 };
-                if let Err(error) =
-                    prepare_turn_state_for_primitive(driver, &run_id, &primitive).await
-                {
+                let turn_start =
+                    prepare_turn_state_for_primitive(driver, &run_id, &primitive).await;
+                if let Ok(crate::run_progress::TurnStartSignal::Signalled) = turn_start {
+                    // Only now does the shared `TurnPhase` describe this run,
+                    // so only now may either supervisor read it as evidence.
+                    turn_start_signal.mark_signalled();
+                }
+                if let Err(error) = turn_start {
                     tracing::error!(%run_id, error = %error, "failed to start runtime turn state");
                     let completion_reason =
                         format!("runtime turn-state preparation failed: {error}");
@@ -5638,6 +6157,10 @@ async fn process_queue(
                                     error.to_string(),
                                 ),
                                 completion_reason: completion_reason.clone(),
+                                // Turn-state preparation failed before the
+                                // executor was called, so nothing is in flight.
+                                contributor_disposition:
+                                    crate::meerkat_machine::FailedRunContributorDisposition::Replayed,
                             },
                         )
                         .await
@@ -5747,8 +6270,25 @@ async fn process_queue(
 
                 let directed_interaction_ids = staged_directed_interaction_ids;
 
-                // Execute outside the driver lock (this calls start_turn, which is slow)
-                let result = executor.apply(run_id.clone(), primitive).await;
+                // Execute outside the driver lock (this calls start_turn, which is slow).
+                // The staged -> executing transition is bounded and typed: a
+                // consumer that never begins executing this run yields a typed
+                // ExecutorNotProgressing teardown instead of holding the staged
+                // input, and its caller, forever. The deadline runs from the
+                // staging instant, so the pre-apply segment counts against the
+                // same window instead of extending it.
+                let result = crate::run_progress::apply_with_execution_start_bound(
+                    executor,
+                    execution_progress.as_ref(),
+                    run_id.clone(),
+                    primitive,
+                    staged_at,
+                    crate::run_progress::RUN_EXECUTION_START_BOUND,
+                )
+                .await;
+                // The window is closed: `apply` returned an outcome, whatever
+                // it is. Retire the watchdog before the terminal paths below.
+                drop(start_watchdog);
 
                 // Lock again to update driver state
                 let d = driver.lock().await;
@@ -6121,8 +6661,49 @@ async fn process_queue(
                         }
                     }
                     Err(e) => {
-                        drop(d);
-                        let teardown_required = e.requires_runtime_teardown();
+                        let cancelled = e.is_cancelled();
+                        // Post-mutation failures must not re-enter the retry
+                        // lane. `failed_run_contributor_disposition` classifies
+                        // from the typed error alone, and every failure that is
+                        // not the never-started class is `Replayed`; the
+                        // catch-all in `apply_failed_from_session_error` puts an
+                        // ordinary run-boundary persistence failure there too.
+                        // For a run that already reached its completed terminal
+                        // that release is unsafe: the model call and the tools
+                        // already ran, so the backlog resolution below would
+                        // restage the same content and execute the turn again
+                        // inside this process. Route it to the same fail-closed
+                        // teardown handoff the typed
+                        // `SessionDurableProjectionAuthorityUnknown` class uses,
+                        // so the terminal publishes, the waiters resolve, and
+                        // the shell is retired instead of being handed the work
+                        // a second time.
+                        //
+                        // ORDERING CONSTRAINT - READ THIS BEFORE MOVING THE
+                        // LINE BELOW. This witness must be captured here, ahead
+                        // of `realize_runtime_loop_terminal_owned`, which fires
+                        // the generated `RunFailed` update. That update sets
+                        // `turn_terminal_run_id = Some(run_id)` unconditionally
+                        // while preserving a pre-existing `Completed` outcome,
+                        // so after it the exact-run half of the witness is true
+                        // by construction and the conjunction collapses into a
+                        // bare "outcome is Completed" - which the skipped
+                        // turn-start classes can leave stale. Read after the
+                        // realization, or read a second time downstream, and
+                        // every failed run holding a preserved or stale
+                        // `Completed` outcome is classified post-mutation and
+                        // torn down: an ordinary transient failure would retire
+                        // a live session instead of retrying it. The correctness
+                        // of the whole arming rests on this ordering, so the
+                        // capture consumes the driver guard rather than
+                        // borrowing it; a later read has to take a fresh lock,
+                        // and the realization cannot run while this one is held.
+                        let completed_terminal_before_failure =
+                            completed_terminal_witness_before_failure_realization(
+                                d, cancelled, &run_id,
+                            );
+                        let teardown_required =
+                            e.requires_runtime_teardown() || completed_terminal_before_failure;
                         if teardown_required {
                             handoff.disposition =
                                 RuntimeLoopTeardownDisposition::UnregisterRequired;
@@ -6144,11 +6725,21 @@ async fn process_queue(
                                 return true;
                             }
                         };
-                        let cancelled = e.is_cancelled();
+                        let contributor_disposition = failed_run_contributor_disposition(&e);
                         let executor_stopped = matches!(&e, CoreExecutorError::Stopped);
                         let legacy_machine_terminal =
                             matches!(&e, CoreExecutorError::TerminalFailure { .. });
                         let error_msg = e.to_string();
+                        // The completion detail must be byte-identical to the
+                        // one the failed-run realization stages on the input
+                        // terminal-completion batch
+                        // (`TurnErrorMetadata::runtime_apply_failure` over the
+                        // apply-failure cause message). The completion authority
+                        // refuses to deliver a payload whose digest differs from
+                        // the staged candidate, so a second wording here would
+                        // resolve the caller with `AuthorityUnavailable` instead
+                        // of the typed reason the run terminal carries.
+                        let completion_detail = e.apply_failure_cause().message().to_owned();
                         if executor_stopped || legacy_machine_terminal {
                             // `Stopped` and the legacy error-shaped terminal
                             // are fail-closed executor exits. Neither carries
@@ -6182,7 +6773,8 @@ async fn process_queue(
                         } else {
                             OwnedRuntimeLoopTerminalization::Failed {
                                 failure: e.apply_failure_cause(),
-                                completion_reason: format!("apply failed: {error_msg}"),
+                                completion_reason: completion_detail.clone(),
+                                contributor_disposition,
                             }
                         };
                         let (terminal_authority_guard, terminalization_outcome) =
@@ -6375,7 +6967,7 @@ async fn process_queue(
                                     teardown_slot,
                                     &nondirected_input_ids,
                                     &run_id,
-                                    format!("apply failed: {error_msg}"),
+                                    completion_detail.clone(),
                                 )
                                 .await;
                             }
@@ -8610,6 +9202,13 @@ mod tests {
     /// backlog stranded until an unrelated external wake (~13 minutes in the
     /// field). Post-fix the same wake keeps draining: the poison terminalizes
     /// as machine policy and the next queued input still gets its attempt.
+    ///
+    /// 0.8.23 strengthens the tail of the same wake. This executor fails every
+    /// apply, so the backlog input's own rollback returns it to a lane with
+    /// nothing else queued. Parking there was the disarmed-member defect, so
+    /// the wake now carries that input through its remaining machine-owned
+    /// stage attempts to the same typed terminal instead of leaving it queued
+    /// for a wake nobody owes it.
     #[tokio::test]
     async fn max_attempts_abandonment_does_not_wedge_the_backlog() {
         let driver = make_shared_ephemeral_driver("defer-wedge-class");
@@ -8672,22 +9271,25 @@ mod tests {
                 assert_eq!(d.input_attempt_count(&poison_id), 3);
                 assert_eq!(
                     d.input_attempt_count(&innocent_id),
-                    1,
-                    "the same wake must keep draining past the abandoned poison — a zero \
-                     attempt count means the backlog wedged behind a dropped wake"
+                    3,
+                    "the same wake must keep draining past the abandoned poison and spend the \
+                     backlog input's own machine-owned budget; a zero attempt count means the \
+                     backlog wedged behind a dropped wake, and stopping at one means it parked \
+                     queued with nobody coming back for it"
                 );
                 assert_eq!(
                     d.input_phase(&innocent_id),
-                    Some(crate::input_state::InputLifecycleState::Queued),
-                    "the innocent input keeps its remaining machine-policy retries"
+                    Some(crate::input_state::InputLifecycleState::Abandoned),
+                    "an input that spends every machine-policy retry terminalizes typed"
                 );
             }
             _ => panic!("expected ephemeral driver"),
         }
         assert_eq!(
             apply_calls.load(Ordering::SeqCst),
-            2,
-            "one wake must attempt both the poison batch and the innocent batch"
+            4,
+            "one wake must attempt the poison batch and then every remaining attempt the \
+             backlog input is owed"
         );
     }
 
@@ -8705,6 +9307,920 @@ mod tests {
             crate::accept::AcceptOutcome::Accepted { input_id, .. } => input_id,
             other => panic!("expected accepted queued input, got {other:?}"),
         }
+    }
+
+    /// Stage `input_id` for a fresh run and then run the recovery-normalization
+    /// pass over the live driver, reproducing the exact field precondition: a
+    /// row that was Staged when its run went away, rolled back to Queued by a
+    /// recovery pass ("recovery: RollbackStaged") without the runtime loop's
+    /// own failure path ever running.
+    async fn stage_then_recover_rollback(
+        driver: &crate::meerkat_machine::SharedDriver,
+        input_id: &InputId,
+    ) -> RunId {
+        let staged_run_id = RunId::new();
+        let mut guard = driver.lock().await;
+        match &mut *guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                d.contract_begin_run_authority(staged_run_id.clone())
+                    .expect("run authority should begin through generated DSL");
+                d.machine_realize_authorized_stage_batch(
+                    crate::meerkat_machine::driver::test_authorized_stage_for_run(
+                        vec![input_id.clone()],
+                        staged_run_id.clone(),
+                    ),
+                )
+                .expect("input should stage for the run");
+                assert_eq!(
+                    d.input_phase(input_id),
+                    Some(crate::input_state::InputLifecycleState::Staged)
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+        // The run goes away while the input is still Staged - no loop failure
+        // path, so nothing resolves the staged input.
+        crate::meerkat_machine::driver::machine_apply_run_return_projection(
+            &mut guard,
+            &staged_run_id,
+            crate::meerkat_machine::driver::RunReturnDisposition::Rollback,
+        )
+        .expect("run should return through generated DSL");
+        match &mut *guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_phase(input_id),
+                    Some(crate::input_state::InputLifecycleState::Staged),
+                    "a returned run leaves the staged input for recovery to normalize"
+                );
+                d.recover_ephemeral()
+                    .expect("recovery pass should normalize");
+                assert_eq!(
+                    d.input_phase(input_id),
+                    Some(crate::input_state::InputLifecycleState::Queued),
+                    "recovery normalizes a staged row back to queued"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+        staged_run_id
+    }
+
+    /// Field class (0.8.22 household fleet): a recovery pass rolled two
+    /// members' head-of-line inputs from Staged back to Queued, keeping the
+    /// durable attribution of the run they had been staged for. `StageForRun`'s
+    /// `input_not_run_associated` guard then refused those inputs against every
+    /// later run ("generated machine did not authorize StageForRun") even though
+    /// its own update rebinds that attribution. The refusal counted no attempt,
+    /// so the max-attempts valve never fired, and under `queue_mode fifo`
+    /// nothing behind the refused head could run - two members were down ~4
+    /// hours with 11 inputs piled up behind 2 heads. Post-fix the attribution
+    /// stays durable AND the same wake re-stages the head and keeps draining the
+    /// backlog behind it.
+    #[tokio::test]
+    async fn recovery_requeued_head_restages_and_the_backlog_drains() {
+        let driver = make_shared_ephemeral_driver("stage-refusal-wedge-class");
+        let head_id =
+            accept_queued_input_id(&driver, make_peer_message("lead-rt", "stuck head")).await;
+        let follower_id = accept_queued_input_id(
+            &driver,
+            make_terminal_peer_response(TEST_PEER_RESPONSE_ROUTE_ID, TEST_PEER_RESPONSE_REQUEST_ID),
+        )
+        .await;
+
+        let staged_run_id = stage_then_recover_rollback(&driver, &head_id).await;
+
+        {
+            let guard = driver.lock().await;
+            match &*guard {
+                crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                    assert_eq!(
+                        d.input_last_run_id(&head_id),
+                        Some(staged_run_id.clone()),
+                        "a requeued input keeps the durable attribution of the run it last \
+                         contributed to (pinned by recovery_replay); staging must rebind it, \
+                         not refuse it"
+                    );
+                    assert_eq!(
+                        d.input_attempt_count(&head_id),
+                        1,
+                        "the rolled-back staging attempt stays counted"
+                    );
+                    assert_eq!(
+                        crate::meerkat_machine::driver::machine_authorize_runtime_loop_batch(
+                            &guard
+                        )
+                        .expect("generated runtime-loop batch")
+                        .input_ids()
+                        .to_vec(),
+                        vec![head_id.clone()],
+                        "the requeued input is still the fifo head"
+                    );
+                }
+                _ => panic!("expected ephemeral driver"),
+            }
+            drop(guard);
+        }
+
+        // The exact field refusal point: a NEW run, the recovery-requeued head
+        // still carrying the attribution of the run it was rolled back from.
+        let restage_run_id = RunId::new();
+        {
+            let mut guard = driver.lock().await;
+            crate::meerkat_machine::driver::machine_begin_run(&mut guard, restage_run_id.clone())
+                .expect("run authority should begin through generated DSL");
+            assert!(
+                crate::meerkat_machine::driver::machine_authorize_stage_for_run(
+                    &guard,
+                    &restage_run_id,
+                    std::slice::from_ref(&head_id),
+                    crate::meerkat_machine::driver::RuntimeLoopBatchSource::Queue,
+                )
+                .is_some(),
+                "the generated authority must stage a recovery-requeued input for a new run: \
+                 refusing it here is the 0.8.22 wedge - the input can never run again and every \
+                 fifo follower starves behind it"
+            );
+        }
+
+        let apply_calls = Arc::new(AtomicUsize::new(0));
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = crate::control_plane::test_support::ApplyFailingExecutor::new(
+            Arc::clone(&apply_calls),
+            Arc::clone(&stop_calls),
+        );
+        let (_effect_tx, mut effect_rx) = tokio::sync::mpsc::channel(1);
+        let authority_binding = RuntimeLoopAuthorityBinding::detached_for_test();
+        let teardown_slot = RuntimeLoopTeardownSlot::pending();
+        let mut terminal_handoff = RuntimeLoopTerminalHandoff::default();
+
+        let should_stop = process_queue(
+            &driver,
+            &mut executor,
+            &mut effect_rx,
+            None,
+            &authority_binding,
+            &teardown_slot,
+            &mut terminal_handoff,
+        )
+        .await;
+        assert!(
+            !should_stop,
+            "a recovered requeued head must not stop the runtime loop"
+        );
+        assert_eq!(stop_calls.load(Ordering::SeqCst), 0);
+
+        // Exact counters, matching the exactness of the preserved
+        // `max_attempts_abandonment_does_not_wedge_the_backlog` pin. The
+        // executor fails every apply, so both inputs burn their generated
+        // attempts either way; what discriminates staged-from-refused is
+        // WHERE the attempts came from.
+        //
+        // The loop no longer parks while a lane still holds queued work, so
+        // the follower is drained to its own cap in this same wake rather than
+        // left with attempts unspent. That RETIRED the follower's count as a
+        // discriminator: it reaches 3 whether the head staged or was refused.
+        // `apply_calls` is what still separates the two, and it separates them
+        // more sharply than before, because a refused head never applies:
+        //   staged (correct): every lap of both inputs reaches the executor.
+        //   refused (the regression this test exists for): only the follower's
+        //     laps reach it, and the head burns its budget on refusals.
+        // The rebound run association is the second live discriminator.
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_ne!(
+                    d.input_last_run_id(&head_id),
+                    Some(staged_run_id.clone()),
+                    "re-staging must rebind the run association away from the rolled-back run; \
+                     keeping it means the head was never staged again"
+                );
+                assert_eq!(
+                    d.input_attempt_count(&head_id),
+                    3,
+                    "the recovered head must burn its generated attempts through real staging"
+                );
+                assert_eq!(
+                    d.input_attempt_count(&follower_id),
+                    3,
+                    "the same wake must keep draining past the recovered head, and past the \
+                     follower too: a zero count means the fifo backlog wedged behind the head, \
+                     and anything short of the cap means the loop parked while the lane still \
+                     held selectable queued work"
+                );
+                assert_eq!(
+                    d.input_phase(&head_id),
+                    Some(crate::input_state::InputLifecycleState::Abandoned),
+                    "an always-failing executor terminalizes the head at the generated cap, \
+                     which is the honest outcome; it must never sit queued and unstageable"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+        assert_eq!(
+            d_follower_phase(&guard, &follower_id),
+            Some(crate::input_state::InputLifecycleState::Abandoned),
+            "the follower is drained to its own generated cap in this wake rather than left \
+             queued with attempts unspent"
+        );
+        drop(guard);
+        assert_eq!(
+            apply_calls.load(Ordering::SeqCst),
+            5,
+            "every lap of this wake that reaches staging must reach the executor: a refused head \
+             never applies, so this count is what separates a re-staged head from a re-refused \
+             one. Five, not six: the lap that carries an input past its generated cap \
+             terminalizes it instead of applying it"
+        );
+    }
+
+    fn d_follower_phase(
+        guard: &crate::meerkat_machine::DriverEntry,
+        input_id: &InputId,
+    ) -> Option<crate::input_state::InputLifecycleState> {
+        match guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => d.input_phase(input_id),
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    /// The safety valve for a genuinely unstageable queued input. `StageForRun`
+    /// increments the attempt count inside its update block, which only runs
+    /// when every guard PASSES, so a refused input used to accrue nothing and
+    /// starve forever. The machine now owns the refusal disposition: another
+    /// attempt at the back of the backlog (so a fifo follower becomes the head)
+    /// until the generated retry cap, then a typed terminal outcome.
+    #[tokio::test]
+    async fn refused_staging_counts_attempts_then_terminalizes() {
+        let driver = make_shared_ephemeral_driver("stage-refusal-valve-class");
+        let head_id =
+            accept_queued_input_id(&driver, make_peer_message("lead-rt", "doomed head")).await;
+        let follower_id =
+            accept_queued_input_id(&driver, make_peer_message("lead-rt", "innocent follower"))
+                .await;
+
+        let mut guard = driver.lock().await;
+        assert_eq!(
+            crate::meerkat_machine::driver::machine_authorize_runtime_loop_batch(&guard)
+                .expect("generated runtime-loop batch")
+                .input_ids()
+                .first(),
+            Some(&head_id),
+            "the doomed input starts as the fifo head"
+        );
+
+        // Attempt 1: refused, counted, and deferred behind the backlog.
+        let abandoned = guard
+            .resolve_unstageable_queued_inputs(std::slice::from_ref(&head_id))
+            .await
+            .expect("machine resolves a refused queued input");
+        assert!(
+            abandoned.is_empty(),
+            "attempts remain, so nothing terminalizes yet"
+        );
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(d.input_attempt_count(&head_id), 1);
+                assert_eq!(
+                    d.input_phase(&head_id),
+                    Some(crate::input_state::InputLifecycleState::Queued)
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+        assert_eq!(
+            crate::meerkat_machine::driver::machine_authorize_runtime_loop_batch(&guard)
+                .expect("generated runtime-loop batch")
+                .input_ids()
+                .first(),
+            Some(&follower_id),
+            "the refused head goes behind the backlog so the follower can run"
+        );
+
+        // Burn the remaining generated attempts.
+        for _ in 0..2 {
+            let abandoned = guard
+                .resolve_unstageable_queued_inputs(std::slice::from_ref(&head_id))
+                .await
+                .expect("machine resolves a refused queued input");
+            assert!(abandoned.is_empty(), "the retry cap is not reached yet");
+        }
+
+        let abandoned = guard
+            .resolve_unstageable_queued_inputs(std::slice::from_ref(&head_id))
+            .await
+            .expect("machine resolves a refused queued input");
+        assert_eq!(
+            abandoned,
+            vec![head_id.clone()],
+            "at the generated retry cap the refused input terminalizes instead of starving"
+        );
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_phase(&head_id),
+                    Some(crate::input_state::InputLifecycleState::Abandoned)
+                );
+                assert_eq!(
+                    d.input_terminal_outcome(&head_id),
+                    Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                        reason: crate::input_state::InputAbandonReason::MaxAttemptsExhausted {
+                            attempts: 3
+                        }
+                    }),
+                    "the terminal outcome is machine-owned and typed"
+                );
+                assert!(
+                    !d.has_queued_input(&head_id),
+                    "a terminalized input leaves the work lane"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+        assert_eq!(
+            crate::meerkat_machine::driver::machine_authorize_runtime_loop_batch(&guard)
+                .expect("generated runtime-loop batch")
+                .input_ids()
+                .to_vec(),
+            vec![follower_id],
+            "the backlog behind a doomed head is intact and selectable"
+        );
+    }
+
+    // ─── Staged -> executing bound (field: staged 757s+ on an established run) ───
+
+    /// Seed the runtime binding a session-owned handle bundle records. Without
+    /// it there is no turn-state handle bound to this authority, the staged ->
+    /// executing fact is unobservable, and the bound must refuse to escalate.
+    async fn bind_runtime_for_progress_test(
+        driver: &crate::meerkat_machine::SharedDriver,
+        runtime_name: &str,
+    ) {
+        let mut guard = driver.lock().await;
+        match &mut *guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => d
+                .install_registered_authority_for_test(
+                    crate::meerkat_machine::dsl::SessionId::from_domain(&SessionId::new()),
+                    Some(&crate::identifiers::LogicalRuntimeId::new(runtime_name)),
+                    Some(1),
+                    Some(crate::meerkat_machine::dsl::Generation::from(1)),
+                    Some(crate::meerkat_machine::dsl::RuntimeEpochId::from(
+                        "progress-bound-epoch".to_string(),
+                    )),
+                    crate::store::SupervisorAuthoritySnapshot::UnboundNoReceipt,
+                )
+                .expect("seed session-owned runtime binding"),
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    async fn shared_authority_for_test(
+        driver: &crate::meerkat_machine::SharedDriver,
+    ) -> crate::driver::ephemeral::SharedIngressDslAuthority {
+        let guard = driver.lock().await;
+        guard.shared_dsl_authority()
+    }
+
+    fn last_apply_failure_message(
+        authority: &crate::driver::ephemeral::SharedIngressDslAuthority,
+    ) -> Option<String> {
+        authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state()
+            .last_runtime_apply_failure_message
+            .clone()
+    }
+
+    /// The consumer from the field report: it takes the run and applies
+    /// nothing, forever.
+    struct NotDrainingExecutor {
+        entered: Arc<AtomicBool>,
+        stop_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::CoreExecutor for NotDrainingExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, CoreExecutorError>
+        {
+            self.entered.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            unreachable!("a command loop that is not draining never returns")
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A live consumer whose turn takes far longer than the bound. It does
+    /// exactly what a real agent does first: applies the primitive, moving the
+    /// machine's turn phase off `ApplyingPrimitive` before the first LLM call.
+    struct SlowButExecutingExecutor {
+        authority: crate::driver::ephemeral::SharedIngressDslAuthority,
+        applies: Arc<AtomicUsize>,
+        completed: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::CoreExecutor for SlowButExecutingExecutor {
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, CoreExecutorError>
+        {
+            self.applies.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut authority = self
+                    .authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                    &mut *authority,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::PrimitiveApplied {
+                        run_id: crate::meerkat_machine::dsl::RunId::from_domain(&run_id),
+                    },
+                )
+                .expect("agent-side PrimitiveApplied should be legal for a started run");
+            }
+            crate::tokio::time::sleep(crate::run_progress::RUN_EXECUTION_START_BOUND * 10).await;
+            self.completed.store(true, Ordering::SeqCst);
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                    meerkat_core::RunBoundaryReceiptDraft {
+                        run_id,
+                        boundary: RunApplyBoundary::RunStart,
+                        contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                        conversation_digest: None,
+                        message_count: 0,
+                    },
+                    None,
+                    None,
+                ),
+            )
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    /// Field class (0.8.22, household fleet): `QueueAccepted`, then
+    /// `StageForRun(run …)`, then 757+ seconds of nothing. Zero gateway lines
+    /// for the run or the input, no error, no transcript append, no state
+    /// change. The run existed and owned the input; the executor that had to
+    /// consume it was not draining, and `StageForRun` never asked whether it
+    /// could.
+    ///
+    /// This is the lane's regression guard: it is RED on revert, where
+    /// `process_queue` hangs inside `apply` forever - the exact mute wait the
+    /// field saw, with the caller waiting behind it.
+    #[tokio::test(start_paused = true)]
+    async fn staged_run_whose_consumer_never_executes_terminalizes_with_a_typed_reason() {
+        let driver = make_shared_ephemeral_driver("consumer-not-draining");
+        bind_runtime_for_progress_test(&driver, "consumer-not-draining").await;
+        let authority = shared_authority_for_test(&driver).await;
+        let input_id = accept_queued_input_id(&driver, make_prompt("is the door locked?")).await;
+
+        let completions: crate::meerkat_machine::SharedCompletionRegistry = Arc::new(
+            crate::tokio::sync::Mutex::new(crate::completion::CompletionRegistry::new()),
+        );
+        let waiter = completions.lock().await.register(input_id.clone());
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = NotDrainingExecutor {
+            entered: Arc::clone(&entered),
+            stop_calls: Arc::clone(&stop_calls),
+        };
+        let (_effect_tx, mut effect_rx) = tokio::sync::mpsc::channel(1);
+        let authority_binding = RuntimeLoopAuthorityBinding::detached_for_test();
+        let teardown_slot = RuntimeLoopTeardownSlot::pending();
+        let mut terminal_handoff = RuntimeLoopTerminalHandoff::default();
+
+        let should_stop = tokio::time::timeout(
+            crate::run_progress::RUN_EXECUTION_START_BOUND * 8,
+            process_queue(
+                &driver,
+                &mut executor,
+                &mut effect_rx,
+                Some(&completions),
+                &authority_binding,
+                &teardown_slot,
+                &mut terminal_handoff,
+            ),
+        )
+        .await
+        .expect("a staged run whose consumer never executes must not wait forever");
+
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "the consumer must have owned the staged run"
+        );
+        assert!(
+            should_stop,
+            "a consumer proven not to be draining must hand its executor off, not receive more work"
+        );
+        // The field evidence was a caller waiting forever. A terminalized input
+        // with the caller still hanging would fail this lane's criterion the
+        // same way the original defect did.
+        let outcome = tokio::time::timeout(
+            crate::run_progress::RUN_EXECUTION_START_BOUND,
+            waiter.wait_authorized(),
+        )
+        .await
+        .expect("the caller must stop waiting when its run is terminalized");
+        let reason = match &outcome {
+            crate::completion::CompletionOutcome::Abandoned { reason, .. }
+            | crate::completion::CompletionOutcome::AbandonedWithError { reason, .. } => {
+                reason.clone()
+            }
+            other => panic!("expected a typed abandoned completion, got {other:?}"),
+        };
+        assert!(
+            reason.contains("ExecutorNotProgressing"),
+            "the caller's outcome must name why its run could not progress, got: {reason}"
+        );
+        let failure = last_apply_failure_message(&authority)
+            .expect("the machine must record why the run could not progress");
+        assert!(
+            failure.contains("ExecutorNotProgressing"),
+            "the recorded failure must name the reason, got: {failure}"
+        );
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_phase(&input_id),
+                    Some(crate::input_state::InputLifecycleState::Abandoned),
+                    "the staged input must terminalize, never be released back into the queue \
+                     where a late-draining consumer could execute the instruction twice"
+                );
+                assert!(
+                    !d.has_queued_input(&input_id),
+                    "a never-started run's contributor must never re-enter a work lane"
+                );
+                assert_eq!(
+                    d.input_terminal_outcome(&input_id),
+                    Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                        reason: crate::input_state::InputAbandonReason::NeverExecuted,
+                    }),
+                    "the durable reason must say the run never executed, not `Cancelled`: a host \
+                     reading `Cancelled` here concludes a user stopped the work, and this is the \
+                     one path that drives the real escalation end to end"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    /// The window measures staged -> executing, not how long a live turn may
+    /// take. A turn that begins executing and then runs ten times longer than
+    /// the bound must keep its own outcome and must never be applied twice.
+    ///
+    /// Mutation guard, not a regression guard: this also passes on revert,
+    /// because an unbounded `apply` lets a slow executor finish. It goes RED if
+    /// the escalation branch stops requiring positive proof of non-progress.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_that_began_executing_is_not_disturbed_by_the_bound() {
+        let driver = make_shared_ephemeral_driver("slow-but-executing");
+        bind_runtime_for_progress_test(&driver, "slow-but-executing").await;
+        let authority = shared_authority_for_test(&driver).await;
+        let input_id = accept_queued_input_id(&driver, make_prompt("is the door locked?")).await;
+
+        let applies = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicBool::new(false));
+        let mut executor = SlowButExecutingExecutor {
+            authority: authority.clone(),
+            applies: Arc::clone(&applies),
+            completed: Arc::clone(&completed),
+        };
+        let (_effect_tx, mut effect_rx) = tokio::sync::mpsc::channel(1);
+        let authority_binding = RuntimeLoopAuthorityBinding::detached_for_test();
+        let teardown_slot = RuntimeLoopTeardownSlot::pending();
+        let mut terminal_handoff = RuntimeLoopTerminalHandoff::default();
+
+        let _should_stop = tokio::time::timeout(
+            crate::run_progress::RUN_EXECUTION_START_BOUND * 40,
+            process_queue(
+                &driver,
+                &mut executor,
+                &mut effect_rx,
+                None,
+                &authority_binding,
+                &teardown_slot,
+                &mut terminal_handoff,
+            ),
+        )
+        .await
+        .expect("a slow but executing turn must still finish");
+
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "a live turn must run to its own completion, not be cut off at the bound"
+        );
+        assert_eq!(
+            applies.load(Ordering::SeqCst),
+            1,
+            "the bound must never cause a staged instruction to be executed twice"
+        );
+        let failure = last_apply_failure_message(&authority);
+        assert!(
+            !failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("ExecutorNotProgressing")),
+            "an executing turn must not be recorded as a non-progressing one: {failure:?}"
+        );
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_ne!(
+                    d.input_phase(&input_id),
+                    Some(crate::input_state::InputLifecycleState::Abandoned),
+                    "a turn that began executing must not be terminalized by the bound"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    /// The detector refuses when it cannot prove non-progress. Without a
+    /// session-owned runtime binding no turn-state handle writes to this
+    /// authority, so `ApplyingPrimitive` is not evidence of anything and the
+    /// bound must not terminalize on it.
+    ///
+    /// Mutation guard, not a regression guard: asserting that the call times
+    /// out is an assertion the code still waits, which also holds on revert. It
+    /// goes RED if the escalation branch ever fires on an unprovable
+    /// observation. The cost it documents is real - this run stays unbounded,
+    /// which is why the watchdog reports it rather than the bound resolving it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unobservable_session_refuses_to_terminalize_its_staged_run() {
+        let driver = make_shared_ephemeral_driver("runtime-unbound");
+        let authority = shared_authority_for_test(&driver).await;
+        let input_id = accept_queued_input_id(&driver, make_prompt("is the door locked?")).await;
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = NotDrainingExecutor {
+            entered: Arc::clone(&entered),
+            stop_calls: Arc::clone(&stop_calls),
+        };
+        let (_effect_tx, mut effect_rx) = tokio::sync::mpsc::channel(1);
+        let authority_binding = RuntimeLoopAuthorityBinding::detached_for_test();
+        let teardown_slot = RuntimeLoopTeardownSlot::pending();
+        let mut terminal_handoff = RuntimeLoopTerminalHandoff::default();
+
+        let outcome = tokio::time::timeout(
+            crate::run_progress::RUN_EXECUTION_START_BOUND * 8,
+            process_queue(
+                &driver,
+                &mut executor,
+                &mut effect_rx,
+                None,
+                &authority_binding,
+                &teardown_slot,
+                &mut terminal_handoff,
+            ),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "an unobservable session must refuse to escalate rather than risk terminalizing live work"
+        );
+        assert!(
+            last_apply_failure_message(&authority).is_none(),
+            "refusing to escalate must not record a failure the machine cannot prove"
+        );
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_phase(&input_id),
+                    Some(crate::input_state::InputLifecycleState::Staged),
+                    "an unprovable observation must leave the staged input owned by its run"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    /// Stage exactly one accepted input onto a fresh run, leaving the driver
+    /// where the runtime loop sits when it calls `apply`.
+    async fn stage_one_run_for_disposition_test(
+        driver: &crate::meerkat_machine::SharedDriver,
+    ) -> (RunId, InputId) {
+        let input_id = accept_queued_input_id(driver, make_prompt("is the door locked?")).await;
+        let batch = {
+            let guard = driver.lock().await;
+            crate::meerkat_machine::driver::machine_authorize_runtime_loop_batch(&guard)
+                .expect("generated runtime-loop batch")
+        };
+        let run_id = RunId::new();
+        // The starvation-valve lane made a refusal a typed `Ok` outcome, so
+        // this fixture must assert it actually staged: silently proceeding
+        // with nothing staged would make the expect message below a lie for
+        // every disposition test built on this fixture.
+        let outcome =
+            crate::meerkat_machine::prepare_runtime_loop_batch_start(driver, run_id.clone(), batch)
+                .await
+                .expect("staging an accepted batch must succeed");
+        assert!(
+            matches!(
+                outcome,
+                crate::meerkat_machine::driver::RuntimeLoopBatchStart::Started
+            ),
+            "staging an accepted batch must succeed, got {outcome:?}"
+        );
+        (run_id, input_id)
+    }
+
+    /// Scoping guard for the never-started disposition. Every other failed run
+    /// still replays: the executor gave a received answer, nothing is in
+    /// flight, and re-queuing repeats nothing. If this goes RED the new
+    /// disposition has leaked into a class it does not describe.
+    #[tokio::test]
+    async fn an_ordinary_apply_failure_still_returns_its_contributor_to_the_work_lane() {
+        let driver = make_shared_ephemeral_driver("replayed-disposition");
+        let (run_id, input_id) = stage_one_run_for_disposition_test(&driver).await;
+
+        crate::meerkat_machine::fail_runtime_loop_run(
+            &driver,
+            run_id,
+            CoreApplyFailureCause::executor_internal("ordinary apply failure"),
+            crate::meerkat_machine::FailedRunContributorDisposition::Replayed,
+        )
+        .await
+        .expect("an ordinary apply failure must terminalize its run");
+
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_phase(&input_id),
+                    Some(crate::input_state::InputLifecycleState::Queued),
+                    "an answered failure must return its contributor to the queue"
+                );
+                assert!(
+                    d.has_queued_input(&input_id),
+                    "a replayed contributor must be lane-bound again"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    /// The double-execution refusal, at the machine realization rather than as
+    /// a compensating step after it: a never-started run's contributors are
+    /// terminalized by the same realization that terminalizes the run, so they
+    /// are never durably queued for a successor attachment, not even briefly.
+    ///
+    /// Two boundary facts that claim does not cover: a crash *before* the
+    /// commit leaves the row durably `Staged`, and successor recovery
+    /// normalizes it to `Queued` and re-runs it - safe, because the crash took
+    /// the in-flight `apply` with it, and that is the pre-existing recovery
+    /// contract. A store-commit *failure without a crash* takes
+    /// checkpoint-restore plus loop teardown and leaves the row `Staged` for
+    /// same-process recovery to re-queue on a fresh executor while the
+    /// torn-down consumer's channel may still hold the command; that is the
+    /// residual double-execution window, and it is named rather than implied.
+    #[tokio::test]
+    async fn a_never_started_run_terminalizes_its_contributor_in_the_same_realization() {
+        let driver = make_shared_ephemeral_driver("terminalized-disposition");
+        let (run_id, input_id) = stage_one_run_for_disposition_test(&driver).await;
+
+        crate::meerkat_machine::fail_runtime_loop_run(
+            &driver,
+            run_id,
+            CoreApplyFailureCause::executor_stopped(),
+            crate::meerkat_machine::FailedRunContributorDisposition::Terminalized,
+        )
+        .await
+        .expect("a never-started run must terminalize");
+
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_phase(&input_id),
+                    Some(crate::input_state::InputLifecycleState::Abandoned),
+                    "a never-started run's contributor must terminalize, not re-queue"
+                );
+                assert!(
+                    !d.has_queued_input(&input_id),
+                    "a never-started run's contributor must not be lane-bound again"
+                );
+                // The durable reason is the whole point: a host reading this
+                // row (and, once the abandon-delivery lane lands, a waiter
+                // receiving it typed) must not be told an operator cancelled
+                // work the runtime itself refused.
+                assert_eq!(
+                    d.input_terminal_outcome(&input_id),
+                    Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                        reason: crate::input_state::InputAbandonReason::NeverExecuted,
+                    }),
+                    "a never-started run's contributor must carry the never-executed reason"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    /// The other mint site for a staged-run abandonment. An operator
+    /// cancellation keeps `Cancelled`, so the two reasons stay distinguishable
+    /// at the durable row that every host reads. If this and its sibling ever
+    /// agree, the typed reason has stopped carrying information.
+    #[tokio::test]
+    async fn an_operator_cancelled_run_keeps_the_cancelled_reason() {
+        let driver = make_shared_ephemeral_driver("cancelled-disposition");
+        let (run_id, input_id) = stage_one_run_for_disposition_test(&driver).await;
+
+        crate::meerkat_machine::cancel_runtime_loop_run(&driver, run_id)
+            .await
+            .expect("a cancelled run must terminalize");
+
+        let guard = driver.lock().await;
+        match &*guard {
+            crate::meerkat_machine::DriverEntry::Ephemeral(d) => {
+                assert_eq!(
+                    d.input_terminal_outcome(&input_id),
+                    Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                        reason: crate::input_state::InputAbandonReason::Cancelled,
+                    }),
+                    "a genuine cancellation must keep the cancelled reason"
+                );
+            }
+            _ => panic!("expected ephemeral driver"),
+        }
+    }
+
+    /// Symmetric pin on the disposition classifier. The positive half
+    /// (`ExecutorNotProgressing` -> `Terminalized`) is exercised end to end
+    /// above; the negative half needs a `TeardownRequired` carrying some
+    /// *other* reason, or a later widening of the match to all teardown
+    /// reasons would silently start terminalizing contributors of runs whose
+    /// executor answered.
+    #[test]
+    fn only_the_never_started_teardown_reason_terminalizes_contributors() {
+        use crate::meerkat_machine::FailedRunContributorDisposition;
+        use meerkat_core::lifecycle::core_executor::CoreExecutorTeardownReason;
+
+        assert_eq!(
+            failed_run_contributor_disposition(
+                &CoreExecutorError::executor_not_progressing_requires_teardown(
+                    "consumer never began executing"
+                )
+            ),
+            FailedRunContributorDisposition::Terminalized
+        );
+        for reason in [
+            CoreExecutorTeardownReason::ArchivedSession,
+            CoreExecutorTeardownReason::SessionUnavailable,
+            CoreExecutorTeardownReason::DurableProjectionAuthorityUnknown,
+        ] {
+            assert_eq!(
+                failed_run_contributor_disposition(&CoreExecutorError::teardown_required(
+                    reason,
+                    "executor requested teardown"
+                )),
+                FailedRunContributorDisposition::Replayed,
+                "{} is an answer the executor gave, so its contributors still replay",
+                reason.as_str()
+            );
+        }
+        assert_eq!(
+            failed_run_contributor_disposition(&CoreExecutorError::Internal(
+                "ordinary apply failure".into()
+            )),
+            FailedRunContributorDisposition::Replayed
+        );
     }
 
     #[tokio::test]
@@ -10521,5 +12037,562 @@ mod tests {
                 .expect_err("conflicting batch metadata should be rejected");
 
         assert_eq!(err.field, "model");
+    }
+
+    /// Drive the generated machine into the state the `Completed` arm of
+    /// [`machine_terminal_completion_error`] actually sees in the field, using
+    /// nothing but real generated inputs.
+    ///
+    /// Every step below is a transition the runtime already applies in
+    /// production, in the order it applies them:
+    ///
+    /// 1. `Prepare` binds a first run.
+    /// 2. `RecoverRuntimeCompletionResultCorrelation` restores a durable
+    ///    machine-failure terminal - what a process restart does after an
+    ///    earlier run failed. It sets `terminal_cause_kind` without touching
+    ///    `turn_phase`, which is the only way a cause can outlive its run.
+    /// 3. `Prepare` binds a second run. It clears `turn_terminal_run_id` and
+    ///    leaves the terminal facts alone.
+    /// 4. `RunCompleted` closes that run. Because `turn_phase` is still
+    ///    non-terminal it sets `terminal_outcome = Completed` - and it does not
+    ///    clear `terminal_cause_kind`, so the recovered cause is now sitting
+    ///    next to a completed outcome.
+    /// 5. `Commit` returns the shell to `Idle`. It carries no terminal
+    ///    coherence guard, so the pair survives the run boundary.
+    /// 6. `Prepare` binds a third run: the skipped-turn-start class, which
+    ///    inherits both stale terminal facts.
+    /// 7. `RunFailed` fails that third run with a runtime apply failure. It
+    ///    preserves the stale outcome and the stale cause, and records this
+    ///    run's own apply-failure cause.
+    ///
+    /// Nothing is hand-set: each fact is placed by the transition that owns it.
+    fn stale_completed_terminal_driver(
+        stale_cause: crate::meerkat_machine::dsl::TurnTerminalCauseKind,
+        runtime_apply_failure: Option<crate::meerkat_machine::dsl::RuntimeApplyFailureCause>,
+        failure_message: &str,
+    ) -> crate::meerkat_machine::driver::DriverEntry {
+        use crate::meerkat_machine::dsl;
+
+        let mut driver = crate::driver::ephemeral::EphemeralRuntimeDriver::new(
+            crate::identifiers::LogicalRuntimeId::for_session(&SessionId::new()),
+        );
+        let recovered_run = RunId::new();
+        driver
+            .contract_begin_run_authority(recovered_run.clone())
+            .expect("the first run must bind through generated authority");
+        let driver = crate::meerkat_machine::driver::DriverEntry::Ephemeral(driver);
+
+        crate::meerkat_machine::driver::machine_recover_runtime_completion_result_correlation(
+            &driver,
+            &recovered_run,
+            crate::input_state::RuntimeCompletionTerminalRecovery::MachineFailure {
+                outcome: meerkat_core::TurnTerminalOutcome::Failed,
+                cause: meerkat_core::TurnTerminalCauseKind::from(stale_cause),
+            },
+        )
+        .expect("a durable machine-failure terminal must be recoverable");
+
+        let completed_run = RunId::new();
+        let failed_run = RunId::new();
+        // Read once and hold no lock across an apply: the authority mutex is
+        // not reentrant, and taking it inside an argument expression would
+        // still be held when the closure below locks it again.
+        let session_id = {
+            let authority = driver.shared_dsl_authority();
+            let authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            authority
+                .state()
+                .session_id
+                .clone()
+                .expect("the fixture registered a session")
+        };
+        let apply = |input: dsl::MeerkatMachineInput, context: &str| {
+            let authority = driver.shared_dsl_authority();
+            let mut authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            dsl::MeerkatMachineMutator::apply(&mut *authority, input)
+                .unwrap_or_else(|err| panic!("generated machine rejected {context}: {err:?}"));
+        };
+
+        // The recovery correlation is declared `per_phase`, so it restores the
+        // terminal facts without leaving `Running`. The run boundary is what
+        // returns the shell to `Idle`, exactly as the runtime loop does it.
+        apply(
+            dsl::MeerkatMachineInput::Commit {
+                input_id: dsl::InputId::from_domain(&InputId::new()),
+                run_id: dsl::RunId::from_domain(&recovered_run),
+            },
+            "Commit(recovered run)",
+        );
+        apply(
+            dsl::MeerkatMachineInput::Prepare {
+                session_id: session_id.clone(),
+                run_id: dsl::RunId::from_domain(&completed_run),
+            },
+            "Prepare(completed run)",
+        );
+        apply(
+            dsl::MeerkatMachineInput::RunCompleted {
+                run_id: dsl::RunId::from_domain(&completed_run),
+            },
+            "RunCompleted(completed run)",
+        );
+        apply(
+            dsl::MeerkatMachineInput::Commit {
+                input_id: dsl::InputId::from_domain(&InputId::new()),
+                run_id: dsl::RunId::from_domain(&completed_run),
+            },
+            "Commit(completed run)",
+        );
+        apply(
+            dsl::MeerkatMachineInput::Prepare {
+                session_id,
+                run_id: dsl::RunId::from_domain(&failed_run),
+            },
+            "Prepare(skipped turn-start run)",
+        );
+        apply(
+            dsl::MeerkatMachineInput::RunFailed {
+                run_id: dsl::RunId::from_domain(&failed_run),
+                runtime_apply_failure_cause: runtime_apply_failure,
+                runtime_apply_failure_message: runtime_apply_failure
+                    .map(|_| failure_message.to_string()),
+                machine_terminal_failure_observed: false,
+                terminal_failure_source: None,
+                error: failure_message.to_string(),
+            },
+            "RunFailed(skipped turn-start run)",
+        );
+
+        driver
+    }
+
+    fn assert_stale_completed_terminal_state(
+        driver: &crate::meerkat_machine::driver::DriverEntry,
+        expected_stale_cause: Option<crate::meerkat_machine::dsl::TurnTerminalCauseKind>,
+    ) {
+        let authority = driver.shared_dsl_authority();
+        let authority = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = authority.state();
+        assert_eq!(
+            state.terminal_outcome,
+            Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::Completed),
+            "the fixture must reach the arm under test, not a different one"
+        );
+        assert_eq!(
+            state.terminal_cause_kind, expected_stale_cause,
+            "the stale cause the machine carries is the premise of this test"
+        );
+    }
+
+    /// The cause the host is told must be this run's, not the one the machine
+    /// happens to still be carrying.
+    ///
+    /// The machine's own coherence rule (`completed_terminal_is_coherent` on
+    /// the `ServiceTurnCommitted*` transitions) says a `Completed` terminal
+    /// carries no cause at all, so the `LlmFailure` visible here belongs to a
+    /// run that ended before this one. Reporting it would be the same defect as
+    /// the one this arm was written to fix, pointed the other way: a typed
+    /// reason that names a failure that did not happen.
+    ///
+    /// `last_runtime_apply_failure_cause` is the run-scoped fact - `RunFailed`
+    /// assigns it unconditionally - and it says this run failed applying its
+    /// runtime turn.
+    #[test]
+    fn completed_terminal_reports_this_runs_cause_not_the_stale_one() {
+        const DETAIL: &str = "run-boundary session save failed after the turn completed";
+        let driver = stale_completed_terminal_driver(
+            crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure,
+            Some(crate::meerkat_machine::dsl::RuntimeApplyFailureCause::RuntimeTurn),
+            DETAIL,
+        );
+        assert_stale_completed_terminal_state(
+            &driver,
+            Some(crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure),
+        );
+
+        let metadata = machine_terminal_completion_error(&driver, DETAIL.to_string())
+            .expect("a completed terminal with a failed runtime completion must resolve")
+            .expect("a failed runtime completion must carry typed metadata");
+
+        assert_eq!(
+            metadata.kind,
+            meerkat_core::TurnTerminalCauseKind::RuntimeApplyFailure,
+            "the host must be told the runtime apply failure that actually happened, not the \
+             dead cause the machine still carries next to a completed outcome"
+        );
+        assert_ne!(
+            metadata.kind,
+            meerkat_core::TurnTerminalCauseKind::LlmFailure,
+            "reporting the stale cause would name a failure this run never had"
+        );
+        assert_eq!(
+            metadata.outcome,
+            Some(meerkat_core::TurnTerminalOutcome::Failed),
+            "the metadata describes the runtime completion being delivered, which is abandoned \
+             work; durable machine-terminal recovery rejects any non-failure outcome outright"
+        );
+        assert_eq!(metadata.detail.as_deref(), Some(DETAIL));
+        assert!(metadata.terminal);
+    }
+
+    /// The digest contract the durable path enforces, stated as an equality
+    /// rather than trusted.
+    ///
+    /// `authorize_runtime_terminal_bundle` compares the delivered payload
+    /// against the candidate the failed-run realization staged, which is
+    /// `TurnErrorMetadata::runtime_apply_failure` over the same apply-failure
+    /// message. The derived metadata must be that value exactly, or the durable
+    /// batch resolves `AuthorityUnavailable` instead of a typed terminal.
+    ///
+    /// Both sides are produced independently: the left by driving the machine,
+    /// the right by the constructor the staging site calls.
+    #[test]
+    fn completed_terminal_metadata_matches_the_staged_durable_candidate() {
+        const DETAIL: &str = "run-boundary session save failed after the turn completed";
+        let driver = stale_completed_terminal_driver(
+            crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure,
+            Some(crate::meerkat_machine::dsl::RuntimeApplyFailureCause::RuntimeTurn),
+            DETAIL,
+        );
+
+        let metadata = machine_terminal_completion_error(&driver, DETAIL.to_string())
+            .expect("a completed terminal with a failed runtime completion must resolve")
+            .expect("a failed runtime completion must carry typed metadata");
+
+        assert_eq!(
+            metadata,
+            meerkat_core::TurnErrorMetadata::runtime_apply_failure(DETAIL),
+            "the delivered payload must digest identically to the staged candidate, or the \
+             durable batch answers AuthorityUnavailable instead of this terminal"
+        );
+    }
+
+    /// The fail-honest branch: a failed run that carries no runtime apply
+    /// failure of its own.
+    ///
+    /// No production caller reaches this today - `fail_runtime_loop_run` always
+    /// carries `Some(cause)` from `CoreExecutorError::apply_failure_cause`, and
+    /// the machine-terminal route cannot hold a `Completed` outcome at all. It
+    /// is pinned because the alternative is a branch that mints a confident
+    /// `runtime_apply_failure` for a run that had none, which is what the
+    /// hardcode did and what would silently return the moment `RunFailed`'s
+    /// inputs widen.
+    ///
+    /// `Unknown` is the vocabulary's own "not classified", and the
+    /// operator-facing detail still travels. It cannot become durable truth:
+    /// the candidate digest rejects it before any receipt is written, so this
+    /// branch fails closed at the waiter rather than persisting an
+    /// unclassified terminal.
+    #[test]
+    fn completed_terminal_without_this_runs_apply_failure_reports_an_unknown_cause() {
+        const DETAIL: &str = "runtime completion failed with no apply-failure cause of its own";
+        let driver = stale_completed_terminal_driver(
+            crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure,
+            None,
+            DETAIL,
+        );
+        assert_stale_completed_terminal_state(
+            &driver,
+            Some(crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure),
+        );
+
+        let metadata = machine_terminal_completion_error(&driver, DETAIL.to_string())
+            .expect("a completed terminal with a failed runtime completion must resolve")
+            .expect("a failed runtime completion must carry typed metadata");
+
+        assert_eq!(
+            metadata.kind,
+            meerkat_core::TurnTerminalCauseKind::Unknown,
+            "with no run-scoped apply failure and only an incoherent stale cause available, the \
+             honest answer is that the cause is unclassified"
+        );
+        assert!(
+            !metadata.kind.is_specific_failure_cause(),
+            "an unclassified cause must not read as a specific one to a host keying off it"
+        );
+        assert_eq!(metadata.detail.as_deref(), Some(DETAIL));
+    }
+
+    fn apply_generated_input(
+        driver: &crate::meerkat_machine::driver::DriverEntry,
+        input: crate::meerkat_machine::dsl::MeerkatMachineInput,
+        context: &str,
+    ) {
+        let authority = driver.shared_dsl_authority();
+        let mut authority = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(&mut *authority, input)
+            .unwrap_or_else(|err| panic!("generated machine rejected {context}: {err:?}"));
+    }
+
+    fn generated_session_id(
+        driver: &crate::meerkat_machine::driver::DriverEntry,
+    ) -> crate::meerkat_machine::dsl::SessionId {
+        let authority = driver.shared_dsl_authority();
+        let authority = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        authority
+            .state()
+            .session_id
+            .clone()
+            .expect("the fixture registered a session")
+    }
+
+    fn bound_ephemeral_driver() -> (crate::meerkat_machine::driver::DriverEntry, RunId) {
+        let mut driver = crate::driver::ephemeral::EphemeralRuntimeDriver::new(
+            crate::identifiers::LogicalRuntimeId::for_session(&SessionId::new()),
+        );
+        let first_run = RunId::new();
+        driver
+            .contract_begin_run_authority(first_run.clone())
+            .expect("the first run must bind through generated authority");
+        (
+            crate::meerkat_machine::driver::DriverEntry::Ephemeral(driver),
+            first_run,
+        )
+    }
+
+    fn assert_cancelled_terminal_with_cause(
+        driver: &crate::meerkat_machine::driver::DriverEntry,
+        expected_cause: crate::meerkat_machine::dsl::TurnTerminalCauseKind,
+    ) {
+        let authority = driver.shared_dsl_authority();
+        let authority = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = authority.state();
+        assert_eq!(
+            state.terminal_outcome,
+            Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::Cancelled),
+            "the fixture must reach the arm under test, not a different one"
+        );
+        assert_eq!(
+            state.terminal_cause_kind,
+            Some(expected_cause),
+            "a cancelled terminal carrying a failure cause is the premise of this test"
+        );
+    }
+
+    /// Assert the generated machine accepts the same authority state the shell
+    /// just resolved, and classifies it as a cancellation.
+    ///
+    /// This is the load-bearing half. A shell function that returns `Err` for a
+    /// state its own authority accepts is the defect class this release exists
+    /// to stop, so the test states the machine's answer rather than assuming
+    /// the shell's is unopposed.
+    fn assert_machine_classifies_cancelled(
+        driver: &crate::meerkat_machine::driver::DriverEntry,
+        run_id: &RunId,
+    ) {
+        let finalization = machine_failed_completion_finalization(driver);
+        assert_eq!(
+            finalization,
+            crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+            "a cancelled outcome is not a completed one, so the completion must still be \
+             finalized under Succeeded"
+        );
+        let authority = crate::meerkat_machine::driver::machine_resolve_runtime_completion_result(
+            driver,
+            Some(run_id),
+            crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::MachineTerminal,
+            finalization,
+        )
+        .expect(
+            "the generated machine accepts this state: ResolveRuntimeCompletionResultCancelled \
+             guards on the cancelled outcome and consults no cause at all",
+        );
+        assert_eq!(
+            authority.result_class(),
+            crate::meerkat_machine::dsl::RuntimeCompletionResultClass::Cancelled,
+            "the machine's own result class for this state is Cancelled, so no error metadata \
+             belongs in the shell's answer either"
+        );
+    }
+
+    /// Drive the generated machine to a cancelled terminal that still carries
+    /// an earlier run's failure cause, using nothing but real generated inputs.
+    ///
+    /// Every step is a transition the runtime already applies in production, in
+    /// the order it applies them:
+    ///
+    /// 1. `Prepare` binds a first run.
+    /// 2. `RecoverRuntimeCompletionResultCorrelation` restores a durable
+    ///    machine-failure terminal - what a process restart does after an
+    ///    earlier run failed. It sets `terminal_cause_kind` without touching
+    ///    `turn_phase`, which is how a cause outlives its run.
+    /// 3. `Commit` returns the shell to `Idle`.
+    /// 4. `Prepare` binds a second run: the skipped-turn-start class, which
+    ///    clears `turn_terminal_run_id` and inherits the stale cause. Only
+    ///    `StartConversationRun*` / `StartImmediate*` would have cleared it.
+    /// 5. `RunCancelled` cancels that run. It sets `terminal_outcome =
+    ///    Cancelled` and does not touch `terminal_cause_kind`, so the dead
+    ///    cause is now sitting next to a cancelled outcome.
+    fn cancelled_terminal_inheriting_a_stale_cause_driver(
+        stale_cause: crate::meerkat_machine::dsl::TurnTerminalCauseKind,
+    ) -> (crate::meerkat_machine::driver::DriverEntry, RunId) {
+        use crate::meerkat_machine::dsl;
+
+        let (driver, recovered_run) = bound_ephemeral_driver();
+        crate::meerkat_machine::driver::machine_recover_runtime_completion_result_correlation(
+            &driver,
+            &recovered_run,
+            crate::input_state::RuntimeCompletionTerminalRecovery::MachineFailure {
+                outcome: meerkat_core::TurnTerminalOutcome::Failed,
+                cause: meerkat_core::TurnTerminalCauseKind::from(stale_cause),
+            },
+        )
+        .expect("a durable machine-failure terminal must be recoverable");
+
+        let session_id = generated_session_id(&driver);
+        let cancelled_run = RunId::new();
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::Commit {
+                input_id: dsl::InputId::from_domain(&InputId::new()),
+                run_id: dsl::RunId::from_domain(&recovered_run),
+            },
+            "Commit(recovered run)",
+        );
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::Prepare {
+                session_id,
+                run_id: dsl::RunId::from_domain(&cancelled_run),
+            },
+            "Prepare(skipped turn-start run)",
+        );
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::RunCancelled {
+                run_id: dsl::RunId::from_domain(&cancelled_run),
+            },
+            "RunCancelled(skipped turn-start run)",
+        );
+        (driver, cancelled_run)
+    }
+
+    /// The cancel-path sibling of the carrier wedge, pinned on a state a
+    /// production caller reaches.
+    ///
+    /// PRODUCTION CALLER: [`realize_runtime_loop_terminal_owned`] with
+    /// `OwnedRuntimeLoopTerminalization::Cancelled`. It calls this function
+    /// after `cancel_runtime_loop_run` has applied `RunCancelled`, whenever the
+    /// cancelled run retained non-directed completion waiters, and it turns an
+    /// `Err` here into
+    /// `OwnedRuntimeLoopTerminalizationOutcome::CleanupCarrierCorrupt` by
+    /// short-circuiting its `and_then` chain. `process_queue` answers that
+    /// outcome by returning, which ends the runtime loop task for the remaining
+    /// life of the process.
+    ///
+    /// The reachability argument is inherited rather than new: it is the same
+    /// skipped-turn-start class the `Completed` arm already relies on, and no
+    /// cancel-producing transition clears `terminal_cause_kind`.
+    #[test]
+    fn cancelled_terminal_with_a_stale_cause_resolves_instead_of_wedging() {
+        let (driver, cancelled_run) = cancelled_terminal_inheriting_a_stale_cause_driver(
+            crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure,
+        );
+        assert_cancelled_terminal_with_cause(
+            &driver,
+            crate::meerkat_machine::dsl::TurnTerminalCauseKind::LlmFailure,
+        );
+
+        let metadata =
+            machine_terminal_completion_error(&driver, "runtime run cancelled".to_string()).expect(
+                "a cancelled terminal carrying a dead cause must resolve; refusing it corrupts the \
+             recovery carrier and ends the runtime loop",
+            );
+
+        assert_eq!(
+            metadata, None,
+            "a cancellation carries no failure metadata, and the stale cause is not this run's \
+             to report"
+        );
+        assert_machine_classifies_cancelled(&driver, &cancelled_run);
+    }
+
+    /// The same arm reached from the other direction, with no recovery input
+    /// anywhere in the fixture: an ordinary cancelled run, then a
+    /// skipped-turn-start run that fails.
+    ///
+    /// PRODUCTION CALLERS: [`resolve_process_local_failed_run_waiters`] and
+    /// [`resolve_machine_terminal_completion_waiters_under_authority`], both
+    /// past `RunFailed`. The generated `RunFailed` update replaces
+    /// `terminal_outcome` only when it is absent, so it preserves the stale
+    /// `Cancelled` and fills `terminal_cause_kind` with this run's own
+    /// `RuntimeApplyFailure`. The cause the old code refused was written by the
+    /// machine one transition earlier.
+    ///
+    /// The shell must answer what the machine answers for this state, which is
+    /// `Cancelled` with no error metadata: reporting the failure cause instead
+    /// would contradict the generated result class, and refusing it wedges the
+    /// carrier.
+    #[test]
+    fn failed_run_inheriting_a_cancelled_outcome_resolves_instead_of_wedging() {
+        use crate::meerkat_machine::dsl;
+        const DETAIL: &str = "run-boundary session save failed after an inherited cancellation";
+
+        let (driver, cancelled_run) = bound_ephemeral_driver();
+        let session_id = generated_session_id(&driver);
+        let failed_run = RunId::new();
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::RunCancelled {
+                run_id: dsl::RunId::from_domain(&cancelled_run),
+            },
+            "RunCancelled(first run)",
+        );
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::Commit {
+                input_id: dsl::InputId::from_domain(&InputId::new()),
+                run_id: dsl::RunId::from_domain(&cancelled_run),
+            },
+            "Commit(cancelled run)",
+        );
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::Prepare {
+                session_id,
+                run_id: dsl::RunId::from_domain(&failed_run),
+            },
+            "Prepare(skipped turn-start run)",
+        );
+        apply_generated_input(
+            &driver,
+            dsl::MeerkatMachineInput::RunFailed {
+                run_id: dsl::RunId::from_domain(&failed_run),
+                runtime_apply_failure_cause: Some(dsl::RuntimeApplyFailureCause::RuntimeTurn),
+                runtime_apply_failure_message: Some(DETAIL.to_string()),
+                machine_terminal_failure_observed: false,
+                terminal_failure_source: None,
+                error: DETAIL.to_string(),
+            },
+            "RunFailed(skipped turn-start run)",
+        );
+        assert_cancelled_terminal_with_cause(
+            &driver,
+            crate::meerkat_machine::dsl::TurnTerminalCauseKind::RuntimeApplyFailure,
+        );
+
+        let metadata = machine_terminal_completion_error(&driver, DETAIL.to_string()).expect(
+            "a failed run holding an inherited cancelled outcome must resolve; refusing it \
+             corrupts the recovery carrier and ends the runtime loop",
+        );
+
+        assert_eq!(
+            metadata, None,
+            "the machine classifies this state as a cancellation, so the shell must not attach \
+             failure metadata the generated result class contradicts"
+        );
+        assert_machine_classifies_cancelled(&driver, &failed_run);
     }
 }

@@ -177,10 +177,14 @@ fn applying_typed_input_yields_typed_transition_outcome() {
             &state,
             &KernelInput {
                 variant: input("RegisterSession"),
-                fields: BTreeMap::from([(
-                    field("session_id"),
-                    named_string("SessionId", "sess-1"),
-                )]),
+                // Every field the variant DECLARES must be present: the kernel
+                // refuses an input missing one, so the registration-owned
+                // runtime epoch is part of the fixture, not optional at the
+                // wire.
+                fields: BTreeMap::from([
+                    (field("session_id"), named_string("SessionId", "sess-1")),
+                    (field("runtime_epoch_id"), KernelValue::None),
+                ]),
             },
         )
         .expect("register session");
@@ -612,10 +616,10 @@ fn no_matching_transition_refusal_carries_typed_route_variant() {
             &state,
             &KernelInput {
                 variant: input("RegisterSession"),
-                fields: BTreeMap::from([(
-                    field("session_id"),
-                    named_string("SessionId", "sess-early"),
-                )]),
+                fields: BTreeMap::from([
+                    (field("session_id"), named_string("SessionId", "sess-early")),
+                    (field("runtime_epoch_id"), KernelValue::None),
+                ]),
             },
         )
         .expect_err("no matching transition from Initializing");
@@ -713,7 +717,10 @@ fn kernel_state_serde_round_trips_with_typed_ids_as_strings() {
 fn kernel_input_signal_effect_serde_round_trip_with_typed_ids() {
     let input_msg = KernelInput {
         variant: input("RegisterSession"),
-        fields: BTreeMap::from([(field("session_id"), KernelValue::String("sess-1".into()))]),
+        fields: BTreeMap::from([
+            (field("session_id"), KernelValue::String("sess-1".into())),
+            (field("runtime_epoch_id"), KernelValue::None),
+        ]),
     };
     // KernelInput/Signal/Effect don't derive Serialize themselves, so round-trip
     // through the KernelValue surface which is the serde-visible layer.

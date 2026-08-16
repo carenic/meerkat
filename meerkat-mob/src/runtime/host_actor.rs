@@ -4862,6 +4862,10 @@ pub fn build_host_comms_runtime(
     dsl.apply_input(
         mm_dsl::MeerkatMachineInput::RegisterSession {
             session_id: session_id.clone(),
+            // Honestly epochless: this is a comms peer-projection authority for
+            // the host participant, not a runtime session entry, so there is no
+            // entry runtime epoch to register under.
+            runtime_epoch_id: None,
         },
         "mob_host_actor::register",
     )

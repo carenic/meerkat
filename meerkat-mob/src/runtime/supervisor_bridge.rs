@@ -378,6 +378,15 @@ impl PreparedSupervisorRuntime {
             dsl,
             request_response_authority,
         } = self;
+        // `{mob_id}/__mob_supervisor__` gets exactly the same rule as every
+        // other participant name: a live route under it is never taken over,
+        // whether the holder is another mob sharing this mob id or an earlier
+        // generation of this same authority. Bridge construction has no
+        // predecessor generation in hand, so it cannot prove the incumbent is
+        // gone and publishes ordinarily; rotation, which does hold the current
+        // runtime, replaces that exact generation through
+        // `publish_replacing_recoverable` below. Both refusal shapes are pinned
+        // by `supervisor_bridge_refuses_*` in this module's tests.
         let runtime = runtime.publish().map_err(|error| {
             MobError::Internal(format!(
                 "failed to publish prepared mob supervisor comms runtime: {error}"
@@ -1025,6 +1034,10 @@ impl MobSupervisorBridge {
         dsl.apply_input(
             meerkat_runtime::meerkat_machine::dsl::MeerkatMachineInput::RegisterSession {
                 session_id: session_id.clone(),
+                // Honestly epochless: the supervisor bridge authority projects
+                // peer interaction for a participant name, not a runtime session
+                // entry, so it owns no entry runtime epoch.
+                runtime_epoch_id: None,
             },
             "mob_supervisor_bridge::register",
         )
@@ -1454,6 +1467,16 @@ impl MobSupervisorBridge {
             let runtime = self.runtime_with_gate_held().await;
             runtime.stop_listeners_for_rebind().await;
         }
+        // Release `{mob_id}/__mob_supervisor__` here, not at `Arc` drop. This is
+        // terminal teardown, and a live participant name is never taken over, so
+        // a cold replacement for this mob id in the same process has to observe
+        // the name actually freed. Route lifetime would otherwise be bound to
+        // the last surviving bridge reference (an actor task's, typically),
+        // which is exactly the race the surrounding teardown comment in
+        // `shutdown_actor_owned_background_work` set out to close. The removal
+        // is generation-exact, so a successor that has already rebound this
+        // authority key keeps its route.
+        self.runtime_with_gate_held().await.retire_inproc_route();
     }
 
     /// Rebuild the supervisor runtime under a (possibly new) authority record,
@@ -3570,6 +3593,171 @@ mod tests {
             .finalize(claim)
             .await
             .expect("member MeerkatMachine must durably finalize the exact claim")
+    }
+
+    /// The supervisor axis of the 0.8.22 name-eviction defect, different-key
+    /// shape: two mobs that share a mob id in one process render the same
+    /// `{mob_id}/__mob_supervisor__` participant name from two independently
+    /// generated authorities. The newcomer used to displace the incumbent's only
+    /// control-ingress route under a warning. It is now refused with the same
+    /// typed refusal every other registrant gets, and the incumbent keeps the
+    /// route.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn supervisor_bridge_refuses_to_displace_a_live_foreign_authority_route() {
+        let suffix = uuid::Uuid::new_v4();
+        let mob_id = crate::MobId::from(format!("mob/supervisor-name-collision-{suffix}"));
+        let incumbent_authority = SupervisorAuthorityRecord::generate(
+            super::super::bridge_protocol::SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
+        );
+        let incumbent = MobSupervisorBridge::new(&mob_id, incumbent_authority, None)
+            .await
+            .expect("incumbent supervisor bridge should build");
+        let incumbent_key = incumbent.runtime().await.public_key();
+        assert!(
+            meerkat_comms::InprocRegistry::global()
+                .get_by_pubkey_in_namespace("", &incumbent_key)
+                .is_some(),
+            "incumbent supervisor route should be published"
+        );
+
+        let newcomer_authority = SupervisorAuthorityRecord::generate(
+            super::super::bridge_protocol::SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
+        );
+        let newcomer_key = newcomer_authority.keypair().public_key();
+        let error = MobSupervisorBridge::new(&mob_id, newcomer_authority, None)
+            .await
+            .err()
+            .expect("a second live mob sharing this mob id must not take the supervisor name over");
+        assert!(
+            error
+                .to_string()
+                .contains("the participant name already has a live route"),
+            "the supervisor must fail closed with the typed name-occupancy refusal, got: {error}"
+        );
+
+        assert!(
+            meerkat_comms::InprocRegistry::global()
+                .get_by_pubkey_in_namespace("", &incumbent_key)
+                .is_some(),
+            "the refused bridge must leave the incumbent route installed"
+        );
+        assert_eq!(
+            meerkat_comms::InprocRegistry::global()
+                .get_name_by_pubkey_in_namespace("", &incumbent_key),
+            Some(format!("{mob_id}/__mob_supervisor__")),
+            "the supervisor participant name must still resolve to the incumbent authority"
+        );
+        assert!(
+            meerkat_comms::InprocRegistry::global()
+                .get_by_pubkey_in_namespace("", &newcomer_key)
+                .is_none(),
+            "a refused supervisor bridge must not install its own route"
+        );
+        incumbent.shutdown().await;
+    }
+
+    /// The complementary supervisor shape, and the boundary of the rule: a
+    /// second bridge built from the SAME persisted authority record (one mob
+    /// re-hosted or resumed in this process) is the same supervisor identity
+    /// rebuilding its own route, so it is admitted and the supervisor name keeps
+    /// resolving to that identity. Nothing here can see whether two *hosts* of
+    /// one mob are live at once - they are cryptographically the same peer - so
+    /// comms does not adjudicate that; the host binding/authority records do.
+    ///
+    /// That the rebind moves the route onto the newest inbox generation and that
+    /// the superseded predecessor's `Drop` cannot unbind the successor are pinned
+    /// inside `meerkat-comms` by
+    /// `inproc_constructor_rebinds_its_own_identity_and_survives_predecessor_drop`,
+    /// which can see the crate-private generation predicate.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn supervisor_bridge_rebinds_its_own_authority_identity_without_losing_the_route() {
+        let suffix = uuid::Uuid::new_v4();
+        let mob_id = crate::MobId::from(format!("mob/supervisor-same-authority-{suffix}"));
+        let participant_name = format!("{mob_id}/__mob_supervisor__");
+        let authority = SupervisorAuthorityRecord::generate(
+            super::super::bridge_protocol::SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
+        );
+        let predecessor = MobSupervisorBridge::new(&mob_id, authority.clone(), None)
+            .await
+            .expect("predecessor supervisor bridge should build");
+        let authority_key = predecessor.runtime().await.public_key();
+        assert_eq!(authority_key, authority.keypair().public_key());
+        assert!(
+            meerkat_comms::InprocRegistry::global()
+                .get_by_pubkey_in_namespace("", &authority_key)
+                .is_some(),
+            "predecessor supervisor route should be published"
+        );
+
+        let successor = MobSupervisorBridge::new(&mob_id, authority.clone(), None)
+            .await
+            .expect("one supervisor identity must be able to rebuild its own route");
+        assert_eq!(successor.runtime().await.public_key(), authority_key);
+        assert_eq!(
+            meerkat_comms::InprocRegistry::global()
+                .get_name_by_pubkey_in_namespace("", &authority_key),
+            Some(participant_name.clone()),
+            "the supervisor identity must never stop being addressable across a rebind"
+        );
+
+        predecessor.shutdown().await;
+        drop(predecessor);
+        assert_eq!(
+            meerkat_comms::InprocRegistry::global()
+                .get_name_by_pubkey_in_namespace("", &authority_key),
+            Some(participant_name),
+            "releasing the superseded predecessor must not unbind the live supervisor route"
+        );
+        successor.shutdown().await;
+    }
+
+    /// The different-key refusal is a liveness boundary on the incumbent route,
+    /// not a permanent reservation of the supervisor name: once the incumbent
+    /// bridge is released, a *different* authority for the same mob id publishes
+    /// normally. This is what makes "no takeover, no exemption" survivable for
+    /// the supervisor without an eviction escape hatch, and it is the property
+    /// the deleted `publish_displacing_live_name` was covering for.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn supervisor_name_is_reclaimable_by_a_new_authority_once_released() {
+        let suffix = uuid::Uuid::new_v4();
+        let mob_id = crate::MobId::from(format!("mob/supervisor-rebuild-{suffix}"));
+        let incumbent = MobSupervisorBridge::new(
+            &mob_id,
+            SupervisorAuthorityRecord::generate(
+                super::super::bridge_protocol::SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
+            ),
+            None,
+        )
+        .await
+        .expect("incumbent supervisor bridge should build");
+        let incumbent_key = incumbent.runtime().await.public_key();
+        incumbent.shutdown().await;
+        drop(incumbent);
+        assert!(
+            meerkat_comms::InprocRegistry::global()
+                .get_by_pubkey_in_namespace("", &incumbent_key)
+                .is_none(),
+            "releasing the incumbent bridge must free the supervisor participant name"
+        );
+
+        let successor_authority = SupervisorAuthorityRecord::generate(
+            super::super::bridge_protocol::SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
+        );
+        let successor = MobSupervisorBridge::new(&mob_id, successor_authority, None)
+            .await
+            .expect("the freed supervisor name must be claimable by the next authority");
+        let successor_key = successor.runtime().await.public_key();
+        assert_ne!(successor_key, incumbent_key);
+        assert_eq!(
+            meerkat_comms::InprocRegistry::global()
+                .get_name_by_pubkey_in_namespace("", &successor_key),
+            Some(format!("{mob_id}/__mob_supervisor__")),
+            "the successor bridge must own the supervisor route"
+        );
+        successor.shutdown().await;
     }
 
     #[cfg(not(target_arch = "wasm32"))]

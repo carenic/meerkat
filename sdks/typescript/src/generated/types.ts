@@ -1,9 +1,9 @@
 // Generated wire types for Meerkat SDK
-// Contract version: 0.8.22
+// Contract version: 0.8.23
 
 import { MeerkatError } from "./errors.js";
 
-export const CONTRACT_VERSION = "0.8.22";
+export const CONTRACT_VERSION = "0.8.23";
 
 export type Value = unknown;
 
@@ -655,7 +655,7 @@ export interface HelpResponse {
   text: string;
   tool_calls: number;
   turns: number;
-  usage: Record<string, unknown>;
+  usage: WireUsage;
 }
 
 export interface InjectSystemContextParams {
@@ -1321,6 +1321,7 @@ export interface WireMobToolConfig {
   mcp?: string[];
   memory?: boolean;
   mob?: boolean;
+  read_only?: boolean;
   schedule?: boolean;
   shell?: boolean;
   workgraph?: boolean;
@@ -1351,7 +1352,28 @@ export interface WireMobRun {
   status: WireMobRunStatus;
 }
 
+export interface WireMobRunMemberAccounting {
+  agent_identity: string;
+  message_count?: number | null;
+  model?: string | null;
+  provider?: Provider | null;
+  role: string;
+  session_id?: string | null;
+  usage?: WireUsage | null;
+  usage_unavailable?: string | null;
+}
+
+export interface WireMobRunAccounting {
+  attribution: WireMobRunUsageAttribution;
+  member_session_ids?: string[];
+  members?: WireMobRunMemberAccounting[];
+  members_usage_unavailable?: number;
+  unpriced_reason: string;
+  usage_total: WireUsage;
+}
+
 export interface WireMobRunResultEnvelope {
+  accounting?: WireMobRunAccounting | null;
   flow_id: string;
   mob_id: string;
   outputs?: Record<string, unknown>;
@@ -2007,6 +2029,7 @@ export interface MobFlowStepInput {
   depends_on_mode?: MobDependencyModeInput;
   dispatch_mode?: MobDispatchModeInput;
   expected_schema_ref?: string | null;
+  failure_policy?: MobFlowNodeFailurePolicyInput;
   message: WireContentInput;
   output_format?: MobStepOutputFormatInput | null;
   role: string;
@@ -2067,6 +2090,7 @@ export interface MobToolConfigInput {
   mcp?: string[];
   memory?: boolean;
   mob?: boolean;
+  read_only?: boolean;
   schedule?: boolean;
   shell?: boolean;
   workgraph?: boolean;
@@ -2879,7 +2903,11 @@ export interface WireToolAccessPolicyDenyList {
   value: string[];
 }
 
-export type WireToolAccessPolicy = WireToolAccessPolicyInherit | WireToolAccessPolicyAllowList | WireToolAccessPolicyDenyList;
+export interface WireToolAccessPolicyReadOnly {
+  type: "read_only";
+}
+
+export type WireToolAccessPolicy = WireToolAccessPolicyInherit | WireToolAccessPolicyAllowList | WireToolAccessPolicyDenyList | WireToolAccessPolicyReadOnly;
 
 export type WireToolFilter = "All" | { Allow: string[] } | { Deny: string[] };
 
@@ -2955,10 +2983,13 @@ export type MobDependencyModeInput = "all" | "any";
 
 export type MobDispatchModeInput = "fan_out" | "one_to_one" | "fan_in";
 
+export type MobFlowNodeFailurePolicyInput = "escalate" | "continue";
+
 export interface MobFlowNodeInputStep {
   branch?: string | null;
   depends_on?: string[];
   depends_on_mode?: MobDependencyModeInput;
+  failure_policy?: MobFlowNodeFailurePolicyInput;
   kind: "step";
   step_id: string;
 }
@@ -2967,6 +2998,7 @@ export interface MobFlowNodeInputRepeatUntil {
   body: MobFrameSpecInput;
   depends_on?: string[];
   depends_on_mode?: MobDependencyModeInput;
+  failure_policy?: MobFlowNodeFailurePolicyInput;
   kind: "repeat_until";
   loop_id: string;
   max_iterations: number;
@@ -3017,6 +3049,8 @@ export type WireReachability = "reachable" | "stale" | "unreachable" | "unknown"
 export type WireNonPortableResourceKind = "rust_bundles" | "per_spawn_external_tools" | "mob_default_external_tools" | "default_llm_client_override" | "host_surface_mcp_allowlist" | "workgraph_tools";
 
 export type WireMobRunStatus = "pending" | "running" | "completed" | "failed" | "canceled";
+
+export type WireMobRunUsageAttribution = "session_cumulative";
 
 export type WireWorkExecutionLifecyclePhase = "absent" | "launch_requested" | "launch_uncertain" | "launch_quarantined" | "running" | "evidence_projection_requested" | "failure_evidence_projection_requested" | "cancellation_evidence_projection_requested" | "launch_failure_evidence_projection_requested" | "work_closure_requested" | "flow_failed" | "flow_canceled" | "evidence_projected" | "work_closed" | "launch_failed";
 
@@ -4705,7 +4739,7 @@ export interface WireLiveAdapterObservationAssistantTranscriptFinal {
   response_id?: string | null;
   stop_reason: WireStopReason;
   text: string;
-  usage: Record<string, unknown>;
+  usage: WireUsage;
 }
 
 export interface WireLiveAdapterObservationAssistantTranscriptTruncated {

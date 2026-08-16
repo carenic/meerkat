@@ -1115,6 +1115,7 @@ fn generated_test_machine_for_registered_session(
         &mut authority,
         MeerkatMachineInput::RegisterSession {
             session_id: DslSessionId(session_id.to_string()),
+            runtime_epoch_id: None,
         },
     )
     .expect("register session in generated MeerkatMachine authority");

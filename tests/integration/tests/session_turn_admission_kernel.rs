@@ -57,10 +57,13 @@ fn prepared_meerkat_state() -> KernelState {
             &initialized,
             &KernelInput {
                 variant: input("RegisterSession"),
-                fields: BTreeMap::from([(
-                    field("session_id"),
-                    named_string("SessionId", "session-1"),
-                )]),
+                // The kernel refuses an input missing any DECLARED field, so the
+                // registration-owned runtime epoch must be present here even when
+                // this fixture registers epochlessly.
+                fields: BTreeMap::from([
+                    (field("session_id"), named_string("SessionId", "session-1")),
+                    (field("runtime_epoch_id"), KernelValue::None),
+                ]),
             },
         )
         .expect("register session")

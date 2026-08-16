@@ -212,8 +212,16 @@ All transports use a length-prefixed CBOR framing protocol implemented by `Trans
 - `register_with_meta_in_namespace(...)` adds an agent in a namespace
 - `unregister_in_namespace(namespace, pubkey)` removes an agent from a namespace
 - delivery within a namespace is internal to the registry (crate-private send paths keyed by pubkey)
+- `retire_inproc_route()` releases a runtime's own published route at a point the owner chooses, instead of at the last `Arc` drop
 
-When `CommsRuntime` is created, it automatically registers itself in the active namespace. When dropped, it unregisters from that namespace.
+The public key is the participant identity, and delivery is key-addressed, so registration applies one rule to every registrant with no exemptions (the mob supervisor included):
+
+- a participant name held by a **different** live key belongs to another peer. Honouring the newcomer would make a key that peers still hold and trust unreachable, so the registration is refused without mutation (`RegistrationRejection::NameOccupied`) and the incumbent keeps routing. There is no name-takeover opt-in.
+- a participant name held by the **same** key is that identity rebuilding its own route. It is admitted and reported as `RegistrationOutcome::ReboundOwnName`: the identity never stops being addressable and now resolves to the newest inbox generation, while the superseded generation stops receiving. Whether two live hosts of one identity may exist at all is invisible here (they are cryptographically the same peer) and is decided one layer up - `SessionClaimHandle` for session identities, the mob host binding/authority records for mobs.
+- a caller that succeeds a *known* predecessor generation replaces it exactly with `PreparedCommsRuntime::publish_replacing`, which names the generation being replaced.
+- a teardown that hands its name to a replacement under a different key releases it first (`CommsRuntime::retire_inproc_route`, or dropping the runtime). Release is generation-exact, so it can never remove a successor that has already rebound the same key.
+
+When `CommsRuntime` is created, it automatically registers itself in the active namespace. When dropped, it unregisters from that namespace (generation-exactly, so a superseded generation's drop is a no-op).
 </Accordion>
 
 ## Message types

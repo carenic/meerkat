@@ -89,7 +89,31 @@ async fn wait_for_input_state(
     context: &'static str,
     matches: impl Fn(&StoredInputState) -> bool,
 ) -> StoredInputState {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    wait_for_input_state_within(
+        adapter,
+        sid,
+        input_id,
+        Duration::from_secs(2),
+        context,
+        matches,
+    )
+    .await
+}
+
+/// [`wait_for_input_state`] with an explicit bound, for callers whose predicate
+/// is the thing under test rather than incidental setup. Widening the bound can
+/// only delay a pass: the predicate is a machine-owned state, so exceeding the
+/// bound means the state was never reached, never that the test ran out of
+/// patience for a state that would have been wrong anyway.
+async fn wait_for_input_state_within(
+    adapter: &MeerkatMachine,
+    sid: &SessionId,
+    input_id: &InputId,
+    within: Duration,
+    context: &'static str,
+    matches: impl Fn(&StoredInputState) -> bool,
+) -> StoredInputState {
+    tokio::time::timeout(within, async {
         loop {
             if let Some(state) = adapter
                 .input_state(sid, input_id)
@@ -2722,38 +2746,482 @@ async fn failed_executor_stops_retrying_after_stage_budget_exhausted() {
         "failing executor should be called before retry-budget assertions",
     )
     .await;
+    // The budget is exhausted only by attempts that actually accrue. Waiting
+    // for "any non-in-flight phase" would also accept a rolled-back input that
+    // parked in Queued after a single attempt, which is the disarmed-member
+    // defect wearing a passing assertion.
     let state = wait_for_input_state(
         &adapter,
         &sid,
         &input_id,
-        "failed input should leave in-flight lifecycle state after retry exhaustion",
-        |state| {
-            !matches!(
-                state.seed.phase,
-                InputLifecycleState::Staged | InputLifecycleState::AppliedPendingConsumption
-            )
-        },
+        "failed input should terminalize typed once its stage budget is spent",
+        |state| state.seed.phase == InputLifecycleState::Abandoned,
     )
     .await;
-    let call_count = calls.load(Ordering::SeqCst);
-    assert!(
-        (1..=3).contains(&call_count),
-        "retry budget should remain bounded; expected 1-3 attempts, saw {call_count}"
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "retry budget should be spent exactly once per stage attempt"
     );
-    assert!(
-        !matches!(
-            state.seed.phase,
-            InputLifecycleState::Staged | InputLifecycleState::AppliedPendingConsumption
-        ),
-        "failed inputs must not remain stuck in an in-flight lifecycle state"
+    assert_eq!(state.seed.attempt_count, 3);
+    assert_eq!(
+        state.seed.terminal_outcome,
+        Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::MaxAttemptsExhausted { attempts: 3 },
+        }),
+        "the generated retry policy owns the terminal outcome"
     );
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        call_count,
+        3,
         "failed inputs must not keep spinning through fresh run ids"
+    );
+}
+
+/// Field regression (household fleet, 2026-08-12, domain:home): a turn failed,
+/// its staged input was rolled back to Queued, and nothing re-armed the runtime
+/// loop. The input sat queued for 21 minutes with zero further attempts and
+/// zero refusals; only an app restart - which wakes on
+/// `!active_input_ids().is_empty()` at attachment commit - re-staged it. A
+/// sibling input on the same member moved 288 seconds after its own rollback,
+/// but only because an unrelated input arrived and woke the loop: the wake was
+/// incidental, never owned by the rollback.
+///
+/// The particular provider error that failed that turn is irrelevant. This
+/// drives a deliberately generic turn failure and then supplies NO further
+/// stimulus: no second input, no wake, no completion traffic, no restart. The
+/// machine's own stage-attempt policy must carry the input to a typed terminal.
+#[tokio::test]
+async fn generic_turn_failure_re_arms_its_own_rolled_back_input_without_external_stimulus() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    struct GenericTurnFailureExecutor {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for GenericTurnFailureExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(CoreExecutorError::apply_failed_runtime_turn(
+                "generic turn failure",
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = SessionId::new();
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(GenericTurnFailureExecutor {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+
+    let input = make_prompt("generic failure with nothing else happening");
+    let input_id = input.id().clone();
+    adapter.accept_input(&sid, input).await.unwrap();
+
+    // Nothing else touches this session from here on.
+    let state = wait_for_input_state(
+        &adapter,
+        &sid,
+        &input_id,
+        "a failed turn must own the re-arm for the input it rolled back; \
+         without it the input parks in Queued until unrelated activity wakes the loop",
+        |state| state.seed.phase == InputLifecycleState::Abandoned,
+    )
+    .await;
+
+    assert_eq!(
+        state.seed.attempt_count, 3,
+        "every re-arm must accrue a machine-owned stage attempt"
+    );
+    assert_eq!(
+        state.seed.terminal_outcome,
+        Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::MaxAttemptsExhausted { attempts: 3 },
+        }),
+        "the generated retry policy owns the terminal, not the shell"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "the re-arm must be bounded by the machine's stage-attempt budget"
+    );
+
+    // The budget is the bound: once the lane is empty the loop parks for real.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "a terminalized input must not keep spinning through fresh run ids"
+    );
+    assert!(
+        adapter.list_active_inputs(&sid).await.unwrap().is_empty(),
+        "a terminalized input must not remain active work"
+    );
+}
+
+/// Sibling of the re-arm regression: the caller's completion waiter must still
+/// resolve on the attempt that failed, AND the durable input must still reach a
+/// typed terminal. Converting "caller hangs, input queued forever" into
+/// "caller hangs, input abandoned" would be a worse lie than the defect.
+#[tokio::test]
+async fn generic_turn_failure_resolves_its_completion_waiter_and_terminalizes_the_input() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    struct GenericTurnFailureExecutor;
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for GenericTurnFailureExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            Err(CoreExecutorError::apply_failed_runtime_turn(
+                "generic turn failure",
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = SessionId::new();
+    adapter
+        .register_session_with_executor(sid.clone(), Box::new(GenericTurnFailureExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+
+    let input = make_prompt("generic failure with a waiting caller");
+    let input_id = input.id().clone();
+    let (outcome, handle) = adapter
+        .accept_input_with_completion(&sid, input)
+        .await
+        .unwrap();
+    assert!(outcome.is_accepted());
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        handle
+            .expect("accepted input should carry a completion handle")
+            .wait(),
+    )
+    .await
+    .expect("completion waiter must resolve after a failed turn")
+    .expect("completion waiter should resolve");
+    assert!(
+        matches!(
+            result,
+            meerkat_runtime::completion::CompletionOutcome::AbandonedWithError { .. }
+                | meerkat_runtime::completion::CompletionOutcome::Abandoned { .. }
+        ),
+        "a failed turn must report typed failure metadata to its caller, got {result:?}"
+    );
+
+    let state = wait_for_input_state(
+        &adapter,
+        &sid,
+        &input_id,
+        "a resolved caller waiter must not leave the durable input parked in Queued",
+        |state| state.seed.phase == InputLifecycleState::Abandoned,
+    )
+    .await;
+    assert_eq!(
+        state.seed.terminal_outcome,
+        Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::MaxAttemptsExhausted { attempts: 3 },
+        }),
+    );
+}
+
+/// Wake coalescing contract. `wake_tx` is a bounded `mpsc(16)` written with
+/// `try_send`, so wakes are silently dropped when the channel is full and
+/// merged whenever several arrive while the loop is inside `process_queue`.
+/// That is only sound because ONE wake drains the queue to empty. Prompts never
+/// batch with each other (the generated queue batcher breaks after a prompt),
+/// so these three inputs are three separate runs from exactly one wake.
+#[tokio::test]
+async fn one_wake_drains_every_queued_input_so_a_merged_wake_cannot_park_work() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::{RunApplyBoundary, RunPrimitive};
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    struct CountingExecutor {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for CountingExecutor {
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = SessionId::new();
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(CountingExecutor {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+
+    let mut input_ids = Vec::new();
+    for index in 0..3 {
+        let input = make_prompt(&format!("queued without a wake {index}"));
+        input_ids.push(input.id().clone());
+        adapter
+            .accept_input_without_wake(&sid, input)
+            .await
+            .expect("queued-only admission should succeed");
+    }
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "queued-only admission must not process work before a wake"
+    );
+
+    assert!(
+        adapter
+            .wake_runtime_if_active_inputs(&sid)
+            .await
+            .expect("wake should reach the attached loop"),
+        "a single wake must be delivered while queued work exists"
+    );
+
+    for input_id in &input_ids {
+        let state = wait_for_input_state(
+            &adapter,
+            &sid,
+            input_id,
+            "one wake must drain every queued input; a dropped or merged wake \
+             must not leave queued work parked",
+            |state| state.seed.phase == InputLifecycleState::Consumed,
+        )
+        .await;
+        assert_eq!(state.seed.phase, InputLifecycleState::Consumed);
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "each prompt is its own run, all reached from one wake"
+    );
+}
+
+/// FIFO head contract for the re-arm: work queued behind a failing head must
+/// still make progress, and the head itself must still terminalize typed. The
+/// backlog input is the last external stimulus in this test.
+#[tokio::test]
+async fn queued_backlog_progresses_while_the_failing_head_terminalizes() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::{RunApplyBoundary, RunPrimitive};
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    struct HeadFailsExecutor {
+        head_id: InputId,
+        head_calls: Arc<AtomicUsize>,
+        backlog_calls: Arc<AtomicUsize>,
+        first_apply_started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for HeadFailsExecutor {
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            if primitive.contributing_input_ids().contains(&self.head_id) {
+                if self.head_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.first_apply_started.notify_one();
+                    // Hold the head's first run open long enough for the
+                    // backlog input to be admitted behind it.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                return Err(CoreExecutorError::apply_failed_runtime_turn(
+                    "generic turn failure",
+                ));
+            }
+            self.backlog_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let head = make_prompt("failing head");
+    let head_id = head.id().clone();
+    let head_calls = Arc::new(AtomicUsize::new(0));
+    let backlog_calls = Arc::new(AtomicUsize::new(0));
+    let first_apply_started = Arc::new(tokio::sync::Notify::new());
+
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = SessionId::new();
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(HeadFailsExecutor {
+                head_id: head_id.clone(),
+                head_calls: Arc::clone(&head_calls),
+                backlog_calls: Arc::clone(&backlog_calls),
+                first_apply_started: Arc::clone(&first_apply_started),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+
+    adapter.accept_input(&sid, head).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), first_apply_started.notified())
+        .await
+        .expect("the head run should start before the backlog input is queued");
+
+    let backlog = make_prompt("backlog behind the failing head");
+    let backlog_id = backlog.id().clone();
+    adapter.accept_input(&sid, backlog).await.unwrap();
+
+    let backlog_state = wait_for_input_state(
+        &adapter,
+        &sid,
+        &backlog_id,
+        "work queued behind a failing head must still drain",
+        |state| state.seed.phase == InputLifecycleState::Consumed,
+    )
+    .await;
+    assert_eq!(backlog_state.seed.phase, InputLifecycleState::Consumed);
+
+    let head_state = wait_for_input_state(
+        &adapter,
+        &sid,
+        &head_id,
+        "the failing head must terminalize typed instead of parking in Queued \
+         once the backlog behind it is empty",
+        |state| state.seed.phase == InputLifecycleState::Abandoned,
+    )
+    .await;
+    assert_eq!(
+        head_state.seed.terminal_outcome,
+        Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::MaxAttemptsExhausted { attempts: 3 },
+        }),
+    );
+    assert_eq!(
+        head_calls.load(Ordering::SeqCst),
+        3,
+        "the head must consume exactly its machine-owned stage budget"
+    );
+    assert_eq!(
+        backlog_calls.load(Ordering::SeqCst),
+        1,
+        "the backlog input must run exactly once"
     );
 }
 
@@ -3230,9 +3698,29 @@ async fn ensure_session_with_executor_repairs_stale_attached_driver() {
     let input_id = input.id().clone();
     adapter.accept_input(&sid, input).await.unwrap();
 
-    tokio::time::timeout(Duration::from_secs(1), async {
+    // Wait for the OUTCOME, not for the proxy that precedes it.
+    //
+    // `RecordingExecutor::apply` sets `apply_called` on ENTRY and only then
+    // returns the output the runtime still has to process before the input
+    // reaches `Consumed` and the runtime reaches `Attached`. Waiting on the
+    // flag and asserting the phase immediately afterwards therefore races the
+    // repair it is trying to observe: the flag says "apply was entered", and
+    // the assertion reads "the repair committed". Those are different facts
+    // with a window between them, and on a loaded runner the read lands inside
+    // it - observed on a shard where this same commit had already passed the
+    // identical lane minutes earlier.
+    //
+    // The bound is not the bug and raising it would not fix this: the old
+    // 1s applied to reaching the proxy, which is fast and was never what
+    // timed out. Poll the durable post-condition instead, so the test passes
+    // as soon as the repair is real and fails only if it never becomes real.
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            if apply_called.load(Ordering::SeqCst) {
+            let state = adapter.input_state(&sid, &input_id).await.unwrap();
+            let runtime_state = adapter.runtime_state(&sid).await.unwrap();
+            if state.is_some_and(|state| state.seed.phase == InputLifecycleState::Consumed)
+                && runtime_state == RuntimeState::Attached
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -3241,6 +3729,10 @@ async fn ensure_session_with_executor_repairs_stale_attached_driver() {
     .await
     .expect("ensuring with executor should repair the stale attached driver");
 
+    assert!(
+        apply_called.load(Ordering::SeqCst),
+        "the repair must have run the executor, not merely reached the end state"
+    );
     let state = adapter.input_state(&sid, &input_id).await.unwrap().unwrap();
     assert_eq!(state.seed.phase, InputLifecycleState::Consumed);
     assert_eq!(
@@ -4952,5 +5444,693 @@ async fn session_has_executor_false_for_unknown() {
             .await
             .expect("session_has_executor should resolve"),
         "unknown session should not have an executor"
+    );
+}
+
+/// Executor that drives a real turn to its completed terminal and only then
+/// fails its runtime completion.
+///
+/// Nothing about the machine state is hand-built. The executor applies the same
+/// generated turn inputs an agent applies (`PrimitiveApplied` ->
+/// `LlmReturnedToolCalls(0)` -> `BoundaryComplete`) through the session's own
+/// `TurnStateHandle` from `prepare_bindings`, so `BoundaryCompleteCompleted`
+/// fires on the exact shared authority the runtime loop reads. The failure it
+/// then returns is what an ordinary run-boundary persistence failure looks like
+/// from the loop's side: `AgentEvent::TurnCompleted` has already been published
+/// to the host, the model call and the tools have already run, and only the
+/// save after them failed.
+struct CompletedTerminalThenFailingExecutor {
+    turn_state: Arc<dyn meerkat_core::handles::TurnStateHandle>,
+    calls: Arc<AtomicUsize>,
+}
+
+const COMPLETED_TERMINAL_FAILURE_DETAIL: &str =
+    "run-boundary session save failed after the turn completed";
+
+#[async_trait::async_trait]
+impl meerkat_core::lifecycle::CoreExecutor for CompletedTerminalThenFailingExecutor {
+    async fn apply(
+        &mut self,
+        run_id: RunId,
+        _primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+    ) -> Result<
+        meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+        meerkat_core::lifecycle::core_executor::CoreExecutorError,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.turn_state
+            .primitive_applied(run_id.clone())
+            .expect("the runtime loop signals turn start before apply, so the primitive applies");
+        self.turn_state
+            .llm_returned_tool_calls(run_id.clone(), 0)
+            .expect("a zero-tool-call answer must reach the draining boundary");
+        self.turn_state
+            .apply_turn_input(
+                meerkat_core::turn_execution_authority::TurnExecutionInput::BoundaryComplete {
+                    run_id,
+                },
+            )
+            .expect("the completed boundary must reach the machine");
+        Err(
+            meerkat_core::lifecycle::core_executor::CoreExecutorError::apply_failed_runtime_turn(
+                COMPLETED_TERMINAL_FAILURE_DETAIL,
+            ),
+        )
+    }
+
+    async fn cancel_after_boundary(
+        &mut self,
+        _reason: String,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn stop_runtime_executor(
+        &mut self,
+        _reason: String,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        Ok(())
+    }
+}
+
+async fn completed_terminal_then_failing_session(
+    calls: Arc<AtomicUsize>,
+) -> (Arc<MeerkatMachine>, SessionId) {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = SessionId::new();
+    // The production binding route: the executor drives the same handle a
+    // factory-built agent would be handed for this session.
+    let bindings = adapter
+        .prepare_bindings(sid.clone())
+        .await
+        .expect("session runtime bindings should prepare");
+    let turn_state = Arc::clone(bindings.turn_state());
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(CompletedTerminalThenFailingExecutor { turn_state, calls }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+    (adapter, sid)
+}
+
+/// Field regression (household fleet, 0.8.23). A run whose turn reached a
+/// `Completed` terminal and whose runtime-level completion then failed was
+/// refused as an incoherent terminal pair. That refusal corrupted the recovery
+/// carrier, which ended the runtime loop task, and the session could not run
+/// another turn for the remaining life of the process. The host had already
+/// been told `AgentEvent::TurnCompleted`, and the completion waiter was never
+/// resolved, so a watchdog keyed on turn completion was actively defeated
+/// rather than merely uninformed.
+#[tokio::test]
+async fn completed_terminal_then_failed_runtime_completion_resolves_a_typed_terminal() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (adapter, sid) = completed_terminal_then_failing_session(Arc::clone(&calls)).await;
+
+    let (outcome, handle) = adapter
+        .accept_input_with_completion(
+            &sid,
+            make_prompt("the turn completes and only its persistence fails"),
+        )
+        .await
+        .expect("input should be accepted");
+    assert!(outcome.is_accepted());
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle
+            .expect("accepted input should carry a completion handle")
+            .wait(),
+    )
+    .await
+    .expect(
+        "a run that completed its turn and then failed its runtime completion must still resolve \
+         its caller; hanging here is the field defect",
+    )
+    .expect("completion waiter should resolve");
+
+    match result {
+        meerkat_runtime::completion::CompletionOutcome::AbandonedWithError { reason, error } => {
+            assert_eq!(
+                error.kind,
+                meerkat_core::TurnTerminalCauseKind::RuntimeApplyFailure,
+                "the host must receive the typed runtime-apply failure, not silence behind an \
+                 AgentEvent::TurnCompleted that lied"
+            );
+            assert!(
+                reason.contains(COMPLETED_TERMINAL_FAILURE_DETAIL),
+                "the typed terminal must carry the executor's own failure cause, got {reason}"
+            );
+        }
+        other => panic!("expected a typed runtime-apply-failure terminal, got {other:?}"),
+    }
+}
+
+/// The carrier fix removes the accidental guard that used to suppress replay:
+/// before it, the loop died at the corrupt carrier and never reached the
+/// failed-batch backlog. `failed_run_contributor_disposition` classifies from
+/// the typed error alone, so an ordinary post-turn persistence failure is
+/// `Replayed` and its contributor returns to the work lane. Restaging it
+/// re-appends the same content and re-runs the whole turn - a second model call
+/// with tools free to fire again, for work whose effects already happened.
+///
+/// The run must therefore be handed off rather than retried.
+///
+/// The replay window is closed by a positive signal, never by a sleep. A sleep
+/// does not bound something that has not happened yet; it only bounds how long
+/// the test was willing to wait for it. The version of this test that slept
+/// 400ms did detect the regression, but not because of the sleep: on a build
+/// without the teardown routing the restages all land before the completion
+/// waiter resolves, so the count was already wrong when the sleep started.
+/// Nothing in the test asserted that ordering, and it is not a contract - move
+/// the caller's resolution earlier and the same assertion becomes a pure race
+/// against a wall clock.
+///
+/// The signal used instead is the machine's own retirement of the session: once
+/// the `MeerkatMachine` no longer holds a registration for this session there
+/// is no runtime loop, no executor and no work lane left that could stage the
+/// contributor, so the apply count is final rather than merely not-yet-moved.
+/// `ListActiveInputs` reports that absence as
+/// `RuntimeDriverError::NotReady { state: RuntimeState::Destroyed }`.
+///
+/// That signal cannot be satisfied early on a regressed build, and this was
+/// measured rather than assumed. With the teardown routing removed, the session
+/// stays registered and `Attached` with its executor still claimed for as long
+/// as the test polls, so the wait cannot pass; the build without the fix can
+/// only go red. Load moves how long the red takes to arrive, never whether it
+/// arrives.
+#[tokio::test]
+async fn completed_terminal_then_failed_runtime_completion_refuses_to_replay_the_turn() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (adapter, sid) = completed_terminal_then_failing_session(Arc::clone(&calls)).await;
+
+    let (outcome, handle) = adapter
+        .accept_input_with_completion(
+            &sid,
+            make_prompt("one household instruction, executed exactly once"),
+        )
+        .await
+        .expect("input should be accepted");
+    assert!(outcome.is_accepted());
+
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle
+            .expect("accepted input should carry a completion handle")
+            .wait(),
+    )
+    .await
+    .expect("the caller must be resolved before the replay window is measured");
+
+    // Generous on purpose: a longer bound can only delay a pass, and the only
+    // way to exceed it is for the retirement never to happen, which is the
+    // regression itself.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            // Fail on the replay itself rather than on the wait expiring, so a
+            // regressed build reports the count that proves the defect instead
+            // of a bare timeout.
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the turn was executed again while the shell was still being retired; a run \
+                 whose effects already ran must never re-enter the work lane"
+            );
+            match adapter.list_active_inputs(&sid).await {
+                // The session registration is gone: nothing is left that could
+                // stage the contributor, so the apply count below is final.
+                Err(RuntimeDriverError::NotReady {
+                    state: RuntimeState::Destroyed,
+                }) => break,
+                // Still registered, teardown in flight, or mid-lifecycle. Keep
+                // waiting for the retirement rather than sampling a clock.
+                Ok(_) | Err(RuntimeDriverError::NotReady { .. }) => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(other) => {
+                    panic!("unexpected error while waiting for the shell to be retired: {other}")
+                }
+            }
+        }
+    })
+    .await
+    .expect(
+        "the post-mutation failure must retire the session instead of releasing its contributor \
+         to the retry lane; a session still registered here means the turn is queued to run a \
+         second time",
+    );
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a turn whose effects already ran must not be executed a second time"
+    );
+}
+
+/// What a host experiences on the far side of the fail-closed handoff.
+///
+/// The post-mutation failure hands the runtime loop off to the unregister saga
+/// instead of retrying the turn, so the measurable question is whether the
+/// shell is actually retired and whether an ordinary host - one with no mob
+/// provisioner to call a recovery/discard route for it - can rebuild the
+/// session afterwards. Wedging here would be the same class of defect as the
+/// one being fixed, one branch later.
+///
+/// This also measures, rather than assumes, what the still-queued contributor
+/// does on the rebuilt session: that number is the deferred replay this fix
+/// does not close.
+#[tokio::test]
+async fn completed_terminal_then_failed_runtime_completion_retires_the_shell_and_rebuilds() {
+    let store = Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        Arc::clone(&store) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let sid = SessionId::new();
+    let bindings = adapter
+        .prepare_bindings(sid.clone())
+        .await
+        .expect("session runtime bindings should prepare");
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(CompletedTerminalThenFailingExecutor {
+                turn_state: Arc::clone(bindings.turn_state()),
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+
+    let (outcome, handle) = adapter
+        .accept_input_with_completion(&sid, make_prompt("persisted household instruction"))
+        .await
+        .expect("input should be accepted");
+    assert!(outcome.is_accepted());
+    // Kept so the contributor can be read back by identity below. Its
+    // machine-owned stage-attempt count is what makes the "no replay"
+    // assertions final instead of merely early.
+    let contributor_input_id = match &outcome {
+        meerkat_runtime::accept::AcceptOutcome::Accepted { input_id, .. } => input_id.clone(),
+        other => panic!("an accepted input is the premise of this test, got {other:?}"),
+    };
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle
+            .expect("accepted input should carry a completion handle")
+            .wait(),
+    )
+    .await
+    .expect("the caller must be resolved before teardown is observed");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !adapter
+                .session_has_executor(&sid)
+                .await
+                .expect("session_has_executor should resolve")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(
+        "the fail-closed handoff must retire the exact executor; holding it is the wedge this \
+         change exists to remove",
+    );
+
+    // An ordinary host rebuilds by asking for bindings again. There is no mob
+    // provisioner in this shape, so this is the whole recovery affordance.
+    let rebuilt_calls = Arc::new(AtomicUsize::new(0));
+    let rebuilt = Arc::clone(&adapter);
+    let mut last_rebind_error = None;
+    let rebuilt_bindings = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rebuilt.prepare_bindings(sid.clone()).await {
+                Ok(bindings) => break bindings,
+                Err(error) => {
+                    last_rebind_error = Some(error.to_string());
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "an ordinary host must be able to rebind the torn-down session; last error: {last_rebind_error:?}"
+        )
+    });
+    rebuilt
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(CompletedTerminalThenFailingExecutor {
+                turn_state: Arc::clone(rebuilt_bindings.turn_state()),
+                calls: Arc::clone(&rebuilt_calls),
+            }),
+        )
+        .await
+        .expect("a cold host must be able to re-attach an executor");
+
+    // Positive signal, not a sleep. The contributor's own terminal is the fact
+    // that closes the replay window: an input in a terminal lifecycle phase
+    // cannot be staged again, so no later apply can be pending behind this
+    // read. `attempt_count` is the machine's own count of stage attempts, so a
+    // replay cannot hide inside the wait either - restaging would have to move
+    // the input back through `Staged` and leave the count above 1. Waiting on a
+    // clock instead would assert that nothing happened yet, which is not the
+    // same claim and is satisfied by a machine that is merely busy.
+    let contributor = wait_for_input_state_within(
+        &rebuilt,
+        &sid,
+        &contributor_input_id,
+        Duration::from_secs(20),
+        "the already-executed contributor must reach a machine-owned terminal; while it is \
+         non-terminal it is still stageable and no count read here is final",
+        |state| state.seed.phase == meerkat_runtime::InputLifecycleState::Abandoned,
+    )
+    .await;
+    assert_eq!(
+        contributor.seed.attempt_count, 1,
+        "the contributor was staged more than once; the machine's own attempt count is the \
+         witness that the turn whose effects already ran was handed off rather than replayed"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the retired shell must not have retried the turn whose effects already ran"
+    );
+    assert!(
+        rebuilt
+            .list_active_inputs(&sid)
+            .await
+            .expect("the rebuilt session should report its active work")
+            .is_empty(),
+        "the teardown must not leave the already-executed contributor as active work for the \
+         rebuilt session to pick up"
+    );
+    assert_eq!(
+        rebuilt_calls.load(Ordering::SeqCst),
+        0,
+        "the rebuilt session must not re-execute the turn the torn-down shell already ran"
+    );
+}
+
+/// Baseline for the cold-rebuild question the sibling test raises. A session
+/// unregistered through the ordinary public route, with no runtime-loop failure
+/// anywhere near it, behaves the same way under a second `MeerkatMachine` over
+/// the same store. Whatever that behaviour is, it is a property of cold
+/// re-registration and not of the post-mutation teardown routing.
+#[tokio::test]
+async fn cold_rebind_after_plain_unregister_is_the_pre_existing_baseline() {
+    let store = Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new());
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        Arc::clone(&store) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let sid = SessionId::new();
+    adapter
+        .prepare_bindings(sid.clone())
+        .await
+        .expect("session runtime bindings should prepare");
+    adapter
+        .unregister_session(&sid)
+        .await
+        .expect("ordinary unregister should succeed");
+
+    let cold = Arc::new(MeerkatMachine::persistent(
+        Arc::clone(&store) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    assert!(
+        cold.prepare_bindings(sid.clone()).await.is_ok(),
+        "a second host over the same store must be able to bind an unregistered session"
+    );
+    assert!(
+        adapter.prepare_bindings(sid.clone()).await.is_ok(),
+        "the same host must be able to rebind a session it unregistered"
+    );
+}
+
+/// The terminal publication capability a directed input requires. A session
+/// with active directed work refuses to abandon it without one, so a directed
+/// shape cannot be built without recording what is published.
+#[derive(Default)]
+struct RecordingTerminalPublisher {
+    events: std::sync::Mutex<Vec<meerkat_core::event::AgentEvent>>,
+}
+
+impl RecordingTerminalPublisher {
+    fn events(&self) -> Vec<meerkat_core::event::AgentEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::lifecycle::CoreExecutorPublicationHandle for RecordingTerminalPublisher {
+    async fn publish_interaction_terminals(
+        &self,
+        events: &[meerkat_core::event::AgentEvent],
+    ) -> Result<
+        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
+        meerkat_core::lifecycle::core_executor::CoreExecutorError,
+    > {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(events);
+        events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| {
+                meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt::try_new(
+                    event,
+                    index as u64 + 1,
+                )
+            })
+            .collect()
+    }
+}
+
+/// [`CompletedTerminalThenFailingExecutor`] with the publication capability a
+/// directed input needs. Same turn, same failure, same detail.
+struct DirectedCompletedTerminalThenFailingExecutor {
+    turn_state: Arc<dyn meerkat_core::handles::TurnStateHandle>,
+    calls: Arc<AtomicUsize>,
+    publisher: Arc<RecordingTerminalPublisher>,
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::lifecycle::CoreExecutor for DirectedCompletedTerminalThenFailingExecutor {
+    fn publication_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>> {
+        Some(Arc::clone(&self.publisher) as Arc<_>)
+    }
+
+    async fn publish_interaction_terminals(
+        &mut self,
+        events: &[meerkat_core::event::AgentEvent],
+    ) -> Result<
+        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
+        meerkat_core::lifecycle::core_executor::CoreExecutorError,
+    > {
+        meerkat_core::lifecycle::CoreExecutorPublicationHandle::publish_interaction_terminals(
+            self.publisher.as_ref(),
+            events,
+        )
+        .await
+    }
+
+    async fn apply(
+        &mut self,
+        run_id: RunId,
+        _primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+    ) -> Result<
+        meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+        meerkat_core::lifecycle::core_executor::CoreExecutorError,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.turn_state
+            .primitive_applied(run_id.clone())
+            .expect("the runtime loop signals turn start before apply, so the primitive applies");
+        self.turn_state
+            .llm_returned_tool_calls(run_id.clone(), 0)
+            .expect("a zero-tool-call answer must reach the draining boundary");
+        self.turn_state
+            .apply_turn_input(
+                meerkat_core::turn_execution_authority::TurnExecutionInput::BoundaryComplete {
+                    run_id,
+                },
+            )
+            .expect("the completed boundary must reach the machine");
+        Err(
+            meerkat_core::lifecycle::core_executor::CoreExecutorError::apply_failed_runtime_turn(
+                COMPLETED_TERMINAL_FAILURE_DETAIL,
+            ),
+        )
+    }
+
+    async fn cancel_after_boundary(
+        &mut self,
+        _reason: String,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn stop_runtime_executor(
+        &mut self,
+        _reason: String,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        Ok(())
+    }
+}
+
+/// What a DIRECTED caller observes on the post-completion failure class, held
+/// to what the code does rather than to what would be nice.
+///
+/// The two recipient classes do not observe the same thing, and the difference
+/// is not cosmetic. A non-directed waiter is resolved by the failed run itself
+/// and receives `AbandonedWithError` carrying
+/// `TurnTerminalCauseKind::RuntimeApplyFailure` and the executor's own
+/// apply-failure detail (the sibling test above asserts exactly that).
+///
+/// A directed caller receives neither. `failed_run_contributor_disposition`
+/// classifies an ordinary post-turn persistence failure as `Replayed`, so the
+/// contributor is requeued rather than terminalized; the failed-run realization
+/// therefore computes an empty terminal recipient set and stages no interaction
+/// terminal outbox for the run at all. What the directed caller eventually sees
+/// is produced by the teardown that follows, not by the run: the unregister
+/// path stages a runless runtime-termination batch, so the interaction terminal
+/// is `InteractionFailed { reason: Abandoned { detail: "runtime session
+/// unregistered" } }` and the completion waiter resolves `RuntimeTerminated`
+/// with `TurnTerminalCauseKind::FatalFailure`.
+///
+/// The negative assertions are the point. A directed caller keying off the
+/// typed cause cannot distinguish this from any other teardown, and the
+/// operator-facing detail that names the actual failure never reaches it. That
+/// gap is real and is recorded here rather than described as delivered.
+#[tokio::test]
+async fn directed_caller_on_post_completion_failure_observes_teardown_not_the_run_terminal() {
+    let store = Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let publisher = Arc::new(RecordingTerminalPublisher::default());
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        Arc::clone(&store) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let sid = SessionId::new();
+    let bindings = adapter
+        .prepare_bindings(sid.clone())
+        .await
+        .expect("session runtime bindings should prepare");
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(DirectedCompletedTerminalThenFailingExecutor {
+                turn_state: Arc::clone(bindings.turn_state()),
+                calls: Arc::clone(&calls),
+                publisher: Arc::clone(&publisher),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+
+    let interaction_uuid = meerkat_core::time_compat::new_uuid_v7();
+    let input = meerkat_runtime::mob_adapter::create_tracked_flow_step_input(
+        "directed-step",
+        meerkat_core::types::ContentInput::Text("directed household instruction".to_string()),
+        "directed-flow",
+        None,
+        &interaction_uuid.to_string(),
+    )
+    .expect("a tracked flow step is the ordinary directed shape");
+    let input_id = input.id().clone();
+    let (outcome, handle) = adapter
+        .accept_input_with_completion(&sid, input)
+        .await
+        .expect("input should be accepted");
+    assert!(outcome.is_accepted());
+
+    // Generous on purpose: a longer bound can only delay a pass, and the only
+    // way to exceed it is for the directed caller never to be resolved, which
+    // would itself be the wedge.
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(20),
+        handle
+            .expect("accepted directed input should carry a completion handle")
+            .wait(),
+    )
+    .await
+    .expect("a directed caller must be resolved by the teardown; hanging here is a wedge")
+    .expect("completion waiter should resolve");
+
+    match resolved {
+        meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated { reason, error } => {
+            assert_eq!(
+                reason, "runtime session unregistered",
+                "the directed caller is resolved by the teardown, not by the failed run"
+            );
+            assert_eq!(
+                error.kind,
+                meerkat_core::TurnTerminalCauseKind::FatalFailure,
+                "the directed caller does not receive the run's RuntimeApplyFailure cause"
+            );
+            assert!(
+                !reason.contains(COMPLETED_TERMINAL_FAILURE_DETAIL),
+                "the executor's own failure detail does not travel to the directed caller"
+            );
+        }
+        other => panic!(
+            "directed callers observe runtime termination on this class, not a run terminal; got \
+             {other:?}"
+        ),
+    }
+
+    let events = publisher.events();
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one interaction terminal reaches the directed caller, and it comes from the \
+         teardown; got {events:?}"
+    );
+    match &events[0] {
+        meerkat_core::event::AgentEvent::InteractionFailed {
+            reason: meerkat_core::event::InteractionFailureReason::Abandoned { detail },
+            ..
+        } => {
+            assert_eq!(
+                detail, "runtime session unregistered",
+                "the abandonment names the teardown, not the run-boundary persistence failure"
+            );
+            assert!(
+                !detail.contains(COMPLETED_TERMINAL_FAILURE_DETAIL),
+                "no interaction terminal outbox is staged for the failed run, so its detail \
+                 cannot be what the directed caller reads"
+            );
+        }
+        other => panic!("unexpected directed interaction terminal: {other:?}"),
+    }
+
+    let stored = adapter
+        .input_state(&sid, &input_id)
+        .await
+        .expect("the directed input state should load")
+        .expect("the directed input should still be recorded");
+    assert_eq!(
+        stored.seed.attempt_count, 1,
+        "the directed contributor must not have been staged a second time either"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a turn whose effects already ran must not be executed a second time"
     );
 }

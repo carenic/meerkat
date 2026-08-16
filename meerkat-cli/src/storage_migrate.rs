@@ -625,9 +625,11 @@ async fn apply_realm(
                 fence
             }
             Ok((_fence, Err(error))) => {
-                entry
-                    .errors
-                    .push(format!("pre-v0.8.10 bridge failed: {error}"));
+                // Whole-realm preflight refusal: this fires before the first
+                // domain write, so there is no per-domain progress to report.
+                entry.errors.push(format!(
+                    "pre-v0.8.10 bridge refused before any domain was written: {error}"
+                ));
                 return;
             }
             Err(join_error) => {
@@ -640,7 +642,14 @@ async fn apply_realm(
     } else {
         fence
     };
-    if let Some(bridge_report) = bridge_report {
+    // Every domain that committed is reported even when a later domain
+    // refused: each domain owns its own transaction, so durable progress
+    // already landed and a caller who is told nothing happened would be
+    // told a falsehood.
+    let bridge_incomplete = bridge_report
+        .as_ref()
+        .is_some_and(|report| !report.is_complete());
+    if let Some(bridge_report) = bridge_report.as_ref() {
         for database in &bridge_report.inactive_databases {
             entry.notes.push(format!(
                 "pre-v0.8.10 bridge: skipped inactive database {} because the realm manifest's \
@@ -702,13 +711,45 @@ async fn apply_realm(
                 ));
             }
         }
-        if changed == 0 {
+        if changed == 0 && bridge_report.is_complete() {
             entry.notes.push(
                 "pre-v0.8.10 bridge: no domain required pre-floor import; normal strict \
                  migration continued"
                     .to_string(),
             );
         }
+        // Records left behind are surfaced individually, never summarised
+        // away. The domain landed and the realm opens, but this is durable
+        // state the binary now cannot read, and an operator told only "3
+        // domains migrated" would never learn it existed.
+        for (domain, refusal) in bridge_report.records_left_behind() {
+            entry.notes.push(format!(
+                "pre-v0.8.10 bridge: domain '{}' could not carry forward {}: {}. Its bytes are \
+                 untouched on disk - nothing later in this bridge rewrites or retires a record \
+                 it refused - so the realm opens without it and any session that depends on it \
+                 may not resume",
+                domain, refusal.record, refusal.reason
+            ));
+        }
+        for failure in &bridge_report.failures {
+            entry.errors.push(format!(
+                "pre-v0.8.10 bridge: refused domain '{}' in {} ({}): {}",
+                failure.domain,
+                failure.database.display(),
+                failure.refusal.as_str(),
+                failure.detail
+            ));
+        }
+        if bridge_incomplete && changed > 0 {
+            entry.notes.push(format!(
+                "pre-v0.8.10 bridge: {changed} domain(s) above committed durably and are not \
+                 rolled back by the refusals below; re-running the bridge after the refusal is \
+                 resolved resumes from that state"
+            ));
+        }
+    }
+    if bridge_incomplete {
+        return;
     }
 
     // Case 1: normal constructors via the facade bundle (sessions, schedule,

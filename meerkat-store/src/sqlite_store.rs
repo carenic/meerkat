@@ -1260,7 +1260,7 @@ pub fn prepare_pre_0_8_10_session_base_schema(
         [],
     )?;
     tx.execute_batch("DROP TABLE pre_floor_sessions_import")?;
-    Ok(meerkat_sqlite::MaintenancePrepareReport { changed })
+    Ok(meerkat_sqlite::MaintenancePrepareReport::rewrote(changed))
 }
 
 fn verify_released_0_8_10_session_schema(conn: &Connection) -> Result<(), String> {
@@ -1308,6 +1308,7 @@ pub const SESSION_STORE_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::S
     ],
     initialize_current: initialize_current_session_schema,
     allowed_existing_versions: &[1, 2, 3, 4],
+    bridge_recoverable_versions: &[1],
     released_predecessors: &[
         meerkat_sqlite::SchemaPredecessor {
             version: 1,
@@ -9028,6 +9029,22 @@ mod tests {
         let path = dir.path().join("sessions.sqlite3");
         let store = SqliteSessionStore::open(&path).unwrap();
         (dir, store)
+    }
+
+    /// The durable-writer invariant for the session store, asserted through
+    /// the constructor every surface calls. Read back over a connection the
+    /// store did not configure, because journal mode belongs to the file: a
+    /// rollback-journal session database would take a database-wide
+    /// EXCLUSIVE lock for every write.
+    #[test]
+    fn production_session_store_open_leaves_the_database_in_wal() {
+        let (_dir, store) = temp_store();
+        let conn = meerkat_sqlite::open(store.path(), meerkat_sqlite::ConnectionProfile::ReadOnly)
+            .expect("read-only reopen");
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("journal_mode");
+        assert_eq!(mode, "wal");
     }
 
     #[test]

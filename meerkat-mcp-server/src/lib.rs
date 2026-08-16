@@ -5676,6 +5676,18 @@ mod tests {
         .await;
     }
 
+    /// The bound on a resume that must not re-enter the registration lock.
+    ///
+    /// These tests assert a structural property: the property either holds and
+    /// the resume completes in milliseconds, or it does not and the resume
+    /// never completes at all. The timeout exists only so a re-entrant lock
+    /// fails the test instead of hanging the run forever, so it wants to be
+    /// generous rather than tight. A tight bound measures how loaded the box
+    /// is, which is a different question - at three seconds these failed under
+    /// a full-workspace run on a machine that was also compiling, and passed
+    /// in 0.13s standalone, which says nothing about locking either way.
+    const NO_DEADLOCK_BOUND: Duration = Duration::from_secs(60);
+
     fn bounded_resume_input(session_id: String, tools: Vec<McpToolDef>) -> MeerkatResumeInput {
         MeerkatResumeInput {
             session_id,
@@ -5751,7 +5763,7 @@ mod tests {
     async fn resume_success_path_without_tools_does_not_reenter_registration_lock() {
         let (state, session_id) = state_with_persisted_session().await;
         let result = tokio::time::timeout(
-            Duration::from_secs(3),
+            NO_DEADLOCK_BOUND,
             Box::pin(handle_meerkat_resume(
                 &state,
                 bounded_resume_input(session_id, vec![]),
@@ -5780,7 +5792,7 @@ mod tests {
         input.system_prompt = Some("cold turn system".to_string());
 
         let result = tokio::time::timeout(
-            Duration::from_secs(3),
+            NO_DEADLOCK_BOUND,
             Box::pin(handle_meerkat_resume(&state, input, None, None)),
         )
         .await
@@ -6029,7 +6041,7 @@ mod tests {
             handler: Some("callback".to_string()),
         };
         let result = tokio::time::timeout(
-            Duration::from_secs(3),
+            NO_DEADLOCK_BOUND,
             Box::pin(handle_meerkat_resume(
                 &state,
                 bounded_resume_input(session_id.clone(), vec![callback]),
@@ -6062,7 +6074,7 @@ mod tests {
         );
 
         let empty_resume = tokio::time::timeout(
-            Duration::from_secs(3),
+            NO_DEADLOCK_BOUND,
             Box::pin(handle_meerkat_resume(
                 &state,
                 bounded_resume_input(session_id.clone(), vec![]),
@@ -6129,7 +6141,7 @@ mod tests {
         let state = MeerkatMcpState::new_with_store(store).await;
         let missing = meerkat::SessionId::new();
         let result = tokio::time::timeout(
-            Duration::from_secs(3),
+            NO_DEADLOCK_BOUND,
             Box::pin(handle_meerkat_resume(
                 &state,
                 bounded_resume_input(missing.to_string(), vec![]),
@@ -6156,7 +6168,7 @@ mod tests {
         .await;
 
         tokio::time::timeout(
-            Duration::from_secs(3),
+            NO_DEADLOCK_BOUND,
             state.cleanup_archived_session_runtime(&session_id),
         )
         .await

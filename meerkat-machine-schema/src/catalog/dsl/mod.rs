@@ -1293,6 +1293,10 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 &["AlreadyRegistered", "MaxConcurrentExceeded"],
             ),
             NamedTypeBinding::string_enum(
+                "SessionRegistrationRejectReasonKind",
+                &["RuntimeEpochConflict"],
+            ),
+            NamedTypeBinding::string_enum(
                 "OperationPublicResultClass",
                 &[
                     "MissingAuthority",
@@ -1403,6 +1407,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "Destroyed",
                     "Cancelled",
                     "MaxAttemptsExhausted",
+                    "NeverExecuted",
                 ],
             ),
             NamedTypeBinding::string_enum("InputLane", &["Queue", "Steer"]),
@@ -2526,6 +2531,7 @@ runtime_internal_inputs!(
         ResolveMobEventStreamClose,
         ResolveSessionEventStreamClose,
         ResolveStagedRollback,
+        ResolveUnstageableQueuedInput,
         RetireCompletedOp,
         RetireRequestedOp,
         RetryRequested,
@@ -3078,6 +3084,7 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
                     TypePathStructField::named("name", "PeerName"),
                 ],
             ),
+            NamedTypeBinding::string_enum("FlowNodeFailurePolicy", &["Escalate", "Continue"]),
             NamedTypeBinding::string("FlowNodeId"),
             NamedTypeBinding::string_enum("FlowNodeKind", &["Step", "Loop"]),
             NamedTypeBinding::string_enum(

@@ -54,13 +54,55 @@ AgentErrorClass = str
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
+class ProviderTokenAccounting:
+    """Provider-authored attribution and normalized input total for one call.
+
+    ``provider`` and ``model`` name the resolved model the request was actually
+    lowered to, so one ``turn_completed`` event attributes its own cost without
+    a join against session metadata.
+
+    ``presented_tokens`` is the provider-normalized input presented to the
+    model for that one call. It is the value to sum across turns;
+    ``Usage.input_tokens`` is not (see :class:`Usage`).
+    """
+
+    provider: str
+    model: str
+    presented_tokens: int
+    convention: str
+    aggregation: str
+
+
+@dataclass(frozen=True, slots=True)
 class Usage:
-    """Token usage for a single LLM turn."""
+    """Token usage.
+
+    The same shape carries two different denominators:
+
+    * Per-call (``turn_completed.usage``): raw provider counters for one
+      request, plus ``accounting``. For Anthropic ``input_tokens`` is the
+      *uncached* input only, with cache-write/cache-read input in the separate
+      cache fields; the normalized presented input is
+      ``accounting.presented_tokens``.
+    * Cumulative (``run_completed.usage``, ``RunResult.usage``): a
+      *session*-cumulative total whose ``input_tokens`` is already the sum of
+      each recorded call's presented tokens, whose cache fields are always
+      ``None``, and which carries no ``accounting`` because a session may span
+      providers and models. It is persisted with the session, so on the second
+      run of a session it already contains the first run's calls.
+
+    Do not sum the cumulative value with anything - take the latest one - and do
+    not sum per-call ``input_tokens`` (that undercounts on cache-heavy Anthropic
+    sessions); sum ``accounting.presented_tokens`` instead. The per-call rows
+    cover only the calls that closed a run, so they do not reconcile with the
+    cumulative total. See ``docs/reference/usage-accounting.mdx``.
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
     cache_creation_tokens: int | None = None
     cache_read_tokens: int | None = None
+    accounting: ProviderTokenAccounting | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +718,30 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _parse_accounting(raw: Any) -> ProviderTokenAccounting | None:
+    """Parse per-call model attribution.
+
+    Absent on cumulative usage and on rows written before 0.8.22, so ``None``
+    is a legitimate answer; a present-but-malformed object is rejected.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("usage.accounting must be object")
+    for field_name in ("provider", "model", "convention", "aggregation"):
+        if not isinstance(raw.get(field_name), str):
+            raise ValueError(f"usage.accounting.{field_name} must be string")
+    if not _is_number(raw.get("presented_tokens")):
+        raise ValueError("usage.accounting.presented_tokens must be number")
+    return ProviderTokenAccounting(
+        provider=raw["provider"],
+        model=raw["model"],
+        presented_tokens=raw["presented_tokens"],
+        convention=raw["convention"],
+        aggregation=raw["aggregation"],
+    )
+
+
 def _parse_usage(raw: dict[str, Any] | None) -> Usage:
     if not isinstance(raw, dict):
         raise ValueError("missing usage")
@@ -692,6 +758,7 @@ def _parse_usage(raw: dict[str, Any] | None) -> Usage:
         output_tokens=raw["output_tokens"],
         cache_creation_tokens=raw.get("cache_creation_tokens"),
         cache_read_tokens=raw.get("cache_read_tokens"),
+        accounting=_parse_accounting(raw.get("accounting")),
     )
 
 

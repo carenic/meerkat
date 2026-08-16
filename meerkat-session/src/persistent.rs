@@ -1457,7 +1457,7 @@ impl StoreCheckpointer {
             })?
             .clone()
             .ok_or_else(|| {
-                AgentError::InternalError(format!(
+                AgentError::session_durable_projection_authority_unknown(format!(
                     "WholeBlob actor for session {} has no exact materialization authority; live actor reload required",
                     session.id()
                 ))
@@ -1490,16 +1490,23 @@ impl StoreCheckpointer {
                 ))
             })?
             .ok_or_else(|| {
-                AgentError::InternalError(format!(
+                AgentError::session_durable_projection_authority_unknown(format!(
                     "committed WholeBlob authority disappeared before provisional checkpoint of session {}; live actor reload required",
                     session.id()
                 ))
             })?;
         if observed_authority != committed_authority {
-            return Err(AgentError::InternalError(format!(
-                "WholeBlob committed authority advanced beyond the live actor base for session {}; live actor reload required",
-                session.id()
-            )));
+            // Say what the comparison proves. Inequality covers a committed
+            // authority that moved ahead, one that regressed, and one at the
+            // same revision carrying a different blob digest. An operator
+            // weighing data loss must not read "advanced beyond" into the last
+            // two.
+            return Err(AgentError::session_durable_projection_authority_unknown(
+                format!(
+                    "WholeBlob committed authority differs from the live actor base for session {}; live actor reload required",
+                    session.id()
+                ),
+            ));
         }
         // The checkpointer owns a mutable live Session. Externalize the same
         // actor state in place (as the HeadCanonical path already does), then
@@ -2139,20 +2146,27 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
     ) -> Result<Option<RunCheckpointReceipt>, AgentError> {
         let guard = self.gate.cancelled.lock().await;
         if *guard {
+            // The run tail was never attempted, so the durable projection and
+            // the live actor can no longer be proved to be one image. That is
+            // the teardown-required class, not an ordinary internal error: the
+            // runtime must be handed the live executor so the shell is retired
+            // and the next registration cold-loads a fresh one.
             return match self.runtime_store.session_persistence_profile() {
                 RuntimeSessionPersistenceProfile::WholeBlobV1
-                | RuntimeSessionPersistenceProfile::HeadCanonicalV1 => {
-                    Err(AgentError::InternalError(format!(
+                | RuntimeSessionPersistenceProfile::HeadCanonicalV1 => Err(
+                    AgentError::session_durable_projection_authority_unknown(format!(
                         "checkpoint gate is cancelled for session {}; the required provisional \
                          run tail was not attempted; live actor reload required",
                         session.id()
-                    )))
-                }
-                profile => Err(AgentError::InternalError(format!(
-                    "checkpoint gate is cancelled for session {} under unsupported runtime \
-                     persistence profile {profile}; live actor reload required",
-                    session.id()
-                ))),
+                    )),
+                ),
+                profile => Err(AgentError::session_durable_projection_authority_unknown(
+                    format!(
+                        "checkpoint gate is cancelled for session {} under unsupported runtime \
+                         persistence profile {profile}; live actor reload required",
+                        session.id()
+                    ),
+                )),
             };
         }
         let result = match self.runtime_store.session_persistence_profile() {
@@ -11528,6 +11542,153 @@ mod tests {
             }
             other => panic!("expected machine-owned exact-interrupt refusal, got {other:?}"),
         }
+    }
+
+    /// The three WholeBlob checkpoint refusals below all say "live actor reload
+    /// required", and the runtime can only honour that by tearing the live
+    /// executor down. Reported as `InternalError` they were indistinguishable
+    /// from an ordinary apply failure, whose contributors are released back to
+    /// the work lane for a replay the durable projection cannot be proved to
+    /// need. The typed family is what the runtime keys teardown off.
+    async fn whole_blob_checkpointer_fixture() -> (Arc<dyn RuntimeStore>, Session, StoreCheckpointer)
+    {
+        let runtime_store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+        let session = Session::new();
+        let runtime_id = LogicalRuntimeId::for_session(session.id());
+        let artifact = session
+            .to_persisted_artifact()
+            .expect("encode initial WholeBlob session");
+        runtime_store
+            .commit_session_snapshot(
+                &runtime_id,
+                SerializedSessionSnapshot {
+                    session_snapshot: artifact.bytes_arc(),
+                },
+            )
+            .await
+            .expect("commit initial WholeBlob authority");
+        let authority = runtime_store
+            .load_whole_blob_store_authority(&runtime_id)
+            .await
+            .expect("load initial WholeBlob authority")
+            .expect("initial WholeBlob authority should exist");
+        let checkpointer = StoreCheckpointer {
+            runtime_store: Arc::clone(&runtime_store),
+            incremental: None,
+            blob_store: memory_blob_store(),
+            gate: Arc::new(CheckpointerGate {
+                cancelled: Mutex::new(false),
+            }),
+            whole_blob_base_authority: std::sync::Mutex::new(Some(authority)),
+            latest_run_checkpoint_receipt: Mutex::new(None),
+        };
+        (runtime_store, session, checkpointer)
+    }
+
+    fn assert_teardown_required_projection_authority(error: AgentError, expected_message: &str) {
+        assert!(
+            error.requires_session_teardown(),
+            "a checkpoint that demands a live actor reload must survive the surface cleanup \
+             wrappers so the runtime can hand its executor to teardown, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains(expected_message),
+            "expected {expected_message:?} in {error}"
+        );
+        match meerkat_core::lifecycle::core_executor::CoreExecutorError::apply_failed_from_session_error(
+            meerkat_core::service::SessionError::Agent(error),
+        ) {
+            meerkat_core::lifecycle::core_executor::CoreExecutorError::TeardownRequired {
+                reason,
+                ..
+            } => assert_eq!(
+                reason,
+                meerkat_core::lifecycle::core_executor::CoreExecutorTeardownReason::DurableProjectionAuthorityUnknown,
+            ),
+            other => panic!("expected a typed durable-projection teardown, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_checkpoint_gate_reports_a_teardown_required_projection_authority() {
+        let (_runtime_store, mut session, checkpointer) = whole_blob_checkpointer_fixture().await;
+        *checkpointer.gate.cancelled.lock().await = true;
+
+        let error = meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &RunId::new(),
+            None,
+        )
+        .await
+        .expect_err("a cancelled gate must refuse the run tail");
+        assert_teardown_required_projection_authority(
+            error,
+            "the required provisional run tail was not attempted",
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_whole_blob_base_authority_reports_a_teardown_required_projection_authority() {
+        let (_runtime_store, mut session, checkpointer) = whole_blob_checkpointer_fixture().await;
+        *checkpointer
+            .whole_blob_base_authority
+            .lock()
+            .expect("checkpointer authority lock") = None;
+
+        let error = meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &RunId::new(),
+            None,
+        )
+        .await
+        .expect_err("an actor with no materialization authority must refuse the checkpoint");
+        assert_teardown_required_projection_authority(
+            error,
+            "has no exact materialization authority",
+        );
+    }
+
+    /// The committed-authority comparison is `!=`, which proves the two images
+    /// differ. It does not prove the committed one moved ahead: a regression, or
+    /// a same-revision row carrying a different blob digest, prints the same
+    /// sentence, and an operator reads that sentence to judge data loss.
+    #[tokio::test]
+    async fn divergent_committed_whole_blob_authority_reports_what_the_comparison_proves() {
+        let (runtime_store, session, checkpointer) = whole_blob_checkpointer_fixture().await;
+        let runtime_id = LogicalRuntimeId::for_session(session.id());
+        let mut successor = session;
+        successor.push(Message::User(UserMessage::text(
+            "committed successor the live actor never observed".to_string(),
+        )));
+        let successor_artifact = successor
+            .to_persisted_artifact()
+            .expect("encode successor WholeBlob session");
+        runtime_store
+            .commit_session_snapshot(
+                &runtime_id,
+                SerializedSessionSnapshot {
+                    session_snapshot: successor_artifact.bytes_arc(),
+                },
+            )
+            .await
+            .expect("commit successor WholeBlob authority");
+
+        let mut live = successor;
+        let error = meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut live,
+            &RunId::new(),
+            None,
+        )
+        .await
+        .expect_err("a stale actor base must refuse the checkpoint");
+        assert!(
+            !error.to_string().contains("advanced beyond"),
+            "the message must not claim an ordering the comparison never established: {error}"
+        );
+        assert_teardown_required_projection_authority(error, "differs from the live actor base");
     }
 
     #[tokio::test]

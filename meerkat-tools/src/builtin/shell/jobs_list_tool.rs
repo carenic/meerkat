@@ -51,6 +51,11 @@ impl BuiltinTool for ShellJobsListTool {
         false
     }
 
+    /// Job-registry read.
+    fn mutation_class(&self) -> meerkat_core::ToolMutationClass {
+        meerkat_core::ToolMutationClass::ReadOnly
+    }
+
     async fn call(&self, _args: Value) -> Result<ToolOutput, BuiltinToolError> {
         let jobs = self
             .job_manager

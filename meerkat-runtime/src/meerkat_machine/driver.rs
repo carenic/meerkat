@@ -1329,6 +1329,10 @@ impl DriverEntry {
         let owner_session_id = outbox.owner_session_id.to_string();
         let session_matches = state.session_id.as_ref().map(|value| value.0.as_str())
             == Some(owner_session_id.as_str());
+        // Placement-only, matching the generated adoption guard
+        // `current_runtime_binding_consistent`: a registered-unplaced shell
+        // (entry epoch present, no placement) is the ordinary recovery shape,
+        // so the retained entry epoch must not disqualify it.
         let unbound_recovery_shell = matches!(
             state.lifecycle_phase,
             crate::meerkat_machine::dsl::MeerkatPhase::Idle
@@ -1336,8 +1340,7 @@ impl DriverEntry {
                 | crate::meerkat_machine::dsl::MeerkatPhase::Stopped
         ) && state.active_runtime_id.is_none()
             && state.active_fence_token.is_none()
-            && state.active_runtime_generation.is_none()
-            && state.active_runtime_epoch_id.is_none();
+            && state.active_runtime_generation.is_none();
         session_matches
             && (unbound_recovery_shell
                 || (state
@@ -3630,14 +3633,6 @@ impl DriverEntry {
         }
     }
 
-    /// Check and clear the wake flag (backward-compat wrapper).
-    pub(crate) fn take_wake_requested(&mut self) -> bool {
-        match self {
-            DriverEntry::Ephemeral(d) => d.take_wake_requested(),
-            DriverEntry::Persistent(d) => d.take_wake_requested(),
-        }
-    }
-
     pub(crate) fn hydrate_authorized_batch(
         &mut self,
         batch: &AuthorizedRuntimeLoopBatch,
@@ -3861,6 +3856,13 @@ impl DriverEntry {
         }
     }
 
+    pub(crate) fn has_queued_input_in_any_lane(&self) -> bool {
+        match self {
+            DriverEntry::Ephemeral(d) => d.has_queued_input_in_any_lane(),
+            DriverEntry::Persistent(d) => d.has_queued_input_in_any_lane(),
+        }
+    }
+
     pub(crate) fn defer_queued_inputs_behind_backlog(
         &mut self,
         input_ids: &[InputId],
@@ -3924,7 +3926,7 @@ impl DriverEntry {
             replay_plan,
             terminal_error,
             runtime_apply_failure,
-            recoverable,
+            contributor_disposition,
             applied_commit,
         } = realization;
         let checkpoint = self.begin_terminal_transition("failed_run_terminal_realization")?;
@@ -3933,7 +3935,7 @@ impl DriverEntry {
             &run_id,
             &contributing_input_ids,
             &replay_plan,
-            recoverable,
+            contributor_disposition,
         ) {
             return Err(self.fail_terminal_transition(checkpoint, "failed_run_realization", error));
         }
@@ -3985,13 +3987,14 @@ impl DriverEntry {
             ));
         }
 
-        // A recoverable failed run normally requeues its contributors, but the
+        // A replayed failed run normally requeues its contributors, but the
         // generated rollback transition can terminalize the exact inputs whose
-        // stage-attempt budget was exhausted. Only directed members own
-        // Interaction rows, but the owner row retains the complete terminal
-        // recipient set so one generated completion finalizes directed and
-        // non-directed inputs together.
-        if recoverable && !terminal_input_ids.is_empty() {
+        // stage-attempt budget was exhausted, and a never-started run
+        // terminalizes all of them. Only directed members own Interaction rows,
+        // but the owner row retains the complete terminal recipient set so one
+        // generated completion finalizes directed and non-directed inputs
+        // together.
+        if contributor_disposition.owes_terminal_outboxes() && !terminal_input_ids.is_empty() {
             let outboxes = match authorized_staged_directed_terminal_outboxes(
                 self,
                 InteractionTerminalBatchScope::Run(&run_id),
@@ -4030,7 +4033,7 @@ impl DriverEntry {
                         replay_plan,
                         terminal_error,
                         runtime_apply_failure,
-                        recoverable,
+                        contributor_disposition,
                         applied_commit,
                     })
                     .await
@@ -4167,6 +4170,19 @@ impl DriverEntry {
         match self {
             DriverEntry::Ephemeral(d) => d.rollback_staged(input_ids),
             DriverEntry::Persistent(d) => d.rollback_staged(input_ids),
+        }
+    }
+
+    /// Resolve queued inputs the generated staging authority refused, returning
+    /// the inputs the machine terminalized. The persistent arm commits the
+    /// machine's disposition durably before returning it.
+    pub(crate) async fn resolve_unstageable_queued_inputs(
+        &mut self,
+        input_ids: &[InputId],
+    ) -> Result<Vec<InputId>, crate::traits::RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.resolve_unstageable_queued_inputs(input_ids),
+            DriverEntry::Persistent(d) => d.resolve_unstageable_queued_inputs(input_ids).await,
         }
     }
 
@@ -4663,6 +4679,48 @@ pub(crate) struct MachineTerminalAppliedCommit {
     pub(crate) owner_session_id: SessionId,
 }
 
+/// What becomes of a failed run's staged contributors.
+///
+/// A failed run does not imply one answer for its inputs, and the answer is a
+/// semantic fact about the failure rather than something to reconstruct from a
+/// bool at the persistence boundary. It travels with the realization so the
+/// contributor transition lands inside the same machine realization - and, on
+/// the persistent driver, the same store commit - as the run terminal itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailedRunContributorDisposition {
+    /// The run reached a machine-owned terminal after mutating the session, so
+    /// its contributors were applied and are consumed.
+    Consumed,
+    /// The executor gave a received answer and nothing is in flight, so
+    /// replaying repeats nothing. The machine's staged-rollback resolution
+    /// decides per input whether that means the work lane or the retry cap.
+    Replayed,
+    /// The run never began executing and the loop dropped an `apply` whose
+    /// in-flight fate it cannot observe. A contributor returned to its lane
+    /// here could be executed a second time by a consumer that drains late,
+    /// and for a household instruction that means an action taken twice. The
+    /// machine terminalizes the contributors instead: refuse the release
+    /// rather than risk it.
+    Terminalized,
+}
+
+impl FailedRunContributorDisposition {
+    /// Whether the failed-run realization still owes its contributors a staged
+    /// terminal outbox. The machine-terminal path staged one before this point;
+    /// the other two did not.
+    pub(crate) fn owes_terminal_outboxes(self) -> bool {
+        matches!(self, Self::Replayed | Self::Terminalized)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Consumed => "Consumed",
+            Self::Replayed => "Replayed",
+            Self::Terminalized => "Terminalized",
+        }
+    }
+}
+
 /// Complete mechanical payload for realizing a machine-authorized failed run.
 ///
 /// The runtime-loop owner assembles this only after the generated authority has
@@ -4675,7 +4733,7 @@ pub(crate) struct MachineRunFailureRealization {
     pub(crate) replay_plan: crate::driver::ephemeral::ReplayQueuedContributorsPlan,
     pub(crate) terminal_error: String,
     pub(crate) runtime_apply_failure: Option<CoreApplyFailureCause>,
-    pub(crate) recoverable: bool,
+    pub(crate) contributor_disposition: FailedRunContributorDisposition,
     pub(crate) applied_commit: Option<MachineTerminalAppliedCommit>,
 }
 
@@ -6261,28 +6319,38 @@ pub(crate) fn runtime_authority_reconcile_decision_for_observation(
     runtime_authority_reconcile_decision(kind, decoded)
 }
 
+/// Re-register a converged durable row as a fresh in-process authority.
+///
+/// The recovered row's own epoch (if any) belonged to the dead process; this
+/// registration installs the epoch of the entry being built, which is why the
+/// caller must supply it.
 pub(crate) fn registered_runtime_authority_from_converged_record(
     session_id: &SessionId,
+    runtime_epoch_id: &meerkat_core::RuntimeEpochId,
     record: &crate::store::DecodedMachineLifecycleObservation,
 ) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
     registered_runtime_authority_from_converged_record_id(
         &crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
+        &crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(runtime_epoch_id),
         record,
     )
 }
 
 fn registered_runtime_authority_from_converged_record_id(
     session_id: &crate::meerkat_machine::dsl::SessionId,
+    runtime_epoch_id: &crate::meerkat_machine::dsl::RuntimeEpochId,
     record: &crate::store::DecodedMachineLifecycleObservation,
 ) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
-    let mut authority =
-        crate::meerkat_machine::dsl_authority::new_registered_authority_id(session_id.clone())
-            .map_err(|error| {
-                RuntimeDriverError::Internal(crate::meerkat_machine::dsl_authority::map_error(
-                    error,
-                    "fresh cold runtime registration",
-                ))
-            })?;
+    let mut authority = crate::meerkat_machine::dsl_authority::new_registered_authority_id(
+        session_id.clone(),
+        runtime_epoch_id.clone(),
+    )
+    .map_err(|error| {
+        RuntimeDriverError::Internal(crate::meerkat_machine::dsl_authority::map_error(
+            error,
+            "fresh cold runtime registration",
+        ))
+    })?;
     crate::meerkat_machine::dsl_authority::recover_supervisor_authority_snapshot(
         &mut authority,
         record.supervisor_authority().clone(),
@@ -6310,11 +6378,13 @@ pub(crate) async fn reconcile_runtime_authority_for_cold_recovery(
     store: &dyn crate::store::RuntimeStore,
     runtime_id: &LogicalRuntimeId,
     session_id: &SessionId,
+    runtime_epoch_id: &meerkat_core::RuntimeEpochId,
 ) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
     reconcile_runtime_authority_for_cold_recovery_id(
         store,
         runtime_id,
         &crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
+        &crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(runtime_epoch_id),
     )
     .await
 }
@@ -6323,6 +6393,7 @@ async fn reconcile_runtime_authority_for_cold_recovery_id(
     store: &dyn crate::store::RuntimeStore,
     runtime_id: &LogicalRuntimeId,
     session_id: &crate::meerkat_machine::dsl::SessionId,
+    runtime_epoch_id: &crate::meerkat_machine::dsl::RuntimeEpochId,
 ) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
     loop {
         let observed = match store.observe_machine_lifecycle(runtime_id).await {
@@ -6363,7 +6434,11 @@ async fn reconcile_runtime_authority_for_cold_recovery_id(
                         "runtime-authority classifier converged a non-decoded row".to_string(),
                     ));
                 };
-                return registered_runtime_authority_from_converged_record_id(session_id, &record);
+                return registered_runtime_authority_from_converged_record_id(
+                    session_id,
+                    runtime_epoch_id,
+                    &record,
+                );
             }
             crate::meerkat_machine::dsl::RuntimeAuthorityReconcileDecision::NormalizeOrReplace => {
                 let expected = match observed.version() {
@@ -6448,8 +6523,15 @@ pub(crate) async fn machine_recover_persistent_driver(
     driver: &mut crate::driver::ephemeral::EphemeralRuntimeDriver,
 ) -> Result<RecoveryReport, RuntimeDriverError> {
     let session_id = driver.session_authority_id_for_recovery();
-    let reconciled =
-        reconcile_runtime_authority_for_cold_recovery_id(store, runtime_id, &session_id).await?;
+    let reconciled = reconcile_runtime_authority_for_cold_recovery_id(
+        store,
+        runtime_id,
+        &session_id,
+        &crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(
+            &meerkat_core::RuntimeEpochId::new(),
+        ),
+    )
+    .await?;
     let recovered_unregister_progress = reconciled.unregister_progress;
     driver.replace_runtime_authority(reconciled.authority);
 
@@ -7196,11 +7278,35 @@ pub(crate) async fn machine_recycle_preserving_work(
     }
 }
 
+/// What happened when the runtime loop asked the machine to turn an authorized
+/// batch into a run.
+///
+/// `StageRefused` is NOT a loop-stopping failure: the generated authority
+/// declined to stage an accepted, queued batch, every member has been resolved
+/// through machine authority (deferred behind the backlog for another attempt,
+/// or terminalized at the retry cap), and the run has been returned. The caller
+/// must keep draining - the field class this variant closes is a fifo head the
+/// machine refuses forever while the wake is dropped, which starved every input
+/// behind it (0.8.22, two household members down ~4h).
+///
+/// `#[must_use]`: discarding the outcome silently accepts a refusal where the
+/// caller believes it staged, which is exactly what two test fixtures did when
+/// this was a bare `Result<(), _>` whose `Err` they unwrapped.
+#[must_use]
+#[derive(Debug)]
+pub(crate) enum RuntimeLoopBatchStart {
+    Started,
+    StageRefused {
+        reason: String,
+        abandoned_input_ids: Vec<InputId>,
+    },
+}
+
 pub(crate) async fn prepare_runtime_loop_batch_start(
     driver: &SharedDriver,
     run_id: RunId,
     batch: AuthorizedRuntimeLoopBatch,
-) -> Result<(), RuntimeDriverError> {
+) -> Result<RuntimeLoopBatchStart, RuntimeDriverError> {
     let mut driver = driver.lock().await;
     let staged_ids = batch.input_ids().to_vec();
     let stage_source = batch.source();
@@ -7208,17 +7314,57 @@ pub(crate) async fn prepare_runtime_loop_batch_start(
         RuntimeDriverError::Internal(format!("failed to start runtime run: {err}"))
     })?;
 
-    let stage_result = machine_authorize_stage_for_run(&driver, &run_id, &staged_ids, stage_source)
-        .ok_or_else(|| {
-            RuntimeDriverError::Internal(format!(
+    let stage_authority = match machine_authorize_stage_for_run(
+        &driver,
+        &run_id,
+        &staged_ids,
+        stage_source,
+    ) {
+        Some(stage_authority) => stage_authority,
+        None => {
+            let reason = format!(
                 "generated machine did not authorize StageForRun for run {run_id:?} and inputs {staged_ids:?}"
-            ))
-        })
-        .and_then(|stage_authority| {
-            driver.machine_realize_authorized_stage_batch(stage_authority)
-        });
+            );
+            // Count the refusal and let the machine decide the disposition
+            // BEFORE returning the run: an uncounted refusal never reaches
+            // the max-attempts valve, so the input would be re-selected as
+            // the fifo head on every later wake forever.
+            //
+            // The disposition is applied to the WHOLE batch, mirroring the
+            // existing whole-batch `ResolveStagedRollback` idiom: every still
+            // queued member accrues an attempt and is re-minted behind the
+            // backlog together, so at the retry cap the whole batch
+            // terminalizes rather than only the culpable member. Blast radius
+            // is therefore the batch size (`select_queue_batch` does batch
+            // multiple non-prompt inputs). Accepted deliberately: a per-input
+            // refusal probe cannot attribute a batch-level refusal to any
+            // single member, so it would need a whole-batch fallback anyway -
+            // a second, untested path through the never-starve floor.
+            let abandoned_input_ids = driver
+                    .resolve_unstageable_queued_inputs(&staged_ids)
+                    .await
+                    .map_err(|resolve_err| {
+                        RuntimeDriverError::Internal(format!(
+                            "failed to resolve unstageable queued inputs: {resolve_err}; staging refusal: {reason}"
+                        ))
+                    })?;
+            if let Err(rollback_err) = machine_apply_run_return_projection(
+                &mut driver,
+                &run_id,
+                RunReturnDisposition::Rollback,
+            ) {
+                return Err(RuntimeDriverError::Internal(format!(
+                    "failed to roll back runtime run after batch staging refusal: {rollback_err}; staging refusal: {reason}"
+                )));
+            }
+            return Ok(RuntimeLoopBatchStart::StageRefused {
+                reason,
+                abandoned_input_ids,
+            });
+        }
+    };
 
-    if let Err(err) = stage_result {
+    if let Err(err) = driver.machine_realize_authorized_stage_batch(stage_authority) {
         let _ = driver.rollback_staged(&staged_ids);
         if let Err(rollback_err) = machine_apply_run_return_projection(
             &mut driver,
@@ -7257,7 +7403,7 @@ pub(crate) async fn prepare_runtime_loop_batch_start(
         }
     }
 
-    Ok(())
+    Ok(RuntimeLoopBatchStart::Started)
 }
 
 /// Validate the committed boundary witness.
@@ -7707,15 +7853,16 @@ pub(crate) fn machine_resolve_pre_resolved_runtime_completion_result(
     let dsl_run_id = run_id.map(crate::meerkat_machine::dsl::RunId::from_domain);
     let session_id = SessionId::new();
     let dsl_session_id = crate::meerkat_machine::dsl::SessionId::from_domain(&session_id);
-    let mut authority = crate::meerkat_machine::dsl_authority::new_registered_authority(
-        &session_id,
-    )
-    .map_err(|error| RuntimeDriverError::ValidationFailed {
-        reason: crate::meerkat_machine::dsl_authority::map_error(
-            error,
-            "fresh pre-resolved completion authority",
-        ),
-    })?;
+    let mut authority =
+        crate::meerkat_machine::dsl_authority::new_registered_authority_without_runtime_entry(
+            &session_id,
+        )
+        .map_err(|error| RuntimeDriverError::ValidationFailed {
+            reason: crate::meerkat_machine::dsl_authority::map_error(
+                error,
+                "fresh pre-resolved completion authority",
+            ),
+        })?;
 
     if let Some(run_id) = dsl_run_id.clone() {
         apply_runtime_completion_authority_preview(
@@ -7866,10 +8013,18 @@ pub(crate) async fn machine_resolve_runtime_terminated_completion_result(
     )
 }
 
+/// Terminalize a failed runtime-loop run, disposing of its staged contributors
+/// as the caller's typed disposition says.
+///
+/// The disposition is the caller's because only the runtime loop knows whether
+/// the executor answered (nothing in flight, replay repeats nothing) or whether
+/// the loop concluded non-progress and dropped an `apply` whose fate it cannot
+/// observe (replay could execute the instruction twice).
 pub(crate) async fn fail_runtime_loop_run(
     driver: &SharedDriver,
     run_id: RunId,
     failure: CoreApplyFailureCause,
+    contributor_disposition: FailedRunContributorDisposition,
 ) -> Result<(), RuntimeLoopRunFailError> {
     fail_runtime_loop_run_inner(
         driver,
@@ -7880,6 +8035,7 @@ pub(crate) async fn fail_runtime_loop_run(
             machine_terminal_failure_observed: false,
             machine_terminal_error: None,
             terminal_failure_source: None,
+            contributor_disposition,
             applied_terminal: None,
         },
     )
@@ -7893,6 +8049,11 @@ pub(crate) async fn fail_machine_run(
     run_id: RunId,
     failure: super::MeerkatMachineRunFailure,
 ) -> Result<(), RuntimeLoopRunFailError> {
+    let contributor_disposition = if failure.machine_terminal_failure_observed {
+        FailedRunContributorDisposition::Consumed
+    } else {
+        FailedRunContributorDisposition::Replayed
+    };
     fail_runtime_loop_run_inner(
         driver,
         run_id,
@@ -7902,6 +8063,7 @@ pub(crate) async fn fail_machine_run(
             machine_terminal_failure_observed: failure.machine_terminal_failure_observed,
             machine_terminal_error: failure.machine_terminal_error,
             terminal_failure_source: failure.source,
+            contributor_disposition,
             applied_terminal: None,
         },
     )
@@ -7925,6 +8087,7 @@ pub(crate) async fn commit_machine_terminal_run(
             machine_terminal_failure_observed: failure.machine_terminal_failure_observed,
             machine_terminal_error: failure.machine_terminal_error,
             terminal_failure_source: failure.source,
+            contributor_disposition: FailedRunContributorDisposition::Consumed,
             applied_terminal: Some(applied),
         },
     )
@@ -8170,6 +8333,7 @@ struct RuntimeLoopRunFailureContext {
     machine_terminal_failure_observed: bool,
     machine_terminal_error: Option<meerkat_core::TurnErrorMetadata>,
     terminal_failure_source: Option<crate::meerkat_machine::dsl::RunFailureSourceKind>,
+    contributor_disposition: FailedRunContributorDisposition,
     applied_terminal: Option<MachineTerminalAppliedDraft>,
 }
 
@@ -8184,6 +8348,7 @@ async fn fail_runtime_loop_run_inner(
         machine_terminal_failure_observed,
         machine_terminal_error,
         terminal_failure_source,
+        contributor_disposition,
         applied_terminal,
     } = failure;
     let mut driver = driver.lock().await;
@@ -8196,6 +8361,24 @@ async fn fail_runtime_loop_run_inner(
             RuntimeDriverError::ValidationFailed {
                 reason: "machine-terminal failure observation and typed completion error disagreed"
                     .to_string(),
+            },
+        ));
+    }
+    // Consumed asserts the contributors were applied, which only a
+    // machine-terminal failure witnesses. Fail closed rather than let a caller
+    // consume inputs no turn ever touched, or replay ones a turn did.
+    if machine_terminal_failure_observed
+        != matches!(
+            contributor_disposition,
+            FailedRunContributorDisposition::Consumed
+        )
+    {
+        return Err(RuntimeLoopRunFailError::Rejected(
+            RuntimeDriverError::ValidationFailed {
+                reason: format!(
+                    "machine-terminal failure observation and contributor disposition {} disagreed",
+                    contributor_disposition.as_str()
+                ),
             },
         ));
     }
@@ -8338,7 +8521,6 @@ async fn fail_runtime_loop_run_inner(
             return Err(RuntimeLoopRunFailError::Rejected(error));
         }
     };
-    let recoverable = !machine_terminal_failure_observed;
     let replay_plan = machine_build_replay_plan(&driver, &staged_input_ids, "RunFailed");
     if let Err(err) = machine_apply_run_return_projection(
         &mut driver,
@@ -8362,7 +8544,7 @@ async fn fail_runtime_loop_run_inner(
             replay_plan,
             terminal_error,
             runtime_apply_failure,
-            recoverable,
+            contributor_disposition,
             applied_commit,
         })
         .await
@@ -10034,10 +10216,14 @@ mod recovery_tests {
             .await
             .expect("persist cold lifecycle with independent custody");
 
-        let reconciled =
-            reconcile_runtime_authority_for_cold_recovery(&store, &runtime_id, &session_id)
-                .await
-                .expect("cold lifecycle should normalize without erasing custody");
+        let reconciled = reconcile_runtime_authority_for_cold_recovery(
+            &store,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+        )
+        .await
+        .expect("cold lifecycle should normalize without erasing custody");
         assert_eq!(
             reconciled.unregister_progress,
             Some(unregister_progress.clone())
@@ -10110,6 +10296,7 @@ mod recovery_tests {
                             &store,
                             &runtime_id,
                             &session_id,
+                            &meerkat_core::RuntimeEpochId::new(),
                         )
                         .await
                         .expect("every decoded torn tuple must converge through a typed decision");
@@ -10123,10 +10310,29 @@ mod recovery_tests {
                             panic!("reconciled lifecycle row must decode");
                         };
                         assert_eq!(record.runtime_state(), Some(RuntimeState::Idle));
-                        assert_eq!(
-                            record.binding(),
-                            &crate::store::MachineLifecycleBindingFacts::default()
-                        );
+                        // The clean UNPLACED Idle row is the classifier's fixed
+                        // point, so it is left byte-identical - including a
+                        // retained entry epoch, which is a registration fact of
+                        // the process that wrote the row rather than evidence of a
+                        // torn placement. Every other tuple is normalized to a
+                        // cleared placement.
+                        // `trailing_zeros() >= 3`: the three placement bits
+                        // (runtime id, fence token, generation) are all clear.
+                        let converged_fixed_point = state == Some(RuntimeState::Idle)
+                            && binding_bits.trailing_zeros() >= 3
+                            && !run_present
+                            && pre_run_phase.is_none();
+                        let expected_binding = if converged_fixed_point && binding_bits & 8 != 0 {
+                            crate::store::MachineLifecycleBindingFacts::new(
+                                None,
+                                None,
+                                None,
+                                Some("dead-process-epoch".to_string()),
+                            )
+                        } else {
+                            crate::store::MachineLifecycleBindingFacts::default()
+                        };
+                        assert_eq!(record.binding(), &expected_binding);
                         assert_eq!(
                             record.run(),
                             &crate::store::MachineLifecycleRunFacts::default()
@@ -10157,6 +10363,7 @@ mod recovery_tests {
                 &store,
                 &runtime_id,
                 &session_id,
+                &meerkat_core::RuntimeEpochId::new(),
             )
             .await
             {
@@ -10180,8 +10387,13 @@ mod recovery_tests {
         let unavailable = crate::store::InMemoryRuntimeStore::new();
         unavailable.fail_next_machine_lifecycle_observation();
         assert!(matches!(
-            reconcile_runtime_authority_for_cold_recovery(&unavailable, &runtime_id, &session_id,)
-                .await,
+            reconcile_runtime_authority_for_cold_recovery(
+                &unavailable,
+                &runtime_id,
+                &session_id,
+                &meerkat_core::RuntimeEpochId::new(),
+            )
+            .await,
             Err(RuntimeDriverError::RecoveryBackoff { .. })
         ));
 
@@ -10200,8 +10412,13 @@ mod recovery_tests {
             .unwrap();
         conflict.conflict_next_machine_lifecycle_cas();
         assert!(matches!(
-            reconcile_runtime_authority_for_cold_recovery(&conflict, &runtime_id, &session_id,)
-                .await,
+            reconcile_runtime_authority_for_cold_recovery(
+                &conflict,
+                &runtime_id,
+                &session_id,
+                &meerkat_core::RuntimeEpochId::new(),
+            )
+            .await,
             Err(RuntimeDriverError::RecoveryBackoff { .. })
         ));
         assert!(matches!(
@@ -10210,9 +10427,14 @@ mod recovery_tests {
                 if record.runtime_state() == Some(RuntimeState::Running)
         ));
 
-        reconcile_runtime_authority_for_cold_recovery(&conflict, &runtime_id, &session_id)
-            .await
-            .expect("requeued conflict must converge on its next pass");
+        reconcile_runtime_authority_for_cold_recovery(
+            &conflict,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+        )
+        .await
+        .expect("requeued conflict must converge on its next pass");
         let fixed_version = conflict
             .observe_machine_lifecycle(&runtime_id)
             .await
@@ -10220,9 +10442,14 @@ mod recovery_tests {
             .version()
             .cloned()
             .expect("fixed lifecycle row version");
-        reconcile_runtime_authority_for_cold_recovery(&conflict, &runtime_id, &session_id)
-            .await
-            .expect("fixed point must remain converged");
+        reconcile_runtime_authority_for_cold_recovery(
+            &conflict,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+        )
+        .await
+        .expect("fixed point must remain converged");
         assert_eq!(
             conflict
                 .observe_machine_lifecycle(&runtime_id)

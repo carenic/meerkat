@@ -229,6 +229,262 @@ pub enum CacheBreakpointEvidenceError {
     ProviderEncodingMismatch,
 }
 
+/// Why one provider-authored cache breakpoint was discarded instead of
+/// retained as durable session evidence.
+///
+/// A cache breakpoint is an optimization artifact anchored to the exact
+/// transcript head a provider lowered. Ordinary transcript motion - a
+/// synthetic-notice refresh, a compaction, a re-materialized prefix - moves
+/// that anchor without saying anything about the transcript's own integrity.
+/// Every variant here therefore describes the ARTIFACT. Faults that describe
+/// the committed TRANSCRIPT stay [`CacheBreakpointEvidenceError`].
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CacheBreakpointDiscardReason {
+    /// The anchored boundary is past the end of the committed transcript.
+    BoundaryOutsideCommittedTranscript {
+        message_count: u64,
+        message_len: u64,
+    },
+    /// The committed transcript prefix at the anchored boundary is no longer
+    /// the one the provider lowered.
+    CanonicalPrefixMoved,
+    /// The proof itself is not usable evidence, independently of any
+    /// transcript: a malformed rendered identity, an incoherent
+    /// provider/encoding pairing, or an undecodable persisted row.
+    EvidenceUnusable { detail: String },
+    /// Durable history retains superseded prompt versions, so the projected
+    /// provider boundary has no raw-to-projected map to rebind through.
+    ProjectedBoundaryUnmappable,
+}
+
+impl CacheBreakpointDiscardReason {
+    /// Stable observation code for logs and host metrics.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::BoundaryOutsideCommittedTranscript { .. } => {
+                "boundary_outside_committed_transcript"
+            }
+            Self::CanonicalPrefixMoved => "canonical_prefix_moved",
+            Self::EvidenceUnusable { .. } => "evidence_unusable",
+            Self::ProjectedBoundaryUnmappable => "projected_boundary_unmappable",
+        }
+    }
+}
+
+impl std::fmt::Display for CacheBreakpointDiscardReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BoundaryOutsideCommittedTranscript {
+                message_count,
+                message_len,
+            } => write!(
+                f,
+                "anchored boundary {message_count} is outside committed transcript length {message_len}"
+            ),
+            Self::CanonicalPrefixMoved => {
+                f.write_str("committed transcript prefix moved under the anchored boundary")
+            }
+            Self::EvidenceUnusable { detail } => {
+                write!(f, "cache-breakpoint proof is unusable: {detail}")
+            }
+            Self::ProjectedBoundaryUnmappable => {
+                f.write_str("durable prompt-version history has no raw-to-projected boundary map")
+            }
+        }
+    }
+}
+
+/// Which side of a turn commit produced the discarded proof.
+///
+/// Load-bearing for hosts: `PersistedEvidence` is inherited poison from an
+/// earlier turn, `AuthoredThisTurn` is this turn's own lowering disagreeing
+/// with the committed transcript. The two have different root causes and are
+/// otherwise indistinguishable from the outside.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheBreakpointDiscardOrigin {
+    /// Freshly authored by the lowering that produced this turn's request.
+    AuthoredThisTurn,
+    /// Persisted by an earlier turn and re-checked before the merge.
+    PersistedEvidence,
+}
+
+impl CacheBreakpointDiscardOrigin {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthoredThisTurn => "authored_this_turn",
+            Self::PersistedEvidence => "persisted_evidence",
+        }
+    }
+}
+
+/// Identity of a discarded proof, when the proof itself could be decoded.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct DiscardedCacheBreakpointIdentity {
+    pub provider: Provider,
+    pub model: String,
+    pub boundary: CacheBreakpointBoundary,
+}
+
+/// One provider-authored cache proof that could not be retained.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct DiscardedCacheBreakpoint {
+    origin: CacheBreakpointDiscardOrigin,
+    /// Absent only when the persisted evidence row itself could not be
+    /// decoded, so no individual proof identity exists to name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<DiscardedCacheBreakpointIdentity>,
+    reason: CacheBreakpointDiscardReason,
+}
+
+impl DiscardedCacheBreakpoint {
+    pub(crate) fn proof(
+        origin: CacheBreakpointDiscardOrigin,
+        breakpoint: &AuthoredCacheBreakpoint,
+        reason: CacheBreakpointDiscardReason,
+    ) -> Self {
+        Self {
+            origin,
+            identity: Some(DiscardedCacheBreakpointIdentity {
+                provider: breakpoint.provider(),
+                model: breakpoint.model().to_string(),
+                boundary: breakpoint.boundary(),
+            }),
+            reason,
+        }
+    }
+
+    pub(crate) const fn persisted_row(reason: CacheBreakpointDiscardReason) -> Self {
+        Self {
+            origin: CacheBreakpointDiscardOrigin::PersistedEvidence,
+            identity: None,
+            reason,
+        }
+    }
+
+    pub const fn origin(&self) -> CacheBreakpointDiscardOrigin {
+        self.origin
+    }
+
+    pub const fn identity(&self) -> Option<&DiscardedCacheBreakpointIdentity> {
+        self.identity.as_ref()
+    }
+
+    pub const fn reason(&self) -> &CacheBreakpointDiscardReason {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for DiscardedCacheBreakpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.identity {
+            Some(identity) => write!(
+                f,
+                "provider={} model={} boundary={} ({}): {}",
+                identity.provider.as_str(),
+                identity.model,
+                identity.boundary.message_count(),
+                self.origin.as_str(),
+                self.reason
+            ),
+            None => write!(
+                f,
+                "persisted cache-breakpoint evidence row ({}): {}",
+                self.origin.as_str(),
+                self.reason
+            ),
+        }
+    }
+}
+
+/// Outcome of merging this turn's provider-authored proofs into durable
+/// session evidence.
+///
+/// A degraded retention means the turn proceeds with less caching than the
+/// provider offered. It never means the turn failed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthoredCacheBreakpointRetention {
+    retained: usize,
+    discarded: Vec<DiscardedCacheBreakpoint>,
+}
+
+impl AuthoredCacheBreakpointRetention {
+    /// Number of proofs that still bind and remain durable evidence.
+    pub const fn retained(&self) -> usize {
+        self.retained
+    }
+
+    pub fn discarded(&self) -> &[DiscardedCacheBreakpoint] {
+        &self.discarded
+    }
+
+    /// Take the discards for routing onto an observable boundary event.
+    pub fn into_discarded(self) -> Vec<DiscardedCacheBreakpoint> {
+        self.discarded
+    }
+
+    /// True when at least one proof was dropped, so caching for this turn is
+    /// weaker than the provider authored.
+    pub fn is_degraded(&self) -> bool {
+        !self.discarded.is_empty()
+    }
+
+    pub(crate) fn set_retained(&mut self, retained: usize) {
+        self.retained = retained;
+    }
+
+    pub(crate) fn push_discard(&mut self, discard: DiscardedCacheBreakpoint) {
+        self.discarded.push(discard);
+    }
+}
+
+/// Classify one binding failure as recoverable artifact motion or an
+/// unrecoverable statement about the committed transcript.
+///
+/// The propagating variants describe the transcript we are binding AGAINST:
+/// they would fail identically for every boundary and for a transcript that
+/// carries no cache evidence at all. The dropping variants describe the proof
+/// anchored to a head the transcript has since left.
+pub(crate) fn classify_cache_breakpoint_binding_failure(
+    error: CacheBreakpointEvidenceError,
+) -> Result<CacheBreakpointDiscardReason, CacheBreakpointEvidenceError> {
+    match error {
+        CacheBreakpointEvidenceError::BoundaryOutOfRange {
+            message_count,
+            message_len,
+        } => Ok(
+            CacheBreakpointDiscardReason::BoundaryOutsideCommittedTranscript {
+                message_count,
+                message_len: message_len as u64,
+            },
+        ),
+        CacheBreakpointEvidenceError::CanonicalPrefixMismatch => {
+            Ok(CacheBreakpointDiscardReason::CanonicalPrefixMoved)
+        }
+        error @ (CacheBreakpointEvidenceError::RenderedPrefixMalformed
+        | CacheBreakpointEvidenceError::ProviderEncodingMismatch) => {
+            Ok(CacheBreakpointDiscardReason::EvidenceUnusable {
+                detail: error.to_string(),
+            })
+        }
+        // `CanonicalEncodingFailed` says the committed transcript cannot be
+        // canonically encoded at all. `PersistedEvidenceMalformed` never
+        // reaches this classifier from a bind: its decode and serialize call
+        // sites own their own handling, and a serialize failure is our own
+        // write failing, not a stale artifact.
+        error @ (CacheBreakpointEvidenceError::CanonicalEncodingFailed { .. }
+        | CacheBreakpointEvidenceError::PersistedEvidenceMalformed { .. }) => Err(error),
+    }
+}
+
 impl AuthoredCacheBreakpoint {
     pub(crate) fn from_provider_claim(claim: ProviderCacheBreakpointClaim) -> Self {
         claim.evidence

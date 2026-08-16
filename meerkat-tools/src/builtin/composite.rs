@@ -684,6 +684,28 @@ impl AgentToolDispatcher for CompositeDispatcher {
         tools.into()
     }
 
+    /// Forward the precedence winner's own declaration.
+    ///
+    /// The same `resolve_tool_owner` derivation that decides advertisement and
+    /// dispatch decides which declaration counts, so a policy-disabled local
+    /// tool can never lend its read-only class to a colliding external tool.
+    /// External dispatchers declare for themselves and default to `Unknown`.
+    fn tool_mutation_class(&self, tool_name: &str) -> meerkat_core::ToolMutationClass {
+        match self.resolve_tool_owner(tool_name) {
+            ResolvedToolOwner::Builtin(tool) => tool.mutation_class(),
+            #[cfg(feature = "skills")]
+            ResolvedToolOwner::Skill(tool) => tool.mutation_class(),
+            ResolvedToolOwner::External => self
+                .external
+                .as_ref()
+                .map(|external| external.tool_mutation_class(tool_name))
+                .unwrap_or_default(),
+            ResolvedToolOwner::PolicyDenied | ResolvedToolOwner::NotFound => {
+                meerkat_core::ToolMutationClass::Unknown
+            }
+        }
+    }
+
     fn tool_catalog_capabilities(&self) -> ToolCatalogCapabilities {
         ToolCatalogCapabilities {
             exact_catalog: self

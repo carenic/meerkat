@@ -285,6 +285,29 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         }
     }
 
+    async fn durable_input_state_by_idempotency_key(
+        &self,
+        session_id: &SessionId,
+        idempotency_key: &str,
+    ) -> Result<Option<StoredInputState>, RuntimeDriverError> {
+        match self
+            .execute_meerkat_machine_command(
+                None,
+                MeerkatMachineCommand::DurableInputStateByIdempotencyKey {
+                    session_id: session_id.clone(),
+                    idempotency_key: idempotency_key.to_string(),
+                },
+            )
+            .await
+            .map_err(MeerkatMachine::driver_error_from_command_error)?
+        {
+            MeerkatMachineCommandResult::InputState(state) => Ok(state),
+            other => Err(RuntimeDriverError::Internal(format!(
+                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::durable_input_state_by_idempotency_key: {other:?}"
+            ))),
+        }
+    }
+
     async fn interaction_terminal_status(
         &self,
         session_id: &SessionId,
@@ -2613,9 +2636,13 @@ mod tests {
         session_id: &SessionId,
         runtime_id: &LogicalRuntimeId,
     ) {
-        let mut authority =
-            crate::meerkat_machine::dsl_authority::new_registered_authority(session_id)
-                .expect("register dispatch test authority");
+        let epoch_id =
+            crate::meerkat_machine::dsl::RuntimeEpochId::from("dispatch-test-epoch".to_string());
+        let mut authority = crate::meerkat_machine::dsl_authority::new_registered_authority_id(
+            crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
+            epoch_id.clone(),
+        )
+        .expect("register dispatch test authority");
         crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
             &mut authority,
             crate::meerkat_machine::dsl::MeerkatMachineInput::PrepareBindings {
@@ -2624,9 +2651,7 @@ mod tests {
                 ),
                 fence_token: crate::meerkat_machine::dsl::FenceToken::from(31),
                 generation: Some(crate::meerkat_machine::dsl::Generation::from(7)),
-                runtime_epoch_id: Some(crate::meerkat_machine::dsl::RuntimeEpochId::from(
-                    "dispatch-test-epoch".to_string(),
-                )),
+                runtime_epoch_id: Some(epoch_id),
                 session_id: crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
             },
         )

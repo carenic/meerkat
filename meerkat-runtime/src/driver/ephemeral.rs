@@ -649,14 +649,20 @@ impl EphemeralRuntimeDriver {
         active_runtime_epoch_id: Option<mm_dsl::RuntimeEpochId>,
         supervisor_authority: crate::store::SupervisorAuthoritySnapshot,
     ) -> Result<(), RuntimeDriverError> {
+        // The seeded epoch is a REGISTRATION fact: install it here, and let the
+        // optional placement below assert it. Threading it only as a placement
+        // passenger would seed a shape the machine no longer admits.
         let mut recovered =
-            crate::meerkat_machine::dsl_authority::new_registered_authority_id(session_id.clone())
-                .map_err(|err| {
-                    RuntimeDriverError::Internal(crate::meerkat_machine::dsl_authority::map_error(
-                        err,
-                        "test runtime registration",
-                    ))
-                })?;
+            crate::meerkat_machine::dsl_authority::new_registered_authority_with_optional_epoch(
+                session_id.clone(),
+                active_runtime_epoch_id.clone(),
+            )
+            .map_err(|err| {
+                RuntimeDriverError::Internal(crate::meerkat_machine::dsl_authority::map_error(
+                    err,
+                    "test runtime registration",
+                ))
+            })?;
         if let (Some(runtime_id), Some(fence_token)) = (runtime_id, active_fence_token) {
             crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
                 &mut recovered,
@@ -990,6 +996,7 @@ impl EphemeralRuntimeDriver {
                         }) as u32;
                         InputAbandonReason::MaxAttemptsExhausted { attempts }
                     }
+                    mm_dsl::InputAbandonReason::NeverExecuted => InputAbandonReason::NeverExecuted,
                 };
                 Some(InputTerminalOutcome::Abandoned { reason })
             }
@@ -1816,6 +1823,9 @@ impl EphemeralRuntimeDriver {
         self.dsl_apply(
             mm_dsl::MeerkatMachineInput::RegisterSession {
                 session_id: session_id.clone(),
+                // Contract-test authority: no runtime session entry exists, so
+                // there is no entry epoch to register under.
+                runtime_epoch_id: None,
             },
             "ContractRegisterSession",
         )?;
@@ -1987,6 +1997,17 @@ impl EphemeralRuntimeDriver {
                 .keys()
                 .any(|queued_key| !excluded_keys.contains(queued_key))
         })
+    }
+
+    /// Whether machine-owned lane truth still holds any queued input.
+    ///
+    /// `input_lane` is the singular ordered-membership authority, so an empty
+    /// lane is the only state in which no queued work can be selected. This is
+    /// the total question the runtime loop must answer before it parks:
+    /// parking with a non-empty lane is the "queued work exists, nobody is
+    /// coming back for it" state that silently disarms a live member.
+    pub(crate) fn has_queued_input_in_any_lane(&self) -> bool {
+        self.with_dsl_state(|state| !state.input_lane.is_empty())
     }
 
     pub(crate) fn defer_queued_inputs_behind_backlog(
@@ -2807,6 +2828,129 @@ impl EphemeralRuntimeDriver {
         }
 
         Ok(())
+    }
+
+    /// Resolve queued inputs the generated staging authority REFUSED.
+    ///
+    /// `StageForRun` only increments the attempt count when every guard passes,
+    /// so a refused input accrued nothing and could never reach the
+    /// max-attempts valve - it starved, and under fifo it starved the whole
+    /// lane behind it (field 0.8.22). The machine owns the disposition exactly
+    /// as it does for a staged-then-failed input: another attempt at the back
+    /// of the backlog, or a typed terminal outcome at the retry cap. The shell
+    /// supplies only the generated recovery-lane witness.
+    ///
+    /// Returns the inputs the machine terminalized, so the caller can fail
+    /// exactly their completion waiters and leave deferred ones pending.
+    pub(crate) fn resolve_unstageable_queued_inputs(
+        &mut self,
+        input_ids: &[InputId],
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        // ALL-OR-NOTHING PRECONDITION.
+        //
+        // The disposition below is applied to the WHOLE batch, and one member
+        // can be unresolvable while its siblings are perfectly healthy. Applied
+        // member-by-member, a batch of [healthy-at-cap, corrupt] abandons the
+        // HEALTHY input and only then errors on the corrupt one - so a corrupt
+        // sibling costs a legitimate input its work, and the loss is durable
+        // while the error is not.
+        //
+        // A healthy row really can sit at the cap: `RecoverInputLifecycle`
+        // restores `input_attempt_counts` absolutely from the persisted seed
+        // with no cap bound on a Queued row, so a restart can hand this loop a
+        // member one refusal away from terminalization.
+        //
+        // So every member is verified BEFORE any member is applied. If any
+        // member fails, nothing is applied and the existing typed error stands.
+        // The failure mode becomes a stuck member with an explicit error naming
+        // the input - visible, and clearable by an operator - instead of a
+        // silent abandonment of work nobody asked to lose.
+        let mut resolvable = Vec::with_capacity(input_ids.len());
+        for input_id in input_ids {
+            // Skip anything the machine already resolved out of the queued
+            // world (terminalized, or staged by a concurrent path). This is a
+            // resolved-member skip, not an "already resolved" judgement the
+            // shell is making on the machine's behalf: a row still claiming
+            // InputPhase::Queued always reaches the machine, and if it lost its
+            // lane the DSL's own `input_lane_bound` guard rejects loudly (same
+            // split `DeferInputBehindBacklogAlreadyResolved` draws).
+            if self.input_phase(input_id) != Some(InputLifecycleState::Queued) {
+                continue;
+            }
+            // A Queued row with no recovery lane is projection corruption, not
+            // a reachable refusal cause: `recovered_current_lane_matches_phase`
+            // forces lane == recovery_lane with both Some for any recovered
+            // Queued row, and every producer of a Queued row
+            // (QueueAccepted, SteerAccepted, ChangeLane, RollbackStaged,
+            // ResolveStagedRollbackQueued) inserts both together. Fail loudly
+            // rather than inventing a lane: both `ResolveUnstageableQueuedInput`
+            // transitions guard `recovery_lane_matches`, so a fabricated
+            // witness would be refused anyway and the refusal would be silent.
+            let lane = self.input_recovery_lane(input_id).ok_or_else(|| {
+                RuntimeDriverError::Internal(format!(
+                    "generated recovery lane missing for unstageable queued input '{input_id}'"
+                ))
+            })?;
+            resolvable.push((input_id, lane));
+        }
+
+        let mut abandoned = Vec::new();
+        for (input_id, lane) in resolvable {
+            self.dsl_apply(
+                mm_dsl::MeerkatMachineInput::ResolveUnstageableQueuedInput {
+                    input_id: Self::dsl_key(input_id),
+                    lane: mm_dsl::InputLane::from(lane),
+                },
+                "ResolveUnstageableQueuedInput",
+            )?;
+
+            match self.input_phase_required(input_id, "after unstageable queued resolution")? {
+                InputLifecycleState::Queued => {
+                    let attempts = self.input_attempt_count(input_id);
+                    tracing::warn!(
+                        input_id = %input_id,
+                        attempts,
+                        "queued input refused by generated staging authority; deferred behind the backlog for another attempt"
+                    );
+                }
+                InputLifecycleState::Abandoned => {
+                    let attempts = self.input_attempt_count(input_id);
+                    // ERROR, not WARN: this is durable work loss, and the log
+                    // is the only channel that carries it. The typed
+                    // `InputLifecycleEvent::Abandoned` pushed below goes into
+                    // `self.events`, whose only `drain_events` caller in the
+                    // workspace is a unit test, and the waiter receives a
+                    // stringly `AuthorityUnavailable` that consumers correctly
+                    // read as plumbing noise rather than a terminal fact.
+                    tracing::error!(
+                        input_id = %input_id,
+                        attempts,
+                        "queued input abandoned after generated max stage attempts of refused staging"
+                    );
+                    self.sync_terminal_projection_from_machine(
+                        input_id,
+                        InputLifecycleState::Queued,
+                        InputLifecycleState::Abandoned,
+                        "ResolveUnstageableQueuedInput->Abandon",
+                    )?;
+                    self.events
+                        .push(self.make_envelope(RuntimeEvent::InputLifecycle(
+                            InputLifecycleEvent::Abandoned {
+                                input_id: input_id.clone(),
+                                reason: InputAbandonReason::MaxAttemptsExhausted { attempts },
+                            },
+                        )));
+                    abandoned.push(input_id.clone());
+                }
+                other => {
+                    return Err(RuntimeDriverError::Internal(format!(
+                        "generated unstageable queued resolution for input {input_id} produced unexpected phase {other:?}"
+                    )));
+                }
+            }
+        }
+
+        Ok(abandoned)
     }
 
     pub(crate) fn finalize_retire(&mut self) -> RetireReport {
@@ -3932,7 +4076,11 @@ impl EphemeralRuntimeDriver {
                     reason: dsl_reason,
                     attempt_count,
                 },
-                "AbandonInput(CancelledRun)",
+                // Every caller of this helper abandons inputs still owned by a
+                // staged run; the reason says which kind of abandonment it is.
+                // Naming a cancellation here would misdescribe the callers that
+                // are not one.
+                "AbandonInput(StagedRun)",
             )?;
 
             self.sync_terminal_projection_from_machine(
@@ -4020,28 +4168,77 @@ impl EphemeralRuntimeDriver {
         run_id: &RunId,
         contributing_input_ids: &[InputId],
         replay_plan: &ReplayQueuedContributorsPlan,
-        recoverable: bool,
+        contributor_disposition: crate::meerkat_machine::driver::FailedRunContributorDisposition,
     ) -> Result<(), RuntimeDriverError> {
-        if !recoverable {
-            tracing::debug!(
-                run_id = ?run_id,
-                contributors = contributing_input_ids.len(),
-                "runtime consumed contributors after a machine-owned terminal failure"
-            );
-            return self.consume_inputs(contributing_input_ids, run_id);
-        }
-        tracing::debug!(
-            run_id = ?run_id,
-            kind = replay_plan.notice_kind,
-            queue = replay_plan.queue_work_ids.len(),
-            steer = replay_plan.steer_work_ids.len(),
-            "runtime replayed queued contributors"
-        );
+        use crate::meerkat_machine::driver::FailedRunContributorDisposition;
+        match contributor_disposition {
+            FailedRunContributorDisposition::Consumed => {
+                tracing::debug!(
+                    run_id = ?run_id,
+                    contributors = contributing_input_ids.len(),
+                    "runtime consumed contributors after a machine-owned terminal failure"
+                );
+                self.consume_inputs(contributing_input_ids, run_id)
+            }
+            FailedRunContributorDisposition::Terminalized => {
+                // The one failure class that must not re-enter a work lane:
+                // the loop concluded non-progress and dropped an `apply` whose
+                // in-flight fate it cannot observe, so a late-draining consumer
+                // could still carry the instruction out. Terminalizing here -
+                // inside the same realization, and so inside the same durable
+                // commit, as the run terminal - means the input is never
+                // durably *Queued* for a successor, not even for an instant.
+                //
+                // Two boundary facts that claim does not cover, stated rather
+                // than implied:
+                //
+                // * A crash before the commit leaves the row durably `Staged`,
+                //   and successor recovery normalizes `Staged` to `Queued` and
+                //   re-runs it. That is safe and is the pre-existing recovery
+                //   contract: the crash killed the in-flight `apply` with the
+                //   process, so nothing can drain late.
+                // * A store-commit *failure* without a crash is different, and
+                //   the two drivers diverge here: the ephemeral checkpoint is
+                //   restored, while a persistent post-checkpoint failure is
+                //   NOT snapshot-restored - it marks the shell as requiring a
+                //   durable reload and fails closed. Either way the durable
+                //   row stays `Staged` for same-process recovery to re-queue
+                //   on a fresh executor, while the torn-down consumer's
+                //   channel may still hold the command. That is the residual
+                //   double-execution window this disposition does not close.
+                //
+                // `NeverExecuted`, not `Cancelled`: nobody asked for this work
+                // to stop, and a host reading the durable reason to answer
+                // "why did my work not run" must not be told an operator
+                // cancelled it.
+                tracing::error!(
+                    run_id = ?run_id,
+                    contributors = contributing_input_ids.len(),
+                    "runtime terminalized the contributors of a run that never began executing; \
+                     they are deliberately not re-queued because an execution this loop could not \
+                     observe could still land"
+                );
+                self.abandon_staged_inputs(
+                    contributing_input_ids,
+                    InputAbandonReason::NeverExecuted,
+                )
+                .map(|_| ())
+            }
+            FailedRunContributorDisposition::Replayed => {
+                tracing::debug!(
+                    run_id = ?run_id,
+                    kind = replay_plan.notice_kind,
+                    queue = replay_plan.queue_work_ids.len(),
+                    steer = replay_plan.steer_work_ids.len(),
+                    "runtime replayed queued contributors"
+                );
 
-        // `rollback_staged` drives generated `ResolveStagedRollback`
-        // authority and re-inserts surviving contributors into the correct
-        // lane — no separate lane seeding is needed here.
-        self.rollback_staged(contributing_input_ids)
+                // `rollback_staged` drives generated `ResolveStagedRollback`
+                // authority and re-inserts surviving contributors into the correct
+                // lane - no separate lane seeding is needed here.
+                self.rollback_staged(contributing_input_ids)
+            }
+        }
     }
 
     /// Machine-owned realization for a validated cancelled run.

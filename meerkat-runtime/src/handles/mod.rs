@@ -435,6 +435,10 @@ impl HandleDslAuthority {
     /// old cloned handle cannot authorize new durable work after unregister or
     /// epoch rotation. The generated binding fields are the semantic identity
     /// authority; this method only samples them without mutating machine state.
+    ///
+    /// The refusal is typed because its caller routes on the cause: an epoch
+    /// that rotated under a live session is recoverable by re-deriving it,
+    /// while a placement rotation or a torn-down epoch must fail closed.
     pub(crate) fn current_runtime_binding(
         &self,
         expected_session_id: &mm_dsl::SessionId,
@@ -446,38 +450,39 @@ impl HandleDslAuthority {
             Option<mm_dsl::FenceToken>,
             Option<mm_dsl::Generation>,
         ),
-        String,
+        RuntimeBindingSampleRefusal,
     > {
         self.ensure_durability_ready(context)
-            .map_err(|error| error.to_string())?;
+            .map_err(RuntimeBindingSampleRefusal::authority_unavailable)?;
         self.teardown_gate
             .ensure_open(context)
-            .map_err(|error| error.to_string())?;
+            .map_err(RuntimeBindingSampleRefusal::authority_unavailable)?;
         let guard = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.ensure_durability_ready(context)
-            .map_err(|error| error.to_string())?;
+            .map_err(RuntimeBindingSampleRefusal::authority_unavailable)?;
         self.teardown_gate
             .ensure_open(context)
-            .map_err(|error| error.to_string())?;
+            .map_err(RuntimeBindingSampleRefusal::authority_unavailable)?;
         let state = guard.state();
         if state.session_id.as_ref() != Some(expected_session_id) {
-            return Err(format!(
-                "session binding changed (expected {expected_session_id:?}, current {:?})",
-                state.session_id
-            ));
+            return Err(RuntimeBindingSampleRefusal::SessionChanged {
+                expected: expected_session_id.clone(),
+                current: state.session_id.clone(),
+            });
         }
         if state.active_runtime_epoch_id.as_ref() != Some(expected_runtime_epoch_id) {
-            return Err(format!(
-                "runtime epoch changed (expected {expected_runtime_epoch_id:?}, current {:?})",
-                state.active_runtime_epoch_id
-            ));
+            return Err(RuntimeBindingSampleRefusal::EpochChanged {
+                expected: expected_runtime_epoch_id.clone(),
+                current: state.active_runtime_epoch_id.clone(),
+            });
         }
-        let runtime_id = state.active_runtime_id.clone().ok_or_else(|| {
-            "session has no authoritative runtime binding for compaction commit".to_string()
-        })?;
+        let runtime_id = state
+            .active_runtime_id
+            .clone()
+            .ok_or(RuntimeBindingSampleRefusal::PlacementAbsent)?;
         Ok((
             runtime_id,
             state.active_fence_token,
@@ -526,6 +531,53 @@ impl std::fmt::Debug for HandleDslAuthority {
     }
 }
 
+/// Typed refusal from sampling a session's live runtime binding.
+#[derive(Debug, Clone)]
+pub(crate) enum RuntimeBindingSampleRefusal {
+    /// The handle's own gates refused before any state was read: the epoch was
+    /// torn down, or its durability authority is not ready.
+    AuthorityUnavailable(String),
+    /// The authority no longer holds the session this handle was minted for.
+    SessionChanged {
+        expected: mm_dsl::SessionId,
+        current: Option<mm_dsl::SessionId>,
+    },
+    /// The session's live runtime epoch is not the one this handle holds.
+    /// `current` is the value a caller may re-derive from.
+    EpochChanged {
+        expected: mm_dsl::RuntimeEpochId,
+        current: Option<mm_dsl::RuntimeEpochId>,
+    },
+    /// The session carries no authoritative runtime placement.
+    PlacementAbsent,
+}
+
+impl RuntimeBindingSampleRefusal {
+    fn authority_unavailable(error: impl std::fmt::Display) -> Self {
+        Self::AuthorityUnavailable(error.to_string())
+    }
+}
+
+impl std::fmt::Display for RuntimeBindingSampleRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AuthorityUnavailable(detail) => write!(f, "{detail}"),
+            Self::SessionChanged { expected, current } => write!(
+                f,
+                "session binding changed (expected {expected:?}, current {current:?})"
+            ),
+            Self::EpochChanged { expected, current } => write!(
+                f,
+                "runtime epoch changed (expected {expected:?}, current {current:?})"
+            ),
+            Self::PlacementAbsent => write!(
+                f,
+                "session has no authoritative runtime binding for compaction commit"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +596,7 @@ mod tests {
             .apply_input(
                 mm_dsl::MeerkatMachineInput::RegisterSession {
                     session_id: mm_dsl::SessionId::from("closed-session"),
+                    runtime_epoch_id: None,
                 },
                 "test::stale_handle",
             )

@@ -2275,7 +2275,9 @@ fn build_tool_defs_with_profile_support(
              PROFILE FIELDS:\n\
              - model (required): LLM model name, e.g. \"claude-sonnet-4-5\".\n\
              - tools: {builtins: bool, shell: bool, comms: bool, memory: bool, mob: bool, \
-               schedule: bool, image_generation: bool}. Each defaults to false.\n\
+               schedule: bool, image_generation: bool, read_only: bool}. Each defaults to false. \
+               read_only enforces at the execution gate that the member may only call tools \
+               declared read-only (shell and MCP tools are refused; a spawn cannot widen it).\n\
              - skills: Array of skill names to load.\n\
              - peer_description: Human-readable role description visible to other members.\n\
              - runtime_mode: \"autonomous_host\" (default) or \"turn_driven\".\n\

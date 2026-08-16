@@ -237,6 +237,7 @@ mod tests {
             &mut authority,
             mm_dsl::MeerkatMachineInput::RegisterSession {
                 session_id: mm_dsl::SessionId::from("interaction-stream-test".to_string()),
+                runtime_epoch_id: None,
             },
         )
         .unwrap();

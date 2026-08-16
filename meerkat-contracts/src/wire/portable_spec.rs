@@ -98,6 +98,10 @@ pub struct PortableProfile {
 /// from nor encoded to the wire this type exists for.
 impl Eq for PortableProfile {}
 
+fn read_only_is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Portable projection of `meerkat_mob::ToolConfig` category toggles.
 ///
 /// Structural exclusions vs the domain type: no `rust_bundles` carrier
@@ -126,6 +130,17 @@ pub struct PortableToolConfig {
     pub schedule: bool,
     #[serde(default)]
     pub image_generation: bool,
+    /// Profile-declared read-only intent, carried so a member materialized on
+    /// another host enforces the same execution gate.
+    ///
+    /// Unlike its sibling category toggles this field is omitted when false,
+    /// which is load-bearing twice over: a spec that carries no read-only
+    /// intent keeps the exact digest-covered bytes it had before the field
+    /// existed, and a read-only spec sent to a host too old to know the field
+    /// is rejected by `deny_unknown_fields` instead of silently materializing
+    /// an ungated member.
+    #[serde(default, skip_serializing_if = "read_only_is_false")]
+    pub read_only: bool,
     /// Declarative MCP servers keyed by server name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp_servers: BTreeMap<String, PortableMcpDecl>,
@@ -255,6 +270,10 @@ pub enum PortableSystemPrompt {
 pub enum WireResolvedToolAccessPolicy {
     AllowList(Vec<String>),
     DenyList(Vec<String>),
+    /// Read-only intent, carried across the host boundary so a remotely
+    /// materialized member keeps the declaration instead of silently
+    /// downgrading to unrestricted.
+    ReadOnly,
 }
 
 /// Wire mirror of `meerkat_mob::SpawnContinuityIntent` (same serde shape).
@@ -360,6 +379,7 @@ pub(crate) fn sample_portable_member_spec() -> PortableMemberSpec {
                 mob: true,
                 schedule: false,
                 image_generation: false,
+                read_only: false,
                 mcp_servers: BTreeMap::from([(
                     "docs".to_string(),
                     PortableMcpDecl::Stdio {
