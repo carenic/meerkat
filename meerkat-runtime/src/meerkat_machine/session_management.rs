@@ -1734,6 +1734,7 @@ impl MeerkatMachine {
             None,
         )?;
         let control_projection = entry.control_projection_handle();
+        let run_start_window = entry.run_start_window_handle();
         let handle_teardown_gate = crate::handles::HandleTeardownGate::open();
         let tool_visibility_owner = Arc::new(MachineToolVisibilityOwner::new());
         tool_visibility_owner.bind_dsl_authority(Arc::clone(&dsl_authority));
@@ -1747,6 +1748,7 @@ impl MeerkatMachine {
             live_lifecycle_gate: Arc::new(Mutex::new(())),
             supervisor_rotation_task: Arc::new(SupervisorRotationTaskSlot::new()),
             control_projection,
+            run_start_window,
             driver: Arc::new(Mutex::new(entry)),
             ops_lifecycle,
             ops_lifecycle_persistence_worker: None,
@@ -1910,6 +1912,7 @@ impl MeerkatMachine {
             return Err(err);
         }
         let control_projection = entry.control_projection_handle();
+        let run_start_window = entry.run_start_window_handle();
 
         let handle_teardown_gate = crate::handles::HandleTeardownGate::open();
         let tool_visibility_owner = Arc::new(MachineToolVisibilityOwner::new());
@@ -1924,6 +1927,7 @@ impl MeerkatMachine {
             live_lifecycle_gate: Arc::new(Mutex::new(())),
             supervisor_rotation_task: Arc::new(SupervisorRotationTaskSlot::new()),
             control_projection,
+            run_start_window,
             driver: Arc::new(Mutex::new(entry)),
             ops_lifecycle,
             ops_lifecycle_persistence_worker: None,
@@ -2113,6 +2117,7 @@ impl MeerkatMachine {
                 .registration_phase
                 == crate::meerkat_machine::dsl::RegistrationPhase::Draining;
         let control_projection = entry.control_projection_handle();
+        let run_start_window = entry.run_start_window_handle();
 
         let (ops_lifecycle, epoch_id, cursor_state) = ops_state;
         tracing::debug!(
@@ -2136,6 +2141,7 @@ impl MeerkatMachine {
             live_lifecycle_gate: Arc::new(Mutex::new(())),
             supervisor_rotation_task: Arc::new(SupervisorRotationTaskSlot::new()),
             control_projection,
+            run_start_window,
             driver: Arc::new(Mutex::new(entry)),
             ops_lifecycle,
             ops_lifecycle_persistence_worker: None,
@@ -3803,6 +3809,7 @@ impl MeerkatMachine {
                 }
 
                 let control_projection = recovered_entry.control_projection_handle();
+                let run_start_window = recovered_entry.run_start_window_handle();
                 let driver = Arc::new(Mutex::new(recovered_entry));
                 let completions =
                     Arc::new(Mutex::new(crate::completion::CompletionRegistry::new()));
@@ -3831,6 +3838,7 @@ impl MeerkatMachine {
                         live_lifecycle_gate: Arc::new(Mutex::new(())),
                         supervisor_rotation_task: Arc::new(SupervisorRotationTaskSlot::new()),
                         control_projection,
+                        run_start_window,
                         driver: driver.clone(),
                         ops_lifecycle: recovered_ops.clone(),
                         ops_lifecycle_persistence_worker: None,

@@ -3020,6 +3020,16 @@ impl SessionRuntime {
         self.runtime_adapter.dead_runtime_loop_session_count()
     }
 
+    /// Sessions holding a staged run overdue to begin executing.
+    ///
+    /// Pass-through to the runtime adapter, which is private to this type.
+    /// `None` carries the same report-it-as-unreadable obligation as its
+    /// siblings, and additionally covers a past-bound window whose machine
+    /// authority could not be read without blocking.
+    pub(crate) fn overdue_run_start_session_count(&self) -> Option<usize> {
+        self.runtime_adapter.overdue_run_start_session_count()
+    }
+
     /// Active instance id for this runtime, if configured.
     pub fn instance_id(&self) -> Option<String> {
         self.inner.instance_id()

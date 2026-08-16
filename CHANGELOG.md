@@ -13,6 +13,52 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+### Breaking
+
+- **`meerkat::surface::RUNTIME_HEALTH_DIMENSIONS` is now `[&str; 5]`** (was
+  `[&str; 4]`). The declared runtime-health coverage gains `session_run_start`;
+  downstream code binding the constant by its exact array type must add the new
+  dimension. The `checks` map itself is an open string map on the wire, so the
+  new key is additive: no wire break, no schema change, no SDK regeneration.
+
+### Added
+
+- **`runtime/health` measures `session_run_start` on both surfaces** (JSON-RPC
+  `runtime/health` and REST `GET /runtime/health`): `degraded` while any
+  registered session holds a staged run that is overdue to begin executing -
+  staged more than the watchdog's notice bound (120s) ago while machine
+  authority still shows the run current with its primitive un-applied and its
+  turn start signalled. The verdict is recomputed from machine truth on every
+  scrape via the same classification the staged-run watchdog logs, so the wire
+  claim and that log line cannot disagree; there is no latched flag anywhere,
+  which is what makes a stale window degrade to clear instead of into a false
+  or missing alarm. Runs whose execution start is honestly unobservable (the
+  appends-empty and retired-drain classes, or an unbound runtime) are never
+  counted, matching the watchdog's own refusal to escalate them. A past-bound
+  window whose authority cannot be read without blocking publishes
+  `unreadable:session_run_start` rather than a rung - the holder of that
+  authority is the prime suspect for the wedge itself, so "could not look" must
+  reach the operator instead of rolling up as `ok`. The observation is
+  mechanical and read-only by declared contract: the moment anything other
+  than the health census branches on it, it becomes a semantic fact needing a
+  machine owner, and a source-grep test
+  (`run_start_window_stays_out_of_machine_authority`) enforces that boundary.
+
+### Corrected
+
+- **The 0.8.23 notes claimed `session_liveness` "needs a watchdog bridge that
+  is 0.8.24 work". That was wrong, and this release does not clear that key.**
+  `session_liveness` names the PRE-staging class - a live, open session parked
+  while machine-owned lane truth still holds selectable queued work that never
+  gets staged at all. The staged-run watchdog (and the new `session_run_start`
+  dimension built on its classification) observes the POST-staging window,
+  which opens at the durable `StageForRun` commit; it structurally cannot see
+  work that never reaches staging. The two are disjoint classes.
+  `unmeasured:session_liveness` therefore remains published, honestly, until a
+  lane-truth probe exists. Clearing it on the strength of the staged-run
+  census would have republished the one-reading-stands-for-the-whole-dimension
+  defect 0.8.23 existed to remove, from inside the item that cited it.
+
 ## [0.8.23] - 2026-08-16
 
 ### Breaking

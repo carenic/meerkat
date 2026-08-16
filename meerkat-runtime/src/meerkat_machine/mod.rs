@@ -1355,6 +1355,15 @@ struct RuntimeSessionEntry {
     /// queries should publish from this shared cell rather than treating the
     /// driver shell as the source of lifecycle truth.
     control_projection: Arc<StdRwLock<crate::driver::ephemeral::RuntimeControlProjection>>,
+    /// Session-scoped staged -> executing window record, shared with the
+    /// driver shell that created it and armed by the runtime loop at the
+    /// durable `StageForRun` commit.
+    ///
+    /// Mechanical observation state for the health census only - see the void
+    /// condition on [`crate::run_progress::SharedRunStartWindowCell`]. The
+    /// verdict is never stored here; [`RuntimeSessionEntry::run_start_health`]
+    /// recomputes it from `dsl_authority` on every read.
+    run_start_window: crate::run_progress::SharedRunStartWindowCell,
     /// Shared async-operation lifecycle registry for this runtime/session.
     ops_lifecycle: Arc<crate::ops_lifecycle::RuntimeOpsLifecycleRegistry>,
     /// Joinable durability worker for `ops_lifecycle`. Never detached: final
@@ -4360,6 +4369,25 @@ impl RuntimeSessionEntry {
             .unwrap_or(true)
     }
 
+    /// Recompute this session's staged -> executing window health from
+    /// machine truth.
+    ///
+    /// Nothing is latched: the armed window supplies only the run identity,
+    /// the staging instant, and the turn-start gate, and the verdict is
+    /// re-derived from `dsl_authority` per read via the same classification
+    /// the staged-run watchdog uses. The authority read inside is a
+    /// `try_lock` (see `AuthorityRunExecutionProgress::observe`), so a wedged
+    /// holder of the authority - the prime suspect for the very wedge this
+    /// observes - cannot park the probe; it surfaces as
+    /// [`crate::run_progress::RunStartHealth::Unreadable`] instead.
+    fn run_start_health(&self) -> crate::run_progress::RunStartHealth {
+        crate::run_progress::observe_run_start_window(
+            &self.run_start_window,
+            &self.dsl_authority,
+            crate::run_progress::RUN_EXECUTION_START_NOTICE,
+        )
+    }
+
     fn generated_executor_registration_has_viable_attachment(&self) -> bool {
         self.generated_executor_registration_active()
             && match &self.attachment_slot {
@@ -4783,6 +4811,60 @@ impl MeerkatMachine {
                 .filter(|entry| entry.runtime_loop_is_dead_shell())
                 .count(),
         )
+    }
+
+    /// How many registered sessions hold a staged run that is overdue to
+    /// begin executing.
+    ///
+    /// "Overdue" is recomputed from machine truth on every call and means
+    /// exactly what the staged-run watchdog's notice tier means: the run was
+    /// staged more than [`crate::run_progress::RUN_EXECUTION_START_NOTICE`]
+    /// ago, machine authority still reports it current with its primitive
+    /// un-applied, and the loop signalled its turn start so the phase read
+    /// describes this run. The wire claim and the existing watchdog log line
+    /// therefore cannot disagree about what "overdue" means. Runs whose
+    /// execution start is honestly unobservable (the appends-empty and
+    /// retired-drain classes, or an unbound runtime) are never counted - the
+    /// escalation bound cannot arm on them and the phase says nothing.
+    ///
+    /// `None` means the count was not established: the session registry was
+    /// not readable, or a past-bound window's authority could not be read
+    /// without blocking and no other session was positively overdue. The
+    /// per-entry miss propagates here - unlike
+    /// [`RuntimeSessionEntry::runtime_loop_is_dead_shell`], which counts its
+    /// per-entry miss - because the two misses sit on opposite sides of an
+    /// established fact. A dead shell is proven lock-free before its
+    /// authority is consulted; the try_lock there only resolves who owns the
+    /// corpse. Here nothing is proven without the authority: a past-bound
+    /// window is also what a healthy long turn looks like, so counting an
+    /// unread entry would assert a wedge nobody observed. And an unread
+    /// authority on a past-bound window is not noise to average away - the
+    /// wedged pre-apply consumer this dimension exists to see holds exactly
+    /// that mutex, so "could not look" must reach the operator rather than
+    /// roll up as `Ok`. When some other session IS positively overdue, the
+    /// observed fault wins: the count publishes and the unread entry waits
+    /// for the next scrape.
+    ///
+    /// Not `async` on purpose, for the same reason as its siblings: every
+    /// lock this touches is a non-blocking try or a short synchronous one, so
+    /// the signature itself proves the probe cannot park behind the wedge it
+    /// is trying to report.
+    pub fn overdue_run_start_session_count(&self) -> Option<usize> {
+        let sessions = self.sessions.try_read().ok()?;
+        let mut overdue = 0_usize;
+        let mut window_unreadable = false;
+        for entry in sessions.values() {
+            match entry.run_start_health() {
+                crate::run_progress::RunStartHealth::Overdue => overdue += 1,
+                crate::run_progress::RunStartHealth::Unreadable => window_unreadable = true,
+                crate::run_progress::RunStartHealth::Clear => {}
+            }
+        }
+        if overdue == 0 && window_unreadable {
+            None
+        } else {
+            Some(overdue)
+        }
     }
 
     #[cfg(test)]

@@ -3788,6 +3788,13 @@ impl DriverEntry {
         }
     }
 
+    pub(crate) fn run_start_window_handle(&self) -> crate::run_progress::SharedRunStartWindowCell {
+        match self {
+            DriverEntry::Ephemeral(d) => d.run_start_window_handle(),
+            DriverEntry::Persistent(d) => d.inner_ref().run_start_window_handle(),
+        }
+    }
+
     pub(crate) fn ledger(&self) -> &crate::input_ledger::InputLedger {
         match self {
             DriverEntry::Ephemeral(d) => d.ledger(),

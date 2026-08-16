@@ -5938,13 +5938,16 @@ async fn process_queue(
                 // clock and its watchdog start here rather than at `apply`.
                 let staged_at = crate::run_progress::Instant::now();
                 let turn_start_signal = crate::run_progress::TurnStartSignalCell::default();
-                let (staged_directed_interaction_ids, shared_dsl_authority) = {
+                let (staged_directed_interaction_ids, shared_dsl_authority, run_start_window) = {
                     let driver_guard = driver.lock().await;
                     let shared_dsl_authority = driver_guard.shared_dsl_authority();
+                    let run_start_window = driver_guard.run_start_window_handle();
                     match crate::meerkat_machine::driver::machine_staged_directed_interaction_ids(
                         &driver_guard,
                     ) {
-                        Ok(interaction_ids) => (interaction_ids, shared_dsl_authority),
+                        Ok(interaction_ids) => {
+                            (interaction_ids, shared_dsl_authority, run_start_window)
+                        }
                         Err(error) => {
                             drop(driver_guard);
                             drop(queue_authority_guard);
@@ -5962,6 +5965,14 @@ async fn process_queue(
                         }
                     }
                 };
+                // Session-scoped mechanical record of this window for the
+                // runtime host health census. The census recomputes the
+                // verdict from machine truth on every read, so this cell is
+                // never cleared: a stale window degrades to Clear through
+                // `run_is_current` / `applying_primitive`, never to a false
+                // Overdue. See the void condition on
+                // `SharedRunStartWindowCell` before adding any other reader.
+                run_start_window.arm(run_id.clone(), staged_at, turn_start_signal.clone());
                 // Read seam for the machine-owned "this run began executing"
                 // fact. Captured without the async driver lock - which the
                 // wedged party may itself be holding - so both supervisors can

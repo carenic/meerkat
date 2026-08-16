@@ -139,12 +139,21 @@ pub async fn handle_health(id: Option<RpcId>, runtime: &Arc<SessionRuntime>) -> 
 /// - `session_runtime_loop` - registered sessions still claiming a runtime loop
 ///   whose task is gone or whose channels are closed. `Degraded` when any
 ///   session is in that state.
+/// - `session_run_start` - registered sessions holding a staged run that is
+///   overdue to begin executing: staged past the watchdog's notice bound while
+///   machine authority still shows the run current with its primitive
+///   un-applied. `Degraded` when any session is in that state. The verdict is
+///   recomputed from machine truth per scrape - the same classification the
+///   staged-run watchdog logs - so this key and that log line cannot disagree.
+///   Runs whose execution start is honestly unobservable are never counted.
 ///
-/// **Every one of the three may instead answer "I could not look", and every
-/// one of the three reports that as `unreadable:<dimension>` rather than as a
+/// **Every one of the four may instead answer "I could not look", and every
+/// one of the four reports that as `unreadable:<dimension>` rather than as a
 /// `Measured` rung.** For the session probes the failed read is an unreadable
-/// session registry; for `jobs` it is a job-service snapshot or a delivery
-/// backlog that returned an error. This is the same rule the paragraph above
+/// session registry - and for `session_run_start` also a past-bound window
+/// whose machine authority could not be read without blocking, the holder of
+/// which is the prime suspect for the wedge itself; for `jobs` it is a
+/// job-service snapshot or a delivery backlog that returned an error. This is the same rule the paragraph above
 /// states, applied to this function's own checks: a `jobs: degraded` published
 /// off a failed snapshot read would be asserting a specific and actionable
 /// fault - the job service is in trouble - that nobody observed, and it is a
@@ -163,12 +172,16 @@ pub async fn handle_health(id: Option<RpcId>, runtime: &Arc<SessionRuntime>) -> 
 ///
 /// ## Not covered (published as `unmeasured:*`, never as healthy)
 ///
-/// - `session_liveness` - nothing here observes whether live sessions are
-///   *progressing*. A session whose loop task is alive and whose channels are
-///   open, but which is parked while machine-owned lane truth still holds
-///   selectable queued work, moves no value this handler reads. That signal
-///   needs a watchdog bridge, which is 0.8.24 work. No probe exists, so this
-///   one stays out of the rollup: a permanent amber light is a muted alarm.
+/// - `session_liveness` - nothing here observes the PRE-staging class: a
+///   session whose loop task is alive and whose channels are open, but which
+///   is parked while machine-owned lane truth still holds selectable queued
+///   work that never gets staged at all. `session_run_start` does not cover
+///   it and cannot: the staged-run window opens at the durable `StageForRun`
+///   commit, so work that never reaches staging never opens a window. (0.8.23
+///   claimed this class needed "a watchdog bridge"; that was wrong - the
+///   watchdog is also downstream of staging. It needs a lane-truth probe that
+///   does not exist yet.) No probe exists, so this one stays out of the
+///   rollup: a permanent amber light is a muted alarm.
 async fn runtime_health(runtime: &SessionRuntime) -> meerkat_contracts::RuntimeHostHealth {
     let observed_at_ms = meerkat_core::time_compat::SystemTime::now()
         .duration_since(meerkat_core::time_compat::UNIX_EPOCH)
@@ -201,7 +214,7 @@ async fn runtime_health(runtime: &SessionRuntime) -> meerkat_contracts::RuntimeH
             ),
         },
     };
-    // All three probes are attempted unconditionally, so every dimension this
+    // All four probes are attempted unconditionally, so every dimension this
     // handler owns is in the attempted set on every scrape. The only thing that
     // varies is whether the probe came back with a reading.
     let observations = vec![
@@ -213,6 +226,10 @@ async fn runtime_health(runtime: &SessionRuntime) -> meerkat_contracts::RuntimeH
         (
             "session_runtime_loop".to_string(),
             observed_session_population(runtime.dead_runtime_loop_session_count()),
+        ),
+        (
+            "session_run_start".to_string(),
+            observed_session_population(runtime.overdue_run_start_session_count()),
         ),
     ];
     meerkat::surface::build_runtime_host_health_from_observations(observations)
