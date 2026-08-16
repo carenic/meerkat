@@ -15,11 +15,47 @@ via cargo-semver-checks against the published baselines).
 
 ### Breaking
 
+**Some entries below are BEHAVIOUR-ONLY: a public function keeps its signature
+and changes what it does. `cargo-semver-checks` cannot see those, so the
+`semver-breaks` gate stays green through them. They are declared here by hand
+and tagged inline. Read this section rather than trusting the gate - the gate
+checks that this section EXISTS, not that it covers every break.**
+
 - The facade's and `meerkat-mob`'s `atif` re-export moves behind a new
   off-by-default `atif` feature on each crate (`meerkat/atif`,
   `meerkat-mob/atif`). Hosts that referenced `meerkat::atif` or
   `meerkat_mob::atif` must enable the feature; `rkat` and `rkat-rpc` depend on
   `meerkat-atif` directly and are unaffected.
+- BEHAVIOUR-ONLY, NO TOOL WILL CATCH THIS:
+  `meerkat::surface::build_runtime_host_health()` now returns
+  `status: Degraded` with four `unmeasured:<dimension>` entries where it
+  previously returned `status: Ok` with an empty `checks` map. The signature is
+  unchanged. It is the "probed nothing" projection, and returning `Ok` from it
+  meant any caller that forgot to supply a real reading shipped an invisible
+  clean bill of health. An embedder calling it directly, or embedding it via
+  `build_runtime_host_info()`, gets the loud default instead; supply your own
+  measured value if you want a rollup that reflects a probe.
+- BEHAVIOUR-ONLY, NO TOOL WILL CATCH THIS:
+  `rkat storage migrate --apply --bridge-pre-0-8-10` no longer aborts the realm
+  on the first domain that cannot be authenticated. It attempts every domain,
+  commits the ones that succeed, and reports each refusal with a typed
+  classification. A script that treated a non-zero exit as "nothing changed" is
+  now wrong: read the per-domain report, which the CLI prints on failure as
+  well as on success.
+- `meerkat_sqlite::SchemaDomain` gains a `bridge_recoverable_versions` field.
+  Any out-of-tree construction of that struct literal must supply it; an empty
+  slice declares that no offline bridge recovers the domain.
+- `meerkat_sqlite::MaintenanceBridgeReport` and `MaintenancePrepareReport` NO
+  LONGER DERIVE `Copy`, because each gained a `refused` field listing the
+  records the bridge could not carry forward. This is the least visible break
+  in the release: code that relied on implicit copies (`let a = report;` and
+  then using `report` again) stops compiling without ever having named `Copy`,
+  and the compiler error points at the use rather than the change. Both types
+  still derive `Clone`.
+- `SqliteStoreError::UnledgeredDomainObjects` and
+  `StoreError::UnledgeredDomainObjects` gain a `bridgeable` field carrying
+  whether the pre-0.8.10 bridge can actually authenticate that domain's
+  on-disk shape. Exhaustive struct-variant patterns must bind or ignore it.
 - `meerkat_sqlite::SqliteStoreError` gains a `WalConversionContended` variant.
   The enum is not `#[non_exhaustive]`, so a downstream matching it exhaustively
   must add an arm. It is returned where an exhausted WAL-conversion retry
