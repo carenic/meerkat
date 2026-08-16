@@ -72,6 +72,24 @@ checks that this section EXISTS, not that it covers every break.**
   foreign route now fails closed. An embedder that relied on displacement gets
   `CommsRuntimeError::InprocRegistrationRejected` where it used to get a working
   runtime. This is the intended fix, and it is a behaviour break.
+  **IF YOUR TEST SUITE JUST WENT RED, START HERE.** The pattern that trips is
+  a suite that constructs MORE THAN ONE RUNTIME IN A SINGLE PROCESS UNDER THE
+  SAME PARTICIPANT NAME - typically a shared `build_test_runtime()` helper
+  called once per test. Before this release the second and later registrations
+  silently displaced the first and handed back a working runtime, so every test
+  after the first was running against a route it had taken from its
+  predecessor. That was never isolation; it was a collision that happened to be
+  survivable. This release refuses it, so those tests now fail at construction.
+  **The message will not lead you here on its own.** It reads
+  `the participant name already has a live route under a different public key
+  ed25519:...`, which names the key and sends you to key management, rotation
+  or trust config - none of which is the problem. The fix is to give each
+  runtime its own participant name, or to retire the previous route
+  (`CommsRuntime::retire_inproc_route`, or `publish_replacing` when you hold
+  the predecessor handle deliberately).
+  Production code is usually unaffected: one runtime per process has no second
+  registration to collide with. Reported from the field by an adopter whose
+  21 failing tests were all this, and whose production path was not.
 - `meerkat_core::ops::ToolAccessPolicy` gains a `ReadOnly` variant. The enum is
   not `#[non_exhaustive]`, so exhaustive matches break.
   **READ THIS BEFORE ENABLING READ-ONLY ANYWHERE: it makes rollback one-way for
