@@ -1294,7 +1294,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum(
                 "SessionRegistrationRejectReasonKind",
-                &["RuntimeEpochConflict"],
+                &["RuntimeEpochConflict", "UnregisterTeardownInProgress"],
             ),
             NamedTypeBinding::string_enum(
                 "OperationPublicResultClass",

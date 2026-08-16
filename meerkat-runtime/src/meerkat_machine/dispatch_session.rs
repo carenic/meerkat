@@ -2244,8 +2244,9 @@ impl MeerkatMachine {
             Ok(staged) => {
                 // The machine may ACCEPT the registration and return a refusal
                 // verdict (a different entry epoch is registered under this
-                // session id). Surface it as stale authority; never let it read
-                // as an idempotent no-op.
+                // session id, or the entry is still inside its unregister drain
+                // window). The verdict's reason kind owns the typed error;
+                // never let a refusal read as an idempotent no-op.
                 if let Some(refusal) = staged.effects.session_registration_refusal() {
                     release_failed_materialization_claim(
                         &materialization_claim_state,
@@ -2260,9 +2261,7 @@ impl MeerkatMachine {
                         &materialization_claim_state,
                     )
                     .await;
-                    return Err(RuntimeDriverError::StaleAuthority {
-                        reason: format!("session {session_id}: {refusal}"),
-                    });
+                    return Err(refusal.into_runtime_driver_error(&session_id));
                 }
                 if staged.revived_stopped_session() {
                     // Machine-emitted revival: refresh the durable lifecycle
@@ -2977,23 +2976,22 @@ impl MeerkatMachine {
         match command {
             MeerkatMachineCommand::RegisterSession { session_id } => {
                 let sid = session_id.clone();
-                let registration = self.register_session_inner(session_id).await?;
-                if matches!(
-                    registration,
-                    super::session_management::RegisterSessionInnerOutcome::InsertedColdRecoveredDraining
-                ) {
-                    // The generated Draining image was reconstructed from the
-                    // durable unregister retry record while inserting this
-                    // entry. RegisterSession correctly rejects Draining, so
-                    // re-staging it here would turn successful mechanical
-                    // recovery into a false registration failure and strand
-                    // the canonical unregister retry. This exact insertion
-                    // witness is the only bypass: an already-resident
-                    // Draining entry still reaches the generated rejection
-                    // below, and binding/actor preparation keeps staging its
-                    // own RegisterSession input and therefore remains fenced.
-                    return Ok(MeerkatMachineCommandResult::Unit);
-                }
+                // A generated Draining image reconstructed from the durable
+                // unregister retry record is CONCLUDED here, not bypassed.
+                // Through 0.8.23 this arm returned `Unit` on that witness -
+                // reporting success for a registration the authority had not
+                // admitted - and left the entry Draining, so every later
+                // registration (binding preparation included) was guard-rejected
+                // for the life of the durable record. Settling reuses the same
+                // teardown `ensure_runtime_executor_attachment` joins.
+                let registration = self
+                    .register_session_settling_cold_recovered_drain(&sid, None)
+                    .await?;
+                debug_assert!(
+                    registration
+                        != super::session_management::RegisterSessionInnerOutcome::InsertedColdRecoveredDraining,
+                    "settled registration must not remain in a cold-recovered drain window"
+                );
                 let _registration_gate_guard = self.lock_registration_gate(&sid).await?;
                 // The entry that `register_session_inner` just published owns
                 // the runtime epoch this registration restates.
@@ -3037,9 +3035,7 @@ impl MeerkatMachine {
                     }
                 };
                 if let Some(refusal) = staged.effects.session_registration_refusal() {
-                    return Err(RuntimeDriverError::StaleAuthority {
-                        reason: format!("session {sid}: {refusal}"),
-                    });
+                    return Err(refusal.into_runtime_driver_error(&sid));
                 }
                 Ok(MeerkatMachineCommandResult::Unit)
             }

@@ -5834,47 +5834,48 @@ async fn cold_recovery_resumes_typed_v3_unregister_progress() {
         store.clone() as Arc<dyn crate::store::RuntimeStore>,
         memory_blob_store(),
     ));
+    // The typed v3 prefix above is what a fresh process replays; that replay is
+    // pinned directly by
+    // `session_management::unregister_progress_recovery_tests::durable_unregister_progress_replays_through_generated_feedback`.
+    // What this test owns from here is what the recovering process DOES with it.
+    //
+    // Through 0.8.23 that was: nothing. The cold registration reconstructed the
+    // Draining image and stopped, and this test asserted that a second
+    // `register_session`, `prepare_bindings`, and `prepare_local_session_bindings`
+    // must then all FAIL - the resume wedge encoded as contract. Nothing
+    // concludes a drain whose producers died with their process, so those
+    // refusals were permanent: the session could never be registered again. A
+    // registration now CONCLUDES the recovered teardown through its owning
+    // authority and re-admits on a fresh one.
     recovered_machine
         .register_session(session_id.clone())
         .await
-        .expect("fresh process should recover the partial Draining epoch");
-    let recovered = recovered_machine
+        .expect("a registration must conclude a cold-recovered drain, not wedge behind it");
+    let settled = recovered_machine
         .session_dsl_state(&session_id)
         .await
-        .expect("recovered generated unregister authority");
-    assert_eq!(
-        recovered.registration_phase,
-        mm_dsl::RegistrationPhase::Draining
+        .expect("settled authority remains registered");
+    assert_ne!(
+        settled.registration_phase,
+        mm_dsl::RegistrationPhase::Draining,
+        "concluded teardown must leave a registrable authority"
     );
-    assert!(!recovered.unregister_runtime_loop_drain_pending);
-    assert!(recovered.unregister_comms_drain_exit_pending);
-    assert!(recovered.unregister_completion_waiter_drain_pending);
-    assert!(
-        recovered_machine
-            .register_session(session_id.clone())
-            .await
-            .is_err(),
-        "only the insertion that mechanically recovers Draining may succeed; an existing Draining entry must still receive the generated RegisterSession rejection"
-    );
-    assert!(
-        recovered_machine
-            .prepare_bindings(session_id.clone())
-            .await
-            .is_err(),
-        "cold-recovered Draining must not expose authoritative actor bindings"
-    );
-    assert!(
-        recovered_machine
-            .prepare_local_session_bindings(session_id.clone())
-            .await
-            .is_err(),
-        "cold-recovered Draining must not expose local actor resources"
-    );
+    assert!(!settled.unregister_runtime_loop_drain_pending);
+    assert!(!settled.unregister_comms_drain_exit_pending);
+    assert!(!settled.unregister_completion_waiter_drain_pending);
+    recovered_machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("a settled session exposes authoritative actor bindings");
+    recovered_machine
+        .prepare_local_session_bindings(session_id.clone())
+        .await
+        .expect("a settled session exposes local actor resources");
 
     recovered_machine
         .unregister_session(&session_id)
         .await
-        .expect("cold-recovered saga should close only its remaining obligations");
+        .expect("the re-admitted session unregisters cleanly");
     assert!(!recovered_machine.contains_session(&session_id).await);
     let durable_final = crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id)
         .await
@@ -5882,6 +5883,80 @@ async fn cold_recovery_resumes_typed_v3_unregister_progress() {
         .expect("final lifecycle record should remain queryable");
     assert_eq!(durable_final.unregister_progress(), None);
     assert_eq!(durable_final.binding().agent_runtime_id(), None);
+}
+
+/// OWNER REPRO (0.8.23): a first turn that fails terminally leaves the CLI
+/// unable to finish teardown ("Unregister teardown is still in progress for
+/// runtime rt:session:..."), and the process exits with the drain window
+/// durably open. Every later `rkat --resume` then died on
+/// "DSL authority (RegisterSession): guard rejected transition from Idle for
+/// input::RegisterSession" - a durable dead end, not a race that clears.
+///
+/// An incomplete teardown is a warning about cleanup. It must not be a verdict
+/// that the session may never run again.
+#[tokio::test]
+async fn failed_first_turn_with_incomplete_teardown_still_resumes() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store = Arc::new(RuntimeCommitAtomicityStore::pass_through(Arc::clone(
+        &inner,
+    )));
+    let runtime_id;
+    let session_id = SessionId::new();
+
+    // Process A: the session runs, the turn fails terminally, and CLI shutdown
+    // cannot finish teardown before the process goes away.
+    {
+        let first_process = Arc::new(MeerkatMachine::persistent(
+            store.clone() as Arc<dyn crate::store::RuntimeStore>,
+            memory_blob_store(),
+        ));
+        runtime_id = runtime_id_for_session(&session_id);
+        first_process
+            .prepare_bindings(session_id.clone())
+            .await
+            .expect("first turn prepares its runtime bindings");
+        // Fail the comms drain disposition write, leaving a real typed partial
+        // drain prefix durable - the shape a process loss mid-teardown leaves.
+        let calls_before = store.commit_machine_lifecycle_calls();
+        store.fail_commit_machine_lifecycle_on_call(calls_before + 3);
+        first_process
+            .unregister_session(&session_id)
+            .await
+            .expect_err("CLI shutdown cannot conclude teardown");
+    }
+    let durable_partial = crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id)
+        .await
+        .expect("load partial lifecycle")
+        .expect("a partial teardown must leave a durable retry record")
+        .unregister_progress()
+        .cloned()
+        .expect("the durable record must carry the open drain obligations");
+    assert!(
+        durable_partial.comms_drain_exit_pending()
+            || durable_partial.completion_waiter_drain_pending()
+            || durable_partial.runtime_loop_drain_pending(),
+        "the repro requires at least one obligation left open across the process boundary"
+    );
+
+    // Process B: `rkat --resume`.
+    let resumed_process = Arc::new(MeerkatMachine::persistent(
+        store.clone() as Arc<dyn crate::store::RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let bindings = resumed_process
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("resume after a failed first turn must not be permanently refused");
+    assert_eq!(bindings.session_id(), &session_id);
+    let resumed = resumed_process
+        .session_dsl_state(&session_id)
+        .await
+        .expect("resumed authority is registered");
+    assert_ne!(
+        resumed.registration_phase,
+        mm_dsl::RegistrationPhase::Draining,
+        "a resumed session must not remain inside the previous process's drain window"
+    );
 }
 
 #[tokio::test]
@@ -8960,6 +9035,9 @@ fn re_registration_is_idempotent_on_same_epoch_and_a_typed_verdict_on_a_differen
             reason: mm_dsl::SessionRegistrationRejectReasonKind::RuntimeEpochConflict,
             registered_runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-a".to_string())),
             attempted_runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-b".to_string())),
+            unregister_runtime_loop_drain_pending: false,
+            unregister_comms_drain_exit_pending: false,
+            unregister_completion_waiter_drain_pending: false,
         }],
         "the refusal must name both epochs so the surface can align its error"
     );
