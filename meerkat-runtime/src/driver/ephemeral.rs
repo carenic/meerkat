@@ -347,6 +347,14 @@ impl EphemeralRuntimeDriver {
         self.sync_control_projection_from_dsl_authority();
     }
 
+    /// Test seam: seed one ledger row directly, bypassing admission. The
+    /// parked-work census tests use this to pair a synthetic queued phase in
+    /// the DSL authority with a ledger clock they control.
+    #[cfg(test)]
+    pub(crate) fn insert_input_state_for_test(&mut self, state: crate::input_state::InputState) {
+        self.ledger.accept(state);
+    }
+
     pub(crate) fn session_authority_id_for_recovery(&self) -> mm_dsl::SessionId {
         self.with_dsl_state(|state| state.session_id.clone())
             .unwrap_or_else(|| self.contract_session_authority_id())

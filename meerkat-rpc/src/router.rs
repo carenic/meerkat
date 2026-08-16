@@ -4840,10 +4840,10 @@ mod tests {
         );
         assert_eq!(capabilities["result"]["features"]["approvals"], false);
         assert_eq!(health["result"]["checks"]["jobs"], "ok");
-        // Nothing is wrong with this host and every measurement says so, so the
-        // rollup is `ok`. What it is *not* saying is "everything is covered":
-        // `checks` still carries `unmeasured:session_liveness`, asserted in
-        // `runtime_health_names_unmeasured_dimensions_and_rolls_up_measured_ones`.
+        // Nothing is wrong with this host and every measurement says so, so
+        // the rollup is `ok`. Every declared dimension is measured on this
+        // surface; the remaining coverage boundary (mid-turn progress, which
+        // has no declared dimension yet) is documented on `runtime_health`.
         assert_eq!(
             health["result"]["status"], "ok",
             "a host with no measured fault must not stand permanently amber: {health}"
@@ -4945,15 +4945,19 @@ mod tests {
             .as_object()
             .expect("health payload carries a checks map");
 
-        // Measured. The three session dimensions are read off live runtime
+        // Measured. The four session dimensions are read off live runtime
         // state, so their presence here is the wiring pin: a handler that
         // forgot to insert them would publish `unmeasured:*` instead and fail
-        // on the next assertion block.
+        // on the next assertion block. `session_liveness` earning its place in
+        // this list is the point of the lane-truth probe: 0.8.23 shipped it
+        // honestly unmeasured, and the field promptly produced a five-day
+        // outage in exactly that class.
         for measured in [
             "jobs",
             "session_durability",
             "session_runtime_loop",
             "session_run_start",
+            "session_liveness",
         ] {
             assert_eq!(
                 checks.get(measured).and_then(serde_json::Value::as_str),
@@ -4966,18 +4970,13 @@ mod tests {
             );
         }
 
-        // Unmeasured, and named rather than omitted. Nothing here observes
-        // the PRE-staging class: a session whose loop task is alive and whose
-        // channels are open, but which is parked on selectable queued work
-        // that never gets staged. `session_run_start` cannot see it - its
-        // window opens at the durable StageForRun commit - so the payload
-        // says so rather than implying coverage.
-        assert_eq!(
-            checks
-                .get("unmeasured:session_liveness")
-                .and_then(serde_json::Value::as_str),
-            Some("degraded"),
-            "runtime/health must name `unmeasured:session_liveness`: {result}"
+        // Every declared dimension is measured on this surface, so no
+        // `unmeasured:*` key may remain: a leftover one would mean a probe was
+        // wired without clearing its coverage claim, or a dimension was
+        // declared without a probe.
+        assert!(
+            !checks.keys().any(|key| key.starts_with("unmeasured:")),
+            "every declared dimension is probed on this surface: {result}"
         );
 
         // The third coverage vocabulary, absent here on purpose. On a readable
@@ -5002,6 +5001,7 @@ mod tests {
             "session_durability",
             "session_runtime_loop",
             "session_run_start",
+            "session_liveness",
         ]
         .into_iter()
         .filter_map(|key| checks.get(key).and_then(serde_json::Value::as_str))

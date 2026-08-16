@@ -247,22 +247,26 @@ impl SharedRunStartWindowCell {
 /// executing window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStartHealth {
-    /// Nothing to report: no window was ever armed, the window is still
-    /// inside the notice bound, or machine truth says the window is not a
-    /// wedge - the run began executing, moved on, or its execution start is
-    /// honestly unobservable ([`RunExecutionProgress::RuntimeUnbound`] /
-    /// [`RunExecutionProgress::ExecutionStartUnobservable`], which the
-    /// escalation bound can never arm on either).
+    /// A POSITIVE fact resolved the window: no window was ever armed, the
+    /// window is still inside the notice bound, machine truth shows the run
+    /// began executing, or machine truth shows the run is no longer current
+    /// (it moved on, however it ended). Nothing else folds here: an absence
+    /// of observation is not health.
     Clear,
     /// The window has been open past the notice bound and machine authority
     /// positively shows this exact run still current with its primitive
     /// un-applied: the staged -> executing wedge, observed.
     Overdue,
-    /// The window is past the notice bound and machine authority could not be
-    /// read without blocking, so neither `Clear` nor `Overdue` was
-    /// established. Not a rung and never an escalation - but also not
-    /// silence, because the party holding that authority is the prime
-    /// suspect for the wedge this read exists to see.
+    /// The window is past the notice bound and neither `Clear` nor `Overdue`
+    /// was established: the authority could not be read without blocking, or
+    /// the window's run is STILL CURRENT but its start cannot be interpreted
+    /// (no runtime binding, or a turn start that was never signalled, so the
+    /// shared phase describes some other run). Not a rung and never an
+    /// escalation - but also not silence: an unread authority's holder is the
+    /// prime suspect for the wedge, and a current run nobody can interpret
+    /// has not been proven healthy by anyone. Both resolve on their own - the
+    /// lock frees, or the run terminalizes and stops being current - so this
+    /// is the per-scrape self-clearing class, never a standing amber.
     Unreadable,
 }
 
@@ -271,12 +275,30 @@ pub(crate) enum RunStartHealth {
 ///
 /// The verdict is a pure function of the armed window, the shared machine
 /// authority, and `notice`; nothing here is stored, latched, or trusted from
-/// an earlier tick. The classification is [`classify_execution_start`] via
-/// [`AuthorityRunExecutionProgress`] - the same read the staged-run watchdog
-/// uses - so the wire claim and the existing log line cannot disagree about
-/// what "overdue" means. A stale window degrades through the same facts:
+/// an earlier tick. The facts are the same [`RunTurnStateFacts`] the
+/// staged-run watchdog classifies, read through the same non-blocking seam,
+/// so the wire claim and the existing log line cannot disagree about what
+/// "overdue" means. A stale window degrades through the same facts:
 /// `run_is_current` fails once another run took over, and `applying_primitive`
 /// fails once the run progressed, so neither can produce a false `Overdue`.
+///
+/// The FOLD deliberately differs from [`classify_execution_start`] in one
+/// place, and the difference is the reporting tier's whole job.
+/// Classification gates phase interpretation on the turn-start signal BEFORE
+/// resolving run currency, because its consumer escalates - dropping the
+/// `apply` future on an unproven condition is forbidden, so anything
+/// uninterpretable must refuse loudly but harmlessly. Health has no such
+/// constraint and the opposite duty: it resolves CURRENCY first, because a
+/// window whose run is no longer current is positively resolved (the run
+/// moved on, however it ended - including the appends-empty and retired-drain
+/// classes that never signal, whose stale windows must not stand amber
+/// forever on a healthy idle session); while a window whose run IS still
+/// current but cannot be interpreted - unbound runtime, unsignalled turn
+/// start - is an ABSENCE of observation, and an absence may not publish as
+/// health. Those fold to [`RunStartHealth::Unreadable`], which self-clears
+/// the moment the run terminalizes and stops being current. Folding them to
+/// `Clear` would render "I cannot see" as "healthy", which is the exact
+/// defect this whole projection exists to remove.
 pub(crate) fn observe_run_start_window(
     cell: &SharedRunStartWindowCell,
     authority: &crate::driver::ephemeral::SharedIngressDslAuthority,
@@ -288,15 +310,241 @@ pub(crate) fn observe_run_start_window(
     if window.staged_at.elapsed() < notice {
         return RunStartHealth::Clear;
     }
-    let progress = AuthorityRunExecutionProgress::new(Arc::clone(authority), window.turn_start);
-    match progress.observe(&window.run_id) {
-        RunExecutionProgress::PrimitiveUnapplied => RunStartHealth::Overdue,
-        RunExecutionProgress::Unreadable => RunStartHealth::Unreadable,
-        RunExecutionProgress::Executing
-        | RunExecutionProgress::RunNotCurrent
-        | RunExecutionProgress::RuntimeUnbound
-        | RunExecutionProgress::ExecutionStartUnobservable => RunStartHealth::Clear,
+    let Some((facts, signal)) =
+        read_run_turn_state_facts(authority, &window.run_id, &window.turn_start)
+    else {
+        return RunStartHealth::Unreadable;
+    };
+    // Positive resolution first: the run moved on, so the window is over.
+    if !facts.run_is_current {
+        return RunStartHealth::Clear;
     }
+    // A current run this read cannot interpret is an absence of observation,
+    // never a clean bill of health.
+    if !facts.runtime_bound || signal == TurnStartSignal::NotSignalled {
+        return RunStartHealth::Unreadable;
+    }
+    if facts.applying_primitive {
+        RunStartHealth::Overdue
+    } else {
+        RunStartHealth::Clear
+    }
+}
+
+/// How long an admitted input may sit queued while the session has no run in
+/// flight before the condition is reported as parked work.
+///
+/// Deliberately equal to [`RUN_EXECUTION_START_NOTICE`], so "overdue" means
+/// one thing across the whole staged-and-earlier pipeline: a run staged this
+/// long without beginning, and an input queued this long with nothing running
+/// at all, are the same rung of the same alarm. The queued case is if anything
+/// the stronger claim - the predicate below only fires when `current_run_id`
+/// is `None`, so the loop had nothing else to do and ordinary staging latency
+/// is its wake-up latency, not a turn. Two minutes of parked-with-work-while-
+/// idle is already the wedge.
+///
+/// The bound is meerkat-derived on purpose. The household fleet's own
+/// input-queue fuse fires at 300s; that number reflects their turn mix and
+/// remains their layer of defense in depth. A wire claim published by this
+/// runtime should not import another system's tuning.
+pub(crate) const QUEUED_INPUT_START_NOTICE: Duration = RUN_EXECUTION_START_NOTICE;
+
+/// How many stage attempts a still-queued input may accumulate before the
+/// churn axis of the parked-work census reports it, independent of any clock.
+///
+/// This axis exists because the queued-age clock is structurally defeated by
+/// exactly the state it most needs to see: the rollback path re-stamps
+/// `InputState::updated_at` on every Staged -> Queued return (the ledger
+/// bookkeeping in `resolve_staged_rollbacks`), so an input flapping through
+/// stage -> fail -> rollback faster than the notice bound reads as
+/// forever-fresh on the age axis - and the flapping member is the MORE
+/// alarming one, not the less. Stage attempts are the machine's own count
+/// (`input_attempt_counts`, incremented by `StageForRun`), untouched by the
+/// re-stamp: an input that is QUEUED with two or more attempts has been
+/// staged and thrown back at least twice without completing.
+///
+/// Two is the smallest count that is churn rather than incident: one attempt
+/// followed by a rollback is an ordinary recovery the machine performed once.
+/// The tier above this is the machine's own `max_stage_attempts` abandonment
+/// cap, which terminalizes the input - this census only makes the road there
+/// visible.
+pub(crate) const PARKED_STAGE_CHURN_ATTEMPTS: u64 = 2;
+
+/// Which axis of the parked-work predicate established the verdict, so a
+/// consumer (a test, a log line, an operator reading a trace) is told rather
+/// than left to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParkedQueuedWorkAxis {
+    /// The input entered its current queued state more than the notice bound
+    /// ago and has simply never been staged.
+    AgedInQueue,
+    /// The input has been staged and rolled back at least
+    /// [`PARKED_STAGE_CHURN_ATTEMPTS`] times and is queued again with nothing
+    /// running: churning, not progressing. Its age clock is meaningless -
+    /// every rollback resets it.
+    StageChurn,
+}
+
+/// What one out-of-band read established about a session's queued-but-idle
+/// work.
+///
+/// This is the PRE-staging sibling of [`RunStartHealth`], and the exact class
+/// the 2026-08-16 field incident occupied for five days: a session that
+/// resumed cleanly on every boot, kept its loop task alive and its channels
+/// open, and held peer inputs in the machine's queued phase without ever
+/// staging them - `queue_mode: fifo` turning one parked input into a total
+/// member outage. Every registration-shaped probe read it as healthy, because
+/// registration was healthy; the wedge was visible only in lane truth plus
+/// time (or, for a stage-churning input whose clock resets on every rollback,
+/// lane truth plus the machine's own attempt count).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParkedQueuedWorkHealth {
+    /// Nothing to report: no queued work, a run is in flight (queued work
+    /// waiting behind a live turn is a backlog, not a wedge), the executor
+    /// registration is not `Active` (nothing could stage), or no queued input
+    /// trips either axis.
+    Clear,
+    /// The session's registration is `Active`, no run is in flight, and
+    /// machine lane truth holds at least one queued input that either aged
+    /// past the notice bound or churned past the stage-attempt threshold:
+    /// work somebody handed this session, which it is not moving, while doing
+    /// nothing else. The axis says which.
+    Parked(ParkedQueuedWorkAxis),
+    /// One of the two structures this predicate reads could not be read
+    /// without blocking, so neither `Clear` nor `Parked` was established.
+    /// Never a rung and never an escalation - and not silence either, because
+    /// a holder wedged on either lock is a prime suspect for the parked state
+    /// itself.
+    Unreadable,
+}
+
+/// Recompute one session's parked-queued-work health from machine truth plus
+/// the ledger's own per-input clocks.
+///
+/// The verdict is a pure function of the shared generated authority, the
+/// input ledger, `notice`, and `now`; nothing is stored, latched, or trusted
+/// from an earlier tick, so nothing here can go stale in either direction.
+/// The predicate has TWO AXES, because either one alone is structurally
+/// blind to a real wedge shape:
+///
+/// - **Aged in queue** ([`ParkedQueuedWorkAxis::AgedInQueue`]): the input's
+///   [`InputState::updated_at`] - the instant it entered its CURRENT state -
+///   is older than `notice`. This is the cleanly-parked shape: admitted,
+///   never staged, nothing running. `updated_at` rather than `created_at` so
+///   an input staged once and rolled back does not carry its pre-staging age
+///   into the fresh queue entry.
+/// - **Stage churn** ([`ParkedQueuedWorkAxis::StageChurn`]): the machine's
+///   own `input_attempt_counts` for the input has reached
+///   [`PARKED_STAGE_CHURN_ATTEMPTS`] while the input is queued again with
+///   nothing running, and the input has existed (`created_at`) for at least
+///   `notice`. This axis exists because the age axis CANNOT see a flapping
+///   input: the rollback path re-stamps `updated_at` on every Staged ->
+///   Queued return, so stage -> fail -> rollback loops faster than `notice`
+///   read as forever-fresh - and the flapping member is the more alarming
+///   one. The `created_at` floor keeps a young input inside its ordinary
+///   first-bounces window from being read as churn; unlike `updated_at`,
+///   `created_at` is written once and never re-stamped, and the attempt
+///   count - not age - is what carries the churn claim.
+///
+/// Lane truth (which inputs are queued, whether a run is in flight, whether
+/// registration is `Active`, the attempt counts) is read from the generated
+/// machine authority - the DSL is the sole writer of `input_phases` and
+/// `input_attempt_counts`. The clocks come from the ledger's per-input shell
+/// state.
+///
+/// The two locks are taken strictly in sequence, never nested: the authority
+/// read completes and releases before the driver lock is attempted, so this
+/// probe can never hold one contended lock while waiting on the other. Both
+/// acquisitions are non-blocking tries; either miss reports
+/// [`ParkedQueuedWorkHealth::Unreadable`]. In particular the ledger is read
+/// through the driver's own `tokio` mutex with `try_lock` - the wedged party
+/// may be holding it, and a health probe that can park behind the wedge it
+/// reports is the joke version of this fix.
+///
+/// A queued id with no ledger row is skipped rather than counted: the ledger
+/// carries a row for every admitted input by construction, so the miss is a
+/// transient mid-mutation window, and counting it would assert an age nobody
+/// measured.
+///
+/// # Void condition
+///
+/// **The moment any admission, dispatch, backpressure or lifecycle path
+/// branches on this observation, it becomes a semantic fact, needs a machine
+/// owner, and this design is void.** The only permitted consumer is the
+/// runtime host health census
+/// (`MeerkatMachine::parked_queued_input_session_count`), which is read-only
+/// by contract. The `run_start_window_stays_out_of_machine_authority` test
+/// pins this boundary with a source grep over the machine-authority files.
+pub(crate) fn observe_parked_queued_work(
+    authority: &crate::driver::ephemeral::SharedIngressDslAuthority,
+    driver: &crate::meerkat_machine::driver::SharedDriver,
+    notice: Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ParkedQueuedWorkHealth {
+    // Stage 1: machine lane truth, released before stage 2 begins.
+    //
+    // Deliberately a direct authority read, NOT `with_dsl_state` on the
+    // driver: that helper takes the dsl mutex BLOCKING from inside the driver
+    // lock, which would nest the two locks this probe must never nest. Anyone
+    // extending this census with another machine fact must add it to THIS
+    // read, not reach through the driver.
+    let queued_inputs: Vec<(String, u64)> = {
+        let authority = match authority.try_lock() {
+            Ok(authority) => authority,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return ParkedQueuedWorkHealth::Unreadable;
+            }
+        };
+        let state = authority.state();
+        if state.registration_phase != mm_dsl::RegistrationPhase::Active {
+            return ParkedQueuedWorkHealth::Clear;
+        }
+        if state.current_run_id.is_some() {
+            return ParkedQueuedWorkHealth::Clear;
+        }
+        state
+            .input_phases
+            .iter()
+            .filter(|(_, phase)| **phase == mm_dsl::InputPhase::Queued)
+            .map(|(key, _)| {
+                let attempts = state.input_attempt_counts.get(key).copied().unwrap_or(0);
+                (key.clone(), attempts)
+            })
+            .collect()
+    };
+    if queued_inputs.is_empty() {
+        return ParkedQueuedWorkHealth::Clear;
+    }
+
+    // Stage 2: the ledger's per-input clocks, under the driver's own mutex.
+    let driver = match driver.try_lock() {
+        Ok(driver) => driver,
+        Err(_) => return ParkedQueuedWorkHealth::Unreadable,
+    };
+    let ledger = driver.ledger();
+    let past = |since: chrono::DateTime<chrono::Utc>| {
+        now.signed_duration_since(since)
+            .to_std()
+            .is_ok_and(|elapsed| elapsed >= notice)
+    };
+    for (key, attempts) in &queued_inputs {
+        // Production writes `input_phases` keys as `InputId::to_string()`, so
+        // an unparseable key names nothing the ledger could hold.
+        let Some(input_id) = uuid::Uuid::parse_str(key).ok().map(InputId::from_uuid) else {
+            continue;
+        };
+        let Some(state) = ledger.get(&input_id) else {
+            continue;
+        };
+        if past(state.updated_at()) {
+            return ParkedQueuedWorkHealth::Parked(ParkedQueuedWorkAxis::AgedInQueue);
+        }
+        if *attempts >= PARKED_STAGE_CHURN_ATTEMPTS && past(state.created_at) {
+            return ParkedQueuedWorkHealth::Parked(ParkedQueuedWorkAxis::StageChurn);
+        }
+    }
+    ParkedQueuedWorkHealth::Clear
 }
 
 /// The exact machine facts an execution-start observation is computed from.
@@ -431,26 +679,41 @@ impl AuthorityRunExecutionProgress {
 
 impl RunExecutionProgressSource for AuthorityRunExecutionProgress {
     fn observe(&self, run_id: &RunId) -> RunExecutionProgress {
-        // `try_lock` is deliberate: a wedged holder of this authority must not
-        // be able to wedge the supervisor too. An unreadable authority is an
-        // unprovable one, which never escalates.
-        let authority = match self.authority.try_lock() {
-            Ok(authority) => authority,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return RunExecutionProgress::Unreadable,
-        };
-        let state = authority.state();
-        let current = state
-            .current_run_id
-            .as_ref()
-            .and_then(crate::meerkat_machine::dsl_authority::current_run_id_from_dsl);
-        let facts = RunTurnStateFacts {
-            runtime_bound: state.active_runtime_id.is_some(),
-            run_is_current: current.as_ref() == Some(run_id),
-            applying_primitive: state.turn_phase == mm_dsl::TurnPhase::ApplyingPrimitive,
-        };
-        classify_execution_start(facts, self.turn_start.signal())
+        match read_run_turn_state_facts(&self.authority, run_id, &self.turn_start) {
+            None => RunExecutionProgress::Unreadable,
+            Some((facts, signal)) => classify_execution_start(facts, signal),
+        }
     }
+}
+
+/// One non-blocking read of the machine facts an execution-start observation
+/// is computed from, plus the turn-start gate. `None` means the authority
+/// could not be read without blocking.
+///
+/// `try_lock` is deliberate: a wedged holder of this authority must not be
+/// able to wedge an observer too. An unreadable authority is an unprovable
+/// one, which never escalates.
+fn read_run_turn_state_facts(
+    authority: &crate::driver::ephemeral::SharedIngressDslAuthority,
+    run_id: &RunId,
+    turn_start: &TurnStartSignalCell,
+) -> Option<(RunTurnStateFacts, TurnStartSignal)> {
+    let authority = match authority.try_lock() {
+        Ok(authority) => authority,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    let state = authority.state();
+    let current = state
+        .current_run_id
+        .as_ref()
+        .and_then(crate::meerkat_machine::dsl_authority::current_run_id_from_dsl);
+    let facts = RunTurnStateFacts {
+        runtime_bound: state.active_runtime_id.is_some(),
+        run_is_current: current.as_ref() == Some(run_id),
+        applying_primitive: state.turn_phase == mm_dsl::TurnPhase::ApplyingPrimitive,
+    };
+    Some((facts, turn_start.signal()))
 }
 
 /// Non-escalating supervision of the whole staged -> executing window, loud in
@@ -1277,17 +1540,34 @@ mod tests {
             shared_authority_with(Some(run), mm_dsl::TurnPhase::ApplyingPrimitive, true);
         assert_eq!(
             observe_run_start_window(&armed_window(run, false), &authority, PAST_BOUND),
-            RunStartHealth::Clear,
-            "an unsignalled window's phase describes some other run; refusing to read it is the honest answer"
+            RunStartHealth::Unreadable,
+            "a CURRENT run whose start this read cannot interpret is an absence \
+             of observation; publishing it as Clear would render 'I cannot see' \
+             as 'healthy'. Folding this arm to Clear must turn this test red."
         );
     }
 
-    /// The other warn-tier carve-out: no runtime binding means the agent's
-    /// turn writes land somewhere this observer cannot see. The classification
-    /// checks `runtime_bound` before run identity, and machine recovery
-    /// forbids a current run on an unbound authority anyway, so the honest
-    /// unbound fixture carries no current run - the armed window still routes
-    /// through the `RuntimeUnbound` arm.
+    /// The anti-amber twin of the test above: an unsignalled window whose run
+    /// is NO LONGER CURRENT is positively resolved - the run moved on, however
+    /// it ended. This is the appends-empty / retired-drain stale-window shape:
+    /// those runs never signal, and a healthy idle session may hold such a
+    /// window for days. Folding it to Unreadable would stand that session
+    /// permanently amber, which is the muted-alarm defect from the other side.
+    #[tokio::test]
+    async fn census_clears_an_unsignalled_window_once_its_run_moved_on() {
+        let stale_run = uuid::Uuid::new_v4();
+        let authority = shared_authority_with(None, mm_dsl::TurnPhase::Ready, true);
+        assert_eq!(
+            observe_run_start_window(&armed_window(stale_run, false), &authority, PAST_BOUND),
+            RunStartHealth::Clear,
+            "a window whose run is no longer current is resolved, whatever its signal says"
+        );
+    }
+
+    /// No runtime binding on a STALE window: resolved by currency before the
+    /// binding is ever consulted. A stopped session (executor detached,
+    /// current run cleared) holding an old window must not read as anything
+    /// but Clear.
     #[tokio::test]
     async fn census_treats_an_unbound_runtime_as_unobservable_not_overdue() {
         let run = uuid::Uuid::new_v4();
@@ -1295,7 +1575,25 @@ mod tests {
         assert_eq!(
             observe_run_start_window(&armed_window(run, true), &authority, PAST_BOUND),
             RunStartHealth::Clear,
-            "an unbound runtime is unobservable, and unobservable never escalates"
+            "an unbound runtime with the window's run no longer current is a \
+             resolved window, not a wedge and not an unreadable"
+        );
+    }
+
+    /// No runtime binding on a CURRENT run: an absence of observation, so
+    /// Unreadable. The recovered state is unusual (Running with no bound
+    /// runtime) but no machine invariant forbids it, and the census guards
+    /// the branch rather than assuming it away.
+    #[tokio::test]
+    async fn census_reports_an_unbound_current_run_as_unreadable() {
+        let run = uuid::Uuid::new_v4();
+        let authority =
+            shared_authority_with(Some(run), mm_dsl::TurnPhase::ApplyingPrimitive, false);
+        assert_eq!(
+            observe_run_start_window(&armed_window(run, true), &authority, PAST_BOUND),
+            RunStartHealth::Unreadable,
+            "a current run whose writes land where this observer cannot see \
+             has not been proven healthy by anyone"
         );
     }
 
@@ -1379,6 +1677,13 @@ mod tests {
             "SharedRunStartWindowCell",
             "observe_run_start_window",
             "overdue_run_start",
+            "ParkedQueuedWorkHealth",
+            "ParkedQueuedWorkAxis",
+            "observe_parked_queued_work",
+            "parked_queued_work_health",
+            "parked_queued_input_session_count",
+            "QUEUED_INPUT_START_NOTICE",
+            "PARKED_STAGE_CHURN_ATTEMPTS",
         ];
         for file in files {
             let source = std::fs::read_to_string(&file)
@@ -1394,5 +1699,376 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Parked-queued-work census (`observe_parked_queued_work`)
+    //
+    // Like the staged-run census above, these route through the REAL
+    // generated authority and the REAL ledger clock, so voiding the
+    // run-in-flight exclusion, the queued-phase filter, or the age comparison
+    // each turns exactly one named test red.
+    // -----------------------------------------------------------------------
+
+    /// A shared generated authority whose registration, run, and input-phase
+    /// facts are exactly the given ones, recovered through the same path
+    /// production uses for projection previews.
+    fn parked_census_authority(
+        registration_active: bool,
+        current_run: Option<uuid::Uuid>,
+        inputs: &[(InputId, mm_dsl::InputPhase, u64)],
+    ) -> crate::driver::ephemeral::SharedIngressDslAuthority {
+        let session_id = meerkat_core::types::SessionId::new();
+        let authority =
+            crate::meerkat_machine::dsl_authority::new_registered_authority_without_runtime_entry(
+                &session_id,
+            )
+            .expect("parked census test authority must register");
+        let mut state = authority.state().clone();
+        if registration_active {
+            state.registration_phase = mm_dsl::RegistrationPhase::Active;
+        }
+        state.current_run_id = current_run.map(|run| mm_dsl::RunId(run.to_string()));
+        if current_run.is_some() {
+            state.lifecycle_phase = mm_dsl::MeerkatPhase::Running;
+            state.pre_run_phase = Some(mm_dsl::PreRunPhase::Attached);
+        }
+        for (input_id, phase, attempts) in inputs {
+            // Production writes these keys as `InputId::to_string()`
+            // (`driver/ephemeral.rs` phase reads use the same form), so the
+            // fixture must too or it would test a correspondence nothing uses.
+            state.input_phases.insert(input_id.to_string(), *phase);
+            state
+                .input_attempt_counts
+                .insert(input_id.to_string(), *attempts);
+            if *phase == mm_dsl::InputPhase::Queued {
+                state
+                    .input_lane
+                    .insert(input_id.to_string(), mm_dsl::InputLane::Queue);
+            }
+        }
+        Arc::new(std::sync::Mutex::new(
+            crate::meerkat_machine::recover_projected_authority(
+                state,
+                "parked census state must recover",
+            ),
+        ))
+    }
+
+    /// A real ephemeral driver entry whose ledger holds exactly the given
+    /// rows, each with controlled `updated_at` and `created_at` clocks.
+    fn parked_census_driver(
+        rows: &[(
+            InputId,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        )],
+    ) -> crate::meerkat_machine::driver::SharedDriver {
+        let session_id = meerkat_core::types::SessionId::new();
+        let mut driver = crate::driver::ephemeral::EphemeralRuntimeDriver::new(
+            crate::identifiers::LogicalRuntimeId::for_session(&session_id),
+        );
+        for (input_id, updated_at, created_at) in rows {
+            let mut state = crate::input_state::InputState::new_accepted(input_id.clone());
+            state.updated_at = *updated_at;
+            state.created_at = *created_at;
+            driver.insert_input_state_for_test(state);
+        }
+        Arc::new(crate::tokio::sync::Mutex::new(
+            crate::meerkat_machine::driver::DriverEntry::Ephemeral(driver),
+        ))
+    }
+
+    const PARKED_NOTICE: Duration = Duration::from_secs(120);
+
+    /// The positive pin: the exact field shape. Registration `Active`, no run
+    /// in flight, an input in the machine's queued phase, and its ledger
+    /// clock says it entered that state past the notice bound.
+    #[test]
+    fn parked_census_reports_queued_work_past_the_bound() {
+        let now = chrono::Utc::now();
+        let input_id = InputId::new();
+        let authority = parked_census_authority(
+            true,
+            None,
+            &[(input_id.clone(), mm_dsl::InputPhase::Queued, 0)],
+        );
+        let driver = parked_census_driver(&[(
+            input_id,
+            now - chrono::Duration::seconds(600),
+            now - chrono::Duration::seconds(600),
+        )]);
+        assert_eq!(
+            observe_parked_queued_work(&authority, &driver, PARKED_NOTICE, now),
+            ParkedQueuedWorkHealth::Parked(ParkedQueuedWorkAxis::AgedInQueue),
+            "queued work aged past the bound with nothing running is the wedge"
+        );
+    }
+
+    /// Queued work waiting behind a live turn is a backlog, not a wedge.
+    /// Voiding the run-in-flight exclusion turns this test red.
+    #[test]
+    fn parked_census_stays_clear_while_a_run_is_in_flight() {
+        let now = chrono::Utc::now();
+        let input_id = InputId::new();
+        let authority = parked_census_authority(
+            true,
+            Some(uuid::Uuid::new_v4()),
+            &[(input_id.clone(), mm_dsl::InputPhase::Queued, 0)],
+        );
+        let driver = parked_census_driver(&[(
+            input_id,
+            now - chrono::Duration::seconds(600),
+            now - chrono::Duration::seconds(600),
+        )]);
+        assert_eq!(
+            observe_parked_queued_work(&authority, &driver, PARKED_NOTICE, now),
+            ParkedQueuedWorkHealth::Clear,
+            "aged queued work behind a live run must not be read as a wedge"
+        );
+    }
+
+    /// A session whose executor registration is not `Active` could not stage
+    /// anything, so it is not accused of failing to.
+    #[test]
+    fn parked_census_stays_clear_without_an_active_registration() {
+        let now = chrono::Utc::now();
+        let input_id = InputId::new();
+        let authority = parked_census_authority(
+            false,
+            None,
+            &[(input_id.clone(), mm_dsl::InputPhase::Queued, 0)],
+        );
+        let driver = parked_census_driver(&[(
+            input_id,
+            now - chrono::Duration::seconds(600),
+            now - chrono::Duration::seconds(600),
+        )]);
+        assert_eq!(
+            observe_parked_queued_work(&authority, &driver, PARKED_NOTICE, now),
+            ParkedQueuedWorkHealth::Clear,
+            "nothing could stage here, so nothing failed to"
+        );
+    }
+
+    /// Only the queued phase names selectable parked work. Voiding the phase
+    /// filter turns this test red.
+    #[test]
+    fn parked_census_ignores_inputs_outside_the_queued_phase() {
+        let now = chrono::Utc::now();
+        let input_id = InputId::new();
+        let authority = parked_census_authority(
+            true,
+            None,
+            &[(input_id.clone(), mm_dsl::InputPhase::Consumed, 0)],
+        );
+        let driver = parked_census_driver(&[(
+            input_id,
+            now - chrono::Duration::seconds(600),
+            now - chrono::Duration::seconds(600),
+        )]);
+        assert_eq!(
+            observe_parked_queued_work(&authority, &driver, PARKED_NOTICE, now),
+            ParkedQueuedWorkHealth::Clear,
+            "an aged input outside the queued phase is another stage's concern"
+        );
+    }
+
+    /// Inside the bound the same facts are ordinary admission latency.
+    /// Voiding the age comparison turns this test red.
+    #[test]
+    fn parked_census_stays_clear_inside_the_notice_bound() {
+        let now = chrono::Utc::now();
+        let input_id = InputId::new();
+        let authority = parked_census_authority(
+            true,
+            None,
+            &[(input_id.clone(), mm_dsl::InputPhase::Queued, 0)],
+        );
+        let driver = parked_census_driver(&[(
+            input_id,
+            now - chrono::Duration::seconds(30),
+            now - chrono::Duration::seconds(30),
+        )]);
+        assert_eq!(
+            observe_parked_queued_work(&authority, &driver, PARKED_NOTICE, now),
+            ParkedQueuedWorkHealth::Clear,
+            "thirty seconds queued is latency, not a wedge"
+        );
+    }
+
+    /// With no queued work the driver lock is never attempted: the probe
+    /// short-circuits on machine truth alone. Pinned by holding the driver
+    /// guard and still reading `Clear` rather than `Unreadable`.
+    #[test]
+    fn parked_census_never_touches_the_driver_without_queued_work() {
+        let now = chrono::Utc::now();
+        let authority = parked_census_authority(true, None, &[]);
+        let driver = parked_census_driver(&[]);
+        let held = driver.try_lock().expect("fixture driver is uncontended");
+        assert_eq!(
+            observe_parked_queued_work(&authority, &driver, PARKED_NOTICE, now),
+            ParkedQueuedWorkHealth::Clear,
+            "no queued work means no driver read, held or not"
+        );
+        drop(held);
+    }
+
+    /// A queued id with no ledger row is a transient mid-mutation window; the
+    /// probe skips it rather than asserting an age nobody measured.
+    #[test]
+    fn parked_census_skips_a_queued_id_with_no_ledger_row() {
+        let now = chrono::Utc::now();
+        let input_id = InputId::new();
+        let authority =
+            parked_census_authority(true, None, &[(input_id, mm_dsl::InputPhase::Queued, 0)]);
+        let driver = parked_census_driver(&[]);
+        assert_eq!(
+            observe_parked_queued_work(&authority, &driver, PARKED_NOTICE, now),
+            ParkedQueuedWorkHealth::Clear,
+            "a phase entry with no ledger clock proves nothing about age"
+        );
+    }
+
+    /// A held authority surfaces as Unreadable without blocking - the wedged
+    /// holder shape, on the first of the two locks.
+    #[test]
+    fn parked_census_reports_a_held_authority_as_unreadable() {
+        let now = chrono::Utc::now();
+        let input_id = InputId::new();
+        let authority = parked_census_authority(
+            true,
+            None,
+            &[(input_id.clone(), mm_dsl::InputPhase::Queued, 0)],
+        );
+        let driver = parked_census_driver(&[(
+            input_id,
+            now - chrono::Duration::seconds(600),
+            now - chrono::Duration::seconds(600),
+        )]);
+        let guard = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            observe_parked_queued_work(&authority, &driver, PARKED_NOTICE, now),
+            ParkedQueuedWorkHealth::Unreadable,
+            "a held authority is unprovable, and the probe must say so rather than wait"
+        );
+        drop(guard);
+    }
+
+    /// A held driver surfaces as Unreadable without blocking - the same shape
+    /// on the second lock - and clears on the next read once released.
+    #[test]
+    fn parked_census_reports_a_held_driver_as_unreadable() {
+        let now = chrono::Utc::now();
+        let input_id = InputId::new();
+        let authority = parked_census_authority(
+            true,
+            None,
+            &[(input_id.clone(), mm_dsl::InputPhase::Queued, 0)],
+        );
+        let driver = parked_census_driver(&[(
+            input_id,
+            now - chrono::Duration::seconds(600),
+            now - chrono::Duration::seconds(600),
+        )]);
+        let held = driver.try_lock().expect("fixture driver is uncontended");
+        assert_eq!(
+            observe_parked_queued_work(&authority, &driver, PARKED_NOTICE, now),
+            ParkedQueuedWorkHealth::Unreadable,
+            "a held driver ledger is unprovable, and the probe must not join the queue behind it"
+        );
+        drop(held);
+        assert_eq!(
+            observe_parked_queued_work(&authority, &driver, PARKED_NOTICE, now),
+            ParkedQueuedWorkHealth::Parked(ParkedQueuedWorkAxis::AgedInQueue),
+            "the same facts read normally once the driver is released"
+        );
+    }
+
+    /// THE WORST CASE, pinned: a stage-churning input. Every Staged -> Queued
+    /// rollback re-stamps `updated_at`, so this input's age clock reads
+    /// seconds-old forever - and the age axis alone would read the most
+    /// alarming member as the healthiest. The machine's own attempt count is
+    /// what survives the re-stamp. Voiding the churn axis turns this test
+    /// red.
+    #[test]
+    fn parked_census_sees_a_stage_churning_input_whose_age_clock_resets() {
+        let now = chrono::Utc::now();
+        let input_id = InputId::new();
+        let authority = parked_census_authority(
+            true,
+            None,
+            &[(
+                input_id.clone(),
+                mm_dsl::InputPhase::Queued,
+                PARKED_STAGE_CHURN_ATTEMPTS,
+            )],
+        );
+        // updated_at is FRESH - the rollback just re-stamped it - while
+        // created_at carries the input's true age.
+        let driver = parked_census_driver(&[(
+            input_id,
+            now - chrono::Duration::seconds(5),
+            now - chrono::Duration::seconds(600),
+        )]);
+        assert_eq!(
+            observe_parked_queued_work(&authority, &driver, PARKED_NOTICE, now),
+            ParkedQueuedWorkHealth::Parked(ParkedQueuedWorkAxis::StageChurn),
+            "an input staged and thrown back twice, queued again with nothing \
+             running, is churn - and its re-stamped age clock must not hide it"
+        );
+    }
+
+    /// The churn axis has a floor: a young input inside its ordinary first
+    /// bounces is not churn yet, however many attempts it burned quickly.
+    #[test]
+    fn parked_census_gives_a_young_churning_input_the_notice_floor() {
+        let now = chrono::Utc::now();
+        let input_id = InputId::new();
+        let authority = parked_census_authority(
+            true,
+            None,
+            &[(
+                input_id.clone(),
+                mm_dsl::InputPhase::Queued,
+                PARKED_STAGE_CHURN_ATTEMPTS,
+            )],
+        );
+        let driver = parked_census_driver(&[(
+            input_id,
+            now - chrono::Duration::seconds(5),
+            now - chrono::Duration::seconds(30),
+        )]);
+        assert_eq!(
+            observe_parked_queued_work(&authority, &driver, PARKED_NOTICE, now),
+            ParkedQueuedWorkHealth::Clear,
+            "thirty seconds of existence is the ordinary bounce window, not churn"
+        );
+    }
+
+    /// Below the attempt threshold the churn axis stays silent: one staging
+    /// followed by one rollback is a recovery the machine performed once, not
+    /// a loop.
+    #[test]
+    fn parked_census_ignores_a_single_recovered_attempt() {
+        let now = chrono::Utc::now();
+        let input_id = InputId::new();
+        let authority = parked_census_authority(
+            true,
+            None,
+            &[(input_id.clone(), mm_dsl::InputPhase::Queued, 1)],
+        );
+        let driver = parked_census_driver(&[(
+            input_id,
+            now - chrono::Duration::seconds(5),
+            now - chrono::Duration::seconds(600),
+        )]);
+        assert_eq!(
+            observe_parked_queued_work(&authority, &driver, PARKED_NOTICE, now),
+            ParkedQueuedWorkHealth::Clear,
+            "one attempt and one rollback is an ordinary recovery, not churn"
+        );
     }
 }

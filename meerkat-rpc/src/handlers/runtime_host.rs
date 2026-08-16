@@ -143,17 +143,32 @@ pub async fn handle_health(id: Option<RpcId>, runtime: &Arc<SessionRuntime>) -> 
 ///   overdue to begin executing: staged past the watchdog's notice bound while
 ///   machine authority still shows the run current with its primitive
 ///   un-applied. `Degraded` when any session is in that state. The verdict is
-///   recomputed from machine truth per scrape - the same classification the
-///   staged-run watchdog logs - so this key and that log line cannot disagree.
-///   Runs whose execution start is honestly unobservable are never counted.
+///   recomputed from machine truth per scrape - the same facts the staged-run
+///   watchdog classifies - so this key and that log line cannot disagree. A
+///   window whose run moved on is resolved and never counted; a window whose
+///   run is STILL CURRENT but cannot be interpreted (unbound runtime,
+///   unsignalled turn start) publishes `unreadable:session_run_start`, never
+///   a rung - an absence of observation is not health.
+/// - `session_liveness` - registered sessions parked on queued work, on
+///   either of two axes: an input in the machine's queued phase for longer
+///   than the notice bound (aged), or an input staged and rolled back at
+///   least twice that is queued again (stage churn - its age clock resets on
+///   every rollback, so age alone would read the flapping member as
+///   forever-fresh). Both require the executor registration `Active` and no
+///   run in flight. This is the pre-staging class - a session that resumed
+///   cleanly, keeps its loop alive, and never starts the work it was handed,
+///   which under `queue_mode: fifo` is a total outage for that session.
+///   `Degraded` when any session is in that state. Queued work waiting behind
+///   a live turn is a backlog, not a wedge, and is never counted.
 ///
-/// **Every one of the four may instead answer "I could not look", and every
-/// one of the four reports that as `unreadable:<dimension>` rather than as a
+/// **Every one of the five may instead answer "I could not look", and every
+/// one of the five reports that as `unreadable:<dimension>` rather than as a
 /// `Measured` rung.** For the session probes the failed read is an unreadable
-/// session registry - and for `session_run_start` also a past-bound window
-/// whose machine authority could not be read without blocking, the holder of
-/// which is the prime suspect for the wedge itself; for `jobs` it is a
-/// job-service snapshot or a delivery backlog that returned an error. This is the same rule the paragraph above
+/// session registry - and for `session_run_start` and `session_liveness` also
+/// a per-session authority or driver ledger that could not be read without
+/// blocking, the holder of which is the prime suspect for the wedge itself;
+/// for `jobs` it is a job-service snapshot or a delivery backlog that
+/// returned an error. This is the same rule the paragraph above
 /// states, applied to this function's own checks: a `jobs: degraded` published
 /// off a failed snapshot read would be asserting a specific and actionable
 /// fault - the job service is in trouble - that nobody observed, and it is a
@@ -170,18 +185,18 @@ pub async fn handle_health(id: Option<RpcId>, runtime: &Arc<SessionRuntime>) -> 
 /// the difference between telling an operator where to look and sending them
 /// after a fault that does not exist.
 ///
-/// ## Not covered (published as `unmeasured:*`, never as healthy)
+/// ## Coverage boundary (not a declared dimension, stated so nobody infers it)
 ///
-/// - `session_liveness` - nothing here observes the PRE-staging class: a
-///   session whose loop task is alive and whose channels are open, but which
-///   is parked while machine-owned lane truth still holds selectable queued
-///   work that never gets staged at all. `session_run_start` does not cover
-///   it and cannot: the staged-run window opens at the durable `StageForRun`
-///   commit, so work that never reaches staging never opens a window. (0.8.23
-///   claimed this class needed "a watchdog bridge"; that was wrong - the
-///   watchdog is also downstream of staging. It needs a lane-truth probe that
-///   does not exist yet.) No probe exists, so this one stays out of the
-///   rollup: a permanent amber light is a muted alarm.
+/// Every declared dimension is measured on this surface, so no `unmeasured:*`
+/// key remains here. That is a claim about the DECLARED dimensions, not about
+/// everything that can go wrong. In particular, a turn that BEGINS and then
+/// produces nothing - `PrimitiveApplied` has moved the phase on, so
+/// `session_run_start` stands down, and the run is in flight, so
+/// `session_liveness` stands down - is mid-turn progress, a distinct
+/// dimension with no probe and no declared name yet. The household fleet's
+/// own fuse has already observed that class in the field (a member mute on an
+/// established run for 54 minutes). Naming it here is what keeps this
+/// handler's green honest about its edges.
 async fn runtime_health(runtime: &SessionRuntime) -> meerkat_contracts::RuntimeHostHealth {
     let observed_at_ms = meerkat_core::time_compat::SystemTime::now()
         .duration_since(meerkat_core::time_compat::UNIX_EPOCH)
@@ -214,7 +229,7 @@ async fn runtime_health(runtime: &SessionRuntime) -> meerkat_contracts::RuntimeH
             ),
         },
     };
-    // All four probes are attempted unconditionally, so every dimension this
+    // All five probes are attempted unconditionally, so every dimension this
     // handler owns is in the attempted set on every scrape. The only thing that
     // varies is whether the probe came back with a reading.
     let observations = vec![
@@ -230,6 +245,10 @@ async fn runtime_health(runtime: &SessionRuntime) -> meerkat_contracts::RuntimeH
         (
             "session_run_start".to_string(),
             observed_session_population(runtime.overdue_run_start_session_count()),
+        ),
+        (
+            "session_liveness".to_string(),
+            observed_session_population(runtime.parked_queued_input_session_count()),
         ),
     ];
     meerkat::surface::build_runtime_host_health_from_observations(observations)
