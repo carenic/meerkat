@@ -3698,9 +3698,29 @@ async fn ensure_session_with_executor_repairs_stale_attached_driver() {
     let input_id = input.id().clone();
     adapter.accept_input(&sid, input).await.unwrap();
 
-    tokio::time::timeout(Duration::from_secs(1), async {
+    // Wait for the OUTCOME, not for the proxy that precedes it.
+    //
+    // `RecordingExecutor::apply` sets `apply_called` on ENTRY and only then
+    // returns the output the runtime still has to process before the input
+    // reaches `Consumed` and the runtime reaches `Attached`. Waiting on the
+    // flag and asserting the phase immediately afterwards therefore races the
+    // repair it is trying to observe: the flag says "apply was entered", and
+    // the assertion reads "the repair committed". Those are different facts
+    // with a window between them, and on a loaded runner the read lands inside
+    // it - observed on a shard where this same commit had already passed the
+    // identical lane minutes earlier.
+    //
+    // The bound is not the bug and raising it would not fix this: the old
+    // 1s applied to reaching the proxy, which is fast and was never what
+    // timed out. Poll the durable post-condition instead, so the test passes
+    // as soon as the repair is real and fails only if it never becomes real.
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            if apply_called.load(Ordering::SeqCst) {
+            let state = adapter.input_state(&sid, &input_id).await.unwrap();
+            let runtime_state = adapter.runtime_state(&sid).await.unwrap();
+            if state.is_some_and(|state| state.seed.phase == InputLifecycleState::Consumed)
+                && runtime_state == RuntimeState::Attached
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -3709,6 +3729,10 @@ async fn ensure_session_with_executor_repairs_stale_attached_driver() {
     .await
     .expect("ensuring with executor should repair the stale attached driver");
 
+    assert!(
+        apply_called.load(Ordering::SeqCst),
+        "the repair must have run the executor, not merely reached the end state"
+    );
     let state = adapter.input_state(&sid, &input_id).await.unwrap().unwrap();
     assert_eq!(state.seed.phase, InputLifecycleState::Consumed);
     assert_eq!(
