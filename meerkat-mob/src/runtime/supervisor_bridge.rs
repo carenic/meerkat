@@ -387,10 +387,20 @@ impl PreparedSupervisorRuntime {
         // runtime, replaces that exact generation through
         // `publish_replacing_recoverable` below. Both refusal shapes are pinned
         // by `supervisor_bridge_refuses_*` in this module's tests.
+        let participant_name = runtime.runtime().participant_name().to_string();
         let runtime = runtime.publish().map_err(|error| {
-            MobError::Internal(format!(
-                "failed to publish prepared mob supervisor comms runtime: {error}"
-            ))
+            // The name-occupancy refusal is comms-owned and typed; re-carry
+            // the incumbent's key instead of flattening it into prose that
+            // embedders would have to string-match.
+            match crate::error::comms_name_occupancy_holder(&error) {
+                Some(holder_pubkey) => MobError::ParticipantNameOccupied {
+                    participant_name,
+                    holder_pubkey,
+                },
+                None => MobError::Internal(format!(
+                    "failed to publish prepared mob supervisor comms runtime: {error}"
+                )),
+            }
         })?;
         let runtime = Arc::new(runtime);
         runtime.install_peer_request_response_authority(request_response_authority);
@@ -3602,6 +3612,15 @@ mod tests {
     /// control-ingress route under a warning. It is now refused with the same
     /// typed refusal every other registrant gets, and the incumbent keeps the
     /// route.
+    ///
+    /// Through 0.8.23 this test could only assert
+    /// `error.to_string().contains("the participant name already has a live
+    /// route")`, because the mob layer flattened the comms-owned
+    /// `RegistrationRejection::NameOccupied` into `MobError::Internal(String)`.
+    /// That assertion could not tell the typed refusal apart from the flattened
+    /// one: deleting the typed conversion leaves it GREEN (verified by
+    /// mutation) while the `ParticipantNameOccupied` destructure below goes RED.
+    /// Assert the variant and its re-carried holder key, never the prose.
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn supervisor_bridge_refuses_to_displace_a_live_foreign_authority_route() {
@@ -3629,11 +3648,26 @@ mod tests {
             .await
             .err()
             .expect("a second live mob sharing this mob id must not take the supervisor name over");
-        assert!(
-            error
-                .to_string()
-                .contains("the participant name already has a live route"),
-            "the supervisor must fail closed with the typed name-occupancy refusal, got: {error}"
+        // The refusal is a typed fact, not prose: the mob layer re-carries the
+        // comms-owned `RegistrationRejection::NameOccupied` holder key verbatim,
+        // so an embedder matches a variant instead of a message.
+        let crate::error::MobError::ParticipantNameOccupied {
+            participant_name,
+            holder_pubkey,
+        } = &error
+        else {
+            panic!(
+                "the supervisor must fail closed with the typed name-occupancy variant, got: {error:?}"
+            )
+        };
+        assert_eq!(
+            participant_name,
+            &format!("{mob_id}/__mob_supervisor__"),
+            "the typed refusal must name the participant name that was refused"
+        );
+        assert_eq!(
+            holder_pubkey, &incumbent_key,
+            "the typed refusal must re-carry the incumbent's holder key verbatim"
         );
 
         assert!(

@@ -165,6 +165,20 @@ pub enum MaterializeServeError {
     Build(#[from] crate::error::MobError),
     #[error("member comms runtime construction failed: {detail}")]
     Comms { detail: String },
+    /// The member participant name could not be published because a
+    /// *different* live public key already holds that route.
+    ///
+    /// Re-carries [`meerkat_comms::RegistrationRejection::NameOccupied`]'s
+    /// `holder_pubkey` verbatim rather than flattening it into [`Self::Comms`]'s
+    /// prose. Construct only from `crate::error::comms_name_occupancy_holder`.
+    #[error(
+        "{}",
+        crate::error::participant_name_occupied_message(participant_name, holder_pubkey)
+    )]
+    ParticipantNameOccupied {
+        participant_name: String,
+        holder_pubkey: meerkat_comms::PubKey,
+    },
     #[error("host-seeded supervisor bind failed: {detail}")]
     SupervisorBind { detail: String },
     #[error("member session service failed: {0}")]
@@ -247,8 +261,16 @@ impl MaterializeServeError {
                 },
                 format!("materialize rejected: {}", failure.public_message()),
             ),
+            // `ParticipantNameOccupied` deliberately keeps the pre-existing
+            // `Internal` wire projection: there is no `BridgeRejectionCause`
+            // that means "participant name held by a live incumbent", and
+            // minting one is a `meerkat-contracts` change (schema regen + SDK
+            // codegen + version parity). Remote controllers see exactly what
+            // they see today, with the operator remedy in the detail string;
+            // in-process embedders get the typed variant.
             Self::Build(_)
             | Self::Comms { .. }
+            | Self::ParticipantNameOccupied { .. }
             | Self::SupervisorBind { .. }
             | Self::SessionService(_)
             | Self::IdentityMismatch { .. }
@@ -2760,9 +2782,17 @@ impl HostMemberMaterializer {
             claim_handle,
         )
         .await
-        .map_err(|err| MaterializeServeError::Comms {
-            detail: err.to_string(),
-        })?;
+        .map_err(
+            |err| match crate::error::comms_name_occupancy_holder(&err) {
+                Some(holder_pubkey) => MaterializeServeError::ParticipantNameOccupied {
+                    participant_name: comms_name.to_string(),
+                    holder_pubkey,
+                },
+                None => MaterializeServeError::Comms {
+                    detail: err.to_string(),
+                },
+            },
+        )?;
         if let Some(meta) = config.peer_meta.clone() {
             runtime.set_peer_meta(meta);
         }
