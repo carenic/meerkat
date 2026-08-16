@@ -594,6 +594,9 @@ jobs:
       - name: Verify SDK wrapper freshness
         run: make verify-sdk-wrapper-freshness
 
+      - name: Verify pre-ledger corpus generator exclusions
+        run: make verify-fixture-mint-generator
+
       - name: Verify Rust release configuration
         run: make check-rust-release-config
 
