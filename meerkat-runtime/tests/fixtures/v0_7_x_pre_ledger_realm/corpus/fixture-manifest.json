@@ -23,11 +23,6 @@
           "writer_error": "Error: turn abandoned: apply failed: Terminal failure: Failed (LlmFailure): LLM failure terminal turn; error={\"kind\":\"llm_failure\",\"terminal\":true,\"outcome\":\"failed\",\"detail\":\"apply failed: Terminal failure: Failed (LlmFailure): LLM failure terminal turn\"}",
           "payloads": [
             {
-              "path": ".rkat/events/.sequence/01a00703-2118-7712-8d1b-5fd002e2a7d1.lock",
-              "bytes": 0,
-              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            },
-            {
               "path": ".rkat/events/.sequence/01a00703-2118-7712-8d1b-5fd002e2a7d1.seq",
               "bytes": 2,
               "sha256": "1121cfccd5913f0a63fec40a6ffd44ea64f9dc135c66634ba001d10bcf4302a2"
@@ -791,11 +786,6 @@
           "writer_exit_code": 1,
           "writer_error": "Error: turn abandoned: apply failed: Terminal failure: Failed (LlmFailure): LLM failure terminal turn; error={\"kind\":\"llm_failure\",\"terminal\":true,\"outcome\":\"failed\",\"detail\":\"apply failed: Terminal failure: Failed (LlmFailure): LLM failure terminal turn\"}",
           "payloads": [
-            {
-              "path": ".rkat/events/.sequence/01a00703-2762-7c22-8c30-d3ed99b3ad42.lock",
-              "bytes": 0,
-              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            },
             {
               "path": ".rkat/events/.sequence/01a00703-2762-7c22-8c30-d3ed99b3ad42.seq",
               "bytes": 2,
