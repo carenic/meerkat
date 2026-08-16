@@ -2869,6 +2869,28 @@ impl RuntimeLoopTeardownSlot {
         }
     }
 
+    /// True only when the runtime loop has already released its executor, so
+    /// the disposal protocol can be entered without parking.
+    ///
+    /// This exists for callers that must decline rather than wait. Of the four
+    /// slot states, exactly two park:  `Pending` means the loop body is still
+    /// running and may take arbitrarily long to publish, and `Cleaning` means
+    /// another owner holds the handoff mid-claim. Both make
+    /// [`Self::wait_until_published`] and
+    /// [`Self::discard_after_reload_required`] blocking operations.  `Ready`
+    /// and `Cleaned` both answer immediately - the handoff is there to claim,
+    /// or it was already discharged - and neither can return to a parking
+    /// state without a new attachment, which would install a new slot.
+    pub(crate) fn exit_handoff_is_settled(&self) -> bool {
+        matches!(
+            &*self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            RuntimeLoopTeardownState::Ready(_) | RuntimeLoopTeardownState::Cleaned(_)
+        )
+    }
+
     /// Consume the exact executor handoff after its registration loses durable
     /// authority, without publishing an ordinary stop or unregister terminal.
     ///
