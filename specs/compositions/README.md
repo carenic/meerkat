@@ -32,6 +32,19 @@ Status:
   - `workgraph_attention_bundle` remains because WorkGraph item lifecycle and
     attention binding lifecycle are separate WorkGraph-owned authority surfaces
 
+Reading `model.tla`:
+
+- `UnchangedFrame_<16 hex>` operators are generated state frames. Each distinct
+  `UNCHANGED << ... >>` tuple is defined exactly once, immediately after
+  `vars == << ... >>`, and every action that leaves those variables unchanged
+  references it by name. The suffix is an FNV-1a 64 hash of the frame body, so
+  a frame keeps its name across unrelated schema edits.
+- A frame wider than 96 variables is emitted as a conjunction of 64-variable
+  tuples inside its definition. That split works around a TLC semantic-pass
+  overflow and is the same formula as one wide tuple.
+- Frames are owned by the renderer (`meerkat-machine-codegen`); never edit them
+  by hand.
+
 Validation:
 
 - `make machine-codegen`

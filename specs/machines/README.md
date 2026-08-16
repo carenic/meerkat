@@ -22,6 +22,18 @@ Status:
   out explicitly
 - the checked-in `ci.cfg` files are the bounded CI TLC profiles
 
+Reading `model.tla`:
+
+- `UnchangedFrame_<16 hex>` operators are generated state frames. Each distinct
+  `UNCHANGED << ... >>` tuple is defined exactly once, ahead of the transition
+  actions, and every action that leaves those variables unchanged references it
+  by name. The suffix is an FNV-1a 64 hash of the frame body, so a frame keeps
+  its name across unrelated schema edits.
+- `UNCHANGED vars` (the whole-state frame, used by `TerminalStutter`) stays
+  inline; only per-field frames are named.
+- Frames are owned by the renderer (`meerkat-machine-codegen`); never edit them
+  by hand.
+
 Validation:
 
 - `make machine-codegen`
