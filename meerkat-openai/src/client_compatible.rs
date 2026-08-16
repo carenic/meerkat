@@ -467,21 +467,21 @@ impl OpenAiCompatibleClient {
         }
     }
 
-    fn parse_chat_completions_line(line: &str) -> Result<Option<ChatCompletionsChunk>, LlmError> {
+    fn parse_chat_completions_line(line: &str) -> Result<ChatCompletionsLine, LlmError> {
         if let Some(data) = line
             .strip_prefix("data: ")
             .or_else(|| line.strip_prefix("data:"))
         {
             if data == "[DONE]" {
-                return Ok(None);
+                return Ok(ChatCompletionsLine::Done);
             }
             serde_json::from_str(data)
-                .map(Some)
+                .map(ChatCompletionsLine::Chunk)
                 .map_err(|err| LlmError::StreamParseError {
                     message: format!("failed to parse chat completions chunk: {err}; line={data}"),
                 })
         } else {
-            Ok(None)
+            Ok(ChatCompletionsLine::Ignored)
         }
     }
 }
@@ -644,9 +644,21 @@ impl LlmClient for OpenAiCompatibleClient {
                     let mut buffer = String::with_capacity(512);
                     let mut tool_buffers: HashMap<usize, ToolCallBuffer> = HashMap::new();
                     let mut reasoning_text = String::new();
-                    let mut done_emitted = false;
+                    // `finish_reason` and the `stream_options.include_usage`
+                    // accounting are not required to share one SSE event. vLLM
+                    // emits the finish event, then a usage-only event with an
+                    // empty `choices`, then `[DONE]`; other OpenAI-compatible
+                    // servers co-locate usage with the finish event. Both
+                    // chunkings are legal, so the derived stop reason is latched
+                    // here rather than spent immediately: the terminal `Done`
+                    // stops the consuming wrapper, and emitting it at
+                    // `finish_reason` would discard the very accounting this
+                    // request asked for. The latch is spent exactly once, by
+                    // the terminal emission below.
+                    let mut latched_stop: Option<StopReason> = None;
+                    let mut saw_done_sentinel = false;
 
-                    while let Some(chunk) = stream.next().await {
+                    'consume: while let Some(chunk) = stream.next().await {
                         let chunk = chunk.map_err(|_| LlmError::ConnectionReset)?;
                         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -659,145 +671,172 @@ impl LlmClient for OpenAiCompatibleClient {
                             let parsed = if should_process {
                                 Self::parse_chat_completions_line(line)
                             } else {
-                                Ok(None)
+                                Ok(ChatCompletionsLine::Ignored)
                             };
                             buffer.drain(..=newline_pos);
 
-                            if let Some(event) = parsed? {
-                                if let Some(event_usage) = event.usage {
-                                    let usage = Usage {
-                                        input_tokens: event_usage.prompt_tokens.unwrap_or(0),
-                                        output_tokens: event_usage.completion_tokens.unwrap_or(0),
-                                        cache_creation_tokens: event_usage
-                                            .prompt_tokens_details
-                                            .as_ref()
-                                            .and_then(|details| details.cache_write_tokens),
-                                        cache_read_tokens: event_usage
-                                            .prompt_tokens_details
-                                            .as_ref()
-                                            .and_then(|details| details.cached_tokens),
-                                        provider_accounting: Some(
-                                            meerkat_core::ProviderTokenAccounting::openai_compatible(
-                                                &request.model,
-                                                event_usage.prompt_tokens.unwrap_or(0),
-                                            ),
-                                        ),
-                                    };
-                                    chunk_yielded.set(true);
-                                    yield LlmEvent::UsageUpdate {
-                                        usage: meerkat_core::TurnUsage::try_from_usage(usage)
-                                            .map_err(|error| LlmError::Unknown {
-                                                message: error.to_string(),
-                                            })?,
-                                    };
+                            // A malformed `data:` line fails the turn even after
+                            // the stop reason is latched: past the finish event
+                            // the most likely undecodable line is the usage
+                            // event itself, and swallowing it would reproduce
+                            // the missing-accounting failure with no diagnosis.
+                            // Truncated trailing bytes are treated differently
+                            // below, because they carry no decodable claim.
+                            let event = match parsed? {
+                                ChatCompletionsLine::Ignored => continue,
+                                ChatCompletionsLine::Done => {
+                                    // The protocol's terminal sentinel closes
+                                    // the turn without waiting for the server
+                                    // to drop the connection.
+                                    saw_done_sentinel = true;
+                                    break 'consume;
                                 }
+                                ChatCompletionsLine::Chunk(event) => event,
+                            };
 
-                                for choice in event.choices {
-                                    if let Some(delta) = choice.delta {
-                                        // REASONING BEFORE CONTENT, and the order is load-bearing.
-                                        //
-                                        // A single delta may carry BOTH fields - that is what an
-                                        // OpenAI-compatible server emits on the reasoning-to-content
-                                        // transition, and vLLM does. The reasoning in such a chunk
-                                        // was produced BEFORE the content beside it, so emitting
-                                        // content first reverses them in the event stream and the
-                                        // operator sees the two channels shuffled together.
-                                        // Nothing downstream can repair it: by then the
-                                        // interleaving IS the stream.
-                                        let reasoning_delta = delta
-                                            .reasoning_content
-                                            .as_ref()
-                                            .or(delta.reasoning.as_ref())
-                                            .or(delta.thinking.as_ref());
-                                        if let Some(reasoning) = reasoning_delta
-                                            && !reasoning.is_empty()
-                                        {
-                                            reasoning_text.push_str(reasoning);
-                                            chunk_yielded.set(true);
-                                            yield LlmEvent::ReasoningDelta {
-                                                delta: reasoning.clone(),
-                                            };
-                                        }
-                                        if let Some(content) = delta.content
-                                            && !content.is_empty()
-                                        {
-                                            chunk_yielded.set(true);
-                                            yield LlmEvent::TextDelta {
-                                                delta: content,
-                                                meta: None,
-                                            };
-                                        }
-                                        if let Some(tool_calls) = delta.tool_calls {
-                                            for tool_call in tool_calls {
-                                                let index = tool_call.index.unwrap_or(0);
-                                                let buffer = tool_buffers.entry(index).or_insert_with(|| {
-                                                    ToolCallBuffer::new(
-                                                        tool_call
-                                                            .id
-                                                            .clone()
-                                                            .unwrap_or_else(|| format!("tool_call_{index}")),
-                                                    )
-                                                });
-                                                if let Some(id) = tool_call.id
-                                                    && buffer.id.starts_with("tool_call_")
-                                                {
-                                                    buffer.id = id;
-                                                }
-                                                if let Some(function) = tool_call.function {
-                                                    if let Some(name) = function.name {
-                                                        buffer.name = Some(name);
-                                                    }
-                                                    if let Some(arguments) = function.arguments
-                                                        && !arguments.is_empty()
-                                                    {
-                                                        buffer.push_args(&arguments);
-                                                        chunk_yielded.set(true);
-                                                        yield LlmEvent::ToolCallDelta {
-                                                            id: buffer.id.clone(),
-                                                            name: buffer.name.clone(),
-                                                            args_delta: arguments,
-                                                        };
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                            if let Some(event_usage) = event.usage {
+                                let usage = Usage {
+                                    input_tokens: event_usage.prompt_tokens.unwrap_or(0),
+                                    output_tokens: event_usage.completion_tokens.unwrap_or(0),
+                                    cache_creation_tokens: event_usage
+                                        .prompt_tokens_details
+                                        .as_ref()
+                                        .and_then(|details| details.cache_write_tokens),
+                                    cache_read_tokens: event_usage
+                                        .prompt_tokens_details
+                                        .as_ref()
+                                        .and_then(|details| details.cached_tokens),
+                                    provider_accounting: Some(
+                                        meerkat_core::ProviderTokenAccounting::openai_compatible(
+                                            &request.model,
+                                            event_usage.prompt_tokens.unwrap_or(0),
+                                        ),
+                                    ),
+                                };
+                                chunk_yielded.set(true);
+                                yield LlmEvent::UsageUpdate {
+                                    usage: meerkat_core::TurnUsage::try_from_usage(usage)
+                                        .map_err(|error| LlmError::Unknown {
+                                            message: error.to_string(),
+                                        })?,
+                                };
+                            }
 
-                                    if let Some(finish_reason) = choice.finish_reason {
-                                        let stop_reason = match finish_reason.as_str() {
-                                            "tool_calls" => StopReason::ToolUse,
-                                            "length" => StopReason::MaxTokens,
-                                            "content_filter" => StopReason::ContentFilter,
-                                            _ => StopReason::EndTurn,
+                            for choice in event.choices {
+                                // The turn is terminal once a finish
+                                // reason has been latched. A compliant
+                                // server sends only usage and `[DONE]`
+                                // after it, and choice content past the
+                                // finish event was never part of the
+                                // observable turn: the terminal-done
+                                // wrapper truncated it. Deferring `Done`
+                                // must not start admitting it.
+                                if latched_stop.is_some() {
+                                    continue;
+                                }
+                                if let Some(delta) = choice.delta {
+                                    // REASONING BEFORE CONTENT, and the order is load-bearing.
+                                    //
+                                    // A single delta may carry BOTH fields - what an
+                                    // OpenAI-compatible server emits on the reasoning-to-content
+                                    // transition, and vLLM does. The reasoning in such a chunk was
+                                    // produced BEFORE the content beside it, so emitting content
+                                    // first reverses them and the operator sees the two channels
+                                    // shuffled together. Nothing downstream can repair it: by then
+                                    // the interleaving IS the stream.
+                                    let reasoning_delta = delta
+                                        .reasoning_content
+                                        .as_ref()
+                                        .or(delta.reasoning.as_ref())
+                                        .or(delta.thinking.as_ref());
+                                    if let Some(reasoning) = reasoning_delta
+                                        && !reasoning.is_empty()
+                                    {
+                                        reasoning_text.push_str(reasoning);
+                                        chunk_yielded.set(true);
+                                        yield LlmEvent::ReasoningDelta {
+                                            delta: reasoning.clone(),
                                         };
-                                        if matches!(stop_reason, StopReason::ToolUse) {
-                                            for buffer in tool_buffers.values() {
-                                                if let Some(tool_call) = buffer.try_complete()? {
+                                    }
+                                    if let Some(content) = delta.content
+                                        && !content.is_empty()
+                                    {
+                                        chunk_yielded.set(true);
+                                        yield LlmEvent::TextDelta {
+                                            delta: content,
+                                            meta: None,
+                                        };
+                                    }
+                                    if let Some(tool_calls) = delta.tool_calls {
+                                        for tool_call in tool_calls {
+                                            let index = tool_call.index.unwrap_or(0);
+                                            let buffer = tool_buffers.entry(index).or_insert_with(|| {
+                                                ToolCallBuffer::new(
+                                                    tool_call
+                                                        .id
+                                                        .clone()
+                                                        .unwrap_or_else(|| format!("tool_call_{index}")),
+                                                )
+                                            });
+                                            if let Some(id) = tool_call.id
+                                                && buffer.id.starts_with("tool_call_")
+                                            {
+                                                buffer.id = id;
+                                            }
+                                            if let Some(function) = tool_call.function {
+                                                if let Some(name) = function.name {
+                                                    buffer.name = Some(name);
+                                                }
+                                                if let Some(arguments) = function.arguments
+                                                    && !arguments.is_empty()
+                                                {
+                                                    buffer.push_args(&arguments);
                                                     chunk_yielded.set(true);
-                                                    yield LlmEvent::ToolCallComplete {
-                                                        id: tool_call.id,
-                                                        name: tool_call.name,
-                                                        args: tool_call.args,
-                                                        meta: None,
+                                                    yield LlmEvent::ToolCallDelta {
+                                                        id: buffer.id.clone(),
+                                                        name: buffer.name.clone(),
+                                                        args_delta: arguments,
                                                     };
                                                 }
                                             }
                                         }
-                                        if !reasoning_text.is_empty() {
-                                            chunk_yielded.set(true);
-                                            yield LlmEvent::ReasoningComplete {
-                                                text: std::mem::take(&mut reasoning_text),
-                                                meta: None,
-                                            };
-                                        }
-                                        if !done_emitted {
-                                            done_emitted = true;
-                                            chunk_yielded.set(true);
-                                            yield LlmEvent::Done {
-                                                outcome: LlmDoneOutcome::Success { stop_reason },
-                                            };
+                                    }
+                                }
+
+                                if let Some(finish_reason) = choice.finish_reason {
+                                    let stop_reason = match finish_reason.as_str() {
+                                        "tool_calls" => StopReason::ToolUse,
+                                        "length" => StopReason::MaxTokens,
+                                        "content_filter" => StopReason::ContentFilter,
+                                        _ => StopReason::EndTurn,
+                                    };
+                                    if matches!(stop_reason, StopReason::ToolUse) {
+                                        for buffer in tool_buffers.values() {
+                                            if let Some(tool_call) = buffer.try_complete()? {
+                                                chunk_yielded.set(true);
+                                                yield LlmEvent::ToolCallComplete {
+                                                    id: tool_call.id,
+                                                    name: tool_call.name,
+                                                    args: tool_call.args,
+                                                    meta: None,
+                                                };
+                                            }
                                         }
                                     }
+                                    if !reasoning_text.is_empty() {
+                                        chunk_yielded.set(true);
+                                        yield LlmEvent::ReasoningComplete {
+                                            text: std::mem::take(&mut reasoning_text),
+                                            meta: None,
+                                        };
+                                    }
+                                    // Latched, not emitted: the terminal
+                                    // `Done` is owed to `[DONE]` or to the
+                                    // end of the stream, whichever comes
+                                    // first, so a usage-only event that
+                                    // follows this finish event is still
+                                    // read.
+                                    latched_stop = Some(stop_reason);
                                 }
                             }
                         }
@@ -811,7 +850,13 @@ impl LlmClient for OpenAiCompatibleClient {
                         }
                     }
 
-                    if !buffer.trim().is_empty() {
+                    // A trailing partial line only falsifies the turn when the
+                    // turn never reached a terminal event of its own. Once a
+                    // finish reason is latched or `[DONE]` has been seen, the
+                    // turn is complete and trailing bytes are not a fault -
+                    // exactly the reachability this branch had when `Done` was
+                    // emitted at `finish_reason`.
+                    if latched_stop.is_none() && !saw_done_sentinel && !buffer.trim().is_empty() {
                         Err::<(), _>(LlmError::IncompleteResponse {
                             message: format!(
                                 "chat completions stream ended with an incomplete SSE buffer: {}",
@@ -825,13 +870,13 @@ impl LlmClient for OpenAiCompatibleClient {
                             meta: None,
                         };
                     }
-                    if !done_emitted {
-                        yield LlmEvent::Done {
-                            outcome: LlmDoneOutcome::Success {
-                                stop_reason: StopReason::EndTurn,
-                            },
-                        };
-                    }
+                    // The single terminal emission, after every usage event the
+                    // server chose to send.
+                    yield LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Success {
+                            stop_reason: latched_stop.unwrap_or(StopReason::EndTurn),
+                        },
+                    };
                 });
 
                 streaming::ensure_terminal_done(inner)
@@ -876,8 +921,26 @@ impl LlmClient for OpenAiCompatibleClient {
     }
 }
 
+/// One decoded line of an OpenAI-compatible Chat Completions SSE body.
+///
+/// The `[DONE]` sentinel and a line this adapter has no reason to interpret are
+/// different facts: the first closes the turn, the second is only wire
+/// liveness. Collapsing both into `Option::None` is what made the terminal
+/// event unrepresentable at its true position and forced the adapter to emit
+/// `Done` at `finish_reason`, discarding any usage event that followed.
+#[derive(Debug)]
+enum ChatCompletionsLine {
+    Chunk(ChatCompletionsChunk),
+    Done,
+    Ignored,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatCompletionsChunk {
+    // A usage-only or metadata-only event may omit `choices` entirely rather
+    // than send it empty. That is a chunking difference, not a fault, and must
+    // not fail the turn.
+    #[serde(default)]
     choices: Vec<ChatChoice>,
     #[serde(default)]
     usage: Option<ChatUsage>,
@@ -1127,6 +1190,207 @@ mod tests {
         );
     }
 
+    /// Streams one stub chat-completions body and returns the observed events.
+    ///
+    /// The timeout is part of the contract under test: the adapter defers its
+    /// terminal `Done` until `[DONE]` or the end of the stream, so a stream
+    /// carrying no usage event at all must still terminate rather than wait for
+    /// accounting that never arrives.
+    async fn collect_chat_stream_events(payload: &str) -> Vec<LlmEvent> {
+        let (base_url, handle) = spawn_chat_stub_server(payload.to_string()).await;
+        // The remote model name deliberately differs from the request model so
+        // the accounting assertion below shows which one the adapter attributes
+        // to: `validate_provider_turn_usage_identity` compares the accounting
+        // model against the active (request) model, not the remote name.
+        let client = OpenAiCompatibleClient::new_with_options(
+            OpenAiCompatibleMode::ChatCompletions,
+            "remote-model".to_string(),
+            base_url,
+            None,
+            options(true, false, false, false),
+        );
+        let request = LlmRequest::new(
+            "qwen3.8-27b",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        );
+        let events: Vec<LlmEvent> = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.stream(&request).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("chat completions stream must terminate")
+        .into_iter()
+        .map(|event| event.expect("stream event"))
+        .collect();
+        handle.abort();
+        events
+    }
+
+    fn usage_update_index(events: &[LlmEvent]) -> Option<usize> {
+        events
+            .iter()
+            .position(|event| matches!(event, LlmEvent::UsageUpdate { .. }))
+    }
+
+    fn done_index(events: &[LlmEvent]) -> Option<usize> {
+        events
+            .iter()
+            .position(|event| matches!(event, LlmEvent::Done { .. }))
+    }
+
+    fn done_count(events: &[LlmEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, LlmEvent::Done { .. }))
+            .count()
+    }
+
+    fn observed_usage(events: &[LlmEvent]) -> Option<&meerkat_core::TurnUsage> {
+        events.iter().find_map(|event| match event {
+            LlmEvent::UsageUpdate { usage } => Some(usage),
+            _ => None,
+        })
+    }
+
+    fn observed_done_outcome(events: &[LlmEvent]) -> Option<&LlmDoneOutcome> {
+        events.iter().find_map(|event| match event {
+            LlmEvent::Done { outcome } => Some(outcome),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn chat_completions_usage_only_event_after_finish_is_not_discarded() {
+        // The finish event and the `stream_options.include_usage` accounting are
+        // separate SSE events here, which is how vLLM streams. Every fixture in
+        // this file used to co-locate them in one chunk, so the corpus encoded
+        // one provider's chunking as if it were the protocol and could not
+        // express this stream at all.
+        let events = collect_chat_stream_events(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":56,\"completion_tokens\":16,\"total_tokens\":72}}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+
+        let usage_index = usage_update_index(&events).expect(
+            "a usage-only event after the finish event must still reach the consumer; \
+             discarding it is what left the turn with no normalized accounting evidence",
+        );
+        let terminal_index = done_index(&events).expect("terminal done");
+        assert!(
+            usage_index < terminal_index,
+            "UsageUpdate must be emitted before the terminal Done, got {events:?}"
+        );
+        assert_eq!(done_count(&events), 1, "exactly one terminal Done");
+
+        let usage = observed_usage(&events).expect("usage update");
+        assert_eq!(usage.input_tokens, 56);
+        assert_eq!(usage.output_tokens, 16);
+        // A `TurnUsage` exists at all only because the adapter minted normalized
+        // accounting for it, which is precisely the evidence the turn commit
+        // requires.
+        assert_eq!(usage.accounting().model, "qwen3.8-27b");
+        assert!(matches!(
+            observed_done_outcome(&events),
+            Some(LlmDoneOutcome::Success {
+                stop_reason: StopReason::EndTurn
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_completions_separate_usage_event_preserves_length_finish_reason() {
+        // The reported production stream: metadata, deltas, `finish:length`,
+        // then a usage-only event, then `[DONE]`. `length` (not `stop`)
+        // distinguishes a remembered finish reason from a defaulted one:
+        // `stop` and "nothing latched" both project to `EndTurn`.
+        let events = collect_chat_stream_events(concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":56,\"completion_tokens\":16,\"total_tokens\":72}}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+
+        let usage_index = usage_update_index(&events).expect("usage-only event after finish");
+        let terminal_index = done_index(&events).expect("terminal done");
+        assert!(
+            usage_index < terminal_index,
+            "UsageUpdate must be emitted before the terminal Done, got {events:?}"
+        );
+        assert_eq!(done_count(&events), 1, "exactly one terminal Done");
+        assert!(
+            matches!(
+                observed_done_outcome(&events),
+                Some(LlmDoneOutcome::Success {
+                    stop_reason: StopReason::MaxTokens
+                })
+            ),
+            "the deferred Done must carry the remembered finish reason, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_separate_usage_event_terminates_without_done_sentinel() {
+        // Same split chunking, but the server closes the body instead of
+        // sending `[DONE]`. End of stream must close the turn too.
+        let events = collect_chat_stream_events(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":56,\"completion_tokens\":16,\"total_tokens\":72}}\n\n"
+        ))
+        .await;
+
+        let usage_index = usage_update_index(&events).expect("usage-only event after finish");
+        let terminal_index = done_index(&events).expect("terminal done at end of stream");
+        assert!(usage_index < terminal_index, "got {events:?}");
+        assert_eq!(done_count(&events), 1, "exactly one terminal Done");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_stream_without_any_usage_event_still_terminates() {
+        // Deferring the terminal Done must not introduce a wait for accounting
+        // a server never sends. This stream terminates with the same successful
+        // Done it produced before the fix, carrying no usage event.
+        let events = collect_chat_stream_events(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+
+        assert!(
+            usage_update_index(&events).is_none(),
+            "this stream carries no usage event, got {events:?}"
+        );
+        assert_eq!(done_count(&events), 1, "exactly one terminal Done");
+        assert!(matches!(
+            observed_done_outcome(&events),
+            Some(LlmDoneOutcome::Success {
+                stop_reason: StopReason::EndTurn
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_completions_stream_without_usage_or_sentinel_still_terminates() {
+        // Neither usage nor `[DONE]`: only the end of the body closes this turn.
+        let events = collect_chat_stream_events(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        )
+        .await;
+
+        assert!(usage_update_index(&events).is_none());
+        assert_eq!(done_count(&events), 1, "exactly one terminal Done");
+        assert!(matches!(
+            observed_done_outcome(&events),
+            Some(LlmDoneOutcome::Success {
+                stop_reason: StopReason::EndTurn
+            })
+        ));
+    }
+
     #[tokio::test]
     async fn chat_completions_stream_accumulates_tool_calls() {
         let payload = concat!(
@@ -1283,13 +1547,12 @@ mod tests {
 
     /// A single delta may carry BOTH `reasoning` and `content`. An
     /// OpenAI-compatible server emits exactly that on the reasoning-to-content
-    /// transition, and vLLM does. The reasoning in such a chunk was produced
-    /// BEFORE the content beside it, so the events must leave in that order.
+    /// transition, and vLLM does. The reasoning was produced BEFORE the content
+    /// beside it, so the events must leave in that order.
     ///
-    /// 0.8.23 emitted content first, which interleaved the two channels and
-    /// rendered as corruption. The reasoning test above cannot catch it: every
-    /// one of its chunks carries reasoning OR content, never both, so no
-    /// ordering question ever arises in the fixture.
+    /// The reasoning test above cannot catch a reversal: every one of its
+    /// chunks carries reasoning OR content, never both, so no ordering
+    /// question ever arises in the fixture.
     #[tokio::test]
     async fn combined_reasoning_and_content_delta_emits_reasoning_first() {
         let payload = concat!(
@@ -1331,9 +1594,7 @@ mod tests {
                 ("text", "I am an".to_string()),
                 ("text", " AI assistant.".to_string()),
             ],
-            "a combined delta must emit its reasoning before its content; \
-             emitting content first interleaves the channels and the operator \
-             sees the two streams shuffled together"
+            "a combined delta must emit its reasoning before its content"
         );
         handle.abort();
     }
@@ -1919,7 +2180,41 @@ mod tests {
         let line = r#"data:{"choices":[{"delta":{"content":"Hello"}}]}"#;
         let chunk =
             OpenAiCompatibleClient::parse_chat_completions_line(line).expect("line should parse");
-        assert!(chunk.is_some());
+        assert!(matches!(chunk, ChatCompletionsLine::Chunk(_)));
+    }
+
+    #[test]
+    fn parse_chat_completions_line_separates_terminal_sentinel_from_ignored_lines() {
+        // The terminal sentinel closes the turn; a line this adapter does not
+        // interpret is only wire liveness. One decoded value cannot stand for
+        // both.
+        assert!(matches!(
+            OpenAiCompatibleClient::parse_chat_completions_line("data: [DONE]")
+                .expect("sentinel should parse"),
+            ChatCompletionsLine::Done
+        ));
+        assert!(matches!(
+            OpenAiCompatibleClient::parse_chat_completions_line("event: ping")
+                .expect("unhandled field should parse"),
+            ChatCompletionsLine::Ignored
+        ));
+    }
+
+    #[test]
+    fn parse_chat_completions_line_accepts_a_chunk_without_choices() {
+        // A usage-only event may omit `choices` instead of sending it empty.
+        let line = r#"data: {"usage":{"prompt_tokens":56,"completion_tokens":16}}"#;
+        let parsed =
+            OpenAiCompatibleClient::parse_chat_completions_line(line).expect("line should parse");
+        let ChatCompletionsLine::Chunk(chunk) = parsed else {
+            unreachable!("a data line carrying usage decodes to a chunk")
+        };
+        assert!(chunk.choices.is_empty());
+        assert_eq!(
+            chunk.usage.and_then(|usage| usage.prompt_tokens),
+            Some(56),
+            "the usage on a choices-less chunk must survive decoding"
+        );
     }
 
     #[test]
