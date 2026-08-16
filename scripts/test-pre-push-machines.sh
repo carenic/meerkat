@@ -27,6 +27,13 @@ printf 'cargo %s\n' "$*" >> "$MEERKAT_MACHINE_TEST_CALL_LOG"
 if [[ "${MEERKAT_MACHINE_TEST_DIRTY_CODEGEN:-0}" == "1" ]]; then
   touch "$MEERKAT_MACHINE_TEST_ROOT/generated-untracked"
 fi
+# Dirty the tree only on the protocol-codegen call, so the protocol
+# clean-tree check is proven to fail on its own rather than inheriting the
+# machine-codegen check's verdict.
+if [[ "${MEERKAT_MACHINE_TEST_DIRTY_PROTOCOL_CODEGEN:-0}" == "1" \
+      && "$*" == "xtask protocol-codegen" ]]; then
+  touch "$MEERKAT_MACHINE_TEST_ROOT/protocol-generated-untracked"
+fi
 EOF
 cat > "$FAKE_MAKE" <<'EOF'
 #!/usr/bin/env bash
@@ -67,10 +74,45 @@ if [[ -s "$CALL_LOG" ]]; then
 fi
 
 run_case 0 0
-expected_calls=$'cargo xtask machine-codegen --all\nmake -C '"$TEST_ROOT"$' machine-verify'
+expected_calls=$'cargo xtask machine-codegen --all\ncargo xtask protocol-codegen\nmake -C '"$TEST_ROOT"$' machine-verify'
 if [[ "$(cat "$CALL_LOG")" != "$expected_calls" ]]; then
   echo "changed machine authority ran unexpected commands:" >&2
   cat "$CALL_LOG" >&2
+  exit 1
+fi
+
+# The protocol clean-tree check must fail on its own. Dirty the tree only on
+# the protocol-codegen call, so machine-codegen's check passes first and the
+# non-zero exit can only come from the protocol check.
+: > "$CALL_LOG"
+set +e
+(
+  ROOT="$TEST_ROOT" \
+    CARGO="$FAKE_CARGO" \
+    MAKE_BIN="$FAKE_MAKE" \
+    MACHINE_AUTHORITY_CHANGED="$FAKE_CLASSIFIER" \
+    PRE_COMMIT_FROM_REF="$test_head" \
+    PRE_COMMIT_TO_REF="$test_head" \
+    MEERKAT_MACHINE_TEST_CLASSIFIER_STATUS=0 \
+    MEERKAT_MACHINE_TEST_DIRTY_CODEGEN=0 \
+    MEERKAT_MACHINE_TEST_DIRTY_PROTOCOL_CODEGEN=1 \
+    MEERKAT_MACHINE_TEST_CALL_LOG="$CALL_LOG" \
+    MEERKAT_MACHINE_TEST_ROOT="$TEST_ROOT" \
+    "$REPO_ROOT/scripts/pre-push-machines.sh"
+) >/dev/null 2>&1
+dirty_protocol_failure=$?
+set -e
+rm -f "$TEST_ROOT/protocol-generated-untracked"
+if [[ "$dirty_protocol_failure" -eq 0 ]]; then
+  echo "dirty protocol codegen unexpectedly passed the machine gate" >&2
+  exit 1
+fi
+if ! grep -Fxq "cargo xtask protocol-codegen" "$CALL_LOG"; then
+  echo "protocol codegen was not invoked by the machine gate" >&2
+  exit 1
+fi
+if grep -Fq "machine-verify" "$CALL_LOG"; then
+  echo "dirty protocol codegen did not stop before machine-verify" >&2
   exit 1
 fi
 
