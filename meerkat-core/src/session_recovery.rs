@@ -778,6 +778,7 @@ mod tests {
                 budget_limits: Some(BudgetLimits {
                     max_tokens: Some(55),
                     max_duration: Some(Duration::from_secs(9)),
+                    max_turn_duration: None,
                     max_tool_calls: Some(2),
                 }),
                 recoverable_tool_defs: vec![ToolDef {
@@ -1114,6 +1115,7 @@ mod tests {
                 budget_limits: Some(BudgetLimits {
                     max_tokens: Some(77),
                     max_duration: Some(Duration::from_secs(12)),
+                    max_turn_duration: None,
                     max_tool_calls: Some(5),
                 }),
                 override_builtins: Some(true),

@@ -2065,8 +2065,12 @@ pub type MeerkatCommsSendInput = meerkat_contracts::CommsSendParams;
 pub struct BudgetLimitsInput {
     #[serde(default)]
     pub max_tokens: Option<u64>,
+    /// Agent-lifetime ceiling, measured from agent construction.
     #[serde(default)]
     pub max_duration_secs: Option<u64>,
+    /// Aggregate ceiling for a single turn, re-armed at every run entry.
+    #[serde(default)]
+    pub max_turn_duration_secs: Option<u64>,
     #[serde(default)]
     pub max_tool_calls: Option<usize>,
 }
@@ -2076,6 +2080,9 @@ impl From<BudgetLimitsInput> for meerkat_core::BudgetLimits {
         meerkat_core::BudgetLimits {
             max_tokens: value.max_tokens,
             max_duration: value.max_duration_secs.map(std::time::Duration::from_secs),
+            max_turn_duration: value
+                .max_turn_duration_secs
+                .map(std::time::Duration::from_secs),
             max_tool_calls: value.max_tool_calls,
         }
     }

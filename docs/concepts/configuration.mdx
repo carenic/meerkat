@@ -193,6 +193,41 @@ watchdog covers all built-in provider clients; a custom `AgentLlmClient`
 that does not report stream liveness fails open (no watchdog — only the
 hard call timeout applies).
 
+## Turn and agent-lifetime bounds
+
+The timeouts above bound one *segment* of a turn: a single LLM call, a single
+provider stream, a single tool call. Their **sum** is a separate fact with a
+separate owner:
+
+```toml
+[limits]
+budget = 200000              # max tokens, agent lifetime
+max_duration = "4h"          # wall-clock ceiling for the AGENT'S LIFETIME
+max_turn_duration = "30m"    # aggregate wall-clock ceiling for ONE TURN
+```
+
+`max_turn_duration` is the aggregate bound. Its clock is re-armed at every run
+entry, so it measures one turn end-to-end no matter how many LLM calls,
+retries, and tool batches that turn contains. Exceeding it takes the existing
+time terminal, `TurnTerminalOutcome::TimeBudgetExceeded`, which surfaces as
+`AgentError::TerminalFailure { outcome: TimeBudgetExceeded, .. }`. Note the
+asymmetry with the other budget dimensions, which is deliberate: an exhausted
+token or tool-call budget is an orderly stop that still answers the caller,
+while an exhausted deadline is a hard failure. A turn past its deadline can no
+longer promise what it did or when it will answer, so it fails closed rather
+than reporting a warning and continuing.
+
+`max_duration` is **not** a per-turn deadline. Its clock starts when the
+session's agent is built and is never re-armed, so it measures the agent's
+whole lifetime including idle time between turns. Setting it low to bound a
+turn will terminalize a later turn that did no work.
+
+Both are unset by default: turns are unbounded in aggregate unless a
+deployment declares a ceiling. The bound is enforced at segment boundaries, so
+it never tears down a tool call that is already running; the effective ceiling
+is `max_turn_duration` plus the longest segment already in flight (at most one
+per-tool-call timeout, since calls in a batch run their clocks together).
+
 ## Model fallback settings
 
 The model fallback chain is realm-scoped configuration. Empty `chain` means

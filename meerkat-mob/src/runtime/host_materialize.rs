@@ -3060,6 +3060,7 @@ mod tests {
                 budget_limits: Some(meerkat_core::BudgetLimits {
                     max_tokens: Some(100_000),
                     max_duration: None,
+                    max_turn_duration: None,
                     max_tool_calls: Some(50),
                 }),
                 runtime_mode: meerkat_contracts::wire::WireMobRuntimeMode::TurnDriven,

@@ -1030,6 +1030,7 @@ mod tests {
         let limits = meerkat_core::BudgetLimits {
             max_tokens: None,
             max_duration: None,
+            max_turn_duration: None,
             max_tool_calls: Some(3),
         };
         let mut p = params(

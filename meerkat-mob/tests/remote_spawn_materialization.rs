@@ -742,6 +742,7 @@ async fn budget_rides_the_digest_covered_overlay_and_nowhere_else() {
     let limits = meerkat_core::BudgetLimits {
         max_tokens: None,
         max_duration: None,
+        max_turn_duration: None,
         max_tool_calls: Some(1),
     };
     let mut spec = support::placed_spawn_spec("worker", "b2", &report.host_id);

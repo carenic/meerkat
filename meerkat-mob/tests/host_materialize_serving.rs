@@ -1597,6 +1597,7 @@ async fn materialize_overlay_budget_lands_in_build_options() {
     let limits = meerkat_core::BudgetLimits {
         max_tokens: Some(4_096),
         max_duration: None,
+        max_turn_duration: None,
         max_tool_calls: Some(3),
     };
     let mut spec = sample_portable_member_spec("mob-t11", "b2", "worker");

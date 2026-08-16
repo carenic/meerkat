@@ -414,6 +414,9 @@ impl Config {
         if other.limits.max_duration.is_some() {
             self.limits.max_duration = other.limits.max_duration;
         }
+        if other.limits.max_turn_duration.is_some() {
+            self.limits.max_turn_duration = other.limits.max_turn_duration;
+        }
         if other.rest != RestServerConfig::default() {
             self.rest = other.rest;
         }
@@ -909,6 +912,15 @@ impl Config {
         if self.limits.max_sessions == Some(0) {
             return Err(ConfigError::Validation(
                 "limits.max_sessions must be greater than 0 when set".to_string(),
+            ));
+        }
+        // A zero turn ceiling would terminalize every turn before its first
+        // LLM call. That is a configuration mistake, not a way to express "no
+        // turns allowed", so it fails closed at load rather than producing a
+        // fleet of instantly-dead turns.
+        if self.limits.max_turn_duration == Some(Duration::ZERO) {
+            return Err(ConfigError::Validation(
+                "limits.max_turn_duration must be greater than 0 when set".to_string(),
             ));
         }
         if self.compaction.auto_compact_threshold == 0 {
@@ -1557,8 +1569,25 @@ pub struct LimitsConfig {
     /// this limit. RPC observes runtime config updates dynamically; REST/MCP
     /// process-local services apply changes on service restart.
     pub max_sessions: Option<usize>,
+    /// Agent-lifetime wall-clock ceiling. Measured from agent construction
+    /// (session creation, for service-backed surfaces), not per turn.
     #[serde(with = "optional_duration_serde")]
     pub max_duration: Option<Duration>,
+    /// Aggregate wall-clock ceiling for a single turn, re-armed at every run
+    /// entry.
+    ///
+    /// Unset by default: turns stay unbounded in aggregate unless a
+    /// deployment declares a ceiling. Every segment of a turn carries its own
+    /// timeout regardless; this is the only bound on their sum.
+    ///
+    /// Skipped when unset so an existing realm config document keeps its
+    /// exact bytes rather than gaining a null key on the next rewrite.
+    #[serde(
+        default,
+        with = "optional_duration_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_turn_duration: Option<Duration>,
 }
 
 impl LimitsConfig {
@@ -1566,6 +1595,7 @@ impl LimitsConfig {
         BudgetLimits {
             max_tokens: self.budget,
             max_duration: self.max_duration,
+            max_turn_duration: self.max_turn_duration,
             max_tool_calls: None,
         }
     }
