@@ -55,6 +55,20 @@ TerminalStutter ==
     /\ phase = "Released"
     /\ UNCHANGED vars
 
+\* Named UNCHANGED frames. One definition per distinct frame; every action
+\* that leaves those variables unchanged references the definition by name.
+UnchangedFrame_131bb96ef518525a == UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+UnchangedFrame_17e882200453b6ed == UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+UnchangedFrame_406de655613c82f8 == UNCHANGED << last_refresh, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+UnchangedFrame_4c7cae2d3aa4ff6d == UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count >>
+UnchangedFrame_58d7ab2993337708 == UNCHANGED << credential_generation, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+UnchangedFrame_70b7c14ac09c236c == UNCHANGED << expires_at, last_refresh, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+UnchangedFrame_84b4777df2a321b4 == UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+UnchangedFrame_c1e698ecd35aa39a == UNCHANGED << credential_generation >>
+UnchangedFrame_e68d2f8d143b21b0 == UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+UnchangedFrame_e9fda9e62fb02e30 == UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count >>
+UnchangedFrame_f87ebf4401320955 == UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+
 Acquire(expires_at_ts, arg_credential_published_at_millis) ==
     /\ phase = "Valid" \/ phase = "Expiring" \/ phase = "Expired" \/ phase = "Refreshing" \/ phase = "ReauthRequired" \/ phase = "Released"
     /\ phase' = "Valid"
@@ -64,14 +78,14 @@ Acquire(expires_at_ts, arg_credential_published_at_millis) ==
     /\ credential_present' = TRUE
     /\ credential_generation' = (credential_generation + 1)
     /\ credential_published_at_millis' = Some(arg_credential_published_at_millis)
-    /\ UNCHANGED << last_refresh, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_406de655613c82f8
 
 
 MarkExpiring ==
     /\ phase = "Valid"
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ObserveCredentialFreshnessValid(now_ts, refresh_window_secs) ==
@@ -79,7 +93,7 @@ ObserveCredentialFreshnessValid(now_ts, refresh_window_secs) ==
     /\ (IF (expires_at = None) THEN TRUE ELSE ((now_ts + refresh_window_secs) <= (IF "value" \in DOMAIN expires_at THEN expires_at["value"] ELSE None)))
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ObserveCredentialFreshnessExpiringFromValid(now_ts, refresh_window_secs) ==
@@ -87,7 +101,7 @@ ObserveCredentialFreshnessExpiringFromValid(now_ts, refresh_window_secs) ==
     /\ (IF (expires_at = None) THEN FALSE ELSE ((now_ts < (IF "value" \in DOMAIN expires_at THEN expires_at["value"] ELSE None)) /\ ((IF "value" \in DOMAIN expires_at THEN expires_at["value"] ELSE None) < (now_ts + refresh_window_secs))))
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ObserveCredentialFreshnessExpiredFromValid(now_ts, refresh_window_secs) ==
@@ -95,7 +109,7 @@ ObserveCredentialFreshnessExpiredFromValid(now_ts, refresh_window_secs) ==
     /\ (IF (expires_at = None) THEN FALSE ELSE ((IF "value" \in DOMAIN expires_at THEN expires_at["value"] ELSE None) <= now_ts))
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ObserveCredentialFreshnessExpiring(now_ts, refresh_window_secs) ==
@@ -103,7 +117,7 @@ ObserveCredentialFreshnessExpiring(now_ts, refresh_window_secs) ==
     /\ (IF (expires_at = None) THEN TRUE ELSE (now_ts < (IF "value" \in DOMAIN expires_at THEN expires_at["value"] ELSE None)))
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ObserveCredentialFreshnessExpiredFromExpiring(now_ts, refresh_window_secs) ==
@@ -111,56 +125,56 @@ ObserveCredentialFreshnessExpiredFromExpiring(now_ts, refresh_window_secs) ==
     /\ (IF (expires_at = None) THEN FALSE ELSE ((IF "value" \in DOMAIN expires_at THEN expires_at["value"] ELSE None) <= now_ts))
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ObserveCredentialFreshnessExpired(now_ts, refresh_window_secs) ==
     /\ phase = "Expired"
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ObserveCredentialFreshnessRefreshing(now_ts, refresh_window_secs) ==
     /\ phase = "Refreshing"
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ObserveCredentialFreshnessReauthRequired(now_ts, refresh_window_secs) ==
     /\ phase = "ReauthRequired"
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ObserveCredentialFreshnessReleased(now_ts, refresh_window_secs) ==
     /\ phase = "Released"
     /\ phase' = "Released"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 BeginRefreshFromValid ==
     /\ phase = "Valid"
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 BeginRefreshFromExpiring ==
     /\ phase = "Expiring"
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 BeginRefreshFromExpired ==
     /\ phase = "Expired"
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 CompleteRefresh(new_expires_at, now_ts, arg_credential_published_at_millis) ==
@@ -174,7 +188,7 @@ CompleteRefresh(new_expires_at, now_ts, arg_credential_published_at_millis) ==
     /\ credential_present' = TRUE
     /\ credential_generation' = (credential_generation + 1)
     /\ credential_published_at_millis' = Some(arg_credential_published_at_millis)
-    /\ UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_e68d2f8d143b21b0
 
 
 ResolveRefreshFailureDispositionTransientRefreshing(http_status, oauth_error_code, local_credential_unusable) ==
@@ -182,7 +196,7 @@ ResolveRefreshFailureDispositionTransientRefreshing(http_status, oauth_error_cod
     /\ ((local_credential_unusable = FALSE) /\ (http_status # Some(401)) /\ (http_status # Some(403)) /\ (oauth_error_code # Some("invalid_grant")) /\ (oauth_error_code # Some("invalid_client")) /\ (oauth_error_code # Some("unauthorized_client")) /\ (oauth_error_code # Some("invalid_scope")) /\ (oauth_error_code # Some("access_denied")) /\ (oauth_error_code # Some("permission_denied")) /\ (oauth_error_code # Some("expired_token")))
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveRefreshFailureDispositionPermanentRefreshing(http_status, oauth_error_code, local_credential_unusable) ==
@@ -190,7 +204,7 @@ ResolveRefreshFailureDispositionPermanentRefreshing(http_status, oauth_error_cod
     /\ (IF (local_credential_unusable = TRUE) THEN TRUE ELSE (IF (http_status = Some(401)) THEN TRUE ELSE (IF (http_status = Some(403)) THEN TRUE ELSE (IF (oauth_error_code = Some("invalid_grant")) THEN TRUE ELSE (IF (oauth_error_code = Some("invalid_client")) THEN TRUE ELSE (IF (oauth_error_code = Some("unauthorized_client")) THEN TRUE ELSE (IF (oauth_error_code = Some("invalid_scope")) THEN TRUE ELSE (IF (oauth_error_code = Some("access_denied")) THEN TRUE ELSE (IF (oauth_error_code = Some("permission_denied")) THEN TRUE ELSE (oauth_error_code = Some("expired_token")))))))))))
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 RefreshFailedTransient(disposition) ==
@@ -199,7 +213,7 @@ RefreshFailedTransient(disposition) ==
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
     /\ refresh_attempt' = (refresh_attempt + 1)
-    /\ UNCHANGED << expires_at, last_refresh, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_70b7c14ac09c236c
 
 
 RefreshFailedPermanent(disposition) ==
@@ -208,35 +222,35 @@ RefreshFailedPermanent(disposition) ==
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
     /\ refresh_attempt' = (refresh_attempt + 1)
-    /\ UNCHANGED << expires_at, last_refresh, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_70b7c14ac09c236c
 
 
 MarkReauthRequiredFromValid ==
     /\ phase = "Valid"
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 MarkReauthRequiredFromExpiring ==
     /\ phase = "Expiring"
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 MarkReauthRequiredFromExpired ==
     /\ phase = "Expired"
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 MarkReauthRequiredFromRefreshing ==
     /\ phase = "Refreshing"
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ClearCredentialLifecycle ==
@@ -248,7 +262,7 @@ ClearCredentialLifecycle ==
     /\ refresh_attempt' = 0
     /\ credential_present' = FALSE
     /\ credential_published_at_millis' = None
-    /\ UNCHANGED << credential_generation, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_58d7ab2993337708
 
 
 ReleaseCredentialLifecycleWithOAuth ==
@@ -261,7 +275,7 @@ ReleaseCredentialLifecycleWithOAuth ==
     /\ refresh_attempt' = 0
     /\ credential_present' = FALSE
     /\ credential_published_at_millis' = None
-    /\ UNCHANGED << credential_generation, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_58d7ab2993337708
 
 
 ReleaseCredentialLifecycleWithoutOAuth ==
@@ -284,7 +298,7 @@ ReleaseCredentialLifecycleWithoutOAuth ==
     /\ oauth_device_poll_ids' = {}
     /\ oauth_outstanding_flow_count' = 0
     /\ release_draining' = FALSE
-    /\ UNCHANGED << credential_generation >>
+    /\ UnchangedFrame_c1e698ecd35aa39a
 
 
 BeginReleaseDrainingOAuthFlowsValid ==
@@ -293,7 +307,7 @@ BeginReleaseDrainingOAuthFlowsValid ==
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
     /\ release_draining' = TRUE
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count >>
+    /\ UnchangedFrame_4c7cae2d3aa4ff6d
 
 
 BeginReleaseDrainingOAuthFlowsExpiring ==
@@ -302,7 +316,7 @@ BeginReleaseDrainingOAuthFlowsExpiring ==
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
     /\ release_draining' = TRUE
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count >>
+    /\ UnchangedFrame_4c7cae2d3aa4ff6d
 
 
 BeginReleaseDrainingOAuthFlowsExpired ==
@@ -311,7 +325,7 @@ BeginReleaseDrainingOAuthFlowsExpired ==
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
     /\ release_draining' = TRUE
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count >>
+    /\ UnchangedFrame_4c7cae2d3aa4ff6d
 
 
 BeginReleaseDrainingOAuthFlowsRefreshing ==
@@ -320,7 +334,7 @@ BeginReleaseDrainingOAuthFlowsRefreshing ==
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
     /\ release_draining' = TRUE
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count >>
+    /\ UnchangedFrame_4c7cae2d3aa4ff6d
 
 
 BeginReleaseDrainingOAuthFlowsReauthRequired ==
@@ -329,7 +343,7 @@ BeginReleaseDrainingOAuthFlowsReauthRequired ==
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
     /\ release_draining' = TRUE
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count >>
+    /\ UnchangedFrame_4c7cae2d3aa4ff6d
 
 
 BeginReleaseWithoutOAuthFlowsValid ==
@@ -338,7 +352,7 @@ BeginReleaseWithoutOAuthFlowsValid ==
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
     /\ release_draining' = TRUE
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count >>
+    /\ UnchangedFrame_4c7cae2d3aa4ff6d
 
 
 BeginReleaseWithoutOAuthFlowsExpiring ==
@@ -347,7 +361,7 @@ BeginReleaseWithoutOAuthFlowsExpiring ==
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
     /\ release_draining' = TRUE
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count >>
+    /\ UnchangedFrame_4c7cae2d3aa4ff6d
 
 
 BeginReleaseWithoutOAuthFlowsExpired ==
@@ -356,7 +370,7 @@ BeginReleaseWithoutOAuthFlowsExpired ==
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
     /\ release_draining' = TRUE
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count >>
+    /\ UnchangedFrame_4c7cae2d3aa4ff6d
 
 
 BeginReleaseWithoutOAuthFlowsRefreshing ==
@@ -365,7 +379,7 @@ BeginReleaseWithoutOAuthFlowsRefreshing ==
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
     /\ release_draining' = TRUE
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count >>
+    /\ UnchangedFrame_4c7cae2d3aa4ff6d
 
 
 BeginReleaseWithoutOAuthFlowsReauthRequired ==
@@ -374,14 +388,14 @@ BeginReleaseWithoutOAuthFlowsReauthRequired ==
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
     /\ release_draining' = TRUE
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count >>
+    /\ UnchangedFrame_4c7cae2d3aa4ff6d
 
 
 BeginReleaseReleased ==
     /\ phase = "Released"
     /\ phase' = "Released"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 Release ==
@@ -404,7 +418,7 @@ Release ==
     /\ oauth_device_poll_ids' = {}
     /\ oauth_outstanding_flow_count' = 0
     /\ release_draining' = FALSE
-    /\ UNCHANGED << credential_generation >>
+    /\ UnchangedFrame_c1e698ecd35aa39a
 
 
 RestoreCredentialLifecycleSnapshotValid(lifecycle_phase, arg_expires_at, arg_last_refresh, arg_refresh_attempt, arg_credential_present, arg_credential_generation, arg_credential_published_at_millis, restored_oauth_membership_observed) ==
@@ -418,7 +432,7 @@ RestoreCredentialLifecycleSnapshotValid(lifecycle_phase, arg_expires_at, arg_las
     /\ credential_present' = arg_credential_present
     /\ credential_generation' = IF (arg_credential_generation > credential_generation) THEN arg_credential_generation ELSE credential_generation
     /\ credential_published_at_millis' = arg_credential_published_at_millis
-    /\ UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_e68d2f8d143b21b0
 
 
 RestoreCredentialLifecycleSnapshotExpiring(lifecycle_phase, arg_expires_at, arg_last_refresh, arg_refresh_attempt, arg_credential_present, arg_credential_generation, arg_credential_published_at_millis, restored_oauth_membership_observed) ==
@@ -432,7 +446,7 @@ RestoreCredentialLifecycleSnapshotExpiring(lifecycle_phase, arg_expires_at, arg_
     /\ credential_present' = arg_credential_present
     /\ credential_generation' = IF (arg_credential_generation > credential_generation) THEN arg_credential_generation ELSE credential_generation
     /\ credential_published_at_millis' = arg_credential_published_at_millis
-    /\ UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_e68d2f8d143b21b0
 
 
 RestoreCredentialLifecycleSnapshotRefreshing(lifecycle_phase, arg_expires_at, arg_last_refresh, arg_refresh_attempt, arg_credential_present, arg_credential_generation, arg_credential_published_at_millis, restored_oauth_membership_observed) ==
@@ -446,7 +460,7 @@ RestoreCredentialLifecycleSnapshotRefreshing(lifecycle_phase, arg_expires_at, ar
     /\ credential_present' = arg_credential_present
     /\ credential_generation' = IF (arg_credential_generation > credential_generation) THEN arg_credential_generation ELSE credential_generation
     /\ credential_published_at_millis' = arg_credential_published_at_millis
-    /\ UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_e68d2f8d143b21b0
 
 
 RestoreCredentialLifecycleSnapshotExpired(lifecycle_phase, arg_expires_at, arg_last_refresh, arg_refresh_attempt, arg_credential_present, arg_credential_generation, arg_credential_published_at_millis, restored_oauth_membership_observed) ==
@@ -460,7 +474,7 @@ RestoreCredentialLifecycleSnapshotExpired(lifecycle_phase, arg_expires_at, arg_l
     /\ credential_present' = arg_credential_present
     /\ credential_generation' = IF (arg_credential_generation > credential_generation) THEN arg_credential_generation ELSE credential_generation
     /\ credential_published_at_millis' = arg_credential_published_at_millis
-    /\ UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_e68d2f8d143b21b0
 
 
 RestoreCredentialLifecycleSnapshotReauthRequired(lifecycle_phase, arg_expires_at, arg_last_refresh, arg_refresh_attempt, arg_credential_present, arg_credential_generation, arg_credential_published_at_millis, restored_oauth_membership_observed) ==
@@ -474,7 +488,7 @@ RestoreCredentialLifecycleSnapshotReauthRequired(lifecycle_phase, arg_expires_at
     /\ credential_present' = arg_credential_present
     /\ credential_generation' = IF (arg_credential_generation > credential_generation) THEN arg_credential_generation ELSE credential_generation
     /\ credential_published_at_millis' = arg_credential_published_at_millis
-    /\ UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_e68d2f8d143b21b0
 
 
 RestoreCredentialLifecycleSnapshotNoCredentialWithOAuth(lifecycle_phase, arg_expires_at, arg_last_refresh, arg_refresh_attempt, arg_credential_present, arg_credential_generation, arg_credential_published_at_millis, restored_oauth_membership_observed) ==
@@ -489,7 +503,7 @@ RestoreCredentialLifecycleSnapshotNoCredentialWithOAuth(lifecycle_phase, arg_exp
     /\ credential_present' = FALSE
     /\ credential_generation' = IF (arg_credential_generation > credential_generation) THEN arg_credential_generation ELSE credential_generation
     /\ credential_published_at_millis' = None
-    /\ UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_e68d2f8d143b21b0
 
 
 RestoreCredentialLifecycleSnapshotNoCredentialWithoutOAuth(lifecycle_phase, arg_expires_at, arg_last_refresh, arg_refresh_attempt, arg_credential_present, arg_credential_generation, arg_credential_published_at_millis, restored_oauth_membership_observed) ==
@@ -527,7 +541,7 @@ RestoreAuthoritySnapshotValid(lifecycle_phase, arg_expires_at, arg_last_refresh,
     /\ credential_present' = arg_credential_present
     /\ credential_generation' = IF (arg_credential_generation > credential_generation) THEN arg_credential_generation ELSE credential_generation
     /\ credential_published_at_millis' = arg_credential_published_at_millis
-    /\ UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_e68d2f8d143b21b0
 
 
 RestoreAuthoritySnapshotExpiring(lifecycle_phase, arg_expires_at, arg_last_refresh, arg_refresh_attempt, arg_credential_present, arg_credential_generation, arg_credential_published_at_millis) ==
@@ -541,7 +555,7 @@ RestoreAuthoritySnapshotExpiring(lifecycle_phase, arg_expires_at, arg_last_refre
     /\ credential_present' = arg_credential_present
     /\ credential_generation' = IF (arg_credential_generation > credential_generation) THEN arg_credential_generation ELSE credential_generation
     /\ credential_published_at_millis' = arg_credential_published_at_millis
-    /\ UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_e68d2f8d143b21b0
 
 
 RestoreAuthoritySnapshotRefreshing(lifecycle_phase, arg_expires_at, arg_last_refresh, arg_refresh_attempt, arg_credential_present, arg_credential_generation, arg_credential_published_at_millis) ==
@@ -555,7 +569,7 @@ RestoreAuthoritySnapshotRefreshing(lifecycle_phase, arg_expires_at, arg_last_ref
     /\ credential_present' = arg_credential_present
     /\ credential_generation' = IF (arg_credential_generation > credential_generation) THEN arg_credential_generation ELSE credential_generation
     /\ credential_published_at_millis' = arg_credential_published_at_millis
-    /\ UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_e68d2f8d143b21b0
 
 
 RestoreAuthoritySnapshotExpired(lifecycle_phase, arg_expires_at, arg_last_refresh, arg_refresh_attempt, arg_credential_present, arg_credential_generation, arg_credential_published_at_millis) ==
@@ -569,7 +583,7 @@ RestoreAuthoritySnapshotExpired(lifecycle_phase, arg_expires_at, arg_last_refres
     /\ credential_present' = arg_credential_present
     /\ credential_generation' = IF (arg_credential_generation > credential_generation) THEN arg_credential_generation ELSE credential_generation
     /\ credential_published_at_millis' = arg_credential_published_at_millis
-    /\ UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_e68d2f8d143b21b0
 
 
 RestoreAuthoritySnapshotReauthRequired(lifecycle_phase, arg_expires_at, arg_last_refresh, arg_refresh_attempt, arg_credential_present, arg_credential_generation, arg_credential_published_at_millis) ==
@@ -583,7 +597,7 @@ RestoreAuthoritySnapshotReauthRequired(lifecycle_phase, arg_expires_at, arg_last
     /\ credential_present' = arg_credential_present
     /\ credential_generation' = IF (arg_credential_generation > credential_generation) THEN arg_credential_generation ELSE credential_generation
     /\ credential_published_at_millis' = arg_credential_published_at_millis
-    /\ UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_e68d2f8d143b21b0
 
 
 RestoreAuthoritySnapshotReleased(lifecycle_phase, arg_expires_at, arg_last_refresh, arg_refresh_attempt, arg_credential_present, arg_credential_generation, arg_credential_published_at_millis) ==
@@ -598,7 +612,7 @@ RestoreAuthoritySnapshotReleased(lifecycle_phase, arg_expires_at, arg_last_refre
     /\ credential_generation' = IF (arg_credential_generation > credential_generation) THEN arg_credential_generation ELSE credential_generation
     /\ credential_published_at_millis' = arg_credential_published_at_millis
     /\ release_draining' = FALSE
-    /\ UNCHANGED << oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count >>
+    /\ UnchangedFrame_e9fda9e62fb02e30
 
 
 RestoreOAuthBrowserFlowValid(flow_id, provider, redirect_uri, expires_at_millis) ==
@@ -614,7 +628,7 @@ RestoreOAuthBrowserFlowValid(flow_id, provider, redirect_uri, expires_at_millis)
     /\ oauth_browser_flow_redirect_uris' = MapSet(oauth_browser_flow_redirect_uris, flow_id, (IF "value" \in DOMAIN redirect_uri THEN redirect_uri["value"] ELSE None))
     /\ oauth_browser_flow_expires_at_millis' = MapSet(oauth_browser_flow_expires_at_millis, flow_id, (IF "value" \in DOMAIN expires_at_millis THEN expires_at_millis["value"] ELSE None))
     /\ oauth_outstanding_flow_count' = IF ((flow_id \in oauth_browser_flow_ids) = FALSE) THEN (oauth_outstanding_flow_count + 1) ELSE oauth_outstanding_flow_count
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 RestoreOAuthBrowserFlowExpiring(flow_id, provider, redirect_uri, expires_at_millis) ==
@@ -630,7 +644,7 @@ RestoreOAuthBrowserFlowExpiring(flow_id, provider, redirect_uri, expires_at_mill
     /\ oauth_browser_flow_redirect_uris' = MapSet(oauth_browser_flow_redirect_uris, flow_id, (IF "value" \in DOMAIN redirect_uri THEN redirect_uri["value"] ELSE None))
     /\ oauth_browser_flow_expires_at_millis' = MapSet(oauth_browser_flow_expires_at_millis, flow_id, (IF "value" \in DOMAIN expires_at_millis THEN expires_at_millis["value"] ELSE None))
     /\ oauth_outstanding_flow_count' = IF ((flow_id \in oauth_browser_flow_ids) = FALSE) THEN (oauth_outstanding_flow_count + 1) ELSE oauth_outstanding_flow_count
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 RestoreOAuthBrowserFlowExpired(flow_id, provider, redirect_uri, expires_at_millis) ==
@@ -646,7 +660,7 @@ RestoreOAuthBrowserFlowExpired(flow_id, provider, redirect_uri, expires_at_milli
     /\ oauth_browser_flow_redirect_uris' = MapSet(oauth_browser_flow_redirect_uris, flow_id, (IF "value" \in DOMAIN redirect_uri THEN redirect_uri["value"] ELSE None))
     /\ oauth_browser_flow_expires_at_millis' = MapSet(oauth_browser_flow_expires_at_millis, flow_id, (IF "value" \in DOMAIN expires_at_millis THEN expires_at_millis["value"] ELSE None))
     /\ oauth_outstanding_flow_count' = IF ((flow_id \in oauth_browser_flow_ids) = FALSE) THEN (oauth_outstanding_flow_count + 1) ELSE oauth_outstanding_flow_count
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 RestoreOAuthBrowserFlowRefreshing(flow_id, provider, redirect_uri, expires_at_millis) ==
@@ -662,7 +676,7 @@ RestoreOAuthBrowserFlowRefreshing(flow_id, provider, redirect_uri, expires_at_mi
     /\ oauth_browser_flow_redirect_uris' = MapSet(oauth_browser_flow_redirect_uris, flow_id, (IF "value" \in DOMAIN redirect_uri THEN redirect_uri["value"] ELSE None))
     /\ oauth_browser_flow_expires_at_millis' = MapSet(oauth_browser_flow_expires_at_millis, flow_id, (IF "value" \in DOMAIN expires_at_millis THEN expires_at_millis["value"] ELSE None))
     /\ oauth_outstanding_flow_count' = IF ((flow_id \in oauth_browser_flow_ids) = FALSE) THEN (oauth_outstanding_flow_count + 1) ELSE oauth_outstanding_flow_count
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 RestoreOAuthBrowserFlowReauthRequired(flow_id, provider, redirect_uri, expires_at_millis) ==
@@ -678,7 +692,7 @@ RestoreOAuthBrowserFlowReauthRequired(flow_id, provider, redirect_uri, expires_a
     /\ oauth_browser_flow_redirect_uris' = MapSet(oauth_browser_flow_redirect_uris, flow_id, (IF "value" \in DOMAIN redirect_uri THEN redirect_uri["value"] ELSE None))
     /\ oauth_browser_flow_expires_at_millis' = MapSet(oauth_browser_flow_expires_at_millis, flow_id, (IF "value" \in DOMAIN expires_at_millis THEN expires_at_millis["value"] ELSE None))
     /\ oauth_outstanding_flow_count' = IF ((flow_id \in oauth_browser_flow_ids) = FALSE) THEN (oauth_outstanding_flow_count + 1) ELSE oauth_outstanding_flow_count
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 RestoreOAuthDeviceFlowValid(flow_id, provider, expires_at_millis) ==
@@ -693,7 +707,7 @@ RestoreOAuthDeviceFlowValid(flow_id, provider, expires_at_millis) ==
     /\ oauth_device_flow_expires_at_millis' = MapSet(oauth_device_flow_expires_at_millis, flow_id, (IF "value" \in DOMAIN expires_at_millis THEN expires_at_millis["value"] ELSE None))
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = IF ((flow_id \in oauth_device_flow_ids) = FALSE) THEN (oauth_outstanding_flow_count + 1) ELSE oauth_outstanding_flow_count
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 RestoreOAuthDeviceFlowExpiring(flow_id, provider, expires_at_millis) ==
@@ -708,7 +722,7 @@ RestoreOAuthDeviceFlowExpiring(flow_id, provider, expires_at_millis) ==
     /\ oauth_device_flow_expires_at_millis' = MapSet(oauth_device_flow_expires_at_millis, flow_id, (IF "value" \in DOMAIN expires_at_millis THEN expires_at_millis["value"] ELSE None))
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = IF ((flow_id \in oauth_device_flow_ids) = FALSE) THEN (oauth_outstanding_flow_count + 1) ELSE oauth_outstanding_flow_count
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 RestoreOAuthDeviceFlowExpired(flow_id, provider, expires_at_millis) ==
@@ -723,7 +737,7 @@ RestoreOAuthDeviceFlowExpired(flow_id, provider, expires_at_millis) ==
     /\ oauth_device_flow_expires_at_millis' = MapSet(oauth_device_flow_expires_at_millis, flow_id, (IF "value" \in DOMAIN expires_at_millis THEN expires_at_millis["value"] ELSE None))
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = IF ((flow_id \in oauth_device_flow_ids) = FALSE) THEN (oauth_outstanding_flow_count + 1) ELSE oauth_outstanding_flow_count
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 RestoreOAuthDeviceFlowRefreshing(flow_id, provider, expires_at_millis) ==
@@ -738,7 +752,7 @@ RestoreOAuthDeviceFlowRefreshing(flow_id, provider, expires_at_millis) ==
     /\ oauth_device_flow_expires_at_millis' = MapSet(oauth_device_flow_expires_at_millis, flow_id, (IF "value" \in DOMAIN expires_at_millis THEN expires_at_millis["value"] ELSE None))
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = IF ((flow_id \in oauth_device_flow_ids) = FALSE) THEN (oauth_outstanding_flow_count + 1) ELSE oauth_outstanding_flow_count
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 RestoreOAuthDeviceFlowReauthRequired(flow_id, provider, expires_at_millis) ==
@@ -753,7 +767,7 @@ RestoreOAuthDeviceFlowReauthRequired(flow_id, provider, expires_at_millis) ==
     /\ oauth_device_flow_expires_at_millis' = MapSet(oauth_device_flow_expires_at_millis, flow_id, (IF "value" \in DOMAIN expires_at_millis THEN expires_at_millis["value"] ELSE None))
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = IF ((flow_id \in oauth_device_flow_ids) = FALSE) THEN (oauth_outstanding_flow_count + 1) ELSE oauth_outstanding_flow_count
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 RestoreOAuthDevicePollValid(flow_id) ==
@@ -763,7 +777,7 @@ RestoreOAuthDevicePollValid(flow_id) ==
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \cup {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 RestoreOAuthDevicePollExpiring(flow_id) ==
@@ -773,7 +787,7 @@ RestoreOAuthDevicePollExpiring(flow_id) ==
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \cup {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 RestoreOAuthDevicePollExpired(flow_id) ==
@@ -783,7 +797,7 @@ RestoreOAuthDevicePollExpired(flow_id) ==
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \cup {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 RestoreOAuthDevicePollRefreshing(flow_id) ==
@@ -793,7 +807,7 @@ RestoreOAuthDevicePollRefreshing(flow_id) ==
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \cup {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 RestoreOAuthDevicePollReauthRequired(flow_id) ==
@@ -803,7 +817,7 @@ RestoreOAuthDevicePollReauthRequired(flow_id) ==
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \cup {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 AdmitOAuthBrowserFlowValid(flow_id, provider, redirect_uri, expires_at_millis, max_outstanding_flows, observed_global_outstanding_flows) ==
@@ -819,7 +833,7 @@ AdmitOAuthBrowserFlowValid(flow_id, provider, redirect_uri, expires_at_millis, m
     /\ oauth_browser_flow_redirect_uris' = MapSet(oauth_browser_flow_redirect_uris, flow_id, redirect_uri)
     /\ oauth_browser_flow_expires_at_millis' = MapSet(oauth_browser_flow_expires_at_millis, flow_id, expires_at_millis)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count + 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 AdmitOAuthBrowserFlowExpiring(flow_id, provider, redirect_uri, expires_at_millis, max_outstanding_flows, observed_global_outstanding_flows) ==
@@ -835,7 +849,7 @@ AdmitOAuthBrowserFlowExpiring(flow_id, provider, redirect_uri, expires_at_millis
     /\ oauth_browser_flow_redirect_uris' = MapSet(oauth_browser_flow_redirect_uris, flow_id, redirect_uri)
     /\ oauth_browser_flow_expires_at_millis' = MapSet(oauth_browser_flow_expires_at_millis, flow_id, expires_at_millis)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count + 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 AdmitOAuthBrowserFlowExpired(flow_id, provider, redirect_uri, expires_at_millis, max_outstanding_flows, observed_global_outstanding_flows) ==
@@ -851,7 +865,7 @@ AdmitOAuthBrowserFlowExpired(flow_id, provider, redirect_uri, expires_at_millis,
     /\ oauth_browser_flow_redirect_uris' = MapSet(oauth_browser_flow_redirect_uris, flow_id, redirect_uri)
     /\ oauth_browser_flow_expires_at_millis' = MapSet(oauth_browser_flow_expires_at_millis, flow_id, expires_at_millis)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count + 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 AdmitOAuthBrowserFlowRefreshing(flow_id, provider, redirect_uri, expires_at_millis, max_outstanding_flows, observed_global_outstanding_flows) ==
@@ -867,7 +881,7 @@ AdmitOAuthBrowserFlowRefreshing(flow_id, provider, redirect_uri, expires_at_mill
     /\ oauth_browser_flow_redirect_uris' = MapSet(oauth_browser_flow_redirect_uris, flow_id, redirect_uri)
     /\ oauth_browser_flow_expires_at_millis' = MapSet(oauth_browser_flow_expires_at_millis, flow_id, expires_at_millis)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count + 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 AdmitOAuthBrowserFlowReauthRequired(flow_id, provider, redirect_uri, expires_at_millis, max_outstanding_flows, observed_global_outstanding_flows) ==
@@ -883,7 +897,7 @@ AdmitOAuthBrowserFlowReauthRequired(flow_id, provider, redirect_uri, expires_at_
     /\ oauth_browser_flow_redirect_uris' = MapSet(oauth_browser_flow_redirect_uris, flow_id, redirect_uri)
     /\ oauth_browser_flow_expires_at_millis' = MapSet(oauth_browser_flow_expires_at_millis, flow_id, expires_at_millis)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count + 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 ReopenReleasedForOAuthBrowserFlowAdmission(flow_id, provider, redirect_uri, expires_at_millis, max_outstanding_flows, observed_global_outstanding_flows) ==
@@ -899,7 +913,7 @@ ReopenReleasedForOAuthBrowserFlowAdmission(flow_id, provider, redirect_uri, expi
     /\ oauth_browser_flow_redirect_uris' = MapSet(oauth_browser_flow_redirect_uris, flow_id, redirect_uri)
     /\ oauth_browser_flow_expires_at_millis' = MapSet(oauth_browser_flow_expires_at_millis, flow_id, expires_at_millis)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count + 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 VerifyOAuthBrowserFlowValid(flow_id, provider, redirect_uri, now_millis) ==
@@ -910,7 +924,7 @@ VerifyOAuthBrowserFlowValid(flow_id, provider, redirect_uri, now_millis) ==
     /\ (now_millis <= (IF "value" \in DOMAIN (IF (flow_id \in DOMAIN oauth_browser_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_browser_flow_expires_at_millis THEN oauth_browser_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None) THEN (IF (flow_id \in DOMAIN oauth_browser_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_browser_flow_expires_at_millis THEN oauth_browser_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None)["value"] ELSE None))
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 VerifyOAuthBrowserFlowExpiring(flow_id, provider, redirect_uri, now_millis) ==
@@ -921,7 +935,7 @@ VerifyOAuthBrowserFlowExpiring(flow_id, provider, redirect_uri, now_millis) ==
     /\ (now_millis <= (IF "value" \in DOMAIN (IF (flow_id \in DOMAIN oauth_browser_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_browser_flow_expires_at_millis THEN oauth_browser_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None) THEN (IF (flow_id \in DOMAIN oauth_browser_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_browser_flow_expires_at_millis THEN oauth_browser_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None)["value"] ELSE None))
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 VerifyOAuthBrowserFlowExpired(flow_id, provider, redirect_uri, now_millis) ==
@@ -932,7 +946,7 @@ VerifyOAuthBrowserFlowExpired(flow_id, provider, redirect_uri, now_millis) ==
     /\ (now_millis <= (IF "value" \in DOMAIN (IF (flow_id \in DOMAIN oauth_browser_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_browser_flow_expires_at_millis THEN oauth_browser_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None) THEN (IF (flow_id \in DOMAIN oauth_browser_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_browser_flow_expires_at_millis THEN oauth_browser_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None)["value"] ELSE None))
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 VerifyOAuthBrowserFlowRefreshing(flow_id, provider, redirect_uri, now_millis) ==
@@ -943,7 +957,7 @@ VerifyOAuthBrowserFlowRefreshing(flow_id, provider, redirect_uri, now_millis) ==
     /\ (now_millis <= (IF "value" \in DOMAIN (IF (flow_id \in DOMAIN oauth_browser_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_browser_flow_expires_at_millis THEN oauth_browser_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None) THEN (IF (flow_id \in DOMAIN oauth_browser_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_browser_flow_expires_at_millis THEN oauth_browser_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None)["value"] ELSE None))
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 VerifyOAuthBrowserFlowReauthRequired(flow_id, provider, redirect_uri, now_millis) ==
@@ -954,7 +968,7 @@ VerifyOAuthBrowserFlowReauthRequired(flow_id, provider, redirect_uri, now_millis
     /\ (now_millis <= (IF "value" \in DOMAIN (IF (flow_id \in DOMAIN oauth_browser_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_browser_flow_expires_at_millis THEN oauth_browser_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None) THEN (IF (flow_id \in DOMAIN oauth_browser_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_browser_flow_expires_at_millis THEN oauth_browser_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None)["value"] ELSE None))
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ConsumeOAuthBrowserFlowValid(flow_id, provider, redirect_uri, now_millis) ==
@@ -970,7 +984,7 @@ ConsumeOAuthBrowserFlowValid(flow_id, provider, redirect_uri, now_millis) ==
     /\ oauth_browser_flow_redirect_uris' = MapRemove(oauth_browser_flow_redirect_uris, flow_id)
     /\ oauth_browser_flow_expires_at_millis' = MapRemove(oauth_browser_flow_expires_at_millis, flow_id)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 ConsumeOAuthBrowserFlowExpiring(flow_id, provider, redirect_uri, now_millis) ==
@@ -986,7 +1000,7 @@ ConsumeOAuthBrowserFlowExpiring(flow_id, provider, redirect_uri, now_millis) ==
     /\ oauth_browser_flow_redirect_uris' = MapRemove(oauth_browser_flow_redirect_uris, flow_id)
     /\ oauth_browser_flow_expires_at_millis' = MapRemove(oauth_browser_flow_expires_at_millis, flow_id)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 ConsumeOAuthBrowserFlowExpired(flow_id, provider, redirect_uri, now_millis) ==
@@ -1002,7 +1016,7 @@ ConsumeOAuthBrowserFlowExpired(flow_id, provider, redirect_uri, now_millis) ==
     /\ oauth_browser_flow_redirect_uris' = MapRemove(oauth_browser_flow_redirect_uris, flow_id)
     /\ oauth_browser_flow_expires_at_millis' = MapRemove(oauth_browser_flow_expires_at_millis, flow_id)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 ConsumeOAuthBrowserFlowRefreshing(flow_id, provider, redirect_uri, now_millis) ==
@@ -1018,7 +1032,7 @@ ConsumeOAuthBrowserFlowRefreshing(flow_id, provider, redirect_uri, now_millis) =
     /\ oauth_browser_flow_redirect_uris' = MapRemove(oauth_browser_flow_redirect_uris, flow_id)
     /\ oauth_browser_flow_expires_at_millis' = MapRemove(oauth_browser_flow_expires_at_millis, flow_id)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 ConsumeOAuthBrowserFlowReauthRequired(flow_id, provider, redirect_uri, now_millis) ==
@@ -1034,7 +1048,7 @@ ConsumeOAuthBrowserFlowReauthRequired(flow_id, provider, redirect_uri, now_milli
     /\ oauth_browser_flow_redirect_uris' = MapRemove(oauth_browser_flow_redirect_uris, flow_id)
     /\ oauth_browser_flow_expires_at_millis' = MapRemove(oauth_browser_flow_expires_at_millis, flow_id)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 ExpireOAuthBrowserFlowValid(flow_id) ==
@@ -1047,7 +1061,7 @@ ExpireOAuthBrowserFlowValid(flow_id) ==
     /\ oauth_browser_flow_redirect_uris' = MapRemove(oauth_browser_flow_redirect_uris, flow_id)
     /\ oauth_browser_flow_expires_at_millis' = MapRemove(oauth_browser_flow_expires_at_millis, flow_id)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 ExpireOAuthBrowserFlowExpiring(flow_id) ==
@@ -1060,7 +1074,7 @@ ExpireOAuthBrowserFlowExpiring(flow_id) ==
     /\ oauth_browser_flow_redirect_uris' = MapRemove(oauth_browser_flow_redirect_uris, flow_id)
     /\ oauth_browser_flow_expires_at_millis' = MapRemove(oauth_browser_flow_expires_at_millis, flow_id)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 ExpireOAuthBrowserFlowExpired(flow_id) ==
@@ -1073,7 +1087,7 @@ ExpireOAuthBrowserFlowExpired(flow_id) ==
     /\ oauth_browser_flow_redirect_uris' = MapRemove(oauth_browser_flow_redirect_uris, flow_id)
     /\ oauth_browser_flow_expires_at_millis' = MapRemove(oauth_browser_flow_expires_at_millis, flow_id)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 ExpireOAuthBrowserFlowRefreshing(flow_id) ==
@@ -1086,7 +1100,7 @@ ExpireOAuthBrowserFlowRefreshing(flow_id) ==
     /\ oauth_browser_flow_redirect_uris' = MapRemove(oauth_browser_flow_redirect_uris, flow_id)
     /\ oauth_browser_flow_expires_at_millis' = MapRemove(oauth_browser_flow_expires_at_millis, flow_id)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 ExpireOAuthBrowserFlowReauthRequired(flow_id) ==
@@ -1099,7 +1113,7 @@ ExpireOAuthBrowserFlowReauthRequired(flow_id) ==
     /\ oauth_browser_flow_redirect_uris' = MapRemove(oauth_browser_flow_redirect_uris, flow_id)
     /\ oauth_browser_flow_expires_at_millis' = MapRemove(oauth_browser_flow_expires_at_millis, flow_id)
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, release_draining >>
+    /\ UnchangedFrame_17e882200453b6ed
 
 
 ExpireOAuthBrowserFlowAbsentValid(flow_id) ==
@@ -1107,7 +1121,7 @@ ExpireOAuthBrowserFlowAbsentValid(flow_id) ==
     /\ ((flow_id \in oauth_browser_flow_ids) = FALSE)
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ExpireOAuthBrowserFlowAbsentExpiring(flow_id) ==
@@ -1115,7 +1129,7 @@ ExpireOAuthBrowserFlowAbsentExpiring(flow_id) ==
     /\ ((flow_id \in oauth_browser_flow_ids) = FALSE)
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ExpireOAuthBrowserFlowAbsentExpired(flow_id) ==
@@ -1123,7 +1137,7 @@ ExpireOAuthBrowserFlowAbsentExpired(flow_id) ==
     /\ ((flow_id \in oauth_browser_flow_ids) = FALSE)
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ExpireOAuthBrowserFlowAbsentRefreshing(flow_id) ==
@@ -1131,7 +1145,7 @@ ExpireOAuthBrowserFlowAbsentRefreshing(flow_id) ==
     /\ ((flow_id \in oauth_browser_flow_ids) = FALSE)
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ExpireOAuthBrowserFlowAbsentReauthRequired(flow_id) ==
@@ -1139,14 +1153,14 @@ ExpireOAuthBrowserFlowAbsentReauthRequired(flow_id) ==
     /\ ((flow_id \in oauth_browser_flow_ids) = FALSE)
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ExpireOAuthBrowserFlowReleased(flow_id) ==
     /\ phase = "Released"
     /\ phase' = "Released"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 AdmitOAuthDeviceFlowValid(flow_id, provider, expires_at_millis, max_outstanding_flows, observed_global_outstanding_flows) ==
@@ -1162,7 +1176,7 @@ AdmitOAuthDeviceFlowValid(flow_id, provider, expires_at_millis, max_outstanding_
     /\ oauth_device_flow_expires_at_millis' = MapSet(oauth_device_flow_expires_at_millis, flow_id, expires_at_millis)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count + 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 AdmitOAuthDeviceFlowExpiring(flow_id, provider, expires_at_millis, max_outstanding_flows, observed_global_outstanding_flows) ==
@@ -1178,7 +1192,7 @@ AdmitOAuthDeviceFlowExpiring(flow_id, provider, expires_at_millis, max_outstandi
     /\ oauth_device_flow_expires_at_millis' = MapSet(oauth_device_flow_expires_at_millis, flow_id, expires_at_millis)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count + 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 AdmitOAuthDeviceFlowExpired(flow_id, provider, expires_at_millis, max_outstanding_flows, observed_global_outstanding_flows) ==
@@ -1194,7 +1208,7 @@ AdmitOAuthDeviceFlowExpired(flow_id, provider, expires_at_millis, max_outstandin
     /\ oauth_device_flow_expires_at_millis' = MapSet(oauth_device_flow_expires_at_millis, flow_id, expires_at_millis)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count + 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 AdmitOAuthDeviceFlowRefreshing(flow_id, provider, expires_at_millis, max_outstanding_flows, observed_global_outstanding_flows) ==
@@ -1210,7 +1224,7 @@ AdmitOAuthDeviceFlowRefreshing(flow_id, provider, expires_at_millis, max_outstan
     /\ oauth_device_flow_expires_at_millis' = MapSet(oauth_device_flow_expires_at_millis, flow_id, expires_at_millis)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count + 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 AdmitOAuthDeviceFlowReauthRequired(flow_id, provider, expires_at_millis, max_outstanding_flows, observed_global_outstanding_flows) ==
@@ -1226,7 +1240,7 @@ AdmitOAuthDeviceFlowReauthRequired(flow_id, provider, expires_at_millis, max_out
     /\ oauth_device_flow_expires_at_millis' = MapSet(oauth_device_flow_expires_at_millis, flow_id, expires_at_millis)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count + 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 ReopenReleasedForOAuthDeviceFlowAdmission(flow_id, provider, expires_at_millis, max_outstanding_flows, observed_global_outstanding_flows) ==
@@ -1242,7 +1256,7 @@ ReopenReleasedForOAuthDeviceFlowAdmission(flow_id, provider, expires_at_millis, 
     /\ oauth_device_flow_expires_at_millis' = MapSet(oauth_device_flow_expires_at_millis, flow_id, expires_at_millis)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count + 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 ConfirmOAuthDurableAdmissionValid(observed_global_outstanding_flows, max_outstanding_flows) ==
@@ -1250,7 +1264,7 @@ ConfirmOAuthDurableAdmissionValid(observed_global_outstanding_flows, max_outstan
     /\ (observed_global_outstanding_flows < max_outstanding_flows)
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ConfirmOAuthDurableAdmissionExpiring(observed_global_outstanding_flows, max_outstanding_flows) ==
@@ -1258,7 +1272,7 @@ ConfirmOAuthDurableAdmissionExpiring(observed_global_outstanding_flows, max_outs
     /\ (observed_global_outstanding_flows < max_outstanding_flows)
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ConfirmOAuthDurableAdmissionExpired(observed_global_outstanding_flows, max_outstanding_flows) ==
@@ -1266,7 +1280,7 @@ ConfirmOAuthDurableAdmissionExpired(observed_global_outstanding_flows, max_outst
     /\ (observed_global_outstanding_flows < max_outstanding_flows)
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ConfirmOAuthDurableAdmissionRefreshing(observed_global_outstanding_flows, max_outstanding_flows) ==
@@ -1274,7 +1288,7 @@ ConfirmOAuthDurableAdmissionRefreshing(observed_global_outstanding_flows, max_ou
     /\ (observed_global_outstanding_flows < max_outstanding_flows)
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ConfirmOAuthDurableAdmissionReauthRequired(observed_global_outstanding_flows, max_outstanding_flows) ==
@@ -1282,14 +1296,14 @@ ConfirmOAuthDurableAdmissionReauthRequired(observed_global_outstanding_flows, ma
     /\ (observed_global_outstanding_flows < max_outstanding_flows)
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ConfirmOAuthDurableAdmissionReleased(observed_global_outstanding_flows, max_outstanding_flows) ==
     /\ phase = "Released"
     /\ phase' = "Released"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 VerifyOAuthDeviceFlowValid(flow_id, provider, now_millis) ==
@@ -1299,7 +1313,7 @@ VerifyOAuthDeviceFlowValid(flow_id, provider, now_millis) ==
     /\ (now_millis <= (IF "value" \in DOMAIN (IF (flow_id \in DOMAIN oauth_device_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_device_flow_expires_at_millis THEN oauth_device_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None) THEN (IF (flow_id \in DOMAIN oauth_device_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_device_flow_expires_at_millis THEN oauth_device_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None)["value"] ELSE None))
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 VerifyOAuthDeviceFlowExpiring(flow_id, provider, now_millis) ==
@@ -1309,7 +1323,7 @@ VerifyOAuthDeviceFlowExpiring(flow_id, provider, now_millis) ==
     /\ (now_millis <= (IF "value" \in DOMAIN (IF (flow_id \in DOMAIN oauth_device_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_device_flow_expires_at_millis THEN oauth_device_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None) THEN (IF (flow_id \in DOMAIN oauth_device_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_device_flow_expires_at_millis THEN oauth_device_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None)["value"] ELSE None))
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 VerifyOAuthDeviceFlowExpired(flow_id, provider, now_millis) ==
@@ -1319,7 +1333,7 @@ VerifyOAuthDeviceFlowExpired(flow_id, provider, now_millis) ==
     /\ (now_millis <= (IF "value" \in DOMAIN (IF (flow_id \in DOMAIN oauth_device_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_device_flow_expires_at_millis THEN oauth_device_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None) THEN (IF (flow_id \in DOMAIN oauth_device_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_device_flow_expires_at_millis THEN oauth_device_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None)["value"] ELSE None))
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 VerifyOAuthDeviceFlowRefreshing(flow_id, provider, now_millis) ==
@@ -1329,7 +1343,7 @@ VerifyOAuthDeviceFlowRefreshing(flow_id, provider, now_millis) ==
     /\ (now_millis <= (IF "value" \in DOMAIN (IF (flow_id \in DOMAIN oauth_device_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_device_flow_expires_at_millis THEN oauth_device_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None) THEN (IF (flow_id \in DOMAIN oauth_device_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_device_flow_expires_at_millis THEN oauth_device_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None)["value"] ELSE None))
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 VerifyOAuthDeviceFlowReauthRequired(flow_id, provider, now_millis) ==
@@ -1339,7 +1353,7 @@ VerifyOAuthDeviceFlowReauthRequired(flow_id, provider, now_millis) ==
     /\ (now_millis <= (IF "value" \in DOMAIN (IF (flow_id \in DOMAIN oauth_device_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_device_flow_expires_at_millis THEN oauth_device_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None) THEN (IF (flow_id \in DOMAIN oauth_device_flow_expires_at_millis) THEN Some((IF flow_id \in DOMAIN oauth_device_flow_expires_at_millis THEN oauth_device_flow_expires_at_millis[flow_id] ELSE 0)) ELSE None)["value"] ELSE None))
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 BeginOAuthDevicePollValid(flow_id, provider, now_millis) ==
@@ -1351,7 +1365,7 @@ BeginOAuthDevicePollValid(flow_id, provider, now_millis) ==
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \cup {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 BeginOAuthDevicePollExpiring(flow_id, provider, now_millis) ==
@@ -1363,7 +1377,7 @@ BeginOAuthDevicePollExpiring(flow_id, provider, now_millis) ==
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \cup {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 BeginOAuthDevicePollExpired(flow_id, provider, now_millis) ==
@@ -1375,7 +1389,7 @@ BeginOAuthDevicePollExpired(flow_id, provider, now_millis) ==
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \cup {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 BeginOAuthDevicePollRefreshing(flow_id, provider, now_millis) ==
@@ -1387,7 +1401,7 @@ BeginOAuthDevicePollRefreshing(flow_id, provider, now_millis) ==
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \cup {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 BeginOAuthDevicePollReauthRequired(flow_id, provider, now_millis) ==
@@ -1399,7 +1413,7 @@ BeginOAuthDevicePollReauthRequired(flow_id, provider, now_millis) ==
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \cup {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 FinishOAuthDevicePollValid(flow_id) ==
@@ -1408,7 +1422,7 @@ FinishOAuthDevicePollValid(flow_id) ==
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 FinishOAuthDevicePollExpiring(flow_id) ==
@@ -1417,7 +1431,7 @@ FinishOAuthDevicePollExpiring(flow_id) ==
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 FinishOAuthDevicePollExpired(flow_id) ==
@@ -1426,7 +1440,7 @@ FinishOAuthDevicePollExpired(flow_id) ==
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 FinishOAuthDevicePollRefreshing(flow_id) ==
@@ -1435,7 +1449,7 @@ FinishOAuthDevicePollRefreshing(flow_id) ==
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 FinishOAuthDevicePollReauthRequired(flow_id) ==
@@ -1444,7 +1458,7 @@ FinishOAuthDevicePollReauthRequired(flow_id) ==
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_131bb96ef518525a
 
 
 FinishOAuthDevicePollAbsentValid(flow_id) ==
@@ -1452,7 +1466,7 @@ FinishOAuthDevicePollAbsentValid(flow_id) ==
     /\ ((flow_id \in oauth_device_poll_ids) = FALSE)
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 FinishOAuthDevicePollAbsentExpiring(flow_id) ==
@@ -1460,7 +1474,7 @@ FinishOAuthDevicePollAbsentExpiring(flow_id) ==
     /\ ((flow_id \in oauth_device_poll_ids) = FALSE)
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 FinishOAuthDevicePollAbsentExpired(flow_id) ==
@@ -1468,7 +1482,7 @@ FinishOAuthDevicePollAbsentExpired(flow_id) ==
     /\ ((flow_id \in oauth_device_poll_ids) = FALSE)
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 FinishOAuthDevicePollAbsentRefreshing(flow_id) ==
@@ -1476,7 +1490,7 @@ FinishOAuthDevicePollAbsentRefreshing(flow_id) ==
     /\ ((flow_id \in oauth_device_poll_ids) = FALSE)
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 FinishOAuthDevicePollAbsentReauthRequired(flow_id) ==
@@ -1484,14 +1498,14 @@ FinishOAuthDevicePollAbsentReauthRequired(flow_id) ==
     /\ ((flow_id \in oauth_device_poll_ids) = FALSE)
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 FinishOAuthDevicePollReleased(flow_id) ==
     /\ phase = "Released"
     /\ phase' = "Released"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ConsumeOAuthDeviceFlowValid(flow_id, provider, now_millis) ==
@@ -1506,7 +1520,7 @@ ConsumeOAuthDeviceFlowValid(flow_id, provider, now_millis) ==
     /\ oauth_device_flow_expires_at_millis' = MapRemove(oauth_device_flow_expires_at_millis, flow_id)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 ConsumeOAuthDeviceFlowExpiring(flow_id, provider, now_millis) ==
@@ -1521,7 +1535,7 @@ ConsumeOAuthDeviceFlowExpiring(flow_id, provider, now_millis) ==
     /\ oauth_device_flow_expires_at_millis' = MapRemove(oauth_device_flow_expires_at_millis, flow_id)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 ConsumeOAuthDeviceFlowExpired(flow_id, provider, now_millis) ==
@@ -1536,7 +1550,7 @@ ConsumeOAuthDeviceFlowExpired(flow_id, provider, now_millis) ==
     /\ oauth_device_flow_expires_at_millis' = MapRemove(oauth_device_flow_expires_at_millis, flow_id)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 ConsumeOAuthDeviceFlowRefreshing(flow_id, provider, now_millis) ==
@@ -1551,7 +1565,7 @@ ConsumeOAuthDeviceFlowRefreshing(flow_id, provider, now_millis) ==
     /\ oauth_device_flow_expires_at_millis' = MapRemove(oauth_device_flow_expires_at_millis, flow_id)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 ConsumeOAuthDeviceFlowReauthRequired(flow_id, provider, now_millis) ==
@@ -1566,7 +1580,7 @@ ConsumeOAuthDeviceFlowReauthRequired(flow_id, provider, now_millis) ==
     /\ oauth_device_flow_expires_at_millis' = MapRemove(oauth_device_flow_expires_at_millis, flow_id)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 ExpireOAuthDeviceFlowValid(flow_id) ==
@@ -1579,7 +1593,7 @@ ExpireOAuthDeviceFlowValid(flow_id) ==
     /\ oauth_device_flow_expires_at_millis' = MapRemove(oauth_device_flow_expires_at_millis, flow_id)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 ExpireOAuthDeviceFlowExpiring(flow_id) ==
@@ -1592,7 +1606,7 @@ ExpireOAuthDeviceFlowExpiring(flow_id) ==
     /\ oauth_device_flow_expires_at_millis' = MapRemove(oauth_device_flow_expires_at_millis, flow_id)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 ExpireOAuthDeviceFlowExpired(flow_id) ==
@@ -1605,7 +1619,7 @@ ExpireOAuthDeviceFlowExpired(flow_id) ==
     /\ oauth_device_flow_expires_at_millis' = MapRemove(oauth_device_flow_expires_at_millis, flow_id)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 ExpireOAuthDeviceFlowRefreshing(flow_id) ==
@@ -1618,7 +1632,7 @@ ExpireOAuthDeviceFlowRefreshing(flow_id) ==
     /\ oauth_device_flow_expires_at_millis' = MapRemove(oauth_device_flow_expires_at_millis, flow_id)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 ExpireOAuthDeviceFlowReauthRequired(flow_id) ==
@@ -1631,7 +1645,7 @@ ExpireOAuthDeviceFlowReauthRequired(flow_id) ==
     /\ oauth_device_flow_expires_at_millis' = MapRemove(oauth_device_flow_expires_at_millis, flow_id)
     /\ oauth_device_poll_ids' = (oauth_device_poll_ids \ {flow_id})
     /\ oauth_outstanding_flow_count' = (oauth_outstanding_flow_count - 1)
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, release_draining >>
+    /\ UnchangedFrame_84b4777df2a321b4
 
 
 ExpireOAuthDeviceFlowAbsentValid(flow_id) ==
@@ -1639,7 +1653,7 @@ ExpireOAuthDeviceFlowAbsentValid(flow_id) ==
     /\ ((flow_id \in oauth_device_flow_ids) = FALSE)
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ExpireOAuthDeviceFlowAbsentExpiring(flow_id) ==
@@ -1647,7 +1661,7 @@ ExpireOAuthDeviceFlowAbsentExpiring(flow_id) ==
     /\ ((flow_id \in oauth_device_flow_ids) = FALSE)
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ExpireOAuthDeviceFlowAbsentExpired(flow_id) ==
@@ -1655,7 +1669,7 @@ ExpireOAuthDeviceFlowAbsentExpired(flow_id) ==
     /\ ((flow_id \in oauth_device_flow_ids) = FALSE)
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ExpireOAuthDeviceFlowAbsentRefreshing(flow_id) ==
@@ -1663,7 +1677,7 @@ ExpireOAuthDeviceFlowAbsentRefreshing(flow_id) ==
     /\ ((flow_id \in oauth_device_flow_ids) = FALSE)
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ExpireOAuthDeviceFlowAbsentReauthRequired(flow_id) ==
@@ -1671,14 +1685,14 @@ ExpireOAuthDeviceFlowAbsentReauthRequired(flow_id) ==
     /\ ((flow_id \in oauth_device_flow_ids) = FALSE)
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ExpireOAuthDeviceFlowReleased(flow_id) ==
     /\ phase = "Released"
     /\ phase' = "Released"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionValidUseAuthorizedValid(intent) ==
@@ -1686,7 +1700,7 @@ ResolveCredentialUseAdmissionValidUseAuthorizedValid(intent) ==
     /\ ((intent = "UseCredential") /\ credential_present)
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionValidHoldAuthorizedValid(intent) ==
@@ -1694,7 +1708,7 @@ ResolveCredentialUseAdmissionValidHoldAuthorizedValid(intent) ==
     /\ ((intent = "HoldAuthority") /\ credential_present)
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionValidBeginRefreshValid(intent) ==
@@ -1702,7 +1716,7 @@ ResolveCredentialUseAdmissionValidBeginRefreshValid(intent) ==
     /\ ((intent = "BeginRefresh") /\ credential_present)
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionValidNoCredentialValid(intent) ==
@@ -1710,7 +1724,7 @@ ResolveCredentialUseAdmissionValidNoCredentialValid(intent) ==
     /\ (credential_present = FALSE)
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionExpiringUseRefreshExpiring(intent) ==
@@ -1718,7 +1732,7 @@ ResolveCredentialUseAdmissionExpiringUseRefreshExpiring(intent) ==
     /\ ((intent = "UseCredential") /\ credential_present)
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionExpiringHoldAuthorizedExpiring(intent) ==
@@ -1726,7 +1740,7 @@ ResolveCredentialUseAdmissionExpiringHoldAuthorizedExpiring(intent) ==
     /\ ((intent = "HoldAuthority") /\ credential_present)
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionExpiringBeginRefreshExpiring(intent) ==
@@ -1734,7 +1748,7 @@ ResolveCredentialUseAdmissionExpiringBeginRefreshExpiring(intent) ==
     /\ ((intent = "BeginRefresh") /\ credential_present)
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionExpiringNoCredentialExpiring(intent) ==
@@ -1742,7 +1756,7 @@ ResolveCredentialUseAdmissionExpiringNoCredentialExpiring(intent) ==
     /\ (credential_present = FALSE)
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionExpiredUseRefreshExpired(intent) ==
@@ -1750,7 +1764,7 @@ ResolveCredentialUseAdmissionExpiredUseRefreshExpired(intent) ==
     /\ ((intent = "UseCredential") /\ credential_present)
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionExpiredHoldRefreshExpired(intent) ==
@@ -1758,7 +1772,7 @@ ResolveCredentialUseAdmissionExpiredHoldRefreshExpired(intent) ==
     /\ ((intent = "HoldAuthority") /\ credential_present)
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionExpiredBeginRefreshExpired(intent) ==
@@ -1766,7 +1780,7 @@ ResolveCredentialUseAdmissionExpiredBeginRefreshExpired(intent) ==
     /\ ((intent = "BeginRefresh") /\ credential_present)
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionExpiredNoCredentialExpired(intent) ==
@@ -1774,7 +1788,7 @@ ResolveCredentialUseAdmissionExpiredNoCredentialExpired(intent) ==
     /\ (credential_present = FALSE)
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionRefreshingUseRefreshRefreshing(intent) ==
@@ -1782,7 +1796,7 @@ ResolveCredentialUseAdmissionRefreshingUseRefreshRefreshing(intent) ==
     /\ ((intent = "UseCredential") /\ credential_present)
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionRefreshingHoldAuthorizedRefreshing(intent) ==
@@ -1790,7 +1804,7 @@ ResolveCredentialUseAdmissionRefreshingHoldAuthorizedRefreshing(intent) ==
     /\ ((intent = "HoldAuthority") /\ credential_present)
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionRefreshingBeginAlreadyRefreshingRefreshing(intent) ==
@@ -1798,7 +1812,7 @@ ResolveCredentialUseAdmissionRefreshingBeginAlreadyRefreshingRefreshing(intent) 
     /\ (intent = "BeginRefresh")
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionRefreshingNoCredentialUseOrHoldRefreshing(intent) ==
@@ -1806,21 +1820,21 @@ ResolveCredentialUseAdmissionRefreshingNoCredentialUseOrHoldRefreshing(intent) =
     /\ ((credential_present = FALSE) /\ (IF (intent = "UseCredential") THEN TRUE ELSE (intent = "HoldAuthority")))
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionReauthRequiredReauthRequired(intent) ==
     /\ phase = "ReauthRequired"
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveCredentialUseAdmissionReleasedReleased(intent) ==
     /\ phase = "Released"
     /\ phase' = "Released"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveOAuthLoginCredentialDispositionUseCachedValid(arg_credential_present, force_refresh, refresh_allowed) ==
@@ -1828,7 +1842,7 @@ ResolveOAuthLoginCredentialDispositionUseCachedValid(arg_credential_present, for
     /\ (credential_present /\ arg_credential_present /\ (force_refresh = FALSE))
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveOAuthLoginCredentialDispositionRefreshValidValid(arg_credential_present, force_refresh, refresh_allowed) ==
@@ -1836,7 +1850,7 @@ ResolveOAuthLoginCredentialDispositionRefreshValidValid(arg_credential_present, 
     /\ (~((credential_present /\ arg_credential_present /\ (force_refresh = FALSE))) /\ refresh_allowed)
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveOAuthLoginCredentialDispositionRefreshDisallowedValidValid(arg_credential_present, force_refresh, refresh_allowed) ==
@@ -1844,7 +1858,7 @@ ResolveOAuthLoginCredentialDispositionRefreshDisallowedValidValid(arg_credential
     /\ (~((credential_present /\ arg_credential_present /\ (force_refresh = FALSE))) /\ (refresh_allowed = FALSE))
     /\ phase' = "Valid"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveOAuthLoginCredentialDispositionRefreshNonValidExpiring(arg_credential_present, force_refresh, refresh_allowed) ==
@@ -1852,7 +1866,7 @@ ResolveOAuthLoginCredentialDispositionRefreshNonValidExpiring(arg_credential_pre
     /\ refresh_allowed
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveOAuthLoginCredentialDispositionRefreshNonValidExpired(arg_credential_present, force_refresh, refresh_allowed) ==
@@ -1860,7 +1874,7 @@ ResolveOAuthLoginCredentialDispositionRefreshNonValidExpired(arg_credential_pres
     /\ refresh_allowed
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveOAuthLoginCredentialDispositionRefreshNonValidRefreshing(arg_credential_present, force_refresh, refresh_allowed) ==
@@ -1868,7 +1882,7 @@ ResolveOAuthLoginCredentialDispositionRefreshNonValidRefreshing(arg_credential_p
     /\ refresh_allowed
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveOAuthLoginCredentialDispositionRefreshNonValidReauthRequired(arg_credential_present, force_refresh, refresh_allowed) ==
@@ -1876,7 +1890,7 @@ ResolveOAuthLoginCredentialDispositionRefreshNonValidReauthRequired(arg_credenti
     /\ refresh_allowed
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveOAuthLoginCredentialDispositionRefreshNonValidReleased(arg_credential_present, force_refresh, refresh_allowed) ==
@@ -1884,7 +1898,7 @@ ResolveOAuthLoginCredentialDispositionRefreshNonValidReleased(arg_credential_pre
     /\ refresh_allowed
     /\ phase' = "Released"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveOAuthLoginCredentialDispositionRefreshDisallowedNonValidExpiring(arg_credential_present, force_refresh, refresh_allowed) ==
@@ -1892,7 +1906,7 @@ ResolveOAuthLoginCredentialDispositionRefreshDisallowedNonValidExpiring(arg_cred
     /\ (refresh_allowed = FALSE)
     /\ phase' = "Expiring"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveOAuthLoginCredentialDispositionRefreshDisallowedNonValidExpired(arg_credential_present, force_refresh, refresh_allowed) ==
@@ -1900,7 +1914,7 @@ ResolveOAuthLoginCredentialDispositionRefreshDisallowedNonValidExpired(arg_crede
     /\ (refresh_allowed = FALSE)
     /\ phase' = "Expired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveOAuthLoginCredentialDispositionRefreshDisallowedNonValidRefreshing(arg_credential_present, force_refresh, refresh_allowed) ==
@@ -1908,7 +1922,7 @@ ResolveOAuthLoginCredentialDispositionRefreshDisallowedNonValidRefreshing(arg_cr
     /\ (refresh_allowed = FALSE)
     /\ phase' = "Refreshing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveOAuthLoginCredentialDispositionRefreshDisallowedNonValidReauthRequired(arg_credential_present, force_refresh, refresh_allowed) ==
@@ -1916,7 +1930,7 @@ ResolveOAuthLoginCredentialDispositionRefreshDisallowedNonValidReauthRequired(ar
     /\ (refresh_allowed = FALSE)
     /\ phase' = "ReauthRequired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 ResolveOAuthLoginCredentialDispositionRefreshDisallowedNonValidReleased(arg_credential_present, force_refresh, refresh_allowed) ==
@@ -1924,7 +1938,7 @@ ResolveOAuthLoginCredentialDispositionRefreshDisallowedNonValidReleased(arg_cred
     /\ (refresh_allowed = FALSE)
     /\ phase' = "Released"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << expires_at, last_refresh, refresh_attempt, credential_present, credential_generation, credential_published_at_millis, oauth_browser_flow_ids, oauth_browser_flow_providers, oauth_browser_flow_redirect_uris, oauth_browser_flow_expires_at_millis, oauth_device_flow_ids, oauth_device_flow_providers, oauth_device_flow_expires_at_millis, oauth_device_poll_ids, oauth_outstanding_flow_count, release_draining >>
+    /\ UnchangedFrame_f87ebf4401320955
 
 
 Next ==

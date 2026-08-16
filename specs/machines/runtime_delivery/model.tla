@@ -38,6 +38,12 @@ Init ==
     /\ next_sequence = 0
     /\ applied_cursor = 0
 
+\* Named UNCHANGED frames. One definition per distinct frame; every action
+\* that leaves those variables unchanged references the definition by name.
+UnchangedFrame_364cfd98cff75537 == UNCHANGED << delivery_ids, delivery_sequences, delivery_source_sequences, committed_sequences, next_sequence >>
+UnchangedFrame_9ba8eb3711879fba == UNCHANGED << applied_cursor >>
+UnchangedFrame_e541e6a2bf4478c3 == UNCHANGED << delivery_ids, delivery_sequences, delivery_source_sequences, committed_sequences, next_sequence, applied_cursor >>
+
 CommitNewDelivery(delivery_id, source_sequence) ==
     /\ phase = "Active"
     /\ (((delivery_id \in delivery_ids) = FALSE) /\ (source_sequence > 0) /\ (next_sequence < RustU64Max))
@@ -48,7 +54,7 @@ CommitNewDelivery(delivery_id, source_sequence) ==
     /\ delivery_source_sequences' = MapSet(delivery_source_sequences, delivery_id, source_sequence)
     /\ committed_sequences' = (committed_sequences \cup {(next_sequence) + 1})
     /\ next_sequence' = (next_sequence) + 1
-    /\ UNCHANGED << applied_cursor >>
+    /\ UnchangedFrame_9ba8eb3711879fba
 
 
 ReuseCommittedDelivery(delivery_id, source_sequence) ==
@@ -56,7 +62,7 @@ ReuseCommittedDelivery(delivery_id, source_sequence) ==
     /\ ((delivery_id \in delivery_ids) /\ ((IF "value" \in DOMAIN (IF (delivery_id \in DOMAIN delivery_source_sequences) THEN Some((IF delivery_id \in DOMAIN delivery_source_sequences THEN delivery_source_sequences[delivery_id] ELSE 0)) ELSE None) THEN (IF (delivery_id \in DOMAIN delivery_source_sequences) THEN Some((IF delivery_id \in DOMAIN delivery_source_sequences THEN delivery_source_sequences[delivery_id] ELSE 0)) ELSE None)["value"] ELSE None) = source_sequence))
     /\ phase' = "Active"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << delivery_ids, delivery_sequences, delivery_source_sequences, committed_sequences, next_sequence, applied_cursor >>
+    /\ UnchangedFrame_e541e6a2bf4478c3
 
 
 ApplyNextDelivery(delivery_id, delivery_sequence) ==
@@ -65,7 +71,7 @@ ApplyNextDelivery(delivery_id, delivery_sequence) ==
     /\ phase' = "Active"
     /\ model_step_count' = model_step_count + 1
     /\ applied_cursor' = delivery_sequence
-    /\ UNCHANGED << delivery_ids, delivery_sequences, delivery_source_sequences, committed_sequences, next_sequence >>
+    /\ UnchangedFrame_364cfd98cff75537
 
 
 ObserveAlreadyAppliedDelivery(delivery_id, delivery_sequence) ==
@@ -73,7 +79,7 @@ ObserveAlreadyAppliedDelivery(delivery_id, delivery_sequence) ==
     /\ ((delivery_id \in delivery_ids) /\ ((IF "value" \in DOMAIN (IF (delivery_id \in DOMAIN delivery_sequences) THEN Some((IF delivery_id \in DOMAIN delivery_sequences THEN delivery_sequences[delivery_id] ELSE 0)) ELSE None) THEN (IF (delivery_id \in DOMAIN delivery_sequences) THEN Some((IF delivery_id \in DOMAIN delivery_sequences THEN delivery_sequences[delivery_id] ELSE 0)) ELSE None)["value"] ELSE None) = delivery_sequence) /\ (delivery_sequence <= applied_cursor))
     /\ phase' = "Active"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << delivery_ids, delivery_sequences, delivery_source_sequences, committed_sequences, next_sequence, applied_cursor >>
+    /\ UnchangedFrame_e541e6a2bf4478c3
 
 
 Next ==

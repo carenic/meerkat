@@ -41,6 +41,13 @@ TerminalStutter ==
     /\ phase = "FlowFailed" \/ phase = "FlowCanceled" \/ phase = "EvidenceProjected" \/ phase = "WorkClosed" \/ phase = "LaunchFailed"
     /\ UNCHANGED vars
 
+\* Named UNCHANGED frames. One definition per distinct frame; every action
+\* that leaves those variables unchanged references the definition by name.
+UnchangedFrame_45f559d421f5cafa == UNCHANGED << binding_id, run_id >>
+UnchangedFrame_55e049da328809ca == UNCHANGED << binding_id, run_id, evidence_kind >>
+UnchangedFrame_614ab550edf5e73d == UNCHANGED << binding_id, run_id, last_failure_detail, evidence_kind >>
+UnchangedFrame_d0be54b2fc02a2da == UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+
 BindExecution(arg_binding_id, arg_run_id) ==
     /\ phase = "Absent"
     /\ ((arg_binding_id # "") /\ (arg_run_id # ""))
@@ -57,98 +64,98 @@ RecoverLaunchRequest ==
     /\ phase = "LaunchRequested"
     /\ phase' = "LaunchRequested"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 RecoverUncertainLaunch ==
     /\ phase = "LaunchUncertain"
     /\ phase' = "LaunchUncertain"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 RecoverQuarantinedLaunch ==
     /\ phase = "LaunchQuarantined"
     /\ phase' = "LaunchQuarantined"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 RecoverRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 RecoverEvidenceProjection ==
     /\ phase = "EvidenceProjectionRequested"
     /\ phase' = "EvidenceProjectionRequested"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 RecoverWorkClosure ==
     /\ phase = "WorkClosureRequested"
     /\ phase' = "WorkClosureRequested"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 RecoverFlowFailureEvidenceProjection ==
     /\ phase = "FailureEvidenceProjectionRequested"
     /\ phase' = "FailureEvidenceProjectionRequested"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 RecoverFlowCancellationEvidenceProjection ==
     /\ phase = "CancellationEvidenceProjectionRequested"
     /\ phase' = "CancellationEvidenceProjectionRequested"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 RecoverLaunchFailureEvidenceProjection ==
     /\ phase = "LaunchFailureEvidenceProjectionRequested"
     /\ phase' = "LaunchFailureEvidenceProjectionRequested"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 RecoverFlowFailure ==
     /\ phase = "FlowFailed"
     /\ phase' = "FlowFailed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 RecoverFlowCancellation ==
     /\ phase = "FlowCanceled"
     /\ phase' = "FlowCanceled"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 RecoverEvidenceProjected ==
     /\ phase = "EvidenceProjected"
     /\ phase' = "EvidenceProjected"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 RecoverClosedWork ==
     /\ phase = "WorkClosed"
     /\ phase' = "WorkClosed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 RecoverLaunchFailure ==
     /\ phase = "LaunchFailed"
     /\ phase' = "LaunchFailed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 AcceptFlowLaunch ==
@@ -158,7 +165,7 @@ AcceptFlowLaunch ==
     /\ revision' = (revision) + 1
     /\ last_failure_detail' = None
     /\ evidence_kind' = None
-    /\ UNCHANGED << binding_id, run_id >>
+    /\ UnchangedFrame_45f559d421f5cafa
 
 
 ObserveRunningFlow ==
@@ -168,7 +175,7 @@ ObserveRunningFlow ==
     /\ revision' = (revision) + 1
     /\ last_failure_detail' = None
     /\ evidence_kind' = None
-    /\ UNCHANGED << binding_id, run_id >>
+    /\ UnchangedFrame_45f559d421f5cafa
 
 
 ObserveCompletedFlow ==
@@ -178,7 +185,7 @@ ObserveCompletedFlow ==
     /\ revision' = (revision) + 1
     /\ last_failure_detail' = None
     /\ evidence_kind' = Some("Completed")
-    /\ UNCHANGED << binding_id, run_id >>
+    /\ UnchangedFrame_45f559d421f5cafa
 
 
 ObserveFailedFlow(detail) ==
@@ -188,7 +195,7 @@ ObserveFailedFlow(detail) ==
     /\ revision' = (revision) + 1
     /\ last_failure_detail' = detail
     /\ evidence_kind' = Some("Failed")
-    /\ UNCHANGED << binding_id, run_id >>
+    /\ UnchangedFrame_45f559d421f5cafa
 
 
 ObserveCanceledFlow(detail) ==
@@ -198,7 +205,7 @@ ObserveCanceledFlow(detail) ==
     /\ revision' = (revision) + 1
     /\ last_failure_detail' = detail
     /\ evidence_kind' = Some("Canceled")
-    /\ UNCHANGED << binding_id, run_id >>
+    /\ UnchangedFrame_45f559d421f5cafa
 
 
 ObserveLostRun(detail) ==
@@ -208,7 +215,7 @@ ObserveLostRun(detail) ==
     /\ revision' = (revision) + 1
     /\ last_failure_detail' = Some(detail)
     /\ evidence_kind' = Some("RunLost")
-    /\ UNCHANGED << binding_id, run_id >>
+    /\ UnchangedFrame_45f559d421f5cafa
 
 
 ObserveLostCompletedRunBeforeEvidence(detail) ==
@@ -218,7 +225,7 @@ ObserveLostCompletedRunBeforeEvidence(detail) ==
     /\ revision' = (revision) + 1
     /\ last_failure_detail' = Some(detail)
     /\ evidence_kind' = Some("RunLost")
-    /\ UNCHANGED << binding_id, run_id >>
+    /\ UnchangedFrame_45f559d421f5cafa
 
 
 RecordUncertainLaunch(detail) ==
@@ -228,7 +235,7 @@ RecordUncertainLaunch(detail) ==
     /\ revision' = (revision) + 1
     /\ last_failure_detail' = Some(detail)
     /\ evidence_kind' = None
-    /\ UNCHANGED << binding_id, run_id >>
+    /\ UnchangedFrame_45f559d421f5cafa
 
 
 QuarantineLaunch(detail) ==
@@ -238,7 +245,7 @@ QuarantineLaunch(detail) ==
     /\ revision' = (revision) + 1
     /\ last_failure_detail' = Some(detail)
     /\ evidence_kind' = None
-    /\ UNCHANGED << binding_id, run_id >>
+    /\ UnchangedFrame_45f559d421f5cafa
 
 
 FailLaunch(detail) ==
@@ -248,7 +255,7 @@ FailLaunch(detail) ==
     /\ revision' = (revision) + 1
     /\ last_failure_detail' = Some(detail)
     /\ evidence_kind' = Some("LaunchFailed")
-    /\ UNCHANGED << binding_id, run_id >>
+    /\ UnchangedFrame_45f559d421f5cafa
 
 
 CommitLaunchFailureEvidenceProjection ==
@@ -256,7 +263,7 @@ CommitLaunchFailureEvidenceProjection ==
     /\ phase' = "LaunchFailed"
     /\ model_step_count' = model_step_count + 1
     /\ revision' = (revision) + 1
-    /\ UNCHANGED << binding_id, run_id, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_614ab550edf5e73d
 
 
 CommitEvidenceProjection ==
@@ -264,7 +271,7 @@ CommitEvidenceProjection ==
     /\ phase' = "WorkClosureRequested"
     /\ model_step_count' = model_step_count + 1
     /\ revision' = (revision) + 1
-    /\ UNCHANGED << binding_id, run_id, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_614ab550edf5e73d
 
 
 CommitFlowFailureEvidenceProjection ==
@@ -272,7 +279,7 @@ CommitFlowFailureEvidenceProjection ==
     /\ phase' = "FlowFailed"
     /\ model_step_count' = model_step_count + 1
     /\ revision' = (revision) + 1
-    /\ UNCHANGED << binding_id, run_id, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_614ab550edf5e73d
 
 
 CommitFlowCancellationEvidenceProjection ==
@@ -280,7 +287,7 @@ CommitFlowCancellationEvidenceProjection ==
     /\ phase' = "FlowCanceled"
     /\ model_step_count' = model_step_count + 1
     /\ revision' = (revision) + 1
-    /\ UNCHANGED << binding_id, run_id, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_614ab550edf5e73d
 
 
 CommitWorkClosure ==
@@ -289,7 +296,7 @@ CommitWorkClosure ==
     /\ model_step_count' = model_step_count + 1
     /\ revision' = (revision) + 1
     /\ last_failure_detail' = None
-    /\ UNCHANGED << binding_id, run_id, evidence_kind >>
+    /\ UnchangedFrame_55e049da328809ca
 
 
 RecordWorkClosureRefusal(detail) ==
@@ -298,112 +305,112 @@ RecordWorkClosureRefusal(detail) ==
     /\ model_step_count' = model_step_count + 1
     /\ revision' = (revision) + 1
     /\ last_failure_detail' = Some(detail)
-    /\ UNCHANGED << binding_id, run_id, evidence_kind >>
+    /\ UnchangedFrame_55e049da328809ca
 
 
 ClassifyRetryEligibilityTerminalFlowFailed ==
     /\ phase = "FlowFailed"
     /\ phase' = "FlowFailed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityTerminalFlowCanceled ==
     /\ phase = "FlowCanceled"
     /\ phase' = "FlowCanceled"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityTerminalEvidenceProjected ==
     /\ phase = "EvidenceProjected"
     /\ phase' = "EvidenceProjected"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityTerminalWorkClosed ==
     /\ phase = "WorkClosed"
     /\ phase' = "WorkClosed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityTerminalLaunchFailed ==
     /\ phase = "LaunchFailed"
     /\ phase' = "LaunchFailed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityLiveAbsent ==
     /\ phase = "Absent"
     /\ phase' = "Absent"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityLiveLaunchRequested ==
     /\ phase = "LaunchRequested"
     /\ phase' = "LaunchRequested"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityLiveLaunchUncertain ==
     /\ phase = "LaunchUncertain"
     /\ phase' = "LaunchUncertain"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityLiveLaunchQuarantined ==
     /\ phase = "LaunchQuarantined"
     /\ phase' = "LaunchQuarantined"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityLiveRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityLiveEvidenceProjectionRequested ==
     /\ phase = "EvidenceProjectionRequested"
     /\ phase' = "EvidenceProjectionRequested"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityLiveFailureEvidenceProjectionRequested ==
     /\ phase = "FailureEvidenceProjectionRequested"
     /\ phase' = "FailureEvidenceProjectionRequested"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityLiveCancellationEvidenceProjectionRequested ==
     /\ phase = "CancellationEvidenceProjectionRequested"
     /\ phase' = "CancellationEvidenceProjectionRequested"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityLiveLaunchFailureEvidenceProjectionRequested ==
     /\ phase = "LaunchFailureEvidenceProjectionRequested"
     /\ phase' = "LaunchFailureEvidenceProjectionRequested"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 ClassifyRetryEligibilityLiveWorkClosureRequested ==
     /\ phase = "WorkClosureRequested"
     /\ phase' = "WorkClosureRequested"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << binding_id, run_id, revision, last_failure_detail, evidence_kind >>
+    /\ UnchangedFrame_d0be54b2fc02a2da
 
 
 Next ==

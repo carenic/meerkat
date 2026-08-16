@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -167,6 +168,21 @@ pub enum CompositionTlaError {
     /// are defined.
     #[error("machine `{machine}`: helper-call cycle detected: {cycle}")]
     HelperCycle { machine: String, cycle: String },
+    /// Two distinct UNCHANGED frames derived the same generated operator name.
+    /// Disambiguating with a counter would be order-dependent and would hand
+    /// one action a frame condition it did not have, so this fails the render.
+    #[error("composition `{composition}`: {collision}")]
+    UnchangedFrameCollision {
+        composition: String,
+        collision: UnchangedFrameCollision,
+    },
+    /// Two distinct UNCHANGED frames derived the same generated operator name
+    /// while rendering a per-machine model.
+    #[error("machine `{machine}`: {collision}")]
+    MachineUnchangedFrameCollision {
+        machine: String,
+        collision: UnchangedFrameCollision,
+    },
     /// Lower-level TLA compiler construction/render failure (e.g. an unknown
     /// machine schema for a composition instance).
     #[error("composition TLA compilation failed: {0}")]
@@ -5514,10 +5530,150 @@ struct CompositionTlaCompiler<'a> {
     machine_by_instance: BTreeMap<&'a str, &'a MachineSchema>,
     named_bindings: BTreeMap<String, meerkat_machine_schema::RustTypeAtom>,
     fallback_machine: &'a MachineSchema,
+    unchanged_frames: RefCell<UnchangedFrameInterner>,
 }
 
 const COMPOSITION_UNCHANGED_CHUNK_SIZE: usize = 64;
 const COMPOSITION_UNCHANGED_SPLIT_THRESHOLD: usize = 96;
+
+/// Prefix for the generated named UNCHANGED frame operators.
+///
+/// Deliberately upper-camel: the machine-poster TLA reader treats a
+/// `^[a-z_][A-Za-z0-9_]* == ...` line before `THEOREM` as a machine invariant,
+/// and a line ending in bare `==` as the head of a multi-line definition. An
+/// upper-case name on a single line is invisible to both.
+const UNCHANGED_FRAME_PREFIX: &str = "UnchangedFrame_";
+
+/// Stable 64-bit FNV-1a.
+///
+/// Frame operator names are derived from frame content so that adding or
+/// removing a transition perturbs exactly the frames it touches instead of
+/// renumbering every later one. That only holds if the hash itself is stable:
+/// `std::collections::hash_map::DefaultHasher` is explicitly documented as not
+/// stable across Rust releases, so a toolchain bump would rename every frame
+/// and turn `machine-check-drift` red with no source change. FNV-1a is pinned
+/// here for that reason.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// Renders one UNCHANGED frame as a single TLA line.
+///
+/// `chunking` carries the composition-only `(split_threshold, chunk_size)`
+/// policy: TLC's semantic pass can overflow on very large tuple frames, so a
+/// composition frame past the threshold is expressed as a conjunction of
+/// smaller tuples. `/\` is an ordinary infix operator, so the conjunction is
+/// the same formula as the previously emitted bulleted list. Machines pass
+/// `None` and keep their single-tuple frame verbatim.
+fn unchanged_frame_body(vars: &[String], chunking: Option<(usize, usize)>) -> String {
+    if let Some((split_threshold, chunk_size)) = chunking
+        && vars.len() > split_threshold
+    {
+        return vars
+            .chunks(chunk_size)
+            .map(|chunk| format!("UNCHANGED << {} >>", chunk.join(", ")))
+            .collect::<Vec<_>>()
+            .join(" /\\ ");
+    }
+    format!("UNCHANGED << {} >>", vars.join(", "))
+}
+
+/// Interns the distinct UNCHANGED frames of one generated TLA module.
+///
+/// The renderer used to expand a full frame tuple inline at every action. On
+/// the largest composition that was 32,850 expansions of 650 distinct frames,
+/// which is where ~85% of the emitted bytes went. Each distinct frame is now
+/// emitted once as a named operator and referenced by name.
+#[derive(Default)]
+struct UnchangedFrameInterner {
+    /// Frame operator name -> single-line frame body. Names are derived from
+    /// the body, so a name already bound to a *different* body is a hash
+    /// collision, never a rename.
+    frames: BTreeMap<String, String>,
+    /// First observed collision, if any. Recorded rather than resolved: a
+    /// counter suffix would be order-dependent across schema edits and, worse,
+    /// would silently hand one action a different frame condition than it had.
+    /// The owning `render` turns this into a typed error and emits nothing.
+    collision: Option<UnchangedFrameCollision>,
+}
+
+/// Two distinct frames that derive the same operator name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnchangedFrameCollision {
+    pub name: String,
+    pub first: String,
+    pub second: String,
+}
+
+impl std::fmt::Display for UnchangedFrameCollision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "frame operator `{}` derives from two different frames:\n  {}\n  {}",
+            self.name, self.first, self.second
+        )
+    }
+}
+
+impl UnchangedFrameInterner {
+    /// Returns the operator name for `body`, registering the definition on
+    /// first sight.
+    fn intern(&mut self, body: String) -> String {
+        let name = format!("{UNCHANGED_FRAME_PREFIX}{:016x}", fnv1a64(body.as_bytes()));
+        match self.frames.get(&name) {
+            Some(existing) if *existing == body => {}
+            Some(existing) => {
+                if self.collision.is_none() {
+                    self.collision = Some(UnchangedFrameCollision {
+                        name: name.clone(),
+                        first: existing.clone(),
+                        second: body,
+                    });
+                }
+            }
+            None => {
+                self.frames.insert(name.clone(), body);
+            }
+        }
+        name
+    }
+
+    fn collision(&self) -> Option<&UnchangedFrameCollision> {
+        self.collision.as_ref()
+    }
+
+    /// Renders the definition block, sorted by operator name.
+    ///
+    /// Sorted rather than first-use order so that a later schema edit inserts
+    /// or drops a single definition line instead of shifting every definition
+    /// after it. Returns `String::new()` when the module has no frames.
+    fn definitions_block(&self) -> String {
+        if self.frames.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        pushln!(
+            &mut out,
+            "\\* Named UNCHANGED frames. One definition per distinct frame; every action"
+        );
+        pushln!(
+            &mut out,
+            "\\* that leaves those variables unchanged references the definition by name."
+        );
+        for (name, body) in &self.frames {
+            pushln!(&mut out, "{name} == {body}");
+        }
+        pushln!(&mut out);
+        out
+    }
+}
 
 impl<'a> CompositionTlaCompiler<'a> {
     fn new(
@@ -5555,6 +5711,7 @@ impl<'a> CompositionTlaCompiler<'a> {
                     schema.name
                 )
             })?,
+            unchanged_frames: RefCell::new(UnchangedFrameInterner::default()),
         })
     }
 
@@ -5562,16 +5719,18 @@ impl<'a> CompositionTlaCompiler<'a> {
         if vars.is_empty() {
             return;
         }
-        if vars.len() <= COMPOSITION_UNCHANGED_SPLIT_THRESHOLD {
-            writeln!(out, "{prefix}UNCHANGED << {} >>", vars.join(", ")).expect("write to string");
-            return;
-        }
-
-        // TLC's semantic pass can overflow on very large repeated tuple frames in
-        // generated seam models. Split the frame into equivalent smaller tuples.
-        for chunk in vars.chunks(COMPOSITION_UNCHANGED_CHUNK_SIZE) {
-            writeln!(out, "{prefix}UNCHANGED << {} >>", chunk.join(", ")).expect("write to string");
-        }
+        // The frame is interned on its variable list alone and referenced at
+        // the caller's own `prefix`, so the conjunct keeps its original column.
+        // Indentation is semantically load-bearing in TLA bulleted lists.
+        let body = unchanged_frame_body(
+            vars,
+            Some((
+                COMPOSITION_UNCHANGED_SPLIT_THRESHOLD,
+                COMPOSITION_UNCHANGED_CHUNK_SIZE,
+            )),
+        );
+        let name = self.unchanged_frames.borrow_mut().intern(body);
+        writeln!(out, "{prefix}{name}").expect("write to string");
     }
 
     fn render(&self) -> std::result::Result<String, CompositionTlaError> {
@@ -5783,6 +5942,12 @@ impl<'a> CompositionTlaCompiler<'a> {
         writeln!(&mut out, "VARIABLES {}", all_vars.join(", ")).expect("write to string");
         writeln!(&mut out, "vars == << {} >>", all_vars.join(", ")).expect("write to string");
         pushln!(&mut out);
+
+        // Named UNCHANGED frames are spliced back in here once the whole module
+        // body is rendered: the frames are discovered while rendering actions,
+        // but TLA requires an operator to be defined before it is referenced.
+        // This is the first point where every frame variable is in scope.
+        let unchanged_frame_anchor = out.len();
 
         writeln!(
             &mut out,
@@ -6195,6 +6360,18 @@ impl<'a> CompositionTlaCompiler<'a> {
             "============================================================================="
         )
         .expect("write to string");
+
+        // Fail closed on a frame-name collision: the rendered body already
+        // references one name for two different frames, so returning it would
+        // silently give an action the wrong frame condition.
+        let frames = self.unchanged_frames.borrow();
+        if let Some(collision) = frames.collision() {
+            return Err(CompositionTlaError::UnchangedFrameCollision {
+                composition: self.schema.name.as_str().to_owned(),
+                collision: collision.clone(),
+            });
+        }
+        out.insert_str(unchanged_frame_anchor, &frames.definitions_block());
 
         Ok(out)
     }
@@ -8491,6 +8668,7 @@ struct MachineTlaCompiler<'a> {
     helper_prefix: Option<String>,
     phase_symbol: Option<String>,
     field_env_override: Option<BTreeMap<String, String>>,
+    unchanged_frames: UnchangedFrameInterner,
 }
 
 impl<'a> MachineTlaCompiler<'a> {
@@ -8503,6 +8681,7 @@ impl<'a> MachineTlaCompiler<'a> {
             helper_prefix: None,
             phase_symbol: None,
             field_env_override: None,
+            unchanged_frames: UnchangedFrameInterner::default(),
         }
     }
 
@@ -8515,6 +8694,7 @@ impl<'a> MachineTlaCompiler<'a> {
             helper_prefix: Some(helper_prefix.into()),
             phase_symbol: None,
             field_env_override: None,
+            unchanged_frames: UnchangedFrameInterner::default(),
         }
     }
 
@@ -8767,6 +8947,19 @@ impl<'a> MachineTlaCompiler<'a> {
             pushln!(&mut out, "    /\\ UNCHANGED vars");
             pushln!(&mut out);
         }
+
+        // Fail closed on a frame-name collision: the rendered transitions
+        // already reference one name for two different frames, so returning the
+        // module would silently give an action the wrong frame condition.
+        if let Some(collision) = self.unchanged_frames.collision() {
+            return Err(CompositionTlaError::MachineUnchangedFrameCollision {
+                machine: self.schema.machine.as_str().to_owned(),
+                collision: collision.clone(),
+            });
+        }
+        // Every frame variable is in scope from the VARIABLES declaration
+        // above, and every reference is in the transition bodies below.
+        out.push_str(&self.unchanged_frames.definitions_block());
 
         if !self.helper_defs.is_empty() {
             for helper in &self.helper_defs {
@@ -10284,7 +10477,13 @@ impl<'a> MachineTlaCompiler<'a> {
             .map(|field| field.name.as_str().to_owned())
             .collect::<Vec<_>>();
         if !unchanged.is_empty() {
-            pushln!(out, "    /\\ UNCHANGED << {} >>", unchanged.join(", "));
+            // Machine frames are never chunked: the split policy is a
+            // composition-scale TLC mitigation, and applying it here would
+            // change the emitted formula for wide machines.
+            let name = self
+                .unchanged_frames
+                .intern(unchanged_frame_body(&unchanged, None));
+            pushln!(out, "    /\\ {name}");
         }
     }
 

@@ -1,5 +1,7 @@
 #![allow(clippy::expect_used)]
 
+use std::collections::BTreeSet;
+
 use meerkat_machine_codegen::{
     GENERATED_COVERAGE_END, GENERATED_COVERAGE_START, merge_mapping_document,
     render_composition_ci_cfg, render_composition_driver, render_composition_mapping_coverage,
@@ -1404,5 +1406,167 @@ fn render_adaptive_mob_bundle_driver_emits_layer_terminal_route() {
     assert!(
         rendered.contains("(FieldId::parse(\"result\").expect(\"route producer field slug\"), FieldId::parse(\"result_class\").expect(\"route consumer field slug\")),"),
         "adaptive route must carry the producer result into result_class while owner-provided context stays driver-owned:\n{rendered}"
+    );
+}
+
+/// Facts about one rendered TLA module's UNCHANGED frames.
+struct FrameAudit {
+    /// Frame operator name -> body, in emission order.
+    definitions: Vec<(String, String)>,
+    /// Every `<indent>/\ UnchangedFrame_...` conjunct, in emission order.
+    references: Vec<String>,
+    /// Lines that expand a frame tuple somewhere other than a definition.
+    inline_expansions: Vec<String>,
+    /// `UNCHANGED vars` conjuncts, which are already short and stay inline.
+    whole_state_frames: usize,
+}
+
+fn audit_unchanged_frames(rendered: &str) -> FrameAudit {
+    let mut audit = FrameAudit {
+        definitions: Vec::new(),
+        references: Vec::new(),
+        inline_expansions: Vec::new(),
+        whole_state_frames: 0,
+    };
+    for line in rendered.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("UnchangedFrame_")
+            && let Some((suffix, body)) = rest.split_once(" == ")
+        {
+            assert_eq!(
+                suffix.len(),
+                16,
+                "frame operator name must carry a 16-hex content hash: {line}"
+            );
+            assert!(
+                suffix
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "frame operator name must carry a lowercase hex content hash: {line}"
+            );
+            assert!(
+                !line.starts_with(' '),
+                "frame definitions must sit at column 0: {line}"
+            );
+            audit
+                .definitions
+                .push((format!("UnchangedFrame_{suffix}"), body.to_owned()));
+            continue;
+        }
+        if let Some(name) = trimmed.strip_prefix("/\\ UnchangedFrame_") {
+            audit.references.push(format!("UnchangedFrame_{name}"));
+            continue;
+        }
+        if trimmed == "/\\ UNCHANGED vars" {
+            audit.whole_state_frames += 1;
+            continue;
+        }
+        if line.contains("UNCHANGED <<") {
+            audit.inline_expansions.push(line.to_owned());
+        }
+    }
+    audit
+}
+
+/// The renderer used to expand a full `UNCHANGED << ... >>` tuple at every
+/// action. On `meerkat_mob_seam` that was 32,850 expansions of 650 distinct
+/// frames and ~85% of the emitted bytes. Pins the frame-reuse contract:
+/// every distinct frame is defined exactly once and referenced by name, and no
+/// action carries an expanded tuple.
+#[test]
+fn tla_models_emit_each_unchanged_frame_once_and_reference_it_by_name() {
+    let machine =
+        render_machine_semantic_model(&meerkat_machine()).expect("render machine semantic model");
+    let composition = render_composition_semantic_model(&meerkat_mob_seam_composition())
+        .expect("render composition semantic model");
+
+    for (label, rendered) in [
+        ("meerkat_machine", &machine),
+        ("meerkat_mob_seam", &composition),
+    ] {
+        let audit = audit_unchanged_frames(rendered);
+
+        assert!(
+            audit.inline_expansions.is_empty(),
+            "{label}: {} UNCHANGED tuple(s) expanded outside a frame definition, first: {}",
+            audit.inline_expansions.len(),
+            audit.inline_expansions[0]
+        );
+        assert!(
+            !audit.definitions.is_empty(),
+            "{label}: expected named frame definitions"
+        );
+
+        let mut names = BTreeSet::new();
+        let mut bodies = BTreeSet::new();
+        for (name, body) in &audit.definitions {
+            assert!(
+                names.insert(name.clone()),
+                "{label}: frame operator `{name}` defined more than once"
+            );
+            assert!(
+                bodies.insert(body.clone()),
+                "{label}: frame body emitted under two operator names: {body}"
+            );
+        }
+
+        // Definitions are sorted by name so a later schema edit inserts or
+        // drops a single line instead of shifting every definition after it.
+        let sorted = names.iter().cloned().collect::<Vec<_>>();
+        let emitted = audit
+            .definitions
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            emitted, sorted,
+            "{label}: frame definitions must be name-sorted"
+        );
+
+        for name in &audit.references {
+            assert!(
+                names.contains(name),
+                "{label}: action references undefined frame `{name}`"
+            );
+        }
+        // Frame reuse is the whole point: the model must reference frames far
+        // more often than it defines them.
+        assert!(
+            audit.references.len() > audit.definitions.len(),
+            "{label}: {} references over {} definitions is no reuse at all",
+            audit.references.len(),
+            audit.definitions.len()
+        );
+        // Every operator must be defined before it is referenced. Definitions
+        // are one contiguous block, so it is enough that the block ends before
+        // the first reference.
+        let last_definition = rendered
+            .rfind("\nUnchangedFrame_")
+            .expect("frame definition block");
+        let first_reference = rendered
+            .find("/\\ UnchangedFrame_")
+            .expect("frame reference");
+        assert!(
+            last_definition < first_reference,
+            "{label}: frame definitions must precede every reference"
+        );
+    }
+
+    // The composition-only split policy (a frame past 96 variables becomes a
+    // conjunction of 64-variable tuples, working around a TLC semantic-pass
+    // overflow) has to survive inside the named definition.
+    let composition_audit = audit_unchanged_frames(&composition);
+    assert!(
+        composition_audit
+            .definitions
+            .iter()
+            .any(|(_, body)| body.contains(">> /\\ UNCHANGED <<")),
+        "meerkat_mob_seam: wide frames must stay split into chunked tuples"
+    );
+    // `UNCHANGED vars` stays inline: it is already one short conjunct.
+    let machine_audit = audit_unchanged_frames(&machine);
+    assert!(
+        machine_audit.whole_state_frames > 0,
+        "meerkat_machine: whole-state UNCHANGED vars conjuncts must stay inline"
     );
 }
