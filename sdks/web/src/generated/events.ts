@@ -202,6 +202,13 @@ export interface DiscardedCacheBreakpointIdentity {
   provider: Provider;
 }
 
+export interface DisputedTurnUsageAccountingIdentity {
+  active_model: string;
+  active_provider: Provider;
+  reported_model: string;
+  reported_provider: Provider;
+}
+
 export type ExternalToolDeltaPhase = "pending" | "applied" | "draining" | "forced" | "failed";
 
 export type GeminiImageMetadata = {
@@ -551,6 +558,11 @@ export type TurnUsage = {
   provider_accounting?: ProviderTokenAccounting | null;
 };
 
+export interface UnmeasuredTurnUsageAccounting {
+  model: string;
+  provider: Provider;
+}
+
 export type Usage = {
   cache_creation_tokens?: number | null;
   cache_read_tokens?: number | null;
@@ -681,7 +693,19 @@ export interface ToolResultReceivedEvent {
 export interface TurnCompletedEvent {
   stop_reason: StopReason;
   type: "turn_completed";
-  usage: TurnUsage;
+  usage?: TurnUsage | null;
+}
+
+export interface TurnUsageAccountingUnmeasuredEvent {
+  session_id: SessionId;
+  type: "turn_usage_accounting_unmeasured";
+  unmeasured: UnmeasuredTurnUsageAccounting;
+}
+
+export interface TurnUsageAccountingIdentityDisputedEvent {
+  dispute: DisputedTurnUsageAccountingIdentity;
+  session_id: SessionId;
+  type: "turn_usage_accounting_identity_disputed";
 }
 
 export interface ToolExecutionStartedEvent {
@@ -836,6 +860,8 @@ export const KNOWN_AGENT_EVENT_TYPES = [
   "tool_call_requested",
   "tool_result_received",
   "turn_completed",
+  "turn_usage_accounting_unmeasured",
+  "turn_usage_accounting_identity_disputed",
   "tool_execution_started",
   "tool_execution_completed",
   "tool_execution_timed_out",
@@ -879,6 +905,8 @@ export type AgentEvent =
   ToolCallRequestedEvent |
   ToolResultReceivedEvent |
   TurnCompletedEvent |
+  TurnUsageAccountingUnmeasuredEvent |
+  TurnUsageAccountingIdentityDisputedEvent |
   ToolExecutionStartedEvent |
   ToolExecutionCompletedEvent |
   ToolExecutionTimedOutEvent |
