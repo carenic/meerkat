@@ -97,6 +97,47 @@ them.
   machine owner, and a source-grep test
   (`run_start_window_stays_out_of_machine_authority`) enforces that boundary.
 
+### Fixed
+
+- **An OpenAI-compatible provider that reports usage in a separate SSE event
+  no longer fails every turn** (`meerkat-openai`). The chat-completions
+  adapter requests `stream_options.include_usage: true`, then emitted the
+  terminal `LlmEvent::Done` the moment it saw `finish_reason`. Because
+  `streaming::ensure_terminal_done` stops consuming at `Done`, a usage-only
+  event arriving afterwards was never read, and the turn then failed in
+  `Agent::commit_calling_llm_response` with "provider turn usage is missing
+  normalized accounting evidence" - AFTER the model's answer had already been
+  streamed to the user, and again on every retry. vLLM emits exactly this
+  order (metadata, deltas, `finish_reason`, usage-only event with empty
+  `choices`, `[DONE]`), so whole self-hosted deployments were unusable.
+
+  The adapter now latches the derived `StopReason` instead of spending it,
+  keeps consuming, emits `UsageUpdate` where it lands, and emits the single
+  terminal `Done` at `[DONE]` or end of stream. Two facts became typed to make
+  that expressible: `parse_chat_completions_line` returns
+  `ChatCompletionsLine::{Chunk, Done, Ignored}` instead of an `Option` that
+  collapsed "the turn is over" and "a line this adapter does not interpret"
+  into one `None`; and the stop reason is a `latched_stop` spent exactly once.
+  `ChatCompletionsChunk.choices` gains `#[serde(default)]` so a usage-only
+  chunk deserializes.
+
+- **Reasoning and content carried in the SAME delta are no longer emitted in
+  reverse order** (`meerkat-openai`). A server emits both fields in one chunk
+  on the reasoning-to-content transition; the reasoning in such a chunk was
+  produced BEFORE the content beside it, and 0.8.23 emitted the content first.
+  Field-reported as output that reads as corruption, and nothing downstream can
+  repair it: by the time the events leave the adapter, the interleaving IS the
+  stream. `ReasoningDelta` now precedes `TextDelta` within a chunk.
+
+  Why the existing reasoning test could not catch it, which is the part worth
+  keeping: every chunk in that fixture carries reasoning OR content, never
+  both, so no ordering question ever arose. The usage defect above has the same
+  shape - every fixture co-located usage with `finish_reason`. A corpus
+  assembled from one provider's chunking encodes that chunking as if it were
+  the protocol. The new test records the ORDER the two channels arrive in
+  rather than their contents, and is mutation-proven: restoring the 0.8.23
+  order turns it red with the intended diagnostic.
+
 ### Corrected
 
 - **The 0.8.23 notes claimed `session_liveness` "needs a watchdog bridge that
