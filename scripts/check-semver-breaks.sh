@@ -47,13 +47,15 @@ tool_exit=0
 "$ROOT/scripts/repo-cargo" semver-checks check-release --workspace --release-type patch \
     >"$report_file" 2>&1 || tool_exit=$?
 
-# Every crate the release publishes must appear in the report. A run that died
-# after twelve crates exits non-zero with real findings, and judging only the
-# findings it managed to print would call a partial measurement a pass.
-expected_args=()
+# Every crate the release publishes and that cargo-semver-checks can look at
+# must appear in the report. A run that died after twelve crates exits non-zero
+# with real findings, and judging only the findings it managed to print would
+# call a partial measurement a pass. The analyser decides which crates the tool
+# can look at (proc-macro crates are absent from its output entirely).
+release_args=()
 while IFS= read -r crate; do
     [[ -n "$crate" ]] || continue
-    expected_args+=(--expected-crate "$crate")
+    release_args+=(--release-crate "$crate")
 done < <("$ROOT/scripts/release-rust-crates.sh")
 
 analyser_exit=0
@@ -62,7 +64,7 @@ analyser_exit=0
     --changelog "$ROOT/CHANGELOG.md" \
     --repo-root "$ROOT" \
     --tool-exit-code "$tool_exit" \
-    "${expected_args[@]}" || analyser_exit=$?
+    "${release_args[@]}" || analyser_exit=$?
 
 if [[ "$analyser_exit" -ne 0 ]]; then
     echo >&2

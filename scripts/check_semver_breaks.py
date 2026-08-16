@@ -49,7 +49,6 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 FAILURE_HEADER_RE = re.compile(r"^--- failure ([A-Za-z0-9_]+):")
 CHECKING_RE = re.compile(r"^\s+Checking (\S+) v")
 FINISHED_RE = re.compile(r"^\s+Finished \[[^\]]*\] (\S+)\s*$")
-SKIPPING_RE = re.compile(r"^\s+Skipping (\S+)\b")
 SUMMARY_RE = re.compile(r"^\s+Summary\b")
 FAILED_IN_RE = re.compile(r"^Failed in:\s*$")
 ITEM_RE = re.compile(r"^  (\S.*)$")
@@ -80,8 +79,23 @@ class ReportParse:
     findings: list[Finding] = field(default_factory=list)
     checked_crates: list[str] = field(default_factory=list)
     finished_crates: list[str] = field(default_factory=list)
-    skipped_crates: list[str] = field(default_factory=list)
     summary_lines: int = 0
+
+
+@dataclass
+class CrateScope:
+    """Which published crates cargo-semver-checks can actually look at.
+
+    Observed, not assumed: a `--workspace` run says NOTHING about a proc-macro
+    crate. No Building line, no Checking line, no Skipping line - the crate is
+    simply absent from the report. Requiring every published crate to appear
+    would therefore red-gate every release forever.
+    """
+
+    checkable: list[str] = field(default_factory=list)
+    proc_macro: list[str] = field(default_factory=list)
+    no_lib_target: list[str] = field(default_factory=list)
+    missing_manifest: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -206,12 +220,6 @@ def parse_report(text: str) -> ReportParse:
         finished = FINISHED_RE.match(line)
         if finished:
             parsed.finished_crates.append(finished.group(1))
-            collecting = False
-            continue
-
-        skipping = SKIPPING_RE.match(line)
-        if skipping:
-            parsed.skipped_crates.append(skipping.group(1))
             collecting = False
             continue
 
@@ -354,7 +362,51 @@ def workspace_version(repo_root: pathlib.Path) -> str:
     return str(data["workspace"]["package"]["version"])
 
 
-def check_measured(parsed: ReportParse, tool_exit_code: int, expected_crates: list[str]) -> list[str]:
+def workspace_manifests(repo_root: pathlib.Path) -> dict[str, dict]:
+    """Map crate name to parsed manifest for every workspace member."""
+    workspace = tomllib.loads((repo_root / "Cargo.toml").read_text(encoding="utf-8"))
+    paths: list[pathlib.Path] = []
+    for member in workspace["workspace"]["members"]:
+        if "*" in member:
+            paths.extend(sorted(repo_root.glob(member)))
+        else:
+            paths.append(repo_root / member)
+
+    manifests: dict[str, dict] = {}
+    for path in paths:
+        manifest = path / "Cargo.toml"
+        if not manifest.exists():
+            continue
+        data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        name = data.get("package", {}).get("name")
+        if name:
+            data["__dir__"] = str(path)
+            manifests[name] = data
+    return manifests
+
+
+def classify_crates(repo_root: pathlib.Path, release_crates: list[str]) -> CrateScope:
+    """Split the published crates into "the report must cover it" and "it cannot"."""
+    manifests = workspace_manifests(repo_root)
+    scope = CrateScope()
+    for name in release_crates:
+        manifest = manifests.get(name)
+        if manifest is None:
+            scope.missing_manifest.append(name)
+            continue
+        lib = manifest.get("lib", {})
+        if lib.get("proc-macro") is True:
+            scope.proc_macro.append(name)
+            continue
+        lib_path = pathlib.Path(manifest["__dir__"]) / lib.get("path", "src/lib.rs")
+        if not lib_path.exists():
+            scope.no_lib_target.append(name)
+            continue
+        scope.checkable.append(name)
+    return scope
+
+
+def check_measured(parsed: ReportParse, tool_exit_code: int, scope: CrateScope | None) -> list[str]:
     """Fail closed when the report is not evidence about the whole release."""
     errors: list[str] = []
 
@@ -377,13 +429,19 @@ def check_measured(parsed: ReportParse, tool_exit_code: int, expected_crates: li
             "missing baseline, network), so this gate could not measure the release"
         )
 
-    if expected_crates:
-        covered = set(parsed.finished_crates) | set(parsed.skipped_crates)
-        missing = [crate for crate in expected_crates if crate not in covered]
+    if scope is not None:
+        if scope.missing_manifest:
+            errors.append(
+                "these crates are published by the release but have no workspace "
+                "manifest, so the gate cannot tell whether they were checked: "
+                + ", ".join(scope.missing_manifest)
+            )
+        covered = set(parsed.finished_crates)
+        missing = [crate for crate in scope.checkable if crate not in covered]
         if missing:
             errors.append(
-                "the report never reached these publishable crates (neither Finished "
-                "nor Skipping): " + ", ".join(missing)
+                "the report never reached these publishable crates (no `Finished` "
+                "line): " + ", ".join(missing)
             )
 
     return errors
@@ -464,10 +522,11 @@ def main() -> int:
     parser.add_argument("--repo-root", type=pathlib.Path)
     parser.add_argument("--version", help="workspace version (defaults to --repo-root Cargo.toml)")
     parser.add_argument(
-        "--expected-crate",
+        "--release-crate",
         action="append",
         default=[],
-        help="publishable crate that the report must have reached; repeatable",
+        help="crate this release publishes; repeatable. Those with a non-proc-macro "
+        "lib target must appear in the report.",
     )
     args = parser.parse_args()
 
@@ -479,11 +538,18 @@ def main() -> int:
         print("error: one of --version or --repo-root is required", file=sys.stderr)
         return 2
 
+    scope: CrateScope | None = None
+    if args.release_crate:
+        if not args.repo_root:
+            print("error: --release-crate requires --repo-root", file=sys.stderr)
+            return 2
+        scope = classify_crates(args.repo_root, args.release_crate)
+
     report_text = args.report.read_text(encoding="utf-8", errors="replace")
     parsed = parse_report(report_text)
     sections = parse_changelog(args.changelog.read_text(encoding="utf-8"))
 
-    errors = check_measured(parsed, args.tool_exit_code, args.expected_crate)
+    errors = check_measured(parsed, args.tool_exit_code, scope)
     errors.extend(check_stamped(sections, version))
 
     section = pending_section(sections)
@@ -493,9 +559,24 @@ def main() -> int:
     fallback_lints = sorted({f.lint_id for f in parsed.findings if not f.structural})
     if fallback_lints:
         print(
-            "semver-breaks: NOTE: no structural extractor for lint(s) "
+            "semver-breaks: NOTE: no structural extractor matched the message shape of "
+            "lint(s) "
             + ", ".join(fallback_lints)
-            + "; fell back to PascalCase symbols, which cannot see field or method names.",
+            + "; fell back to PascalCase symbols, which cannot see field or method names. "
+            "Either the lint is new or its message shape changed: teach "
+            "scripts/check_semver_breaks.py the shape to restore full granularity.",
+            file=sys.stderr,
+        )
+
+    # Say out loud which published crates no tool is checking. A coverage gap
+    # that only exists in the parser's head is the same shape of defect as an
+    # undeclared break.
+    if scope is not None and (scope.proc_macro or scope.no_lib_target):
+        unchecked = [f"{name} (proc-macro)" for name in scope.proc_macro]
+        unchecked += [f"{name} (no lib target)" for name in scope.no_lib_target]
+        print(
+            "semver-breaks: NOTE: cargo-semver-checks does not look at these published "
+            "crates, and neither does this gate: " + ", ".join(unchecked),
             file=sys.stderr,
         )
 

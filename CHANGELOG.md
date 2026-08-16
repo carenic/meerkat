@@ -35,7 +35,9 @@ them.
   cargo-semver-checks findings against the section body per finding, requires
   the pending section to be stamped against the workspace version (notes left
   under `## [Unreleased]` after the version bump are now a failure), and fails
-  closed when the tool run did not reach every publishable crate. The gate also
+  closed when the tool run did not reach every publishable library crate. It
+  also prints the three published crates cargo-semver-checks cannot look at
+  (`meerkat-machine-derive`, `meerkat-machine-dsl`, `rkat`). The gate also
   runs in the release workflow now (job `release_semver_gate`), gating
   `publish_github_release`, `publish_registries`, and
   `publish_unix_release_and_homebrew`; previously it only existed in

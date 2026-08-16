@@ -96,6 +96,30 @@ Behaviour-only breaks - a public signature that keeps its shape and changes
 what it does - are invisible to cargo-semver-checks and therefore to this gate.
 Declare them by hand in `### Breaking`.
 
+Three published crates are outside what cargo-semver-checks looks at, and the
+gate prints them on every run rather than hiding the gap: `meerkat-machine-derive`
+and `meerkat-machine-dsl` are proc-macro crates (a `--workspace` run emits no
+output for them at all), and `rkat` has no lib target. Breaks in those three are
+declared by hand or not at all.
+
+### Stamping is a manual step
+
+Nothing stamps `CHANGELOG.md` automatically: neither `cargo release` nor
+`scripts/release-hook.sh` touches it. The order is:
+
+1. Write the release notes under `## [Unreleased]`. `make release-preflight`
+   runs before the version bump, so `## [Unreleased]` is the correct home at
+   that point and the gate accepts it.
+2. Before running `cargo release <patch|minor|major>`, rename that heading to
+   `## [<next version>] - <YYYY-MM-DD>` and leave a fresh empty
+   `## [Unreleased]` stub above it.
+3. Run `cargo release`, which bumps the version, commits, and pushes the tag.
+
+Skipping step 2 is what happened in 0.8.23, and it is what
+`release_semver_gate` now fails the tag for: at the tag the workspace version
+has moved but the notes have not, so the release would publish notes titled
+"Unreleased".
+
 Where it runs:
 
 | Lane | Entry point |

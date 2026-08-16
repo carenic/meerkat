@@ -29,6 +29,7 @@ SPEC.loader.exec_module(gate)
 FIXTURES = Path(__file__).with_name("fixtures") / "semver-breaks"
 SQLITE_REPORT = (FIXTURES / "report-meerkat-sqlite-0.8.22.txt").read_text(encoding="utf-8")
 CLEAN_REPORT = (FIXTURES / "report-clean-two-crates.txt").read_text(encoding="utf-8")
+WORKSPACE_REPORT = (FIXTURES / "report-workspace-clean-0.8.23.txt").read_text(encoding="utf-8")
 REPO_CHANGELOG = (Path(__file__).resolve().parent.parent / "CHANGELOG.md").read_text(
     encoding="utf-8"
 )
@@ -305,38 +306,97 @@ class MeasuredTests(unittest.TestCase):
 
     def test_clean_report_with_exit_zero_is_measured(self) -> None:
         parsed = gate.parse_report(CLEAN_REPORT)
-        self.assertEqual(gate.check_measured(parsed, 0, []), [])
+        self.assertEqual(gate.check_measured(parsed, 0, None), [])
 
     def test_nonzero_exit_with_no_findings_is_red(self) -> None:
         parsed = gate.parse_report(CLEAN_REPORT)
-        errors = gate.check_measured(parsed, 101, [])
+        errors = gate.check_measured(parsed, 101, None)
         self.assertEqual(len(errors), 1, "\n".join(errors))
         self.assertIn("could not measure", errors[0])
 
     def test_zero_exit_with_findings_is_red(self) -> None:
         parsed = gate.parse_report(SQLITE_REPORT)
-        errors = gate.check_measured(parsed, 0, [])
+        errors = gate.check_measured(parsed, 0, None)
         self.assertEqual(len(errors), 1, "\n".join(errors))
         self.assertIn("disagree", errors[0])
 
     def test_truncated_report_is_red(self) -> None:
         truncated = "\n".join(CLEAN_REPORT.splitlines()[:4])
         parsed = gate.parse_report(truncated)
-        errors = gate.check_measured(parsed, 101, [])
+        errors = gate.check_measured(parsed, 101, None)
         self.assertTrue(any("did not complete" in e for e in errors), "\n".join(errors))
 
     def test_crate_the_report_never_reached_is_red(self) -> None:
         parsed = gate.parse_report(CLEAN_REPORT)
-        errors = gate.check_measured(parsed, 0, ["meerkat", "meerkat-core", "rkat"])
+        scope = gate.CrateScope(checkable=["meerkat", "meerkat-core"])
+        errors = gate.check_measured(parsed, 0, scope)
         self.assertEqual(len(errors), 1, "\n".join(errors))
         self.assertIn("meerkat-core", errors[0])
-        self.assertIn("rkat", errors[0])
         self.assertNotIn("meerkat,", errors[0])
 
-    def test_skipped_crate_counts_as_covered(self) -> None:
-        report = CLEAN_REPORT + "    Skipping rkat (no library target)\n"
-        parsed = gate.parse_report(report)
-        self.assertEqual(gate.check_measured(parsed, 0, ["meerkat", "rkat"]), [])
+    def test_a_published_crate_with_no_manifest_is_red(self) -> None:
+        parsed = gate.parse_report(CLEAN_REPORT)
+        scope = gate.CrateScope(checkable=["meerkat"], missing_manifest=["ghost-crate"])
+        errors = gate.check_measured(parsed, 0, scope)
+        self.assertEqual(len(errors), 1, "\n".join(errors))
+        self.assertIn("ghost-crate", errors[0])
+
+
+class CrateScopeTests(unittest.TestCase):
+    """Which published crates cargo-semver-checks can look at, from manifests.
+
+    Observed from a real `--workspace` run: proc-macro crates produce NO output
+    at all, not even a skip line. Requiring them would red-gate every release.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.root = Path(__file__).resolve().parent.parent
+        release = subprocess.run(
+            [str(cls.root / "scripts" / "release-rust-crates.sh")],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        cls.release_crates = [line for line in release.stdout.split() if line]
+        cls.scope = gate.classify_crates(cls.root, cls.release_crates)
+
+    def test_every_release_crate_is_classified_exactly_once(self) -> None:
+        classified = (
+            self.scope.checkable
+            + self.scope.proc_macro
+            + self.scope.no_lib_target
+            + self.scope.missing_manifest
+        )
+        self.assertEqual(sorted(classified), sorted(self.release_crates))
+        self.assertEqual(self.scope.missing_manifest, [])
+
+    def test_proc_macro_crates_are_out_of_scope(self) -> None:
+        # These two are absent from a real --workspace report; the gate must
+        # not demand a `Finished` line for them.
+        self.assertIn("meerkat-machine-derive", self.scope.proc_macro)
+        self.assertIn("meerkat-machine-dsl", self.scope.proc_macro)
+        self.assertNotIn("meerkat-machine-derive", self.scope.checkable)
+
+    def test_bin_only_crate_is_out_of_scope(self) -> None:
+        self.assertIn("rkat", self.scope.no_lib_target)
+        self.assertNotIn("rkat", self.scope.checkable)
+
+    def test_library_crates_are_in_scope(self) -> None:
+        for name in ("meerkat", "meerkat-core", "meerkat-sqlite", "meerkat-machine-dsl-core"):
+            self.assertIn(name, self.scope.checkable)
+
+    def test_real_full_workspace_report_covers_exactly_the_checkable_crates(self) -> None:
+        # The strongest coverage evidence available: a complete real
+        # `cargo semver-checks check-release --workspace` run. Every crate the
+        # classifier calls checkable produced a `Finished` line, and every crate
+        # it excludes produced nothing at all.
+        parsed = gate.parse_report(WORKSPACE_REPORT)
+        self.assertEqual(sorted(parsed.finished_crates), sorted(self.scope.checkable))
+        self.assertEqual(gate.check_measured(parsed, 0, self.scope), [])
+        for name in self.scope.proc_macro + self.scope.no_lib_target:
+            self.assertNotIn(name, parsed.finished_crates)
+            self.assertNotIn(name, parsed.checked_crates)
 
 
 class CliAcceptanceTests(unittest.TestCase):
@@ -376,8 +436,6 @@ class CliAcceptanceTests(unittest.TestCase):
                 "0.8.23",
                 "--tool-exit-code",
                 "1",
-                "--expected-crate",
-                "meerkat-sqlite",
             ],
             capture_output=True,
             text=True,
