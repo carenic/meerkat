@@ -150,6 +150,149 @@ impl ProviderTokenAccounting {
     }
 }
 
+/// Operator marker prefix for a dimension this build declares it could not
+/// measure.
+///
+/// This is the same vocabulary `runtime/health` publishes as
+/// `unmeasured:<dimension>`; the facade's `RUNTIME_HEALTH_UNMEASURED_PREFIX` is
+/// this constant, because the facade depends on core and not the reverse. An
+/// unmeasured dimension is an honest absence, never a reading: nothing about
+/// the underlying value is implied by it.
+pub const UNMEASURED_MARKER_PREFIX: &str = "unmeasured:";
+
+/// Operator marker prefix for a fact two owners state incompatibly.
+///
+/// Unlike [`UNMEASURED_MARKER_PREFIX`] a disputed fact HAS a value; what is in
+/// question is who it belongs to. The value is passed through exactly as its
+/// author stated it and is never rewritten to match the disputing side.
+pub const DISPUTED_MARKER_PREFIX: &str = "disputed:";
+
+/// Marker dimension: provider token accounting for one model turn.
+pub const TURN_USAGE_ACCOUNTING_DIMENSION: &str = "turn_usage_accounting";
+
+/// Marker dimension: whose model/provider one turn's accounting describes.
+pub const TURN_USAGE_ACCOUNTING_IDENTITY_DIMENSION: &str = "turn_usage_accounting_identity";
+
+/// Provider token accounting for one completed model turn was absent.
+///
+/// # What this makes untrue, and what it does not
+///
+/// A provider that streams a complete answer and no usage event has stated
+/// nothing about tokens. The turn's SEMANTIC facts - what the model said,
+/// which tools it asked for, what was committed to the transcript - are
+/// untouched by that silence, so the turn completes and commits. Only the
+/// accounting axis is affected, and it is affected by being left exactly where
+/// it was: no counter advances, no per-call row is published, and no value is
+/// substituted for the one the provider did not send.
+///
+/// # Why the identity here is not accounting
+///
+/// `provider` and `model` name the REQUEST this turn was lowered for. They are
+/// the address of the missing measurement, not a reconstruction of it, and
+/// carry no counters. This is exactly the line
+/// [`ProviderTokenAccounting::host_declared`] would cross: it would mint
+/// provider attribution for numbers no provider issued.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct UnmeasuredTurnUsageAccounting {
+    /// Provider of the request that produced the unaccounted turn.
+    pub provider: Provider,
+    /// Model of the request that produced the unaccounted turn.
+    pub model: String,
+}
+
+impl UnmeasuredTurnUsageAccounting {
+    /// Canonical operator marker for this dimension:
+    /// `unmeasured:turn_usage_accounting`.
+    ///
+    /// Composed from [`UNMEASURED_MARKER_PREFIX`] and
+    /// [`TURN_USAGE_ACCOUNTING_DIMENSION`]; the composition is pinned by
+    /// `unmeasured_turn_usage_marker_composes_from_the_shared_vocabulary`.
+    pub const MARKER: &'static str = "unmeasured:turn_usage_accounting";
+
+    pub fn new(provider: Provider, model: impl Into<String>) -> Self {
+        Self {
+            provider,
+            model: model.into(),
+        }
+    }
+
+    /// The operator-facing marker string. One owner; emit sites read it rather
+    /// than spelling it.
+    pub const fn marker(&self) -> &'static str {
+        Self::MARKER
+    }
+}
+
+impl std::fmt::Display for UnmeasuredTurnUsageAccounting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}{{provider={}, model={}}}",
+            Self::MARKER,
+            self.provider.as_str(),
+            self.model
+        )
+    }
+}
+
+/// One turn's provider-authored accounting named a different provider/model
+/// than the request it answered.
+///
+/// # Why this is not the same fault as absent accounting
+///
+/// A mismatched identity still arrives with a complete, internally consistent
+/// measurement: the [`PresentedTokenConvention`] travels with the number, so
+/// the counters mean what they say regardless of which name is attached. The
+/// disputed fact is attribution alone, so the token axis still advances on the
+/// number the provider actually sent. Absent accounting has no number at all
+/// and therefore cannot advance anything. Collapsing the two would either kill
+/// correct work over a name or fabricate counters over silence.
+///
+/// # Why the reported identity is preserved verbatim
+///
+/// Rewriting `reported_*` to the active identity would publish an agreement
+/// that was never observed - a guess laundered as evidence. Both sides are
+/// carried so a host can see exactly who disagreed with whom.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct DisputedTurnUsageAccountingIdentity {
+    /// Provider of the request this turn was lowered for.
+    pub active_provider: Provider,
+    /// Model of the request this turn was lowered for.
+    pub active_model: String,
+    /// Provider the accounting claims, exactly as the adapter minted it.
+    pub reported_provider: Provider,
+    /// Model the accounting claims, exactly as the adapter minted it.
+    pub reported_model: String,
+}
+
+impl DisputedTurnUsageAccountingIdentity {
+    /// Canonical operator marker for this dimension:
+    /// `disputed:turn_usage_accounting_identity`.
+    pub const MARKER: &'static str = "disputed:turn_usage_accounting_identity";
+
+    pub const fn marker(&self) -> &'static str {
+        Self::MARKER
+    }
+}
+
+impl std::fmt::Display for DisputedTurnUsageAccountingIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}{{active={}/{}, reported={}/{}}}",
+            Self::MARKER,
+            self.active_provider.as_str(),
+            self.active_model,
+            self.reported_provider.as_str(),
+            self.reported_model
+        )
+    }
+}
+
 /// Stable provider-independent identity of an authored cache breakpoint.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -755,4 +898,57 @@ pub fn provider_cache_breakpoint_claim(
     };
     evidence.validate_rendered_identity()?;
     Ok(ProviderCacheBreakpointClaim { evidence })
+}
+
+#[cfg(test)]
+mod degradation_marker_tests {
+    use super::{
+        DISPUTED_MARKER_PREFIX, DisputedTurnUsageAccountingIdentity,
+        TURN_USAGE_ACCOUNTING_DIMENSION, TURN_USAGE_ACCOUNTING_IDENTITY_DIMENSION,
+        UNMEASURED_MARKER_PREFIX, UnmeasuredTurnUsageAccounting,
+    };
+    use crate::Provider;
+
+    /// The marker constant is one owner's spelling of a composed vocabulary.
+    /// Pinning the composition keeps a hand-edited literal from drifting away
+    /// from the prefix `runtime/health` publishes.
+    #[test]
+    fn unmeasured_turn_usage_marker_composes_from_the_shared_vocabulary() {
+        assert_eq!(
+            UnmeasuredTurnUsageAccounting::MARKER,
+            format!("{UNMEASURED_MARKER_PREFIX}{TURN_USAGE_ACCOUNTING_DIMENSION}")
+        );
+        assert_eq!(
+            DisputedTurnUsageAccountingIdentity::MARKER,
+            format!("{DISPUTED_MARKER_PREFIX}{TURN_USAGE_ACCOUNTING_IDENTITY_DIMENSION}")
+        );
+    }
+
+    /// The operator rendering must name the address of the missing
+    /// measurement, because "some turn was unaccounted" is not actionable.
+    #[test]
+    fn unmeasured_turn_usage_renders_the_request_identity() {
+        let unmeasured = UnmeasuredTurnUsageAccounting::new(Provider::Anthropic, "claude-opus-5");
+        assert_eq!(
+            unmeasured.to_string(),
+            "unmeasured:turn_usage_accounting{provider=anthropic, model=claude-opus-5}"
+        );
+        assert_eq!(unmeasured.marker(), UnmeasuredTurnUsageAccounting::MARKER);
+    }
+
+    /// A dispute names BOTH sides. Rendering only one of them would be the
+    /// same laundering the type exists to prevent.
+    #[test]
+    fn disputed_identity_renders_both_sides() {
+        let dispute = DisputedTurnUsageAccountingIdentity {
+            active_provider: Provider::OpenAI,
+            active_model: "gpt-5.5".to_string(),
+            reported_provider: Provider::OpenAI,
+            reported_model: "gpt-5.4".to_string(),
+        };
+        assert_eq!(
+            dispute.to_string(),
+            "disputed:turn_usage_accounting_identity{active=openai/gpt-5.5, reported=openai/gpt-5.4}"
+        );
+    }
 }

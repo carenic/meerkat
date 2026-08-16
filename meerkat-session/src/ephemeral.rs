@@ -6228,14 +6228,19 @@ async fn session_task<A: SessionAgent>(
                         );
                         let _ = control.session_event_tx.send(envelope);
                     }
-                    if let Some(usage) = usage_for_event {
-                        let envelope = stamp_event_envelope(
-                            &mut next_seq,
-                            &source,
-                            AgentEvent::TurnCompleted { stop_reason, usage },
-                        );
-                        let _ = control.session_event_tx.send(envelope);
-                    }
+                    // The completion is published whether or not the host
+                    // supplied normalized accounting. Withholding it when the
+                    // number is missing would let an accounting gap erase a
+                    // semantic fact the caller has already observed.
+                    let envelope = stamp_event_envelope(
+                        &mut next_seq,
+                        &source,
+                        AgentEvent::TurnCompleted {
+                            stop_reason,
+                            usage: usage_for_event,
+                        },
+                    );
+                    let _ = control.session_event_tx.send(envelope);
                 }
                 let _ = reply_tx.send(result);
             }
@@ -6268,17 +6273,15 @@ async fn session_task<A: SessionAgent>(
                                 );
                                 let _ = control.session_event_tx.send(envelope);
                             }
-                            if let Some(usage) = usage.clone() {
-                                let envelope = stamp_event_envelope(
-                                    &mut next_seq,
-                                    &source,
-                                    AgentEvent::TurnCompleted {
-                                        stop_reason: *stop_reason,
-                                        usage,
-                                    },
-                                );
-                                let _ = control.session_event_tx.send(envelope);
-                            }
+                            let envelope = stamp_event_envelope(
+                                &mut next_seq,
+                                &source,
+                                AgentEvent::TurnCompleted {
+                                    stop_reason: *stop_reason,
+                                    usage: usage.clone(),
+                                },
+                            );
+                            let _ = control.session_event_tx.send(envelope);
                         }
                     }
                 }

@@ -2707,6 +2707,20 @@ def test_parse_turn_completed_without_accounting_is_accepted():
     assert event.usage.accounting is None
 
 
+def test_parse_turn_completed_with_no_usage_at_all_is_a_completed_turn():
+    """A turn the provider never accounted for is still a completed turn.
+
+    The SDK must surface it as ``TurnCompleted`` with ``usage=None`` - not as a
+    malformed event, and not with a fabricated zero row that would silently
+    understate every aggregate built on top of it.
+    """
+    raw = {"type": "turn_completed", "stop_reason": "end_turn"}
+    event = parse_event(raw)
+    assert isinstance(event, TurnCompleted)
+    assert event.usage is None
+    assert event.stop_reason == "end_turn"
+
+
 def test_parse_interaction_complete_structured_output():
     raw = {
         "type": "interaction_complete",

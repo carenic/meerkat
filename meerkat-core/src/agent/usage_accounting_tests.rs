@@ -227,7 +227,15 @@ fn drain(rx: &mut mpsc::Receiver<AgentEvent>) -> ObservedRun {
     let mut run_totals = Vec::new();
     while let Ok(event) = rx.try_recv() {
         match event {
-            AgentEvent::TurnCompleted { usage, .. } => turn_rows.push(usage),
+            // A measured run publishes a row per closing call. An absent row
+            // would be a different observation entirely, so this collector
+            // refuses to flatten one into the measured sequence.
+            AgentEvent::TurnCompleted {
+                usage: Some(usage), ..
+            } => turn_rows.push(usage),
+            AgentEvent::TurnCompleted { usage: None, .. } => {
+                panic!("the documented worked example measures every call")
+            }
             AgentEvent::RunCompleted { usage, .. } => run_totals.push(usage),
             _ => {}
         }

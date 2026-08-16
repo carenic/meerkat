@@ -331,6 +331,19 @@ describe("Typed Events", () => {
     }
   });
 
+  it("parses a turn_completed with no usage at all as a completed turn", () => {
+    // A provider stream that never sent a usage event still produced an
+    // answer. The turn is a completed turn with no accounting: `usage` must be
+    // absent, never a fabricated zero row.
+    const event = parseEvent({ type: "turn_completed", stop_reason: "end_turn" });
+    if (isTurnCompleted(event)) {
+      assert.equal(event.stopReason, "end_turn");
+      assert.equal(event.usage, undefined);
+    } else {
+      assert.fail("Expected TurnCompletedEvent");
+    }
+  });
+
   it("rejects malformed turn_completed usage attribution", () => {
     const malformed = [
       { provider: "anthropic", model: "claude-opus-5", presented_tokens: 4420 },

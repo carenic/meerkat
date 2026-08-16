@@ -583,7 +583,13 @@ pub fn build_runtime_host_capabilities(
 /// unreadable dimension is a *transient runtime* fact - a probe ran and lost a
 /// race - so folding it in costs at most one amber scrape, which any alert
 /// window absorbs.
-pub const RUNTIME_HEALTH_UNMEASURED_PREFIX: &str = "unmeasured:";
+///
+/// The spelling has one owner. [`meerkat_core::UNMEASURED_MARKER_PREFIX`] is
+/// the same vocabulary used by degradation markers minted inside the agent
+/// loop (for example `unmeasured:turn_usage_accounting`), so an operator who
+/// learns to read one reads the other; this alias exists because the facade
+/// depends on core and not the reverse.
+pub const RUNTIME_HEALTH_UNMEASURED_PREFIX: &str = meerkat_core::UNMEASURED_MARKER_PREFIX;
 
 /// Prefix on a `checks` key that names a dimension a probe **tried and failed
 /// to observe**.
