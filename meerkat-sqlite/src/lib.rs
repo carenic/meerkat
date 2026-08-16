@@ -51,13 +51,15 @@ pub mod json_column;
 pub mod ledger;
 pub mod profile;
 
-pub use error::{SqliteErrorClass, SqliteStoreError, classify_sqlite_error, is_busy_or_locked};
+pub use error::{
+    BridgeEligibility, SqliteErrorClass, SqliteStoreError, classify_sqlite_error, is_busy_or_locked,
+};
 pub use fence::{ExclusiveFence, OperationGuard, fence_lock_path};
 pub use json_column::JsonColumnBytes;
 pub use ledger::{
     LedgerReport, MaintenanceBridgeReport, MaintenancePrepareFn, MaintenancePrepareReport,
-    Migration, SchemaDomain, SchemaObject, SchemaObjectKind, SchemaPredecessor,
-    apply_domain_migrations, bridge_unledgered_domain, domain_version,
+    MaintenanceRecordRefusal, Migration, SchemaDomain, SchemaObject, SchemaObjectKind,
+    SchemaPredecessor, apply_domain_migrations, bridge_unledgered_domain, domain_version,
     preflight_schema_eligibility, verify_released_schema_fingerprint,
     verify_released_schema_structure,
 };
@@ -65,3 +67,6 @@ pub use profile::{
     ConnectionProfile, JournalPolicy, OpenOptions, SHARED_BUSY_TIMEOUT, WriteContact,
     begin_immediate, open, open_with,
 };
+/// The connection type [`open`] returns, so callers can name it without
+/// taking their own direct `rusqlite` dependency.
+pub use rusqlite::Connection;

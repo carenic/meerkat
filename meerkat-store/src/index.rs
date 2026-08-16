@@ -34,6 +34,7 @@ pub const JSONL_INDEX_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::Sch
     }],
     initialize_current: migration_0001_session_index,
     allowed_existing_versions: &[1],
+    bridge_recoverable_versions: &[],
     released_predecessors: &[],
     owned_objects: &[
         meerkat_sqlite::SchemaObject {

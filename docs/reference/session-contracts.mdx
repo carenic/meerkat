@@ -274,11 +274,16 @@ State older than 0.8.10 in a SQLite realm is admitted only through the explicit
 offline command `rkat ... storage migrate --apply --bridge-pre-0-8-10`.
 JSONL and memory realms are rejected before any database is mutated. This is a
 frozen, fail-closed pre-floor importer: under the realm maintenance fence it
-authenticates supported historical schema and row shapes before installing
-current representation and authority. Ordinary store opens and v3 reads remain
-strict and never enter the bridge. The maintenance transaction preserves
-queued and nonterminal input rows without scheduling or replaying them. A later
-session activation follows normal recovery.
+authenticates supported historical schema before installing current
+representation and authority. Ordinary store opens and v3 reads remain strict
+and never enter the bridge. Catalog authentication is per domain and row
+admission is per record: a row the current typed contract cannot represent
+without loss is left byte-identical on disk and reported, rather than costing
+the realm every other row. The maintenance transaction preserves input rows -
+including their ingress payloads, whatever lifecycle state they reached -
+without scheduling or replaying them. A later session activation follows normal
+recovery, which applies this binary's ordinary terminal-payload retirement to
+rows it writes itself.
 
 ### Durable-tail recovery
 

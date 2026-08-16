@@ -1,0 +1,1252 @@
+{
+  "schema_version": 2,
+  "fixture_id": "meerkat-0.7.x-pre-ledger-realms",
+  "data_classification": "synthetic_non_production",
+  "purpose": "Realms written by published pre-0.8.10 rkat binaries, used to prove the explicit storage bridge authenticates and migrates the schema those releases actually wrote, and admits the rows they actually left.",
+  "realm_id": "legacy-realm",
+  "target": "aarch64-apple-darwin",
+  "releases": [
+    {
+      "meerkat_version": "0.7.5",
+      "source_release": "https://github.com/lukacf/meerkat/releases/tag/v0.7.5",
+      "release_asset": "rkat-0.7.5-aarch64-apple-darwin.tar.gz",
+      "release_asset_sha256": "3e7fa34aba8d905eebe543bfd51573f038f2db5c1c1b5974ab6a54737b3abddf",
+      "binary_version_output": "rkat 0.7.5",
+      "binary_sha256": "565f54d2881d45b2afc42823258c8947b7d3791263878396e00af94fe03303dc",
+      "current_source_build": false,
+      "captures": [
+        {
+          "capture_id": "attempted-turn",
+          "root": "realms/0.7.5/attempted-turn",
+          "capture_command": "published rkat 0.7.5: --realm legacy-realm --realm-backend sqlite run -m claude-opus-4-8 'hello', with ANTHROPIC_API_KEY set to a dummy value and no other environment inherited",
+          "writer_exit_code": 1,
+          "writer_error": "Error: turn abandoned: apply failed: Terminal failure: Failed (LlmFailure): LLM failure terminal turn; error={\"kind\":\"llm_failure\",\"terminal\":true,\"outcome\":\"failed\",\"detail\":\"apply failed: Terminal failure: Failed (LlmFailure): LLM failure terminal turn\"}",
+          "payloads": [
+            {
+              "path": ".rkat/events/.sequence/01a00703-2118-7712-8d1b-5fd002e2a7d1.lock",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": ".rkat/events/.sequence/01a00703-2118-7712-8d1b-5fd002e2a7d1.seq",
+              "bytes": 2,
+              "sha256": "1121cfccd5913f0a63fec40a6ffd44ea64f9dc135c66634ba001d10bcf4302a2"
+            },
+            {
+              "path": ".rkat/events/01a00703-2118-7712-8d1b-5fd002e2a7d1.jsonl",
+              "bytes": 1088,
+              "sha256": "cfebe8fc074561e37a2d380ed58b067f9fb5f62541ee7bee5df078e9ca974df4"
+            },
+            {
+              "path": ".rkat/sessions/01a00703-2118-7712-8d1b-5fd002e2a7d1/checkpoint",
+              "bytes": 32,
+              "sha256": "c56a28b4bc1c45dd0e42785580fc66d60383633a19770a37720a77ad6fe0dc0a"
+            },
+            {
+              "path": ".rkat/sessions/01a00703-2118-7712-8d1b-5fd002e2a7d1/events.jsonl",
+              "bytes": 1088,
+              "sha256": "cfebe8fc074561e37a2d380ed58b067f9fb5f62541ee7bee5df078e9ca974df4"
+            },
+            {
+              "path": "realm_manifest.json",
+              "bytes": 109,
+              "sha256": "31444d357285234cc71557167d8110bb88506bd87365955f0e26ea05e989c119"
+            },
+            {
+              "path": "sessions.sqlite3",
+              "bytes": 143360,
+              "sha256": "f183f0a2491113e04891cb74bcb88ae42123ee5cff9c868519f3786bd3587b06"
+            },
+            {
+              "path": "workgraph.sqlite3",
+              "bytes": 49152,
+              "sha256": "9a55e6b78f7d1bb64ac905d284edcb8642c7a7f7cc2199a891ede35395a658e3"
+            }
+          ],
+          "sessions_sqlite_catalog": [
+            {
+              "type": "index",
+              "name": "schedule_occurrences_due_idx",
+              "sql": "CREATE INDEX schedule_occurrences_due_idx\nON schedule_occurrences(phase, due_at_ms ASC, schedule_revision ASC, occurrence_ordinal ASC)"
+            },
+            {
+              "type": "index",
+              "name": "schedule_occurrences_schedule_idx",
+              "sql": "CREATE INDEX schedule_occurrences_schedule_idx\nON schedule_occurrences(schedule_id, due_at_ms ASC)"
+            },
+            {
+              "type": "index",
+              "name": "schedule_receipts_occurrence_idx",
+              "sql": "CREATE INDEX schedule_receipts_occurrence_idx\nON schedule_receipts(occurrence_id, recorded_at_ms ASC)"
+            },
+            {
+              "type": "index",
+              "name": "sessions_updated_idx",
+              "sql": "CREATE INDEX sessions_updated_idx\nON sessions(updated_at_ms DESC, session_id ASC)"
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_auth_oauth_flow_state_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_boundary_receipts_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_input_states_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_ops_lifecycle_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_projection_quarantine_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_session_snapshots_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_states_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_occurrences_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_receipts_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_schedules_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_sessions_1",
+              "sql": ""
+            },
+            {
+              "type": "table",
+              "name": "runtime_auth_oauth_flow_state",
+              "sql": "CREATE TABLE runtime_auth_oauth_flow_state (\n    id TEXT PRIMARY KEY,\n    state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_boundary_receipts",
+              "sql": "CREATE TABLE runtime_boundary_receipts (\n    runtime_id TEXT NOT NULL,\n    run_id TEXT NOT NULL,\n    sequence INTEGER NOT NULL,\n    receipt_json BLOB NOT NULL,\n    PRIMARY KEY (runtime_id, run_id, sequence)\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_input_states",
+              "sql": "CREATE TABLE runtime_input_states (\n    runtime_id TEXT NOT NULL,\n    input_id TEXT NOT NULL,\n    state_json BLOB NOT NULL,\n    PRIMARY KEY (runtime_id, input_id)\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_ops_lifecycle",
+              "sql": "CREATE TABLE runtime_ops_lifecycle (\n    runtime_id TEXT PRIMARY KEY,\n    state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_projection_quarantine",
+              "sql": "CREATE TABLE runtime_projection_quarantine (\n    runtime_id TEXT PRIMARY KEY\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_session_snapshots",
+              "sql": "CREATE TABLE runtime_session_snapshots (\n    runtime_id TEXT PRIMARY KEY,\n    session_snapshot BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_states",
+              "sql": "CREATE TABLE runtime_states (\n    runtime_id TEXT PRIMARY KEY,\n    runtime_state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_occurrences",
+              "sql": "CREATE TABLE schedule_occurrences (\n    occurrence_id TEXT PRIMARY KEY,\n    schedule_id TEXT NOT NULL,\n    phase TEXT NOT NULL,\n    schedule_revision INTEGER NOT NULL,\n    occurrence_ordinal INTEGER NOT NULL,\n    due_at_ms INTEGER NOT NULL,\n    lease_expires_at_ms INTEGER NULL,\n    occurrence_json BLOB NOT NULL,\n    FOREIGN KEY(schedule_id) REFERENCES schedule_schedules(schedule_id)\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_receipts",
+              "sql": "CREATE TABLE schedule_receipts (\n    receipt_id TEXT PRIMARY KEY,\n    occurrence_id TEXT NOT NULL,\n    recorded_at_ms INTEGER NOT NULL,\n    receipt_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_schedules",
+              "sql": "CREATE TABLE schedule_schedules (\n    schedule_id TEXT PRIMARY KEY,\n    phase TEXT NOT NULL,\n    revision INTEGER NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    next_occurrence_ordinal INTEGER NOT NULL,\n    planning_cursor_at_ms INTEGER NULL,\n    schedule_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "sessions",
+              "sql": "CREATE TABLE sessions (\n    session_id TEXT PRIMARY KEY,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    message_count INTEGER NOT NULL,\n    total_tokens INTEGER NOT NULL,\n    metadata_json TEXT NOT NULL,\n    session_json BLOB NOT NULL\n)"
+            }
+          ],
+          "sessions_sqlite_row_counts": {
+            "runtime_auth_oauth_flow_state": 0,
+            "runtime_boundary_receipts": 0,
+            "runtime_input_states": 1,
+            "runtime_ops_lifecycle": 0,
+            "runtime_projection_quarantine": 0,
+            "runtime_session_snapshots": 1,
+            "runtime_states": 1,
+            "schedule_occurrences": 0,
+            "schedule_receipts": 0,
+            "schedule_schedules": 0,
+            "sessions": 1
+          },
+          "workgraph_sqlite_row_counts": {
+            "workgraph_attention": 0,
+            "workgraph_edges": 0,
+            "workgraph_events": 0,
+            "workgraph_items": 0
+          },
+          "runtime_input_state_rows": [
+            {
+              "runtime_id": "rt:session:01a00703-2118-7712-8d1b-5fd002e2a7d1",
+              "input_id": "01a00703-2169-72a3-b621-9257daab9d1d",
+              "stored_input_state_version": 3,
+              "current_state": "abandoned",
+              "input_type": "prompt",
+              "state_json_sha256": "e98d49a217a693382102e84f60e0652eaaf165ae604e241c953fff34374fa083"
+            }
+          ],
+          "carries_runtime_input_rows": true
+        },
+        {
+          "capture_id": "bootstrap-only",
+          "root": "realms/0.7.5/bootstrap-only",
+          "capture_command": "published rkat 0.7.5: --realm legacy-realm --realm-backend sqlite run 'hello' with no provider credentials in the environment",
+          "payloads": [
+            {
+              "path": "realm_manifest.json",
+              "bytes": 109,
+              "sha256": "776d16880651c098b8f8016ed68c41b67dac283784ece9b87ff4e1487be96617"
+            },
+            {
+              "path": "sessions.sqlite3",
+              "bytes": 118784,
+              "sha256": "47183154aa126b5538d84429a5f254e356f3106e1301ff1866469e4e08e15cbf"
+            },
+            {
+              "path": "workgraph.sqlite3",
+              "bytes": 49152,
+              "sha256": "9a55e6b78f7d1bb64ac905d284edcb8642c7a7f7cc2199a891ede35395a658e3"
+            }
+          ],
+          "sessions_sqlite_catalog": [
+            {
+              "type": "index",
+              "name": "schedule_occurrences_due_idx",
+              "sql": "CREATE INDEX schedule_occurrences_due_idx\nON schedule_occurrences(phase, due_at_ms ASC, schedule_revision ASC, occurrence_ordinal ASC)"
+            },
+            {
+              "type": "index",
+              "name": "schedule_occurrences_schedule_idx",
+              "sql": "CREATE INDEX schedule_occurrences_schedule_idx\nON schedule_occurrences(schedule_id, due_at_ms ASC)"
+            },
+            {
+              "type": "index",
+              "name": "schedule_receipts_occurrence_idx",
+              "sql": "CREATE INDEX schedule_receipts_occurrence_idx\nON schedule_receipts(occurrence_id, recorded_at_ms ASC)"
+            },
+            {
+              "type": "index",
+              "name": "sessions_updated_idx",
+              "sql": "CREATE INDEX sessions_updated_idx\nON sessions(updated_at_ms DESC, session_id ASC)"
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_auth_oauth_flow_state_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_boundary_receipts_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_input_states_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_ops_lifecycle_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_projection_quarantine_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_session_snapshots_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_states_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_occurrences_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_receipts_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_schedules_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_sessions_1",
+              "sql": ""
+            },
+            {
+              "type": "table",
+              "name": "runtime_auth_oauth_flow_state",
+              "sql": "CREATE TABLE runtime_auth_oauth_flow_state (\n    id TEXT PRIMARY KEY,\n    state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_boundary_receipts",
+              "sql": "CREATE TABLE runtime_boundary_receipts (\n    runtime_id TEXT NOT NULL,\n    run_id TEXT NOT NULL,\n    sequence INTEGER NOT NULL,\n    receipt_json BLOB NOT NULL,\n    PRIMARY KEY (runtime_id, run_id, sequence)\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_input_states",
+              "sql": "CREATE TABLE runtime_input_states (\n    runtime_id TEXT NOT NULL,\n    input_id TEXT NOT NULL,\n    state_json BLOB NOT NULL,\n    PRIMARY KEY (runtime_id, input_id)\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_ops_lifecycle",
+              "sql": "CREATE TABLE runtime_ops_lifecycle (\n    runtime_id TEXT PRIMARY KEY,\n    state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_projection_quarantine",
+              "sql": "CREATE TABLE runtime_projection_quarantine (\n    runtime_id TEXT PRIMARY KEY\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_session_snapshots",
+              "sql": "CREATE TABLE runtime_session_snapshots (\n    runtime_id TEXT PRIMARY KEY,\n    session_snapshot BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_states",
+              "sql": "CREATE TABLE runtime_states (\n    runtime_id TEXT PRIMARY KEY,\n    runtime_state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_occurrences",
+              "sql": "CREATE TABLE schedule_occurrences (\n    occurrence_id TEXT PRIMARY KEY,\n    schedule_id TEXT NOT NULL,\n    phase TEXT NOT NULL,\n    schedule_revision INTEGER NOT NULL,\n    occurrence_ordinal INTEGER NOT NULL,\n    due_at_ms INTEGER NOT NULL,\n    lease_expires_at_ms INTEGER NULL,\n    occurrence_json BLOB NOT NULL,\n    FOREIGN KEY(schedule_id) REFERENCES schedule_schedules(schedule_id)\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_receipts",
+              "sql": "CREATE TABLE schedule_receipts (\n    receipt_id TEXT PRIMARY KEY,\n    occurrence_id TEXT NOT NULL,\n    recorded_at_ms INTEGER NOT NULL,\n    receipt_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_schedules",
+              "sql": "CREATE TABLE schedule_schedules (\n    schedule_id TEXT PRIMARY KEY,\n    phase TEXT NOT NULL,\n    revision INTEGER NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    next_occurrence_ordinal INTEGER NOT NULL,\n    planning_cursor_at_ms INTEGER NULL,\n    schedule_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "sessions",
+              "sql": "CREATE TABLE sessions (\n    session_id TEXT PRIMARY KEY,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    message_count INTEGER NOT NULL,\n    total_tokens INTEGER NOT NULL,\n    metadata_json TEXT NOT NULL,\n    session_json BLOB NOT NULL\n)"
+            }
+          ],
+          "sessions_sqlite_row_counts": {
+            "runtime_auth_oauth_flow_state": 0,
+            "runtime_boundary_receipts": 0,
+            "runtime_input_states": 0,
+            "runtime_ops_lifecycle": 0,
+            "runtime_projection_quarantine": 0,
+            "runtime_session_snapshots": 0,
+            "runtime_states": 1,
+            "schedule_occurrences": 0,
+            "schedule_receipts": 0,
+            "schedule_schedules": 0,
+            "sessions": 0
+          },
+          "workgraph_sqlite_row_counts": {
+            "workgraph_attention": 0,
+            "workgraph_edges": 0,
+            "workgraph_events": 0,
+            "workgraph_items": 0
+          },
+          "runtime_input_state_rows": [],
+          "carries_runtime_input_rows": false
+        }
+      ]
+    },
+    {
+      "meerkat_version": "0.7.19",
+      "source_release": "https://github.com/lukacf/meerkat/releases/tag/v0.7.19",
+      "release_asset": "rkat-0.7.19-aarch64-apple-darwin.tar.gz",
+      "release_asset_sha256": "6db146b169b9cd888ff9fc5d6aa908e887b162e6b1db3815c7bd499cb586ca20",
+      "binary_version_output": "rkat 0.7.19",
+      "binary_sha256": "6c1435f467d20a86988efa0d7a6e5c8d3b03c903b044236ecfa857accfe33f38",
+      "current_source_build": false,
+      "captures": [
+        {
+          "capture_id": "bootstrap-only",
+          "root": "realms/0.7.19/bootstrap-only",
+          "capture_command": "published rkat 0.7.19: --realm legacy-realm --realm-backend sqlite run 'hello' with no provider credentials in the environment",
+          "payloads": [
+            {
+              "path": "realm_manifest.json",
+              "bytes": 109,
+              "sha256": "1c32190aeb3996c04b3b267dc49e2968c98df83b49c7d38441e2d870696ed972"
+            },
+            {
+              "path": "sessions.sqlite3",
+              "bytes": 118784,
+              "sha256": "f35fe413c69c86828c765401783656982fa5aa5351b08363cf546e0700e3eef5"
+            },
+            {
+              "path": "workgraph.sqlite3",
+              "bytes": 49152,
+              "sha256": "9a55e6b78f7d1bb64ac905d284edcb8642c7a7f7cc2199a891ede35395a658e3"
+            }
+          ],
+          "sessions_sqlite_catalog": [
+            {
+              "type": "index",
+              "name": "schedule_occurrences_due_idx",
+              "sql": "CREATE INDEX schedule_occurrences_due_idx\nON schedule_occurrences(phase, due_at_ms ASC, schedule_revision ASC, occurrence_ordinal ASC)"
+            },
+            {
+              "type": "index",
+              "name": "schedule_occurrences_schedule_idx",
+              "sql": "CREATE INDEX schedule_occurrences_schedule_idx\nON schedule_occurrences(schedule_id, due_at_ms ASC)"
+            },
+            {
+              "type": "index",
+              "name": "schedule_receipts_occurrence_idx",
+              "sql": "CREATE INDEX schedule_receipts_occurrence_idx\nON schedule_receipts(occurrence_id, recorded_at_ms ASC)"
+            },
+            {
+              "type": "index",
+              "name": "sessions_updated_idx",
+              "sql": "CREATE INDEX sessions_updated_idx\nON sessions(updated_at_ms DESC, session_id ASC)"
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_auth_oauth_flow_state_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_boundary_receipts_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_input_states_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_ops_lifecycle_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_projection_quarantine_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_session_snapshots_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_states_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_occurrences_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_receipts_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_schedules_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_sessions_1",
+              "sql": ""
+            },
+            {
+              "type": "table",
+              "name": "runtime_auth_oauth_flow_state",
+              "sql": "CREATE TABLE runtime_auth_oauth_flow_state (\n    id TEXT PRIMARY KEY,\n    state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_boundary_receipts",
+              "sql": "CREATE TABLE runtime_boundary_receipts (\n    runtime_id TEXT NOT NULL,\n    run_id TEXT NOT NULL,\n    sequence INTEGER NOT NULL,\n    receipt_json BLOB NOT NULL,\n    PRIMARY KEY (runtime_id, run_id, sequence)\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_input_states",
+              "sql": "CREATE TABLE runtime_input_states (\n    runtime_id TEXT NOT NULL,\n    input_id TEXT NOT NULL,\n    state_json BLOB NOT NULL,\n    PRIMARY KEY (runtime_id, input_id)\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_ops_lifecycle",
+              "sql": "CREATE TABLE runtime_ops_lifecycle (\n    runtime_id TEXT PRIMARY KEY,\n    state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_projection_quarantine",
+              "sql": "CREATE TABLE runtime_projection_quarantine (\n    runtime_id TEXT PRIMARY KEY\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_session_snapshots",
+              "sql": "CREATE TABLE runtime_session_snapshots (\n    runtime_id TEXT PRIMARY KEY,\n    session_snapshot BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_states",
+              "sql": "CREATE TABLE runtime_states (\n    runtime_id TEXT PRIMARY KEY,\n    runtime_state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_occurrences",
+              "sql": "CREATE TABLE schedule_occurrences (\n    occurrence_id TEXT PRIMARY KEY,\n    schedule_id TEXT NOT NULL,\n    phase TEXT NOT NULL,\n    schedule_revision INTEGER NOT NULL,\n    occurrence_ordinal INTEGER NOT NULL,\n    due_at_ms INTEGER NOT NULL,\n    lease_expires_at_ms INTEGER NULL,\n    occurrence_json BLOB NOT NULL,\n    FOREIGN KEY(schedule_id) REFERENCES schedule_schedules(schedule_id)\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_receipts",
+              "sql": "CREATE TABLE schedule_receipts (\n    receipt_id TEXT PRIMARY KEY,\n    occurrence_id TEXT NOT NULL,\n    recorded_at_ms INTEGER NOT NULL,\n    receipt_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_schedules",
+              "sql": "CREATE TABLE schedule_schedules (\n    schedule_id TEXT PRIMARY KEY,\n    phase TEXT NOT NULL,\n    revision INTEGER NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    next_occurrence_ordinal INTEGER NOT NULL,\n    planning_cursor_at_ms INTEGER NULL,\n    schedule_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "sessions",
+              "sql": "CREATE TABLE sessions (\n    session_id TEXT PRIMARY KEY,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    message_count INTEGER NOT NULL,\n    total_tokens INTEGER NOT NULL,\n    metadata_json TEXT NOT NULL,\n    session_json BLOB NOT NULL\n)"
+            }
+          ],
+          "sessions_sqlite_row_counts": {
+            "runtime_auth_oauth_flow_state": 0,
+            "runtime_boundary_receipts": 0,
+            "runtime_input_states": 0,
+            "runtime_ops_lifecycle": 0,
+            "runtime_projection_quarantine": 0,
+            "runtime_session_snapshots": 0,
+            "runtime_states": 1,
+            "schedule_occurrences": 0,
+            "schedule_receipts": 0,
+            "schedule_schedules": 0,
+            "sessions": 0
+          },
+          "workgraph_sqlite_row_counts": {
+            "workgraph_attention": 0,
+            "workgraph_edges": 0,
+            "workgraph_events": 0,
+            "workgraph_items": 0
+          },
+          "runtime_input_state_rows": [],
+          "carries_runtime_input_rows": false
+        }
+      ]
+    },
+    {
+      "meerkat_version": "0.7.21",
+      "source_release": "https://github.com/lukacf/meerkat/releases/tag/v0.7.21",
+      "release_asset": "rkat-0.7.21-aarch64-apple-darwin.tar.gz",
+      "release_asset_sha256": "755cf5fc2adec8c27c71c4ade72806695d1958e4679d80512b7d02b80c487050",
+      "binary_version_output": "rkat 0.7.21",
+      "binary_sha256": "7aa44ca773ce7d985a1aa1dda1e3dbf06beac9010e60d73a8166d920eef68274",
+      "current_source_build": false,
+      "captures": [
+        {
+          "capture_id": "bootstrap-only",
+          "root": "realms/0.7.21/bootstrap-only",
+          "capture_command": "published rkat 0.7.21: --realm legacy-realm --realm-backend sqlite run 'hello' with no provider credentials in the environment",
+          "payloads": [
+            {
+              "path": "realm_manifest.json",
+              "bytes": 109,
+              "sha256": "3f348784c05c279717355c1bac3975a13871dd54e147a6e076b6447d9f6cab7d"
+            },
+            {
+              "path": "sessions.sqlite3",
+              "bytes": 118784,
+              "sha256": "8d1e18979a0626f8e74ac3c36dc81fa1a1485886ed7a6357020910c42643f22c"
+            },
+            {
+              "path": "workgraph.sqlite3",
+              "bytes": 49152,
+              "sha256": "9a55e6b78f7d1bb64ac905d284edcb8642c7a7f7cc2199a891ede35395a658e3"
+            }
+          ],
+          "sessions_sqlite_catalog": [
+            {
+              "type": "index",
+              "name": "schedule_occurrences_due_idx",
+              "sql": "CREATE INDEX schedule_occurrences_due_idx\nON schedule_occurrences(phase, due_at_ms ASC, schedule_revision ASC, occurrence_ordinal ASC)"
+            },
+            {
+              "type": "index",
+              "name": "schedule_occurrences_schedule_idx",
+              "sql": "CREATE INDEX schedule_occurrences_schedule_idx\nON schedule_occurrences(schedule_id, due_at_ms ASC)"
+            },
+            {
+              "type": "index",
+              "name": "schedule_receipts_occurrence_idx",
+              "sql": "CREATE INDEX schedule_receipts_occurrence_idx\nON schedule_receipts(occurrence_id, recorded_at_ms ASC)"
+            },
+            {
+              "type": "index",
+              "name": "sessions_updated_idx",
+              "sql": "CREATE INDEX sessions_updated_idx\nON sessions(updated_at_ms DESC, session_id ASC)"
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_auth_oauth_flow_state_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_boundary_receipts_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_input_states_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_ops_lifecycle_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_projection_quarantine_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_session_snapshots_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_states_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_occurrences_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_receipts_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_schedules_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_sessions_1",
+              "sql": ""
+            },
+            {
+              "type": "table",
+              "name": "runtime_auth_oauth_flow_state",
+              "sql": "CREATE TABLE runtime_auth_oauth_flow_state (\n    id TEXT PRIMARY KEY,\n    state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_boundary_receipts",
+              "sql": "CREATE TABLE runtime_boundary_receipts (\n    runtime_id TEXT NOT NULL,\n    run_id TEXT NOT NULL,\n    sequence INTEGER NOT NULL,\n    receipt_json BLOB NOT NULL,\n    PRIMARY KEY (runtime_id, run_id, sequence)\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_input_states",
+              "sql": "CREATE TABLE runtime_input_states (\n    runtime_id TEXT NOT NULL,\n    input_id TEXT NOT NULL,\n    state_json BLOB NOT NULL,\n    PRIMARY KEY (runtime_id, input_id)\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_ops_lifecycle",
+              "sql": "CREATE TABLE runtime_ops_lifecycle (\n    runtime_id TEXT PRIMARY KEY,\n    state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_projection_quarantine",
+              "sql": "CREATE TABLE runtime_projection_quarantine (\n    runtime_id TEXT PRIMARY KEY\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_session_snapshots",
+              "sql": "CREATE TABLE runtime_session_snapshots (\n    runtime_id TEXT PRIMARY KEY,\n    session_snapshot BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_states",
+              "sql": "CREATE TABLE runtime_states (\n    runtime_id TEXT PRIMARY KEY,\n    runtime_state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_occurrences",
+              "sql": "CREATE TABLE schedule_occurrences (\n    occurrence_id TEXT PRIMARY KEY,\n    schedule_id TEXT NOT NULL,\n    phase TEXT NOT NULL,\n    schedule_revision INTEGER NOT NULL,\n    occurrence_ordinal INTEGER NOT NULL,\n    due_at_ms INTEGER NOT NULL,\n    lease_expires_at_ms INTEGER NULL,\n    occurrence_json BLOB NOT NULL,\n    FOREIGN KEY(schedule_id) REFERENCES schedule_schedules(schedule_id)\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_receipts",
+              "sql": "CREATE TABLE schedule_receipts (\n    receipt_id TEXT PRIMARY KEY,\n    occurrence_id TEXT NOT NULL,\n    recorded_at_ms INTEGER NOT NULL,\n    receipt_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_schedules",
+              "sql": "CREATE TABLE schedule_schedules (\n    schedule_id TEXT PRIMARY KEY,\n    phase TEXT NOT NULL,\n    revision INTEGER NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    next_occurrence_ordinal INTEGER NOT NULL,\n    planning_cursor_at_ms INTEGER NULL,\n    schedule_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "sessions",
+              "sql": "CREATE TABLE sessions (\n    session_id TEXT PRIMARY KEY,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    message_count INTEGER NOT NULL,\n    total_tokens INTEGER NOT NULL,\n    metadata_json TEXT NOT NULL,\n    session_json BLOB NOT NULL\n)"
+            }
+          ],
+          "sessions_sqlite_row_counts": {
+            "runtime_auth_oauth_flow_state": 0,
+            "runtime_boundary_receipts": 0,
+            "runtime_input_states": 0,
+            "runtime_ops_lifecycle": 0,
+            "runtime_projection_quarantine": 0,
+            "runtime_session_snapshots": 0,
+            "runtime_states": 1,
+            "schedule_occurrences": 0,
+            "schedule_receipts": 0,
+            "schedule_schedules": 0,
+            "sessions": 0
+          },
+          "workgraph_sqlite_row_counts": {
+            "workgraph_attention": 0,
+            "workgraph_edges": 0,
+            "workgraph_events": 0,
+            "workgraph_items": 0
+          },
+          "runtime_input_state_rows": [],
+          "carries_runtime_input_rows": false
+        }
+      ]
+    },
+    {
+      "meerkat_version": "0.7.28",
+      "source_release": "https://github.com/lukacf/meerkat/releases/tag/v0.7.28",
+      "release_asset": "rkat-0.7.28-aarch64-apple-darwin.tar.gz",
+      "release_asset_sha256": "4b8c44c412f0de477c4de0393ad97d3c80b3650267f071d82ed4fa165f8a7807",
+      "binary_version_output": "rkat 0.7.28",
+      "binary_sha256": "e10a5f1916d42f8c6aad6ca58659026986108988e824c2bf7f99abd389a02ac0",
+      "current_source_build": false,
+      "captures": [
+        {
+          "capture_id": "attempted-turn",
+          "root": "realms/0.7.28/attempted-turn",
+          "capture_command": "published rkat 0.7.28: --realm legacy-realm --realm-backend sqlite run -m claude-opus-4-8 'hello', with ANTHROPIC_API_KEY set to a dummy value and no other environment inherited",
+          "writer_exit_code": 1,
+          "writer_error": "Error: turn abandoned: apply failed: Terminal failure: Failed (LlmFailure): LLM failure terminal turn; error={\"kind\":\"llm_failure\",\"terminal\":true,\"outcome\":\"failed\",\"detail\":\"apply failed: Terminal failure: Failed (LlmFailure): LLM failure terminal turn\"}",
+          "payloads": [
+            {
+              "path": ".rkat/events/.sequence/01a00703-2762-7c22-8c30-d3ed99b3ad42.lock",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": ".rkat/events/.sequence/01a00703-2762-7c22-8c30-d3ed99b3ad42.seq",
+              "bytes": 2,
+              "sha256": "1121cfccd5913f0a63fec40a6ffd44ea64f9dc135c66634ba001d10bcf4302a2"
+            },
+            {
+              "path": ".rkat/events/01a00703-2762-7c22-8c30-d3ed99b3ad42.jsonl",
+              "bytes": 1089,
+              "sha256": "00be4ccd28f5a760fa991b9be038c7ac33cd4ecfbd8edc17749abe4c3d93603e"
+            },
+            {
+              "path": ".rkat/sessions/01a00703-2762-7c22-8c30-d3ed99b3ad42/checkpoint",
+              "bytes": 32,
+              "sha256": "ea71a004e401b8235d78346d85e83e1ffe49b445f0679d27bf692980035bbbcc"
+            },
+            {
+              "path": ".rkat/sessions/01a00703-2762-7c22-8c30-d3ed99b3ad42/events.jsonl",
+              "bytes": 1089,
+              "sha256": "00be4ccd28f5a760fa991b9be038c7ac33cd4ecfbd8edc17749abe4c3d93603e"
+            },
+            {
+              "path": "realm_manifest.json",
+              "bytes": 109,
+              "sha256": "febfe6b1c63347e5605a60dc4b7ff85157f6d7dfeb2373a7b28b9052bb57762c"
+            },
+            {
+              "path": "sessions.sqlite3",
+              "bytes": 217088,
+              "sha256": "db8e8b53beea0697b3d5802017ec322e82d2936215f8906b6da37d31116c5d50"
+            },
+            {
+              "path": "workgraph.sqlite3",
+              "bytes": 53248,
+              "sha256": "2550cf67d58a2db435c2bed54a9e24424a10302158da5285025446c808fc585f"
+            }
+          ],
+          "sessions_sqlite_catalog": [
+            {
+              "type": "index",
+              "name": "schedule_occurrences_due_idx",
+              "sql": "CREATE INDEX schedule_occurrences_due_idx\nON schedule_occurrences(phase, due_at_ms ASC, schedule_revision ASC, occurrence_ordinal ASC)"
+            },
+            {
+              "type": "index",
+              "name": "schedule_occurrences_schedule_idx",
+              "sql": "CREATE INDEX schedule_occurrences_schedule_idx\nON schedule_occurrences(schedule_id, due_at_ms ASC)"
+            },
+            {
+              "type": "index",
+              "name": "schedule_receipts_occurrence_idx",
+              "sql": "CREATE INDEX schedule_receipts_occurrence_idx\nON schedule_receipts(occurrence_id, recorded_at_ms ASC)"
+            },
+            {
+              "type": "index",
+              "name": "session_heads_updated_idx",
+              "sql": "CREATE INDEX session_heads_updated_idx\nON session_heads(updated_at_ms DESC, session_id ASC)"
+            },
+            {
+              "type": "index",
+              "name": "sessions_updated_idx",
+              "sql": "CREATE INDEX sessions_updated_idx\nON sessions(updated_at_ms DESC, session_id ASC)"
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_auth_oauth_flow_state_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_boundary_receipts_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_input_states_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_ops_lifecycle_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_projection_quarantine_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_session_snapshots_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_states_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_occurrences_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_receipts_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_schedules_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_session_heads_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_session_rewrites_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_session_strand_messages_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_sessions_1",
+              "sql": ""
+            },
+            {
+              "type": "table",
+              "name": "runtime_auth_oauth_flow_state",
+              "sql": "CREATE TABLE runtime_auth_oauth_flow_state (\n    id TEXT PRIMARY KEY,\n    state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_boundary_receipts",
+              "sql": "CREATE TABLE runtime_boundary_receipts (\n    runtime_id TEXT NOT NULL,\n    run_id TEXT NOT NULL,\n    sequence INTEGER NOT NULL,\n    receipt_json BLOB NOT NULL,\n    PRIMARY KEY (runtime_id, run_id, sequence)\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_input_states",
+              "sql": "CREATE TABLE runtime_input_states (\n    runtime_id TEXT NOT NULL,\n    input_id TEXT NOT NULL,\n    state_json BLOB NOT NULL,\n    PRIMARY KEY (runtime_id, input_id)\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_ops_lifecycle",
+              "sql": "CREATE TABLE runtime_ops_lifecycle (\n    runtime_id TEXT PRIMARY KEY,\n    state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_projection_quarantine",
+              "sql": "CREATE TABLE runtime_projection_quarantine (\n    runtime_id TEXT PRIMARY KEY\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_session_snapshots",
+              "sql": "CREATE TABLE runtime_session_snapshots (\n    runtime_id TEXT PRIMARY KEY,\n    session_snapshot BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_states",
+              "sql": "CREATE TABLE runtime_states (\n    runtime_id TEXT PRIMARY KEY,\n    runtime_state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_occurrences",
+              "sql": "CREATE TABLE schedule_occurrences (\n    occurrence_id TEXT PRIMARY KEY,\n    schedule_id TEXT NOT NULL,\n    phase TEXT NOT NULL,\n    schedule_revision INTEGER NOT NULL,\n    occurrence_ordinal INTEGER NOT NULL,\n    due_at_ms INTEGER NOT NULL,\n    lease_expires_at_ms INTEGER NULL,\n    occurrence_json BLOB NOT NULL,\n    FOREIGN KEY(schedule_id) REFERENCES schedule_schedules(schedule_id)\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_receipts",
+              "sql": "CREATE TABLE schedule_receipts (\n    receipt_id TEXT PRIMARY KEY,\n    occurrence_id TEXT NOT NULL,\n    recorded_at_ms INTEGER NOT NULL,\n    receipt_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_schedules",
+              "sql": "CREATE TABLE schedule_schedules (\n    schedule_id TEXT PRIMARY KEY,\n    phase TEXT NOT NULL,\n    revision INTEGER NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    next_occurrence_ordinal INTEGER NOT NULL,\n    planning_cursor_at_ms INTEGER NULL,\n    schedule_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "session_heads",
+              "sql": "CREATE TABLE session_heads (\n    session_id TEXT PRIMARY KEY,\n    version INTEGER NOT NULL,\n    strand TEXT NOT NULL,\n    head_revision TEXT NOT NULL,\n    message_count INTEGER NOT NULL,\n    rewrite_count INTEGER NOT NULL,\n    total_tokens INTEGER NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    metadata_json TEXT NOT NULL,\n    head_json BLOB NOT NULL,\n    cas_token TEXT NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "session_rewrites",
+              "sql": "CREATE TABLE session_rewrites (\n    session_id TEXT NOT NULL,\n    rewrite_idx INTEGER NOT NULL,\n    parent_strand TEXT NOT NULL,\n    parent_len INTEGER NOT NULL,\n    strand TEXT NOT NULL,\n    strand_len INTEGER NOT NULL,\n    commit_json BLOB NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    PRIMARY KEY (session_id, rewrite_idx)\n)"
+            },
+            {
+              "type": "table",
+              "name": "session_strand_messages",
+              "sql": "CREATE TABLE session_strand_messages (\n    session_id TEXT NOT NULL,\n    strand TEXT NOT NULL,\n    seq INTEGER NOT NULL,\n    message_json BLOB NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    PRIMARY KEY (session_id, strand, seq)\n)"
+            },
+            {
+              "type": "table",
+              "name": "sessions",
+              "sql": "CREATE TABLE sessions (\n    session_id TEXT PRIMARY KEY,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    message_count INTEGER NOT NULL,\n    total_tokens INTEGER NOT NULL,\n    metadata_json TEXT NOT NULL,\n    session_json BLOB NOT NULL\n)"
+            }
+          ],
+          "sessions_sqlite_row_counts": {
+            "runtime_auth_oauth_flow_state": 0,
+            "runtime_boundary_receipts": 0,
+            "runtime_input_states": 1,
+            "runtime_ops_lifecycle": 0,
+            "runtime_projection_quarantine": 0,
+            "runtime_session_snapshots": 1,
+            "runtime_states": 1,
+            "schedule_occurrences": 0,
+            "schedule_receipts": 0,
+            "schedule_schedules": 0,
+            "session_heads": 1,
+            "session_rewrites": 0,
+            "session_strand_messages": 1,
+            "sessions": 0
+          },
+          "workgraph_sqlite_row_counts": {
+            "workgraph_attention": 0,
+            "workgraph_edges": 0,
+            "workgraph_events": 0,
+            "workgraph_items": 0
+          },
+          "runtime_input_state_rows": [
+            {
+              "runtime_id": "rt:session:01a00703-2762-7c22-8c30-d3ed99b3ad42",
+              "input_id": "01a00703-278e-78b1-9207-ddd7a914abf9",
+              "stored_input_state_version": 3,
+              "current_state": "abandoned",
+              "input_type": "prompt",
+              "state_json_sha256": "a905e51d9dd062e8f917527a88f561e6888145bf6959033d5ef8c9c308fa322a"
+            }
+          ],
+          "carries_runtime_input_rows": true
+        },
+        {
+          "capture_id": "bootstrap-only",
+          "root": "realms/0.7.28/bootstrap-only",
+          "capture_command": "published rkat 0.7.28: --realm legacy-realm --realm-backend sqlite run 'hello' with no provider credentials in the environment",
+          "payloads": [
+            {
+              "path": "realm_manifest.json",
+              "bytes": 109,
+              "sha256": "aa5c9df8223c4966cd09616df4a29460b6e8842fc1e9a8799a2c53ef5a515cf4"
+            },
+            {
+              "path": "sessions.sqlite3",
+              "bytes": 147456,
+              "sha256": "0da81640bf2a97bc0dde74ca760b73da7d7e51ca1d74153f6bca2ac24028aab0"
+            },
+            {
+              "path": "workgraph.sqlite3",
+              "bytes": 53248,
+              "sha256": "2550cf67d58a2db435c2bed54a9e24424a10302158da5285025446c808fc585f"
+            }
+          ],
+          "sessions_sqlite_catalog": [
+            {
+              "type": "index",
+              "name": "schedule_occurrences_due_idx",
+              "sql": "CREATE INDEX schedule_occurrences_due_idx\nON schedule_occurrences(phase, due_at_ms ASC, schedule_revision ASC, occurrence_ordinal ASC)"
+            },
+            {
+              "type": "index",
+              "name": "schedule_occurrences_schedule_idx",
+              "sql": "CREATE INDEX schedule_occurrences_schedule_idx\nON schedule_occurrences(schedule_id, due_at_ms ASC)"
+            },
+            {
+              "type": "index",
+              "name": "schedule_receipts_occurrence_idx",
+              "sql": "CREATE INDEX schedule_receipts_occurrence_idx\nON schedule_receipts(occurrence_id, recorded_at_ms ASC)"
+            },
+            {
+              "type": "index",
+              "name": "session_heads_updated_idx",
+              "sql": "CREATE INDEX session_heads_updated_idx\nON session_heads(updated_at_ms DESC, session_id ASC)"
+            },
+            {
+              "type": "index",
+              "name": "sessions_updated_idx",
+              "sql": "CREATE INDEX sessions_updated_idx\nON sessions(updated_at_ms DESC, session_id ASC)"
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_auth_oauth_flow_state_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_boundary_receipts_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_input_states_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_ops_lifecycle_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_projection_quarantine_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_session_snapshots_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_runtime_states_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_occurrences_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_receipts_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_schedule_schedules_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_session_heads_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_session_rewrites_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_session_strand_messages_1",
+              "sql": ""
+            },
+            {
+              "type": "index",
+              "name": "sqlite_autoindex_sessions_1",
+              "sql": ""
+            },
+            {
+              "type": "table",
+              "name": "runtime_auth_oauth_flow_state",
+              "sql": "CREATE TABLE runtime_auth_oauth_flow_state (\n    id TEXT PRIMARY KEY,\n    state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_boundary_receipts",
+              "sql": "CREATE TABLE runtime_boundary_receipts (\n    runtime_id TEXT NOT NULL,\n    run_id TEXT NOT NULL,\n    sequence INTEGER NOT NULL,\n    receipt_json BLOB NOT NULL,\n    PRIMARY KEY (runtime_id, run_id, sequence)\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_input_states",
+              "sql": "CREATE TABLE runtime_input_states (\n    runtime_id TEXT NOT NULL,\n    input_id TEXT NOT NULL,\n    state_json BLOB NOT NULL,\n    PRIMARY KEY (runtime_id, input_id)\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_ops_lifecycle",
+              "sql": "CREATE TABLE runtime_ops_lifecycle (\n    runtime_id TEXT PRIMARY KEY,\n    state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_projection_quarantine",
+              "sql": "CREATE TABLE runtime_projection_quarantine (\n    runtime_id TEXT PRIMARY KEY\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_session_snapshots",
+              "sql": "CREATE TABLE runtime_session_snapshots (\n    runtime_id TEXT PRIMARY KEY,\n    session_snapshot BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "runtime_states",
+              "sql": "CREATE TABLE runtime_states (\n    runtime_id TEXT PRIMARY KEY,\n    runtime_state_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_occurrences",
+              "sql": "CREATE TABLE schedule_occurrences (\n    occurrence_id TEXT PRIMARY KEY,\n    schedule_id TEXT NOT NULL,\n    phase TEXT NOT NULL,\n    schedule_revision INTEGER NOT NULL,\n    occurrence_ordinal INTEGER NOT NULL,\n    due_at_ms INTEGER NOT NULL,\n    lease_expires_at_ms INTEGER NULL,\n    occurrence_json BLOB NOT NULL,\n    FOREIGN KEY(schedule_id) REFERENCES schedule_schedules(schedule_id)\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_receipts",
+              "sql": "CREATE TABLE schedule_receipts (\n    receipt_id TEXT PRIMARY KEY,\n    occurrence_id TEXT NOT NULL,\n    recorded_at_ms INTEGER NOT NULL,\n    receipt_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "schedule_schedules",
+              "sql": "CREATE TABLE schedule_schedules (\n    schedule_id TEXT PRIMARY KEY,\n    phase TEXT NOT NULL,\n    revision INTEGER NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    next_occurrence_ordinal INTEGER NOT NULL,\n    planning_cursor_at_ms INTEGER NULL,\n    schedule_json BLOB NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "session_heads",
+              "sql": "CREATE TABLE session_heads (\n    session_id TEXT PRIMARY KEY,\n    version INTEGER NOT NULL,\n    strand TEXT NOT NULL,\n    head_revision TEXT NOT NULL,\n    message_count INTEGER NOT NULL,\n    rewrite_count INTEGER NOT NULL,\n    total_tokens INTEGER NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    metadata_json TEXT NOT NULL,\n    head_json BLOB NOT NULL,\n    cas_token TEXT NOT NULL\n)"
+            },
+            {
+              "type": "table",
+              "name": "session_rewrites",
+              "sql": "CREATE TABLE session_rewrites (\n    session_id TEXT NOT NULL,\n    rewrite_idx INTEGER NOT NULL,\n    parent_strand TEXT NOT NULL,\n    parent_len INTEGER NOT NULL,\n    strand TEXT NOT NULL,\n    strand_len INTEGER NOT NULL,\n    commit_json BLOB NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    PRIMARY KEY (session_id, rewrite_idx)\n)"
+            },
+            {
+              "type": "table",
+              "name": "session_strand_messages",
+              "sql": "CREATE TABLE session_strand_messages (\n    session_id TEXT NOT NULL,\n    strand TEXT NOT NULL,\n    seq INTEGER NOT NULL,\n    message_json BLOB NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    PRIMARY KEY (session_id, strand, seq)\n)"
+            },
+            {
+              "type": "table",
+              "name": "sessions",
+              "sql": "CREATE TABLE sessions (\n    session_id TEXT PRIMARY KEY,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    message_count INTEGER NOT NULL,\n    total_tokens INTEGER NOT NULL,\n    metadata_json TEXT NOT NULL,\n    session_json BLOB NOT NULL\n)"
+            }
+          ],
+          "sessions_sqlite_row_counts": {
+            "runtime_auth_oauth_flow_state": 0,
+            "runtime_boundary_receipts": 0,
+            "runtime_input_states": 0,
+            "runtime_ops_lifecycle": 0,
+            "runtime_projection_quarantine": 0,
+            "runtime_session_snapshots": 0,
+            "runtime_states": 1,
+            "schedule_occurrences": 0,
+            "schedule_receipts": 0,
+            "schedule_schedules": 0,
+            "session_heads": 0,
+            "session_rewrites": 0,
+            "session_strand_messages": 0,
+            "sessions": 0
+          },
+          "workgraph_sqlite_row_counts": {
+            "workgraph_attention": 0,
+            "workgraph_edges": 0,
+            "workgraph_events": 0,
+            "workgraph_items": 0
+          },
+          "runtime_input_state_rows": [],
+          "carries_runtime_input_rows": false
+        }
+      ]
+    }
+  ]
+}

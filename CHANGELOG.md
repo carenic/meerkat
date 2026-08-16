@@ -102,6 +102,22 @@ via cargo-semver-checks against the published baselines).
   `EffectKind`, `InputKind` and `TransitionId` are dense enums, adding variants
   also SHIFTS the discriminants of later ones - anything persisting a
   discriminant numerically rather than by name must re-derive it.
+- `meerkat_sqlite::BridgeEligibility::Recoverable` is renamed
+  `CatalogAuthenticated` and `is_recoverable()` is renamed
+  `catalog_authenticates()`. The old names claimed an outcome the check never
+  established: it reads catalog shape and never looks at a record.
+- `meerkat_sqlite::MaintenancePrepareReport` and `MaintenanceBridgeReport` gain
+  a `refused: Vec<MaintenanceRecordRefusal>` field and therefore lose `Copy`.
+  Struct-literal constructions break; `MaintenancePrepareReport::rewrote(n)`
+  builds the "nothing refused" form. `meerkat::PreV0810DomainBridgeReport`
+  likewise gains `refused_records`.
+- `meerkat_sqlite::SchemaDomain` gains a required
+  `bridge_recoverable_versions: &'static [i64]` field. Every domain literal
+  must add it. It declares the exact source versions the explicit offline
+  bridge may infer for an unledgered file of that domain, and an empty list
+  declares that no offline bridge recovers the domain at all. It exists
+  because the same question was previously answered twice - once by the bridge
+  and once by the message an operator reads - and the two disagreed.
 
 ### Known issues
 
@@ -186,6 +202,67 @@ via cargo-semver-checks against the published baselines).
   reports `status: "degraded"` with four `unmeasured:*` entries, rather than the
   hardcoded `ok` it used to serve: a caller that measured nothing may not mint a
   clean bill of health.
+
+- **The pre-0.8.10 bridge now opens a real 0.7.x realm.** It shipped able to
+  authenticate a 0.7.x catalog and then refuse the rows inside it, so the
+  remedy the product prints (`storage migrate --apply --bridge-pre-0-8-10`)
+  half-bridged the realm and left it unopenable: session-store, schedule-store
+  and workgraph committed, runtime-store refused. The row gate had been written
+  from this repository's current source rather than from bytes any release
+  wrote, and it disagreed with released bytes on nearly every constant - it
+  required 16 fields where the 0.7.x writer emits 14 (two `Option::None` fields
+  are skipped), demanded `RollbackStaged` where 0.7.x records
+  `ResolveStagedRollback`, and demanded three attempts where a first-turn
+  failure records one. It refused every realm it existed to rescue.
+  The enumeration is deleted. A row is now admitted when it decodes through the
+  current typed contract, binds to its own row key, agrees with the generated
+  admission authority, and re-encodes without losing a field - a check derived
+  from the row's own bytes rather than from a list. Fields the current types do
+  not name are still refused, because serde would drop them silently.
+- A record the bridge cannot carry no longer costs the operator the realm.
+  Preparation refusals are per record: every other row is carried, the refused
+  row's bytes are left exactly as found (never deleted, never blanked), and
+  `storage migrate` names it, its reason, and the consequence. Only realm-level
+  conditions - an unreadable ledger, a storage failure - still refuse a domain.
+- **A successful bridge no longer deletes the operator's prompt.** On a realm
+  written by published 0.7.28, the ingress payload `persisted_input.content`
+  was present in `sessions.sqlite3` before the bridge and gone after it, while
+  the bridge printed success and said nothing. The cause was the runtime-store
+  v1 -> v2 released-row importer, which retires the ingress payload of a
+  terminal input: correct for an upgrade, because the binary that wrote the row
+  already retires payloads at the terminal transition, and wrong for a rescue,
+  which is carrying rows across from before the durable-state floor. The
+  released-row importers no longer run under the rescue at all, so the rescued
+  realm keeps its payloads. Verified on the real CLI: `"hello"` reads back
+  after the bridge, after `session list`, and after `session show`.
+- The remedy sentence for an unledgered pre-floor domain no longer promises an
+  outcome it did not check. It states that only the schema shape was verified
+  and that the bridge reports any record it cannot carry.
+- A record the preparation refuses is now genuinely untouched for the whole
+  bridge, which is what the CLI already claimed. The released-row importers ran
+  after the preparation and would re-decode a refused row, drop the field the
+  current types cannot name, and rewrite it; or, for a row that did not decode
+  at all, fail and refuse the entire domain after the operator had been told
+  the schema was recognized and to run the bridge. Both are gone with the same
+  change: under the rescue the preparation callback is the sole authority over
+  row content.
+- The eligibility answer an operator reads and the bridge that then runs are
+  now one function. The message was derived only from the frozen predecessor
+  verifiers while the bridge also accepts an exact code-derived migration
+  prefix, so an ordinary open told operators a realm this binary bridges
+  successfully was not recoverable - a false negative that replaced the earlier
+  false promise. Both directions are pinned against realms written by published
+  binaries, and every co-tenant domain of `sessions.sqlite3` is checked rather
+  than one of the three.
+- `SqliteStoreError::UnledgeredDomainObjects` carries the same remedy sentence
+  the `meerkat-store` rendering does. After a partial bridge the raw sqlite
+  Display reached operators with no next step at all.
+- The per-record refusal note no longer ships two stray runs of spaces from a
+  botched line continuation.
+- `storage migrate --apply --bridge-pre-0-8-10` reports records left behind as
+  notes and still exits 0 when every domain landed. The realm opens and the
+  operator is told, per record, what stayed behind and that a session depending
+  on it may not resume; a domain that actually refused is still an error.
 - A failed turn no longer silently disarms a member. When a turn failed, its
   staged input was rolled back to queued and nothing re-armed the runtime loop.
   The input stayed immediately selectable and nobody took the next lap, so it

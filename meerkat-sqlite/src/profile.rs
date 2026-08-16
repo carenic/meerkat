@@ -522,6 +522,7 @@ mod tests {
         }],
         initialize_current: preflight_base,
         allowed_existing_versions: &[1],
+        bridge_recoverable_versions: &[1],
         released_predecessors: &[],
         owned_objects: &[crate::ledger::SchemaObject {
             kind: crate::ledger::SchemaObjectKind::Table,

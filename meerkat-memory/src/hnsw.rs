@@ -214,6 +214,7 @@ pub const MEMORY_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDo
     ],
     initialize_current: initialize_current_memory_schema,
     allowed_existing_versions: &[2],
+    bridge_recoverable_versions: &[1],
     released_predecessors: &[],
     owned_objects: &[
         meerkat_sqlite::SchemaObject {

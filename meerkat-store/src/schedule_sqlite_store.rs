@@ -206,6 +206,7 @@ pub const SCHEDULE_STORE_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::
     ],
     initialize_current: initialize_current_schedule_schema,
     allowed_existing_versions: &[1, 2, 3],
+    bridge_recoverable_versions: &[1],
     released_predecessors: &[
         meerkat_sqlite::SchemaPredecessor {
             version: 1,

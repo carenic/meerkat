@@ -2,6 +2,71 @@
 
 use std::path::PathBuf;
 
+/// Whether the explicit offline pre-0.8.10 bridge can authenticate an
+/// unledgered on-disk catalog.
+///
+/// This exists so a refusal can say what is actually true about the file in
+/// front of it. Naming the bridge as a remedy for a catalog it cannot
+/// authenticate sends the operator into a dead end.
+/// SCOPE. Both variants are decided from the file's **catalog shape** alone.
+/// No durable record is read, decoded, or admitted to reach this answer, so
+/// `CatalogAuthenticated` must never be rendered as a promise that every
+/// record survives the bridge. What it does justify is running the bridge:
+/// preparation callbacks refuse per record, naming what stayed behind, rather
+/// than aborting the domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeEligibility {
+    /// Some frozen released catalog registered by this binary authenticates
+    /// the on-disk shape exactly, so the explicit bridge will run on this
+    /// domain instead of refusing it outright. Individual records may still
+    /// be left behind; the bridge names each one it could not carry.
+    CatalogAuthenticated,
+    /// No frozen released catalog authenticates the on-disk shape. The file
+    /// predates, or diverges from, everything this binary can prove.
+    Unrecognized,
+}
+
+impl BridgeEligibility {
+    /// True when the explicit bridge can authenticate the catalog and will
+    /// therefore run. Says nothing about individual records; see the type
+    /// docs.
+    pub fn catalog_authenticates(self) -> bool {
+        matches!(self, Self::CatalogAuthenticated)
+    }
+
+    /// The operator-facing remedy sentence for an unledgered domain with this
+    /// eligibility, ready to append to a refusal.
+    ///
+    /// It lives here, beside the answer it is derived from, because the same
+    /// refusal reaches operators through more than one error type. A remedy
+    /// carried by only one of them is how a caller ends up staring at a bare
+    /// "refusing to infer or stamp an unversioned schema" with no next step,
+    /// and two hand-copied remedies are how one of them ends up stale.
+    pub fn remedy_sentence(self) -> &'static str {
+        match self {
+            Self::CatalogAuthenticated => {
+                " This realm was last written before the 0.8.10 durable-state floor and its \
+                 on-disk schema is one this binary recognizes, so run the explicit \
+                 current-binary bridge once (`rkat --state-root <ROOT> --realm <REALM> storage \
+                 migrate --apply --bridge-pre-0-8-10`), then retry the original command. Only \
+                 the schema shape has been checked here: the bridge inspects the stored \
+                 records themselves and prints any it cannot carry forward, leaving those \
+                 records' bytes untouched"
+            }
+            Self::Unrecognized => {
+                " No source catalog the `--bridge-pre-0-8-10` bridge can recover matches this \
+                 domain's on-disk shape, so running that bridge will not recover this domain. \
+                 The file predates, or diverges from, every source catalog this binary can \
+                 bridge here. Nothing is deleted or rewritten: keep the realm and open it with \
+                 the version that wrote it, or start a new realm for this binary. The \
+                 read-only `rkat --state-root <ROOT> --realm <REALM> storage migrate` dry run \
+                 prints the per-domain detail; report that object list if you need this shape \
+                 bridged"
+            }
+        }
+    }
+}
+
 /// Errors produced by the shared SQLite mechanics.
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteStoreError {
@@ -66,11 +131,18 @@ pub enum SqliteStoreError {
     /// unreleased candidate schema.
     #[error(
         "schema domain `{domain}` has no ledger row but already owns objects {objects:?}; \
-         refusing to infer or stamp an unversioned schema"
+         refusing to infer or stamp an unversioned schema.{}",
+        bridgeable.remedy_sentence()
     )]
     UnledgeredDomainObjects {
         domain: String,
         objects: Vec<String>,
+        /// Whether the explicit offline bridge can authenticate this exact
+        /// on-disk catalog, decided at the raise site where the domain's
+        /// frozen verifiers and the connection are both in scope. Callers
+        /// that offer the bridge as a remedy must consult this rather than
+        /// naming it unconditionally.
+        bridgeable: BridgeEligibility,
     },
 
     /// Explicit maintenance could not authenticate an unledgered owned
@@ -284,5 +356,56 @@ mod tests {
         let err = sqlite_failure(rusqlite::ErrorCode::ConstraintViolation);
         assert_eq!(classify_sqlite_error(&err), SqliteErrorClass::Other);
         assert!(!is_busy_or_locked(&err));
+    }
+
+    /// This refusal reaches operators through more than one error type, and
+    /// after a partial bridge it reached them through this one with no next
+    /// step at all: a bare "refusing to infer or stamp an unversioned schema".
+    /// The remedy belongs to the eligibility answer, so every rendering of the
+    /// refusal carries it.
+    #[test]
+    fn unledgered_domain_objects_carry_their_remedy_in_every_rendering() {
+        let authenticated = SqliteStoreError::UnledgeredDomainObjects {
+            domain: "session-store".to_string(),
+            objects: vec!["table:sessions (expected table)".to_string()],
+            bridgeable: BridgeEligibility::CatalogAuthenticated,
+        }
+        .to_string();
+        assert!(
+            authenticated.contains("--bridge-pre-0-8-10"),
+            "a bridgeable catalog must name the command that recovers it: {authenticated}"
+        );
+
+        let unrecognized = SqliteStoreError::UnledgeredDomainObjects {
+            domain: "session-store".to_string(),
+            objects: vec!["table:sessions (expected table)".to_string()],
+            bridgeable: BridgeEligibility::Unrecognized,
+        }
+        .to_string();
+        assert!(
+            !unrecognized.contains("--apply"),
+            "an unrecognized catalog must not be handed a runnable apply command: {unrecognized}"
+        );
+        assert!(
+            unrecognized.contains("will not recover this domain"),
+            "the refusal must say plainly that the bridge cannot help: {unrecognized}"
+        );
+    }
+
+    /// The whole point of the remedy sentences is that an operator can read
+    /// them. A stray run of spaces from a botched line continuation shipped
+    /// once already.
+    #[test]
+    fn remedy_sentences_carry_no_botched_line_continuation() {
+        for eligibility in [
+            BridgeEligibility::CatalogAuthenticated,
+            BridgeEligibility::Unrecognized,
+        ] {
+            let sentence = eligibility.remedy_sentence();
+            assert!(
+                !sentence.contains("  "),
+                "{eligibility:?} remedy carries a run of spaces: {sentence:?}"
+            );
+        }
     }
 }

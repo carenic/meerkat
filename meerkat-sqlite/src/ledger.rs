@@ -56,7 +56,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::error::SqliteStoreError;
+use crate::error::{BridgeEligibility, SqliteStoreError};
 
 const CREATE_LEDGER_SQL: &str = "CREATE TABLE IF NOT EXISTS main.meerkat_schema (
     domain TEXT PRIMARY KEY,
@@ -145,6 +145,18 @@ pub struct SchemaDomain {
     pub allowed_existing_versions: &'static [i64],
     /// Exact catalog verifiers for every allowed version below current.
     pub released_predecessors: &'static [SchemaPredecessor],
+    /// Exact source versions the explicit offline bridge may infer for an
+    /// unledgered file of this domain.
+    ///
+    /// This is an authority boundary, not a convenience: catalog equality
+    /// alone cannot prove whether a data-only migration ran, so a version
+    /// absent from this list is never inferred even when its DDL fingerprint
+    /// matches. It lives on the domain rather than at the call site because
+    /// two answers to "which release wrote this catalog" is exactly the defect
+    /// this field exists to prevent: [`Self::bridge_eligibility`] decides what
+    /// an operator is told, [`bridge_unledgered_domain`] decides what runs,
+    /// and both read this one list.
+    pub bridge_recoverable_versions: &'static [i64],
     /// Complete set of catalog objects owned by this domain across its
     /// current schema. Foreign co-tenant objects are deliberately absent.
     pub owned_objects: &'static [SchemaObject],
@@ -221,6 +233,17 @@ impl SchemaDomain {
                 });
             }
         }
+        // The bridge's own source list is validated here, once, so that the
+        // eligibility answer an operator is shown and the bridge that later
+        // runs cannot be reading two differently-shaped lists. An empty list
+        // is legal and load-bearing: it declares that no offline bridge
+        // recovers this domain, and the eligibility oracle then says so
+        // instead of naming a command that would never touch the file.
+        // Membership in `allowed_existing_versions` is deliberately not
+        // required: those are versions this binary may open from a *ledger*
+        // row, while a bridged file has none and is identified from its
+        // catalog, so a source below the oldest openable version is normal.
+        validate_recoverable_source_versions(self, supported, self.bridge_recoverable_versions)?;
         for predecessor in self.released_predecessors {
             if predecessor.version >= supported
                 || !self
@@ -271,6 +294,55 @@ impl SchemaDomain {
         self.allowed_existing_versions.contains(&version)
     }
 
+    /// The exact source version [`bridge_unledgered_domain`] would
+    /// authenticate `conn`'s unledgered catalog as, if any.
+    ///
+    /// This asks the question through the very code the bridge asks it with
+    /// ([`authenticate_unledgered_source_version`]), against the same
+    /// caller-authorized source list ([`Self::bridge_recoverable_versions`]).
+    /// Answering it a second, similar way is what produced the defect this
+    /// replaces: an oracle that consulted only the frozen verifiers called a
+    /// realm unrecoverable while the bridge, which also accepts an exact
+    /// code-derived migration prefix, recovered it on the next command.
+    ///
+    /// SCOPE, because a remedy sentence is built from this: it answers about
+    /// the file's **catalog shape only**. It does not read, decode, or admit a
+    /// single durable record, so it can never promise that every record will
+    /// be carried forward. An ambiguous or unmatched catalog answers `None`,
+    /// exactly as the bridge refuses one.
+    ///
+    /// What makes the narrower answer safe to act on is the bridge's own
+    /// contract: a preparation callback refuses **per record**
+    /// ([`MaintenanceRecordRefusal`]) rather than per domain, so an
+    /// authenticated catalog does land, and any record that could not come
+    /// across is named in [`MaintenanceBridgeReport::refused`] instead of
+    /// costing the operator the rest of the file.
+    pub fn bridgeable_source_version(&self, conn: &Connection) -> Option<i64> {
+        if self.validate().is_err() {
+            return None;
+        }
+        authenticate_unledgered_source_version(
+            conn,
+            self,
+            self.supported_version(),
+            self.bridge_recoverable_versions,
+            Vec::new,
+        )
+        .ok()
+        .map(|matched| matched.version)
+    }
+
+    /// Whether the explicit offline bridge can authenticate `conn`'s catalog
+    /// for this domain. Catalog shape only; see
+    /// [`Self::bridgeable_source_version`] for what this deliberately does
+    /// not check.
+    pub fn bridge_eligibility(&self, conn: &Connection) -> BridgeEligibility {
+        match self.bridgeable_source_version(conn) {
+            Some(_) => BridgeEligibility::CatalogAuthenticated,
+            None => BridgeEligibility::Unrecognized,
+        }
+    }
+
     fn verify_predecessor(&self, conn: &Connection, version: i64) -> Result<(), SqliteStoreError> {
         if version == self.supported_version() {
             return verify_current_schema_fingerprint(conn, self).map_err(|detail| {
@@ -310,15 +382,46 @@ impl LedgerReport {
     }
 }
 
+/// One durable record an explicit maintenance preparation could not carry
+/// forward.
+///
+/// A refusal is per-record, never per-realm: the callback keeps the record's
+/// bytes exactly as it found them, carries every record it can, and names
+/// this one so the operator learns what did not come across and why. A
+/// preparation that answers "this single record is unrepresentable" by
+/// aborting the whole domain would cost the operator every other record in
+/// the file, which is the failure this type exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceRecordRefusal {
+    /// Domain-scoped identity of the record, as its owning store names it.
+    pub record: String,
+    /// Why this record could not be carried forward.
+    pub reason: String,
+}
+
 /// Result returned by an explicit maintenance preparation callback.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MaintenancePrepareReport {
     /// Number of durable records rewritten by the callback.
     pub changed: usize,
+    /// Records the callback deliberately left untouched, each with the
+    /// reason it could not be carried forward. Empty means every record the
+    /// callback inspected came across.
+    pub refused: Vec<MaintenanceRecordRefusal>,
+}
+
+impl MaintenancePrepareReport {
+    /// Report `changed` rewritten records with nothing refused.
+    pub fn rewrote(changed: usize) -> Self {
+        Self {
+            changed,
+            refused: Vec::new(),
+        }
+    }
 }
 
 /// Outcome of [`bridge_unledgered_domain`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaintenanceBridgeReport {
     /// Authenticated schema version before maintenance.
     pub from_version: i64,
@@ -326,6 +429,10 @@ pub struct MaintenanceBridgeReport {
     pub to_version: i64,
     /// Number of records rewritten by the optional preparation callback.
     pub prepared: usize,
+    /// Records the preparation callback left untouched, named with reasons.
+    /// The domain still landed: these records were carried across the schema
+    /// bridge in their existing bytes, not rewritten and not deleted.
+    pub refused: Vec<MaintenanceRecordRefusal>,
 }
 
 impl MaintenanceBridgeReport {
@@ -393,6 +500,7 @@ pub fn preflight_schema_eligibility(
                 return Err(SqliteStoreError::UnledgeredDomainObjects {
                     domain: domain.name.to_string(),
                     objects,
+                    bridgeable: domain.bridge_eligibility(conn),
                 });
             }
         }
@@ -440,6 +548,7 @@ pub fn apply_domain_migrations(
             return Err(SqliteStoreError::UnledgeredDomainObjects {
                 domain: domain.name.to_string(),
                 objects,
+                bridgeable: domain.bridge_eligibility(&tx),
             });
         }
     }
@@ -598,6 +707,7 @@ pub fn bridge_unledgered_domain(
                 from_version: found,
                 to_version: found,
                 prepared: 0,
+                refused: Vec::new(),
             });
         }
         found
@@ -608,59 +718,19 @@ pub fn bridge_unledgered_domain(
                 from_version: 0,
                 to_version: 0,
                 prepared: 0,
+                refused: Vec::new(),
             });
         }
 
-        let oracles = build_migration_prefix_oracles(domain, target_version)?;
-        let actual = domain_catalog_fingerprint(&tx, domain).map_err(|detail| {
-            SqliteStoreError::UnledgeredSchemaNoMatch {
-                domain: domain.name.to_string(),
-                target_version,
-                objects: vec![detail],
-            }
-        })?;
-        let mut matches = oracles
-            .iter()
-            .filter_map(|(version, fingerprint)| {
-                (recoverable_source_versions.contains(version) && fingerprint == &actual)
-                    .then_some(*version)
-            })
-            .collect::<Vec<_>>();
-        // A frozen predecessor verifier may intentionally authenticate more
-        // than one exact released physical catalog for the same logical
-        // version. This covers pre-ledger stores whose idempotent opener grew
-        // new tables without a version marker. It remains fail-closed: only a
-        // caller-authorized version with a registered frozen verifier can add
-        // a match, and duplicate evidence for the same version is collapsed
-        // before ambiguity is judged.
-        for predecessor in domain.released_predecessors.iter().filter(|predecessor| {
-            recoverable_source_versions.contains(&predecessor.version)
-                && predecessor.version <= target_version
-        }) {
-            if (predecessor.verify)(&tx).is_ok() && !matches.contains(&predecessor.version) {
-                matches.push(predecessor.version);
-            }
-        }
-        matches.sort_unstable();
-        let matched = match matches.as_slice() {
-            [version] => *version,
-            [] => {
-                return Err(SqliteStoreError::UnledgeredSchemaNoMatch {
-                    domain: domain.name.to_string(),
-                    target_version,
-                    objects,
-                });
-            }
-            _ => {
-                return Err(SqliteStoreError::UnledgeredSchemaAmbiguous {
-                    domain: domain.name.to_string(),
-                    target_version,
-                    matches,
-                });
-            }
-        };
-        inferred_oracles = Some(oracles);
-        matched
+        let matched = authenticate_unledgered_source_version(
+            &tx,
+            domain,
+            target_version,
+            recoverable_source_versions,
+            || objects.clone(),
+        )?;
+        inferred_oracles = Some(matched.oracles);
+        matched.version
     };
 
     let oracles = match inferred_oracles {
@@ -669,11 +739,13 @@ pub fn bridge_unledgered_domain(
     };
     validate_domain_trigger_isolation(&tx, domain, from_version)?;
 
-    let prepared = match prepare {
+    let (prepared, refused) = match prepare {
         Some(prepare) => {
-            run_with_custody(&tx, domain, from_version, "maintenance-prepare", prepare)?.changed
+            let report =
+                run_with_custody(&tx, domain, from_version, "maintenance-prepare", prepare)?;
+            (report.changed, report.refused)
         }
-        None => 0,
+        None => (0, Vec::new()),
     };
     for migration in domain
         .migrations
@@ -734,6 +806,7 @@ pub fn bridge_unledgered_domain(
         from_version,
         to_version: target_version,
         prepared,
+        refused,
     })
 }
 
@@ -857,6 +930,93 @@ fn run_with_custody<T>(
         name: name.to_string(),
         source,
     })
+}
+
+/// One unledgered catalog identified as exactly one authorized source version,
+/// with the prefix oracles the identification was made against.
+struct AuthenticatedUnledgeredSource {
+    version: i64,
+    oracles: Vec<(i64, DomainCatalogFingerprint)>,
+}
+
+/// Identify an unledgered catalog as exactly one caller-authorized source
+/// version, or refuse it.
+///
+/// THIS IS THE ONLY ANSWER. Both the bridge that migrates the file and the
+/// eligibility oracle that decides what an operator is told call it, because a
+/// realm the bridge recovers being described to that operator as unrecoverable
+/// (or the reverse) is a defect neither side can detect on its own. Two
+/// evidence sources are accepted and must agree on a single version: an exact
+/// code-derived migration-prefix fingerprint, and a registered frozen
+/// predecessor verifier. Anything unmatched or ambiguous is refused, so the
+/// message and the command fail together.
+///
+/// `objects` is called only to describe a refusal, so a caller that just wants
+/// the yes/no answer pays nothing to obtain a list it will discard.
+fn authenticate_unledgered_source_version(
+    conn: &Connection,
+    domain: &SchemaDomain,
+    target_version: i64,
+    recoverable_source_versions: &[i64],
+    objects: impl FnOnce() -> Vec<String>,
+) -> Result<AuthenticatedUnledgeredSource, SqliteStoreError> {
+    if recoverable_source_versions.is_empty() {
+        // A domain with no offline bridge is answered without replaying a
+        // single migration, and the operator is told the bridge will not help
+        // rather than being sent to a command that would never touch the file.
+        return Err(SqliteStoreError::UnledgeredSchemaNoMatch {
+            domain: domain.name.to_string(),
+            target_version,
+            objects: objects(),
+        });
+    }
+    let oracles = build_migration_prefix_oracles(domain, target_version)?;
+    let actual = domain_catalog_fingerprint(conn, domain).map_err(|detail| {
+        SqliteStoreError::UnledgeredSchemaNoMatch {
+            domain: domain.name.to_string(),
+            target_version,
+            objects: vec![detail],
+        }
+    })?;
+    let mut matches = oracles
+        .iter()
+        .filter_map(|(version, fingerprint)| {
+            (recoverable_source_versions.contains(version) && fingerprint == &actual)
+                .then_some(*version)
+        })
+        .collect::<Vec<_>>();
+    // A frozen predecessor verifier may intentionally authenticate more
+    // than one exact released physical catalog for the same logical
+    // version. This covers pre-ledger stores whose idempotent opener grew
+    // new tables without a version marker. It remains fail-closed: only a
+    // caller-authorized version with a registered frozen verifier can add
+    // a match, and duplicate evidence for the same version is collapsed
+    // before ambiguity is judged.
+    for predecessor in domain.released_predecessors.iter().filter(|predecessor| {
+        recoverable_source_versions.contains(&predecessor.version)
+            && predecessor.version <= target_version
+    }) {
+        if (predecessor.verify)(conn).is_ok() && !matches.contains(&predecessor.version) {
+            matches.push(predecessor.version);
+        }
+    }
+    matches.sort_unstable();
+    match matches.as_slice() {
+        [version] => Ok(AuthenticatedUnledgeredSource {
+            version: *version,
+            oracles,
+        }),
+        [] => Err(SqliteStoreError::UnledgeredSchemaNoMatch {
+            domain: domain.name.to_string(),
+            target_version,
+            objects: objects(),
+        }),
+        _ => Err(SqliteStoreError::UnledgeredSchemaAmbiguous {
+            domain: domain.name.to_string(),
+            target_version,
+            matches,
+        }),
+    }
 }
 
 fn build_migration_prefix_oracles(
@@ -1771,6 +1931,7 @@ mod tests {
         }],
         initialize_current: create_t1,
         allowed_existing_versions: &[1],
+        bridge_recoverable_versions: &[1],
         released_predecessors: &[],
         owned_objects: &[SchemaObject {
             kind: SchemaObjectKind::Table,
@@ -1795,6 +1956,7 @@ mod tests {
         ],
         initialize_current: initialize_v2,
         allowed_existing_versions: &[1, 2],
+        bridge_recoverable_versions: &[1],
         released_predecessors: &[SchemaPredecessor {
             version: 1,
             verify: verify_v1,
@@ -1822,6 +1984,7 @@ mod tests {
         ],
         initialize_current: initialize_v2_alt,
         allowed_existing_versions: &[2],
+        bridge_recoverable_versions: &[1],
         released_predecessors: &[],
         owned_objects: &[SchemaObject {
             kind: SchemaObjectKind::Table,
@@ -1861,6 +2024,7 @@ mod tests {
             }],
             initialize_current: build_frozen,
             allowed_existing_versions: &[1],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[],
             owned_objects: STRUCTURE_OBJECTS,
             retired_objects: &[],
@@ -2061,6 +2225,7 @@ mod tests {
             ],
             initialize_current: no_op,
             allowed_existing_versions: &[2, 3],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[SchemaPredecessor {
                 version: 2,
                 verify: verify_v2,
@@ -2094,6 +2259,7 @@ mod tests {
             ],
             initialize_current: no_op,
             allowed_existing_versions: &[2, 4],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[SchemaPredecessor {
                 version: 2,
                 verify: verify_v2,
@@ -2176,6 +2342,7 @@ mod tests {
                 from_version: 1,
                 to_version: 2,
                 prepared: 0,
+                refused: Vec::new(),
             }
         );
         assert_eq!(
@@ -2199,6 +2366,7 @@ mod tests {
                 from_version: 2,
                 to_version: 2,
                 prepared: 0,
+                refused: Vec::new(),
             }
         );
     }
@@ -2209,7 +2377,7 @@ mod tests {
             tx: &Transaction<'_>,
         ) -> Result<MaintenancePrepareReport, rusqlite::Error> {
             let changed = tx.execute("UPDATE t1 SET x = x + 1", [])?;
-            Ok(MaintenancePrepareReport { changed })
+            Ok(MaintenancePrepareReport::rewrote(changed))
         }
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2227,6 +2395,7 @@ mod tests {
                 from_version: 1,
                 to_version: 2,
                 prepared: 1,
+                refused: Vec::new(),
             }
         );
         assert_eq!(
@@ -2248,20 +2417,20 @@ mod tests {
             tx: &Transaction<'_>,
         ) -> Result<MaintenancePrepareReport, rusqlite::Error> {
             let changed = tx.execute("UPDATE t1 SET x = x + 1", [])?;
-            Ok(MaintenancePrepareReport { changed })
+            Ok(MaintenancePrepareReport::rewrote(changed))
         }
         fn mutate_then_fail(
             tx: &Transaction<'_>,
         ) -> Result<MaintenancePrepareReport, rusqlite::Error> {
             tx.execute("UPDATE t1 SET x = 99", [])?;
             tx.execute_batch("THIS IS NOT SQL")?;
-            Ok(MaintenancePrepareReport { changed: 1 })
+            Ok(MaintenancePrepareReport::rewrote(1))
         }
         fn rolls_back_then_begins_and_fails(
             tx: &Transaction<'_>,
         ) -> Result<MaintenancePrepareReport, rusqlite::Error> {
             tx.execute_batch("UPDATE t1 SET x = 99; ROLLBACK; BEGIN; THIS IS NOT SQL")?;
-            Ok(MaintenancePrepareReport { changed: 1 })
+            Ok(MaintenancePrepareReport::rewrote(1))
         }
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2279,6 +2448,7 @@ mod tests {
                 from_version: 2,
                 to_version: 2,
                 prepared: 1,
+                refused: Vec::new(),
             }
         );
         assert!(!report.migrated());
@@ -2384,6 +2554,7 @@ mod tests {
             ],
             initialize_current: initialize_v2,
             allowed_existing_versions: &[3],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[],
             owned_objects: &[SchemaObject {
                 kind: SchemaObjectKind::Table,
@@ -2429,6 +2600,7 @@ mod tests {
                 from_version: 0,
                 to_version: 0,
                 prepared: 0,
+                refused: Vec::new(),
             }
         );
         assert!(!ledger_table_exists(&conn).expect("ledger presence"));
@@ -2480,6 +2652,7 @@ mod tests {
             }],
             initialize_current: create_exact,
             allowed_existing_versions: &[1],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[],
             owned_objects: &[SchemaObject {
                 kind: SchemaObjectKind::Table,
@@ -2513,7 +2686,7 @@ mod tests {
         ) -> Result<MaintenancePrepareReport, rusqlite::Error> {
             tx.execute("UPDATE t1 SET x = 99", [])?;
             tx.execute_batch("THIS IS NOT SQL")?;
-            Ok(MaintenancePrepareReport { changed: 1 })
+            Ok(MaintenancePrepareReport::rewrote(1))
         }
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2550,7 +2723,7 @@ mod tests {
             tx: &Transaction<'_>,
         ) -> Result<MaintenancePrepareReport, rusqlite::Error> {
             tx.execute_batch("UPDATE t1 SET x = 99; COMMIT; THIS IS NOT SQL")?;
-            Ok(MaintenancePrepareReport { changed: 1 })
+            Ok(MaintenancePrepareReport::rewrote(1))
         }
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2574,7 +2747,7 @@ mod tests {
             tx: &Transaction<'_>,
         ) -> Result<MaintenancePrepareReport, rusqlite::Error> {
             let changed = tx.execute("UPDATE t1 SET x = 8 WHERE x = 7", [])?;
-            Ok(MaintenancePrepareReport { changed })
+            Ok(MaintenancePrepareReport::rewrote(changed))
         }
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2614,7 +2787,7 @@ mod tests {
         }
         fn prepare_view(tx: &Transaction<'_>) -> Result<MaintenancePrepareReport, rusqlite::Error> {
             let changed = tx.execute("UPDATE owned_view SET x = 8 WHERE x = 7", [])?;
-            Ok(MaintenancePrepareReport { changed })
+            Ok(MaintenancePrepareReport::rewrote(changed))
         }
         const VIEW_DOMAIN: SchemaDomain = SchemaDomain {
             name: "view-bridge-domain",
@@ -2625,6 +2798,7 @@ mod tests {
             }],
             initialize_current: create_owned_view,
             allowed_existing_versions: &[1],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[],
             owned_objects: &[
                 SchemaObject {
@@ -2688,6 +2862,7 @@ mod tests {
             ],
             initialize_current: create_t1,
             allowed_existing_versions: &[2],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[],
             owned_objects: &[SchemaObject {
                 kind: SchemaObjectKind::Table,
@@ -2859,6 +3034,7 @@ mod tests {
             }],
             initialize_current: create_t1,
             allowed_existing_versions: &[3],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[],
             owned_objects: &[],
             retired_objects: &[],
@@ -2896,6 +3072,7 @@ mod tests {
             ],
             initialize_current: initialize_failing,
             allowed_existing_versions: &[1, 2],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[SchemaPredecessor {
                 version: 1,
                 verify: verify_v1,
@@ -3060,6 +3237,7 @@ mod tests {
             ],
             initialize_current: no_op,
             allowed_existing_versions: &[1, 2],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[SchemaPredecessor {
                 version: 1,
                 verify: verify_empty_predecessor,
@@ -3083,6 +3261,7 @@ mod tests {
             ],
             initialize_current: no_op,
             allowed_existing_versions: &[1, 2],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[SchemaPredecessor {
                 version: 1,
                 verify: verify_empty_predecessor,
@@ -3106,6 +3285,7 @@ mod tests {
             ],
             initialize_current: no_op,
             allowed_existing_versions: &[1, 2],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[SchemaPredecessor {
                 version: 1,
                 verify: verify_empty_predecessor,
@@ -3129,6 +3309,7 @@ mod tests {
             ],
             initialize_current: no_op,
             allowed_existing_versions: &[1, 2],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[SchemaPredecessor {
                 version: 1,
                 verify: verify_empty_predecessor,
@@ -3183,6 +3364,7 @@ mod tests {
             }],
             initialize_current: commits_underneath,
             allowed_existing_versions: &[1],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[],
             owned_objects: &[SchemaObject {
                 kind: SchemaObjectKind::Table,
@@ -3229,6 +3411,7 @@ mod tests {
             }],
             initialize_current: nests_savepoints,
             allowed_existing_versions: &[1],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[],
             owned_objects: &[SchemaObject {
                 kind: SchemaObjectKind::Table,

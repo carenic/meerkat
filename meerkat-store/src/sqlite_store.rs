@@ -1260,7 +1260,7 @@ pub fn prepare_pre_0_8_10_session_base_schema(
         [],
     )?;
     tx.execute_batch("DROP TABLE pre_floor_sessions_import")?;
-    Ok(meerkat_sqlite::MaintenancePrepareReport { changed })
+    Ok(meerkat_sqlite::MaintenancePrepareReport::rewrote(changed))
 }
 
 fn verify_released_0_8_10_session_schema(conn: &Connection) -> Result<(), String> {
@@ -1308,6 +1308,7 @@ pub const SESSION_STORE_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::S
     ],
     initialize_current: initialize_current_session_schema,
     allowed_existing_versions: &[1, 2, 3, 4],
+    bridge_recoverable_versions: &[1],
     released_predecessors: &[
         meerkat_sqlite::SchemaPredecessor {
             version: 1,

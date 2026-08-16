@@ -188,6 +188,7 @@ pub const JOBS_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDoma
     ],
     initialize_current: initialize_current_jobs_schema,
     allowed_existing_versions: &[2, 3],
+    bridge_recoverable_versions: &[1],
     released_predecessors: &[meerkat_sqlite::SchemaPredecessor {
         version: 2,
         verify: verify_released_jobs_v2_schema,

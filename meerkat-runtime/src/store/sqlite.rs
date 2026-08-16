@@ -156,6 +156,71 @@ CREATE TABLE IF NOT EXISTS runtime_compaction_projection_outbox (
     PRIMARY KEY (runtime_id, session_id, parent_revision, revision, commit_fingerprint)
 )";
 
+    // Exact runtime catalog created by the pre-ledger opener across the whole
+    // 0.7.x line. Copied verbatim from `meerkat-runtime/src/store/sqlite.rs`
+    // at commit 9bc314778 (2026-06-16), and confirmed byte-identical in the
+    // realms written by the published 0.7.5, 0.7.19, 0.7.21 and 0.7.28 `rkat`
+    // binaries. `runtime_retired_ops_epochs` and
+    // `runtime_compaction_projection_outbox` only entered the opener later, so
+    // this 7-table shape is the oldest real predecessor of the released 0.8.10
+    // 11-table catalog and the one every realm created before 0.8.0 carries.
+    // Keep this frozen and use it only as an explicit maintenance source
+    // oracle.
+    const CREATE_PRE_LEDGER_0_7_RUNTIME_SCHEMA_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS runtime_input_states (
+    runtime_id TEXT NOT NULL,
+    input_id TEXT NOT NULL,
+    state_json BLOB NOT NULL,
+    PRIMARY KEY (runtime_id, input_id)
+);
+CREATE TABLE IF NOT EXISTS runtime_boundary_receipts (
+    runtime_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    receipt_json BLOB NOT NULL,
+    PRIMARY KEY (runtime_id, run_id, sequence)
+);
+CREATE TABLE IF NOT EXISTS runtime_session_snapshots (
+    runtime_id TEXT PRIMARY KEY,
+    session_snapshot BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_states (
+    runtime_id TEXT PRIMARY KEY,
+    runtime_state_json BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_ops_lifecycle (
+    runtime_id TEXT PRIMARY KEY,
+    state_json BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_auth_oauth_flow_state (
+    id TEXT PRIMARY KEY,
+    state_json BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_projection_quarantine (
+    runtime_id TEXT PRIMARY KEY
+)";
+
+    // Base tables a pre-ledger 0.7.x catalog never created. Version 2
+    // materializes them idempotently so every authenticated version-1 catalog
+    // converges on the same current schema; the version-1 initializer already
+    // creates both, so this adds nothing to a fresh build.
+    const CREATE_PRE_LEDGER_0_7_BACKFILL_SCHEMA_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS runtime_retired_ops_epochs (
+    runtime_id TEXT NOT NULL,
+    epoch_id TEXT NOT NULL,
+    PRIMARY KEY (runtime_id, epoch_id)
+);
+CREATE TABLE IF NOT EXISTS runtime_compaction_projection_outbox (
+    runtime_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    parent_revision TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    commit_fingerprint TEXT NOT NULL,
+    intent_json BLOB NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'finalized')),
+    PRIMARY KEY (runtime_id, session_id, parent_revision, revision, commit_fingerprint)
+)";
+
     const CREATE_RUNTIME_MOB_HOST_SCHEMA_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS runtime_mob_host_bindings (
     mob_id TEXT PRIMARY KEY,
@@ -291,863 +356,103 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
         serde_json::from_slice::<DuplicateRejectingJsonValue>(bytes).map(|value| value.0)
     }
 
-    const PRE_0_8_10_INPUT_STATE_KEYS: &[&str] = &[
-        "input_id",
-        "current_state",
-        "policy",
-        "runtime_semantics",
-        "terminal_outcome",
-        "durability",
-        "idempotency_key",
-        "attempt_count",
-        "recovery_count",
-        "history",
-        "persisted_input",
-        "last_run_id",
-        "last_boundary_sequence",
-        "created_at",
-        "updated_at",
-    ];
-
-    const RELEASED_V3_INPUT_STATE_KEYS: &[&str] = &[
-        "stored_input_state_version",
-        "input_id",
-        "current_state",
-        "policy",
-        "runtime_semantics",
-        "terminal_outcome",
-        "durability",
-        "attempt_count",
-        "recovery_count",
-        "history",
-        "persisted_input",
-        "last_run_id",
-        "last_boundary_sequence",
-        "admission_sequence",
-        "created_at",
-        "updated_at",
-    ];
-
-    const PRE_0_8_10_POLICY_KEYS: &[&str] = &["version", "decision"];
-    const PRE_0_8_10_POLICY_DECISION_KEYS: &[&str] = &[
-        "apply_mode",
-        "wake_mode",
-        "queue_mode",
-        "consume_point",
-        "drain_policy",
-        "routing_disposition",
-        "record_transcript",
-        "emit_operator_content",
-        "policy_version",
-    ];
-    const PRE_0_8_10_RUNTIME_SEMANTICS_KEYS: &[&str] = &[
-        "boundary",
-        "execution_kind",
-        "peer_response_terminal_apply_intent",
-        "execution_handling_mode",
-    ];
-    const RELEASED_V3_RUNTIME_SEMANTICS_KEYS: &[&str] = &[
-        "boundary",
-        "execution_kind",
-        "execution_handling_mode",
-        "peer_response_terminal_apply_intent",
-        "live_interrupt_required",
-    ];
-    const PRE_0_8_10_HISTORY_ENTRY_KEYS: &[&str] = &["timestamp", "from", "to", "reason"];
-    const PRE_0_8_10_PROMPT_KEYS: &[&str] = &["input_type", "header", "text", "turn_metadata"];
-
-    const PRE_0_8_10_SIMPLE_CONTINUATION_KEYS: &[&str] =
-        &["input_type", "header", "reason", "handling_mode"];
-    const RELEASED_V3_PROMPT_KEYS: &[&str] = &["input_type", "header", "content", "turn_metadata"];
-    const PRE_0_8_10_HEADER_KEYS: &[&str] = &[
-        "id",
-        "timestamp",
-        "source",
-        "durability",
-        "visibility",
-        "idempotency_key",
-        "correlation_id",
-    ];
-    const RELEASED_V3_HEADER_KEYS: &[&str] =
-        &["id", "timestamp", "source", "durability", "visibility"];
-    const PRE_0_8_10_SOURCE_KEYS: &[&str] = &["type"];
-    const PRE_0_8_10_VISIBILITY_KEYS: &[&str] = &["transcript_eligible", "operator_eligible"];
-    const PRE_0_8_10_TURN_METADATA_KEYS: &[&str] = &["additional_instructions"];
-    const PRE_0_8_10_TURN_INSTRUCTION_KEYS: &[&str] = &["kind", "body"];
-
-    fn reject_unknown_pre_0_8_10_keys(
-        runtime_id: &str,
-        input_id: &str,
-        owner: &str,
-        object: &serde_json::Map<String, serde_json::Value>,
-        allowed: &[&str],
-    ) -> Result<(), rusqlite::Error> {
-        let unknown = object
-            .keys()
-            .filter(|key| !allowed.contains(&key.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if unknown.is_empty() {
-            Ok(())
-        } else {
-            Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                format!("{owner} carries unsupported fields {unknown:?}"),
-            ))
-        }
-    }
-
-    fn pre_0_8_10_object<'a>(
-        runtime_id: &str,
-        input_id: &str,
-        owner: &str,
-        value: &'a serde_json::Value,
-    ) -> Result<&'a serde_json::Map<String, serde_json::Value>, rusqlite::Error> {
-        value.as_object().ok_or_else(|| {
-            pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                format!("{owner} is not a JSON object"),
-            )
-        })
-    }
-
-    fn pre_0_8_10_required_field<'a>(
-        runtime_id: &str,
-        input_id: &str,
-        owner: &str,
-        object: &'a serde_json::Map<String, serde_json::Value>,
-        field: &str,
-    ) -> Result<&'a serde_json::Value, rusqlite::Error> {
-        object.get(field).ok_or_else(|| {
-            pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                format!("{owner} is missing required field `{field}`"),
-            )
-        })
-    }
-
-    fn require_pre_0_8_10_keys(
-        runtime_id: &str,
-        input_id: &str,
-        owner: &str,
-        object: &serde_json::Map<String, serde_json::Value>,
-        required: &[&str],
-    ) -> Result<(), rusqlite::Error> {
-        reject_unknown_pre_0_8_10_keys(runtime_id, input_id, owner, object, required)?;
-        let missing = required
-            .iter()
-            .filter(|key| !object.contains_key(**key))
-            .copied()
-            .collect::<Vec<_>>();
-        if missing.is_empty() {
-            Ok(())
-        } else {
-            Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                format!("{owner} is missing required fields {missing:?}"),
-            ))
-        }
-    }
-
-    fn validate_pre_0_8_10_policy_shape(
-        runtime_id: &str,
-        input_id: &str,
-        row: &serde_json::Map<String, serde_json::Value>,
-    ) -> Result<(), rusqlite::Error> {
-        let policy = row.get("policy").ok_or_else(|| {
-            pre_0_8_10_input_import_error(runtime_id, input_id, "row has no policy snapshot")
-        })?;
-        let policy = pre_0_8_10_object(runtime_id, input_id, "policy snapshot", policy)?;
-        require_pre_0_8_10_keys(
-            runtime_id,
-            input_id,
-            "policy snapshot",
-            policy,
-            PRE_0_8_10_POLICY_KEYS,
-        )?;
-        let decision = pre_0_8_10_object(
-            runtime_id,
-            input_id,
-            "policy decision",
-            pre_0_8_10_required_field(runtime_id, input_id, "policy snapshot", policy, "decision")?,
-        )?;
-        require_pre_0_8_10_keys(
-            runtime_id,
-            input_id,
-            "policy decision",
-            decision,
-            PRE_0_8_10_POLICY_DECISION_KEYS,
-        )
-    }
-
-    fn validate_pre_0_8_10_runtime_semantics_shape(
-        runtime_id: &str,
-        input_id: &str,
-        row: &serde_json::Map<String, serde_json::Value>,
-        released_v3: bool,
-    ) -> Result<(), rusqlite::Error> {
-        let semantics = row.get("runtime_semantics").ok_or_else(|| {
-            pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "row has no runtime semantics stamp",
-            )
-        })?;
-        let semantics = pre_0_8_10_object(runtime_id, input_id, "runtime semantics", semantics)?;
-        if released_v3 {
-            require_pre_0_8_10_keys(
-                runtime_id,
-                input_id,
-                "runtime semantics",
-                semantics,
-                RELEASED_V3_RUNTIME_SEMANTICS_KEYS,
-            )?;
-        } else {
-            reject_unknown_pre_0_8_10_keys(
-                runtime_id,
-                input_id,
-                "runtime semantics",
-                semantics,
-                PRE_0_8_10_RUNTIME_SEMANTICS_KEYS,
-            )?;
-            for key in [
-                "boundary",
-                "execution_kind",
-                "peer_response_terminal_apply_intent",
-            ] {
-                if !semantics.contains_key(key) {
-                    return Err(pre_0_8_10_input_import_error(
-                        runtime_id,
-                        input_id,
-                        format!("runtime semantics is missing required field `{key}`"),
-                    ));
-                }
-            }
-            if semantics
-                .get("execution_handling_mode")
-                .is_some_and(|value| !value.is_null())
-            {
-                return Err(pre_0_8_10_input_import_error(
-                    runtime_id,
-                    input_id,
-                    "released execution_handling_mode is not null",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_pre_0_8_10_history_shape(
-        runtime_id: &str,
-        input_id: &str,
-        row: &serde_json::Map<String, serde_json::Value>,
-    ) -> Result<(), rusqlite::Error> {
-        let history = row
-            .get("history")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| {
-                pre_0_8_10_input_import_error(
-                    runtime_id,
-                    input_id,
-                    "row history is not a JSON array",
-                )
-            })?;
-        if history.is_empty() {
-            return Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "row history is empty",
-            ));
-        }
-        for (index, entry) in history.iter().enumerate() {
-            let entry = pre_0_8_10_object(
-                runtime_id,
-                input_id,
-                &format!("history entry {index}"),
-                entry,
-            )?;
-            require_pre_0_8_10_keys(
-                runtime_id,
-                input_id,
-                &format!("history entry {index}"),
-                entry,
-                PRE_0_8_10_HISTORY_ENTRY_KEYS,
-            )?;
-            if !entry
-                .get("reason")
-                .is_some_and(serde_json::Value::is_string)
-            {
-                return Err(pre_0_8_10_input_import_error(
-                    runtime_id,
-                    input_id,
-                    format!("history entry {index} has no string reason"),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_pre_0_8_10_terminal_shape(
-        runtime_id: &str,
-        input_id: &str,
-        row: &serde_json::Map<String, serde_json::Value>,
-    ) -> Result<(), rusqlite::Error> {
-        let Some(terminal) = row.get("terminal_outcome") else {
-            return Ok(());
-        };
-        let terminal = pre_0_8_10_object(runtime_id, input_id, "terminal outcome", terminal)?;
-        match terminal
-            .get("outcome_type")
-            .and_then(serde_json::Value::as_str)
-        {
-            Some("consumed") => require_pre_0_8_10_keys(
-                runtime_id,
-                input_id,
-                "consumed terminal outcome",
-                terminal,
-                &["outcome_type"],
-            ),
-            Some("abandoned") => {
-                require_pre_0_8_10_keys(
-                    runtime_id,
-                    input_id,
-                    "abandoned terminal outcome",
-                    terminal,
-                    &["outcome_type", "reason"],
-                )?;
-                let reason = pre_0_8_10_object(
-                    runtime_id,
-                    input_id,
-                    "abandon reason",
-                    pre_0_8_10_required_field(
-                        runtime_id,
-                        input_id,
-                        "abandoned terminal outcome",
-                        terminal,
-                        "reason",
-                    )?,
-                )?;
-                require_pre_0_8_10_keys(
-                    runtime_id,
-                    input_id,
-                    "abandon reason",
-                    reason,
-                    &["max_attempts_exhausted"],
-                )?;
-                let details = pre_0_8_10_object(
-                    runtime_id,
-                    input_id,
-                    "max-attempts abandon reason",
-                    pre_0_8_10_required_field(
-                        runtime_id,
-                        input_id,
-                        "abandon reason",
-                        reason,
-                        "max_attempts_exhausted",
-                    )?,
-                )?;
-                require_pre_0_8_10_keys(
-                    runtime_id,
-                    input_id,
-                    "max-attempts abandon reason",
-                    details,
-                    &["attempts"],
-                )
-            }
-            Some(other) => Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                format!("terminal outcome `{other}` is outside the frozen corpus"),
-            )),
-            None => Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "terminal outcome has no outcome_type discriminator",
-            )),
-        }
-    }
-
-    fn validate_pre_0_8_10_header_shape(
-        runtime_id: &str,
-        input_id: &str,
-        header: &serde_json::Value,
-        released_v3: bool,
-    ) -> Result<(), rusqlite::Error> {
-        let header = pre_0_8_10_object(runtime_id, input_id, "input header", header)?;
-        if released_v3 {
-            require_pre_0_8_10_keys(
-                runtime_id,
-                input_id,
-                "input header",
-                header,
-                RELEASED_V3_HEADER_KEYS,
-            )?;
-        } else {
-            reject_unknown_pre_0_8_10_keys(
-                runtime_id,
-                input_id,
-                "input header",
-                header,
-                PRE_0_8_10_HEADER_KEYS,
-            )?;
-            for key in ["id", "timestamp", "source", "durability", "visibility"] {
-                if !header.contains_key(key) {
-                    return Err(pre_0_8_10_input_import_error(
-                        runtime_id,
-                        input_id,
-                        format!("input header is missing required field `{key}`"),
-                    ));
-                }
-            }
-            if header.contains_key("idempotency_key") != header.contains_key("correlation_id") {
-                return Err(pre_0_8_10_input_import_error(
-                    runtime_id,
-                    input_id,
-                    "released input header must carry idempotency_key and correlation_id together",
-                ));
-            }
-            for key in ["idempotency_key", "correlation_id"] {
-                if header.get(key).is_some_and(|value| !value.is_string()) {
-                    return Err(pre_0_8_10_input_import_error(
-                        runtime_id,
-                        input_id,
-                        format!("released input header field `{key}` is not a string"),
-                    ));
-                }
-            }
-        }
-        let source = pre_0_8_10_object(
-            runtime_id,
-            input_id,
-            "input source",
-            pre_0_8_10_required_field(runtime_id, input_id, "input header", header, "source")?,
-        )?;
-        require_pre_0_8_10_keys(
-            runtime_id,
-            input_id,
-            "input source",
-            source,
-            PRE_0_8_10_SOURCE_KEYS,
-        )?;
-        match source.get("type").and_then(serde_json::Value::as_str) {
-            Some("operator" | "system") => {}
-            other => {
-                return Err(pre_0_8_10_input_import_error(
-                    runtime_id,
-                    input_id,
-                    format!("input source {other:?} is outside the frozen corpus"),
-                ));
-            }
-        }
-        let visibility = pre_0_8_10_object(
-            runtime_id,
-            input_id,
-            "input visibility",
-            pre_0_8_10_required_field(runtime_id, input_id, "input header", header, "visibility")?,
-        )?;
-        require_pre_0_8_10_keys(
-            runtime_id,
-            input_id,
-            "input visibility",
-            visibility,
-            PRE_0_8_10_VISIBILITY_KEYS,
-        )
-    }
-
-    fn validate_pre_0_8_10_turn_metadata_shape(
-        runtime_id: &str,
-        input_id: &str,
-        metadata: &serde_json::Value,
-    ) -> Result<(), rusqlite::Error> {
-        let metadata = pre_0_8_10_object(runtime_id, input_id, "turn metadata", metadata)?;
-        reject_unknown_pre_0_8_10_keys(
-            runtime_id,
-            input_id,
-            "turn metadata",
-            metadata,
-            PRE_0_8_10_TURN_METADATA_KEYS,
-        )?;
-        let Some(instructions) = metadata.get("additional_instructions") else {
-            return Ok(());
-        };
-        let instructions = instructions.as_array().ok_or_else(|| {
-            pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "additional_instructions is not an array",
-            )
-        })?;
-        if instructions.is_empty() {
-            return Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "additional_instructions is empty",
-            ));
-        }
-        for (index, instruction) in instructions.iter().enumerate() {
-            let instruction = pre_0_8_10_object(
-                runtime_id,
-                input_id,
-                &format!("turn instruction {index}"),
-                instruction,
-            )?;
-            require_pre_0_8_10_keys(
-                runtime_id,
-                input_id,
-                &format!("turn instruction {index}"),
-                instruction,
-                PRE_0_8_10_TURN_INSTRUCTION_KEYS,
-            )?;
-            if instruction.get("kind").and_then(serde_json::Value::as_str) != Some("system")
-                || !instruction
-                    .get("body")
-                    .is_some_and(serde_json::Value::is_string)
-            {
-                return Err(pre_0_8_10_input_import_error(
-                    runtime_id,
-                    input_id,
-                    format!("turn instruction {index} is outside the frozen system/body shape"),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_pre_0_8_10_persisted_input_shape(
-        runtime_id: &str,
-        input_id: &str,
-        row: &serde_json::Map<String, serde_json::Value>,
-        released_v3: bool,
-    ) -> Result<(), rusqlite::Error> {
-        let persisted = row.get("persisted_input").ok_or_else(|| {
-            pre_0_8_10_input_import_error(runtime_id, input_id, "row has no persisted input")
-        })?;
-        let persisted = pre_0_8_10_object(runtime_id, input_id, "persisted input", persisted)?;
-        match persisted
-            .get("input_type")
-            .and_then(serde_json::Value::as_str)
-        {
-            Some("prompt") => {
-                let keys = if released_v3 {
-                    RELEASED_V3_PROMPT_KEYS
-                } else {
-                    PRE_0_8_10_PROMPT_KEYS
-                };
-                reject_unknown_pre_0_8_10_keys(
-                    runtime_id,
-                    input_id,
-                    "persisted prompt",
-                    persisted,
-                    keys,
-                )?;
-                for key in [
-                    "input_type",
-                    "header",
-                    if released_v3 { "content" } else { "text" },
-                ] {
-                    if !persisted.contains_key(key) {
-                        return Err(pre_0_8_10_input_import_error(
-                            runtime_id,
-                            input_id,
-                            format!("persisted prompt is missing required field `{key}`"),
-                        ));
-                    }
-                }
-                let content_key = if released_v3 { "content" } else { "text" };
-                if !persisted
-                    .get(content_key)
-                    .is_some_and(serde_json::Value::is_string)
-                {
-                    return Err(pre_0_8_10_input_import_error(
-                        runtime_id,
-                        input_id,
-                        format!("persisted prompt {content_key} is not a string"),
-                    ));
-                }
-                validate_pre_0_8_10_header_shape(
-                    runtime_id,
-                    input_id,
-                    pre_0_8_10_required_field(
-                        runtime_id,
-                        input_id,
-                        "persisted prompt",
-                        persisted,
-                        "header",
-                    )?,
-                    released_v3,
-                )?;
-                if let Some(metadata) = persisted.get("turn_metadata") {
-                    validate_pre_0_8_10_turn_metadata_shape(runtime_id, input_id, metadata)?;
-                } else if released_v3 {
-                    return Err(pre_0_8_10_input_import_error(
-                        runtime_id,
-                        input_id,
-                        "released v3 prompt has no turn_metadata object",
-                    ));
-                }
-                Ok(())
-            }
-            Some("continuation") if !released_v3 => {
-                require_pre_0_8_10_keys(
-                    runtime_id,
-                    input_id,
-                    "persisted continuation",
-                    persisted,
-                    PRE_0_8_10_SIMPLE_CONTINUATION_KEYS,
-                )?;
-                validate_pre_0_8_10_header_shape(
-                    runtime_id,
-                    input_id,
-                    pre_0_8_10_required_field(
-                        runtime_id,
-                        input_id,
-                        "persisted continuation",
-                        persisted,
-                        "header",
-                    )?,
-                    false,
-                )?;
-                if persisted.get("reason").and_then(serde_json::Value::as_str)
-                    != Some("detached_background_op_completed")
-                    || persisted
-                        .get("handling_mode")
-                        .and_then(serde_json::Value::as_str)
-                        != Some("steer")
-                {
-                    return Err(pre_0_8_10_input_import_error(
-                        runtime_id,
-                        input_id,
-                        "continuation is outside the frozen detached-background steer shape",
-                    ));
-                }
-                Ok(())
-            }
-            Some(other) => Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                format!("input type `{other}` is outside the frozen recovery corpus"),
-            )),
-            None => Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "persisted input has no input_type discriminator",
-            )),
-        }
-    }
-
-    fn validate_pre_0_8_10_wire_shape(
-        runtime_id: &str,
-        input_id: &str,
-        encoded: &serde_json::Value,
-        released_v3: bool,
-    ) -> Result<(), rusqlite::Error> {
-        let row = pre_0_8_10_object(runtime_id, input_id, "input-state row", encoded)?;
-        reject_unknown_pre_0_8_10_keys(
-            runtime_id,
-            input_id,
-            "input-state row",
-            row,
-            if released_v3 {
-                RELEASED_V3_INPUT_STATE_KEYS
-            } else {
-                PRE_0_8_10_INPUT_STATE_KEYS
-            },
-        )?;
-        if released_v3 {
-            require_pre_0_8_10_keys(
-                runtime_id,
-                input_id,
-                "released v3 input-state row",
-                row,
-                RELEASED_V3_INPUT_STATE_KEYS,
-            )?;
-        } else {
-            for key in [
-                "input_id",
-                "current_state",
-                "policy",
-                "runtime_semantics",
-                "durability",
-                "attempt_count",
-                "recovery_count",
-                "history",
-                "persisted_input",
-                "created_at",
-                "updated_at",
-            ] {
-                if !row.contains_key(key) {
-                    return Err(pre_0_8_10_input_import_error(
-                        runtime_id,
-                        input_id,
-                        format!("input-state row is missing required field `{key}`"),
-                    ));
-                }
-            }
-            for key in ["idempotency_key", "last_run_id", "last_boundary_sequence"] {
-                if row.get(key).is_some_and(serde_json::Value::is_null) {
-                    return Err(pre_0_8_10_input_import_error(
-                        runtime_id,
-                        input_id,
-                        format!("released input-state field `{key}` is explicitly null"),
-                    ));
-                }
-            }
-        }
-        validate_pre_0_8_10_policy_shape(runtime_id, input_id, row)?;
-        validate_pre_0_8_10_runtime_semantics_shape(runtime_id, input_id, row, released_v3)?;
-        validate_pre_0_8_10_history_shape(runtime_id, input_id, row)?;
-        validate_pre_0_8_10_terminal_shape(runtime_id, input_id, row)?;
-        validate_pre_0_8_10_persisted_input_shape(runtime_id, input_id, row, released_v3)
-    }
-
+    /// Identity bindings a pre-0.8.10 input row must satisfy to be carried
+    /// forward.
+    ///
+    /// SCOPE. Only bindings whose violation would make the successor row
+    /// *wrong* are checked: a row filed under one primary key but carrying a
+    /// different input id, a persisted input whose header disagrees with the
+    /// state that owns it, or a policy snapshot whose two version stamps
+    /// disagree. Origin, durability and visibility combinations are the
+    /// machine's business, not this bridge's: an enumeration of "allowed"
+    /// combinations here is a guess about released bytes, and the predecessor
+    /// of this function proved how that guess ages.
     fn validate_pre_0_8_10_row_identity(
-        runtime_id: &str,
         input_id: &str,
         stored: &StoredInputState,
-    ) -> Result<(), rusqlite::Error> {
+    ) -> Result<(), String> {
         if stored.state.input_id.to_string() != input_id {
-            return Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                format!(
-                    "embedded input id `{}` does not match the owning row",
-                    stored.state.input_id
-                ),
+            return Err(format!(
+                "embedded input id `{}` does not match the owning row",
+                stored.state.input_id
             ));
         }
         if let Some(input) = stored.state.persisted_input.as_ref() {
             if input.id() != &stored.state.input_id {
-                return Err(pre_0_8_10_input_import_error(
-                    runtime_id,
-                    input_id,
-                    format!(
-                        "persisted input header id `{}` does not match the state/row identity",
-                        input.id()
-                    ),
+                return Err(format!(
+                    "persisted input header id `{}` does not match the state/row identity",
+                    input.id()
                 ));
             }
             if stored.state.durability != Some(input.header().durability) {
-                return Err(pre_0_8_10_input_import_error(
-                    runtime_id,
-                    input_id,
-                    "state durability does not match persisted input header durability",
-                ));
+                return Err(
+                    "state durability does not match persisted input header durability".to_string(),
+                );
             }
             if stored.state.idempotency_key != input.header().idempotency_key {
-                return Err(pre_0_8_10_input_import_error(
-                    runtime_id,
-                    input_id,
-                    "state idempotency key does not match persisted input header idempotency key",
-                ));
-            }
-            match input {
-                crate::input::Input::Prompt(prompt)
-                    if prompt.header.durability == crate::input::InputDurability::Durable
-                        && prompt.header.visibility.transcript_eligible
-                        && prompt.header.visibility.operator_eligible
-                        && matches!(
-                            prompt.header.source,
-                            crate::input::InputOrigin::Operator | crate::input::InputOrigin::System
-                        ) => {}
-                crate::input::Input::Continuation(continuation)
-                    if continuation.header.durability == crate::input::InputDurability::Derived
-                        && !continuation.header.visibility.transcript_eligible
-                        && !continuation.header.visibility.operator_eligible
-                        && matches!(
-                            continuation.header.source,
-                            crate::input::InputOrigin::System
-                        )
-                        && continuation.header.idempotency_key.is_none()
-                        && continuation.header.correlation_id.is_none() => {}
-                _ => {
-                    return Err(pre_0_8_10_input_import_error(
-                        runtime_id,
-                        input_id,
-                        "persisted input header origin/durability/visibility is outside the frozen corpus",
-                    ));
-                }
+                return Err(
+                    "state idempotency key does not match persisted input header idempotency key"
+                        .to_string(),
+                );
             }
         }
         if let Some(policy) = stored.state.policy.as_ref()
             && policy.version != policy.decision.policy_version
         {
-            return Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "policy snapshot version does not match decision policy_version",
-            ));
+            return Err(
+                "policy snapshot version does not match decision policy_version".to_string(),
+            );
         }
         Ok(())
     }
 
     fn authorize_pre_0_8_10_row(
-        runtime_id: &str,
-        input_id: &str,
         stored: StoredInputState,
-    ) -> Result<InputStatePersistenceRecord, rusqlite::Error> {
+    ) -> Result<InputStatePersistenceRecord, String> {
         InputStatePersistenceRecord::from_machine_snapshot(stored)
-            .map_err(|error| pre_0_8_10_input_import_error(runtime_id, input_id, error))
     }
 
-    fn validate_pre_0_8_10_lifecycle(
-        runtime_id: &str,
-        input_id: &str,
+    /// Structural coherence of one input's recorded history.
+    ///
+    /// DELIBERATELY NOT A LIFECYCLE ENUMERATION. The predecessor of this
+    /// function listed exact attempt counts, history lengths and reason
+    /// strings, and every one of those constants had been read off this
+    /// repository's current source rather than off bytes any release wrote.
+    /// A real 0.7.x row records `ResolveStagedRollback` and `Abandon` where
+    /// the enumeration demanded `RollbackStaged` and
+    /// `RollbackStaged\u{2192}Abandon(attempts=3)`, so the enumeration
+    /// refused every realm it existed to rescue.
+    ///
+    /// What remains is true of any writer of this table: the chain is
+    /// non-empty, each entry continues its predecessor, time does not run
+    /// backwards, and the tail is the row's own current state. Which phases
+    /// and reasons are legal is the generated machine authority's question,
+    /// and it answers it when the row is authorized.
+    ///
+    /// Returns the initial history timestamp so a caller can detect two rows
+    /// in one runtime claiming the same admission instant.
+    fn validate_pre_0_8_10_history_coherence(
         stored: &StoredInputState,
-    ) -> Result<chrono::DateTime<chrono::Utc>, rusqlite::Error> {
-        if stored.state.recovery_count != 0 {
-            return Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "input recovery_count is outside the frozen zero-recovery corpus",
-            ));
-        }
+    ) -> Result<chrono::DateTime<chrono::Utc>, String> {
         let history = &stored.state.history;
-        let first = history.first().ok_or_else(|| {
-            pre_0_8_10_input_import_error(runtime_id, input_id, "input history is empty")
-        })?;
-        if first.from != crate::input_state::InputLifecycleState::Accepted
-            || first.to != crate::input_state::InputLifecycleState::Queued
-            || first.reason.as_deref() != Some("QueueAccepted")
-        {
-            return Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "input history does not start with exact Accepted -> Queued QueueAccepted",
-            ));
-        }
+        let first = history
+            .first()
+            .ok_or_else(|| "input history is empty".to_string())?;
         for pair in history.windows(2) {
             if pair[0].to != pair[1].from || pair[0].timestamp > pair[1].timestamp {
-                return Err(pre_0_8_10_input_import_error(
-                    runtime_id,
-                    input_id,
-                    "input history is not a coherent monotonic lifecycle chain",
-                ));
+                return Err("input history is not a coherent monotonic lifecycle chain".to_string());
             }
         }
         let Some(last) = history.last() else {
-            return Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "input history lost its validated non-empty tail",
-            ));
+            return Err("input history lost its validated non-empty tail".to_string());
         };
         if last.to != stored.seed.phase || last.timestamp != stored.state.updated_at {
-            return Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "input history tail does not bind current_state and updated_at",
-            ));
+            return Err(
+                "input history tail does not bind current_state and updated_at".to_string(),
+            );
         }
         if stored.state.created_at > first.timestamp {
-            return Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "input created_at is after its initial QueueAccepted history entry",
-            ));
+            return Err("input created_at is after its initial history entry".to_string());
         }
         if stored
             .state
@@ -1155,165 +460,122 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
             .as_ref()
             .is_some_and(|input| input.header().timestamp > stored.state.created_at)
         {
-            return Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "persisted input header timestamp is after state created_at",
-            ));
-        }
-
-        use crate::input_state::{InputAbandonReason, InputLifecycleState, InputTerminalOutcome};
-        match stored.seed.phase {
-            InputLifecycleState::Queued => {
-                if stored.seed.terminal_outcome.is_some()
-                    || stored.seed.last_run_id.is_some()
-                    || stored.seed.last_boundary_sequence.is_some()
-                    || stored.seed.attempt_count >= 3
-                    || history.len() != 1 + 2 * stored.seed.attempt_count as usize
-                {
-                    return Err(pre_0_8_10_input_import_error(
-                        runtime_id,
-                        input_id,
-                        "queued input carries non-corpus lifecycle facts",
-                    ));
-                }
-                for attempt in 0..stored.seed.attempt_count as usize {
-                    let staged = &history[1 + attempt * 2];
-                    let rolled_back = &history[2 + attempt * 2];
-                    let staged_run_id = staged
-                        .reason
-                        .as_deref()
-                        .and_then(|reason| reason.strip_prefix("StageForRun("))
-                        .and_then(|reason| reason.strip_suffix(')'));
-                    if staged.from != InputLifecycleState::Queued
-                        || staged.to != InputLifecycleState::Staged
-                        || staged_run_id.is_none_or(|run_id| uuid::Uuid::parse_str(run_id).is_err())
-                        || rolled_back.from != InputLifecycleState::Staged
-                        || rolled_back.to != InputLifecycleState::Queued
-                        || rolled_back.reason.as_deref() != Some("RollbackStaged")
-                    {
-                        return Err(pre_0_8_10_input_import_error(
-                            runtime_id,
-                            input_id,
-                            "queued input retry history is outside the frozen corpus",
-                        ));
-                    }
-                }
-            }
-            InputLifecycleState::Consumed => {
-                let phases = [
-                    (InputLifecycleState::Accepted, InputLifecycleState::Queued),
-                    (InputLifecycleState::Queued, InputLifecycleState::Staged),
-                    (InputLifecycleState::Staged, InputLifecycleState::Applied),
-                    (
-                        InputLifecycleState::Applied,
-                        InputLifecycleState::AppliedPendingConsumption,
-                    ),
-                    (
-                        InputLifecycleState::AppliedPendingConsumption,
-                        InputLifecycleState::Consumed,
-                    ),
-                ];
-                let run_id = stored
-                    .seed
-                    .last_run_id
-                    .as_ref()
-                    .map(std::string::ToString::to_string);
-                if stored.seed.attempt_count != 1
-                    || stored.seed.terminal_outcome != Some(InputTerminalOutcome::Consumed)
-                    || stored.seed.last_run_id.is_none()
-                    || stored.seed.last_boundary_sequence != Some(0)
-                    || history.len() != phases.len()
-                    || !history
-                        .iter()
-                        .zip(phases)
-                        .all(|(entry, (from, to))| entry.from == from && entry.to == to)
-                    || history[1].reason.as_deref()
-                        != run_id
-                            .as_deref()
-                            .map(|run_id| format!("StageForRun({run_id})"))
-                            .as_deref()
-                    || history[2].reason.as_deref()
-                        != run_id
-                            .as_deref()
-                            .map(|run_id| format!("MarkApplied({run_id})"))
-                            .as_deref()
-                    || history[3].reason.as_deref()
-                        != Some("MarkAppliedPendingConsumption(boundary_sequence=0)")
-                    || history[4].reason.as_deref() != Some("Consume")
-                {
-                    return Err(pre_0_8_10_input_import_error(
-                        runtime_id,
-                        input_id,
-                        "consumed input lifecycle is outside the frozen corpus",
-                    ));
-                }
-            }
-            InputLifecycleState::Abandoned => {
-                if stored.seed.attempt_count != 3
-                    || !matches!(
-                        stored.seed.terminal_outcome,
-                        Some(InputTerminalOutcome::Abandoned {
-                            reason: InputAbandonReason::MaxAttemptsExhausted { attempts: 3 }
-                        })
-                    )
-                    || stored.seed.last_run_id.is_none()
-                    || stored.seed.last_boundary_sequence.is_some()
-                    || history.len() != 7
-                {
-                    return Err(pre_0_8_10_input_import_error(
-                        runtime_id,
-                        input_id,
-                        "abandoned input lifecycle is outside the frozen corpus",
-                    ));
-                }
-                for attempt in 0..3 {
-                    let staged = &history[1 + attempt * 2];
-                    let completed = &history[2 + attempt * 2];
-                    let staged_run_id = staged
-                        .reason
-                        .as_deref()
-                        .and_then(|reason| reason.strip_prefix("StageForRun("))
-                        .and_then(|reason| reason.strip_suffix(')'));
-                    let expected_to = if attempt == 2 {
-                        InputLifecycleState::Abandoned
-                    } else {
-                        InputLifecycleState::Queued
-                    };
-                    if staged.from != InputLifecycleState::Queued
-                        || staged.to != InputLifecycleState::Staged
-                        || staged_run_id.is_none_or(|run_id| uuid::Uuid::parse_str(run_id).is_err())
-                        || completed.from != InputLifecycleState::Staged
-                        || completed.to != expected_to
-                        || (attempt < 2 && completed.reason.as_deref() != Some("RollbackStaged"))
-                        || (attempt == 2
-                            && (completed.reason.as_deref()
-                                != Some("RollbackStaged\u{2192}Abandon(attempts=3)")
-                                || staged_run_id
-                                    != stored
-                                        .seed
-                                        .last_run_id
-                                        .as_ref()
-                                        .map(std::string::ToString::to_string)
-                                        .as_deref()))
-                    {
-                        return Err(pre_0_8_10_input_import_error(
-                            runtime_id,
-                            input_id,
-                            "abandoned input retry history is outside the frozen corpus",
-                        ));
-                    }
-                }
-            }
-            other => {
-                return Err(pre_0_8_10_input_import_error(
-                    runtime_id,
-                    input_id,
-                    format!("non-corpus input lifecycle phase {other:?}"),
-                ));
-            }
+            return Err("persisted input header timestamp is after state created_at".to_string());
         }
         Ok(first.timestamp)
+    }
+
+    /// JSON paths this bridge declares it rewrites, so the loss check below
+    /// does not read a declared rewrite as a loss.
+    ///
+    /// - the version stamp is re-issued by the current encoder;
+    /// - a legacy text-only prompt's `text` owner becomes `content`, and the
+    ///   rename is separately proven value-preserving by the caller.
+    ///
+    /// `runtime_semantics` is deliberately NOT exempt even though the
+    /// generated admission authority re-stamps it. Exempting it would let a
+    /// stored stamp be silently replaced whenever it differed in a subfield
+    /// the authority comparison ignores, which is a silent rewrite of durable
+    /// state. The authority may add subfields an older writer never stored;
+    /// it may not change one this file already carries.
+    const PRE_0_8_10_DECLARED_REWRITE_PATHS: &[&str] =
+        &["stored_input_state_version", "persisted_input.text"];
+
+    /// Prove that re-encoding a pre-0.8.10 row loses nothing durable.
+    ///
+    /// This is the field-level admission oracle, and it is derived from the
+    /// bytes in front of it rather than from a list somebody maintains. The
+    /// row is decoded through the current typed contract and re-encoded
+    /// canonically; serde silently drops any field the current types no
+    /// longer name, so a fact this binary cannot represent would vanish
+    /// without a word. So every scalar the SOURCE carries is required to
+    /// survive to the same path in the canonical output with the same value.
+    ///
+    /// Additions are allowed: the current encoding legitimately carries facts
+    /// the old one did not. Removals and value changes are not, except at
+    /// [`PRE_0_8_10_DECLARED_REWRITE_PATHS`].
+    ///
+    /// Returns `None` when nothing was lost, or the first offending path.
+    fn pre_0_8_10_carry_forward_loss(
+        source: &serde_json::Value,
+        canonical: &serde_json::Value,
+        path: &str,
+    ) -> Option<String> {
+        if PRE_0_8_10_DECLARED_REWRITE_PATHS.contains(&path) {
+            return None;
+        }
+        match (source, canonical) {
+            (serde_json::Value::Object(source), serde_json::Value::Object(canonical)) => {
+                for (key, value) in source {
+                    let child = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if PRE_0_8_10_DECLARED_REWRITE_PATHS.contains(&child.as_str()) {
+                        continue;
+                    }
+                    let Some(successor) = canonical.get(key) else {
+                        return Some(format!("`{child}` is not representable by this binary"));
+                    };
+                    if let Some(loss) = pre_0_8_10_carry_forward_loss(value, successor, &child) {
+                        return Some(loss);
+                    }
+                }
+                None
+            }
+            (serde_json::Value::Array(source), serde_json::Value::Array(canonical)) => {
+                if source.len() != canonical.len() {
+                    return Some(format!(
+                        "`{path}` changed length from {} to {}",
+                        source.len(),
+                        canonical.len()
+                    ));
+                }
+                source
+                    .iter()
+                    .zip(canonical)
+                    .enumerate()
+                    .find_map(|(index, (source, canonical))| {
+                        pre_0_8_10_carry_forward_loss(
+                            source,
+                            canonical,
+                            &format!("{path}[{index}]"),
+                        )
+                    })
+            }
+            (source, canonical) if pre_0_8_10_scalars_agree(source, canonical) => None,
+            (source, canonical) => Some(format!(
+                "`{path}` would change from {source} to {canonical}"
+            )),
+        }
+    }
+
+    /// Whether two scalars carry the same durable fact.
+    ///
+    /// Byte equality is the wrong test for one reason found in real released
+    /// bytes: a timestamp is stored in whatever sub-second precision its
+    /// writer emitted, and the current encoder re-emits the same instant with
+    /// trailing zero groups dropped (`10:00:00.000000Z` becomes `10:00:00Z`).
+    /// That is a rendering change, not a loss, and refusing a row over it
+    /// would repeat in miniature the mistake this whole path is fixing:
+    /// treating an artifact of the current writer as evidence about the file.
+    /// Two strings that parse to the same instant therefore agree; anything
+    /// else must match exactly.
+    fn pre_0_8_10_scalars_agree(source: &serde_json::Value, canonical: &serde_json::Value) -> bool {
+        if source == canonical {
+            return true;
+        }
+        let (Some(source), Some(canonical)) = (source.as_str(), canonical.as_str()) else {
+            return false;
+        };
+        match (
+            chrono::DateTime::parse_from_rfc3339(source),
+            chrono::DateTime::parse_from_rfc3339(canonical),
+        ) {
+            (Ok(source), Ok(canonical)) => source == canonical,
+            _ => false,
+        }
     }
 
     fn frozen_runtime_semantics_match(
@@ -1328,46 +590,34 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
     }
 
     fn generated_projection_for_pre_0_8_10_row(
-        runtime_id: &str,
-        input_id: &str,
         stored: &StoredInputState,
-    ) -> Result<crate::policy_table::GeneratedAdmissionProjection, rusqlite::Error> {
-        let input = stored.state.persisted_input.as_ref().ok_or_else(|| {
-            pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "released row has no persisted input for generated admission validation",
-            )
-        })?;
-        let policy = stored.state.policy.as_ref().ok_or_else(|| {
-            pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "released row has no policy snapshot",
-            )
-        })?;
-        let semantics = stored.state.runtime_semantics.ok_or_else(|| {
-            pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "released row has no runtime semantics stamp",
-            )
-        })?;
+    ) -> Result<crate::policy_table::GeneratedAdmissionProjection, String> {
+        let input = stored
+            .state
+            .persisted_input
+            .as_ref()
+            .ok_or("released row has no persisted input for generated admission validation")?;
+        let policy = stored
+            .state
+            .policy
+            .as_ref()
+            .ok_or("released row has no policy snapshot")?;
+        let semantics = stored
+            .state
+            .runtime_semantics
+            .ok_or("released row has no runtime semantics stamp")?;
         if input.header().visibility.transcript_eligible != policy.decision.record_transcript
             || input.header().visibility.operator_eligible != policy.decision.emit_operator_content
         {
-            return Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "persisted input visibility disagrees with the frozen policy projection",
-            ));
+            return Err(
+                "persisted input visibility disagrees with its own policy projection".to_string(),
+            );
         }
 
         let mut matched: Option<crate::policy_table::GeneratedAdmissionProjection> = None;
         for runtime_idle in [true, false] {
             let candidate =
-                crate::policy_table::generated_admission_projection_for_input(input, runtime_idle)
-                    .map_err(|error| pre_0_8_10_input_import_error(runtime_id, input_id, error))?;
+                crate::policy_table::generated_admission_projection_for_input(input, runtime_idle)?;
             if candidate.policy == policy.decision
                 && frozen_runtime_semantics_match(semantics, candidate.runtime_semantics)
             {
@@ -1375,21 +625,17 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
                     && (previous.policy != candidate.policy
                         || previous.runtime_semantics != candidate.runtime_semantics)
                 {
-                    return Err(pre_0_8_10_input_import_error(
-                        runtime_id,
-                        input_id,
-                        "released admission facts match multiple current generated projections",
-                    ));
+                    return Err(
+                        "released admission facts match multiple current generated projections"
+                            .to_string(),
+                    );
                 }
                 matched = Some(candidate);
             }
         }
         matched.ok_or_else(|| {
-            pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "released policy/runtime semantics disagree with generated admission authority",
-            )
+            "released policy/runtime semantics disagree with generated admission authority"
+                .to_string()
         })
     }
 
@@ -1400,23 +646,17 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
     }
 
     fn accept_pre_0_8_10_input_immediately(
-        runtime_id: &str,
-        input_id: &str,
         driver: &mut crate::driver::ephemeral::EphemeralRuntimeDriver,
         input: crate::input::Input,
-    ) -> Result<crate::accept::AcceptOutcome, rusqlite::Error> {
+    ) -> Result<crate::accept::AcceptOutcome, String> {
         let waker = std::task::Waker::from(Arc::new(PreFloorNoopWake));
         let mut context = std::task::Context::from_waker(&waker);
         let mut future = Box::pin(crate::traits::RuntimeDriver::accept_input(driver, input));
         match std::future::Future::poll(future.as_mut(), &mut context) {
-            std::task::Poll::Ready(result) => result.map_err(|error| {
-                pre_0_8_10_input_import_error(runtime_id, input_id, error.to_string())
-            }),
-            std::task::Poll::Pending => Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                "generated admission unexpectedly suspended during offline maintenance",
-            )),
+            std::task::Poll::Ready(result) => result.map_err(|error| error.to_string()),
+            std::task::Poll::Pending => Err(
+                "generated admission unexpectedly suspended during offline maintenance".to_string(),
+            ),
         }
     }
 
@@ -1424,40 +664,211 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
         runtime_id: String,
         input_id: String,
         source_bytes: Vec<u8>,
+        source_json: serde_json::Value,
         stored: StoredInputState,
     }
 
     fn register_pre_floor_idempotency_owner(
         owners: &mut HashSet<(String, String)>,
         runtime_id: &str,
-        input_id: &str,
         stored: &StoredInputState,
-    ) -> Result<(), rusqlite::Error> {
+    ) -> Result<(), String> {
         let Some(key) = stored.state.idempotency_key.as_ref() else {
             return Ok(());
         };
         if owners.insert((runtime_id.to_string(), key.to_string())) {
             Ok(())
         } else {
-            Err(pre_0_8_10_input_import_error(
-                runtime_id,
-                input_id,
-                format!("duplicate idempotency owner for key `{key}` within one runtime"),
+            Err(format!(
+                "duplicate idempotency owner for key `{key}` within one runtime"
             ))
         }
     }
 
-    /// Prepare exact pre-0.8.10 runtime input rows for the explicit offline
-    /// schema bridge.
+    /// What the admission oracle decided about one pre-0.8.10 input row.
+    enum PreFloorAdmission {
+        /// Carry the row forward by replacing its bytes with these.
+        Rewrite(Vec<u8>),
+        /// The row is already in the exact canonical current encoding.
+        AlreadyCanonical,
+        /// A queued row needs its recovery lane minted by the generated
+        /// admission authority before it can be authorized, and that runs
+        /// per-runtime after every row is read.
+        DeferQueuedLaneMint(Box<PreFloorQueuedRow>),
+    }
+
+    /// Decode one row through the current typed contract, prove nothing is
+    /// lost re-encoding it, and let the generated machine authority decide
+    /// whether it may be carried forward.
+    ///
+    /// ADMISSION IS NOT AN ENUMERATION. Every check here answers "would this
+    /// row be wrong or lossy after the bridge", and nothing here asks "have
+    /// I seen this exact shape before". The three authorities are the typed
+    /// decoder, the generated admission projection, and the machine seed
+    /// authority; the bridge adds only the field-loss proof, which is derived
+    /// from the row's own bytes.
+    fn admit_pre_0_8_10_row(
+        runtime_id: &str,
+        input_id: &str,
+        source_bytes: &[u8],
+        ledger_version: Option<i64>,
+        idempotency_owners: &mut HashSet<(String, String)>,
+    ) -> Result<PreFloorAdmission, String> {
+        let target_current = matches!(ledger_version, Some(2 | 3));
+        let source_json = parse_pre_0_8_10_json(source_bytes).map_err(|error| error.to_string())?;
+        let version = source_json
+            .as_object()
+            .ok_or("input-state row is not a JSON object")?
+            .get("stored_input_state_version")
+            .cloned();
+
+        let mut encoded = source_json.clone();
+        match version {
+            Some(version) => {
+                let version = version
+                    .as_u64()
+                    .ok_or("stored_input_state_version is not an unsigned integer")?;
+                match version {
+                    3 => {}
+                    5 if target_current => {
+                        // A file already at the current encoding is verified,
+                        // not rewritten: the row must already be exactly what
+                        // this binary would write.
+                        let stored: StoredInputState =
+                            serde_json::from_value(encoded).map_err(|error| error.to_string())?;
+                        validate_pre_0_8_10_row_identity(input_id, &stored)?;
+                        register_pre_floor_idempotency_owner(
+                            idempotency_owners,
+                            runtime_id,
+                            &stored,
+                        )?;
+                        let record = authorize_pre_0_8_10_row(stored)?;
+                        let canonical = serde_json::to_vec(record.as_stored())
+                            .map_err(|error| error.to_string())?;
+                        if canonical != source_bytes {
+                            return Err("target-v2 current row is not exact canonical v5 output"
+                                .to_string());
+                        }
+                        return Ok(PreFloorAdmission::AlreadyCanonical);
+                    }
+                    other => {
+                        return Err(format!(
+                            "stored input state version {other} is not admitted at runtime-store \
+                             ledger {ledger_version:?}"
+                        ));
+                    }
+                }
+            }
+            None => {
+                // The pre-v3 encoding named a text-only prompt's payload
+                // `text`. The rename is declared, and the loss check below
+                // proves it carried the same value across.
+                let row = encoded
+                    .as_object_mut()
+                    .ok_or("input-state row is not a JSON object")?;
+                let persisted_input = row
+                    .get_mut("persisted_input")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .ok_or("row has no persisted input object")?;
+                if persisted_input
+                    .get("input_type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("prompt")
+                {
+                    let text = persisted_input
+                        .remove("text")
+                        .ok_or("legacy prompt has no text owner")?;
+                    if !text.is_string() {
+                        return Err("legacy prompt text owner is not a string".to_string());
+                    }
+                    persisted_input.insert("content".to_string(), text);
+                }
+                row.insert(
+                    "stored_input_state_version".to_string(),
+                    serde_json::json!(3),
+                );
+            }
+        }
+
+        let stored: StoredInputState =
+            serde_json::from_value(encoded).map_err(|error| error.to_string())?;
+        validate_pre_0_8_10_row_identity(input_id, &stored)?;
+        register_pre_floor_idempotency_owner(idempotency_owners, runtime_id, &stored)?;
+        validate_pre_0_8_10_history_coherence(&stored)?;
+        // The generated authority owns `runtime_semantics`; this both proves
+        // the stored stamp agrees with it and produces the stamp to re-issue.
+        let projection = generated_projection_for_pre_0_8_10_row(&stored)?;
+        let mut stored = stored;
+        stored.state.runtime_semantics = Some(projection.runtime_semantics);
+
+        if stored.seed.phase == crate::input_state::InputLifecycleState::Queued
+            && stored.seed.recovery_lane.is_none()
+        {
+            return Ok(PreFloorAdmission::DeferQueuedLaneMint(Box::new(
+                PreFloorQueuedRow {
+                    runtime_id: runtime_id.to_string(),
+                    input_id: input_id.to_string(),
+                    source_bytes: source_bytes.to_vec(),
+                    source_json,
+                    stored,
+                },
+            )));
+        }
+
+        finish_pre_0_8_10_row(&source_json, stored).map(PreFloorAdmission::Rewrite)
+    }
+
+    /// Authorize a decoded row and prove the successor bytes lose nothing.
+    fn finish_pre_0_8_10_row(
+        source_json: &serde_json::Value,
+        stored: StoredInputState,
+    ) -> Result<Vec<u8>, String> {
+        let record = authorize_pre_0_8_10_row(stored)?;
+        let replacement_bytes =
+            serde_json::to_vec(record.as_stored()).map_err(|error| error.to_string())?;
+        let canonical_json: serde_json::Value =
+            serde_json::from_slice(&replacement_bytes).map_err(|error| error.to_string())?;
+        if let Some(loss) = pre_0_8_10_carry_forward_loss(source_json, &canonical_json, "") {
+            return Err(format!(
+                "carrying this row forward would lose durable state: {loss}"
+            ));
+        }
+        // The one declared rename must still carry its value.
+        let legacy_text = source_json
+            .get("persisted_input")
+            .and_then(|input| input.get("text"));
+        if let Some(text) = legacy_text {
+            let carried = canonical_json
+                .get("persisted_input")
+                .and_then(|input| input.get("content"));
+            if carried != Some(text) {
+                return Err(format!(
+                    "legacy prompt text {text} did not survive the rename to `content`"
+                ));
+            }
+        }
+        Ok(replacement_bytes)
+    }
+
+    /// Prepare pre-0.8.10 runtime input rows for the explicit offline schema
+    /// bridge.
     ///
     /// This callback must run while `bridge_unledgered_domain` owns an
-    /// immediate transaction. It accepts only the two shapes proven in the
-    /// affected pre-floor corpus: text-only prompts and simple continuations.
-    /// Every rewritten row is decoded through the current typed persistence
-    /// contract, authorized by the generated machine seed authority, encoded
-    /// canonically, and replaced behind an exact-byte fence. The callback only
-    /// rewrites durable bytes. It neither opens nor resumes a runtime, so
-    /// queued and other nonterminal rows are preserved without replay.
+    /// immediate transaction. Every row it carries forward is decoded through
+    /// the current typed persistence contract, checked field by field against
+    /// its own source bytes for durable loss, authorized by the generated
+    /// machine seed authority, encoded canonically, and replaced behind an
+    /// exact-byte fence. It neither opens nor resumes a runtime.
+    ///
+    /// REFUSAL IS PER ROW. A row this binary cannot represent is left exactly
+    /// as it was found - never deleted, never blanked - and named in
+    /// [`meerkat_sqlite::MaintenancePrepareReport::refused`] so the operator
+    /// learns which record stayed behind and why. Aborting the domain instead
+    /// would cost that operator every other session in the realm to protect
+    /// one row, which is the failure this bridge exists to end. Only
+    /// realm-level conditions (an unreadable ledger, a storage failure) still
+    /// refuse the whole domain, because under those the bridge cannot know
+    /// what it is looking at.
     pub fn prepare_pre_0_8_10_runtime_input_states(
         tx: &rusqlite::Transaction<'_>,
     ) -> Result<meerkat_sqlite::MaintenancePrepareReport, rusqlite::Error> {
@@ -1476,7 +887,6 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
                 format!("unsupported runtime-store ledger version {ledger_version:?}"),
             ));
         }
-        let target_current = matches!(ledger_version, Some(2 | 3));
         let rows = {
             let mut statement = tx.prepare(
                 "SELECT inputs.runtime_id, inputs.input_id, inputs.state_json,
@@ -1507,10 +917,21 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
         };
 
         let mut replacements = Vec::new();
+        let mut refused = Vec::<meerkat_sqlite::MaintenanceRecordRefusal>::new();
         let mut queued_by_runtime =
             std::collections::BTreeMap::<String, Vec<PreFloorQueuedRow>>::new();
         let mut queued_history_timestamps = HashSet::new();
         let mut idempotency_owners = HashSet::new();
+        let refuse =
+            |runtime_id: &str,
+             input_id: &str,
+             reason: String,
+             refused: &mut Vec<meerkat_sqlite::MaintenanceRecordRefusal>| {
+                refused.push(meerkat_sqlite::MaintenanceRecordRefusal {
+                    record: format!("runtime input {runtime_id}/{input_id}"),
+                    reason,
+                });
+            };
         for (
             runtime_id,
             input_id,
@@ -1521,237 +942,44 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
         ) in rows
         {
             if storage_class != "blob" {
-                return Err(pre_0_8_10_input_import_error(
+                refuse(
                     &runtime_id,
                     &input_id,
                     format!("state_json storage class is `{storage_class}`, expected `blob`"),
-                ));
+                    &mut refused,
+                );
+                continue;
             }
             if !has_runtime_state || !has_session_snapshot {
-                return Err(pre_0_8_10_input_import_error(
+                refuse(
                     &runtime_id,
                     &input_id,
                     format!(
                         "owning runtime fragments are incomplete: runtime_state={has_runtime_state} session_snapshot={has_session_snapshot}"
                     ),
-                ));
-            }
-            let mut encoded: serde_json::Value =
-                parse_pre_0_8_10_json(&source_bytes).map_err(|error| {
-                    pre_0_8_10_input_import_error(&runtime_id, &input_id, error.to_string())
-                })?;
-            let version = encoded
-                .as_object()
-                .ok_or_else(|| {
-                    pre_0_8_10_input_import_error(
-                        &runtime_id,
-                        &input_id,
-                        "input-state row is not a JSON object",
-                    )
-                })?
-                .get("stored_input_state_version")
-                .cloned();
-
-            if let Some(version) = version {
-                let version = version.as_u64().ok_or_else(|| {
-                    pre_0_8_10_input_import_error(
-                        &runtime_id,
-                        &input_id,
-                        "stored_input_state_version is not an unsigned integer",
-                    )
-                })?;
-                match version {
-                    3 => {
-                        validate_pre_0_8_10_wire_shape(&runtime_id, &input_id, &encoded, true)?;
-                        let stored: StoredInputState =
-                            serde_json::from_value(encoded).map_err(|error| {
-                                pre_0_8_10_input_import_error(
-                                    &runtime_id,
-                                    &input_id,
-                                    error.to_string(),
-                                )
-                            })?;
-                        validate_pre_0_8_10_row_identity(&runtime_id, &input_id, &stored)?;
-                        register_pre_floor_idempotency_owner(
-                            &mut idempotency_owners,
-                            &runtime_id,
-                            &input_id,
-                            &stored,
-                        )?;
-                        validate_pre_0_8_10_lifecycle(&runtime_id, &input_id, &stored)?;
-                        if stored.seed.phase != crate::input_state::InputLifecycleState::Consumed
-                            || stored.seed.admission_sequence != Some(1_000_000_000)
-                        {
-                            return Err(pre_0_8_10_input_import_error(
-                                &runtime_id,
-                                &input_id,
-                                "released v3 row is not one of the frozen consumed prompt rows with exact admission sequence",
-                            ));
-                        }
-                        let projection = generated_projection_for_pre_0_8_10_row(
-                            &runtime_id,
-                            &input_id,
-                            &stored,
-                        )?;
-                        if stored.state.runtime_semantics != Some(projection.runtime_semantics) {
-                            return Err(pre_0_8_10_input_import_error(
-                                &runtime_id,
-                                &input_id,
-                                "released v3 runtime semantics are not exact generated output",
-                            ));
-                        }
-                        authorize_pre_0_8_10_row(&runtime_id, &input_id, stored)?;
-                    }
-                    5 if target_current => {
-                        let stored: StoredInputState =
-                            serde_json::from_value(encoded).map_err(|error| {
-                                pre_0_8_10_input_import_error(
-                                    &runtime_id,
-                                    &input_id,
-                                    error.to_string(),
-                                )
-                            })?;
-                        validate_pre_0_8_10_row_identity(&runtime_id, &input_id, &stored)?;
-                        register_pre_floor_idempotency_owner(
-                            &mut idempotency_owners,
-                            &runtime_id,
-                            &input_id,
-                            &stored,
-                        )?;
-                        let record = authorize_pre_0_8_10_row(&runtime_id, &input_id, stored)?;
-                        let canonical =
-                            serde_json::to_vec(record.as_stored()).map_err(|error| {
-                                pre_0_8_10_input_import_error(
-                                    &runtime_id,
-                                    &input_id,
-                                    error.to_string(),
-                                )
-                            })?;
-                        if canonical != source_bytes {
-                            return Err(pre_0_8_10_input_import_error(
-                                &runtime_id,
-                                &input_id,
-                                "target-v2 current row is not exact canonical v5 output",
-                            ));
-                        }
-                    }
-                    other => {
-                        return Err(pre_0_8_10_input_import_error(
-                            &runtime_id,
-                            &input_id,
-                            format!(
-                                "stored input state version {other} is not admitted at runtime-store ledger {ledger_version:?}"
-                            ),
-                        ));
-                    }
-                }
+                    &mut refused,
+                );
                 continue;
             }
-
-            validate_pre_0_8_10_wire_shape(&runtime_id, &input_id, &encoded, false)?;
-            let row = encoded.as_object_mut().ok_or_else(|| {
-                pre_0_8_10_input_import_error(
-                    &runtime_id,
-                    &input_id,
-                    "input-state row is not a JSON object",
-                )
-            })?;
-            let persisted_input = row
-                .get_mut("persisted_input")
-                .and_then(serde_json::Value::as_object_mut)
-                .ok_or_else(|| {
-                    pre_0_8_10_input_import_error(
-                        &runtime_id,
-                        &input_id,
-                        "row has no persisted input object",
-                    )
-                })?;
-            match persisted_input
-                .get("input_type")
-                .and_then(serde_json::Value::as_str)
-            {
-                Some("prompt") => {
-                    let text = persisted_input.remove("text").ok_or_else(|| {
-                        pre_0_8_10_input_import_error(
-                            &runtime_id,
-                            &input_id,
-                            "legacy prompt has no text owner",
-                        )
-                    })?;
-                    if !text.is_string() {
-                        return Err(pre_0_8_10_input_import_error(
-                            &runtime_id,
-                            &input_id,
-                            "legacy prompt text owner is not a string",
-                        ));
-                    }
-                    persisted_input.insert("content".to_string(), text);
-                }
-                Some("continuation") => {}
-                Some(other) => {
-                    return Err(pre_0_8_10_input_import_error(
-                        &runtime_id,
-                        &input_id,
-                        format!("input type `{other}` is outside the frozen recovery corpus"),
-                    ));
-                }
-                None => {
-                    return Err(pre_0_8_10_input_import_error(
-                        &runtime_id,
-                        &input_id,
-                        "persisted input has no input_type discriminator",
-                    ));
-                }
-            }
-            row.insert(
-                "stored_input_state_version".to_string(),
-                serde_json::json!(3),
-            );
-
-            let stored: StoredInputState = serde_json::from_value(encoded).map_err(|error| {
-                pre_0_8_10_input_import_error(&runtime_id, &input_id, error.to_string())
-            })?;
-            validate_pre_0_8_10_row_identity(&runtime_id, &input_id, &stored)?;
-            register_pre_floor_idempotency_owner(
-                &mut idempotency_owners,
+            match admit_pre_0_8_10_row(
                 &runtime_id,
                 &input_id,
-                &stored,
-            )?;
-            let initial_queue_timestamp =
-                validate_pre_0_8_10_lifecycle(&runtime_id, &input_id, &stored)?;
-            let projection =
-                generated_projection_for_pre_0_8_10_row(&runtime_id, &input_id, &stored)?;
-            let mut stored = stored;
-            stored.state.runtime_semantics = Some(projection.runtime_semantics);
-
-            if stored.seed.phase == crate::input_state::InputLifecycleState::Queued {
-                if !queued_history_timestamps.insert((runtime_id.clone(), initial_queue_timestamp))
-                {
-                    return Err(pre_0_8_10_input_import_error(
-                        &runtime_id,
-                        &input_id,
-                        "duplicate initial QueueAccepted timestamp within one runtime",
-                    ));
+                &source_bytes,
+                ledger_version,
+                &mut idempotency_owners,
+            ) {
+                Ok(PreFloorAdmission::AlreadyCanonical) => {}
+                Ok(PreFloorAdmission::Rewrite(replacement_bytes)) => {
+                    replacements.push((runtime_id, input_id, source_bytes, replacement_bytes));
                 }
-                queued_by_runtime
-                    .entry(runtime_id.clone())
-                    .or_default()
-                    .push(PreFloorQueuedRow {
-                        runtime_id,
-                        input_id,
-                        source_bytes,
-                        stored,
-                    });
-                continue;
+                Ok(PreFloorAdmission::DeferQueuedLaneMint(queued)) => {
+                    queued_by_runtime
+                        .entry(runtime_id)
+                        .or_default()
+                        .push(*queued);
+                }
+                Err(reason) => refuse(&runtime_id, &input_id, reason, &mut refused),
             }
-
-            let replacement = authorize_pre_0_8_10_row(&runtime_id, &input_id, stored)?;
-            let replacement_bytes =
-                serde_json::to_vec(replacement.as_stored()).map_err(|error| {
-                    pre_0_8_10_input_import_error(&runtime_id, &input_id, error.to_string())
-                })?;
-            replacements.push((runtime_id, input_id, source_bytes, replacement_bytes));
         }
 
         for (runtime_id, mut queued) in queued_by_runtime {
@@ -1759,123 +987,34 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
             let mut driver = crate::driver::ephemeral::EphemeralRuntimeDriver::new(
                 crate::identifiers::LogicalRuntimeId::new(runtime_id.clone()),
             );
-            for mut queued in queued {
-                let input = queued
-                    .stored
-                    .state
-                    .persisted_input
-                    .as_ref()
-                    .ok_or_else(|| {
-                        pre_0_8_10_input_import_error(
-                            &queued.runtime_id,
-                            &queued.input_id,
-                            "validated queued row lost its persisted input",
-                        )
-                    })?
-                    .clone();
-                let durable_policy = queued
-                    .stored
-                    .state
-                    .policy
-                    .as_ref()
-                    .ok_or_else(|| {
-                        pre_0_8_10_input_import_error(
-                            &queued.runtime_id,
-                            &queued.input_id,
-                            "validated queued row lost its policy snapshot",
-                        )
-                    })?
-                    .decision
-                    .clone();
-                let durable_semantics = queued.stored.state.runtime_semantics.ok_or_else(|| {
-                    pre_0_8_10_input_import_error(
-                        &queued.runtime_id,
-                        &queued.input_id,
-                        "validated queued row lost its runtime semantics",
-                    )
-                })?;
-                let outcome = accept_pre_0_8_10_input_immediately(
-                    &queued.runtime_id,
-                    &queued.input_id,
+            for queued in queued {
+                match mint_pre_0_8_10_queued_lane(
                     &mut driver,
-                    input.clone(),
-                )?;
-                let crate::accept::AcceptOutcome::Accepted {
-                    input_id: admitted_input_id,
-                    policy,
-                    state,
-                    seed,
-                } = outcome
-                else {
-                    return Err(pre_0_8_10_input_import_error(
-                        &queued.runtime_id,
-                        &queued.input_id,
-                        "generated admission did not accept the frozen queued input",
-                    ));
-                };
-                let emitted_semantics = state.runtime_semantics.ok_or_else(|| {
-                    pre_0_8_10_input_import_error(
-                        &queued.runtime_id,
-                        &queued.input_id,
-                        "generated admission emitted no runtime semantics",
-                    )
-                })?;
-                let predecessor_lane = crate::accept::handling_mode_from_policy(&durable_policy);
-                let requested_lane = input
-                    .handling_mode()
-                    .unwrap_or(meerkat_core::types::HandlingMode::Queue);
-                // These lane comparisons authenticate agreement among the
-                // frozen policy, input request, and generated result. They do
-                // not mint successor authority: the only lane and sequence
-                // copied below come from the generated driver's seed.
-                if admitted_input_id != queued.stored.state.input_id
-                    || policy != durable_policy
-                    || emitted_semantics != durable_semantics
-                    || requested_lane != predecessor_lane
-                    || seed.phase != crate::input_state::InputLifecycleState::Queued
-                    || seed.attempt_count != 0
-                    || seed.terminal_outcome.is_some()
-                    || seed.last_run_id.is_some()
-                    || seed.last_boundary_sequence.is_some()
-                    || seed.recovery_lane != Some(predecessor_lane)
-                    || seed.admission_sequence.is_none()
-                {
-                    return Err(pre_0_8_10_input_import_error(
-                        &queued.runtime_id,
-                        &queued.input_id,
-                        "generated admission witnesses disagree with frozen policy, semantics, identity, or lane",
-                    ));
+                    &mut queued_history_timestamps,
+                    &queued,
+                ) {
+                    Ok(replacement_bytes) => replacements.push((
+                        queued.runtime_id,
+                        queued.input_id,
+                        queued.source_bytes,
+                        replacement_bytes,
+                    )),
+                    Err(reason) => {
+                        refuse(&queued.runtime_id, &queued.input_id, reason, &mut refused);
+                    }
                 }
-                queued.stored.seed.recovery_lane = seed.recovery_lane;
-                queued.stored.seed.admission_sequence = seed.admission_sequence;
-                let replacement =
-                    authorize_pre_0_8_10_row(&queued.runtime_id, &queued.input_id, queued.stored)?;
-                let replacement_bytes =
-                    serde_json::to_vec(replacement.as_stored()).map_err(|error| {
-                        pre_0_8_10_input_import_error(
-                            &queued.runtime_id,
-                            &queued.input_id,
-                            error.to_string(),
-                        )
-                    })?;
-                replacements.push((
-                    queued.runtime_id,
-                    queued.input_id,
-                    queued.source_bytes,
-                    replacement_bytes,
-                ));
             }
         }
 
         let changed = replacements.len();
         for (runtime_id, input_id, source_bytes, replacement_bytes) in replacements {
-            let changed = tx.execute(
+            let updated = tx.execute(
                 "UPDATE runtime_input_states
                  SET state_json = ?1
                  WHERE runtime_id = ?2 AND input_id = ?3 AND state_json = ?4",
                 params![replacement_bytes, &runtime_id, &input_id, &source_bytes],
             )?;
-            if changed != 1 {
+            if updated != 1 {
                 return Err(pre_0_8_10_input_import_error(
                     &runtime_id,
                     &input_id,
@@ -1896,7 +1035,93 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
                 ));
             }
         }
-        Ok(meerkat_sqlite::MaintenancePrepareReport { changed })
+        Ok(meerkat_sqlite::MaintenancePrepareReport { changed, refused })
+    }
+
+    /// Mint the generated recovery lane a queued pre-0.8.10 row never stored.
+    ///
+    /// The lane is the only fact taken from the replay. An admission sequence
+    /// the row already carries is kept: the stored order is the order the
+    /// operator's runtime actually admitted these inputs, and re-minting it
+    /// would silently reorder their queue.
+    fn mint_pre_0_8_10_queued_lane(
+        driver: &mut crate::driver::ephemeral::EphemeralRuntimeDriver,
+        queued_history_timestamps: &mut HashSet<(String, chrono::DateTime<chrono::Utc>)>,
+        queued: &PreFloorQueuedRow,
+    ) -> Result<Vec<u8>, String> {
+        let initial_queue_timestamp = queued
+            .stored
+            .state
+            .history
+            .first()
+            .map(|entry| entry.timestamp)
+            .ok_or("validated queued row lost its history")?;
+        if !queued_history_timestamps.insert((queued.runtime_id.clone(), initial_queue_timestamp)) {
+            return Err(
+                "duplicate initial queue-admission timestamp within one runtime".to_string(),
+            );
+        }
+        let input = queued
+            .stored
+            .state
+            .persisted_input
+            .as_ref()
+            .ok_or("validated queued row lost its persisted input")?
+            .clone();
+        let durable_policy = queued
+            .stored
+            .state
+            .policy
+            .as_ref()
+            .ok_or("validated queued row lost its policy snapshot")?
+            .decision
+            .clone();
+        let durable_semantics = queued
+            .stored
+            .state
+            .runtime_semantics
+            .ok_or("validated queued row lost its runtime semantics")?;
+        let outcome = accept_pre_0_8_10_input_immediately(driver, input.clone())?;
+        let crate::accept::AcceptOutcome::Accepted {
+            input_id: admitted_input_id,
+            policy,
+            state,
+            seed,
+        } = outcome
+        else {
+            return Err("generated admission did not accept this queued input".to_string());
+        };
+        let emitted_semantics = state
+            .runtime_semantics
+            .ok_or("generated admission emitted no runtime semantics")?;
+        let predecessor_lane = crate::accept::handling_mode_from_policy(&durable_policy);
+        let requested_lane = input
+            .handling_mode()
+            .unwrap_or(meerkat_core::types::HandlingMode::Queue);
+        // These lane comparisons authenticate agreement among the durable
+        // policy, input request, and generated result. They do not mint
+        // successor authority: the only lane copied below comes from the
+        // generated driver's seed.
+        if admitted_input_id != queued.stored.state.input_id
+            || policy != durable_policy
+            || emitted_semantics != durable_semantics
+            || requested_lane != predecessor_lane
+            || seed.phase != crate::input_state::InputLifecycleState::Queued
+            || seed.recovery_lane != Some(predecessor_lane)
+            || seed.admission_sequence.is_none()
+        {
+            return Err(
+                "generated admission witnesses disagree with stored policy, semantics, identity, \
+                 or lane"
+                    .to_string(),
+            );
+        }
+        let mut stored = queued.stored.clone();
+        stored.seed.recovery_lane = seed.recovery_lane;
+        if stored.seed.admission_sequence.is_none() {
+            stored.seed.admission_sequence = seed.admission_sequence;
+        }
+        finish_pre_0_8_10_row(&queued.source_json, stored)
     }
 
     fn migration_0001_runtime_schema(
@@ -2753,6 +1978,38 @@ END";
         Ok(())
     }
 
+    /// True when this migration is running under the explicit pre-0.8.10
+    /// rescue, over a file that never carried a ledger row.
+    ///
+    /// The answer is a fact about the file, not an ambient mode.
+    /// `bridge_unledgered_domain` stamps the domain's ledger row only after
+    /// every migration has run, so an absent row observed from inside a
+    /// migration is exact evidence that this file arrived through the rescue:
+    /// `apply_domain_migrations` initializes a fresh domain rather than
+    /// migrating it, and refuses an unledgered one that owns objects, so its
+    /// migrations only ever run with the row already present.
+    ///
+    /// It matters because a rescue's contract is not an upgrade's. Under the
+    /// rescue [`prepare_pre_0_8_10_runtime_input_states`] is the sole authority
+    /// over row content: it carries every row it can prove lossless and leaves
+    /// every other row's bytes exactly as it found them, naming each one to the
+    /// operator. The released-row importers below must therefore neither
+    /// rewrite what the preparation refused nor delete an ingress payload the
+    /// same run reported as carried forward.
+    fn pre_0_8_10_rescue_in_progress(
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<bool, rusqlite::Error> {
+        meerkat_sqlite::domain_version(tx, RUNTIME_STORE_DOMAIN.name)
+            .map(|version| version.is_none())
+            .map_err(|error| {
+                pre_0_8_10_input_import_error(
+                    RUNTIME_STORE_DOMAIN.name,
+                    "<ledger>",
+                    error.to_string(),
+                )
+            })
+    }
+
     /// Retire 0.8.10 ingress payloads whose released machine seed is already
     /// terminal and whose row carries no unfinished completion/publication
     /// obligation.
@@ -2764,9 +2021,25 @@ END";
     /// current replacement is encoded, and the update is exact-byte fenced
     /// inside the same migration transaction. Directed rows without an outbox,
     /// malformed directed carriers, and pending terminal sagas retain content.
+    ///
+    /// A rescued realm keeps its ingress payloads outright; see
+    /// [`pre_0_8_10_rescue_in_progress`].
     fn retire_released_terminal_input_payloads(
         tx: &rusqlite::Transaction<'_>,
     ) -> Result<(), rusqlite::Error> {
+        // An upgrade may reclaim this space because the binary that wrote the
+        // row already retires payloads at the terminal transition, so the
+        // operator loses nothing they still had. A realm from before the
+        // durable-state floor is a different case: its rows are being carried
+        // across by an explicit rescue that reports what it carried, and
+        // deleting the operator's own prompt while reporting success is the
+        // failure that rescue exists to avoid. The retained payload stays a
+        // legal shape at this version - a directed terminal row without its
+        // outbox keeps content here too - and the row is terminal, so no later
+        // transition will retire it behind the operator's back either.
+        if pre_0_8_10_rescue_in_progress(tx)? {
+            return Ok(());
+        }
         let migration_data_error = |runtime_id: &str, input_id: &str, detail: String| {
             rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2851,9 +2124,22 @@ END";
     /// Instruction-like continuations become ordinary ordered System appends
     /// using the frozen 0.8.10 visible rendering. Existing `turn_append`
     /// already owns the current representation and wins unchanged.
+    ///
+    /// This does not run under the pre-0.8.10 rescue; see
+    /// [`pre_0_8_10_rescue_in_progress`].
     fn migrate_released_context_append_input_payloads(
         tx: &rusqlite::Transaction<'_>,
     ) -> Result<(), rusqlite::Error> {
+        // Under the rescue every row that still carries `context_append` is a
+        // row the preparation callback refused: the field has no owner in the
+        // current typed contract, so that row's carry-forward loss check cannot
+        // pass, and the operator has already been told those exact bytes were
+        // left untouched on disk. Rewriting them here would make that report
+        // false. If the preparation ever learns to carry such a row itself,
+        // this guard must be revisited with it.
+        if pre_0_8_10_rescue_in_progress(tx)? {
+            return Ok(());
+        }
         let migration_data_error = |runtime_id: &str, input_id: &str, detail: String| {
             rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2993,9 +2279,14 @@ END";
     ) -> Result<(), rusqlite::Error> {
         // Some exact pre-ledger predecessors were last opened before mob host
         // persistence added these idempotent base tables. Materialize them in
-        // the version-2 transaction so both authenticated version-1 catalogs
-        // converge on the same current schema.
+        // the version-2 transaction so every authenticated version-1 catalog
+        // converges on the same current schema.
         tx.execute_batch(CREATE_RUNTIME_MOB_HOST_SCHEMA_SQL)?;
+        // The 0.7.x pre-ledger opener predates both of these base tables as
+        // well. Same idempotent materialization, same reason; the version-1
+        // initializer already creates them, so a fresh build is unaffected and
+        // the released 0.8.10 and pre-mob-host catalogs see a no-op.
+        tx.execute_batch(CREATE_PRE_LEDGER_0_7_BACKFILL_SCHEMA_SQL)?;
         migrate_released_context_append_input_payloads(tx)?;
         retire_released_terminal_input_payloads(tx)?;
         tx.execute_batch(CREATE_RUNTIME_SESSION_AUTHORITY_SQL)?;
@@ -3139,10 +2430,47 @@ END";
         },
     ];
 
+    const PRE_LEDGER_0_7_RUNTIME_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "runtime_input_states",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "runtime_boundary_receipts",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "runtime_session_snapshots",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "runtime_states",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "runtime_ops_lifecycle",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "runtime_auth_oauth_flow_state",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "runtime_projection_quarantine",
+        },
+    ];
+
     fn build_pre_mob_host_runtime_schema(
         tx: &rusqlite::Transaction<'_>,
     ) -> Result<(), rusqlite::Error> {
         tx.execute_batch(CREATE_PRE_MOB_HOST_RUNTIME_SCHEMA_SQL)
+    }
+
+    fn build_pre_ledger_0_7_runtime_schema(
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<(), rusqlite::Error> {
+        tx.execute_batch(CREATE_PRE_LEDGER_0_7_RUNTIME_SCHEMA_SQL)
     }
 
     fn verify_released_0_8_10_runtime_schema(conn: &Connection) -> Result<(), String> {
@@ -3156,17 +2484,27 @@ END";
             Err(error) => error,
         };
 
-        match meerkat_sqlite::verify_released_schema_fingerprint(
+        let pre_mob_error = match meerkat_sqlite::verify_released_schema_fingerprint(
             conn,
             &RUNTIME_STORE_DOMAIN,
             PRE_MOB_HOST_RUNTIME_OBJECTS,
             build_pre_mob_host_runtime_schema,
         ) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+
+        match meerkat_sqlite::verify_released_schema_fingerprint(
+            conn,
+            &RUNTIME_STORE_DOMAIN,
+            PRE_LEDGER_0_7_RUNTIME_OBJECTS,
+            build_pre_ledger_0_7_runtime_schema,
+        ) {
             Ok(()) => Ok(()),
-            Err(pre_mob_error) => Err(format!(
-                "catalog matches neither exact released 0.8.10 runtime schema \
-                 ({released_error}) nor \
-                 exact pre-mob-host runtime schema ({pre_mob_error})"
+            Err(pre_ledger_error) => Err(format!(
+                "catalog matches no exact released runtime schema: not 0.8.10 \
+                 ({released_error}); not pre-mob-host ({pre_mob_error}); not \
+                 pre-ledger 0.7.x ({pre_ledger_error})"
             )),
         }
     }
@@ -3174,7 +2512,13 @@ END";
     /// The runtime store's schema domain in the per-file migration ledger.
     /// (Co-tenants the sessions file in the sqlite realm backend.)
     ///
-    /// Version 1 is the complete schema published by 0.8.10. Version 2 is the
+    /// Version 1 is the complete schema published by 0.8.10. Three exact
+    /// physical catalogs authenticate as version 1, because the pre-ledger
+    /// opener grew tables without a version marker: the released 0.8.10
+    /// 11-table shape, the 9-table pre-mob-host shape, and the 7-table
+    /// pre-ledger shape every 0.7.x release wrote. Version 2 materializes the
+    /// base tables the two older shapes never created, so all three converge.
+    /// Version 2 is the
     /// single 0.8.11 upgrade: it installs the current head-canonical authority,
     /// exact boundary and recovery witnesses, a one-time allowlist of exact
     /// released boundary receipts, bounded recovery indexes, idempotency
@@ -3211,6 +2555,7 @@ END";
         ],
         initialize_current: initialize_current_runtime_schema,
         allowed_existing_versions: &[1, 2, 3],
+        bridge_recoverable_versions: &[1],
         released_predecessors: &[
             meerkat_sqlite::SchemaPredecessor {
                 version: 1,
@@ -3467,6 +2812,7 @@ END";
             }],
             initialize_current: migration_0001_runtime_delivery_inbox,
             allowed_existing_versions: &[1],
+            bridge_recoverable_versions: &[1],
             released_predecessors: &[],
             owned_objects: &[
                 meerkat_sqlite::SchemaObject {
@@ -3911,6 +3257,23 @@ END";
             .expect("insert row");
         }
 
+        /// The reason attached to the callback's single refusal.
+        ///
+        /// Every assertion below goes through this rather than
+        /// `expect_err`, because refusal is now per record: the callback
+        /// returns `Ok`, carries every row it can, and names the ones it
+        /// could not. A test that still demanded a whole-callback `Err` was
+        /// asserting the behaviour this fix removed.
+        fn sole_refusal(report: &meerkat_sqlite::MaintenancePrepareReport) -> String {
+            assert_eq!(
+                report.refused.len(),
+                1,
+                "expected exactly one refused record, got {:?}",
+                report.refused
+            );
+            report.refused[0].reason.clone()
+        }
+
         fn load_row(conn: &Connection, runtime_id: &str, input_id: &str) -> Vec<u8> {
             conn.query_row(
                 "SELECT state_json FROM runtime_input_states
@@ -3948,7 +3311,8 @@ END";
             let tx = conn.transaction().expect("tx");
             let report =
                 prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare exact corpus");
-            assert_eq!(report.changed, 3);
+            assert_eq!(report.changed, 4);
+            assert!(report.refused.is_empty(), "{:?}", report.refused);
             tx.commit().expect("commit");
 
             let prompt_bytes = load_row(&conn, "runtime", &prompt_id);
@@ -3987,11 +3351,67 @@ END";
                 continuation_bytes,
                 serde_json::to_vec(&continuation).expect("canonical continuation bytes")
             );
+            // A released v3 row is carried forward into the current
+            // encoding rather than left behind at its own version, and every
+            // durable fact it carried is still there afterwards.
+            let carried_v3 = load_row(&conn, "v3-runtime", &v3_id);
+            let source_v3: serde_json::Value =
+                serde_json::from_slice(&v3_bytes).expect("source v3 json");
+            let carried_v3_json: serde_json::Value =
+                serde_json::from_slice(&carried_v3).expect("carried v3 json");
+            assert_eq!(carried_v3_json["stored_input_state_version"], 5);
+            for field in [
+                "input_id",
+                "current_state",
+                "terminal_outcome",
+                "policy",
+                "attempt_count",
+                "recovery_count",
+                "admission_sequence",
+            ] {
+                assert_eq!(
+                    carried_v3_json[field], source_v3[field],
+                    "released v3 `{field}` must survive the bridge unchanged"
+                );
+            }
             assert_eq!(
-                load_row(&conn, "v3-runtime", &v3_id),
-                v3_bytes,
-                "released v3 rows remain byte-identical"
+                carried_v3_json["persisted_input"]["content"],
+                source_v3["persisted_input"]["content"],
+                "the operator's own prompt text must survive"
             );
+            assert_eq!(
+                carried_v3_json["persisted_input"]["header"]["id"],
+                source_v3["persisted_input"]["header"]["id"]
+            );
+            assert_eq!(
+                carried_v3_json["history"].as_array().map(Vec::len),
+                source_v3["history"].as_array().map(Vec::len),
+                "no history entry may be dropped"
+            );
+            for (carried, source) in carried_v3_json["history"]
+                .as_array()
+                .expect("carried history")
+                .iter()
+                .zip(source_v3["history"].as_array().expect("source history"))
+            {
+                assert_eq!(carried["reason"], source["reason"]);
+                assert_eq!(carried["from"], source["from"]);
+                assert_eq!(carried["to"], source["to"]);
+            }
+            // Timestamps are compared as instants: the current encoder drops
+            // trailing zero groups, which changes the rendering and not the
+            // fact.
+            for field in ["created_at", "updated_at"] {
+                let parse = |value: &serde_json::Value| {
+                    chrono::DateTime::parse_from_rfc3339(value.as_str().expect("timestamp string"))
+                        .expect("rfc3339 timestamp")
+                };
+                assert_eq!(
+                    parse(&carried_v3_json[field]),
+                    parse(&source_v3[field]),
+                    "released v3 `{field}` must name the same instant"
+                );
+            }
 
             let mut recovered = crate::driver::ephemeral::EphemeralRuntimeDriver::new(
                 crate::identifiers::LogicalRuntimeId::new("runtime"),
@@ -4018,8 +3438,15 @@ END";
             );
         }
 
+        /// One unrepresentable row costs only itself.
+        ///
+        /// The predecessor of this test asserted the opposite - that an
+        /// ambiguous row aborted the callback and left every sibling
+        /// unmigrated. That is the behaviour this fix removes: refusing a
+        /// whole realm to protect one row is a worse answer than carrying
+        /// the rest and naming what stayed behind.
         #[test]
-        fn maintenance_prepare_refuses_ambiguous_shape_before_any_row_mutation() {
+        fn maintenance_prepare_refuses_only_the_ambiguous_row_and_lands_its_sibling() {
             let mut conn = Connection::open_in_memory().expect("open");
             conn.execute_batch(CREATE_RUNTIME_SCHEMA_SQL)
                 .expect("runtime v1 schema");
@@ -4033,25 +3460,69 @@ END";
             insert_row(&conn, "z-runtime", &invalid_id, &invalid_source);
 
             let tx = conn.transaction().expect("tx");
-            let error = prepare_pre_0_8_10_runtime_input_states(&tx)
-                .expect_err("ambiguous prompt must refuse");
-            assert!(error.to_string().contains("unsupported fields"));
-            tx.commit()
-                .expect("validation failure must leave the transaction committable");
+            let report =
+                prepare_pre_0_8_10_runtime_input_states(&tx).expect("healthy sibling must land");
+            assert_eq!(report.changed, 1);
+            let reason = sole_refusal(&report);
+            assert!(
+                reason.contains("would lose durable state")
+                    && reason.contains("persisted_input.content"),
+                "unexpected ambiguity refusal: {reason}"
+            );
+            assert_eq!(
+                report.refused[0].record,
+                format!("runtime input z-runtime/{invalid_id}")
+            );
+            tx.commit().expect("per-record refusal still commits");
 
-            assert_eq!(load_row(&conn, "a-runtime", &valid_id), valid_source);
-            assert_eq!(load_row(&conn, "z-runtime", &invalid_id), invalid_source);
+            assert_ne!(
+                load_row(&conn, "a-runtime", &valid_id),
+                valid_source,
+                "the healthy row must be carried forward"
+            );
+            assert_eq!(
+                load_row(&conn, "z-runtime", &invalid_id),
+                invalid_source,
+                "a refused row's bytes are left exactly as found"
+            );
         }
 
+        /// Representability, not familiarity, decides admission.
+        ///
+        /// The predecessor of this test refused a continuation that carried
+        /// `request_id` because that key was absent from a hand-maintained
+        /// allow-list - even though `ContinuationInput::request_id` is an
+        /// ordinary field of the current type and survives the round trip
+        /// intact. Refusing state this binary can represent is loss for no
+        /// reason. What must still be refused is a payload whose facts this
+        /// binary would silently drop.
         #[test]
-        fn maintenance_prepare_refuses_non_simple_continuation_and_non_null_blocks() {
+        fn maintenance_prepare_admits_representable_sidecars_and_refuses_droppable_ones() {
+            let mut conn = Connection::open_in_memory().expect("open");
+            conn.execute_batch(CREATE_RUNTIME_SCHEMA_SQL)
+                .expect("runtime v1 schema");
+            let (input_id, source) = legacy_continuation_row();
+            let mut candidate: serde_json::Value =
+                serde_json::from_slice(&source).expect("candidate");
+            candidate["persisted_input"]["request_id"] = serde_json::json!("request-1");
+            let candidate = serde_json::to_vec(&candidate).expect("candidate bytes");
+            insert_row(&conn, "runtime", &input_id, &candidate);
+
+            let tx = conn.transaction().expect("tx");
+            let report = prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare");
+            assert_eq!(report.changed, 1);
+            assert!(report.refused.is_empty(), "{:?}", report.refused);
+            tx.commit().expect("commit");
+            let carried: serde_json::Value =
+                serde_json::from_slice(&load_row(&conn, "runtime", &input_id))
+                    .expect("carried json");
+            assert_eq!(
+                carried["persisted_input"]["request_id"],
+                serde_json::json!("request-1"),
+                "a representable sidecar must survive the bridge"
+            );
+
             for (label, mutate) in [
-                (
-                    "continuation-sidecar",
-                    (|value: &mut serde_json::Value| {
-                        value["persisted_input"]["request_id"] = serde_json::json!("request-1");
-                    }) as fn(&mut serde_json::Value),
-                ),
                 (
                     "multimodal-prompt",
                     (|value: &mut serde_json::Value| {
@@ -4065,11 +3536,7 @@ END";
                 let mut conn = Connection::open_in_memory().expect("open");
                 conn.execute_batch(CREATE_RUNTIME_SCHEMA_SQL)
                     .expect("runtime v1 schema");
-                let (input_id, source) = if label == "continuation-sidecar" {
-                    legacy_continuation_row()
-                } else {
-                    legacy_prompt_row()
-                };
+                let (input_id, source) = legacy_prompt_row();
                 let mut candidate: serde_json::Value =
                     serde_json::from_slice(&source).expect("candidate");
                 mutate(&mut candidate);
@@ -4077,13 +3544,15 @@ END";
                 insert_row(&conn, "runtime", &input_id, &candidate);
 
                 let tx = conn.transaction().expect("tx");
-                let error = prepare_pre_0_8_10_runtime_input_states(&tx)
-                    .expect_err("unsupported legacy shape must refuse");
+                let report = prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare");
+                assert_eq!(report.changed, 0, "{label} must not be carried forward");
+                let reason = sole_refusal(&report);
                 assert!(
-                    error.to_string().contains("unsupported fields")
-                        || error.to_string().contains("multimodal legacy prompt"),
-                    "unexpected {label} error: {error}"
+                    reason.contains("persisted_input.blocks"),
+                    "unexpected {label} refusal: {reason}"
                 );
+                tx.commit().expect("refusal leaves transaction committable");
+                assert_eq!(load_row(&conn, "runtime", &input_id), candidate);
             }
         }
 
@@ -4103,11 +3572,11 @@ END";
             insert_row(&conn, "runtime", &input_id, duplicated.as_bytes());
 
             let tx = conn.transaction().expect("tx");
-            let error = prepare_pre_0_8_10_runtime_input_states(&tx)
-                .expect_err("duplicate object key must refuse");
-            assert!(error.to_string().contains("duplicate JSON object key"));
+            let report = prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare");
+            assert_eq!(report.changed, 0);
+            assert!(sole_refusal(&report).contains("duplicate JSON object key"));
             tx.commit()
-                .expect("duplicate-key preflight must leave the transaction committable");
+                .expect("duplicate-key refusal must leave the transaction committable");
             assert_eq!(load_row(&conn, "runtime", &input_id), duplicated.as_bytes());
         }
 
@@ -4125,9 +3594,13 @@ END";
                 insert_row(&conn, "runtime", &input_id, &candidate);
 
                 let tx = conn.transaction().expect("tx");
-                let error = prepare_pre_0_8_10_runtime_input_states(&tx)
-                    .expect_err("preexisting current version must refuse at source boundary");
-                assert!(error.to_string().contains(&format!("version {version}")));
+                let report = prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare");
+                assert_eq!(report.changed, 0);
+                assert!(
+                    sole_refusal(&report).contains(&format!("version {version}")),
+                    "unexpected boundary refusal: {:?}",
+                    report.refused
+                );
                 tx.commit().expect("refusal leaves transaction committable");
                 assert_eq!(load_row(&conn, "runtime", &input_id), candidate);
             }
@@ -4151,14 +3624,6 @@ END";
                         value["admission_sequence"] = serde_json::Value::Null;
                     },
                 ),
-                (
-                    "terminal-invalid-carrier",
-                    |value: &mut serde_json::Value| {
-                        value["durability"] = serde_json::json!("derived");
-                        value["persisted_input"]["header"]["durability"] =
-                            serde_json::json!("derived");
-                    },
-                ),
             ] {
                 let mut conn = Connection::open_in_memory().expect("open");
                 conn.execute_batch(CREATE_RUNTIME_SCHEMA_SQL)
@@ -4171,12 +3636,55 @@ END";
                 insert_row(&conn, "runtime", &input_id, &candidate);
 
                 let tx = conn.transaction().expect("tx");
-                let error = prepare_pre_0_8_10_runtime_input_states(&tx)
-                    .expect_err("tampered released v3 must refuse");
+                let report = prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare");
+                assert_eq!(report.changed, 0, "{label} must not be carried forward");
+                let reason = sole_refusal(&report);
                 tx.commit().expect("refusal leaves transaction committable");
-                assert_eq!(load_row(&conn, "runtime", &input_id), candidate);
-                assert!(!error.to_string().is_empty(), "empty {label} error");
+                assert_eq!(
+                    load_row(&conn, "runtime", &input_id),
+                    candidate,
+                    "{label} bytes must be left exactly as found"
+                );
+                assert!(!reason.is_empty(), "empty {label} refusal");
             }
+        }
+
+        /// A carrier combination no enumeration blessed is still carried.
+        ///
+        /// The deleted validator refused this row because its
+        /// durability/visibility/origin triple was absent from a hand-written
+        /// list of "frozen corpus" combinations. Both authorities that
+        /// actually own the question - the generated admission projection and
+        /// the machine seed authority - accept it, and re-encoding loses
+        /// nothing, so refusing it would have destroyed a real operator's
+        /// session for failing to resemble a list.
+        #[test]
+        fn maintenance_prepare_carries_a_derived_durability_prompt_the_old_list_refused() {
+            let mut conn = Connection::open_in_memory().expect("open");
+            conn.execute_batch(CREATE_RUNTIME_SCHEMA_SQL)
+                .expect("runtime v1 schema");
+            let (input_id, source) = released_v3_consumed_prompt_row(THIRD_INPUT_ID);
+            let mut candidate: serde_json::Value =
+                serde_json::from_slice(&source).expect("candidate");
+            candidate["durability"] = serde_json::json!("derived");
+            candidate["persisted_input"]["header"]["durability"] = serde_json::json!("derived");
+            let candidate = serde_json::to_vec(&candidate).expect("candidate bytes");
+            insert_row(&conn, "runtime", &input_id, &candidate);
+
+            let tx = conn.transaction().expect("tx");
+            let report = prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare");
+            assert_eq!(report.changed, 1);
+            assert!(report.refused.is_empty(), "{:?}", report.refused);
+            tx.commit().expect("commit");
+            let carried: serde_json::Value =
+                serde_json::from_slice(&load_row(&conn, "runtime", &input_id))
+                    .expect("carried json");
+            assert_eq!(carried["durability"], serde_json::json!("derived"));
+            assert_eq!(
+                carried["persisted_input"]["header"]["durability"],
+                serde_json::json!("derived"),
+                "the carrier fact itself must survive, not be normalized away"
+            );
         }
 
         #[test]
@@ -4195,9 +3703,9 @@ END";
             .expect("store as SQLite TEXT");
 
             let tx = conn.transaction().expect("tx");
-            let error = prepare_pre_0_8_10_runtime_input_states(&tx)
-                .expect_err("TEXT storage class must refuse");
-            assert!(error.to_string().contains("storage class is `text`"));
+            let report = prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare");
+            assert_eq!(report.changed, 0);
+            assert!(sole_refusal(&report).contains("storage class is `text`"));
             tx.commit().expect("refusal leaves transaction committable");
             assert_eq!(
                 conn.query_row(
@@ -4296,11 +3804,12 @@ END";
                 insert_row(&conn, "runtime", &input_id, &candidate);
 
                 let tx = conn.transaction().expect("tx");
-                let error = prepare_pre_0_8_10_runtime_input_states(&tx)
-                    .expect_err("invalid nested/cross-bound row must refuse");
+                let report = prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare");
+                assert_eq!(report.changed, 0, "{label} must not be carried forward");
+                let reason = sole_refusal(&report);
                 tx.commit().expect("refusal leaves transaction committable");
                 assert_eq!(load_row(&conn, "runtime", &input_id), candidate);
-                assert!(!error.to_string().is_empty(), "empty {label} error");
+                assert!(!reason.is_empty(), "empty {label} refusal");
             }
         }
 
@@ -4316,15 +3825,11 @@ END";
             insert_row(&conn, "runtime", &second_id, &second);
 
             let tx = conn.transaction().expect("tx");
-            let error = prepare_pre_0_8_10_runtime_input_states(&tx)
-                .expect_err("duplicate historical timestamp must refuse");
-            assert!(
-                error
-                    .to_string()
-                    .contains("duplicate initial QueueAccepted")
-            );
-            tx.commit().expect("preflight refusal is committable");
-            assert_eq!(load_row(&conn, "runtime", &first_id), first);
+            let report = prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare");
+            assert_eq!(report.changed, 1, "the first claimant still lands");
+            assert!(sole_refusal(&report).contains("duplicate initial queue-admission timestamp"));
+            tx.commit().expect("per-record refusal is committable");
+            assert_ne!(load_row(&conn, "runtime", &first_id), first);
             assert_eq!(load_row(&conn, "runtime", &second_id), second);
         }
 
@@ -4349,16 +3854,19 @@ END";
             }
 
             let tx = conn.transaction().expect("tx");
-            let error = prepare_pre_0_8_10_runtime_input_states(&tx)
-                .expect_err("duplicate idempotency owner must refuse");
+            let report = prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare");
+            assert_eq!(report.changed, 1, "the first owner of the key still lands");
+            let reason = sole_refusal(&report);
             assert!(
-                error.to_string().contains("duplicate idempotency owner"),
-                "unexpected duplicate-owner error: {error}"
+                reason.contains("duplicate idempotency owner"),
+                "unexpected duplicate-owner refusal: {reason}"
             );
-            tx.commit().expect("preflight refusal is committable");
-            for (input_id, bytes) in rows {
-                assert_eq!(load_row(&conn, "runtime", &input_id), bytes);
-            }
+            tx.commit().expect("per-record refusal is committable");
+            assert_eq!(
+                load_row(&conn, "runtime", &rows[1].0),
+                rows[1].1,
+                "the second claimant's bytes are left exactly as found"
+            );
         }
 
         #[test]
@@ -4375,13 +3883,9 @@ END";
             .expect("insert orphan input");
 
             let tx = conn.transaction().expect("tx");
-            let error = prepare_pre_0_8_10_runtime_input_states(&tx)
-                .expect_err("orphan runtime fragments must refuse");
-            assert!(
-                error
-                    .to_string()
-                    .contains("runtime fragments are incomplete")
-            );
+            let report = prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare");
+            assert_eq!(report.changed, 0);
+            assert!(sole_refusal(&report).contains("runtime fragments are incomplete"));
             tx.commit().expect("orphan refusal is committable");
             assert_eq!(load_row(&conn, "orphan-runtime", &input_id), source);
         }
@@ -16316,6 +15820,27 @@ ORDER BY runtime_id";
                     encode_receipt_sequence(released_receipt.sequence),
                     &released_receipt_json,
                 ],
+            )
+            .unwrap();
+
+            // The ordinary v1 -> v2 upgrade always runs against a file that
+            // already carries this domain's ledger row: `apply_domain_migrations`
+            // initializes a fresh domain instead of migrating it, and refuses an
+            // unledgered one that owns objects. The row is what tells the
+            // released-row importers they are upgrading a realm this lineage
+            // wrote rather than rescuing one from before the durable-state floor
+            // (see `pre_0_8_10_rescue_in_progress`), so a test that omits it is
+            // exercising the other path under this one's name.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS main.meerkat_schema (
+                     domain TEXT PRIMARY KEY,
+                     version INTEGER NOT NULL
+                 )",
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO main.meerkat_schema (domain, version) VALUES (?1, 1)",
+                params![RUNTIME_STORE_DOMAIN.name],
             )
             .unwrap();
 
