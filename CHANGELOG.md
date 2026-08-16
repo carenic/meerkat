@@ -35,6 +35,56 @@ them.
   downstream code binding the constant by its exact array type must add the new
   dimension. The `checks` map itself is an open string map on the wire, so the
   new key is additive: no wire break, no schema change, no SDK regeneration.
+- **`meerkat_comms::RegistrationOutcome::ReboundOwnName` is removed.** The enum
+  is not `#[non_exhaustive]`, so any `match` naming that variant, and any
+  exhaustive `match` that relied on it existing, stops compiling. There are now
+  three outcomes: `Registered`, `ReplacedPubkey { evicted_name }`,
+  `Rejected { reason }`.
+- **BEHAVIOUR-ONLY, NO TOOL WILL CATCH THIS: there is now ONE claim rule for a
+  comms participant name - publish only while the name is UNBOUND.**
+  `InprocRegistry::register_with_meta_in_namespace` (and everything reaching it:
+  `InprocRegistry::register`, `CommsRuntime::inproc_only*`,
+  `PreparedCommsRuntime::publish`, and therefore `MobSupervisorBridge::new`)
+  used to fork on key identity: a FOREIGN key was refused, while the SAME key
+  rebound the live route onto its newer inbox generation and reported
+  `ReboundOwnName`. That same-key arm is gone. A live route under the claimed
+  name is now refused whichever key holds it, with the same
+  `RegistrationRejection::NameOccupied { holder_pubkey }` - `holder_pubkey` may
+  now be the claimant's own key, and it is evidence of who holds the name, not a
+  statement that the claimant is a different peer.
+
+  What flips from silent success to typed failure: **building a second runtime
+  for one participant name while the predecessor is still published.** In mob
+  terms, constructing a second `MobSupervisorBridge`/mob runtime for one mob id
+  under the same persisted supervisor authority while the predecessor actor is
+  alive. This was never safe: nothing above comms excluded two live hosts of one
+  mob, so in-proc route occupancy was in practice the only guard, and the
+  same-key case is exactly where the displaced route is most likely still live.
+
+  Succession is admitted on EVIDENCE, in one of two forms, both of which already
+  existed:
+  - the incumbent declares a generation-exact release -
+    `CommsRuntime::retire_inproc_route`, reached by `MobHandle::shutdown()` (and
+    by the test-support `crash_stop_preserving_durable_work_for_test`) via
+    `MobSupervisorBridge::shutdown` - after which the name is unbound and the
+    successor publishes ordinarily, including under the SAME authority key;
+  - or the successor hands in the exact predecessor generation through
+    `PreparedCommsRuntime::publish_replacing` /
+    `InprocRegistry::replace_sender_in_namespace`. Supervisor rotation already
+    took this path, so live rotation is unaffected.
+
+  Not changed: `ReplacedPubkey` (one key renaming itself onto a FREE name) is
+  still admitted - the claimed name is unbound, which is the one rule. Session
+  identities are unaffected in ordering terms: `SessionClaimHandle::try_acquire`
+  still fails closed with `SessionIdentityInUse` before registration is reached.
+
+  The refusal message changed on both layers and is now remedy-first: it says
+  the incumbent has not released the route and must be retired first, names
+  `MobHandle::shutdown`, states that holding the same authority key is not a
+  claim on the route, and marks the public key as evidence rather than a
+  key/trust failure. Code matching the old prose must match the typed variant
+  (`MobError::ParticipantNameOccupied`, or
+  `CommsRuntimeError::InprocRegistrationRejected`).
 
 ### Added
 

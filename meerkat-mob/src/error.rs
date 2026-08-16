@@ -748,16 +748,26 @@ pub enum MobError {
 /// that cost an adopter an hour in 0.8.23: a refused claim that names a public
 /// key reads as a crypto/trust failure when it is almost always a second
 /// runtime under the same participant name in one process.
+///
+/// 0.8.24 made this the ONLY claim rule, so the newly refused - and now
+/// dominant - shape is a host rebuilding a mob whose predecessor is still live,
+/// under the SAME supervisor authority key. That case used to succeed silently
+/// by displacing the predecessor's route, so the message has to say what the
+/// operator must do about their own predecessor, not merely that a claim was
+/// refused.
 pub(crate) fn participant_name_occupied_message(
     participant_name: &str,
     holder_pubkey: &meerkat_comms::PubKey,
 ) -> String {
     format!(
-        "participant name '{participant_name}' already has a live route held by public key {}; \
-         the incumbent has not released this route, so retire the incumbent (or drop its runtime) \
-         before publishing this name again. The usual cause is a second runtime rendering the same \
-         participant name in one process - commonly leftover state from an earlier build, not a key \
-         or trust failure",
+        "participant name '{participant_name}' already has a live route: the incumbent has not \
+         released this route, so retire the incumbent first - shut the predecessor down \
+         (MobHandle::shutdown) or drop its runtime - and then publish this name again. This \
+         applies even when the incumbent is an earlier host of THIS mob holding THIS same \
+         authority key: holding the key is not a claim on the route, and succession is admitted \
+         only on evidence (the incumbent released the name, or the predecessor generation was \
+         handed in). The live route is held by public key {} - that is evidence of who holds the \
+         name, not a key or trust failure",
         holder_pubkey.to_pubkey_string()
     )
 }
@@ -1307,9 +1317,11 @@ mod tests {
     }
 
     /// The operator-facing remedy text is what an adopter reads at 3am. Pin
-    /// that it leads with the action (retire the incumbent) and explicitly
-    /// disclaims the crypto reading that cost a fleet an hour in 0.8.23,
-    /// rather than only naming a public key.
+    /// that it leads with the action (retire the incumbent), names the concrete
+    /// affordance that performs it, covers the shape 0.8.24's one claim rule
+    /// newly refuses (the incumbent is your own predecessor under the same
+    /// authority key), and explicitly disclaims the crypto reading that cost a
+    /// fleet an hour in 0.8.23 - rather than only naming a public key.
     #[test]
     fn participant_name_occupied_message_states_the_remedy_not_just_the_refusal() {
         let message = participant_name_occupied_message(
@@ -1319,6 +1331,15 @@ mod tests {
         assert!(
             message.contains("retire the incumbent"),
             "the message must name the remedy, got: {message}"
+        );
+        assert!(
+            message.contains("MobHandle::shutdown"),
+            "the message must name the affordance that performs the remedy, got: {message}"
+        );
+        assert!(
+            message.contains("holding the key is not a claim on the route"),
+            "the message must cover the same-authority case the one claim rule newly refuses, \
+             got: {message}"
         );
         assert!(
             message.contains("not a key or trust failure"),
