@@ -694,15 +694,16 @@ impl LlmClient for OpenAiCompatibleClient {
 
                                 for choice in event.choices {
                                     if let Some(delta) = choice.delta {
-                                        if let Some(content) = delta.content
-                                            && !content.is_empty()
-                                        {
-                                            chunk_yielded.set(true);
-                                            yield LlmEvent::TextDelta {
-                                                delta: content,
-                                                meta: None,
-                                            };
-                                        }
+                                        // REASONING BEFORE CONTENT, and the order is load-bearing.
+                                        //
+                                        // A single delta may carry BOTH fields - that is what an
+                                        // OpenAI-compatible server emits on the reasoning-to-content
+                                        // transition, and vLLM does. The reasoning in such a chunk
+                                        // was produced BEFORE the content beside it, so emitting
+                                        // content first reverses them in the event stream and the
+                                        // operator sees the two channels shuffled together.
+                                        // Nothing downstream can repair it: by then the
+                                        // interleaving IS the stream.
                                         let reasoning_delta = delta
                                             .reasoning_content
                                             .as_ref()
@@ -715,6 +716,15 @@ impl LlmClient for OpenAiCompatibleClient {
                                             chunk_yielded.set(true);
                                             yield LlmEvent::ReasoningDelta {
                                                 delta: reasoning.clone(),
+                                            };
+                                        }
+                                        if let Some(content) = delta.content
+                                            && !content.is_empty()
+                                        {
+                                            chunk_yielded.set(true);
+                                            yield LlmEvent::TextDelta {
+                                                delta: content,
+                                                meta: None,
                                             };
                                         }
                                         if let Some(tool_calls) = delta.tool_calls {
@@ -1267,6 +1277,63 @@ mod tests {
         assert_eq!(
             reasoning_complete,
             Some("Let me think. Need one more step.".to_string())
+        );
+        handle.abort();
+    }
+
+    /// A single delta may carry BOTH `reasoning` and `content`. An
+    /// OpenAI-compatible server emits exactly that on the reasoning-to-content
+    /// transition, and vLLM does. The reasoning in such a chunk was produced
+    /// BEFORE the content beside it, so the events must leave in that order.
+    ///
+    /// 0.8.23 emitted content first, which interleaved the two channels and
+    /// rendered as corruption. The reasoning test above cannot catch it: every
+    /// one of its chunks carries reasoning OR content, never both, so no
+    /// ordering question ever arises in the fixture.
+    #[tokio::test]
+    async fn combined_reasoning_and_content_delta_emits_reasoning_first() {
+        let payload = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"No tool\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\" needed.\",\"content\":\"I am an\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" AI assistant.\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string();
+        let (base_url, handle) = spawn_chat_stub_server(payload).await;
+        let client = OpenAiCompatibleClient::new_with_options(
+            OpenAiCompatibleMode::ChatCompletions,
+            "remote-model".to_string(),
+            base_url,
+            None,
+            options(true, true, true, false),
+        );
+        let request = LlmRequest::new(
+            "gemma-4-31b",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let events: Vec<_> = client.stream(&request).collect().await;
+        // Record the ORDER the two channels arrive in, not just their contents.
+        let mut order = Vec::new();
+        for event in events {
+            match event.expect("event") {
+                LlmEvent::ReasoningDelta { delta } => order.push(("reasoning", delta)),
+                LlmEvent::TextDelta { delta, .. } => order.push(("text", delta)),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            order,
+            vec![
+                ("reasoning", "No tool".to_string()),
+                ("reasoning", " needed.".to_string()),
+                ("text", "I am an".to_string()),
+                ("text", " AI assistant.".to_string()),
+            ],
+            "a combined delta must emit its reasoning before its content; \
+             emitting content first interleaves the channels and the operator \
+             sees the two streams shuffled together"
         );
         handle.abort();
     }
