@@ -44064,6 +44064,149 @@ async fn dead_runtime_loop_session_count_sees_a_real_corpse_and_not_a_clean_shut
     );
 }
 
+/// The exact registration identity of a session's shell.
+///
+/// A cold reload publishes a brand new entry carrying a brand new mutation
+/// gate, so holding these two `Arc`s and comparing them distinguishes "the
+/// machine minted a replacement registration from durable truth" from
+/// "something flipped the same wedged shell back to Ready". Keeping the `Arc`
+/// alive is deliberate: a raw-pointer comparison could alias a freed
+/// allocation and report a replacement as the original.
+async fn registration_shell_identity(
+    machine: &Arc<MeerkatMachine>,
+    session_id: &SessionId,
+) -> Arc<crate::tokio::sync::Mutex<()>> {
+    let sessions = machine.sessions.read().await;
+    Arc::clone(
+        &sessions
+            .get(session_id)
+            .expect("registered session entry")
+            .mutation_gate,
+    )
+}
+
+/// A durability skew is a condition to recover from, not a life sentence.
+///
+/// The degraded shell emits a demand for a registration-authorized cold
+/// reload, and registration is the only authority that can mint one. A mob
+/// member gets that reload because the mob retire ladder calls the disposal
+/// path (meerkat-mob/src/runtime/provisioner.rs:2207). A plain CLI/RPC session
+/// used to get nothing: `register_session_with_executor` read the same durable
+/// fact and returned the demand back to a caller with no capability to satisfy
+/// it, forever. One fact, two consequences, decided by who owned the caller.
+///
+/// The fixture reaches the wedge the way the corpse probe above does, and for
+/// the same documented reason: a durability-degraded session whose loop has
+/// died is exactly the state `observe_runtime_loop_teardown` refuses to clean
+/// up, so the shell stays registered pointing at a dead loop. That refusal is
+/// also what makes this test answer the open question about the disposal
+/// path's precondition - it can only reach `Discarded` if the refused teardown
+/// handoff survived in the entry.
+#[tokio::test]
+async fn degraded_non_mob_registration_cold_reloads_instead_of_bricking() {
+    let machine = persistent_health_probe_machine();
+    let session_id = SessionId::new();
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    machine
+        .register_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+    let bricked_shell = registration_shell_identity(&machine, &session_id).await;
+
+    assert!(
+        machine
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await,
+        "the fixture needs a genuinely degraded durability gate"
+    );
+
+    // Kill the task WITHOUT touching the slot, so the entry keeps its channels
+    // and its join handle. The teardown watcher wakes, asks the durability
+    // gate, and refuses - leaving the registered shell wedged.
+    {
+        let mut sessions = machine.sessions.write().await;
+        let entry = sessions
+            .get_mut(&session_id)
+            .expect("registered session entry");
+        match &entry.attachment_slot {
+            RuntimeLoopAttachmentSlot::Pending(attachment)
+            | RuntimeLoopAttachmentSlot::Attached(attachment) => attachment.loop_handle.abort(),
+            RuntimeLoopAttachmentSlot::Empty => {
+                panic!("the fixture must have attached a real runtime loop")
+            }
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let sessions = machine.sessions.read().await;
+                let entry = sessions
+                    .get(&session_id)
+                    .expect("teardown must not remove a reload-required entry");
+                let finished = match &entry.attachment_slot {
+                    RuntimeLoopAttachmentSlot::Pending(attachment)
+                    | RuntimeLoopAttachmentSlot::Attached(attachment) => {
+                        attachment.loop_handle.is_finished()
+                    }
+                    RuntimeLoopAttachmentSlot::Empty => {
+                        panic!("blocked teardown must leave the dead shell in place")
+                    }
+                };
+                if finished {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the aborted loop task must actually finish");
+
+    // The wedge, stated in the machine's own health vocabulary. Without these
+    // the test could pass by never having reached the broken state at all.
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(1),
+        "the session under test must actually owe a cold reload"
+    );
+    assert_eq!(
+        machine.dead_runtime_loop_session_count(),
+        Some(1),
+        "and it must actually be pointing at a dead loop that teardown refused \
+         to clear, which is the state that used to be terminal"
+    );
+
+    // The act under test: the ordinary non-mob registration entry point, with
+    // no mob adapter, no retire ladder, and no explicit disposal call.
+    machine
+        .register_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect(
+            "registration owns the cold reload the degraded shell demanded; refusing it here \
+             leaves a non-mob session permanently unusable",
+        );
+
+    let reloaded_shell = registration_shell_identity(&machine, &session_id).await;
+    assert!(
+        !Arc::ptr_eq(&bricked_shell, &reloaded_shell),
+        "recovery must publish a replacement registration cold-loaded from durable truth, not \
+         republish the unreadable shell as healthy"
+    );
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(0),
+        "the successor must be able to execute against durable state"
+    );
+    assert_eq!(
+        machine.dead_runtime_loop_session_count(),
+        Some(0),
+        "and it must carry a live runtime loop, not inherit the corpse"
+    );
+}
+
 /// `None` is the load-bearing half of both signatures, so it is pinned against
 /// the real condition it names rather than left as a documented intention.
 ///

@@ -3603,6 +3603,13 @@ impl MeerkatMachine {
             JoinUnregister {
                 epoch_id: meerkat_core::RuntimeEpochId,
             },
+            /// This exact registration lost durable authority and its runtime
+            /// loop has already handed its executor back, so registration can
+            /// mint the cold reload the degraded shell demands but cannot
+            /// perform itself.
+            ColdReloadDegradedRegistration {
+                witness: RuntimeSessionRegistrationWitness,
+            },
             Claimed {
                 gate: Arc<Mutex<()>>,
                 driver: SharedDriver,
@@ -3616,6 +3623,11 @@ impl MeerkatMachine {
             },
         }
 
+        // One registration call mints at most one cold reload. A successor
+        // that is itself already degraded is a fresh durable fault, not this
+        // caller's to keep re-disposing, so the second observation reports the
+        // degradation instead of looping.
+        let mut minted_cold_reload = false;
         let (
             driver,
             completions,
@@ -3671,12 +3683,53 @@ impl MeerkatMachine {
                         };
                     }
                     if let Err(required) = entry.require_durability_ready() {
-                        break ExistingExecutorClaim::Blocked(
-                            RuntimeDriverError::RecoveryRepairBlocked {
-                                evidence_digest: None,
-                                reason: required.to_string(),
-                            },
-                        );
+                        // The degraded shell demands a registration-authorized
+                        // cold reload that it has no capability to mint. This
+                        // IS registration, and disposal already returns its
+                        // outcome as the typed
+                        // `ReloadRequiredRegistrationDisposition`, so route
+                        // through that owned path rather than reporting the
+                        // demand back to a caller who cannot satisfy it. Only
+                        // the mob retire ladder used to do this, which made one
+                        // durable fact mean "recoverable" or "permanently
+                        // unusable" purely by who owned the caller.
+                        //
+                        // Two states are deliberately still refused, because
+                        // disposal would park rather than converge: a runtime
+                        // loop that has not yet handed its executor back may
+                        // run arbitrarily long before publishing, and a
+                        // handoff mid-claim by another cleanup owner is not
+                        // this caller's to consume.
+                        let degraded_loop_released_its_executor = entry
+                            .runtime_loop_teardown
+                            .as_ref()
+                            .is_some_and(|slot| slot.exit_handoff_is_settled());
+                        // A claim-bound caller is not the registration owner
+                        // here: it arrived holding an actor-materialization
+                        // claim that disposal would clear underneath it. That
+                        // caller keeps the unchanged refusal and retries
+                        // through its own owner.
+                        let caller_owns_the_whole_registration =
+                            expected_materialization_claim.is_none();
+                        if minted_cold_reload
+                            || !degraded_loop_released_its_executor
+                            || !caller_owns_the_whole_registration
+                        {
+                            break ExistingExecutorClaim::Blocked(
+                                RuntimeDriverError::RecoveryRepairBlocked {
+                                    evidence_digest: None,
+                                    reason: required.to_string(),
+                                },
+                            );
+                        }
+                        break ExistingExecutorClaim::ColdReloadDegradedRegistration {
+                            witness: RuntimeSessionRegistrationWitness::new(
+                                Arc::downgrade(&self.shared),
+                                session_id.clone(),
+                                entry.epoch_id.clone(),
+                                Arc::downgrade(&entry.mutation_gate),
+                            ),
+                        };
                     }
                     if let Some(error) = entry.registration_blocked_by_unregister(&session_id) {
                         break ExistingExecutorClaim::Blocked(error);
@@ -4005,6 +4058,27 @@ impl MeerkatMachine {
                     return Err(self
                         .classify_session_dsl_rejection(&session_id, reason)
                         .await);
+                }
+                ExistingExecutorClaim::ColdReloadDegradedRegistration { witness } => {
+                    // T and M are both released above, exactly as the
+                    // JoinUnregister arm requires, before entering a saga that
+                    // takes the stable registration transaction itself. The
+                    // executor factory is still unconsumed, so the reclaim
+                    // below re-runs this full transaction against whatever
+                    // registration disposal published. A stale witness is an
+                    // idempotent `NotCurrent` and can never remove a
+                    // same-SessionId successor.
+                    minted_cold_reload = true;
+                    let disposition = self
+                        .recover_or_discard_reload_required_registration_if_current(&witness)
+                        .await?;
+                    tracing::info!(
+                        %session_id,
+                        ?disposition,
+                        "executor registration minted the cold reload a durability-degraded \
+                         registration required"
+                    );
+                    continue 'settle_unregister;
                 }
                 ExistingExecutorClaim::JoinUnregister { epoch_id } => {
                     self.join_or_start_unregister_teardown_with_admission(
