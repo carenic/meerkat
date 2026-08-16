@@ -5,11 +5,31 @@
 # (pre-1.0 clean-break discipline). Downstreams must exact-pin (`=0.7.24`).
 # In exchange, every release that breaks public API must SAY SO: this gate
 # runs cargo-semver-checks against the last published crates.io baseline and
-# fails the release preflight when breaks exist without a `### Breaking`
-# section in the changelog's pending (topmost) release notes.
+# fails the release when a reported break is not NAMED in the pending release
+# notes' `### Breaking` section, or when those notes are not STAMPED against
+# the version being released.
+#
+# This script is the mechanical half: install check, run the tool, hand the
+# report to `scripts/check_semver_breaks.py`, which owns every judgement and is
+# unit-tested against committed real reports. There is deliberately no env
+# override that relaxes the analyser.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+PYTHON="${PYTHON:-$(command -v python3.11 2>/dev/null || command -v python3)}"
+
+# Self-test the analyser before trusting its verdict. A parser that has drifted
+# from the report grammar reports "no breaks" for the same reason a clean
+# release does, and that is the failure mode this gate exists to prevent.
+selftest_log="$(mktemp)"
+trap 'rm -f "$selftest_log"' EXIT
+if ! "$PYTHON" "$ROOT/scripts/test_check_semver_breaks.py" >"$selftest_log" 2>&1; then
+    cat "$selftest_log" >&2
+    echo "error: the semver-breaks analyser failed its own unit tests" >&2
+    exit 1
+fi
+echo "semver-breaks: analyser self-test passed"
 
 if ! command -v cargo-semver-checks >/dev/null 2>&1; then
     echo "error: cargo-semver-checks is required for the semver-breaks gate" >&2
@@ -22,51 +42,32 @@ fi
 # break is then a REPORTED violation we convert into a changelog obligation
 # rather than a hard stop.
 report_file="$(mktemp)"
-trap 'rm -f "$report_file"' EXIT
-breaks_found=0
-if ! cargo semver-checks check-release --workspace --release-type patch \
-    >"$report_file" 2>&1; then
-    breaks_found=1
-fi
+trap 'rm -f "$selftest_log" "$report_file"' EXIT
+tool_exit=0
+"$ROOT/scripts/repo-cargo" semver-checks check-release --workspace --release-type patch \
+    >"$report_file" 2>&1 || tool_exit=$?
 
-if [[ "$breaks_found" -eq 0 ]]; then
-    echo "semver-breaks: no public-API breaks vs the published baselines"
-    exit 0
-fi
+# Every crate the release publishes must appear in the report. A run that died
+# after twelve crates exits non-zero with real findings, and judging only the
+# findings it managed to print would call a partial measurement a pass.
+expected_args=()
+while IFS= read -r crate; do
+    [[ -n "$crate" ]] || continue
+    expected_args+=(--expected-crate "$crate")
+done < <("$ROOT/scripts/release-rust-crates.sh")
 
-# Breaks exist: they are allowed by policy, but only when loudly declared.
-# The pending release notes are the topmost section of CHANGELOG.md —
-# `## [Unreleased]` when populated, otherwise the topmost stamped release.
-#
-# Stamping a release leaves an EMPTY `## [Unreleased]` stub above it, so
-# "topmost section" and "the section this release is declared in" stop being
-# the same thing at exactly the moment this gate runs. Reading the stub would
-# fail every stamped release no matter how loudly it declared its breaks,
-# which is a gate that cannot be satisfied rather than one that is hard to
-# satisfy. Skip a content-free pending section and read the one below it.
-pending_section="$(awk '
-    /^## \[/ { count++ }
-    count >= 1 && count <= 2 { section[count] = section[count] $0 "\n" }
-    count == 3 { exit }
-    END {
-        body = section[1]
-        sub(/^## \[[^\n]*\n/, "", body)
-        gsub(/[[:space:]]/, "", body)
-        printf "%s", (length(body) > 0 ? section[1] : section[2])
-    }
-' CHANGELOG.md)"
-if ! grep -q '^### Breaking' <<<"$pending_section"; then
-    echo "semver-breaks: public-API breaks detected vs published baselines:" >&2
+analyser_exit=0
+"$PYTHON" "$ROOT/scripts/check_semver_breaks.py" \
+    --report "$report_file" \
+    --changelog "$ROOT/CHANGELOG.md" \
+    --repo-root "$ROOT" \
+    --tool-exit-code "$tool_exit" \
+    "${expected_args[@]}" || analyser_exit=$?
+
+if [[ "$analyser_exit" -ne 0 ]]; then
     echo >&2
-    grep -E "^(--- failure|Summary|.*semver requires)" "$report_file" >&2 || tail -40 "$report_file" >&2
-    echo >&2
-    echo "error: the pending CHANGELOG.md section has no '### Breaking' heading." >&2
-    echo "Policy (M3): 0.x patch releases may break public API, but every break" >&2
-    echo "must be declared under '### Breaking' with the changed signatures so" >&2
-    echo "exact-pinned downstreams can plan the bump. Add the section and rerun." >&2
-    exit 1
+    echo "cargo-semver-checks exited ${tool_exit}; last 40 report lines:" >&2
+    tail -40 "$report_file" >&2
 fi
 
-echo "semver-breaks: public-API breaks detected and declared under '### Breaking':"
-grep -E "^(--- failure|Summary)" "$report_file" || true
-exit 0
+exit "$analyser_exit"

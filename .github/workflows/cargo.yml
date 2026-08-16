@@ -562,6 +562,13 @@ jobs:
       - name: Docs validation
         run: make docs-check
 
+      # The release-time semver-breaks gate needs cargo-semver-checks; its
+      # analyser does not. Run the analyser's unit tests on every PR so parser
+      # drift is caught here rather than at the tag, where "no breaks found"
+      # and "parser stopped matching the report" look identical.
+      - name: Semver-breaks analyser self-test
+        run: make semver-breaks-selftest
+
       - name: Verify version parity
         run: make verify-version-parity
 

@@ -4,14 +4,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 **Versioning policy (pre-1.0):** meerkat 0.x PATCH releases may contain
-breaking public-API changes — this project ships deliberate clean breaks
+breaking public-API changes - this project ships deliberate clean breaks
 instead of compatibility shims. Downstreams must EXACT-PIN the meerkat crate
 family (e.g. `meerkat = "=0.7.24"`) and bump deliberately. In exchange, every
 release that breaks public API declares it under a `### Breaking` heading
-naming the changed signatures (enforced by the `semver-breaks` release gate
-via cargo-semver-checks against the published baselines).
+naming the changed signatures.
+
+**What the `semver-breaks` gate actually enforces**, so this file does not
+claim more than it measures: it runs cargo-semver-checks over the publishable
+workspace against the published baselines, and it fails the release unless
+(1) every crate the release publishes was reached by the run, (2) every break
+the tool reports is NAMED in the pending section's `### Breaking` body at the
+granularity of the individual finding, and (3) that pending section is stamped
+`## [VERSION] - DATE` against the version being released. "Named" means the
+symbols of the finding appear in the `### Breaking` body: a type gaining a
+field and the same type losing a derive are two findings, and naming one does
+not declare the other.
+
+Behaviour-only breaks - a public signature that keeps its shape and changes
+what it does - are invisible to cargo-semver-checks and therefore invisible to
+the gate. They are declared by hand and tagged inline, and nothing enforces
+them.
 
 ## [Unreleased]
+
+### Changed
+
+- The `semver-breaks` release gate now checks that reported breaks are
+  declared, not merely that a `### Breaking` heading exists. It diffs the
+  cargo-semver-checks findings against the section body per finding, requires
+  the pending section to be stamped against the workspace version (notes left
+  under `## [Unreleased]` after the version bump are now a failure), and fails
+  closed when the tool run did not reach every publishable crate. The gate also
+  runs in the release workflow now (job `release_semver_gate`), gating
+  `publish_github_release`, `publish_registries`, and
+  `publish_unix_release_and_homebrew`; previously it only existed in
+  `make release-preflight`.
 
 ## [0.8.23] - 2026-08-16
 
