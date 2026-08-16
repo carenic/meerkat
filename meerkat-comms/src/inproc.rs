@@ -26,7 +26,9 @@ use parking_lot::RwLock;
 use uuid::Uuid;
 
 use crate::identity::{Keypair, PubKey, Signature};
-use crate::inbox::{AdmissionOutcome, DropReason, InboxSender, IngressDeliveryOutcome};
+use crate::inbox::{
+    AdmissionOutcome, BoundedIngressDelivery, DropReason, InboxSender, IngressDeliveryOutcome,
+};
 use crate::peer_meta::PeerMeta;
 use crate::types::{Envelope, InboxItem, MessageKind};
 
@@ -34,7 +36,36 @@ const DEFAULT_NAMESPACE: &str = "";
 
 pub(crate) struct InprocDelivery {
     pub(crate) envelope_id: Uuid,
-    pub(crate) outcome: IngressDeliveryOutcome,
+    pub(crate) outcome: InprocDeliveryOutcome,
+}
+
+/// What the in-process lane can truthfully say about one delivery attempt.
+///
+/// `Resolved` carries the receiver's own terminal ingress fact. `Unconfirmed`
+/// says only that the envelope IS sitting on the receiver's queue and no drain
+/// committed it inside the sender's bound: not a drop, not a success. Callers
+/// must not launder it into either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InprocDeliveryOutcome {
+    Resolved(IngressDeliveryOutcome),
+    Unconfirmed { park_bound: std::time::Duration },
+}
+
+#[cfg(test)]
+impl InprocDelivery {
+    /// Test-only accessor asserting the receiver produced a terminal fact.
+    ///
+    /// Deliberately panics on `Unconfirmed` so a delivery test that silently
+    /// starts timing out is a failure, not a pass on a different fact.
+    #[allow(clippy::panic)]
+    fn resolved_outcome(&self) -> IngressDeliveryOutcome {
+        match self.outcome {
+            InprocDeliveryOutcome::Resolved(outcome) => outcome,
+            InprocDeliveryOutcome::Unconfirmed { park_bound } => panic!(
+                "expected a receiver-resolved inproc delivery, got unconfirmed after {park_bound:?}"
+            ),
+        }
+    }
 }
 
 /// Snapshot of an inproc peer returned by [`InprocRegistry::peers()`].
@@ -553,7 +584,9 @@ impl InprocRegistry {
     /// Backpressured pubkey-keyed delivery across all namespaces.
     ///
     /// Runtime-originated peer sends should await receiver capacity instead of
-    /// turning a transient full inbox into semantic message loss.
+    /// turning a transient full inbox into semantic message loss. `park_bound`
+    /// caps how long the sender's own liveness is allowed to depend on the
+    /// receiver's drain; see [`Self::deliver_to_sender_wait`].
     pub(crate) async fn send_to_pubkey_any_namespace_with_id_wait(
         &self,
         from_keypair: &Keypair,
@@ -561,6 +594,7 @@ impl InprocRegistry {
         envelope_id: Uuid,
         kind: MessageKind,
         sign_envelope: bool,
+        park_bound: std::time::Duration,
     ) -> Result<InprocDelivery, InprocSendError> {
         let sender = self
             .get_by_pubkey_any_namespace(to_pubkey)
@@ -573,6 +607,7 @@ impl InprocRegistry {
             envelope_id,
             kind,
             sign_envelope,
+            park_bound,
         )
         .await
     }
@@ -596,6 +631,7 @@ impl InprocRegistry {
         envelope_id: Uuid,
         kind: MessageKind,
         sign_envelope: bool,
+        park_bound: std::time::Duration,
     ) -> Result<InprocDelivery, InprocSendError> {
         let sender = self
             .get_by_pubkey_in_namespace(namespace, to_pubkey)
@@ -608,10 +644,22 @@ impl InprocRegistry {
             envelope_id,
             kind,
             sign_envelope,
+            park_bound,
         )
         .await
     }
 
+    /// Hand one envelope to a resolved in-process receiver.
+    ///
+    /// Non-`Response` kinds wait for the receiver's ingress authority to commit
+    /// the exact claim, which makes the caller's liveness depend on the
+    /// RECEIVER's drain being alive. `park_bound` caps that dependency: on
+    /// expiry the caller is told delivery is unconfirmed rather than being
+    /// parked forever behind a dead or stalled drain.
+    ///
+    /// `MessageKind::Response` deliberately keeps capacity-only semantics: it
+    /// returns as soon as the item is admitted to the queue and never waits on
+    /// the drain, so it has no receipt park to bound.
     async fn deliver_to_sender_wait(
         from_keypair: &Keypair,
         to_pubkey: PubKey,
@@ -619,6 +667,7 @@ impl InprocRegistry {
         envelope_id: Uuid,
         kind: MessageKind,
         sign_envelope: bool,
+        park_bound: std::time::Duration,
     ) -> Result<InprocDelivery, InprocSendError> {
         let response_uses_legacy_queue_semantics = matches!(&kind, MessageKind::Response { .. });
         let mut envelope = Envelope {
@@ -637,7 +686,7 @@ impl InprocRegistry {
             return match sender.send_wait(InboxItem::External { envelope }).await {
                 AdmissionOutcome::Admitted => Ok(InprocDelivery {
                     envelope_id,
-                    outcome: IngressDeliveryOutcome::Queued,
+                    outcome: InprocDeliveryOutcome::Resolved(IngressDeliveryOutcome::Queued),
                 }),
                 AdmissionOutcome::Dropped {
                     reason: DropReason::SessionClosed,
@@ -651,26 +700,43 @@ impl InprocRegistry {
             };
         }
         match sender
-            .send_wait_for_delivery(InboxItem::External { envelope })
+            .send_wait_for_delivery(InboxItem::External { envelope }, park_bound)
             .await
         {
-            IngressDeliveryOutcome::Queued => unreachable!(
+            BoundedIngressDelivery::Resolved(IngressDeliveryOutcome::Queued) => unreachable!(
                 "only the immediate legacy Response path produces queued inproc delivery"
             ),
-            outcome @ (IngressDeliveryOutcome::DurablyResolved(_)
-            | IngressDeliveryOutcome::VolatileHandedOff) => Ok(InprocDelivery {
+            BoundedIngressDelivery::Resolved(
+                outcome @ (IngressDeliveryOutcome::DurablyResolved(_)
+                | IngressDeliveryOutcome::VolatileHandedOff),
+            ) => Ok(InprocDelivery {
                 envelope_id,
-                outcome,
+                outcome: InprocDeliveryOutcome::Resolved(outcome),
             }),
-            IngressDeliveryOutcome::Dropped {
+            BoundedIngressDelivery::Resolved(IngressDeliveryOutcome::Dropped {
                 reason: DropReason::SessionClosed,
-            } => Err(InprocSendError::InboxClosed),
-            IngressDeliveryOutcome::Dropped {
+            }) => Err(InprocSendError::InboxClosed),
+            BoundedIngressDelivery::Resolved(IngressDeliveryOutcome::Dropped {
                 reason: DropReason::InboxFull,
-            } => Err(InprocSendError::InboxFull),
-            IngressDeliveryOutcome::Dropped { reason } => {
+            }) => Err(InprocSendError::InboxFull),
+            BoundedIngressDelivery::Resolved(IngressDeliveryOutcome::Dropped { reason }) => {
                 Err(InprocSendError::IngressDropped(reason))
             }
+            // The receiver's queue never opened inside the bound: nothing was
+            // admitted, so this is the existing "inbox full" fact, not an
+            // ambiguous delivery.
+            BoundedIngressDelivery::AdmissionParkTimedOut { park_bound } => {
+                tracing::warn!(
+                    %envelope_id,
+                    park_bound_secs = park_bound.as_secs_f64(),
+                    "inproc send gave up waiting for receiver inbox capacity"
+                );
+                Err(InprocSendError::InboxFull)
+            }
+            BoundedIngressDelivery::AdmittedUnconfirmed { park_bound } => Ok(InprocDelivery {
+                envelope_id,
+                outcome: InprocDeliveryOutcome::Unconfirmed { park_bound },
+            }),
         }
     }
 
@@ -733,6 +799,12 @@ mod tests {
     use crate::trust::TrustStore;
     use parking_lot::RwLock;
     use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Park bound for tests whose receiver DOES drain: generous enough that a
+    /// healthy drain always wins the race, so these tests keep asserting
+    /// delivery semantics rather than accidentally asserting the deadline.
+    const TEST_PARK_BOUND: Duration = Duration::from_secs(30);
 
     fn classified_inbox() -> (Inbox, crate::InboxSender) {
         classified_inbox_with_auth(false)
@@ -1033,11 +1105,12 @@ mod tests {
                     Uuid::new_v4(),
                     probe_message(body),
                     true,
+                    TEST_PARK_BOUND,
                 )
                 .await
                 .expect("both same-name peers must remain routable");
             assert!(matches!(
-                delivery.outcome,
+                delivery.resolved_outcome(),
                 IngressDeliveryOutcome::DurablyResolved(
                     meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
                 )
@@ -1127,11 +1200,12 @@ mod tests {
                 Uuid::new_v4(),
                 probe_message("incumbent keeps routing"),
                 true,
+                TEST_PARK_BOUND,
             )
             .await
             .expect("the refused registration must not have unbound the incumbent");
         assert!(matches!(
-            delivery.outcome,
+            delivery.resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
             )
@@ -1220,11 +1294,12 @@ mod tests {
                 Uuid::new_v4(),
                 probe_message("after the rebind"),
                 true,
+                TEST_PARK_BOUND,
             )
             .await
             .expect("the identity must stay addressable across the rebind");
         assert!(matches!(
-            delivery.outcome,
+            delivery.resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
             )
@@ -1640,11 +1715,12 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
         let delivery = result.expect("runtime-bound Message must be durably admitted");
         assert!(matches!(
-            delivery.outcome,
+            delivery.resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
             )
@@ -1689,6 +1765,7 @@ mod tests {
                 envelope_id,
                 message(),
                 true,
+                TEST_PARK_BOUND,
             )
             .await
             .expect("first stable envelope delivery should resolve");
@@ -1696,7 +1773,7 @@ mod tests {
             .await
             .expect("first actual-machine admission should complete");
         assert!(matches!(
-            first.outcome,
+            first.resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
             )
@@ -1711,6 +1788,7 @@ mod tests {
                 envelope_id,
                 message(),
                 true,
+                TEST_PARK_BOUND,
             )
             .await
             .expect("same-envelope retry should resolve by durable deduplication");
@@ -1718,7 +1796,7 @@ mod tests {
             .await
             .expect("retry actual-machine admission should complete");
         assert!(matches!(
-            retry.outcome,
+            retry.resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Deduplicated
             )
@@ -1771,12 +1849,16 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await
             .expect("Response must complete after queue admission");
 
         assert_eq!(delivery.envelope_id, response_id);
-        assert!(matches!(delivery.outcome, IngressDeliveryOutcome::Queued));
+        assert!(matches!(
+            delivery.resolved_outcome(),
+            IngressDeliveryOutcome::Queued
+        ));
         let mut entries = inbox.try_drain_classified();
         assert_eq!(entries.len(), 1);
         let entry = entries.pop().expect("queued Response entry");
@@ -1784,6 +1866,245 @@ mod tests {
             panic!("expected external Response envelope");
         };
         assert_eq!(envelope.id, response_id);
+    }
+
+    /// Bound used by the park tests. Short enough to keep the lane fast, and
+    /// always paired with a much longer OUTER timeout so a regression to the
+    /// unbounded park fails the assertion instead of hanging the lane.
+    const SHORT_PARK_BOUND: Duration = Duration::from_millis(200);
+    const OUTER_DEADLINE: Duration = Duration::from_secs(5);
+
+    fn message_kind(body: &str) -> MessageKind {
+        MessageKind::Message {
+            objective_id: None,
+            content_taint: None,
+            blocks: None,
+            body: body.to_string(),
+            handling_mode: None,
+        }
+    }
+
+    /// The exact field defect: an in-process peer send waits for the RECEIVER's
+    /// drain to commit its claim, so a drain that dies mid-claim used to park
+    /// the sender forever. The claim drop releases the entry back to the queue
+    /// head, nothing commits it, and nothing polls.
+    ///
+    /// The bounded park must return a fact that is neither a drop nor a
+    /// success: the envelope IS queued and may still be drained later.
+    #[tokio::test]
+    async fn parked_inproc_sender_resolves_when_receiver_drain_dies() {
+        let registry = InprocRegistry::new();
+        let receiver_keypair = make_keypair();
+        let (inbox, sender, _finalizer) = classified_inbox_with_runtime();
+        registry.register("receiver", receiver_keypair.public_key(), sender);
+        let inbox = Arc::new(inbox);
+
+        // A drain that dies while holding the exact claim: it takes the claim
+        // and drops it without committing. `PeerIngressQueueClaim::drop`
+        // releases the lease, which leaves the entry queued and the sender's
+        // receipt unresolved forever.
+        let dying_drain = {
+            let inbox = Arc::clone(&inbox);
+            tokio::spawn(async move {
+                loop {
+                    if let Some(claimed) = inbox.try_claim_one_classified() {
+                        drop(crate::runtime::comms_runtime::test_peer_ingress_queue_claim(claimed));
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        let sender_keypair = make_keypair();
+        let envelope_id = Uuid::new_v4();
+        let delivery = tokio::time::timeout(
+            OUTER_DEADLINE,
+            registry.send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                envelope_id,
+                message_kind("drain dies mid-claim"),
+                true,
+                SHORT_PARK_BOUND,
+            ),
+        )
+        .await
+        .expect("a dead receiver drain must not park the sender forever")
+        .expect("the envelope was admitted, so this is not a typed send failure");
+
+        assert_eq!(delivery.envelope_id, envelope_id);
+        assert!(
+            matches!(
+                delivery.outcome,
+                InprocDeliveryOutcome::Unconfirmed { park_bound } if park_bound == SHORT_PARK_BOUND
+            ),
+            "a dropped receiver claim is ambiguous delivery, not success: got {:?}",
+            delivery.outcome
+        );
+        dying_drain.await.expect("dying drain task joins");
+
+        let (_, queued) = inbox
+            .peer_authority_test_snapshot()
+            .expect("classified inbox exposes its queue depth");
+        assert_eq!(
+            queued, 1,
+            "the envelope must still be queued: `Unconfirmed` claims admission, not loss"
+        );
+    }
+
+    /// Companion: a drain that is alive but never claims (stalled, not dead)
+    /// parks the sender at exactly the same await. Same bound, same fact.
+    #[tokio::test]
+    async fn inproc_sender_park_is_bounded_when_drain_never_claims() {
+        let registry = InprocRegistry::new();
+        let receiver_keypair = make_keypair();
+        let (inbox, sender, _finalizer) = classified_inbox_with_runtime();
+        registry.register("receiver", receiver_keypair.public_key(), sender);
+
+        let sender_keypair = make_keypair();
+        let delivery = tokio::time::timeout(
+            OUTER_DEADLINE,
+            registry.send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                Uuid::new_v4(),
+                message_kind("nobody is draining"),
+                true,
+                SHORT_PARK_BOUND,
+            ),
+        )
+        .await
+        .expect("a stalled receiver drain must not park the sender forever")
+        .expect("the envelope was admitted, so this is not a typed send failure");
+
+        assert!(
+            matches!(
+                delivery.outcome,
+                InprocDeliveryOutcome::Unconfirmed { park_bound } if park_bound == SHORT_PARK_BOUND
+            ),
+            "expected the bounded ambiguous fact, got {:?}",
+            delivery.outcome
+        );
+        drop(inbox);
+    }
+
+    /// The second park in the same call: once timed-out senders have filled the
+    /// receiver queue, capacity never opens again (only a dequeue fires the
+    /// capacity notifier), so the capacity wait must share the same deadline.
+    ///
+    /// Expiry BEFORE admission is not ambiguous - nothing was delivered - so it
+    /// keeps the existing typed `InboxFull` fact rather than claiming the
+    /// envelope reached the peer.
+    #[tokio::test]
+    async fn inproc_sender_capacity_park_is_bounded_when_receiver_never_drains() {
+        let registry = InprocRegistry::new();
+        let receiver_keypair = make_keypair();
+        let (peer_comms_handle, _finalizer) =
+            meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+        let context = Arc::new(crate::classify::IngressClassificationContext {
+            require_peer_auth: false,
+            trusted_peers: Arc::new(RwLock::new(TrustStore::new())),
+            peer_comms_handle: Arc::new(RwLock::new(Some(peer_comms_handle))),
+            inproc_namespace: None,
+            durable_runtime_consumer: true,
+        });
+        let (inbox, sender) = Inbox::new_classified_with_capacity_for_test(context, 1);
+        registry.register("receiver", receiver_keypair.public_key(), sender);
+
+        let sender_keypair = make_keypair();
+        let first = tokio::time::timeout(
+            OUTER_DEADLINE,
+            registry.send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                Uuid::new_v4(),
+                message_kind("fills the only slot"),
+                true,
+                SHORT_PARK_BOUND,
+            ),
+        )
+        .await
+        .expect("first send must return at the bound")
+        .expect("first send was admitted");
+        assert!(matches!(
+            first.outcome,
+            InprocDeliveryOutcome::Unconfirmed { .. }
+        ));
+
+        let second = tokio::time::timeout(
+            OUTER_DEADLINE,
+            registry.send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                Uuid::new_v4(),
+                message_kind("waits on capacity that never opens"),
+                true,
+                SHORT_PARK_BOUND,
+            ),
+        )
+        .await
+        .expect("the capacity park must be bounded by the same deadline as the receipt park");
+
+        assert!(
+            matches!(second, Err(InprocSendError::InboxFull)),
+            "a send that never got admitted must not claim ambiguous delivery"
+        );
+        let (_, queued) = inbox
+            .peer_authority_test_snapshot()
+            .expect("classified inbox exposes its queue depth");
+        assert_eq!(queued, 1, "the refused send must not have been queued");
+    }
+
+    /// The `Response` lane deliberately keeps capacity-only semantics: it
+    /// returns on queue admission and never waits for the receiver's drain.
+    ///
+    /// The park bound here is deliberately huge, so the only way this test can
+    /// finish inside its outer deadline is if `Response` never waits on a
+    /// drain that does not exist.
+    #[tokio::test]
+    async fn response_inproc_send_never_waits_for_a_receiver_drain() {
+        let registry = InprocRegistry::new();
+        let receiver_keypair = make_keypair();
+        let (inbox, sender, _finalizer) = classified_inbox_with_runtime();
+        registry.register("receiver", receiver_keypair.public_key(), sender);
+
+        let sender_keypair = make_keypair();
+        let response_id = Uuid::new_v4();
+        let delivery = tokio::time::timeout(
+            OUTER_DEADLINE,
+            registry.send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                response_id,
+                MessageKind::Response {
+                    objective_id: None,
+                    content_taint: None,
+                    in_reply_to: Uuid::new_v4(),
+                    status: crate::types::Status::Completed,
+                    result: serde_json::json!({}),
+                    blocks: None,
+                    handling_mode: None,
+                },
+                true,
+                Duration::from_secs(3600),
+            ),
+        )
+        .await
+        .expect("Response must return on admission, never on drain commit")
+        .expect("Response admission succeeded");
+
+        assert_eq!(delivery.envelope_id, response_id);
+        assert!(matches!(
+            delivery.resolved_outcome(),
+            IngressDeliveryOutcome::Queued
+        ));
+        drop(inbox);
     }
 
     #[tokio::test]
@@ -1823,13 +2144,14 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await
             .expect("auth-exempt supervisor bridge request must hand off as volatile control");
 
         assert_eq!(delivery.envelope_id, request_id);
         assert!(matches!(
-            delivery.outcome,
+            delivery.resolved_outcome(),
             IngressDeliveryOutcome::VolatileHandedOff
         ));
         let entry = handoff.await.expect("volatile handoff task completes");
@@ -1866,6 +2188,7 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
 
@@ -1898,6 +2221,7 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
 
@@ -1947,10 +2271,12 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
         assert!(matches!(
-            ok.expect("matching namespace must deliver").outcome,
+            ok.expect("matching namespace must deliver")
+                .resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
             )
@@ -1971,6 +2297,7 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
         assert!(matches!(wrong_ns, Err(InprocSendError::PeerNotFound(_))));
@@ -2019,11 +2346,12 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
         let delivery = result.expect("canonical target must receive");
         assert!(matches!(
-            delivery.outcome,
+            delivery.resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
             )
@@ -2073,6 +2401,7 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
 

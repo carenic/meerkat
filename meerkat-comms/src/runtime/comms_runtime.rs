@@ -3128,6 +3128,20 @@ impl CommsRuntime {
             Err(crate::router::SendError::DurableAdmissionRejected { envelope_id }) => {
                 Err(SendError::DurableAdmissionRejected { envelope_id })
             }
+            // Admitted to the in-process receiver's queue, never drained inside
+            // the bound. This is exactly the canonical ambiguous-delivery fact:
+            // the caller must reconcile against durable work truth, and no
+            // process-local retry authority is implied.
+            Err(crate::router::SendError::InprocDeliveryUnconfirmed {
+                envelope_id,
+                park_bound,
+            }) => Err(SendError::AmbiguousDelivery {
+                envelope_id,
+                detail: format!(
+                    "in-process receiver admitted the envelope but no drain committed it within {}s",
+                    park_bound.as_secs_f64()
+                ),
+            }),
             Err(
                 error @ (crate::router::SendError::Transport(_) | crate::router::SendError::Io(_)),
             ) => Err(SendError::AmbiguousDelivery {

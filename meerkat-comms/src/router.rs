@@ -94,6 +94,22 @@ pub enum SendError {
     /// envelope as rejected. This is terminal, not an ambiguous/offline send.
     #[error("Peer durably rejected envelope {envelope_id}")]
     DurableAdmissionRejected { envelope_id: Uuid },
+    /// The in-process receiver ADMITTED the envelope to its ingress queue, but
+    /// no drain committed the claim within `ack_timeout_secs`. The envelope was
+    /// neither dropped nor confirmed: a later drain may still commit it.
+    ///
+    /// Deliberately distinct from [`Self::PeerOffline`] (the peer is present
+    /// and took the item) and from [`Self::AdmissionDropped`] (admission
+    /// refused it). Callers must treat it as ambiguous and reconcile against
+    /// durable work truth rather than assume either outcome.
+    #[error(
+        "In-process delivery of envelope {envelope_id} unconfirmed after {}s (admitted, not drained)",
+        park_bound.as_secs_f64()
+    )]
+    InprocDeliveryUnconfirmed {
+        envelope_id: Uuid,
+        park_bound: Duration,
+    },
 }
 
 /// Outcome of a successful router send.
@@ -675,6 +691,13 @@ impl Router {
         dest: PeerId,
     ) -> Result<SendOutcome, SendError> {
         let registry = InprocRegistry::global();
+        // ONE bound, one meaning, both transports: the stream lane already caps
+        // how long a sender waits on the receiver at `ack_timeout_secs`
+        // (`send_on_stream`). The in-process lane waits on the receiver's drain
+        // instead of on an ack frame, but it is the same question - how long
+        // may our liveness depend on the peer - so it reuses the same knob
+        // rather than inventing a second timeout constant.
+        let park_bound = Duration::from_secs(self.config.ack_timeout_secs);
         let delivery = match self.inproc_namespace.as_deref() {
             Some(namespace) => registry
                 .send_to_pubkey_in_namespace_with_id_wait(
@@ -684,6 +707,7 @@ impl Router {
                     envelope.id,
                     envelope.kind,
                     self.require_peer_auth,
+                    park_bound,
                 )
                 .await
                 .map_err(|err| map_inproc_send_error(err, dest))?,
@@ -694,11 +718,24 @@ impl Router {
                     envelope.id,
                     envelope.kind,
                     self.require_peer_auth,
+                    park_bound,
                 )
                 .await
                 .map_err(|err| map_inproc_send_error(err, dest))?,
         };
-        let outcome = match delivery.outcome {
+        let resolved = match delivery.outcome {
+            crate::inproc::InprocDeliveryOutcome::Resolved(outcome) => outcome,
+            // Admitted, never drained inside the bound. Not a success: the
+            // receiver may still commit it, so the caller gets the ambiguous
+            // fact and reconciles rather than being told "delivered".
+            crate::inproc::InprocDeliveryOutcome::Unconfirmed { park_bound } => {
+                return Err(SendError::InprocDeliveryUnconfirmed {
+                    envelope_id: delivery.envelope_id,
+                    park_bound,
+                });
+            }
+        };
+        let outcome = match resolved {
             crate::inbox::IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::interaction::PeerIngressTerminalOutcomeKind::Rejected,
             ) => {
@@ -1196,6 +1233,95 @@ mod tests {
         // Clean up only our own registration; never `clear()` the shared
         // process-global registry.
         registry.unregister_in_namespace(&namespace_b, &receiver_pubkey);
+    }
+
+    /// WIRING, not mechanism: proves the router actually hands
+    /// `CommsConfig.ack_timeout_secs` to the in-process lane as its park bound.
+    /// The inbox-level tests can pass with any bound plumbed from anywhere;
+    /// this one fails if the knob is not the one that governs.
+    ///
+    /// One bound, one meaning across both transports: the stream lane already
+    /// caps its wait on the receiver at `ack_timeout_secs`.
+    #[tokio::test]
+    async fn inproc_send_bounds_the_park_with_ack_timeout_and_reports_unconfirmed() {
+        use crate::classify::test_support;
+
+        let registry = InprocRegistry::global();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let namespace = format!("realm-unconfirmed-{suffix}");
+
+        // Receiver with a classified inbox and NO drain at all.
+        let receiver_kp = Keypair::generate();
+        let receiver_pubkey = receiver_kp.public_key();
+        let receiver_pubkey_bytes = *receiver_pubkey.as_bytes();
+        let (receiver_inbox, receiver_sender) = Inbox::new_classified(
+            test_support::classification_context(TrustStore::new(), false),
+        );
+        registry.register_with_meta_in_namespace(
+            &namespace,
+            "receiver",
+            receiver_pubkey,
+            receiver_sender,
+            PeerMeta::default(),
+        );
+
+        let (_inbox, inbox_sender) = Inbox::new_transport_only();
+        let router = Router::new(
+            Keypair::generate(),
+            CommsConfig {
+                ack_timeout_secs: 1,
+                ..CommsConfig::default()
+            },
+            inbox_sender,
+            false,
+        )
+        .with_inproc_namespace(Some(namespace.clone()));
+
+        let peer_id = PeerId::from_ed25519_pubkey(&receiver_pubkey_bytes);
+        router
+            .add_trusted_peer_for_source(
+                peer("receiver", receiver_pubkey_bytes, "inproc://receiver"),
+                GeneratedCommsTrustAuthoritySourceKind::MeerkatMachinePeerProjection,
+                false,
+            )
+            .expect("trust add");
+
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            router.send(
+                peer_id,
+                MessageKind::Message {
+                    objective_id: None,
+                    body: "nobody drains this inbox".to_string(),
+                    blocks: None,
+                    content_taint: None,
+                    handling_mode: None,
+                },
+            ),
+        )
+        .await
+        .expect("an undrained in-process receiver must not park the sender forever");
+        let elapsed = started.elapsed();
+
+        match result {
+            Err(SendError::InprocDeliveryUnconfirmed {
+                envelope_id: _,
+                park_bound,
+            }) => assert_eq!(
+                park_bound,
+                Duration::from_secs(1),
+                "the park bound must be the router's configured ack timeout"
+            ),
+            other => panic!("expected a typed unconfirmed in-process delivery, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the send must return at the configured 1s bound, not at some other timeout: {elapsed:?}"
+        );
+
+        registry.unregister_in_namespace(&namespace, &receiver_pubkey);
+        drop(receiver_inbox);
     }
 
     /// Single-resolution invariant: when the router is namespace-scoped, the
