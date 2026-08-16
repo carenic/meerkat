@@ -42,39 +42,51 @@ TerminalStutter ==
     /\ phase = "ShuttingDown"
     /\ UNCHANGED vars
 
+\* Named UNCHANGED frames. One definition per distinct frame; every action
+\* that leaves those variables unchanged references the definition by name.
+UnchangedFrame_046c992d3dcb0dcb == UNCHANGED << shutdown_pending, admission_drain_pending, last_public_terminal >>
+UnchangedFrame_055b26c6c93962ea == UNCHANGED << admission_drain_pending >>
+UnchangedFrame_108875a9a5d38041 == UNCHANGED << admission_drain_pending, last_public_terminal >>
+UnchangedFrame_24820eb903e12422 == UNCHANGED << interrupt_pending, shutdown_pending, last_public_terminal >>
+UnchangedFrame_42fc8910cc22d6f9 == UNCHANGED << last_public_terminal >>
+UnchangedFrame_46e95c01cac5058b == UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending >>
+UnchangedFrame_6346570d1f69f450 == UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+UnchangedFrame_7561b2ea569a6002 == UNCHANGED << interrupt_pending, admission_drain_pending, last_public_terminal >>
+UnchangedFrame_ab70b2726ab662a3 == UNCHANGED << shutdown_pending, last_public_terminal >>
+
 ProjectTurnAdmissionIdle ==
     /\ phase = "Idle"
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ProjectTurnAdmissionAdmitted ==
     /\ phase = "Admitted"
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ProjectTurnAdmissionRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ProjectTurnAdmissionCompleting ==
     /\ phase = "Completing"
     /\ phase' = "Completing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ProjectTurnAdmissionShuttingDown ==
     /\ phase = "ShuttingDown"
     /\ phase' = "ShuttingDown"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ClaimTurn ==
@@ -84,7 +96,7 @@ ClaimTurn ==
     /\ interrupt_pending' = FALSE
     /\ shutdown_pending' = FALSE
     /\ last_public_terminal' = None
-    /\ UNCHANGED << admission_drain_pending >>
+    /\ UnchangedFrame_055b26c6c93962ea
 
 
 AbortClaim ==
@@ -93,42 +105,42 @@ AbortClaim ==
     /\ model_step_count' = model_step_count + 1
     /\ interrupt_pending' = FALSE
     /\ shutdown_pending' = FALSE
-    /\ UNCHANGED << admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_108875a9a5d38041
 
 
 ClaimTurnShuttingDown ==
     /\ phase = "ShuttingDown"
     /\ phase' = "ShuttingDown"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 AbortClaimShuttingDown ==
     /\ phase = "ShuttingDown"
     /\ phase' = "ShuttingDown"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 BeginTurn ==
     /\ phase = "Admitted"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 BeginTurnShuttingDown ==
     /\ phase = "ShuttingDown"
     /\ phase' = "ShuttingDown"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ResolveTurn ==
     /\ phase = "Running"
     /\ phase' = "Completing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 FinalizeTurnToShutdown ==
@@ -138,7 +150,7 @@ FinalizeTurnToShutdown ==
     /\ model_step_count' = model_step_count + 1
     /\ interrupt_pending' = FALSE
     /\ admission_drain_pending' = TRUE
-    /\ UNCHANGED << shutdown_pending, last_public_terminal >>
+    /\ UnchangedFrame_ab70b2726ab662a3
 
 
 FinalizeTurnToIdle ==
@@ -148,7 +160,7 @@ FinalizeTurnToIdle ==
     /\ model_step_count' = model_step_count + 1
     /\ interrupt_pending' = FALSE
     /\ shutdown_pending' = FALSE
-    /\ UNCHANGED << admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_108875a9a5d38041
 
 
 RequestInterruptAdmittedFirst ==
@@ -157,7 +169,7 @@ RequestInterruptAdmittedFirst ==
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
     /\ interrupt_pending' = TRUE
-    /\ UNCHANGED << shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_046c992d3dcb0dcb
 
 
 RequestInterruptAdmittedDuplicate ==
@@ -165,7 +177,7 @@ RequestInterruptAdmittedDuplicate ==
     /\ interrupt_pending
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 RequestInterruptRunningFirst ==
@@ -174,7 +186,7 @@ RequestInterruptRunningFirst ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ interrupt_pending' = TRUE
-    /\ UNCHANGED << shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_046c992d3dcb0dcb
 
 
 RequestInterruptRunningDuplicate ==
@@ -182,7 +194,7 @@ RequestInterruptRunningDuplicate ==
     /\ interrupt_pending
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 RequestShutdownImmediateIdle ==
@@ -192,7 +204,7 @@ RequestShutdownImmediateIdle ==
     /\ interrupt_pending' = FALSE
     /\ shutdown_pending' = TRUE
     /\ admission_drain_pending' = TRUE
-    /\ UNCHANGED << last_public_terminal >>
+    /\ UnchangedFrame_42fc8910cc22d6f9
 
 
 RequestShutdownImmediateAdmitted ==
@@ -202,7 +214,7 @@ RequestShutdownImmediateAdmitted ==
     /\ interrupt_pending' = FALSE
     /\ shutdown_pending' = TRUE
     /\ admission_drain_pending' = TRUE
-    /\ UNCHANGED << last_public_terminal >>
+    /\ UnchangedFrame_42fc8910cc22d6f9
 
 
 RequestShutdownDeferredRunning ==
@@ -210,7 +222,7 @@ RequestShutdownDeferredRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ shutdown_pending' = TRUE
-    /\ UNCHANGED << interrupt_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_7561b2ea569a6002
 
 
 RequestShutdownDeferredCompleting ==
@@ -218,14 +230,14 @@ RequestShutdownDeferredCompleting ==
     /\ phase' = "Completing"
     /\ model_step_count' = model_step_count + 1
     /\ shutdown_pending' = TRUE
-    /\ UNCHANGED << interrupt_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_7561b2ea569a6002
 
 
 RequestShutdownAlreadyShuttingDown ==
     /\ phase = "ShuttingDown"
     /\ phase' = "ShuttingDown"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ResolvePendingAdmissionDrained ==
@@ -234,7 +246,7 @@ ResolvePendingAdmissionDrained ==
     /\ phase' = "ShuttingDown"
     /\ model_step_count' = model_step_count + 1
     /\ admission_drain_pending' = FALSE
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, last_public_terminal >>
+    /\ UnchangedFrame_24820eb903e12422
 
 
 AuthorizeSessionTeardown ==
@@ -242,35 +254,35 @@ AuthorizeSessionTeardown ==
     /\ (admission_drain_pending = FALSE)
     /\ phase' = "ShuttingDown"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 AuthorizeCancelAfterBoundaryAdmitted ==
     /\ phase = "Admitted"
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 AuthorizeStartTurnDispatchAdmitted ==
     /\ phase = "Admitted"
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 AuthorizeStartTurnDispatchShuttingDown ==
     /\ phase = "ShuttingDown"
     /\ phase' = "ShuttingDown"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 AuthorizeCancelAfterBoundaryRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ResolveDispositionContentTurn(execution_kind_present, execution_kind, prompt_trimmed_text_byte_count, prompt_non_text_block_count, pending_continuation) ==
@@ -279,7 +291,7 @@ ResolveDispositionContentTurn(execution_kind_present, execution_kind, prompt_tri
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
     /\ last_public_terminal' = None
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending >>
+    /\ UnchangedFrame_46e95c01cac5058b
 
 
 ResolveDispositionResumePendingWithBoundary(execution_kind_present, execution_kind, prompt_trimmed_text_byte_count, prompt_non_text_block_count, pending_continuation) ==
@@ -288,7 +300,7 @@ ResolveDispositionResumePendingWithBoundary(execution_kind_present, execution_ki
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
     /\ last_public_terminal' = None
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending >>
+    /\ UnchangedFrame_46e95c01cac5058b
 
 
 ResolveDispositionResumePendingWithoutBoundary(execution_kind_present, execution_kind, prompt_trimmed_text_byte_count, prompt_non_text_block_count, pending_continuation) ==
@@ -297,7 +309,7 @@ ResolveDispositionResumePendingWithoutBoundary(execution_kind_present, execution
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
     /\ last_public_terminal' = Some("NoPendingBoundary")
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending >>
+    /\ UnchangedFrame_46e95c01cac5058b
 
 
 ResolveDispositionDirectPrompt(execution_kind_present, execution_kind, prompt_trimmed_text_byte_count, prompt_non_text_block_count, pending_continuation) ==
@@ -306,7 +318,7 @@ ResolveDispositionDirectPrompt(execution_kind_present, execution_kind, prompt_tr
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
     /\ last_public_terminal' = None
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending >>
+    /\ UnchangedFrame_46e95c01cac5058b
 
 
 ResolveDispositionDirectPending(execution_kind_present, execution_kind, prompt_trimmed_text_byte_count, prompt_non_text_block_count, pending_continuation) ==
@@ -315,7 +327,7 @@ ResolveDispositionDirectPending(execution_kind_present, execution_kind, prompt_t
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
     /\ last_public_terminal' = None
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending >>
+    /\ UnchangedFrame_46e95c01cac5058b
 
 
 ResolveDispositionDirectNoPending(execution_kind_present, execution_kind, prompt_trimmed_text_byte_count, prompt_non_text_block_count, pending_continuation) ==
@@ -324,14 +336,14 @@ ResolveDispositionDirectNoPending(execution_kind_present, execution_kind, prompt
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
     /\ last_public_terminal' = Some("NoPendingBoundary")
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending >>
+    /\ UnchangedFrame_46e95c01cac5058b
 
 
 ResolveStartTurnDispositionShuttingDown(execution_kind_present, execution_kind, prompt_trimmed_text_byte_count, prompt_non_text_block_count, pending_continuation) ==
     /\ phase = "ShuttingDown"
     /\ phase' = "ShuttingDown"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ResolveRuntimeKeepAliveEnable(keep_alive_request) ==
@@ -339,7 +351,7 @@ ResolveRuntimeKeepAliveEnable(keep_alive_request) ==
     /\ (keep_alive_request = "Enable")
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ResolveRuntimeKeepAliveDisable(keep_alive_request) ==
@@ -347,7 +359,7 @@ ResolveRuntimeKeepAliveDisable(keep_alive_request) ==
     /\ (keep_alive_request = "Disable")
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ResolveRuntimeKeepAlivePreserve(keep_alive_request) ==
@@ -355,14 +367,14 @@ ResolveRuntimeKeepAlivePreserve(keep_alive_request) ==
     /\ (keep_alive_request = "Preserve")
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ResolveRuntimeKeepAliveShuttingDown(keep_alive_request) ==
     /\ phase = "ShuttingDown"
     /\ phase' = "ShuttingDown"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ResolveLastStartTurnPublicTerminalNoPendingIdle ==
@@ -370,7 +382,7 @@ ResolveLastStartTurnPublicTerminalNoPendingIdle ==
     /\ (last_public_terminal = Some("NoPendingBoundary"))
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ResolveLastStartTurnPublicTerminalNoPendingAdmitted ==
@@ -378,7 +390,7 @@ ResolveLastStartTurnPublicTerminalNoPendingAdmitted ==
     /\ (last_public_terminal = Some("NoPendingBoundary"))
     /\ phase' = "Admitted"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ResolveLastStartTurnPublicTerminalNoPendingRunning ==
@@ -386,7 +398,7 @@ ResolveLastStartTurnPublicTerminalNoPendingRunning ==
     /\ (last_public_terminal = Some("NoPendingBoundary"))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ResolveLastStartTurnPublicTerminalNoPendingCompleting ==
@@ -394,7 +406,7 @@ ResolveLastStartTurnPublicTerminalNoPendingCompleting ==
     /\ (last_public_terminal = Some("NoPendingBoundary"))
     /\ phase' = "Completing"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 ResolveLastStartTurnPublicTerminalNoPendingShuttingDown ==
@@ -402,7 +414,7 @@ ResolveLastStartTurnPublicTerminalNoPendingShuttingDown ==
     /\ (last_public_terminal = Some("NoPendingBoundary"))
     /\ phase' = "ShuttingDown"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << interrupt_pending, shutdown_pending, admission_drain_pending, last_public_terminal >>
+    /\ UnchangedFrame_6346570d1f69f450
 
 
 Next ==

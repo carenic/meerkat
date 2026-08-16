@@ -41,12 +41,17 @@ Init ==
     /\ approval_deny_allowed = [x \in {} |-> None]
     /\ approval_has_expiry = [x \in {} |-> None]
 
+\* Named UNCHANGED frames. One definition per distinct frame; every action
+\* that leaves those variables unchanged references the definition by name.
+UnchangedFrame_b7fc92856f337c5b == UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+UnchangedFrame_cf95e632324f10b9 == UNCHANGED << approval_ids, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+
 CreateRejectedEmptyAllowedDecisions(approval_id, approve_allowed, deny_allowed, has_expiry) ==
     /\ phase = "Ready"
     /\ (allowed_non_empty(approve_allowed, deny_allowed) = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 CreateRejectedAlreadyExists(approval_id, approve_allowed, deny_allowed, has_expiry) ==
@@ -54,7 +59,7 @@ CreateRejectedAlreadyExists(approval_id, approve_allowed, deny_allowed, has_expi
     /\ (allowed_non_empty(approve_allowed, deny_allowed) /\ (approval_id \in approval_ids))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 CreatePending(approval_id, approve_allowed, deny_allowed, has_expiry) ==
@@ -74,7 +79,7 @@ RestoreRejectedDuplicate(approval_id, status, approve_allowed, deny_allowed, has
     /\ (approval_id \in approval_ids)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 RestoreRejectedEmptyAllowedDecisions(approval_id, status, approve_allowed, deny_allowed, has_expiry, decision) ==
@@ -82,7 +87,7 @@ RestoreRejectedEmptyAllowedDecisions(approval_id, status, approve_allowed, deny_
     /\ (((approval_id \in approval_ids) = FALSE) /\ (allowed_non_empty(approve_allowed, deny_allowed) = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 RestorePending(approval_id, status, approve_allowed, deny_allowed, has_expiry, decision) ==
@@ -150,7 +155,7 @@ RestoreRejectedInvalidRecord(approval_id, status, approve_allowed, deny_allowed,
     /\ (((approval_id \in approval_ids) = FALSE) /\ allowed_non_empty(approve_allowed, deny_allowed) /\ (IF ((status = "Pending") /\ (decision # None)) THEN TRUE ELSE (IF ((status = "Expired") /\ (decision # None)) THEN TRUE ELSE (IF ((status = "Cancelled") /\ (decision # None)) THEN TRUE ELSE (IF ((status = "Approved") /\ (IF (approve_allowed = FALSE) THEN TRUE ELSE (decision # Some("Approve")))) THEN TRUE ELSE ((status = "Denied") /\ (IF (deny_allowed = FALSE) THEN TRUE ELSE (decision # Some("Deny")))))))))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 ObserveExpiryRejectedMissing(approval_id, expired) ==
@@ -158,7 +163,7 @@ ObserveExpiryRejectedMissing(approval_id, expired) ==
     /\ ((approval_id \in approval_ids) = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 ObserveExpiryExpiresPending(approval_id, expired) ==
@@ -167,7 +172,7 @@ ObserveExpiryExpiresPending(approval_id, expired) ==
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ approval_statuses' = MapSet(approval_statuses, approval_id, "Expired")
-    /\ UNCHANGED << approval_ids, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_cf95e632324f10b9
 
 
 ObserveExpiryPendingNoop(approval_id, expired) ==
@@ -175,7 +180,7 @@ ObserveExpiryPendingNoop(approval_id, expired) ==
     /\ ((approval_id \in approval_ids) /\ ((IF "value" \in DOMAIN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None) THEN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Pending") /\ (IF ((IF "value" \in DOMAIN (IF (approval_id \in DOMAIN approval_has_expiry) THEN Some((IF approval_id \in DOMAIN approval_has_expiry THEN approval_has_expiry[approval_id] ELSE FALSE)) ELSE None) THEN (IF (approval_id \in DOMAIN approval_has_expiry) THEN Some((IF approval_id \in DOMAIN approval_has_expiry THEN approval_has_expiry[approval_id] ELSE FALSE)) ELSE None)["value"] ELSE None) = FALSE) THEN TRUE ELSE (expired = FALSE)))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 ObserveExpiryApprovedNoop(approval_id, expired) ==
@@ -183,7 +188,7 @@ ObserveExpiryApprovedNoop(approval_id, expired) ==
     /\ ((approval_id \in approval_ids) /\ ((IF "value" \in DOMAIN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None) THEN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Approved"))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 ObserveExpiryDeniedNoop(approval_id, expired) ==
@@ -191,7 +196,7 @@ ObserveExpiryDeniedNoop(approval_id, expired) ==
     /\ ((approval_id \in approval_ids) /\ ((IF "value" \in DOMAIN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None) THEN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Denied"))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 ObserveExpiryExpiredNoop(approval_id, expired) ==
@@ -199,7 +204,7 @@ ObserveExpiryExpiredNoop(approval_id, expired) ==
     /\ ((approval_id \in approval_ids) /\ ((IF "value" \in DOMAIN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None) THEN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Expired"))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 ObserveExpiryCancelledNoop(approval_id, expired) ==
@@ -207,7 +212,7 @@ ObserveExpiryCancelledNoop(approval_id, expired) ==
     /\ ((approval_id \in approval_ids) /\ ((IF "value" \in DOMAIN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None) THEN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Cancelled"))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 DecideRejectedMissing(approval_id, decision) ==
@@ -215,7 +220,7 @@ DecideRejectedMissing(approval_id, decision) ==
     /\ ((approval_id \in approval_ids) = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 DecideRejectedExpired(approval_id, decision) ==
@@ -223,7 +228,7 @@ DecideRejectedExpired(approval_id, decision) ==
     /\ ((approval_id \in approval_ids) /\ ((IF "value" \in DOMAIN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None) THEN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Expired"))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 DecideRejectedAlreadyDecided(approval_id, decision) ==
@@ -231,7 +236,7 @@ DecideRejectedAlreadyDecided(approval_id, decision) ==
     /\ ((approval_id \in approval_ids) /\ is_terminal_status((IF "value" \in DOMAIN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None) THEN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None)["value"] ELSE None)))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 DecideRejectedApproveNotAllowed(approval_id, decision) ==
@@ -239,7 +244,7 @@ DecideRejectedApproveNotAllowed(approval_id, decision) ==
     /\ ((approval_id \in approval_ids) /\ ((IF "value" \in DOMAIN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None) THEN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Pending") /\ (decision = "Approve") /\ ((IF "value" \in DOMAIN (IF (approval_id \in DOMAIN approval_approve_allowed) THEN Some((IF approval_id \in DOMAIN approval_approve_allowed THEN approval_approve_allowed[approval_id] ELSE FALSE)) ELSE None) THEN (IF (approval_id \in DOMAIN approval_approve_allowed) THEN Some((IF approval_id \in DOMAIN approval_approve_allowed THEN approval_approve_allowed[approval_id] ELSE FALSE)) ELSE None)["value"] ELSE None) = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 DecideRejectedDenyNotAllowed(approval_id, decision) ==
@@ -247,7 +252,7 @@ DecideRejectedDenyNotAllowed(approval_id, decision) ==
     /\ ((approval_id \in approval_ids) /\ ((IF "value" \in DOMAIN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None) THEN (IF (approval_id \in DOMAIN approval_statuses) THEN Some((IF approval_id \in DOMAIN approval_statuses THEN approval_statuses[approval_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Pending") /\ (decision = "Deny") /\ ((IF "value" \in DOMAIN (IF (approval_id \in DOMAIN approval_deny_allowed) THEN Some((IF approval_id \in DOMAIN approval_deny_allowed THEN approval_deny_allowed[approval_id] ELSE FALSE)) ELSE None) THEN (IF (approval_id \in DOMAIN approval_deny_allowed) THEN Some((IF approval_id \in DOMAIN approval_deny_allowed THEN approval_deny_allowed[approval_id] ELSE FALSE)) ELSE None)["value"] ELSE None) = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << approval_ids, approval_statuses, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_b7fc92856f337c5b
 
 
 DecideApprove(approval_id, decision) ==
@@ -256,7 +261,7 @@ DecideApprove(approval_id, decision) ==
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ approval_statuses' = MapSet(approval_statuses, approval_id, "Approved")
-    /\ UNCHANGED << approval_ids, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_cf95e632324f10b9
 
 
 DecideDeny(approval_id, decision) ==
@@ -265,7 +270,7 @@ DecideDeny(approval_id, decision) ==
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ approval_statuses' = MapSet(approval_statuses, approval_id, "Denied")
-    /\ UNCHANGED << approval_ids, approval_approve_allowed, approval_deny_allowed, approval_has_expiry >>
+    /\ UnchangedFrame_cf95e632324f10b9
 
 
 Next ==
