@@ -4945,11 +4945,16 @@ mod tests {
             .as_object()
             .expect("health payload carries a checks map");
 
-        // Measured. `session_durability` and `session_runtime_loop` are read
-        // off live runtime state, so their presence here is the wiring pin: a
-        // handler that forgot to insert them would publish `unmeasured:*`
-        // instead and fail on the next assertion block.
-        for measured in ["jobs", "session_durability", "session_runtime_loop"] {
+        // Measured. The three session dimensions are read off live runtime
+        // state, so their presence here is the wiring pin: a handler that
+        // forgot to insert them would publish `unmeasured:*` instead and fail
+        // on the next assertion block.
+        for measured in [
+            "jobs",
+            "session_durability",
+            "session_runtime_loop",
+            "session_run_start",
+        ] {
             assert_eq!(
                 checks.get(measured).and_then(serde_json::Value::as_str),
                 Some("ok"),
@@ -4962,11 +4967,11 @@ mod tests {
         }
 
         // Unmeasured, and named rather than omitted. Nothing here observes
-        // whether a live session is *progressing*: a session whose loop task
-        // is alive and whose channels are open, but which is parked on
-        // selectable queued work, moves no value this handler reads. That is
-        // 0.8.24 watchdog work and the payload says so rather than implying
-        // coverage.
+        // the PRE-staging class: a session whose loop task is alive and whose
+        // channels are open, but which is parked on selectable queued work
+        // that never gets staged. `session_run_start` cannot see it - its
+        // window opens at the durable StageForRun commit - so the payload
+        // says so rather than implying coverage.
         assert_eq!(
             checks
                 .get("unmeasured:session_liveness")
@@ -4992,16 +4997,21 @@ mod tests {
             result["status"], "ok",
             "unmeasured coverage is published, not folded into the rollup: {result}"
         );
-        let worst_measured = ["jobs", "session_durability", "session_runtime_loop"]
-            .into_iter()
-            .filter_map(|key| checks.get(key).and_then(serde_json::Value::as_str))
-            .map(|status| match status {
-                "ok" => 0u8,
-                "degraded" => 1,
-                _ => 2,
-            })
-            .max()
-            .expect("at least one measured check");
+        let worst_measured = [
+            "jobs",
+            "session_durability",
+            "session_runtime_loop",
+            "session_run_start",
+        ]
+        .into_iter()
+        .filter_map(|key| checks.get(key).and_then(serde_json::Value::as_str))
+        .map(|status| match status {
+            "ok" => 0u8,
+            "degraded" => 1,
+            _ => 2,
+        })
+        .max()
+        .expect("at least one measured check");
         assert_eq!(
             result["status"].as_str(),
             Some(match worst_measured {

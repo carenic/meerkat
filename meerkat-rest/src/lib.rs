@@ -3855,9 +3855,9 @@ fn rest_observed_session_population(
 
 /// What THIS surface's probes established about runtime host health.
 ///
-/// REST reads the two session dimensions straight off the `MeerkatMachine` it
-/// already holds; both accessors are synchronous non-blocking reads, so a
-/// health scrape cannot park behind the wedge it is trying to report.
+/// REST reads the three session dimensions straight off the `MeerkatMachine`
+/// it already holds; all three accessors are synchronous non-blocking reads,
+/// so a health scrape cannot park behind the wedge it is trying to report.
 ///
 /// `jobs` is not probed here. REST holds no `DetachedJobService`, so it is
 /// published as `unmeasured:jobs`: a coverage statement in the payload rather
@@ -3874,6 +3874,12 @@ fn rest_runtime_health(state: &AppState) -> meerkat_contracts::RuntimeHostHealth
             "session_runtime_loop".to_string(),
             rest_observed_session_population(
                 state.runtime_adapter.dead_runtime_loop_session_count(),
+            ),
+        ),
+        (
+            "session_run_start".to_string(),
+            rest_observed_session_population(
+                state.runtime_adapter.overdue_run_start_session_count(),
             ),
         ),
     ])
@@ -12654,11 +12660,15 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let health: Value = serde_json::from_slice(&body).unwrap();
-        // Measured. REST reads both session dimensions off the runtime machine
-        // it already holds, so their presence here is the wiring pin: a route
-        // that forgot to probe would publish `unmeasured:*` instead and fail
-        // the next block.
-        for measured in ["session_durability", "session_runtime_loop"] {
+        // Measured. REST reads the three session dimensions off the runtime
+        // machine it already holds, so their presence here is the wiring pin:
+        // a route that forgot to probe would publish `unmeasured:*` instead
+        // and fail the next block.
+        for measured in [
+            "session_durability",
+            "session_runtime_loop",
+            "session_run_start",
+        ] {
             assert_eq!(
                 health["checks"][measured], "ok",
                 "GET /runtime/health must publish `{measured}` as measured: {health}"

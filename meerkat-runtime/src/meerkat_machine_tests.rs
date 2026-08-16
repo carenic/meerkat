@@ -44029,6 +44029,11 @@ async fn health_probes_answer_none_when_the_session_registry_cannot_be_read() {
         None,
         "an unreadable registry is not an empty registry"
     );
+    assert_eq!(
+        machine.overdue_run_start_session_count(),
+        None,
+        "an unreadable registry is not an empty registry"
+    );
     drop(registry_guard);
 
     assert_eq!(
@@ -44042,5 +44047,185 @@ async fn health_probes_answer_none_when_the_session_registry_cannot_be_read() {
         Some(0),
         "and the refusal is per-probe, not sticky: it clears the moment the \
          registry is readable again"
+    );
+    assert_eq!(
+        machine.overdue_run_start_session_count(),
+        Some(0),
+        "and the refusal is per-probe, not sticky: it clears the moment the \
+         registry is readable again"
+    );
+}
+
+/// The loop-side arming pin for `session_run_start`: a real turn through the
+/// real runtime loop must arm the session's staged-run window, because the
+/// census reads nothing else. Every other census assertion arms the window by
+/// hand, so without this test the `arm` call in the runtime loop could be
+/// deleted and the whole suite would stay green while the dimension went
+/// permanently, silently `Some(0)`.
+#[tokio::test]
+async fn a_real_turn_arms_the_staged_run_window_and_reads_clear_after_completion() {
+    let machine = persistent_health_probe_machine();
+    let session_id = SessionId::new();
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    machine
+        .ensure_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("registered session entry");
+        assert!(
+            entry.run_start_window.snapshot().is_none(),
+            "no run was staged yet, so nothing may have armed the window"
+        );
+    }
+
+    let (accept_outcome, completion_handle) = machine
+        .accept_input_with_completion(&session_id, make_prompt("run start census arming"))
+        .await
+        .expect("input should be accepted");
+    assert!(matches!(accept_outcome, AcceptOutcome::Accepted { .. }));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        completion_handle
+            .expect("accepted input should register a completion waiter")
+            .wait(),
+    )
+    .await
+    .expect("completion waiter should resolve")
+    .expect("the noop turn should complete");
+
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("registered session entry");
+        assert!(
+            entry.run_start_window.snapshot().is_some(),
+            "the runtime loop must arm the staged-run window at the durable \
+             StageForRun commit"
+        );
+    }
+    assert_eq!(
+        machine.overdue_run_start_session_count(),
+        Some(0),
+        "a completed turn's window is stale in the harmless direction: the \
+         census recomputes from machine truth and reads it Clear"
+    );
+}
+
+/// The `session_run_start` census against a manufactured wedge, at the
+/// accessor level: the run is current, its turn start was signalled, its
+/// primitive is provably un-applied, and the notice bound has elapsed. Also
+/// pins the deliberate failure direction that differs from
+/// `dead_runtime_loop_session_count`: a past-bound window whose authority
+/// cannot be read propagates as `None` rather than counting, because unlike a
+/// dead shell nothing here was established lock-free - a past-bound window is
+/// also what a healthy long turn looks like.
+#[tokio::test(start_paused = true)]
+async fn overdue_run_start_session_count_sees_a_wedged_staged_run() {
+    let machine = persistent_health_probe_machine();
+    let session_id = SessionId::new();
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    machine
+        .ensure_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+
+    // Arm the window and wedge the shared authority: current run staged with
+    // its turn start signalled, primitive still un-applied. The state is
+    // written through the entry's own authority Arc - the same object the
+    // runtime loop's supervisors observe - via the same recover path
+    // production uses for projection previews.
+    let run = uuid::Uuid::new_v4();
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("registered session entry");
+        let turn_start = crate::run_progress::TurnStartSignalCell::default();
+        turn_start.mark_signalled();
+        entry.run_start_window.arm(
+            meerkat_core::lifecycle::RunId::from_uuid(run),
+            crate::run_progress::Instant::now(),
+            turn_start,
+        );
+        let mut state = entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state()
+            .clone();
+        assert!(
+            state.active_runtime_id.is_some(),
+            "an attached executor leaves the runtime bound; the census must \
+             read the same fact"
+        );
+        state.current_run_id = Some(mm_dsl::RunId(run.to_string()));
+        // Recovery enforces `current_run_only_while_running_or_retired` and
+        // `current_run_has_pre_run_phase`.
+        state.lifecycle_phase = mm_dsl::MeerkatPhase::Running;
+        state.pre_run_phase = Some(mm_dsl::PreRunPhase::Attached);
+        state.turn_phase = mm_dsl::TurnPhase::ApplyingPrimitive;
+        *entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            crate::meerkat_machine::recover_projected_authority(
+                state,
+                "wedged census state must recover",
+            );
+    }
+
+    assert_eq!(
+        machine.overdue_run_start_session_count(),
+        Some(0),
+        "inside the notice bound the same facts are ordinary staging latency"
+    );
+
+    tokio::time::advance(crate::run_progress::RUN_EXECUTION_START_NOTICE + Duration::from_secs(1))
+        .await;
+    assert_eq!(
+        machine.overdue_run_start_session_count(),
+        Some(1),
+        "a staged run past the notice bound with its primitive provably \
+         un-applied is exactly what this accessor exists to report"
+    );
+
+    // The unreadable direction. Holding the authority is what the wedged
+    // pre-apply consumer itself does, so the probe must neither block on it
+    // nor publish a rung it did not establish.
+    {
+        let authority = {
+            let sessions = machine.sessions.read().await;
+            Arc::clone(
+                &sessions
+                    .get(&session_id)
+                    .expect("registered session entry")
+                    .dsl_authority,
+            )
+        };
+        // Nothing below awaits, so this synchronous guard cannot be held
+        // across a suspension point.
+        let held = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            machine.overdue_run_start_session_count(),
+            None,
+            "a past-bound window whose authority cannot be read establishes \
+             nothing; publishing a count either way would be a claim nobody \
+             observed"
+        );
+        drop(held);
+    }
+    assert_eq!(
+        machine.overdue_run_start_session_count(),
+        Some(1),
+        "and the refusal is per-probe, not sticky: the wedge is visible again \
+         the moment the authority is readable"
     );
 }

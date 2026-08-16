@@ -165,6 +165,140 @@ impl TurnStartSignalCell {
     }
 }
 
+/// One staged -> executing window, as armed by the runtime loop at the durable
+/// `StageForRun` commit.
+///
+/// Every field is a mechanical shell fact, not a verdict. `run_id` names the
+/// run the window belongs to, `staged_at` is the instant the window opened,
+/// and `turn_start` is a clone of the same shared signal cell the loop hands
+/// its own supervisors - so an out-of-band reader interprets `turn_phase`
+/// under exactly the gate the in-band watchdog uses, never more permissively.
+#[derive(Clone)]
+pub(crate) struct RunStartWindow {
+    pub(crate) run_id: RunId,
+    pub(crate) staged_at: Instant,
+    pub(crate) turn_start: TurnStartSignalCell,
+}
+
+/// Session-scoped cell holding the most recently armed staged -> executing
+/// window, for out-of-band health reads.
+///
+/// This cell holds a timestamp and derives nothing. The verdict about the
+/// window ([`observe_run_start_window`]) is recomputed from machine truth on
+/// every read, which is what makes staleness harmless by construction: the
+/// cell is written at arming and overwritten at the next arming, never
+/// cleared, and a stale window can only degrade to [`RunStartHealth::Clear`]
+/// (its run is no longer current, or its phase moved on) - never to a false
+/// [`RunStartHealth::Overdue`]. A latched verdict flag would instead inherit
+/// every failure mode of its writer: a dead watchdog task leaves it unset
+/// while a caller waits (stale-quiet), and a missed clear leaves it set
+/// forever (a muted alarm in the other direction).
+///
+/// # Void condition
+///
+/// **The moment any admission, dispatch, backpressure or lifecycle path
+/// branches on this cell or on an observation derived from it, that
+/// observation becomes a semantic fact, needs a machine owner, and this
+/// design is void.** The only permitted consumer is the runtime host health
+/// census (`MeerkatMachine::overdue_run_start_session_count`), which is
+/// read-only by contract. If the machine should ever *act* on a run that
+/// never began executing, that action goes through the failed-apply path
+/// that already owns escalation ([`apply_with_execution_start_bound`]) -
+/// never through this cell. The
+/// `run_start_window_stays_out_of_machine_authority` test pins this with a
+/// source grep over the machine-authority files.
+#[derive(Clone, Default)]
+pub(crate) struct SharedRunStartWindowCell {
+    inner: Arc<std::sync::Mutex<Option<RunStartWindow>>>,
+}
+
+impl SharedRunStartWindowCell {
+    /// Arm the window for a newly staged run, overwriting any previous window.
+    ///
+    /// Deliberately no `clear`: clearing would create a second writer with an
+    /// ordering obligation against the turn path, and a missed clear would
+    /// latch a false alarm. Overwrite-on-arm plus recompute-on-read needs
+    /// neither.
+    pub(crate) fn arm(&self, run_id: RunId, staged_at: Instant, turn_start: TurnStartSignalCell) {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(RunStartWindow {
+            run_id,
+            staged_at,
+            turn_start,
+        });
+    }
+
+    /// The most recently armed window, if any run was ever staged.
+    ///
+    /// Both lock sites on this mutex (here and [`Self::arm`]) are short field
+    /// moves with no I/O and no `await` under the guard, so a plain lock
+    /// cannot park a health probe behind a wedged session.
+    pub(crate) fn snapshot(&self) -> Option<RunStartWindow> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// What one out-of-band read established about a session's staged ->
+/// executing window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunStartHealth {
+    /// Nothing to report: no window was ever armed, the window is still
+    /// inside the notice bound, or machine truth says the window is not a
+    /// wedge - the run began executing, moved on, or its execution start is
+    /// honestly unobservable ([`RunExecutionProgress::RuntimeUnbound`] /
+    /// [`RunExecutionProgress::ExecutionStartUnobservable`], which the
+    /// escalation bound can never arm on either).
+    Clear,
+    /// The window has been open past the notice bound and machine authority
+    /// positively shows this exact run still current with its primitive
+    /// un-applied: the staged -> executing wedge, observed.
+    Overdue,
+    /// The window is past the notice bound and machine authority could not be
+    /// read without blocking, so neither `Clear` nor `Overdue` was
+    /// established. Not a rung and never an escalation - but also not
+    /// silence, because the party holding that authority is the prime
+    /// suspect for the wedge this read exists to see.
+    Unreadable,
+}
+
+/// Recompute one session's staged -> executing window health from machine
+/// truth.
+///
+/// The verdict is a pure function of the armed window, the shared machine
+/// authority, and `notice`; nothing here is stored, latched, or trusted from
+/// an earlier tick. The classification is [`classify_execution_start`] via
+/// [`AuthorityRunExecutionProgress`] - the same read the staged-run watchdog
+/// uses - so the wire claim and the existing log line cannot disagree about
+/// what "overdue" means. A stale window degrades through the same facts:
+/// `run_is_current` fails once another run took over, and `applying_primitive`
+/// fails once the run progressed, so neither can produce a false `Overdue`.
+pub(crate) fn observe_run_start_window(
+    cell: &SharedRunStartWindowCell,
+    authority: &crate::driver::ephemeral::SharedIngressDslAuthority,
+    notice: Duration,
+) -> RunStartHealth {
+    let Some(window) = cell.snapshot() else {
+        return RunStartHealth::Clear;
+    };
+    if window.staged_at.elapsed() < notice {
+        return RunStartHealth::Clear;
+    }
+    let progress = AuthorityRunExecutionProgress::new(Arc::clone(authority), window.turn_start);
+    match progress.observe(&window.run_id) {
+        RunExecutionProgress::PrimitiveUnapplied => RunStartHealth::Overdue,
+        RunExecutionProgress::Unreadable => RunStartHealth::Unreadable,
+        RunExecutionProgress::Executing
+        | RunExecutionProgress::RunNotCurrent
+        | RunExecutionProgress::RuntimeUnbound
+        | RunExecutionProgress::ExecutionStartUnobservable => RunStartHealth::Clear,
+    }
+}
+
 /// The exact machine facts an execution-start observation is computed from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RunTurnStateFacts {
@@ -989,5 +1123,276 @@ mod tests {
             1,
             "a run that began executing must stop being supervised after one observation"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Staged-run window census (`observe_run_start_window`)
+    //
+    // These tests go through the REAL classification - a real generated
+    // authority, `AuthorityRunExecutionProgress::observe`, and
+    // `classify_execution_start` - not a scripted source, so that breaking
+    // `run_is_current` or `applying_primitive` in either place turns the
+    // corresponding test red. A scripted source would stay green under
+    // exactly those mutations, which is a test of nothing.
+    // -----------------------------------------------------------------------
+
+    /// A shared generated authority whose turn state is exactly the given
+    /// facts, built by recovering a mutated clone of a real registered
+    /// authority's state (the same recover path production uses for
+    /// projection previews).
+    fn shared_authority_with(
+        current_run: Option<uuid::Uuid>,
+        turn_phase: mm_dsl::TurnPhase,
+        runtime_bound: bool,
+    ) -> crate::driver::ephemeral::SharedIngressDslAuthority {
+        let session_id = meerkat_core::types::SessionId::new();
+        let authority =
+            crate::meerkat_machine::dsl_authority::new_registered_authority_without_runtime_entry(
+                &session_id,
+            )
+            .expect("census test authority must register");
+        let mut state = authority.state().clone();
+        state.active_runtime_id =
+            runtime_bound.then(|| mm_dsl::AgentRuntimeId("census-test-runtime".to_string()));
+        // Recovery enforces `runtime_binding_identity_is_typed`: a bound
+        // runtime must carry a typed generation (or epoch) beside its id.
+        state.active_runtime_generation = runtime_bound.then_some(mm_dsl::Generation(1));
+        state.current_run_id = current_run.map(|run| mm_dsl::RunId(run.to_string()));
+        // Recovery enforces `current_run_only_while_running_or_retired` and
+        // `current_run_has_pre_run_phase`, so a state carrying a current run
+        // must also be Running with a recorded pre-run phase to be a state the
+        // machine could actually reach.
+        if current_run.is_some() {
+            state.lifecycle_phase = mm_dsl::MeerkatPhase::Running;
+            state.pre_run_phase = Some(mm_dsl::PreRunPhase::Attached);
+        }
+        state.turn_phase = turn_phase;
+        Arc::new(std::sync::Mutex::new(
+            crate::meerkat_machine::recover_projected_authority(
+                state,
+                "census test state must recover",
+            ),
+        ))
+    }
+
+    fn armed_window(run: uuid::Uuid, signalled: bool) -> SharedRunStartWindowCell {
+        let cell = SharedRunStartWindowCell::default();
+        let turn_start = TurnStartSignalCell::default();
+        if signalled {
+            turn_start.mark_signalled();
+        }
+        cell.arm(RunId::from_uuid(run), Instant::now(), turn_start);
+        cell
+    }
+
+    /// `notice` values that make the elapsed check deterministic without
+    /// touching the clock: zero is always past the bound, max is never.
+    const PAST_BOUND: Duration = Duration::ZERO;
+    const INSIDE_BOUND: Duration = Duration::MAX;
+
+    #[tokio::test]
+    async fn census_reports_nothing_for_a_session_that_never_staged_a_run() {
+        let authority = shared_authority_with(
+            Some(uuid::Uuid::new_v4()),
+            mm_dsl::TurnPhase::ApplyingPrimitive,
+            true,
+        );
+        assert_eq!(
+            observe_run_start_window(&SharedRunStartWindowCell::default(), &authority, PAST_BOUND),
+            RunStartHealth::Clear,
+            "an unarmed window is not a wedge"
+        );
+    }
+
+    #[tokio::test]
+    async fn census_stays_clear_inside_the_notice_bound_even_when_unapplied() {
+        let run = uuid::Uuid::new_v4();
+        let authority =
+            shared_authority_with(Some(run), mm_dsl::TurnPhase::ApplyingPrimitive, true);
+        assert_eq!(
+            observe_run_start_window(&armed_window(run, true), &authority, INSIDE_BOUND),
+            RunStartHealth::Clear,
+            "a window inside the notice bound is ordinary staging latency, not a wedge"
+        );
+    }
+
+    /// The positive pin: the exact field shape - staged, signalled, past the
+    /// bound, and machine authority still shows this run current with its
+    /// primitive un-applied - is Overdue.
+    #[tokio::test]
+    async fn census_reports_a_wedged_pre_apply_run_as_overdue() {
+        let run = uuid::Uuid::new_v4();
+        let authority =
+            shared_authority_with(Some(run), mm_dsl::TurnPhase::ApplyingPrimitive, true);
+        assert_eq!(
+            observe_run_start_window(&armed_window(run, true), &authority, PAST_BOUND),
+            RunStartHealth::Overdue,
+            "a past-bound staged run whose primitive is provably un-applied is the wedge"
+        );
+    }
+
+    /// A stale window naming a superseded run must NOT fire: another run took
+    /// over `current_run_id`, so `run_is_current` fails and the classification
+    /// is `RunNotCurrent`, whatever the shared phase says. Breaking the
+    /// `run_is_current` check (in `observe` or `classify_execution_start`)
+    /// turns this test red.
+    #[tokio::test]
+    async fn census_never_fires_on_a_stale_window_naming_a_superseded_run() {
+        let stale_run = uuid::Uuid::new_v4();
+        let successor_run = uuid::Uuid::new_v4();
+        let authority = shared_authority_with(
+            Some(successor_run),
+            mm_dsl::TurnPhase::ApplyingPrimitive,
+            true,
+        );
+        assert_eq!(
+            observe_run_start_window(&armed_window(stale_run, true), &authority, PAST_BOUND),
+            RunStartHealth::Clear,
+            "a stale window may not convert a successor's fresh staging into a wedge claim"
+        );
+    }
+
+    /// A window whose run progressed must NOT fire: `PrimitiveApplied` moved
+    /// the phase off `ApplyingPrimitive`, so the classification is
+    /// `Executing` no matter how long ago staging happened. Breaking the
+    /// `applying_primitive` check turns this test red.
+    #[tokio::test]
+    async fn census_never_fires_on_a_run_that_began_executing() {
+        let run = uuid::Uuid::new_v4();
+        let authority = shared_authority_with(Some(run), mm_dsl::TurnPhase::CallingLlm, true);
+        assert_eq!(
+            observe_run_start_window(&armed_window(run, true), &authority, PAST_BOUND),
+            RunStartHealth::Clear,
+            "a run that began its turn is slow work, not a staged wedge"
+        );
+    }
+
+    /// The warn-tier carve-out: a window whose turn start was never signalled
+    /// says nothing about the shared phase, so it is unobservable - never
+    /// Overdue, and not Unreadable either.
+    #[tokio::test]
+    async fn census_refuses_to_read_leftover_phase_for_an_unsignalled_window() {
+        let run = uuid::Uuid::new_v4();
+        let authority =
+            shared_authority_with(Some(run), mm_dsl::TurnPhase::ApplyingPrimitive, true);
+        assert_eq!(
+            observe_run_start_window(&armed_window(run, false), &authority, PAST_BOUND),
+            RunStartHealth::Clear,
+            "an unsignalled window's phase describes some other run; refusing to read it is the honest answer"
+        );
+    }
+
+    /// The other warn-tier carve-out: no runtime binding means the agent's
+    /// turn writes land somewhere this observer cannot see. The classification
+    /// checks `runtime_bound` before run identity, and machine recovery
+    /// forbids a current run on an unbound authority anyway, so the honest
+    /// unbound fixture carries no current run - the armed window still routes
+    /// through the `RuntimeUnbound` arm.
+    #[tokio::test]
+    async fn census_treats_an_unbound_runtime_as_unobservable_not_overdue() {
+        let run = uuid::Uuid::new_v4();
+        let authority = shared_authority_with(None, mm_dsl::TurnPhase::ApplyingPrimitive, false);
+        assert_eq!(
+            observe_run_start_window(&armed_window(run, true), &authority, PAST_BOUND),
+            RunStartHealth::Clear,
+            "an unbound runtime is unobservable, and unobservable never escalates"
+        );
+    }
+
+    /// A held authority must surface as Unreadable - not block, not clear.
+    /// `std::sync::Mutex::try_lock` fails from the same thread while the
+    /// guard is alive, which is exactly the wedged-holder shape in miniature.
+    #[tokio::test]
+    async fn census_reports_a_held_authority_as_unreadable_without_blocking() {
+        let run = uuid::Uuid::new_v4();
+        let authority =
+            shared_authority_with(Some(run), mm_dsl::TurnPhase::ApplyingPrimitive, true);
+        let window = armed_window(run, true);
+        let guard = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            observe_run_start_window(&window, &authority, PAST_BOUND),
+            RunStartHealth::Unreadable,
+            "a held authority is unprovable, and the probe must say so rather than wait"
+        );
+        drop(guard);
+        assert_eq!(
+            observe_run_start_window(&window, &authority, PAST_BOUND),
+            RunStartHealth::Overdue,
+            "the same window reads normally once the authority is released"
+        );
+    }
+
+    /// The void condition as a source gate: the window cell and its census
+    /// vocabulary may not appear in machine authority or dispatch code. This
+    /// returns zero hits today, so the gate is meaningful from the day it
+    /// lands - a hit means someone made the mechanical observation semantic,
+    /// which requires a machine owner, not a new caller.
+    #[test]
+    fn run_start_window_stays_out_of_machine_authority() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let machine_dir = manifest.join("src/meerkat_machine");
+        let mut files = vec![
+            machine_dir.join("dsl.rs"),
+            machine_dir.join("dsl_authority.rs"),
+            machine_dir.join("dsl_effects.rs"),
+            machine_dir.join("composition.rs"),
+        ];
+        let dispatch_entries =
+            std::fs::read_dir(&machine_dir).expect("machine authority directory must be readable");
+        for entry in dispatch_entries {
+            let path = entry
+                .expect("machine authority entry must be readable")
+                .path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("dispatch_") && name.ends_with(".rs"))
+            {
+                files.push(path);
+            }
+        }
+        let generated_dir = manifest.join("src/generated");
+        for entry in
+            std::fs::read_dir(&generated_dir).expect("generated directory must be readable")
+        {
+            let path = entry.expect("generated entry must be readable").path();
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+        // The kernels codegen output lives in a sibling crate, present in the
+        // workspace layout but not in a packaged meerkat-runtime; gate it when
+        // it is there rather than failing a crate-local build.
+        if let Some(workspace) = manifest.parent() {
+            let kernels = workspace.join("meerkat-machine-kernels/src/generated/meerkat.rs");
+            if kernels.exists() {
+                files.push(kernels);
+            }
+        }
+
+        let forbidden = [
+            "run_start_window",
+            "RunStartWindow",
+            "RunStartHealth",
+            "SharedRunStartWindowCell",
+            "observe_run_start_window",
+            "overdue_run_start",
+        ];
+        for file in files {
+            let source = std::fs::read_to_string(&file)
+                .unwrap_or_else(|error| panic!("{} must be readable: {error}", file.display()));
+            for token in forbidden {
+                assert!(
+                    !source.contains(token),
+                    "{} references `{token}`: the staged-run window is mechanical \
+                     observation for the health census only; a machine-authority or \
+                     dispatch consumer makes it a semantic fact that needs a machine \
+                     owner (see the void condition on SharedRunStartWindowCell)",
+                    file.display()
+                );
+            }
+        }
     }
 }

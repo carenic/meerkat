@@ -155,6 +155,12 @@ pub struct EphemeralRuntimeDriver {
     /// Shared session-owned DSL authority for ingress semantics (queue/steer
     /// lanes, input phases, admission ordering).
     dsl: DslAuthority,
+    /// Session-scoped staged -> executing window record for out-of-band
+    /// health reads. Mechanical shell state created here and shared with the
+    /// machine's session entry (like `control`); the runtime loop arms it at
+    /// the durable `StageForRun` commit. See the void condition on
+    /// [`crate::run_progress::SharedRunStartWindowCell`].
+    run_start_window: crate::run_progress::SharedRunStartWindowCell,
     /// Per-input admission metadata with no DSL home (content shape,
     /// correlation IDs, policy snapshot, handling mode). These are pure
     /// shell mechanics — they feed observability and queue routing, never
@@ -265,6 +271,7 @@ impl EphemeralRuntimeDriver {
             events: Vec::new(),
             post_admission_signal: PostAdmissionSignal::None,
             dsl: DslAuthority(dsl),
+            run_start_window: crate::run_progress::SharedRunStartWindowCell::default(),
             handling_mode: HashMap::new(),
             runtime_semantics: HashMap::new(),
             primitive_projection: HashMap::new(),
@@ -1173,6 +1180,16 @@ impl EphemeralRuntimeDriver {
 
     pub(crate) fn control_handle(&self) -> Arc<StdRwLock<RuntimeControlProjection>> {
         self.control.clone()
+    }
+
+    /// Clone of the session's staged -> executing window cell.
+    ///
+    /// The machine's session entry fetches this at registration (the same
+    /// conduit as [`Self::control_handle`]) and the runtime loop fetches it
+    /// under the brief driver lock at staging, so both ends observe the one
+    /// cell this driver created.
+    pub(crate) fn run_start_window_handle(&self) -> crate::run_progress::SharedRunStartWindowCell {
+        self.run_start_window.clone()
     }
 
     fn control_snapshot(&self) -> RuntimeControlProjection {

@@ -620,11 +620,12 @@ pub const RUNTIME_HEALTH_UNREADABLE_PREFIX: &str = "unreadable:";
 /// this projection. It does not assert the dimension is healthy, and it is not
 /// a way to quiet a report: the way to move a dimension out of
 /// `unmeasured:<name>` is to probe it and pass the observation in.
-pub const RUNTIME_HEALTH_DIMENSIONS: [&str; 4] = [
+pub const RUNTIME_HEALTH_DIMENSIONS: [&str; 5] = [
     "jobs",
     "session_liveness",
     "session_durability",
     "session_runtime_loop",
+    "session_run_start",
 ];
 
 /// What one probe established about one health dimension.
@@ -1274,6 +1275,7 @@ mod tests {
             "unmeasured:session_liveness",
             "unmeasured:session_durability",
             "unmeasured:session_runtime_loop",
+            "unmeasured:session_run_start",
         ] {
             assert_eq!(
                 health.checks.get(dimension),
@@ -1391,6 +1393,10 @@ mod tests {
             ),
             (
                 "session_runtime_loop".to_string(),
+                RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
+            ),
+            (
+                "session_run_start".to_string(),
                 RuntimeHealthObservation::Measured(RuntimeHostHealthStatus::Ok),
             ),
         ]);
