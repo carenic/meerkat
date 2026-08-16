@@ -56,6 +56,17 @@ every corpus payload by size and SHA-256, the complete `sessions.sqlite3`
 catalog as the released writer left it, per-table row counts for both
 databases, and one descriptor per `runtime_input_states` row.
 
+What it does *not* bind is a transient artifact of the capturing process. A
+sequence lock is held by the writer while it runs and means nothing once it has
+stopped, and the repo `.gitignore` drops `corpus/**/*.lock`, so binding one
+would describe a file no clean checkout can have. `realm_relative_files` in the
+minting script excludes those suffixes, which is the one place the copy into the
+corpus and the manifest payload list are both derived from;
+`scripts/test_mint_pre_ledger_fixture.py` (run by `make
+verify-fixture-mint-generator`) holds that exclusion and the `.gitignore` rule
+to the same answer. WAL/SHM sidecars are refused rather than excluded, because
+they mean the realm was opened after the writer stopped.
+
 The four releases span the 0.7.x line. Their runtime-store catalogs are
 byte-identical, which `pre_ledger_runtime_catalog_is_identical_across_the_published_span`
 proves by comparison across every release *and* every capture, so a row-bearing
