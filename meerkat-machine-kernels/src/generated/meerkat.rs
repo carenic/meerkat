@@ -6253,6 +6253,118 @@ impl std::fmt::Display for RecoveredRuntimeExecutionKind {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum RecoveredTerminalCompletionDisposition {
+    #[default]
+    #[serde(rename = "Recover")]
+    Recover,
+    #[serde(rename = "DiscardUnrecoverable")]
+    DiscardUnrecoverable,
+    #[serde(rename = "Blocked")]
+    Blocked,
+}
+impl RecoveredTerminalCompletionDisposition {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Recover => "Recover",
+            Self::DiscardUnrecoverable => "DiscardUnrecoverable",
+            Self::Blocked => "Blocked",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for RecoveredTerminalCompletionDisposition {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Recover" => Ok(Self::Recover),
+            "DiscardUnrecoverable" => Ok(Self::DiscardUnrecoverable),
+            "Blocked" => Ok(Self::Blocked),
+            other => Err(format!(
+                "invalid RecoveredTerminalCompletionDisposition value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for RecoveredTerminalCompletionDisposition {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for RecoveredTerminalCompletionDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum RecoveredTerminalCompletionUnrecoverableReasonKind {
+    #[default]
+    #[serde(rename = "UncorrelatableRun")]
+    UncorrelatableRun,
+    #[serde(rename = "OwnerCandidatePayloadLost")]
+    OwnerCandidatePayloadLost,
+    #[serde(rename = "DirectedPublicationUnresolved")]
+    DirectedPublicationUnresolved,
+}
+impl RecoveredTerminalCompletionUnrecoverableReasonKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UncorrelatableRun => "UncorrelatableRun",
+            Self::OwnerCandidatePayloadLost => "OwnerCandidatePayloadLost",
+            Self::DirectedPublicationUnresolved => "DirectedPublicationUnresolved",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for RecoveredTerminalCompletionUnrecoverableReasonKind {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "UncorrelatableRun" => Ok(Self::UncorrelatableRun),
+            "OwnerCandidatePayloadLost" => Ok(Self::OwnerCandidatePayloadLost),
+            "DirectedPublicationUnresolved" => Ok(Self::DirectedPublicationUnresolved),
+            other => Err(format!(
+                "invalid RecoveredTerminalCompletionUnrecoverableReasonKind value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for RecoveredTerminalCompletionUnrecoverableReasonKind {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for RecoveredTerminalCompletionUnrecoverableReasonKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum RegistrationPhase {
     #[default]
     #[serde(rename = "Queuing")]
@@ -11194,6 +11306,7 @@ pub struct State {
     pub last_runtime_apply_failure_cause: Option<RuntimeApplyFailureCause>,
     pub last_runtime_apply_failure_message: Option<String>,
     pub runtime_completion_result_run_id: Option<RunId>,
+    pub runtime_completion_result_resolved: bool,
     pub extraction_attempts: u64,
     pub max_extraction_retries: u64,
     pub extraction_active: bool,
@@ -12111,6 +12224,18 @@ pub mod inputs {
     pub struct ClassifyRecoveredInputDurability {
         pub input_id: String,
         pub durability: InputDurabilityKind,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ClassifyRecoveredTerminalCompletionBatch {
+        pub batch_key: String,
+        pub correlatable: bool,
+        pub owner_candidate_present: bool,
+        pub directed_publication_pending: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DeclareRecoveredTerminalCompletionUnrecoverable {
+        pub batch_key: String,
+        pub reason: RecoveredTerminalCompletionUnrecoverableReasonKind,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ResolveInputPublicLifecycle {
@@ -13325,6 +13450,10 @@ pub enum Input {
     RegisterAcceptedIdempotency(inputs::RegisterAcceptedIdempotency),
     NormalizeRecoveredInputLifecycle(inputs::NormalizeRecoveredInputLifecycle),
     ClassifyRecoveredInputDurability(inputs::ClassifyRecoveredInputDurability),
+    ClassifyRecoveredTerminalCompletionBatch(inputs::ClassifyRecoveredTerminalCompletionBatch),
+    DeclareRecoveredTerminalCompletionUnrecoverable(
+        inputs::DeclareRecoveredTerminalCompletionUnrecoverable,
+    ),
     ResolveInputPublicLifecycle(inputs::ResolveInputPublicLifecycle),
     ResolveInputPublicTerminalOutcome(inputs::ResolveInputPublicTerminalOutcome),
     ClassifyInputTerminality(inputs::ClassifyInputTerminality),
@@ -13672,6 +13801,12 @@ impl Input {
             }
             Self::ClassifyRecoveredInputDurability(_) => {
                 InputKind::ClassifyRecoveredInputDurability
+            }
+            Self::ClassifyRecoveredTerminalCompletionBatch(_) => {
+                InputKind::ClassifyRecoveredTerminalCompletionBatch
+            }
+            Self::DeclareRecoveredTerminalCompletionUnrecoverable(_) => {
+                InputKind::DeclareRecoveredTerminalCompletionUnrecoverable
             }
             Self::ResolveInputPublicLifecycle(_) => InputKind::ResolveInputPublicLifecycle,
             Self::ResolveInputPublicTerminalOutcome(_) => {
@@ -14028,6 +14163,8 @@ pub enum InputKind {
     RegisterAcceptedIdempotency,
     NormalizeRecoveredInputLifecycle,
     ClassifyRecoveredInputDurability,
+    ClassifyRecoveredTerminalCompletionBatch,
+    DeclareRecoveredTerminalCompletionUnrecoverable,
     ResolveInputPublicLifecycle,
     ResolveInputPublicTerminalOutcome,
     ClassifyInputTerminality,
@@ -14557,6 +14694,16 @@ pub mod effects {
     pub struct RecoveredInputDurabilityClassified {
         pub input_id: String,
         pub disposition: RecoveredInputRecoveryDisposition,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecoveredTerminalCompletionBatchClassified {
+        pub batch_key: String,
+        pub disposition: RecoveredTerminalCompletionDisposition,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecoveredTerminalCompletionDeclaredUnrecoverable {
+        pub batch_key: String,
+        pub reason: RecoveredTerminalCompletionUnrecoverableReasonKind,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct InputPublicLifecycleResolved {
@@ -15269,6 +15416,10 @@ pub enum Effect {
     AdmissionIdempotencyResolved(effects::AdmissionIdempotencyResolved),
     RecoveredInputLifecycleNormalized(effects::RecoveredInputLifecycleNormalized),
     RecoveredInputDurabilityClassified(effects::RecoveredInputDurabilityClassified),
+    RecoveredTerminalCompletionBatchClassified(effects::RecoveredTerminalCompletionBatchClassified),
+    RecoveredTerminalCompletionDeclaredUnrecoverable(
+        effects::RecoveredTerminalCompletionDeclaredUnrecoverable,
+    ),
     InputPublicLifecycleResolved(effects::InputPublicLifecycleResolved),
     InputPublicTerminalOutcomeResolved(effects::InputPublicTerminalOutcomeResolved),
     InputBehavioralTerminalityResolved(effects::InputBehavioralTerminalityResolved),
@@ -15444,6 +15595,8 @@ pub enum EffectKind {
     AdmissionIdempotencyResolved,
     RecoveredInputLifecycleNormalized,
     RecoveredInputDurabilityClassified,
+    RecoveredTerminalCompletionBatchClassified,
+    RecoveredTerminalCompletionDeclaredUnrecoverable,
     InputPublicLifecycleResolved,
     InputPublicTerminalOutcomeResolved,
     InputBehavioralTerminalityResolved,
@@ -16621,6 +16774,30 @@ pub enum TransitionId {
     ClassifyRecoveredInputDurabilityRetainDurableDerivedOrMissingRunning,
     ClassifyRecoveredInputDurabilityRetainDurableDerivedOrMissingRetired,
     ClassifyRecoveredInputDurabilityRetainDurableDerivedOrMissingStopped,
+    ClassifyRecoveredTerminalCompletionBatchRecoverInitializing,
+    ClassifyRecoveredTerminalCompletionBatchRecoverIdle,
+    ClassifyRecoveredTerminalCompletionBatchRecoverAttached,
+    ClassifyRecoveredTerminalCompletionBatchRecoverRunning,
+    ClassifyRecoveredTerminalCompletionBatchRecoverRetired,
+    ClassifyRecoveredTerminalCompletionBatchRecoverStopped,
+    ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableInitializing,
+    ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableIdle,
+    ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableAttached,
+    ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRunning,
+    ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRetired,
+    ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableStopped,
+    ClassifyRecoveredTerminalCompletionBatchBlockedInitializing,
+    ClassifyRecoveredTerminalCompletionBatchBlockedIdle,
+    ClassifyRecoveredTerminalCompletionBatchBlockedAttached,
+    ClassifyRecoveredTerminalCompletionBatchBlockedRunning,
+    ClassifyRecoveredTerminalCompletionBatchBlockedRetired,
+    ClassifyRecoveredTerminalCompletionBatchBlockedStopped,
+    DeclareRecoveredTerminalCompletionUnrecoverableInitializing,
+    DeclareRecoveredTerminalCompletionUnrecoverableIdle,
+    DeclareRecoveredTerminalCompletionUnrecoverableAttached,
+    DeclareRecoveredTerminalCompletionUnrecoverableRunning,
+    DeclareRecoveredTerminalCompletionUnrecoverableRetired,
+    DeclareRecoveredTerminalCompletionUnrecoverableStopped,
     ResolveInputPublicLifecycleAcceptedIdle,
     ResolveInputPublicLifecycleQueuedIdle,
     ResolveInputPublicLifecycleStagedIdle,
@@ -16789,8 +16966,11 @@ pub enum TransitionId {
     ClassifyPeerResponseReplyFailedRetired,
     ClassifyPeerResponseReplyFailedStopped,
     PrepareIdle,
+    PrepareIdleRetainingUnsettledCompletion,
     PrepareAttached,
+    PrepareAttachedRetainingUnsettledCompletion,
     DrainQueuedRunRetired,
+    DrainQueuedRunRetiredRetainingUnsettledCompletion,
     StartConversationRunIdleWithBinding,
     StartConversationRunInitializing,
     StartConversationRunAttached,
@@ -18072,6 +18252,7 @@ pub fn initial_state() -> State {
         last_runtime_apply_failure_cause: None,
         last_runtime_apply_failure_message: None,
         runtime_completion_result_run_id: None,
+        runtime_completion_result_resolved: true,
         extraction_attempts: 0,
         max_extraction_retries: 0,
         extraction_active: false,

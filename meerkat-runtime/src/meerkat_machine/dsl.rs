@@ -3655,6 +3655,42 @@ pub enum RecoveredInputRecoveryDisposition {
     Discard,
 }
 
+/// Generated disposition for one recovered durable terminal-completion batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RecoveredTerminalCompletionDisposition {
+    #[default]
+    Recover,
+    DiscardUnrecoverable,
+    Blocked,
+}
+
+/// Generated reason a recovered terminal-completion batch is unrecoverable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RecoveredTerminalCompletionUnrecoverableReasonKind {
+    #[default]
+    UncorrelatableRun,
+    OwnerCandidatePayloadLost,
+    DirectedPublicationUnresolved,
+}
+
+impl std::fmt::Display for RecoveredTerminalCompletionUnrecoverableReasonKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rendered = match self {
+            Self::UncorrelatableRun => {
+                "another pending batch already owns the single completion correlation"
+            }
+            Self::OwnerCandidatePayloadLost => {
+                "the batch owner row lost the candidate payload its completion class derives from"
+            }
+            Self::DirectedPublicationUnresolved => {
+                "the batch still owns an unpublished directed interaction terminal, so discarding \
+                 it would drop a user-visible terminal event"
+            }
+        };
+        f.write_str(rendered)
+    }
+}
+
 impl From<crate::identifiers::InputKind> for RecoveredInputKind {
     fn from(kind: crate::identifiers::InputKind) -> Self {
         match kind {
