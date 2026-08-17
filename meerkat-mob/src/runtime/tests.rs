@@ -8739,6 +8739,93 @@ async fn cold_resume_after_terminal_append_fail_stop(
     .expect("cold recovery should reconcile the terminal run and restart the actor")
 }
 
+/// Test-only process-death primitive for one whole mob incarnation.
+///
+/// `drop(handle)` does NOT stop a mob, so it cannot stand in for process
+/// death:
+///
+/// - the actor owns a CLONE of its own command sender
+///   (`MobActor::command_tx`, wired from the same channel as the handle in
+///   `MobBuilder`), so `command_rx.recv()` never yields `None` no matter how
+///   many handles are dropped;
+/// - aborting the actor task alone would not be enough either: every
+///   in-flight flow run executes on a DETACHED `tokio::spawn` whose
+///   `JoinHandle` merely sits in the actor's `run_tasks` map, and that task
+///   writes terminal run truth itself through
+///   `FlowEngine::terminalize_canceled` / `terminalize_failed`. Dropping the
+///   actor drops the map, which DETACHES those durable writers instead of
+///   stopping them.
+///
+/// So a crashable incarnation is created on its own Tokio runtime and killed
+/// wholesale: every task it ever spawned (actor, flow-run tasks, mock host
+/// turn tasks) is dropped before [`CrashableMobIncarnation::crash`] returns,
+/// and only the durable stores - owned by the test, not by the runtime -
+/// survive into the resume. That is the in-process analogue of the process
+/// death cold recovery claims to survive. Tests that kill an incarnation this
+/// way must still PROVE the kill landed (see
+/// `test_resume_convergence_carries_execution_custody_lost_cause`): a
+/// surviving actor silently turns a recovery assertion into a race.
+struct CrashableMobIncarnation {
+    /// `None` only after the incarnation has been crashed.
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl CrashableMobIncarnation {
+    fn new() -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build crashable mob incarnation runtime");
+        Self {
+            runtime: Some(runtime),
+        }
+    }
+
+    /// Run one setup future to completion ON the incarnation's runtime, so
+    /// every task it spawns belongs to that runtime and dies with it.
+    async fn install<F>(&self, future: F) -> F::Output
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.runtime
+            .as_ref()
+            .expect("incarnation runtime is live before the crash")
+            .spawn(future)
+            .await
+            .expect("incarnation setup task")
+    }
+
+    /// Kill the incarnation. Returns once every task it spawned has been
+    /// dropped. The shutdown is bounded so that a task which refuses to
+    /// yield leaks instead of hanging the suite; callers assert liveness
+    /// afterwards, so a leak surfaces as a red assertion rather than as a
+    /// silently racy pass.
+    async fn crash(mut self) {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("incarnation runtime is live before the crash");
+        tokio::task::spawn_blocking(move || {
+            runtime.shutdown_timeout(Duration::from_secs(5));
+        })
+        .await
+        .expect("incarnation crash join");
+    }
+}
+
+impl Drop for CrashableMobIncarnation {
+    fn drop(&mut self) {
+        // A test that ends (or panics) before crashing must not drop a
+        // runtime from inside async context: that is a tokio panic of its
+        // own, which would mask the real failure.
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 async fn create_test_mob_with_run_store(
     definition: MobDefinition,
     run_store: Arc<dyn MobRunStore>,
@@ -42239,45 +42326,110 @@ async fn test_flow_canceled_append_failure_does_not_write_raw_failure_ledger_ent
 /// Finding 10 (0.8.22 field report): a replayed-active run whose executing
 /// process died must not converge to a BARE Canceled on resume. The terminal
 /// FlowCanceled carrier must say why: execution custody was lost.
+///
+/// The custody-lost condition is defined by the ABSENCE of the executing
+/// incarnation, so this test only means what it says if that incarnation is
+/// genuinely gone. `drop(handle)` cannot produce that state (see
+/// [`CrashableMobIncarnation`]): the actor keeps a clone of its own command
+/// sender and its flow-run task is detached, so both keep writing durable
+/// terminal truth while the resume replays. The whole incarnation therefore
+/// runs on its own runtime, is killed wholesale, and the kill is asserted
+/// before recovery is judged.
 #[tokio::test]
 async fn test_resume_convergence_carries_execution_custody_lost_cause() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
-    let (handle, service, runs, specs, runtime_metadata, identity, identity_status) =
-        create_test_mob_with_recoverable_fault_events(
-            sample_definition_with_single_step_flow(60_000, 8),
-            events.clone(),
-        )
-        .await;
-    handle
-        .spawn(
-            ProfileName::from("worker"),
-            AgentIdentity::from("w-1"),
-            None,
-        )
-        .await
-        .expect("spawn worker");
-    service.set_flow_turn_never_terminal(true);
+    let incarnation = CrashableMobIncarnation::new();
+    let setup_events = events.clone();
+    let (handle, service, runs, specs, runtime_metadata, identity, identity_status, run_id) =
+        incarnation
+            .install(async move {
+                let (handle, service, runs, specs, runtime_metadata, identity, identity_status) =
+                    create_test_mob_with_recoverable_fault_events(
+                        sample_definition_with_single_step_flow(60_000, 8),
+                        setup_events.clone(),
+                    )
+                    .await;
+                handle
+                    .spawn(
+                        ProfileName::from("worker"),
+                        AgentIdentity::from("w-1"),
+                        None,
+                    )
+                    .await
+                    .expect("spawn worker");
+                service.set_flow_turn_never_terminal(true);
 
-    let run_id = handle
-        .run_flow(FlowId::from("demo"), serde_json::json!({}))
-        .await
-        .expect("run flow");
-    let running_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    loop {
-        let run = runs.get_run(&run_id).await.expect("read run row");
-        if run.as_ref().map(|run| &run.status) == Some(&MobRunStatus::Running) {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < running_deadline,
-            "flow run never reached Running before simulated process death"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+                let run_id = handle
+                    .run_flow(FlowId::from("demo"), serde_json::json!({}))
+                    .await
+                    .expect("run flow");
+                // Pin the crash to ONE durable pre-crash shape: the run is
+                // admitted Running AND its only step is durably dispatched
+                // into a host turn that never returns. `Running` alone is set
+                // at StartRun, before dispatch, so waiting only for it would
+                // leave the pre-crash durable state a range instead of a
+                // point.
+                let dispatched_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+                loop {
+                    let run = runs.get_run(&run_id).await.expect("read run row");
+                    let running =
+                        run.as_ref().map(|run| &run.status) == Some(&MobRunStatus::Running);
+                    let dispatched = setup_events
+                        .replay_all()
+                        .await
+                        .expect("replay pre-crash events")
+                        .iter()
+                        .any(|event| {
+                            matches!(
+                                &event.kind,
+                                MobEventKind::StepDispatched { run_id: id, .. } if id == &run_id
+                            )
+                        });
+                    if running && dispatched {
+                        break;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < dispatched_deadline,
+                        "flow run never reached a dispatched Running step before simulated process death"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                (
+                    handle,
+                    service,
+                    runs,
+                    specs,
+                    runtime_metadata,
+                    identity,
+                    identity_status,
+                    run_id,
+                )
+            })
+            .await;
 
-    // Simulated process death: drop the handle mid-flight with no cancel
-    // command; only the durable stores survive into the resume.
-    drop(handle);
+    assert!(
+        !handle.command_tx.is_closed(),
+        "the executing incarnation must still be live before the simulated process death"
+    );
+
+    // Simulated process death: kill the incarnation that owns execution
+    // custody of this run. Only the durable stores survive into the resume.
+    incarnation.crash().await;
+
+    // The custody-lost precondition, proven rather than assumed: the actor
+    // that owned this run is gone, so nothing but the resume can move the
+    // run's durable status from here.
+    assert!(
+        handle.command_tx.is_closed(),
+        "simulated process death must leave no live actor behind; a surviving actor would race the resume instead of testing it"
+    );
+    assert!(
+        matches!(
+            handle.flow_status(run_id.clone()).await,
+            Err(MobError::ActorCommandChannelClosed)
+        ),
+        "an actor-routed command on the dead incarnation must fail closed after the crash"
+    );
 
     let resumed = cold_resume_after_terminal_append_fail_stop(
         events.clone(),
@@ -42313,6 +42465,39 @@ async fn test_resume_convergence_carries_execution_custody_lost_cause() {
         cancel_cause,
         Some(crate::event::FlowCancelClass::ExecutionCustodyLost),
         "resume convergence must carry the typed custody-lost cause, never a bare Canceled"
+    );
+    // One canonical terminal path per condition: convergence writes exactly
+    // one terminal carrier for this run, not a cancel plus whatever a
+    // surviving writer would have appended.
+    let terminal_carriers = replayed
+        .iter()
+        .filter(|event| terminal_event_identity(&event.kind).is_some_and(|(id, _)| id == &run_id))
+        .count();
+    assert_eq!(
+        terminal_carriers, 1,
+        "the converged run must have exactly one terminal carrier"
+    );
+    assert!(
+        recovered_run
+            .step_status_snapshot()
+            .expect("recovered custody-lost step projection")
+            .values()
+            .all(|status| matches!(
+                status,
+                StepRunStatus::Completed
+                    | StepRunStatus::Failed
+                    | StepRunStatus::Skipped
+                    | StepRunStatus::Canceled
+            )),
+        "custody-lost convergence must leave no step of the canceled run unfinished"
+    );
+    let machine_state = resumed
+        .query_machine_state()
+        .await
+        .expect("query MobMachine state after custody-lost convergence");
+    assert_eq!(
+        machine_state.active_run_count, 0,
+        "custody-lost convergence must release the run's active custody in MobMachine"
     );
 }
 
