@@ -4485,7 +4485,7 @@ async fn idle_timeout_updates_authority_before_join() {
         &adapter,
         &session_id,
         CommsDrainMode::Timed,
-        comms_runtime,
+        Arc::clone(&comms_runtime),
         Duration::from_millis(25),
     )
     .await;
