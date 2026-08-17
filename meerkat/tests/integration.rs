@@ -531,6 +531,7 @@ mod budget_enforcement {
         let budget = Budget::new(BudgetLimits {
             max_tokens: Some(1000),
             max_duration: None,
+            max_turn_duration: None,
             max_tool_calls: None,
         });
 
@@ -563,6 +564,7 @@ mod budget_enforcement {
         let budget = Budget::new(BudgetLimits {
             max_tokens: None,
             max_duration: None,
+            max_turn_duration: None,
             max_tool_calls: Some(3),
         });
 
@@ -583,6 +585,7 @@ mod budget_enforcement {
         let budget = Budget::new(BudgetLimits {
             max_tokens: None,
             max_duration: None,
+            max_turn_duration: None,
             max_tool_calls: None,
         });
 

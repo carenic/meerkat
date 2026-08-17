@@ -128,9 +128,72 @@ them.
   key/trust failure. Code matching the old prose must match the typed variant
   (`MobError::ParticipantNameOccupied`, or
   `CommsRuntimeError::InprocRegistrationRejected`).
+- **`meerkat_core::BudgetLimits` gains the field `max_turn_duration:
+  Option<Duration>`.** Struct-literal constructors of `BudgetLimits` must add
+  it (`max_turn_duration: None` preserves today's behaviour exactly); builder
+  and `..Default::default()` users are unaffected. The field is
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`, so persisted
+  and wire payloads written by older versions still deserialize, and `None` -
+  the default - keeps every existing deployment on exactly the behaviour it
+  has today. The skip is load-bearing: a spec carrying no turn ceiling keeps
+  its historical canonical bytes, so the frozen portable-spec digest pin and
+  every `spec_digest` already recorded in host stores still match, exactly as
+  `PortableToolConfig.read_only` did in 0.8.23. No default value is being
+  turned on in this release: see the proposal under Added.
+- **`meerkat_mcp_server::BudgetLimitsInput` gains
+  `max_turn_duration_secs: Option<u64>`** (`#[serde(default)]`, additive on the
+  MCP tool input schema; struct-literal constructors must add the field).
 
 ### Added
 
+- **A turn's aggregate wall-clock has an owner: `limits.max_turn_duration`.**
+  Every segment of a turn was already bounded - the per-call LLM timeout, the
+  300s stream-inactivity watchdog, the 600s per-tool-call timeout - and their
+  SUM was bounded by nothing. Five slow-but-legal tool calls is fifty minutes
+  of entirely legal non-advance, and no owner ever asked whether the turn was
+  ALLOWED to take that long. `BudgetLimits::max_turn_duration` is that owner.
+  Its epoch is re-armed at every run entry by `Budget::begin_turn`, which is
+  the fact the pre-existing `max_duration` cannot express: `Budget::new` runs
+  once when a session's agent is built, so `max_duration` measures the AGENT'S
+  LIFETIME, including the idle wall-clock between turns, and would terminalize
+  a turn that had done nothing. Exhaustion is deliberately a TERMINAL and not
+  a report: a turn past its deadline has been invalidated - we can no longer
+  say when or whether it will produce output - so unlike an accounting or
+  observability fault it fails closed. It travels the EXISTING terminal path
+  (`BudgetDimension::Time` -> `TurnExecutionInput::BudgetLimitExceeded` ->
+  `TurnTerminalOutcome::TimeBudgetExceeded`); there is no second terminal for
+  "ran out of time". The generated authority already encoded that judgement
+  and the new horizon inherits it unchanged: in
+  `generated::terminal_surface_mapping`, an exhausted token/tool-call budget
+  classifies as `Success` (an orderly stop that still answers the caller)
+  while an exhausted TIME budget classifies as `HardFailure`, surfacing as
+  `AgentError::TerminalFailure { outcome: TimeBudgetExceeded, cause_kind:
+  TimeBudgetExceeded, .. }`. Enforcement is at SEGMENT BOUNDARIES: an expired
+  horizon never pre-empts a tool call that is already executing, so the loop cannot
+  tear a tool down mid-write. The honest ceiling is therefore
+  `max_turn_duration + the longest segment already in flight` - for a tool
+  batch that is the largest single per-call tool timeout, since every call in
+  a batch starts its clock together and its timeout wraps its concurrency
+  wait, so a batch cannot sum; for an LLM call it is zero, because each call
+  is wrapped with the horizon's remaining time. One known gap: a barrier-ops
+  wait (`ops_lifecycle.wait_all`) is not interrupted by the horizon and stays
+  unbounded - a separate seam, not closed here. Retries cannot double-count:
+  the horizon is one monotonic clock from run entry. Configure with
+  `[limits] max_turn_duration = "30m"`, `BudgetLimits::with_max_turn_duration`,
+  the `budget_limits` field on REST/RPC/portable-spec requests, or
+  `max_turn_duration_secs` on the MCP surface. `0` is rejected at config
+  validation rather than producing a fleet of instantly-dead turns.
+- **PROPOSED, NOT SHIPPED - a non-`None` default for
+  `limits.max_turn_duration`.** The default in this release is `None`:
+  unbounded turns, byte-identical behaviour to 0.8.23. That means this release
+  does not by itself fix a mute member; it gives the bound an owner, a way to
+  declare it, and one terminal when it blows. Turning a ceiling on by default
+  is a behaviour break for every fleet at once and a wrong number kills
+  legitimate long turns, so the value goes to the fleets before it ships. The
+  proposal on the table is **30 minutes**, which is roughly three of today's
+  600s tool calls back to back; a fleet that legitimately runs longer turns
+  declares its own. If accepted, that default lands under `### Breaking` with
+  the terminal it introduces named explicitly.
 - **`runtime/health` measures `session_liveness` on both surfaces** - the
   dimension 0.8.23 shipped honestly unmeasured, closed by the incident that
   proved it out: a household member wrote no transcript row for five days,

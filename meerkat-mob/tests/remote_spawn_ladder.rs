@@ -212,6 +212,7 @@ async fn spawn_budget_lands_in_host_b_session_build_state() {
     let limits = meerkat_core::BudgetLimits {
         max_tokens: None,
         max_duration: None,
+        max_turn_duration: None,
         max_tool_calls: Some(1),
     };
     let mut spec = placed_spawn_spec("worker", "b2", &report.host_id);
