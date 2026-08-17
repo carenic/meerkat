@@ -2181,14 +2181,22 @@ pub enum AgentEvent {
         usage: Option<crate::types::TurnUsage>,
     },
 
-    /// A completed turn's provider token accounting was absent.
+    /// One model turn's provider token accounting was absent.
     ///
-    /// The routed form of the `unmeasured:turn_usage_accounting` marker: the
-    /// turn completed and committed, and the token axis did not move because
-    /// there was nothing truthful to move it by. Paired with a
-    /// [`AgentEvent::TurnCompleted`] whose `usage` is `None`.
+    /// The routed form of the `unmeasured:turn_usage_accounting` marker. It
+    /// states exactly one thing: the provider stream for this turn carried no
+    /// normalized accounting, so no accounting axis advanced for it - no
+    /// budget charge, no session usage, no presented-token update.
     ///
-    /// This is deliberately not a failure. A number nobody has cannot
+    /// It deliberately does NOT claim the turn completed. This is published at
+    /// the model boundary, before the boundary effects and terminal hooks that
+    /// can still fail the turn on their own (unrelated) grounds, and the
+    /// absence of accounting is true either way. Whether the turn completed is
+    /// owned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the
+    /// turns this marker names - and a turn that fails afterwards publishes
+    /// its own terminal fact.
+    ///
+    /// What this is not is a cause of failure. A number nobody has cannot
     /// invalidate an answer the user has already read; see
     /// [`crate::UnmeasuredTurnUsageAccounting`].
     TurnUsageAccountingUnmeasured {
@@ -2196,7 +2204,7 @@ pub enum AgentEvent {
         unmeasured: crate::provider_evidence::UnmeasuredTurnUsageAccounting,
     },
 
-    /// A completed turn's accounting named a provider/model other than the
+    /// One model turn's accounting named a provider/model other than the
     /// request it answered.
     ///
     /// The routed form of the `disputed:turn_usage_accounting_identity`

@@ -173,17 +173,22 @@ pub const TURN_USAGE_ACCOUNTING_DIMENSION: &str = "turn_usage_accounting";
 /// Marker dimension: whose model/provider one turn's accounting describes.
 pub const TURN_USAGE_ACCOUNTING_IDENTITY_DIMENSION: &str = "turn_usage_accounting_identity";
 
-/// Provider token accounting for one completed model turn was absent.
+/// Provider token accounting for one model turn was absent.
 ///
 /// # What this makes untrue, and what it does not
 ///
 /// A provider that streams a complete answer and no usage event has stated
 /// nothing about tokens. The turn's SEMANTIC facts - what the model said,
-/// which tools it asked for, what was committed to the transcript - are
-/// untouched by that silence, so the turn completes and commits. Only the
-/// accounting axis is affected, and it is affected by being left exactly where
-/// it was: no counter advances, no per-call row is published, and no value is
-/// substituted for the one the provider did not send.
+/// which tools it asked for, what may be committed to the transcript - are
+/// untouched by that silence, so this absence terminalizes none of them. Only
+/// the accounting axis is affected, and it is affected by being left exactly
+/// where it was: no counter advances, no per-call row is published, and no
+/// value is substituted for the one the provider did not send.
+///
+/// This value states the absence and nothing more. It does not assert that the
+/// turn completed: the turn's own terminal fact has its own owner, and a turn
+/// whose accounting went missing can still fail afterwards on unrelated
+/// grounds.
 ///
 /// # Why the identity here is not accounting
 ///

@@ -30,6 +30,13 @@ them.
 
 ### Breaking
 
+- **`AgentEvent` gains two variants**, `TurnUsageAccountingUnmeasured` and
+  `TurnUsageAccountingIdentityDisputed`. The enum is `#[non_exhaustive]`, so a
+  match with a wildcard arm keeps compiling; both discriminators are added to
+  `meerkat_contracts::KNOWN_AGENT_EVENT_TYPES` and to every generated SDK
+  inventory, without which a version-matched Python/TypeScript client would
+  reject them as `UNKNOWN_EVENT_TYPE`.
+
 - **`AgentEvent::TurnCompleted.usage` is now `Option<TurnUsage>`** (was
   `TurnUsage`), and `meerkat_core::agent`'s internal
   `validate_provider_turn_usage_identity` is replaced by
@@ -60,11 +67,14 @@ them.
   `turn_completed` carries no `usage`, and a companion
   `turn_usage_accounting_unmeasured` event names the provider and model that
   went unaccounted under the operator marker `unmeasured:turn_usage_accounting`
-  (the vocabulary `runtime/health` already publishes). The token axis does not
-  move: nothing is charged to the budget, nothing is added to session usage,
-  and `last_input_tokens` keeps the value the last measured turn left. Nothing
-  is substituted for the missing measurement - not raw `input_tokens` (a
-  different denominator on cache-heavy sessions) and not
+  (the vocabulary `runtime/health` already publishes). That marker claims only
+  the absence and that no axis moved for it; whether the turn completed stays
+  owned by `turn_completed`, because the marker is published at the model
+  boundary and a turn can still fail after it on unrelated grounds. The token
+  axis does not move: nothing is charged to the budget, nothing is added to
+  session usage, and `last_input_tokens` keeps the value the last measured turn
+  left. Nothing is substituted for the missing measurement - not raw
+  `input_tokens` (a different denominator on cache-heavy sessions) and not
   `TurnUsage::host_declared` (which would mint provider attribution for
   counters no provider issued). Budget enforcement on measured turns is
   unchanged.

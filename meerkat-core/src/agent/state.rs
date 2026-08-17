@@ -5091,8 +5091,9 @@ where
         // number told the user their turn failed after they had read its
         // answer, and dropped that turn out of the durable transcript.
         //
-        // So absent accounting DEGRADES: the turn completes, the assistant
-        // message commits, and the absence is published as a typed marker. The
+        // So absent accounting DEGRADES: this gate no longer fails the turn, so
+        // the turn goes on to complete and commit its assistant message on the
+        // ordinary path, and the absence is published as a typed marker. The
         // token axis is the exact scope of the fault, so it is the exact scope
         // of the consequence - no counter advances, and `last_input_tokens`
         // keeps the value the last measured turn left, because resetting it
@@ -5118,7 +5119,7 @@ where
                     provider = unmeasured.provider.as_str(),
                     model = %unmeasured.model,
                     error = %error,
-                    "provider turn usage accounting is absent; the turn completes and the token axis does not advance"
+                    "provider turn usage accounting is absent; no accounting axis advances, and the turn is not failed for it"
                 );
                 // A degradation that only reaches tracing is an unrouted
                 // signal, and a warning is not a terminal outcome. The same
