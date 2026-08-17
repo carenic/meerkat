@@ -89,6 +89,52 @@ impl meerkat_core::CompactionCurator for TestCompactionCurator {
     }
 }
 
+/// Release a predecessor mob host's process-global supervisor route the way
+/// process loss does, and WAIT for the release, before building a replacement
+/// host for the same mob id in this process.
+///
+/// MEASURED, and the reason this helper exists rather than a bare drop:
+/// `drop(handle)` does NOT release `{mob_id}/__mob_supervisor__`. Dropping the
+/// handle does not make the actor task exit and run the teardown that reaches
+/// `MobSupervisorBridge::shutdown` -> generation-exact `retire_inproc_route`;
+/// after a bare drop, [`await_supervisor_route_release`] times out with the
+/// route still published. Through 0.8.23 that leak was invisible here because
+/// the resumed host holds the SAME persisted supervisor authority and
+/// registration let a matching key rebind over the still-live route. Under the
+/// 0.8.24 one claim rule it is a typed refusal
+/// (`MobError::ParticipantNameOccupied`), which is exactly the leaked-route
+/// class the rule exists to expose.
+///
+/// `crash_stop_preserving_durable_work_for_test` is the right seam for tests
+/// that model process loss, and the release the 0.8.24 item names alongside
+/// `MobHandle::shutdown()`: it aborts volatile producers and runs the actor
+/// teardown, applies NO `Shutdown` input, and writes no compensating durable
+/// fact, so durable active-run and remote-turn custody survive exactly as they
+/// would across a crash. It is also the more conservative substitute for the
+/// pre-0.8.24 behaviour, under which the predecessor kept running and merely
+/// lost its route. It replies only after teardown, which is what makes it
+/// awaitable; the [`await_supervisor_route_release`] call below is the assertion
+/// that it did what this helper claims.
+///
+/// Use `handle.shutdown()` instead where the test's subject is a graceful stop.
+async fn crash_stop_and_release_routes(handle: MobHandle) {
+    let mob_id = handle.mob_id().clone();
+    match handle.crash_stop_preserving_durable_work_for_test().await {
+        Ok(()) => {}
+        // The actor already left its loop - the test fail-stopped it, or
+        // crash-stopped it itself - so there is nobody to send the command to.
+        // That is not a failure to release: the same loop exit runs the same
+        // teardown. The release is proved below either way, by the route
+        // actually being gone, never by this call having been accepted.
+        Err(MobError::ActorCommandChannelClosed) => {}
+        Err(error) => {
+            panic!("crash-stopping the predecessor host must release its supervisor route: {error}")
+        }
+    }
+    drop(handle);
+    await_supervisor_route_release(&mob_id).await;
+}
+
 fn retirement_error_cause(mut error: &MobError) -> &MobError {
     while let MobError::SharedRetirementFailure(shared) = error {
         error = shared.as_ref();
@@ -12154,7 +12200,7 @@ async fn test_destroy_final_member_event_append_failure_survives_cold_restart() 
             .all(|event| !matches!(event.kind, MobEventKind::MemberRetired { .. }))
     );
 
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
     events.allow_appends_for("MemberRetired").await;
     events.fail_clear();
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
@@ -12521,7 +12567,7 @@ async fn test_destroy_remote_archive_before_revoke_survives_cold_restart() {
             .iter()
             .all(|event| !matches!(event.kind, MobEventKind::MemberRetired { .. }))
     );
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
     events.fail_clear();
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
@@ -12605,7 +12651,7 @@ async fn test_sqlite_destroy_remote_archive_before_revoke_skips_tokenless_rebind
         .await
         .expect_err("fault after checkpoint must leave sqlite destroy incomplete");
     assert!(external.authorized_supervisor_peer_id().await.is_some());
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
 
     let replayed = events
         .replay_all()
@@ -12734,7 +12780,7 @@ async fn test_destroy_remote_final_append_after_revoke_survives_cold_restart() {
     let intents_before_cold_retry = external.received_intents().await.len();
     external.task.abort();
 
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
     events.allow_appends_for("MemberRetired").await;
     events.fail_clear();
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
@@ -12979,7 +13025,7 @@ async fn test_destroy_event_clear_failure_restores_runtime_metadata_for_retry() 
         "rejected rotate must not mutate retained supervisor authority"
     );
 
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
         runtime_metadata.clone(),
@@ -13240,7 +13286,7 @@ async fn test_resume_after_destroying_marker_replays_retire_before_storage_clean
         })
         .await
         .expect("append durable destroy marker");
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
     // The first automatic cleanup attempts reach the final storage clear and
     // fail transiently. Recovery must keep retrying in this same process;
     // the test never sends an operator destroy command.
@@ -13419,7 +13465,7 @@ async fn test_resume_retries_retirement_started_anchor_without_operator_command(
     service
         .clear_mob_machine_trust_owner(&survivor_bridge_session_id)
         .await;
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
 
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
@@ -13576,7 +13622,7 @@ async fn test_shutdown_joins_recovered_retirement_retry_worker_before_reply() {
         .await
         .expect("persist retirement-started crash anchor");
     service.set_archive_failure(&bridge_session_id).await;
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
 
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
@@ -13718,7 +13764,7 @@ async fn test_retire_final_replay_prunes_wiring_and_preserves_generation_history
             .all(|entry| entry.agent_identity != retired),
         "live wait terminality must not require synthetic list membership"
     );
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
 
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
@@ -13806,7 +13852,7 @@ async fn test_retire_final_replay_prunes_wiring_and_preserves_generation_history
             .expect("test generation has a successor"),
         "cold replay must preserve retired generation history"
     );
-    drop(resumed);
+    crash_stop_and_release_routes(resumed).await;
 
     let resumed_replacement = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
@@ -14210,6 +14256,7 @@ async fn test_resume_prefers_destroying_marker_over_completed_marker() {
         "partial destroy should retain the destroy marker"
     );
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
         runtime_metadata.clone(),
@@ -14547,7 +14594,7 @@ async fn test_rotate_supervisor_allows_final_epoch_then_refuses_wrap_without_wri
         .crash_stop_preserving_durable_work_for_test()
         .await
         .expect("crash-stop original actor");
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
 
     recovered_authority.epoch = u64::MAX - 1;
     runtime_metadata
@@ -14764,7 +14811,7 @@ async fn test_rotate_supervisor_unreadable_final_completion_loss_fail_stops_and_
         .expect("fail-stopped actor closes its command channel")
         .expect_err("fail-stopped actor must reject same-process retry");
     assert!(matches!(closed, MobError::ActorCommandChannelClosed));
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
 
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
@@ -16944,8 +16991,7 @@ async fn test_rotate_supervisor_final_commit_failure_preserves_attempted_authori
     // process-global supervisor route before republishing the same mob id. The
     // rotation left the live runtime on the attempted authority key, so a
     // still-published predecessor would be a different key holding the name.
-    drop(handle);
-    await_supervisor_route_release(&mob_id).await;
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata.clone(),
@@ -17646,8 +17692,7 @@ async fn test_v4_resume_is_effect_free_until_explicit_rotation_then_adopts_direc
     // record) under this mob's supervisor name, which is exactly what a live
     // predecessor route refuses. Model the cold restart: release the original
     // process-global route first.
-    drop(handle);
-    await_supervisor_route_release(&mob_id).await;
+    crash_stop_and_release_routes(handle).await;
 
     // Reconstruct the exact structural/identity store under a released V4
     // supervisor record. The receiver has also lost its supervisor state, so
@@ -20839,6 +20884,7 @@ async fn test_wait_for_kickoff_complete_returns_broken_snapshot_without_hanging(
         .expect("archive live session");
     service.delete_persisted_session(&old_sid).await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -21481,7 +21527,7 @@ async fn test_for_resume_rebuilds_definition_and_roster() {
     // runtimes begin unowned, as they do after a real cold restart.
     let restarted_service = Arc::new(service.cold_restart_preserving_durable_state().await);
     let restarted_adapter = restarted_service.enable_runtime_adapter();
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
     drop(service);
 
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
@@ -21571,7 +21617,7 @@ async fn test_cold_running_resume_reestablishes_autonomous_startup_ready_without
     // `for_resume` can only come from checks performed by the recovered actor.
     let restarted_service = Arc::new(service.cold_restart_preserving_durable_state().await);
     let _ = restarted_service.enable_runtime_adapter();
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
     drop(service);
 
     let resumed = MobBuilder::for_resume(MobStorage {
@@ -21724,7 +21770,7 @@ async fn assert_cold_running_local_resume_fails_closed(
             restarted_service.set_comms_runtime_missing_after_successes(4);
         }
     }
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
     drop(service);
 
     let resume_result = MobBuilder::for_resume(MobStorage {
@@ -21869,6 +21915,7 @@ async fn test_resume_preserves_owner_bridge_authority_across_reset_epoch() {
         "live reset must preserve generated owner authority"
     );
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -21967,6 +22014,7 @@ async fn test_resume_fails_when_orchestrator_resume_notification_fails() {
     handle.stop().await.expect("stop");
     service.set_fail_start_turn(true);
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -22026,6 +22074,7 @@ async fn test_resume_reconciles_orphaned_sessions() {
         .expect("create orphan");
     assert_eq!(service.active_session_count().await, 1);
 
+    crash_stop_and_release_routes(_handle).await;
     let _resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -22091,6 +22140,7 @@ async fn test_resume_restores_missing_sessions_with_same_session_and_history() {
         .await
         .expect("discard live session");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -22183,6 +22233,7 @@ async fn test_resume_restores_missing_sessions_with_tool_wiring() {
         .await
         .expect("discard live session");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -22262,6 +22313,7 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
         .expect("archive live session");
     service.delete_persisted_session(&old_sid).await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -22414,6 +22466,7 @@ async fn test_resume_repoints_snapshotless_member_head_to_latest_persisted_sessi
         .expect("recovered-head metadata should serialize");
     service.stage_prepared_resume_session(recovered_head).await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
         runtime_metadata.clone(),
@@ -22487,6 +22540,7 @@ async fn test_resume_repoints_snapshotless_member_head_to_latest_persisted_sessi
         "snapshotless recovery must replace the old spawn endpoint with the exact recovered session endpoint"
     );
 
+    crash_stop_and_release_routes(resumed).await;
     let resumed_again = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
         runtime_metadata,
@@ -22626,6 +22680,7 @@ async fn test_snapshotless_recovery_never_publishes_foreign_attachment_endpoint(
         .await
         .remove(&replacement.session_id);
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
         runtime_metadata,
@@ -22991,6 +23046,7 @@ async fn test_resume_stamps_legacy_recovered_binding_endpoint_exactly_once() {
         .await
         .expect("append legacy endpoint-less recovered binding");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
         runtime_metadata.clone(),
@@ -23012,7 +23068,7 @@ async fn test_resume_stamps_legacy_recovered_binding_endpoint_exactly_once() {
         .query_machine_state()
         .await
         .expect("query first resumed machine state");
-    drop(resumed);
+    crash_stop_and_release_routes(resumed).await;
 
     let resumed_again = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
@@ -23178,6 +23234,7 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
         .await
         .remove(&replacement.session_id);
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
         runtime_metadata.clone(),
@@ -23239,7 +23296,6 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
         .await
         .expect("recovered roster query")
         .expect("recovered roster entry");
-    drop(resumed);
 
     // Simulate a crash immediately after the durable retirement-start append.
     // Replay must retain the historical endpoint cleanup anchor even though
@@ -23266,6 +23322,7 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
         .clear_mob_machine_trust_owner(&replacement.session_id)
         .await;
 
+    crash_stop_and_release_routes(resumed).await;
     let restarted = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -23355,6 +23412,7 @@ async fn test_resume_skips_wiring_for_broken_peer_and_keeps_partial_resume() {
         .expect("archive broken session");
     service.delete_persisted_session(&sid_2).await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -23472,6 +23530,7 @@ async fn test_resume_restores_missing_live_session_even_when_list_reports_inacti
             .await
             .expect("discard live session");
 
+        crash_stop_and_release_routes(handle).await;
         let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
             events,
             runtime_metadata,
@@ -23544,6 +23603,7 @@ async fn test_resume_skips_broken_orchestrator_notification_and_keeps_partial_re
         .expect("archive orchestrator");
     service.delete_persisted_session(&orchestrator_sid).await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -23617,6 +23677,7 @@ async fn test_broken_member_turn_returns_restore_failed_error() {
         .expect("archive live session");
     service.delete_persisted_session(&old_sid).await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -23708,6 +23769,7 @@ async fn test_wire_broken_member_returns_restore_failed_error() {
         .expect("archive live session");
     service.delete_persisted_session(&old_sid).await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -23790,6 +23852,7 @@ async fn test_retire_broken_member_succeeds_and_removes_it() {
         .expect("archive live session");
     service.delete_persisted_session(&old_sid).await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -23867,6 +23930,7 @@ async fn test_respawn_broken_member_clears_restore_diagnostic() {
         .expect("archive live session");
     service.delete_persisted_session(&old_sid).await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -23991,7 +24055,7 @@ async fn test_respawn_broken_wired_member_replays_peer_endpoint_after_cold_servi
             .is_empty(),
         "cold restart must begin without stale generated trust evidence"
     );
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
     drop(service);
 
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
@@ -24146,6 +24210,7 @@ async fn test_resume_restores_persisted_behavior_metadata() {
         .await
         .expect("discard live session");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -24247,6 +24312,7 @@ async fn test_resume_marks_comms_name_mismatch_as_broken() {
         .await
         .expect("discard live session");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -24735,6 +24801,7 @@ async fn test_resume_recreates_missing_external_bridge_preserving_backend_identi
             .expect("archive legacy external bridge session");
     }
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -24832,6 +24899,7 @@ async fn test_resume_treats_normalized_external_binding_overlay_as_projection_on
         .await
         .expect("persist overlay");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -24987,6 +25055,7 @@ async fn test_resume_treats_failed_external_binding_overlay_as_projection_only()
         .await
         .expect("persist failed overlay");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -25108,6 +25177,7 @@ async fn resume_with_stale_external_binding_overlay(
         .await
         .expect("persist stale overlay");
 
+    crash_stop_and_release_routes(handle).await;
     MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -25206,6 +25276,7 @@ async fn test_resume_does_not_require_external_binding_overlay_load_for_authorit
         .fail_list_overlays
         .store(true, Ordering::Relaxed);
 
+    crash_stop_and_release_routes(handle).await;
     MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -25255,6 +25326,7 @@ async fn test_reconcile_spawns_member_despite_stale_overlay_only_record() {
         .await
         .expect("persist overlay-only record");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -25525,6 +25597,7 @@ async fn test_peer_only_members_accept_direct_turn_delivery_without_bridge_sessi
         .await
         .expect("persist overlay");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
         runtime_metadata.clone(),
@@ -25722,8 +25795,8 @@ async fn test_peer_only_members_accept_direct_turn_delivery_without_bridge_sessi
         "respawn retirement must not deduplicate against the prior generation"
     );
 
-    drop(resumed);
     tokio::task::yield_now().await;
+    crash_stop_and_release_routes(resumed).await;
     let cold = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -25832,6 +25905,7 @@ async fn test_resume_reconciles_mixed_topology_without_losing_external_member_re
             .expect("archive legacy external bridge session");
     }
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -25976,6 +26050,7 @@ async fn test_resume_replaces_foreign_live_owner_before_trust_repair() {
     .await;
     handle.stop().await.expect("stop");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -26107,6 +26182,7 @@ async fn test_resume_rebuilds_all_foreign_attachments_before_trust_repair() {
         .await
         .expect("foreign first-member comms before reconstruction");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -26219,6 +26295,7 @@ async fn test_resume_reconciles_peer_only_trust_edges() {
     external_a.forget_supervisor().await;
     external_b.forget_supervisor().await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -26320,6 +26397,7 @@ async fn test_resume_reestablishes_missing_trust() {
     service.clear_mob_machine_trust_owner(&sid_1).await;
     service.clear_mob_machine_trust_owner(&sid_2).await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -26406,6 +26484,7 @@ async fn test_resume_leaves_stale_trust_without_machine_revoke_authority() {
         .force_add_trust_from_spec(&sid_1, stale.clone())
         .await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -26460,7 +26539,7 @@ async fn test_resume_restores_external_wiring_from_event_log() {
 
     let restarted_service = Arc::new(service.cold_restart_preserving_durable_state().await);
     let _ = restarted_service.enable_runtime_adapter();
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
     drop(service);
 
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
@@ -27266,7 +27345,7 @@ async fn test_peer_only_retire_unwire_failure_survives_cold_restart() {
         retained.wired_to.contains(&survivor),
         "failed remote unwire must retain the machine edge for cold retry"
     );
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
 
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
@@ -27514,7 +27593,7 @@ async fn test_peer_only_retire_supervisor_checkpoint_cold_retry_never_recontacts
         intents_before_cold_retry,
         "shutdown must not recontact an offline peer after retirement and supervisor revocation"
     );
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
 
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
@@ -27596,7 +27675,7 @@ async fn test_peer_only_retire_local_trust_remove_repair_is_offline_retryable() 
     );
     let intents_before_cold_retry = external.received_intents().await.len();
     external.task.abort();
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
 
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
@@ -27694,7 +27773,7 @@ async fn test_peer_only_retire_final_append_after_revoke_survives_cold_restart()
         intents_before_cold_retry,
         "shutdown must not recontact an offline peer after final publication fails"
     );
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
     events.allow_appends_for("MemberRetired").await;
 
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
@@ -29482,7 +29561,7 @@ async fn test_retire_external_unwire_failure_without_local_comms_survives_cold_r
         .retire(identity.clone())
         .await
         .expect_err("external unwind append failure must retain retirement authority");
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
     events.allow_appends_for("ExternalPeerUnwired").await;
     service.set_missing_comms_runtime(&owner_session).await;
 
@@ -29690,7 +29769,7 @@ async fn test_resume_seeds_mob_machine_topology_from_event_projection() {
 
     let restarted_service = Arc::new(service.cold_restart_preserving_durable_state().await);
     let _ = restarted_service.enable_runtime_adapter();
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
     drop(service);
 
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
@@ -32096,6 +32175,7 @@ async fn test_spawn_skips_broken_orchestrator_in_auto_wire_selection() {
     service.archive(&sid_l).await.expect("archive orchestrator");
     service.delete_persisted_session(&sid_l).await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -33100,6 +33180,7 @@ async fn test_spawn_skips_broken_role_peers_in_role_wiring_selection() {
     service.archive(&sid_w1).await.expect("archive w-1");
     service.delete_persisted_session(&sid_w1).await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -42407,6 +42488,21 @@ async fn test_resume_convergence_carries_execution_custody_lost_cause() {
             })
             .await;
 
+    // MERGE RESOLUTION (item 10 x item 6): both halves are load-bearing and
+    // they guard different things, so this keeps both rather than choosing.
+    //
+    // Item 10 established that the old `drop(handle)` did NOT simulate process
+    // death at all - MobActor owns a clone of its own command sender, so the
+    // channel-close exit is unreachable while the actor future lives, and the
+    // in-flight run is on a detached spawn. Hence the real kill below, and the
+    // assertions that PROVE custody is lost instead of assuming it.
+    //
+    // Item 6 added the route-release requirement: under one claim rule, a
+    // supervisor name cannot be re-claimed while it is still bound, so the
+    // resume can only re-register once the predecessor's route is actually
+    // gone. That release must be proved by the route being absent, not by a
+    // crash-stop command having been accepted.
+    let mob_id_for_release = handle.mob_id().clone();
     assert!(
         !handle.command_tx.is_closed(),
         "the executing incarnation must still be live before the simulated process death"
@@ -42430,6 +42526,11 @@ async fn test_resume_convergence_carries_execution_custody_lost_cause() {
         ),
         "an actor-routed command on the dead incarnation must fail closed after the crash"
     );
+
+    // Now the item-6 half: the dead incarnation's supervisor route must be
+    // released before the resume can claim the name again.
+    drop(handle);
+    await_supervisor_route_release(&mob_id_for_release).await;
 
     let resumed = cold_resume_after_terminal_append_fail_stop(
         events.clone(),
@@ -43919,6 +44020,7 @@ async fn test_resume_from_events_restarts_autonomous_host_loops_from_runtime_mod
         .await
         .expect("stopped mob retains the exact member attachment");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         MobBuilder::for_resume(storage_for_resume)
@@ -44023,6 +44125,7 @@ async fn test_explicit_resume_retains_wedged_attachment_retirement_for_level_tri
         .await
         .expect("stopped mob retains its exact attachment");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(storage_for_resume)
         .with_session_service(service.clone())
         .notify_orchestrator_on_resume(false)
@@ -44420,6 +44523,7 @@ async fn test_resume_skips_broken_autonomous_member_in_host_loop_startup() {
     service.archive(&sid_l).await.expect("archive lead");
     service.delete_persisted_session(&sid_l).await;
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -44613,6 +44717,8 @@ impl RealCommsSessionService {
             .entry(session_id.clone())
             .or_insert_with(meerkat_comms::Keypair::generate)
             .clone();
+        self.release_retired_route_for_comms_name(&comms_name, &session_id)
+            .await;
         let comms = Arc::new(
             meerkat_comms::CommsRuntime::inproc_only_with_keypair_and_silent_intents(
                 &comms_name,
@@ -44769,7 +44875,15 @@ impl RealCommsSessionService {
         }
         let registry_removed = self.actor_registry.compare_remove(witness);
         debug_assert!(registry_removed);
-        sessions.remove(witness.session_id());
+        // Discarding a session's live actor is where this double stops being
+        // the owner of that session's participant name. The `Arc` can outlive
+        // the map entry (member material holds one), and the route lives with
+        // the runtime, not the map, so the name must be released explicitly or
+        // it stays published with no owner able to free it. Generation-exact,
+        // so it can only remove the route this exact runtime published.
+        if let Some(retired) = sessions.remove(witness.session_id()) {
+            retired.retire_inproc_route();
+        }
         let session_id = witness.session_id();
         self.remove_volatile_control_intake(session_id);
         if let Some(notifier) = self.keep_alive_notifiers.write().await.remove(session_id) {
@@ -44880,7 +44994,14 @@ impl SessionService for RealCommsSessionService {
 
     async fn archive(&self, id: &SessionId) -> Result<(), SessionError> {
         let mut sessions = self.sessions.write().await;
-        if sessions.remove(id).is_some() {
+        // Discarding a session's live actor is where this double stops being
+        // the owner of that session's participant name. The `Arc` can outlive
+        // the map entry (member material holds one), and the route lives with
+        // the runtime, not the map, so the name must be released explicitly or
+        // it stays published with no owner able to free it. Generation-exact,
+        // so it can only remove the route this exact runtime published.
+        if let Some(retired) = sessions.remove(id) {
+            retired.retire_inproc_route();
             self.actor_registry.remove_current(id);
         }
         self.remove_volatile_control_intake(id);
@@ -45146,7 +45267,14 @@ impl MobSessionService for RealCommsSessionService {
 
     async fn discard_live_session(&self, session_id: &SessionId) -> Result<(), SessionError> {
         let mut sessions = self.sessions.write().await;
-        if sessions.remove(session_id).is_some() {
+        // Discarding a session's live actor is where this double stops being
+        // the owner of that session's participant name. The `Arc` can outlive
+        // the map entry (member material holds one), and the route lives with
+        // the runtime, not the map, so the name must be released explicitly or
+        // it stays published with no owner able to free it. Generation-exact,
+        // so it can only remove the route this exact runtime published.
+        if let Some(retired) = sessions.remove(session_id) {
+            retired.retire_inproc_route();
             self.actor_registry.remove_current(session_id);
         }
         self.remove_volatile_control_intake(session_id);
@@ -45173,6 +45301,47 @@ impl RealCommsSessionService {
         sessions.get(session_id).cloned()
     }
 
+    /// Release the inproc route of any session this double still holds under
+    /// `comms_name`, so a rebuild for that name can claim it.
+    ///
+    /// One claim rule (0.8.24): a live participant name is never taken over,
+    /// and NOT taking it over is not conditional on the claimant's key - the
+    /// same session keypair reloads across a restart by design (see
+    /// `session_keypairs`), so a rebuild here presents exactly the incumbent's
+    /// key. Through 0.8.23 registration let that rebind, which silently orphaned
+    /// the predecessor generation; now it is a typed refusal.
+    ///
+    /// This double keeps a session's runtime in `sessions` until the session is
+    /// explicitly discarded, so a restart or a same-name respawn has to release
+    /// the retired namesake first. `retire_inproc_route` is generation-exact, so
+    /// this can only ever remove the route the named session published, and it
+    /// is the same release-then-bootstrap handover a real host performs.
+    async fn release_retired_route_for_comms_name(
+        &self,
+        comms_name: &str,
+        successor_session_id: &SessionId,
+    ) {
+        let retired: Vec<SessionId> = {
+            let names = self.session_comms_names.read().await;
+            names
+                .iter()
+                .filter(|(session_id, name)| {
+                    name.as_str() == comms_name && *session_id != successor_session_id
+                })
+                .map(|(session_id, _)| session_id.clone())
+                .collect()
+        };
+        if retired.is_empty() {
+            return;
+        }
+        let sessions = self.sessions.read().await;
+        for session_id in retired {
+            if let Some(runtime) = sessions.get(&session_id) {
+                runtime.retire_inproc_route();
+            }
+        }
+    }
+
     async fn restart_comms_for_session(
         &self,
         session_id: &SessionId,
@@ -45185,6 +45354,13 @@ impl RealCommsSessionService {
             .entry(session_id.clone())
             .or_insert_with(meerkat_comms::Keypair::generate)
             .clone();
+        // The predecessor generation for THIS session is still in `sessions`
+        // and still holds the name; release it before rebuilding.
+        if let Some(previous) = self.sessions.read().await.get(session_id) {
+            previous.retire_inproc_route();
+        }
+        self.release_retired_route_for_comms_name(comms_name, session_id)
+            .await;
         let comms = Arc::new(
             meerkat_comms::CommsRuntime::inproc_only_with_keypair_and_silent_intents(
                 comms_name,
@@ -55163,6 +55339,11 @@ async fn test_external_tcp_bind_and_peer_turn_use_routable_supervisor_bridge() {
     );
 
     handle.stop().await.expect("stop before peer-only resume");
+    // Released with the crash-stop, not `shutdown`: this member is a peer-only
+    // TCP external whose remote listener is already gone, and a graceful
+    // shutdown makes the supervisor bridge try to reach it, which fails with a
+    // refused connection rather than a released route.
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -55190,10 +55371,23 @@ async fn test_external_tcp_bind_and_peer_turn_use_routable_supervisor_bridge() {
         }
         other => panic!("expected peer-only TCP backend member, got {other:?}"),
     }
-    resumed
-        .resume()
-        .await
-        .expect("explicitly resume the stopped mob before delivering another peer turn");
+    // The predecessor is now genuinely released before the successor is built
+    // (one claim rule), so the successor can observe a lifecycle operation the
+    // reconstruction itself still has in flight. That is transient, and
+    // `MobHandle::shutdown` already treats this exact error class as retryable;
+    // do the same here rather than reading a race as a refusal.
+    let resume_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match resumed.resume().await {
+            Ok(()) => break,
+            Err(MobError::LifecycleOperationPending { .. }) if Instant::now() < resume_deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => panic!(
+                "explicitly resume the stopped mob before delivering another peer turn: {error}"
+            ),
+        }
+    }
     let delivered_before_resumed_turn = external.delivered_input_ids().await.len();
     resumed
         .member(&AgentIdentity::from("l-tcp"))
@@ -56402,6 +56596,7 @@ async fn test_per_spawn_external_tools_are_not_restored_from_storage() {
         .await
         .expect("discard live session");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -56530,6 +56725,7 @@ async fn test_cold_restart_restores_per_spawn_profile_override_without_customize
         .expect("discard live session");
 
     // Cold restart: rebuild the mob from durable storage with NO customizer.
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -56591,6 +56787,7 @@ async fn test_cold_restart_does_not_replay_persisted_system_prompt_configuration
         .await
         .expect("discard live session");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -56778,6 +56975,7 @@ async fn test_restore_seeded_per_spawn_tools_survive_machine_authorized_revival(
         .await
         .expect("discard live session");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -57354,6 +57552,7 @@ async fn test_resume_reconciliation_runs_spawn_customizer_for_missing_session_re
         .await
         .expect("discard live session before resume reconciliation");
 
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -57483,6 +57682,7 @@ async fn test_definition_spawn_policy_lowers_to_machine_authority_on_resume() {
         .expect("query created machine state");
     assert!(created_state.spawn_policy_enabled);
 
+    crash_stop_and_release_routes(created).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -57836,6 +58036,7 @@ async fn test_restored_member_gets_external_tools() {
         .expect("discard live session");
 
     // Resume with provider — restored member should get external tools
+    crash_stop_and_release_routes(handle).await;
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -66675,7 +66876,7 @@ async fn test_bind_host_post_ack_persistence_failure_cold_recovers_from_confirme
         vec![stub.peer_id.to_string()],
         "the trust obligation remains pending until durable local commit",
     );
-    drop(handle);
+    crash_stop_and_release_routes(handle).await;
 
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,

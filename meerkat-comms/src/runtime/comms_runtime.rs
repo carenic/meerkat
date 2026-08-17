@@ -1641,16 +1641,17 @@ pub enum CommsRuntimeError {
 /// Observe a constructor-time inproc registration outcome and fail closed on
 /// rejection.
 ///
-/// A freshly constructed runtime binds its own (non-zero) keypair under its
-/// participant name. A clean [`RegistrationOutcome::Registered`] is the
-/// expected result. No constructor can take a name over from a *different* live
-/// key: that would make an addressable identity unreachable, so it fails the
-/// constructor closed and the incumbent route keeps routing. A caller that
-/// legitimately succeeds a known predecessor generation uses
-/// [`PreparedCommsRuntime::publish_replacing`], which names the exact generation
-/// it replaces. Rebinding this runtime's *own* key (one identity being rebuilt)
-/// and renaming it onto a free name both keep the identity reachable and are
-/// surfaced as typed warnings rather than folded into a clean success.
+/// A freshly constructed runtime claims its participant name under its own
+/// (non-zero) keypair. A clean [`RegistrationOutcome::Registered`] is the
+/// expected result. No constructor takes a name over from a live route,
+/// whichever key holds it - including this runtime's own earlier generation -
+/// so an occupied name fails the constructor closed and the incumbent keeps
+/// routing. A caller that legitimately succeeds a known predecessor generation
+/// uses [`PreparedCommsRuntime::publish_replacing`], which names the exact
+/// generation it replaces; a caller whose predecessor is finished releases the
+/// name first with [`CommsRuntime::retire_inproc_route`]. Renaming this key onto
+/// a *free* name is the one non-clean admitted shape and is surfaced as a typed
+/// warning rather than folded into a clean success.
 fn observe_inproc_registration(
     namespace: &str,
     name: &str,
@@ -1665,16 +1666,6 @@ fn observe_inproc_registration(
                 peer_name = %name,
                 %evicted_name,
                 "inproc registration replaced an existing route under this pubkey"
-            );
-            Ok(())
-        }
-        RegistrationOutcome::ReboundOwnName => {
-            tracing::warn!(
-                inproc_namespace = %namespace,
-                peer_name = %name,
-                "inproc registration rebound this identity's own participant name to a newer \
-                 inbox generation; the identity stays addressable and the predecessor generation \
-                 stops receiving"
             );
             Ok(())
         }
@@ -1849,9 +1840,12 @@ impl PreparedCommsRuntime {
     /// Publish this runtime using ordinary inproc registration semantics.
     ///
     /// A participant name that already has a live route is refused, whichever
-    /// key holds it. There is no name-takeover publish: a caller replacing a
-    /// predecessor it can name uses [`Self::publish_replacing`], and a caller
-    /// that cannot name one has not proved the incumbent is gone.
+    /// key holds it - including a still-published earlier generation of this
+    /// runtime's own key. There is no name-takeover publish, and no
+    /// same-identity exemption: a caller replacing a predecessor it can name
+    /// uses [`Self::publish_replacing`], a caller whose predecessor is finished
+    /// releases the name first with [`CommsRuntime::retire_inproc_route`], and a
+    /// caller that can do neither has not proved the incumbent is gone.
     pub fn publish(mut self) -> Result<CommsRuntime, CommsRuntimeError> {
         self.runtime.publish_prepared_inproc(None)?;
         Ok(self.runtime)
@@ -1900,7 +1894,13 @@ impl CommsRuntime {
         {
             return Err(crate::InprocPublicationError::IdentityMismatch.into());
         }
-        let outcome = if let Some(current) = current {
+        if let Some(current) = current {
+            // Generation-exact replacement is a different seam with its own
+            // typed `Result`, not a registration: the caller proved succession
+            // by handing in the predecessor generation. There is no
+            // `RegistrationOutcome` here to observe, and synthesising
+            // `Registered` to feed `observe_inproc_registration` would fabricate
+            // a fact this path never produced.
             let current_sender = current.inproc_sender.as_ref().ok_or({
                 CommsRuntimeError::InprocPublication(
                     crate::InprocPublicationError::CurrentRuntimeUnpublished,
@@ -1915,17 +1915,16 @@ impl CommsRuntime {
                     sender.clone(),
                 )
                 .map_err(CommsRuntimeError::InprocPublication)?;
-            crate::RegistrationOutcome::Registered
         } else {
-            InprocRegistry::global().register_with_meta_in_namespace(
+            let outcome = InprocRegistry::global().register_with_meta_in_namespace(
                 &namespace,
                 &name,
                 self.public_key,
                 sender.clone(),
                 crate::PeerMeta::default(),
-            )
-        };
-        observe_inproc_registration(&namespace, &name, outcome)?;
+            );
+            observe_inproc_registration(&namespace, &name, outcome)?;
+        }
         self.inproc_sender = Some(sender);
         Ok(())
     }
@@ -9488,13 +9487,20 @@ mod tests {
         assert!(still_live.same_inbox(&incumbent_sender));
     }
 
-    /// The other side of the rule: rebuilding a runtime under the SAME keypair
-    /// and the SAME participant name is one identity reconstructing itself, so
-    /// it is permitted. What must hold is that the identity never stops being
-    /// addressable, that the route follows the newest generation, and that the
-    /// predecessor's `Drop` cannot unbind the successor.
+    /// The same rule with no identity exemption, at the constructor: rebuilding
+    /// a runtime under the SAME keypair and the SAME participant name while the
+    /// predecessor is still published is refused exactly like a foreign key,
+    /// carrying the claimant's own key back as the holder. Through 0.8.23 this
+    /// was admitted as "one identity reconstructing itself", which orphaned the
+    /// predecessor's route in the one case where it is most likely still live.
+    ///
+    /// The successor generation is minted through the one legal door instead
+    /// (`publish_replacing`, naming the predecessor), and the two properties
+    /// that make that a handover rather than a displacement still hold: the key
+    /// never stops resolving, and the superseded predecessor's `Drop` cannot
+    /// unbind the successor.
     #[test]
-    fn inproc_constructor_rebinds_its_own_identity_and_survives_predecessor_drop() {
+    fn inproc_constructor_refuses_its_own_live_identity_and_replaces_only_by_generation() {
         let suffix = Uuid::new_v4().simple().to_string();
         let name = format!("mob.same-key-{suffix}/__mob_supervisor__");
         let namespace = format!("mob.same-key-{suffix}");
@@ -9513,20 +9519,50 @@ mod tests {
             .get_by_pubkey_in_namespace(&namespace, &key)
             .expect("predecessor route should be published");
 
-        let successor = CommsRuntime::inproc_only_with_keypair_and_silent_intents(
+        // `CommsRuntime` is not `Debug`, so unwrap the refusal by hand.
+        let error = match CommsRuntime::inproc_only_with_keypair_and_silent_intents(
+            &name,
+            Some(namespace.clone()),
+            keypair.clone(),
+            Arc::new(HashSet::new()),
+        ) {
+            Ok(_) => panic!("holding the incumbent's own key must not license a second claim"),
+            Err(error) => error,
+        };
+        match error {
+            CommsRuntimeError::InprocRegistrationRejected(
+                crate::RegistrationRejection::NameOccupied { holder_pubkey },
+            ) => assert_eq!(
+                holder_pubkey, key,
+                "the refusal must carry the incumbent's key even when it is the claimant's own"
+            ),
+            other => panic!("expected a NameOccupied rejection, got {other:?}"),
+        }
+        let untouched = InprocRegistry::global()
+            .get_by_pubkey_in_namespace(&namespace, &key)
+            .expect("the refused construction must leave the predecessor route installed");
+        assert!(
+            untouched.same_inbox(&predecessor_sender),
+            "a refused same-key claim must not move the route onto the newcomer generation"
+        );
+
+        // The legal door: hand in the predecessor generation being replaced.
+        let successor = CommsRuntime::prepare_inproc_only_with_keypair_and_silent_intents(
             &name,
             Some(namespace.clone()),
             keypair,
             Arc::new(HashSet::new()),
         )
-        .expect("one identity must be able to rebuild its own route");
+        .expect("preparing a replacement generation must not touch the registry")
+        .publish_replacing(&predecessor)
+        .expect("naming the exact predecessor generation must be admitted");
         assert_eq!(successor.public_key(), key);
         let rebound = InprocRegistry::global()
             .get_by_pubkey_in_namespace(&namespace, &key)
             .expect("the identity must never stop being addressable");
         assert!(
             !rebound.same_inbox(&predecessor_sender),
-            "the rebind must move the route onto the successor generation"
+            "the replacement must move the route onto the successor generation"
         );
 
         // The predecessor is torn down after being superseded. Its
@@ -9549,12 +9585,17 @@ mod tests {
         );
     }
 
-    /// The explicit release seam. A live participant name is never displaced, so
-    /// a teardown that hands its name to a replacement in the same process has
-    /// to release it at a point the replacement can observe, rather than at the
-    /// last `Arc` drop. Release must be generation-exact (a superseded
+    /// The explicit release seam, which under the one claim rule is what makes
+    /// succession possible at all: a live participant name is never displaced,
+    /// so a teardown that hands its name to a replacement in the same process
+    /// has to release it at a point the replacement can observe, rather than at
+    /// the last `Arc` drop. Release must be generation-exact (a superseded
     /// generation cannot take the live route down), idempotent, and must leave
     /// the name claimable by a different identity.
+    ///
+    /// The superseded generation is minted through `publish_replacing`, because
+    /// registration no longer mints one: that is the point of the rule, and this
+    /// test needs two same-key generations to check exactness against.
     #[test]
     fn retire_inproc_route_is_generation_exact_and_frees_the_name() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -9570,13 +9611,15 @@ mod tests {
             Arc::new(HashSet::new()),
         )
         .expect("predecessor should publish");
-        let successor = CommsRuntime::inproc_only_with_keypair_and_silent_intents(
+        let successor = CommsRuntime::prepare_inproc_only_with_keypair_and_silent_intents(
             &name,
             Some(namespace.clone()),
             keypair,
             Arc::new(HashSet::new()),
         )
-        .expect("the same identity should rebind its own route");
+        .expect("preparing a replacement generation must not touch the registry")
+        .publish_replacing(&predecessor)
+        .expect("naming the exact predecessor generation must be admitted");
 
         assert!(
             !predecessor.retire_inproc_route(),
