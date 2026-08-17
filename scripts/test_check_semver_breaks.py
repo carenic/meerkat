@@ -11,6 +11,7 @@ undeclared one rather than a hand-built imitation of both.
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -486,6 +487,110 @@ class CliAcceptanceTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("could not measure", result.stderr)
+
+
+class ChangelogStampTests(unittest.TestCase):
+    """`stamp-changelog-release.py` must produce what this gate demands.
+
+    The stamper and this analyser are a producer/consumer pair, so every case
+    asserts the ROUND TRIP - stamp, then judge the output with the gate's own
+    `check_stamped` - rather than each side's separate idea of the format. The
+    input is this repository's real release notes re-headed as pending, so a
+    green run means the stamper handles a real release section.
+    """
+
+    STAMPER = Path(__file__).with_name("stamp-changelog-release.py")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        start = REPO_CHANGELOG.index("## [0.8.23]")
+        end = REPO_CHANGELOG.index("## [0.8.22]")
+        body = REPO_CHANGELOG[start:end].split("\n", 1)[1]
+        cls.pending = "# Changelog\n\npolicy blurb\n\n## [Unreleased]\n" + body
+        cls.tail = "## [0.8.22] - 2026-08-09\n\n- old\n"
+        cls.tmp = tempfile.TemporaryDirectory()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.tmp.cleanup()
+
+    def stamp(self, text: str, version: str, name: str = "") -> tuple:
+        path = Path(self.tmp.name) / f"CHANGELOG-{name or self.id().rsplit('.', 1)[-1]}.md"
+        path.write_text(text, encoding="utf-8")
+        env = dict(os.environ, MEERKAT_RELEASE_DATE="2026-08-17")
+        result = subprocess.run(
+            [sys.executable, str(self.STAMPER), str(path), version],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        return result, path
+
+    def test_stamped_notes_satisfy_the_break_gate(self) -> None:
+        result, path = self.stamp(self.pending + self.tail, "0.8.24")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sections = gate.parse_changelog(path.read_text(encoding="utf-8"))
+        self.assertEqual(gate.check_stamped(sections, "0.8.24"), [])
+        # The green above must be BOUND to the version, or it proves nothing:
+        # the same bytes have to be red for a different release.
+        self.assertTrue(gate.check_stamped(sections, "0.8.23"))
+
+    def test_the_stamp_leaves_an_empty_unreleased_stub(self) -> None:
+        _, path = self.stamp(self.pending + self.tail, "0.8.24")
+        sections = gate.parse_changelog(path.read_text(encoding="utf-8"))
+        self.assertIsNone(sections[0].version)
+        self.assertTrue(sections[0].is_empty, "stub must stay empty or it becomes the pending one")
+        self.assertEqual(sections[1].version, "0.8.24")
+
+    def test_restamping_the_same_version_is_a_noop(self) -> None:
+        # The stamp leaves an EMPTY stub on top, so "already done" and "nobody
+        # wrote notes" have the same shape. Re-running must not report missing
+        # notes for work it just stamped, and must not stamp twice.
+        first, path = self.stamp(self.pending + self.tail, "0.8.24", name="restamp")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        again = subprocess.run(
+            [sys.executable, str(self.STAMPER), str(path), "0.8.24"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=dict(os.environ, MEERKAT_RELEASE_DATE="2026-08-17"),
+        )
+        self.assertEqual(again.returncode, 0, again.stderr)
+        text = path.read_text(encoding="utf-8")
+        self.assertEqual(text.count("## [0.8.24]"), 1, "restamping duplicated the heading")
+
+    def test_an_empty_pending_section_is_refused(self) -> None:
+        result, _ = self.stamp("# C\n\n## [Unreleased]\n\n" + self.tail, "0.8.24")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("empty", result.stderr)
+
+    def test_an_unrelated_stamped_version_is_not_mistaken_for_already_done(self) -> None:
+        # An empty stub above SOMEONE ELSE'S release is missing notes, not a
+        # completed stamp; accepting it would let a release ship the previous
+        # release's notes as its own.
+        result, _ = self.stamp("# C\n\n## [Unreleased]\n\n" + self.tail, "0.8.24", name="unrelated")
+        self.assertEqual(result.returncode, 1)
+
+    def test_a_duplicate_version_below_the_pending_section_is_refused(self) -> None:
+        result, _ = self.stamp(
+            self.pending + "## [0.8.24] - 2026-08-01\n\n- older attempt\n" + self.tail, "0.8.24"
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("twice", result.stderr)
+
+    def test_a_malformed_release_date_is_refused(self) -> None:
+        path = Path(self.tmp.name) / "CHANGELOG-baddate.md"
+        path.write_text(self.pending + self.tail, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(self.STAMPER), str(path), "0.8.24"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=dict(os.environ, MEERKAT_RELEASE_DATE="17-08-2026"),
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("YYYY-MM-DD", result.stderr)
 
 
 if __name__ == "__main__":

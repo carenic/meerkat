@@ -411,6 +411,94 @@ them.
   closed (this is what protects sessions that persisted the wrong binding
   before the constraint existed).
 
+- **An ambiguous peer delivery no longer reaches a REST caller as a failed
+  send** (`meerkat-rest`, `meerkat-core`). `SendError::AmbiguousDelivery` -
+  which means the envelope may already be on the receiver's queue and a later
+  drain may still commit it - fell into the `send_failed` catch-all of
+  `normalize_rest_comms_send_error`. "Failed" is the one word that must not
+  reach this caller, because the action it invites is a retry and a retry can
+  duplicate work; a model-mediated caller reading the prose will retry on that
+  word alone. It now normalizes to a distinct `send_ambiguous` code carrying
+  `retry_safe: false`, `required_action: "reconcile"`, and the `envelope_id`
+  as the correlation evidence reconciliation needs.
+
+  `SendError::AmbiguousDelivery`'s own documentation now states the
+  precondition the recovery advice depends on: reconciliation only works if
+  the dedup key is COARSER than the retry. An adopter on this exact path was
+  safe because their key was `{schedule_id}:{YYYYMMDD}` - and it had been
+  per-attempt timestamped first, changed only after it bit them. A per-attempt
+  or timestamped key gives zero protection while looking exactly like
+  idempotency.
+
+- **`cargo test -p meerkat` reported success over zero tests** (`meerkat`). The
+  facade's feature-gated tests compiled away entirely in a package-scoped lane
+  because `session-store` is not a default feature there - 28 tests in
+  `src/persistence.rs` (including the pre-0.8.10 bridge tests that guard a
+  field-reported P0), another 28 behind `jsonl-store`, and 5 behind `comms`.
+  The failure mode was silence, not a red lane. CI was never affected, because
+  `cargo unit` is `--workspace` and rpc/rest/mcp-server/mob all enable
+  `session-store` on the facade, so feature unification built the files on -
+  which is exactly why it survived: the evidence was intact in the lane nobody
+  doubted and absent from the one a developer actually runs. The facade now
+  carries a path-only self dev-dependency (stripped at publish, same remedy
+  `meerkat-runtime` already used) enabling the full non-live set, so coverage
+  no longer depends on which sibling crates happen to share the build graph.
+
+- **`@rkat/web` did not handle the two new turn-accounting events.** The Web
+  SDK's compile-time exhaustiveness assertion over `AgentEvent` had no arms for
+  `turn_usage_accounting_unmeasured` or
+  `turn_usage_accounting_identity_disputed`, so the package failed to build
+  against its own generated types. Both are now rendered with the distinction
+  that matters: the unmeasured marker names the provider/model that went
+  unaccounted and must be SKIPPED rather than read as zero, while the disputed
+  marker shows the reported and active identities side by side, since the
+  counters do exist and neither side is ever rewritten to agree.
+
+### Known issues
+
+- **Every tool result body is carried TWICE in the event vocabulary**
+  (`meerkat-core`). `AgentEvent::ToolResultReceived` and
+  `AgentEvent::ToolExecutionCompleted` are both emitted for every tool call
+  and differ by exactly one field, `duration_ms`; both carry the full
+  `content` blocks. Any consumer that durably persists both therefore stores
+  every result body twice. Measured independently on two adopter fleets with
+  different storage engines: a console frame store (~348 MB against ~348 MB,
+  pairwise-identical maxima, from 153 camera-tool calls) and a warehouse
+  events table (89,033 rows / 3.35 GB against 88,934 rows / 1.69 GB). It is a
+  PER-CALL cost, not a scale problem - one tool returning a large blob is
+  enough.
+
+  Both events are legitimate and both should exist: one is the conversation
+  fact (this result entered the transcript), the other the execution fact (the
+  call finished, and here is how long it took). What is wrong is that the
+  execution fact's cost scales with the size of the result instead of with the
+  fact itself. This release documents it on both variants rather than
+  half-fixing it: `id` is present on both and is already the join key, so a
+  consumer persisting both should store the body once against `id`. Note that
+  capping bytes at a downstream writer does NOT fix this - it still writes the
+  body twice, only smaller, and every consumer has to reimplement the cap.
+  Removing `content` from the execution event is a wire break and is deferred
+  to the next release rather than rushed into this one.
+
+- **Streaming events carry no turn identity, so a durable consumer cannot
+  group a turn's frames** (`meerkat-core`). `AgentEvent::TextDelta` and
+  `AgentEvent::TextComplete` carry only their text. The agent emits bare
+  `AgentEvent`s, and the envelope - whose `source` is the only slot that could
+  carry identity - is attached downstream by a wrapper that does not know
+  which turn produced the frame. Identity therefore lives in delivery context,
+  which is exactly what a durable consumer does not keep.
+
+  What this costs in the field: an adopter could not run a coverage check
+  before pruning streamed deltas, because the correlation column was populated
+  on 747 of 532,190 delta rows (0.14%). Of the 15 turns that were correlatable,
+  2 had no terminal text frame at all - meaning for those turns the delta
+  stream was the only surviving record of what the agent said. They correctly
+  declined to prune. The fix is not an optional envelope field: populated from
+  the paths that already carry an interaction, it would be absent on exactly
+  the scheduled turns that need it, reproducing the same hole inside a wire
+  contract that asserts the field exists. It needs a turn identifier minted
+  unconditionally by the emitter, which is design work for the next release.
+
 ### Corrected
 
 - **The 0.8.23 notes claimed `session_liveness` "needs a watchdog bridge that
@@ -440,6 +528,19 @@ them.
   `publish_github_release`, `publish_registries`, and
   `publish_unix_release_and_homebrew`; previously it only existed in
   `make release-preflight`.
+
+- The release now STAMPS its own notes (`scripts/stamp-changelog-release.py`,
+  wired into `scripts/release-hook.sh`). The gate above requires the section a
+  release is declared in to name the version being released, and nothing
+  produced that - which made the requirement unsatisfiable by hand: stamping
+  before the bump is rejected as "declared against a different version", and
+  stamping after the tag publishes notes titled "Unreleased". The hook is the
+  only point where the stamp and the version bump are the same commit, so the
+  stamp is owned there. It leaves the empty `## [Unreleased]` stub the gate
+  expects, is idempotent across hook re-entry, and fails closed on missing
+  notes, a duplicate version, or a malformed date rather than inventing a
+  heading. Covered by `make semver-breaks-selftest`, which now asserts the
+  round trip - stamp, then judge the output with the gate's own checker.
 
 - Three `meerkat-mob` error enums gain a `ParticipantNameOccupied {
   participant_name: String, holder_pubkey: meerkat_comms::PubKey }` variant.

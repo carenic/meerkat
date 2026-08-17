@@ -56,6 +56,16 @@ echo "==> Release hook: syncing SDK versions to $VERSION"
 # 1b. Stamp docs version projections (gated by verify-version-parity.sh)
 "$ROOT/scripts/stamp-docs-contract-version.sh" "$VERSION"
 
+# 1c. Stamp the pending CHANGELOG section (gated by scripts/check_semver_breaks.py).
+# Must happen HERE and not by hand: the gate requires the section a release is
+# declared in to name the version being released, so stamping before the bump
+# fails ("declared against a different version") and stamping after the tag
+# publishes notes titled "Unreleased". This hook is the only point where the
+# stamp and the version bump are the same commit. Runs early so a release with
+# missing notes aborts before the expensive schema/codegen work.
+echo "==> Stamping CHANGELOG.md for $VERSION"
+"$PYTHON" "$ROOT/scripts/stamp-changelog-release.py" "$ROOT/CHANGELOG.md" "$VERSION"
+
 # 2. Bump ContractVersion::CURRENT in version.rs to match package version
 VERSION_RS="$ROOT/meerkat-contracts/src/version.rs"
 V_CORE="${VERSION%%-*}"
@@ -120,6 +130,7 @@ echo "==> Verifying SDK wrapper freshness..."
 
 # 4. Stage SDK and artifact files for the release commit
 git add \
+    "$ROOT/CHANGELOG.md" \
     "$ROOT/docs/" \
     "$ROOT/MODULE.bazel.lock" \
     "$ROOT/meerkat-contracts/src/version.rs" \
