@@ -996,7 +996,9 @@ enum ChatCompletionsLine {
     /// truncated text, which is worse than the failure it replaced. The
     /// sibling adapter already models this (`text_adapter.rs`,
     /// `ServerEvent::Error => Err(map_server_error(error))?`).
-    ServerError { message: String },
+    ServerError {
+        message: String,
+    },
 }
 
 /// Provider error envelope. Both shapes are seen in the wild: a top-level
@@ -1374,19 +1376,21 @@ mod tests {
         .await;
 
         let outcome = observed_done_outcome(&events).expect("terminal done");
-        match outcome {
-            LlmDoneOutcome::Error { error } => {
-                let rendered = error.to_string();
-                assert!(
-                    rendered.contains("engine core proc died"),
-                    "the provider's own message must survive to the caller, got {rendered}"
-                );
+        // Rendered rather than matched, so a wrongly-successful turn fails this
+        // assertion with the outcome in the message instead of needing a
+        // `panic!` arm (which `-D clippy::panic` rejects).
+        let rendered = match outcome {
+            LlmDoneOutcome::Error { error } => error.to_string(),
+            LlmDoneOutcome::Success { stop_reason } => {
+                format!("SUCCESS({stop_reason:?}) - the turn was not failed at all")
             }
-            LlmDoneOutcome::Success { .. } => panic!(
-                "a provider error before the finish event must not present as a successful \
-                 turn carrying truncated text; got {events:?}"
-            ),
-        }
+        };
+        assert!(
+            rendered.contains("engine core proc died"),
+            "a provider error before the finish event must fail the turn carrying the \
+             provider's own message, not present as a success with truncated text; \
+             got {rendered}; events {events:?}"
+        );
     }
 
     /// The nested `{"error":{...}}` envelope shape, same rule.
