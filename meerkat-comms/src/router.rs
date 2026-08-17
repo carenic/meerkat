@@ -6,7 +6,8 @@ use parking_lot::RwLock;
 #[cfg(all(not(unix), not(target_arch = "wasm32")))]
 use std::io::ErrorKind;
 use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
+// The in-process lane is compiled for wasm32 too, and it carries the park
+// bound in its typed outcome, so `Duration` is no longer stream-transport-only.
 use std::time::Duration;
 use thiserror::Error;
 #[cfg(not(target_arch = "wasm32"))]

@@ -34,6 +34,7 @@ use crate::types::{Envelope, InboxItem, MessageKind};
 
 const DEFAULT_NAMESPACE: &str = "";
 
+#[derive(Debug)]
 pub(crate) struct InprocDelivery {
     pub(crate) envelope_id: Uuid,
     pub(crate) outcome: InprocDeliveryOutcome,
@@ -729,15 +730,20 @@ impl InprocRegistry {
                 Err(InprocSendError::IngressDropped(reason))
             }
             // The receiver's queue never opened inside the bound: nothing was
-            // admitted, so this is the existing "inbox full" fact, not an
-            // ambiguous delivery.
+            // admitted, so this is an admission refusal for a typed capacity
+            // reason - NOT an ambiguous delivery, and not "peer unreachable".
+            // The peer was present and its queue answered; it was full.
+            // `IngressDropped` is the arm that carries that typed reason
+            // through to `peer_admission_dropped: inbox_full`; the bare
+            // `InboxFull` arm above collapses into `PeerOffline` on the way
+            // out, which would report an unreachable peer for a reachable one.
             BoundedIngressDelivery::AdmissionParkTimedOut { park_bound } => {
                 tracing::warn!(
                     %envelope_id,
                     park_bound_secs = park_bound.as_secs_f64(),
                     "inproc send gave up waiting for receiver inbox capacity"
                 );
-                Err(InprocSendError::InboxFull)
+                Err(InprocSendError::IngressDropped(DropReason::InboxFull))
             }
             BoundedIngressDelivery::AdmittedUnconfirmed { park_bound } => Ok(InprocDelivery {
                 envelope_id,
@@ -2057,8 +2063,12 @@ mod tests {
         .expect("the capacity park must be bounded by the same deadline as the receipt park");
 
         assert!(
-            matches!(second, Err(InprocSendError::InboxFull)),
-            "a send that never got admitted must not claim ambiguous delivery"
+            matches!(
+                second,
+                Err(InprocSendError::IngressDropped(DropReason::InboxFull))
+            ),
+            "a send that never got admitted must carry the typed capacity refusal, \
+             not an ambiguous delivery and not an unreachable peer: got {second:?}"
         );
         let (_, queued) = inbox
             .peer_authority_test_snapshot()

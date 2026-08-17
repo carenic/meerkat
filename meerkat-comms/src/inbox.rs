@@ -1234,7 +1234,13 @@ impl InboxSender {
                 reason: DropReason::ClassificationRejected,
             });
         };
-        let deadline = tokio::time::Instant::now() + park_bound;
+        // ONE budget across both parks, tracked as remaining time rather than
+        // as a `tokio::time::Instant` deadline: the wasm glue behind
+        // `crate::tokio` exposes neither `Instant` nor `timeout_at`, and this
+        // path is compiled for wasm32. `time_compat::Instant` is the
+        // browser-safe monotonic clock.
+        let park_started = meerkat_core::time_compat::Instant::now();
+        let remaining_budget = || park_bound.saturating_sub(park_started.elapsed());
         let kind = prepared.kind;
         let mut prepared = Some(prepared);
         let capacity_notify = classified_queue.lock().capacity_notifier();
@@ -1278,7 +1284,8 @@ impl InboxSender {
                             actionable.notify_waiters();
                         }
                         self.notify.notify_waiters();
-                        return match tokio::time::timeout_at(deadline, receipt.wait()).await {
+                        return match tokio::time::timeout(remaining_budget(), receipt.wait()).await
+                        {
                             Ok(outcome) => BoundedIngressDelivery::Resolved(outcome),
                             Err(_) => BoundedIngressDelivery::AdmittedUnconfirmed { park_bound },
                         };
@@ -1290,7 +1297,7 @@ impl InboxSender {
             // park: a receiver whose drain is dead never dequeues, so
             // `capacity_notify` never fires and this await would otherwise be
             // the second unbounded park in this call.
-            if tokio::time::timeout_at(deadline, notified.as_mut())
+            if tokio::time::timeout(remaining_budget(), notified.as_mut())
                 .await
                 .is_err()
             {
