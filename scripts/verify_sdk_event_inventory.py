@@ -36,6 +36,13 @@ WEB_EVENTS = ROOT / "sdks" / "web" / "src" / "generated" / "events.ts"
 TS_EVENTS = ROOT / "sdks" / "typescript" / "src" / "generated" / "events.ts"
 PY_EVENTS = ROOT / "sdks" / "python" / "meerkat" / "generated" / "event_inventory.py"
 
+# Generated payload/reason types (a different assertion from the name inventory
+# above: these are the types the events carry, not the event discriminants).
+TS_EVENT_TYPES = ROOT / "sdks" / "typescript" / "src" / "generated" / "event_types.ts"
+PY_EVENT_TYPES = ROOT / "sdks" / "python" / "meerkat" / "generated" / "event_types.py"
+TS_TYPES = ROOT / "sdks" / "typescript" / "src" / "generated" / "types.ts"
+PY_TYPES = ROOT / "sdks" / "python" / "meerkat" / "generated" / "types.py"
+
 
 def schema_known_event_types() -> set[str]:
     data = json.loads(EVENTS_SCHEMA.read_text(encoding="utf-8"))
@@ -84,6 +91,53 @@ def generated_event_types(path: pathlib.Path) -> set[str]:
     return set(re.findall(r'"([^"]+)"', body))
 
 
+def schema_event_payload_types() -> set[str]:
+    """Every named ``$def`` across the agent-event schema roots.
+
+    This is a different authority from ``WireEvent.known_event_types``: that is
+    the set of event *discriminants* (names on the wire), while this is the set
+    of named payload *types* (records and typed reason enums) the events carry.
+    Checking only the former is what let 50+ payload types go ungenerated in the
+    Python and TypeScript SDKs while this gate reported green.
+
+    Mirrors ``_event_type_defs`` in ``tools/sdk-codegen/generate.py``.
+    """
+
+    data = json.loads(EVENTS_SCHEMA.read_text(encoding="utf-8"))
+    names: set[str] = set()
+    for root_name in ("ScopedAgentEvent", "AgentEvent"):
+        root = data.get(root_name, {})
+        if isinstance(root, dict) and isinstance(root.get("$defs"), dict):
+            names.update(root["$defs"].keys())
+    if not names:
+        raise SystemExit(
+            f"{EVENTS_SCHEMA}: no named $defs found under the agent-event roots"
+        )
+    return names
+
+
+def declared_python_types(path: pathlib.Path) -> set[str]:
+    if not path.is_file():
+        raise SystemExit(f"missing generated event types: {path}")
+    text = path.read_text(encoding="utf-8")
+    declared = set(re.findall(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", text, re.M))
+    declared |= set(re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=", text, re.M))
+    return declared
+
+
+def declared_typescript_types(path: pathlib.Path) -> set[str]:
+    if not path.is_file():
+        raise SystemExit(f"missing generated event types: {path}")
+    text = path.read_text(encoding="utf-8")
+    return set(
+        re.findall(
+            r"^export\s+(?:interface|type|enum|const)\s+([A-Za-z_][A-Za-z0-9_]*)",
+            text,
+            re.M,
+        )
+    )
+
+
 def main() -> int:
     known = schema_known_event_types()
     failures: list[str] = []
@@ -105,17 +159,51 @@ def main() -> int:
                 f"  {label} ({path.relative_to(ROOT)}): unknown-to-schema {sorted(extra)}"
             )
 
-    if failures:
+    # A payload type may legitimately live in the SDK's general wire-types module
+    # rather than the event-specific one; the assertion is that the SDK declares
+    # it *somewhere* generated, not which file it landed in.
+    payload_types = schema_event_payload_types()
+    type_failures: list[str] = []
+    for label, sources, declared in (
+        ("web", (WEB_EVENTS,), declared_typescript_types(WEB_EVENTS)),
+        (
+            "typescript",
+            (TS_EVENT_TYPES, TS_TYPES),
+            declared_typescript_types(TS_EVENT_TYPES)
+            | declared_typescript_types(TS_TYPES),
+        ),
+        (
+            "python",
+            (PY_EVENT_TYPES, PY_TYPES),
+            declared_python_types(PY_EVENT_TYPES) | declared_python_types(PY_TYPES),
+        ),
+    ):
+        missing = payload_types - declared
+        if missing:
+            where = ", ".join(str(p.relative_to(ROOT)) for p in sources)
+            type_failures.append(
+                f"  {label} ({where}): no generated type for {sorted(missing)}"
+            )
+
+    if failures or type_failures:
         print("SDK event-inventory parity check FAILED:")
-        print("\n".join(failures))
+        if failures:
+            print(" event-type inventory (names):")
+            print("\n".join(failures))
+        if type_failures:
+            print(" event payload types (declarations):")
+            print("\n".join(type_failures))
         print()
-        print("The generated SDK event inventories are out of sync with")
-        print("artifacts/schemas/events.json (WireEvent.known_event_types).")
+        print("The generated SDK event output is out of sync with")
+        print("artifacts/schemas/events.json.")
         print("Run: make regen-schemas")
-        print("Then commit the updated generated SDK inventories.")
+        print("Then commit the updated generated SDK files.")
         return 1
 
-    print(f"SDK event-inventory parity OK ({len(known)} event types across 3 SDKs)")
+    print(
+        f"SDK event-inventory parity OK ({len(known)} event types and "
+        f"{len(payload_types)} payload types across 3 SDKs)"
+    )
     return 0
 
 

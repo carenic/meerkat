@@ -6,4 +6,5 @@ from .event_inventory import (  # noqa: F401
     KNOWN_AGENT_EVENT_TYPES,
     is_known_agent_event_type,
 )
+from .event_types import *  # noqa: F401,F403
 from .version_compat import is_compatible_with  # noqa: F401
