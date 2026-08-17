@@ -102,9 +102,16 @@ indexmap = { workspace = true }
 # those need real resources and belong to the e2e lanes.
 meerkat = { path = ".", features = [
     "session-store",
+    # Enabling `session-store` alone makes the cold-restart compaction batteries
+    # RUN without the feature they need, so all four fail in setup with
+    # "compaction did not run before the restart" - visible but not honest.
+    # Whatever a test needs to be meaningful belongs in this list.
+    "session-compaction",
     "jsonl-store",
     "memory-store",
+    "memory-store-session",
     "comms",
+    "mcp",
     "skills",
     "schedule",
     "workgraph",
