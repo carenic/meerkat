@@ -64,6 +64,7 @@ from .generated.types import (
     GoalStatusRequest,
     GoalStatusResult,
     JobArtifactRef,
+    JobHealthCoverage,
     JobHealthSummary,
     JobProgress,
     JobRunner,
@@ -1831,8 +1832,14 @@ class MeerkatClient:
                 awaiting_members=self._require_non_negative_integer_field(
                     health, "awaiting_members", "Invalid jobs/health response"
                 ),
-                delivery_backlog=self._require_non_negative_integer_field(
-                    health, "delivery_backlog", "Invalid jobs/health response"
+                coverage=self._parse_job_health_coverage(
+                    health.get("coverage"), "Invalid jobs/health response"
+                ),
+                pending_outbox_jobs=self._require_non_negative_integer_field(
+                    health, "pending_outbox_jobs", "Invalid jobs/health response"
+                ),
+                runtime_inbox_backlog=self._require_non_negative_integer_field(
+                    health, "runtime_inbox_backlog", "Invalid jobs/health response"
                 ),
                 needs_attention=self._require_non_negative_integer_field(
                     health, "needs_attention", "Invalid jobs/health response"
@@ -6543,6 +6550,34 @@ class MeerkatClient:
                 )
             parsed.append(value)
         return parsed
+
+    @staticmethod
+    def _parse_job_health_coverage(raw: Any, context: str) -> JobHealthCoverage:
+        """Parse census coverage.
+
+        An unknown tag is refused rather than defaulted to ``complete``:
+        substituting "the census read everything" for a variant this client
+        does not understand would relabel an admitted non-answer as a clean
+        reading, which is the exact defect the field was added to close.
+        """
+        value = MeerkatClient._require_dict(raw, "coverage", context)
+        kind = MeerkatClient._require_string_field(value, "kind", context)
+        if kind == "complete":
+            return {"kind": "complete"}
+        if kind == "truncated":
+            return {
+                "kind": "truncated",
+                "scanned": MeerkatClient._require_non_negative_integer_field(
+                    value, "scanned", context
+                ),
+                "limit": MeerkatClient._require_non_negative_integer_field(
+                    value, "limit", context
+                ),
+            }
+        raise MeerkatError(
+            "INVALID_RESPONSE",
+            f"{context}: unsupported coverage.kind {kind!r}",
+        )
 
     @staticmethod
     def _require_dict(raw: Any, field: str, context: str) -> dict[str, Any]:

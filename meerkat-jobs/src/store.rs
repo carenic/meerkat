@@ -8,12 +8,54 @@ use ::tokio::sync::RwLock;
 use async_trait::async_trait;
 use meerkat_core::SessionId;
 
-use crate::machines::detached_job::{DetachedJobMachineAuthority, DetachedJobMachineState};
+use crate::machines::detached_job::{
+    DetachedJobMachineAuthority, DetachedJobMachineState, DetachedJobPhase,
+};
 use crate::{
     DetachedJobError, JobId, JobOutboxEntry, JobOutboxPayload, JobProgress, JobSpec,
     JobSubmissionKey, JobTerminalResult, PredicateDeliveryCommit, PredicateDeliveryIdempotencyKey,
     PredicateDeliveryIdentity, PredicateDeliveryReceipt,
 };
+
+/// Whether an operational census must still look at a row in this phase.
+///
+/// **This is not machine terminality and must never be replaced by it.** The
+/// generated machine's terminal set is
+/// `[Succeeded, Failed, Cancelled, WorkerLost, NeedsAttention]`, and
+/// `NeedsAttention` is one of the three conditions that degrade the census.
+/// Classifying rows by machine terminality would silently drop every job
+/// parked for a human out of the health window - the same silence this whole
+/// lane exists to remove, wearing a plausible name.
+///
+/// The exhaustive `match` is the point: a new phase cannot be added without
+/// someone answering this question for it. The classification is the single
+/// owner of the fact; the durable `census_live` column and the SQL window are
+/// both projections of it.
+pub(crate) const fn phase_is_census_live(phase: DetachedJobPhase) -> bool {
+    match phase {
+        // Live work, or work parked for a human. All of it can be wedged, and
+        // some of it is how a wedge is reported.
+        DetachedJobPhase::Unsubmitted
+        | DetachedJobPhase::Queued
+        | DetachedJobPhase::Claimed
+        | DetachedJobPhase::Running
+        | DetachedJobPhase::WaitingExternal
+        | DetachedJobPhase::LossObserved
+        | DetachedJobPhase::RetryScheduled
+        | DetachedJobPhase::NeedsAttention => true,
+        // Settled: the job is over and no lifecycle term can change again.
+        // Its delivery obligations are counted separately and remain visible
+        // through `count_pending_outbox_jobs`, which is phase-blind.
+        DetachedJobPhase::Succeeded
+        | DetachedJobPhase::Failed
+        | DetachedJobPhase::Cancelled
+        | DetachedJobPhase::WorkerLost => false,
+    }
+}
+
+pub(crate) fn job_is_census_live(job: &StoredJob) -> bool {
+    phase_is_census_live(job.machine_state.lifecycle_phase)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredJob {
@@ -107,6 +149,46 @@ pub trait DetachedJobStore: Send + Sync {
     /// Mechanical recovery census. Callers must use generated lifecycle state
     /// to decide whether a row is runnable, reconcilable, or terminal.
     async fn list_all(&self, limit: usize) -> Result<Vec<StoredJob>, DetachedJobError>;
+
+    /// Exact, uncapped count of jobs carrying at least one unapplied outbox
+    /// entry, optionally narrowed to one realm.
+    ///
+    /// This is deliberately NOT expressible as a bounded [`Self::list_all`]
+    /// scan: an outbox backlog is exactly the condition that persists while
+    /// rows accumulate, so a capped window answers a different question as the
+    /// store ages. It is also deliberately phase-blind - a terminal job whose
+    /// terminal delivery never applied is the canonical case this counts.
+    ///
+    /// The unit is JOBS, not entries: entry counts live inside the job
+    /// document, and decoding every document is the cost this method exists
+    /// to avoid. There is no default implementation, because a default that
+    /// fell back to a capped scan would silently reintroduce the blindness in
+    /// every store that forgot to override it.
+    async fn count_pending_outbox_jobs(
+        &self,
+        realm_id: Option<&str>,
+    ) -> Result<u64, DetachedJobError>;
+
+    /// Rows an operational census must look at: realm-filtered IN THE STORE,
+    /// restricted to phases that can still change, capped last.
+    ///
+    /// Every clause is load-bearing against a specific way the previous
+    /// `list_all` window lied. Filtering the realm after the cap let another
+    /// realm's rows consume this realm's window. Including settled rows let
+    /// history consume it - and because job ids are time-ordered, history is
+    /// exactly what sorts first, so the window degraded with age rather than
+    /// with load.
+    ///
+    /// The cap remains, because an unbounded decode of live jobs is a real
+    /// cost. It is now a bound on LIVE work, which is an operational fact
+    /// worth reporting rather than a function of retention - and when it is
+    /// hit the caller must publish [`crate::JobHealthCoverage::Truncated`]
+    /// rather than counts.
+    async fn list_census_candidates(
+        &self,
+        realm_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredJob>, DetachedJobError>;
 
     fn is_persistent(&self) -> bool;
 }
@@ -395,6 +477,44 @@ impl DetachedJobStore for MemoryDetachedJobStore {
             .await
             .jobs
             .values()
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn count_pending_outbox_jobs(
+        &self,
+        realm_id: Option<&str>,
+    ) -> Result<u64, DetachedJobError> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .jobs
+            .values()
+            .filter(|job| realm_id.is_none_or(|realm_id| job.spec.realm_id == realm_id))
+            .filter(|job| job.outbox.iter().any(|entry| !entry.applied))
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX))
+    }
+
+    async fn list_census_candidates(
+        &self,
+        realm_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredJob>, DetachedJobError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .inner
+            .read()
+            .await
+            .jobs
+            .values()
+            .filter(|job| realm_id.is_none_or(|realm_id| job.spec.realm_id == realm_id))
+            .filter(|job| job_is_census_live(job))
             .take(limit)
             .cloned()
             .collect())

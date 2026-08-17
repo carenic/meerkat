@@ -185,14 +185,25 @@ pub const JOBS_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDoma
             name: "predicate-delivery-ledger",
             apply: migration_0003_predicate_delivery_ledger,
         },
+        meerkat_sqlite::Migration {
+            version: 4,
+            name: "census-live-projection",
+            apply: migration_0004_census_live_projection,
+        },
     ],
     initialize_current: initialize_current_jobs_schema,
-    allowed_existing_versions: &[2, 3],
+    allowed_existing_versions: &[2, 3, 4],
     bridge_recoverable_versions: &[1],
-    released_predecessors: &[meerkat_sqlite::SchemaPredecessor {
-        version: 2,
-        verify: verify_released_jobs_v2_schema,
-    }],
+    released_predecessors: &[
+        meerkat_sqlite::SchemaPredecessor {
+            version: 2,
+            verify: verify_released_jobs_v2_schema,
+        },
+        meerkat_sqlite::SchemaPredecessor {
+            version: 3,
+            verify: verify_released_jobs_v3_schema,
+        },
+    ],
     owned_objects: &[
         meerkat_sqlite::SchemaObject {
             kind: meerkat_sqlite::SchemaObjectKind::Table,
@@ -201,6 +212,10 @@ pub const JOBS_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDoma
         meerkat_sqlite::SchemaObject {
             kind: meerkat_sqlite::SchemaObjectKind::Index,
             name: "idx_detached_jobs_pending_outbox",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Index,
+            name: "idx_detached_jobs_census_live",
         },
         meerkat_sqlite::SchemaObject {
             kind: meerkat_sqlite::SchemaObjectKind::Table,
@@ -213,7 +228,8 @@ pub const JOBS_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDoma
 fn initialize_current_jobs_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     migration_0001_jobs_schema(tx)?;
     migration_0002_notification_outbox_and_subscriptions(tx)?;
-    migration_0003_predicate_delivery_ledger(tx)
+    migration_0003_predicate_delivery_ledger(tx)?;
+    migration_0004_census_live_projection(tx)
 }
 
 fn migration_0001_jobs_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
@@ -264,6 +280,42 @@ fn verify_released_jobs_v2_schema(conn: &Connection) -> Result<(), String> {
     )
 }
 
+const RELEASED_JOBS_V3_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "detached_jobs",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "idx_detached_jobs_pending_outbox",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "detached_job_predicate_deliveries",
+    },
+];
+
+/// Frozen v3 catalog: the released shape this binary may migrate FROM.
+///
+/// Deliberately its own builder rather than a call into
+/// [`initialize_current_jobs_schema`]. That function tracks the current
+/// version and would drift into "whatever we ship today", which verifies
+/// nothing.
+fn build_released_jobs_v3_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    migration_0001_jobs_schema(tx)?;
+    migration_0002_notification_outbox_and_subscriptions(tx)?;
+    migration_0003_predicate_delivery_ledger(tx)
+}
+
+fn verify_released_jobs_v3_schema(conn: &Connection) -> Result<(), String> {
+    meerkat_sqlite::verify_released_schema_fingerprint(
+        conn,
+        &JOBS_DOMAIN,
+        RELEASED_JOBS_V3_OBJECTS,
+        build_released_jobs_v3_schema,
+    )
+}
+
 fn migration_0003_predicate_delivery_ledger(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     tx.execute_batch(
         r"
@@ -278,6 +330,93 @@ fn migration_0003_predicate_delivery_ledger(tx: &Transaction<'_>) -> Result<(), 
         );
         ",
     )
+}
+
+/// Project census relevance out of the job document into an indexed column.
+///
+/// Without it the operational census has no way to ask for live rows: phase
+/// lives inside `job_json`, so the only available window was "the first N rows
+/// by primary key", and job ids are time-ordered - the window filled with the
+/// oldest, most settled rows first and went blind as retention grew.
+///
+/// The column is named for the question it answers, not for machine
+/// terminality: [`crate::store::phase_is_census_live`] keeps `NeedsAttention`
+/// live even though the machine calls it terminal, because a job parked for a
+/// human is one of the three conditions that degrade the census.
+fn migration_0004_census_live_projection(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    tx.execute_batch(
+        r"
+        ALTER TABLE detached_jobs
+            ADD COLUMN census_live INTEGER NOT NULL DEFAULT 1
+                CHECK (census_live IN (0, 1));
+        CREATE INDEX idx_detached_jobs_census_live
+            ON detached_jobs (realm_id, job_id)
+            WHERE census_live = 1;
+        ",
+    )?;
+    backfill_census_live(tx)
+}
+
+/// Classify every existing row.
+///
+/// This is the load-bearing half of the migration. Settled rows are never
+/// rewritten again, so a backfill that classified nothing would leave every
+/// pre-existing store exactly as blind as before while reporting a successful
+/// migration - the schema would move and the defect would not.
+///
+/// A row this cannot decode stays LIVE (the column default). That is the safe
+/// direction and the reason the probe below is a frozen, minimal shape rather
+/// than the full document decoder: mis-marking a settled row as live costs
+/// window space, while mis-marking a live row as settled hides a wedged job,
+/// which is the defect itself.
+fn backfill_census_live(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    let settled = {
+        let mut statement = tx.prepare("SELECT job_id, job_json FROM detached_jobs")?;
+        let mut rows = statement.query([])?;
+        let mut settled: Vec<String> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let job_id: String = row.get(0)?;
+            let encoded = row
+                .get::<_, meerkat_sqlite::JsonColumnBytes>(1)?
+                .into_bytes();
+            if probe_settled_phase(&encoded) {
+                settled.push(job_id);
+            }
+        }
+        settled
+    };
+    let mut update = tx.prepare("UPDATE detached_jobs SET census_live = 0 WHERE job_id = ?1")?;
+    for job_id in settled {
+        update.execute([job_id])?;
+    }
+    Ok(())
+}
+
+/// Frozen migration-local view of the stored document: just the phase.
+///
+/// Pinned here rather than reusing [`StoredJobEnvelope`] so that later changes
+/// to the document type cannot change what this already-released migration
+/// does to a database. If the shape ever stops matching, decoding fails and
+/// every row stays live - loud in cost, silent in nothing.
+fn probe_settled_phase(encoded: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct PhaseProbeEnvelope {
+        job: PhaseProbeJob,
+    }
+    #[derive(Deserialize)]
+    struct PhaseProbeJob {
+        machine_state: PhaseProbeState,
+    }
+    #[derive(Deserialize)]
+    struct PhaseProbeState {
+        lifecycle_phase: PersistedPhase,
+    }
+
+    serde_json::from_slice::<PhaseProbeEnvelope>(encoded).is_ok_and(|envelope| {
+        !crate::store::phase_is_census_live(DetachedJobPhase::from(
+            envelope.job.machine_state.lifecycle_phase,
+        ))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -349,17 +488,20 @@ impl DetachedJobStore for SqliteDetachedJobStore {
             }
             let encoded = encode_job(&job)?;
             let pending = has_pending_outbox(&job);
+            let census_live = crate::store::job_is_census_live(&job);
             let revision = revision_bytes(job.revision);
             tx.execute(
                 "INSERT INTO detached_jobs
-                    (job_id, realm_id, submission_key, revision, has_pending_outbox, job_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (job_id, realm_id, submission_key, revision, has_pending_outbox,
+                     census_live, job_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     job.job_id.as_str(),
                     job.spec.realm_id,
                     job.spec.submission_key.as_str(),
                     revision.as_slice(),
                     pending,
+                    census_live,
                     encoded,
                 ],
             )
@@ -400,12 +542,14 @@ impl DetachedJobStore for SqliteDetachedJobStore {
             replacement.revision = next_revision(expected_revision)?;
             let encoded = encode_job(&replacement)?;
             let pending = has_pending_outbox(&replacement);
+            let census_live = crate::store::job_is_census_live(&replacement);
             let replacement_revision = revision_bytes(replacement.revision);
             let expected_revision_bytes = revision_bytes(expected_revision);
             let changed = tx
                 .execute(
                     "UPDATE detached_jobs
-                        SET revision = ?2, has_pending_outbox = ?3, job_json = ?4
+                        SET revision = ?2, has_pending_outbox = ?3, job_json = ?4,
+                            census_live = ?6
                       WHERE job_id = ?1 AND revision = ?5",
                     params![
                         replacement.job_id.as_str(),
@@ -413,6 +557,7 @@ impl DetachedJobStore for SqliteDetachedJobStore {
                         pending,
                         encoded,
                         expected_revision_bytes.as_slice(),
+                        census_live,
                     ],
                 )
                 .map_err(raw_sqlite_error)?;
@@ -501,12 +646,14 @@ impl DetachedJobStore for SqliteDetachedJobStore {
 
             let encoded_job = encode_job(&replacement)?;
             let pending = has_pending_outbox(&replacement);
+            let census_live = crate::store::job_is_census_live(&replacement);
             let replacement_revision = revision_bytes(replacement.revision);
             let expected_revision_bytes = revision_bytes(expected_revision);
             let changed = tx
                 .execute(
                     "UPDATE detached_jobs
-                        SET revision = ?2, has_pending_outbox = ?3, job_json = ?4
+                        SET revision = ?2, has_pending_outbox = ?3, job_json = ?4,
+                            census_live = ?6
                       WHERE job_id = ?1 AND revision = ?5",
                     params![
                         replacement.job_id.as_str(),
@@ -514,6 +661,7 @@ impl DetachedJobStore for SqliteDetachedJobStore {
                         pending,
                         encoded_job,
                         expected_revision_bytes.as_slice(),
+                        census_live,
                     ],
                 )
                 .map_err(raw_sqlite_error)?;
@@ -560,7 +708,7 @@ impl DetachedJobStore for SqliteDetachedJobStore {
             let mut statement = conn
                 .prepare(
                     "SELECT job_id, realm_id, submission_key, revision,
-                            has_pending_outbox, job_json
+                            has_pending_outbox, census_live, job_json
                        FROM detached_jobs
                       WHERE has_pending_outbox = 1
                       ORDER BY job_id",
@@ -597,7 +745,7 @@ impl DetachedJobStore for SqliteDetachedJobStore {
             let mut statement = conn
                 .prepare(
                     "SELECT job_id, realm_id, submission_key, revision,
-                            has_pending_outbox, job_json
+                            has_pending_outbox, census_live, job_json
                        FROM detached_jobs
                       WHERE realm_id = ?1
                       ORDER BY job_id",
@@ -629,7 +777,7 @@ impl DetachedJobStore for SqliteDetachedJobStore {
             let mut statement = conn
                 .prepare(
                     "SELECT job_id, realm_id, submission_key, revision,
-                            has_pending_outbox, job_json
+                            has_pending_outbox, census_live, job_json
                        FROM detached_jobs
                       ORDER BY job_id
                       LIMIT ?1",
@@ -644,6 +792,98 @@ impl DetachedJobStore for SqliteDetachedJobStore {
         })
     }
 
+    /// Live rows for this realm, off the partial index.
+    ///
+    /// `census_live = 1` is written verbatim so SQLite may use
+    /// `idx_detached_jobs_census_live`, which indexes only live rows. The
+    /// index therefore stays proportional to outstanding work rather than to
+    /// history, which is the property that keeps this query from degrading the
+    /// way the old whole-table window did.
+    async fn list_census_candidates(
+        &self,
+        realm_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredJob>, DetachedJobError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.with_connection(|conn| {
+            let bounded = i64::try_from(limit).unwrap_or(i64::MAX);
+            let mut jobs = Vec::new();
+            match realm_id {
+                Some(realm_id) => {
+                    let mut statement = conn
+                        .prepare(
+                            "SELECT job_id, realm_id, submission_key, revision,
+                                    has_pending_outbox, census_live, job_json
+                               FROM detached_jobs
+                              WHERE census_live = 1 AND realm_id = ?1
+                              ORDER BY job_id
+                              LIMIT ?2",
+                        )
+                        .map_err(raw_sqlite_error)?;
+                    let mut rows = statement
+                        .query(params![realm_id, bounded])
+                        .map_err(raw_sqlite_error)?;
+                    while let Some(row) = rows.next().map_err(raw_sqlite_error)? {
+                        jobs.push(decode_job_row(row)?);
+                    }
+                }
+                None => {
+                    let mut statement = conn
+                        .prepare(
+                            "SELECT job_id, realm_id, submission_key, revision,
+                                    has_pending_outbox, census_live, job_json
+                               FROM detached_jobs
+                              WHERE census_live = 1
+                              ORDER BY job_id
+                              LIMIT ?1",
+                        )
+                        .map_err(raw_sqlite_error)?;
+                    let mut rows = statement.query([bounded]).map_err(raw_sqlite_error)?;
+                    while let Some(row) = rows.next().map_err(raw_sqlite_error)? {
+                        jobs.push(decode_job_row(row)?);
+                    }
+                }
+            }
+            Ok(jobs)
+        })
+    }
+
+    /// One indexed aggregate over `idx_detached_jobs_pending_outbox`.
+    ///
+    /// `has_pending_outbox` leads the index, so the `= 1` predicate is a range
+    /// scan over pending rows only and `realm_id` filters from the row. No
+    /// document is decoded, no window is applied, and no lifecycle phase is
+    /// consulted - a terminal job holding an unapplied terminal delivery is
+    /// precisely what this must count.
+    async fn count_pending_outbox_jobs(
+        &self,
+        realm_id: Option<&str>,
+    ) -> Result<u64, DetachedJobError> {
+        self.with_connection(|conn| {
+            let count: i64 = match realm_id {
+                Some(realm_id) => conn.query_row(
+                    "SELECT COUNT(*) FROM detached_jobs
+                      WHERE has_pending_outbox = 1 AND realm_id = ?1",
+                    [realm_id],
+                    |row| row.get(0),
+                ),
+                None => conn.query_row(
+                    "SELECT COUNT(*) FROM detached_jobs WHERE has_pending_outbox = 1",
+                    [],
+                    |row| row.get(0),
+                ),
+            }
+            .map_err(raw_sqlite_error)?;
+            u64::try_from(count).map_err(|_| {
+                DetachedJobError::Store(format!(
+                    "pending outbox count {count} is not a valid population"
+                ))
+            })
+        })
+    }
+
     fn is_persistent(&self) -> bool {
         true
     }
@@ -651,7 +891,8 @@ impl DetachedJobStore for SqliteDetachedJobStore {
 
 fn select_by_id(conn: &Connection, job_id: &JobId) -> Result<Option<StoredJob>, DetachedJobError> {
     conn.query_row(
-        "SELECT job_id, realm_id, submission_key, revision, has_pending_outbox, job_json
+        "SELECT job_id, realm_id, submission_key, revision, has_pending_outbox, census_live,
+                job_json
            FROM detached_jobs
           WHERE job_id = ?1",
         [job_id.as_str()],
@@ -669,7 +910,8 @@ fn select_by_submission(
     submission_key: &crate::JobSubmissionKey,
 ) -> Result<Option<StoredJob>, DetachedJobError> {
     conn.query_row(
-        "SELECT job_id, realm_id, submission_key, revision, has_pending_outbox, job_json
+        "SELECT job_id, realm_id, submission_key, revision, has_pending_outbox, census_live,
+                job_json
            FROM detached_jobs
           WHERE realm_id = ?1 AND submission_key = ?2",
         params![realm_id, submission_key.as_str()],
@@ -739,7 +981,7 @@ fn select_predicate_delivery_receipt(
     Ok(Some(receipt))
 }
 
-type EncodedJobRow = (String, String, String, Vec<u8>, bool, Vec<u8>);
+type EncodedJobRow = (String, String, String, Vec<u8>, bool, bool, Vec<u8>);
 
 fn decode_job_row_sql(row: &rusqlite::Row<'_>) -> Result<EncodedJobRow, rusqlite::Error> {
     Ok((
@@ -748,7 +990,8 @@ fn decode_job_row_sql(row: &rusqlite::Row<'_>) -> Result<EncodedJobRow, rusqlite
         row.get(2)?,
         row.get(3)?,
         row.get(4)?,
-        row.get::<_, meerkat_sqlite::JsonColumnBytes>(5)?
+        row.get(5)?,
+        row.get::<_, meerkat_sqlite::JsonColumnBytes>(6)?
             .into_bytes(),
     ))
 }
@@ -758,7 +1001,7 @@ fn decode_job_row(row: &rusqlite::Row<'_>) -> Result<StoredJob, DetachedJobError
 }
 
 fn decode_checked_row(
-    (job_id, realm_id, submission_key, encoded_revision, pending, encoded): EncodedJobRow,
+    (job_id, realm_id, submission_key, encoded_revision, pending, census_live, encoded): EncodedJobRow,
 ) -> Result<StoredJob, DetachedJobError> {
     let revision = revision_from_bytes(&encoded_revision)?;
     let envelope: StoredJobEnvelope = serde_json::from_slice(&encoded)
@@ -775,6 +1018,12 @@ fn decode_checked_row(
         || job.spec.submission_key.as_str() != submission_key
         || job.revision != revision
         || has_pending_outbox(&job) != pending
+        // Fail closed on a stale census projection. A row whose column says
+        // "settled" while its document says otherwise is invisible to the
+        // health window, which is the exact silence this projection exists to
+        // end - so it must surface as an error on any read that touches the
+        // row rather than as a quietly missing census entry.
+        || crate::store::job_is_census_live(&job) != census_live
     {
         return Err(DetachedJobError::Store(format!(
             "detached job row columns disagree with encoded job {job_id}"
@@ -1177,6 +1426,9 @@ impl TryFrom<PersistedJobOutboxEntry> for JobOutboxEntry {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use super::{JOBS_DOMAIN, PersistedPhase};
+    use crate::machines::detached_job::DetachedJobPhase;
+
     #[test]
     fn revision_encoding_round_trips_the_full_u64_domain() {
         for revision in [1, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
@@ -1185,5 +1437,229 @@ mod tests {
                 revision
             );
         }
+    }
+
+    /// Build a v3 file: the released shape a deployed store is actually in.
+    ///
+    /// Hand-rolled rather than produced by opening the store, because opening
+    /// it with this binary would migrate it to v4 and there would be nothing
+    /// left to test.
+    fn released_v3_database(rows: &[(&str, &str, PersistedPhase)]) -> rusqlite::Connection {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open");
+        let tx = conn.transaction().expect("tx");
+        super::build_released_jobs_v3_schema(&tx).expect("v3 catalog");
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS main.meerkat_schema (
+                 domain TEXT PRIMARY KEY,
+                 version INTEGER NOT NULL
+             )",
+        )
+        .expect("ledger table");
+        tx.execute(
+            "INSERT INTO meerkat_schema (domain, version) VALUES (?1, 3)",
+            [JOBS_DOMAIN.name],
+        )
+        .expect("stamp v3");
+        for (job_id, realm_id, phase) in rows {
+            let document = serde_json::json!({
+                "format_version": 1,
+                "job": { "machine_state": { "lifecycle_phase": phase } },
+            });
+            tx.execute(
+                "INSERT INTO detached_jobs
+                    (job_id, realm_id, submission_key, revision, has_pending_outbox, job_json)
+                 VALUES (?1, ?2, ?1, ?3, 0, ?4)",
+                rusqlite::params![
+                    job_id,
+                    realm_id,
+                    super::revision_bytes(1).as_slice(),
+                    serde_json::to_vec(&document).expect("encode"),
+                ],
+            )
+            .expect("insert v3 row");
+        }
+        tx.commit().expect("commit");
+        conn
+    }
+
+    fn census_live_column(conn: &rusqlite::Connection, job_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT census_live FROM detached_jobs WHERE job_id = ?1",
+            [job_id],
+            |row| row.get(0),
+        )
+        .expect("census_live")
+    }
+
+    /// The migration classifies rows it already had, and the DENOMINATOR is
+    /// part of the evidence.
+    ///
+    /// A backfill that scanned zero rows would leave every deployed store as
+    /// blind as before while reporting a clean migration, so the assertions
+    /// below pin how many rows existed, how many were marked settled, and how
+    /// many stayed live. Settled rows are never rewritten again - if this pass
+    /// does not classify them, nothing ever will.
+    #[test]
+    fn migrating_a_released_v3_store_classifies_every_existing_row() {
+        let mut conn = released_v3_database(&[
+            ("job_a_succeeded", "realm-a", PersistedPhase::Succeeded),
+            ("job_b_failed", "realm-a", PersistedPhase::Failed),
+            ("job_c_cancelled", "realm-a", PersistedPhase::Cancelled),
+            ("job_d_worker_lost", "realm-a", PersistedPhase::WorkerLost),
+            ("job_e_running", "realm-a", PersistedPhase::Running),
+            (
+                "job_f_needs_attention",
+                "realm-a",
+                PersistedPhase::NeedsAttention,
+            ),
+            ("job_g_queued", "realm-b", PersistedPhase::Queued),
+        ]);
+        let scanned: i64 = conn
+            .query_row("SELECT COUNT(*) FROM detached_jobs", [], |row| row.get(0))
+            .expect("row denominator");
+        assert_eq!(scanned, 7, "denominator: the rows the backfill must read");
+
+        let report =
+            meerkat_sqlite::apply_domain_migrations(&mut conn, &JOBS_DOMAIN).expect("migrate v3");
+        assert_eq!(report.from_version, 3);
+        assert_eq!(report.to_version, 4);
+
+        let settled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM detached_jobs WHERE census_live = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("settled count");
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM detached_jobs WHERE census_live = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("live count");
+        assert_eq!(settled, 4, "the four settled phases must be marked");
+        assert_eq!(live, 3, "and only those four");
+
+        // Named, not just counted: NeedsAttention is the row a machine
+        // terminality check would have wrongly hidden.
+        assert_eq!(census_live_column(&conn, "job_a_succeeded"), 0);
+        assert_eq!(census_live_column(&conn, "job_d_worker_lost"), 0);
+        assert_eq!(census_live_column(&conn, "job_e_running"), 1);
+        assert_eq!(census_live_column(&conn, "job_f_needs_attention"), 1);
+        assert_eq!(census_live_column(&conn, "job_g_queued"), 1);
+    }
+
+    /// A v3 file whose owned catalog was tampered with is refused.
+    ///
+    /// The predecessor verifier is only worth registering if it can say no; a
+    /// verifier that passes everything is the generation theater this repo
+    /// keeps finding.
+    #[test]
+    fn a_tampered_v3_catalog_is_refused_rather_than_migrated() {
+        let mut conn = released_v3_database(&[]);
+        conn.execute_batch("DROP INDEX idx_detached_jobs_pending_outbox")
+            .expect("tamper");
+        let error = meerkat_sqlite::apply_domain_migrations(&mut conn, &JOBS_DOMAIN)
+            .expect_err("a v3 catalog missing an owned index is not a v3 catalog");
+        assert!(
+            format!("{error}").contains("jobs"),
+            "the refusal must name the domain: {error}"
+        );
+    }
+
+    /// The partial index is actually used by the census query.
+    ///
+    /// An index the planner ignores is decoration: the whole point of
+    /// `WHERE census_live = 1` is that the scan is proportional to outstanding
+    /// work rather than to retained history.
+    #[test]
+    fn the_census_query_uses_the_live_partial_index() {
+        let mut conn = released_v3_database(&[]);
+        meerkat_sqlite::apply_domain_migrations(&mut conn, &JOBS_DOMAIN).expect("migrate");
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT job_id, realm_id, submission_key, revision,
+                        has_pending_outbox, census_live, job_json
+                   FROM detached_jobs
+                  WHERE census_live = 1 AND realm_id = ?1
+                  ORDER BY job_id
+                  LIMIT ?2",
+                rusqlite::params!["realm-a", 10_i64],
+                |row| row.get(3),
+            )
+            .expect("query plan");
+        assert!(
+            plan.contains("idx_detached_jobs_census_live"),
+            "census query must ride the live partial index, got: {plan}"
+        );
+    }
+
+    /// The column projection and the classification cannot disagree.
+    ///
+    /// Both directions are pinned so a future phase cannot be added to one
+    /// side only: the `match` here is exhaustive, so a new variant fails to
+    /// compile until someone classifies it.
+    #[test]
+    fn every_phase_has_one_census_classification() {
+        for phase in [
+            DetachedJobPhase::Unsubmitted,
+            DetachedJobPhase::Queued,
+            DetachedJobPhase::Claimed,
+            DetachedJobPhase::Running,
+            DetachedJobPhase::WaitingExternal,
+            DetachedJobPhase::LossObserved,
+            DetachedJobPhase::RetryScheduled,
+            DetachedJobPhase::Succeeded,
+            DetachedJobPhase::Failed,
+            DetachedJobPhase::Cancelled,
+            DetachedJobPhase::WorkerLost,
+            DetachedJobPhase::NeedsAttention,
+        ] {
+            let expected = match phase {
+                DetachedJobPhase::Succeeded
+                | DetachedJobPhase::Failed
+                | DetachedJobPhase::Cancelled
+                | DetachedJobPhase::WorkerLost => false,
+                DetachedJobPhase::Unsubmitted
+                | DetachedJobPhase::Queued
+                | DetachedJobPhase::Claimed
+                | DetachedJobPhase::Running
+                | DetachedJobPhase::WaitingExternal
+                | DetachedJobPhase::LossObserved
+                | DetachedJobPhase::RetryScheduled
+                | DetachedJobPhase::NeedsAttention => true,
+            };
+            assert_eq!(
+                crate::store::phase_is_census_live(phase),
+                expected,
+                "{phase:?} is classified inconsistently"
+            );
+            let document = serde_json::json!({
+                "format_version": 1,
+                "job": { "machine_state": { "lifecycle_phase": PersistedPhase::from(phase) } },
+            });
+            assert_eq!(
+                super::probe_settled_phase(&serde_json::to_vec(&document).expect("encode")),
+                !expected,
+                "the migration probe disagrees with the classification for {phase:?}"
+            );
+        }
+    }
+
+    /// A document the probe cannot read leaves the row LIVE.
+    ///
+    /// The safe direction, stated as a test: an unreadable row costs window
+    /// space, while guessing "settled" would hide a job that may be wedged.
+    #[test]
+    fn an_undecodable_document_is_left_live() {
+        assert!(!super::probe_settled_phase(b"not json at all"));
+        assert!(!super::probe_settled_phase(
+            br#"{"format_version":1,"job":{}}"#
+        ));
+        assert!(!super::probe_settled_phase(
+            br#"{"format_version":1,"job":{"machine_state":{"lifecycle_phase":"invented"}}}"#
+        ));
     }
 }

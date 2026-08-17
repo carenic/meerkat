@@ -73904,12 +73904,98 @@
     "title": "JobExecutionActivity",
     "type": "object"
   },
+  "JobHealthCoverage": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Whether the census behind a [`JobHealthSummary`] read every row it needed.\n\n`complete` means every candidate row was read and the phase counts are\nexact. `truncated` means the scan window filled at `scanned` rows out of an\nunknown larger population: the phase counts are a lower bound over the rows\nthat were read, and `status` is `unreadable`.",
+    "oneOf": [
+      {
+        "properties": {
+          "kind": {
+            "const": "complete",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "kind": {
+            "const": "truncated",
+            "type": "string"
+          },
+          "limit": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scanned": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "scanned",
+          "limit"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "JobHealthCoverage"
+  },
   "JobHealthSummary": {
     "$defs": {
+      "JobHealthCoverage": {
+        "description": "Whether the census behind a [`JobHealthSummary`] read every row it needed.\n\n`complete` means every candidate row was read and the phase counts are\nexact. `truncated` means the scan window filled at `scanned` rows out of an\nunknown larger population: the phase counts are a lower bound over the rows\nthat were read, and `status` is `unreadable`.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "complete",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "truncated",
+                "type": "string"
+              },
+              "limit": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "scanned": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "scanned",
+              "limit"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "JobHealthStatus": {
+        "description": "Rung of a job-health census.\n\n`unreadable` is not a rung between `ok` and `degraded`: it says the census\ndid not establish anything, because a read failed or the scan stopped at\nits window. It is distinct from `degraded` on purpose - `degraded` asserts\nthat some job is wedged, and a scan that never reached the rows observed no\nsuch thing, so an operator paging on `degraded` can trust that something\nwas actually seen.",
         "enum": [
           "ok",
-          "degraded"
+          "degraded",
+          "unreadable"
         ],
         "type": "string"
       }
@@ -73921,12 +74007,16 @@
         "minimum": 0,
         "type": "integer"
       },
-      "delivery_backlog": {
+      "coverage": {
+        "$ref": "#/$defs/JobHealthCoverage"
+      },
+      "needs_attention": {
         "format": "uint64",
         "minimum": 0,
         "type": "integer"
       },
-      "needs_attention": {
+      "pending_outbox_jobs": {
+        "description": "Jobs holding at least one unapplied outbox entry, in this realm.\n\nExact and uncapped, and counted in JOBS rather than entries. Kept\nseparate from `runtime_inbox_backlog` because the two name different\nwedges: this one is a job whose delivery was never handed to a runtime,\nthat one is a delivery a runtime accepted and never drained.",
         "format": "uint64",
         "minimum": 0,
         "type": "integer"
@@ -73937,6 +74027,12 @@
         "type": "integer"
       },
       "running": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "runtime_inbox_backlog": {
+        "description": "Committed-but-undrained runtime deliveries in this host's store.\n\nHost-store scoped, not realm scoped: one durable runtime store serves\nevery session the host built, including sessions under other logical\nrealm ids, and a runtime id carries no realm.",
         "format": "uint64",
         "minimum": 0,
         "type": "integer"
@@ -73957,7 +74053,9 @@
       "awaiting_members",
       "stale_leases",
       "needs_attention",
-      "delivery_backlog"
+      "pending_outbox_jobs",
+      "runtime_inbox_backlog",
+      "coverage"
     ],
     "title": "JobHealthSummary",
     "type": "object"
@@ -74756,10 +74854,53 @@
   },
   "JobsHealthResult": {
     "$defs": {
+      "JobHealthCoverage": {
+        "description": "Whether the census behind a [`JobHealthSummary`] read every row it needed.\n\n`complete` means every candidate row was read and the phase counts are\nexact. `truncated` means the scan window filled at `scanned` rows out of an\nunknown larger population: the phase counts are a lower bound over the rows\nthat were read, and `status` is `unreadable`.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "complete",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "truncated",
+                "type": "string"
+              },
+              "limit": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "scanned": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "scanned",
+              "limit"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "JobHealthStatus": {
+        "description": "Rung of a job-health census.\n\n`unreadable` is not a rung between `ok` and `degraded`: it says the census\ndid not establish anything, because a read failed or the scan stopped at\nits window. It is distinct from `degraded` on purpose - `degraded` asserts\nthat some job is wedged, and a scan that never reached the rows observed no\nsuch thing, so an operator paging on `degraded` can trust that something\nwas actually seen.",
         "enum": [
           "ok",
-          "degraded"
+          "degraded",
+          "unreadable"
         ],
         "type": "string"
       },
@@ -74770,12 +74911,16 @@
             "minimum": 0,
             "type": "integer"
           },
-          "delivery_backlog": {
+          "coverage": {
+            "$ref": "#/$defs/JobHealthCoverage"
+          },
+          "needs_attention": {
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
           },
-          "needs_attention": {
+          "pending_outbox_jobs": {
+            "description": "Jobs holding at least one unapplied outbox entry, in this realm.\n\nExact and uncapped, and counted in JOBS rather than entries. Kept\nseparate from `runtime_inbox_backlog` because the two name different\nwedges: this one is a job whose delivery was never handed to a runtime,\nthat one is a delivery a runtime accepted and never drained.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
@@ -74786,6 +74931,12 @@
             "type": "integer"
           },
           "running": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "runtime_inbox_backlog": {
+            "description": "Committed-but-undrained runtime deliveries in this host's store.\n\nHost-store scoped, not realm scoped: one durable runtime store serves\nevery session the host built, including sessions under other logical\nrealm ids, and a runtime id carries no realm.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
@@ -74806,7 +74957,9 @@
           "awaiting_members",
           "stale_leases",
           "needs_attention",
-          "delivery_backlog"
+          "pending_outbox_jobs",
+          "runtime_inbox_backlog",
+          "coverage"
         ],
         "type": "object"
       }

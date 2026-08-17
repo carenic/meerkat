@@ -944,7 +944,19 @@ export interface JobDeliveryKindEvent {
 
 export type JobDeliveryKind = JobDeliveryKindRecord | JobDeliveryKindNotification | JobDeliveryKindEvent;
 
-export type JobHealthStatus = "ok" | "degraded";
+export interface JobHealthCoverageComplete {
+  kind: "complete";
+}
+
+export interface JobHealthCoverageTruncated {
+  kind: "truncated";
+  limit: number;
+  scanned: number;
+}
+
+export type JobHealthCoverage = JobHealthCoverageComplete | JobHealthCoverageTruncated;
+
+export type JobHealthStatus = "ok" | "degraded" | "unreadable";
 
 export type JobIdempotencyScope = "tool_call" | "interaction_and_arguments" | "host_semantic_key";
 
@@ -994,10 +1006,12 @@ export interface JobAttemptAuthority {
 
 export interface JobHealthSummary {
   awaiting_members: number;
-  delivery_backlog: number;
+  coverage: JobHealthCoverage;
   needs_attention: number;
+  pending_outbox_jobs: number;
   queued: number;
   running: number;
+  runtime_inbox_backlog: number;
   stale_leases: number;
   status: JobHealthStatus;
 }

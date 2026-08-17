@@ -77,6 +77,7 @@ JOBS_RPC_CONTRACT_HELPER_TYPES = [
 JOBS_RPC_CONTRACT_ALIAS_TYPES = [
     "CallbackToolExecution",
     "JobDeliveryKind",
+    "JobHealthCoverage",
     "JobHealthStatus",
     "JobIdempotencyScope",
     "JobPhase",

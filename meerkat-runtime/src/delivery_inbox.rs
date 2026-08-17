@@ -546,6 +546,45 @@ impl RuntimeDeliveryInbox {
         )))
     }
 
+    /// Total committed-but-unapplied deliveries across every runtime in this
+    /// store.
+    ///
+    /// Scope is the durable runtime store, which is one file per realm ROOT.
+    /// One such store serves every session the host built, including sessions
+    /// built under another logical realm id (mob members build under
+    /// `mob.<mob_id>`), and no runtime id carries a realm. So this is a
+    /// host-store total and cannot be narrowed to a logical realm; a caller
+    /// that needs a realm-scoped answer does not have one available here and
+    /// must not pretend otherwise. Over-inclusion is the safe direction: every
+    /// counted row is a real undrained delivery in this host.
+    ///
+    /// Uncapped by construction: the population is one row per runtime that
+    /// ever received a delivery, and a cap would hide exactly the backlog the
+    /// caller is asking about.
+    pub async fn pending_delivery_total(&self) -> Result<u64, RuntimeDeliveryError> {
+        let authorities = self.store.list_runtime_delivery_authorities().await?;
+        let mut total = 0_u64;
+        for (runtime_id, record) in authorities {
+            let authority = decode_authority(&record)?;
+            let state = authority.state();
+            // The machine declares applied_cursor <= next_sequence. A store
+            // that violates it is corrupt, and a saturating subtraction would
+            // answer 0 - substituting "nothing pending" for "this file is
+            // broken", which is the one answer that must never be fabricated.
+            let pending = state
+                .next_sequence
+                .checked_sub(state.applied_cursor)
+                .ok_or_else(|| {
+                    RuntimeDeliveryError::Corrupt(format!(
+                        "runtime {runtime_id} applied cursor {} is ahead of committed sequence {}",
+                        state.applied_cursor, state.next_sequence
+                    ))
+                })?;
+            total = total.saturating_add(pending);
+        }
+        Ok(total)
+    }
+
     pub async fn applied_cursor(
         &self,
         runtime_id: &LogicalRuntimeId,

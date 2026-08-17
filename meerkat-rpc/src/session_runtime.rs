@@ -4972,38 +4972,22 @@ impl SessionRuntime {
         Ok(summary)
     }
 
+    /// Committed-but-undrained runtime deliveries across this host's store.
+    ///
+    /// Asked of the delivery authority directly rather than of a session set
+    /// derived from job rows. The derived set MISSES: job rows are read
+    /// through a bounded window ordered by job id, so a session whose jobs
+    /// aged out of that window still holds its undrained inbox rows and used
+    /// to contribute nothing - accepted-and-undrained being the field symptom
+    /// this probe exists to catch.
+    ///
+    /// The answer is host-store scoped rather than realm scoped; see
+    /// [`meerkat_runtime::RuntimeDeliveryInbox::pending_delivery_total`].
     pub async fn runtime_job_delivery_backlog(&self) -> Result<u64, String> {
-        let realm_id = self.realm_id().map(|realm_id| realm_id.to_string());
-        let jobs = self
-            .job_store
-            .list_all(10_000)
+        self.runtime_delivery_inbox
+            .pending_delivery_total()
             .await
-            .map_err(|error| error.to_string())?;
-        let sessions = jobs
-            .into_iter()
-            .filter(|job| {
-                realm_id
-                    .as_deref()
-                    .is_none_or(|realm_id| job.spec.realm_id == realm_id)
-            })
-            .map(|job| {
-                let session_id = job.spec.origin_session_id;
-                (session_id.to_string(), session_id)
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut total = 0_u64;
-        for session_id in sessions.into_values() {
-            let pending = self
-                .runtime_delivery_inbox
-                .list_pending(
-                    &meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
-                    10_000,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            total = total.saturating_add(u64::try_from(pending.len()).unwrap_or(u64::MAX));
-        }
-        Ok(total)
+            .map_err(|error| error.to_string())
     }
 
     /// Build the realm-scoped WorkGraph service.

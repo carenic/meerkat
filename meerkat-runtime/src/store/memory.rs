@@ -2307,6 +2307,19 @@ impl RuntimeStore for InMemoryRuntimeStore {
         Ok(RuntimeDeliveryAuthorityCasOutcome::Applied(replacement))
     }
 
+    async fn list_runtime_delivery_authorities(
+        &self,
+    ) -> Result<Vec<(LogicalRuntimeId, RuntimeDeliveryAuthorityRecord)>, RuntimeStoreError> {
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .runtime_delivery_authority
+            .iter()
+            .map(|(runtime_id, record)| (LogicalRuntimeId::new(runtime_id.clone()), record.clone()))
+            .collect())
+    }
+
     async fn list_runtime_delivery_records(
         &self,
         runtime_id: &LogicalRuntimeId,
