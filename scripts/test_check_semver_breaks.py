@@ -96,6 +96,115 @@ class ReportParsingTests(unittest.TestCase):
             gate.strip_location("type X no longer derives Copy, in /repo/a.rs:425"),
             "type X no longer derives Copy",
         )
+        self.assertEqual(
+            gate.strip_location(
+                "JobHealthSnapshot::is_degraded, previously in file /repo/types.rs:761"
+            ),
+            "JobHealthSnapshot::is_degraded",
+        )
+        self.assertEqual(
+            gate.strip_location(
+                "trait method meerkat_jobs::DetachedJobStore::count_pending_outbox_jobs "
+                "in file /repo/store.rs:167"
+            ),
+            "trait method meerkat_jobs::DetachedJobStore::count_pending_outbox_jobs",
+        )
+
+    def test_extracts_every_message_shape_observed_in_the_0_8_24_report(self) -> None:
+        cases = [
+            (
+                "enum_no_repr_variant_discriminant_changed",
+                "variant AgentEvent::ToolExecutionStarted 19 -> 21",
+                ("AgentEvent", "ToolExecutionStarted"),
+            ),
+            (
+                "enum_variant_added",
+                "MeerkatMachineInputVariant::ResolveInputPublicLifecycle moved from "
+                "position 99 to 101",
+                ("MeerkatMachineInputVariant", "ResolveInputPublicLifecycle"),
+            ),
+            (
+                "enum_variant_missing",
+                "variant RegistrationOutcome::ReboundOwnName, previously in file "
+                "/Users/luka/Library/Caches/meerkat-comms-0.8.23/src/inproc.rs:110",
+                ("RegistrationOutcome", "ReboundOwnName"),
+            ),
+            (
+                "inherent_method_missing",
+                "JobHealthSnapshot::is_degraded, previously in file "
+                "/Users/luka/Library/Caches/meerkat-jobs-0.8.23/src/types.rs:761",
+                ("JobHealthSnapshot", "is_degraded"),
+            ),
+            (
+                "struct_pub_field_missing",
+                "field delivery_backlog of struct JobHealthSummary, previously in file "
+                "/Users/luka/Library/Caches/meerkat-contracts-0.8.23/src/wire/jobs.rs:293",
+                ("JobHealthSummary", "delivery_backlog"),
+            ),
+            (
+                "trait_method_added",
+                "trait method meerkat_jobs::DetachedJobStore::count_pending_outbox_jobs "
+                "in file /Users/luka/meerkat/meerkat-jobs/src/store.rs:167",
+                ("DetachedJobStore", "count_pending_outbox_jobs"),
+            ),
+        ]
+        for lint_id, raw_item, expected in cases:
+            with self.subTest(lint_id=lint_id):
+                symbols, structural = gate.extract_symbols(
+                    lint_id, gate.strip_location(raw_item)
+                )
+                self.assertTrue(structural)
+                self.assertEqual(symbols, expected)
+
+    def test_observed_message_shapes_still_require_the_changed_member(self) -> None:
+        cases = [
+            (
+                "enum_no_repr_variant_discriminant_changed",
+                "variant AgentEvent::ToolExecutionStarted 19 -> 21",
+            ),
+            (
+                "enum_variant_added",
+                "MeerkatMachineInputVariant::ResolveInputPublicLifecycle moved from "
+                "position 99 to 101",
+            ),
+            (
+                "enum_variant_missing",
+                "variant RegistrationOutcome::ReboundOwnName, previously in file "
+                "/repo/inproc.rs:110",
+            ),
+            (
+                "inherent_method_missing",
+                "JobHealthSnapshot::is_degraded, previously in file /repo/types.rs:761",
+            ),
+            (
+                "struct_pub_field_missing",
+                "field delivery_backlog of struct JobHealthSummary, previously in file "
+                "/repo/jobs.rs:293",
+            ),
+            (
+                "trait_method_added",
+                "trait method meerkat_jobs::DetachedJobStore::count_pending_outbox_jobs "
+                "in file /repo/store.rs:167",
+            ),
+        ]
+        for lint_id, raw_item in cases:
+            with self.subTest(lint_id=lint_id):
+                item = gate.strip_location(raw_item)
+                symbols, structural = gate.extract_symbols(lint_id, item)
+                self.assertTrue(structural)
+                owner, member = symbols
+                parsed = gate.ReportParse(
+                    findings=[gate.Finding(lint_id, "crate", item, symbols, structural)]
+                )
+                section = gate.Section(
+                    "## [9.9.9] - 2026-01-01",
+                    "9.9.9",
+                    " - 2026-01-01",
+                    f"\n### Breaking\n\n- `{owner}` changed.\n",
+                )
+                errors = gate.check_named(parsed, section)
+                self.assertEqual(len(errors), 1)
+                self.assertIn(f"`{member}`", errors[0])
 
     def test_single_colon_variant_path_splits(self) -> None:
         symbols, structural = gate.extract_symbols(

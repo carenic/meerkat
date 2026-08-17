@@ -53,7 +53,11 @@ SUMMARY_RE = re.compile(r"^\s+Summary\b")
 FAILED_IN_RE = re.compile(r"^Failed in:\s*$")
 ITEM_RE = re.compile(r"^  (\S.*)$")
 # Every "Failed in:" line ends with the source location the break was found at.
-LOCATION_SUFFIX_RE = re.compile(r",?\s+in\s+\S+:\d+\s*$")
+# cargo-semver-checks uses three observed spellings: `in <path>`,
+# `in file <path>`, and `, previously in file <path>`.
+LOCATION_SUFFIX_RE = re.compile(
+    r"(?:,\s+previously\s+in|,?\s+in)(?:\s+file)?\s+\S+:\d+\s*$"
+)
 
 PASCAL_CASE_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]*\b")
 
@@ -104,7 +108,7 @@ class CrateScope:
 
 
 def strip_location(item: str) -> str:
-    """Drop the trailing ` in <path>:<line>` the tool appends to every item."""
+    """Drop the trailing source location cargo-semver-checks appends."""
     return LOCATION_SUFFIX_RE.sub("", item).strip()
 
 
@@ -130,9 +134,64 @@ def _symbols_enum_struct_variant_field_added(text: str) -> tuple[str, ...] | Non
 def _symbols_enum_variant_added(text: str) -> tuple[str, ...] | None:
     # variant SqliteStoreError:WalConversionContended (single colon: real output)
     match = re.fullmatch(r"variant\s+([A-Za-z0-9_:]+)", text)
+    if match:
+        return _path_symbols(match.group(1))
+
+    # MeerkatMachineInputVariant::ResolveInputPublicLifecycle moved from
+    # position 99 to 101
+    match = re.fullmatch(
+        r"([A-Za-z0-9_:]+)\s+moved\s+from\s+position\s+\d+\s+to\s+\d+",
+        text,
+    )
+    return _path_symbols(match.group(1)) if match else None
+
+
+def _symbols_enum_no_repr_variant_discriminant_changed(
+    text: str,
+) -> tuple[str, ...] | None:
+    # variant AgentEvent::ToolExecutionStarted 19 -> 21
+    match = re.fullmatch(
+        r"variant\s+([A-Za-z0-9_:]+)\s+\d+\s+->\s+\d+",
+        text,
+    )
+    return _path_symbols(match.group(1)) if match else None
+
+
+def _symbols_enum_variant_missing(text: str) -> tuple[str, ...] | None:
+    # variant RegistrationOutcome::ReboundOwnName
+    match = re.fullmatch(r"variant\s+([A-Za-z0-9_:]+)", text)
+    return _path_symbols(match.group(1)) if match else None
+
+
+def _symbols_path_member(path: str) -> tuple[str, ...] | None:
+    """Return the public owner and final field/method segment of a path."""
+    segments = [seg for seg in re.split(r":+", path) if seg]
+    if len(segments) < 2:
+        return None
+    return _path_symbols("::".join(segments[:-1])) + (segments[-1],)
+
+
+def _symbols_inherent_method_missing(text: str) -> tuple[str, ...] | None:
+    # JobHealthSnapshot::is_degraded
+    match = re.fullmatch(r"([A-Za-z0-9_:]+)", text)
+    return _symbols_path_member(match.group(1)) if match else None
+
+
+def _symbols_struct_pub_field_missing(text: str) -> tuple[str, ...] | None:
+    # field delivery_backlog of struct JobHealthSummary
+    match = re.fullmatch(
+        r"field\s+([A-Za-z0-9_]+)\s+of\s+struct\s+([A-Za-z0-9_:]+)",
+        text,
+    )
     if not match:
         return None
-    return _path_symbols(match.group(1))
+    return _path_symbols(match.group(2)) + (match.group(1),)
+
+
+def _symbols_trait_method_added(text: str) -> tuple[str, ...] | None:
+    # trait method meerkat_jobs::DetachedJobStore::count_pending_outbox_jobs
+    match = re.fullmatch(r"trait\s+method\s+([A-Za-z0-9_:]+)", text)
+    return _symbols_path_member(match.group(1)) if match else None
 
 
 def _symbols_derive_trait_impl_removed(text: str) -> tuple[str, ...] | None:
@@ -148,9 +207,16 @@ def _symbols_derive_trait_impl_removed(text: str) -> tuple[str, ...] | None:
 
 STRUCTURAL_EXTRACTORS = {
     "constructible_struct_adds_field": _symbols_constructible_struct_adds_field,
+    "enum_no_repr_variant_discriminant_changed": (
+        _symbols_enum_no_repr_variant_discriminant_changed
+    ),
     "enum_struct_variant_field_added": _symbols_enum_struct_variant_field_added,
     "enum_variant_added": _symbols_enum_variant_added,
+    "enum_variant_missing": _symbols_enum_variant_missing,
     "derive_trait_impl_removed": _symbols_derive_trait_impl_removed,
+    "inherent_method_missing": _symbols_inherent_method_missing,
+    "struct_pub_field_missing": _symbols_struct_pub_field_missing,
+    "trait_method_added": _symbols_trait_method_added,
 }
 
 
