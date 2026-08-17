@@ -195,7 +195,9 @@ impl DetachedJobService {
         // window never reaches, and it is the one term here that a terminal
         // job still contributes to.
         let pending_outbox_jobs = self.store.count_pending_outbox_jobs(realm_id).await?;
-        let jobs = self.store.list_all(limit).await?;
+        // Realm-filtered and phase-filtered IN THE STORE, so the window is a
+        // bound on live work in this realm rather than on rows-by-primary-key.
+        let jobs = self.store.list_census_candidates(realm_id, limit).await?;
         // A scan that came back full stopped at the window, not at the end of
         // the population. Record that as a fact rather than letting the counts
         // below stand in for a census.
@@ -213,10 +215,7 @@ impl DetachedJobService {
             coverage,
             ..JobHealthSnapshot::default()
         };
-        for job in jobs
-            .into_iter()
-            .filter(|job| realm_id.is_none_or(|realm_id| job.spec.realm_id == realm_id))
-        {
+        for job in jobs {
             let state = &job.machine_state;
             match state.lifecycle_phase {
                 dsl::DetachedJobPhase::Queued | dsl::DetachedJobPhase::RetryScheduled => {

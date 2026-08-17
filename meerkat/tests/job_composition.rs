@@ -463,6 +463,14 @@ impl DetachedJobStore for PausingFirstReadStore {
         self.inner.count_pending_outbox_jobs(realm_id).await
     }
 
+    async fn list_census_candidates(
+        &self,
+        realm_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredJob>, DetachedJobError> {
+        self.inner.list_census_candidates(realm_id, limit).await
+    }
+
     fn is_persistent(&self) -> bool {
         self.inner.is_persistent()
     }

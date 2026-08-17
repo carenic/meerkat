@@ -14,9 +14,9 @@ use std::sync::Arc;
 use meerkat_core::SessionId;
 use meerkat_jobs::{
     AttemptClaim, AttemptWriteAuthority, CanonicalArgumentsHash, DetachedJobService,
-    DetachedJobStore, ExecutionIntentId, InteractionLineageId, JobHealthCoverage, JobHealthReading,
-    JobId, JobResultRef, JobSpec, JobSubmissionKey, RestartClass, RunnerHandleRef, RunnerIdentity,
-    SqliteDetachedJobStore, ToolIdentity, WorkerId,
+    DetachedJobStore, ExecutionIntentId, InteractionLineageId, JobFailureCode, JobHealthCoverage,
+    JobHealthReading, JobId, JobResultRef, JobSpec, JobSubmissionKey, RestartClass,
+    RunnerHandleRef, RunnerIdentity, SqliteDetachedJobStore, ToolIdentity, WorkerId,
 };
 
 fn spec(realm_id: &str, key: &str) -> JobSpec {
@@ -109,10 +109,12 @@ async fn wedged_running_job(
 
 /// A census that stopped at its window has not established `ok`.
 ///
-/// This is the false-green case in its purest form: every row in the store is
-/// finished and drained, so the counts are all zero and the OLD `is_degraded()`
-/// answered `false` - "healthy" - on the strength of a scan that never reached
-/// the end of the population.
+/// The boundary is the assertion: a scan that returns exactly `limit` rows
+/// stopped AT the window and cannot know what is behind it, so `limit` rows is
+/// already truncation, not the last complete reading. The same store read with
+/// one more row of headroom is genuinely healthy - so the difference between
+/// `Unreadable` and `Ok` here is entirely about what was looked at, which is
+/// the distinction the old `is_degraded()` could not express at all.
 #[tokio::test]
 async fn a_window_that_filled_reports_unreadable_rather_than_ok() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -121,7 +123,10 @@ async fn a_window_that_filled_reports_unreadable_rather_than_ok() {
     );
     let service = DetachedJobService::new(store);
     for index in 0..3 {
-        drained_terminal_job(&service, "realm-a", &format!("terminal-{index}")).await;
+        service
+            .submit(spec("realm-a", &format!("queued-{index}")))
+            .await
+            .expect("submit healthy queued job");
     }
 
     let saturated = service
@@ -139,7 +144,7 @@ async fn a_window_that_filled_reports_unreadable_rather_than_ok() {
     assert_eq!(
         saturated.reading(),
         JobHealthReading::Unreadable,
-        "zero counts off a truncated window are not evidence of health"
+        "counts off a truncated window are not evidence of health"
     );
 
     let complete = service
@@ -147,6 +152,7 @@ async fn a_window_that_filled_reports_unreadable_rather_than_ok() {
         .await
         .expect("complete census");
     assert_eq!(complete.coverage, JobHealthCoverage::Complete);
+    assert_eq!(complete.queued, 3);
     assert_eq!(
         complete.reading(),
         JobHealthReading::Ok,
@@ -203,6 +209,10 @@ async fn pending_outbox_is_counted_outside_the_scan_window() {
     }
     terminal_job_with_pending_delivery(&service, "realm-a", "owed-delivery").await;
     terminal_job_with_pending_delivery(&service, "realm-b", "other-realm-owed").await;
+    // Two live rows so the phase window genuinely truncates at limit = 1,
+    // proving the outbox count is taken outside it rather than alongside it.
+    wedged_running_job(&service, "realm-a", "wedged-a", 100).await;
+    wedged_running_job(&service, "realm-a", "wedged-b", 100).await;
 
     assert_eq!(
         store
@@ -227,12 +237,20 @@ async fn pending_outbox_is_counted_outside_the_scan_window() {
         2
     );
 
-    // A window of one row cannot see six rows. The outbox count is taken
-    // outside it and stays exact; only the phase counts are truncated.
+    // A window of one row cannot see both live rows, and the job that owes a
+    // delivery is settled so it is not even a census candidate. The outbox
+    // count is taken outside the window and stays exact either way.
     let health = service
         .health_snapshot_for_realm("realm-a", 1_000, 1)
         .await
         .expect("census");
+    assert_eq!(
+        health.coverage,
+        JobHealthCoverage::Truncated {
+            scanned: 1,
+            limit: 1
+        }
+    );
     assert_eq!(
         health.pending_outbox_jobs, 1,
         "an owed delivery must not depend on the row landing inside the scan window"
@@ -260,6 +278,151 @@ async fn an_owed_delivery_degrades_a_complete_census() {
         .expect("census");
     assert_eq!(health.coverage, JobHealthCoverage::Complete);
     assert_eq!(health.pending_outbox_jobs, 1);
+    assert_eq!(health.reading(), JobHealthReading::Degraded);
+}
+
+/// Settled history does not consume the census window.
+///
+/// This is the defect in its original shape, made order-independent. Job ids
+/// are time-ordered, so the terminal jobs created first sort FIRST under
+/// `ORDER BY job_id`: a window of two rows over the old whole-table scan
+/// returned two settled rows and the wedged job behind them was never seen,
+/// while the census still reported counts. Here the same store with the same
+/// window reads to the end of the LIVE population, so coverage is `Complete`
+/// and the expired lease is found.
+///
+/// The discriminator is deliberately not "did we count the wedge" alone: a
+/// whole-table window would answer `Truncated`/`Unreadable` here, which is
+/// honest but useless. Only a live-scoped window can be both complete and
+/// correct.
+#[tokio::test]
+async fn settled_rows_do_not_crowd_a_wedged_job_out_of_the_window() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(
+        SqliteDetachedJobStore::open(temp.path().join("jobs.sqlite3")).expect("open store"),
+    );
+    let service = DetachedJobService::new(store);
+    for index in 0..6 {
+        drained_terminal_job(&service, "realm-a", &format!("terminal-{index}")).await;
+    }
+    wedged_running_job(&service, "realm-a", "wedged", 100).await;
+
+    let health = service
+        .health_snapshot_for_realm("realm-a", 1_000, 2)
+        .await
+        .expect("census");
+    assert_eq!(
+        health.coverage,
+        JobHealthCoverage::Complete,
+        "a window of 2 is not truncated by 6 rows that finished long ago"
+    );
+    assert_eq!(health.running, 1);
+    assert_eq!(
+        health.stale_leases, 1,
+        "the wedge must be inside the window"
+    );
+    assert_eq!(health.reading(), JobHealthReading::Degraded);
+}
+
+/// The window still bounds LIVE work, and saturating it is still unreadable.
+///
+/// The cap did not go away; it stopped being a function of retention. Three
+/// live jobs and a window of three is a genuine operational bound - too much
+/// outstanding work to census - and it answers `Unreadable`, not counts.
+#[tokio::test]
+async fn a_window_filled_by_live_work_is_still_unreadable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(
+        SqliteDetachedJobStore::open(temp.path().join("jobs.sqlite3")).expect("open store"),
+    );
+    let service = DetachedJobService::new(store);
+    for index in 0..4 {
+        drained_terminal_job(&service, "realm-a", &format!("terminal-{index}")).await;
+    }
+    for index in 0..3 {
+        wedged_running_job(&service, "realm-a", &format!("wedged-{index}"), 100).await;
+    }
+
+    let health = service
+        .health_snapshot_for_realm("realm-a", 1_000, 3)
+        .await
+        .expect("census");
+    assert_eq!(
+        health.coverage,
+        JobHealthCoverage::Truncated {
+            scanned: 3,
+            limit: 3
+        }
+    );
+    assert_eq!(health.reading(), JobHealthReading::Unreadable);
+}
+
+/// Another realm's live work does not consume this realm's window.
+///
+/// The realm filter used to run AFTER the cap, so a busy sibling realm could
+/// silently push this realm's jobs out of a window that then reported counts
+/// for this realm.
+#[tokio::test]
+async fn another_realms_live_work_does_not_consume_this_realms_window() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(
+        SqliteDetachedJobStore::open(temp.path().join("jobs.sqlite3")).expect("open store"),
+    );
+    let service = DetachedJobService::new(store);
+    for index in 0..5 {
+        wedged_running_job(&service, "realm-b", &format!("other-{index}"), 100).await;
+    }
+    wedged_running_job(&service, "realm-a", "mine", 100).await;
+
+    let health = service
+        .health_snapshot_for_realm("realm-a", 1_000, 2)
+        .await
+        .expect("census");
+    assert_eq!(health.coverage, JobHealthCoverage::Complete);
+    assert_eq!(health.stale_leases, 1);
+    assert_eq!(health.reading(), JobHealthReading::Degraded);
+}
+
+/// A job parked for a human stays in the census.
+///
+/// `NeedsAttention` is TERMINAL to the generated machine and LIVE to this
+/// census, and that gap is the trap in this whole change: a window scoped by
+/// machine terminality would drop exactly the rows that exist to be noticed,
+/// and `needs_attention` is one of the three terms that degrade the reading.
+/// The store here is mostly finished history, so the row only survives the
+/// window if the classification is the census's own.
+#[tokio::test]
+async fn a_job_parked_for_a_human_is_still_census_live() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(
+        SqliteDetachedJobStore::open(temp.path().join("jobs.sqlite3")).expect("open store"),
+    );
+    let service = DetachedJobService::new(store);
+    for index in 0..5 {
+        drained_terminal_job(&service, "realm-a", &format!("terminal-{index}")).await;
+    }
+    let parked = service
+        .submit(spec("realm-a", "parked"))
+        .await
+        .expect("submit");
+    service
+        .mark_needs_attention(
+            &parked.job_id,
+            10,
+            JobFailureCode::new("credential_removed").expect("failure code"),
+        )
+        .await
+        .expect("mark needs attention");
+
+    let health = service
+        .health_snapshot_for_realm("realm-a", 1_000, 2)
+        .await
+        .expect("census");
+    assert_eq!(
+        health.needs_attention, 1,
+        "a job parked for a human must not be filtered out as terminal"
+    );
+    assert_eq!(health.coverage, JobHealthCoverage::Complete);
     assert_eq!(health.reading(), JobHealthReading::Degraded);
 }
 
