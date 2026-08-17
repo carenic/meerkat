@@ -9683,6 +9683,29 @@ mod tests {
             .await
             .expect("spawn worker");
 
+        // A RESTART MEANS THE PREDECESSOR IS GONE, and this test has to actually
+        // establish that. It used to build the second state while the first
+        // mob's supervisor route was still published, so it was not simulating a
+        // restart at all - it was simulating two live holders of one supervisor
+        // name and relying on the second to take the name over. The one claim
+        // rule (see `MobSupervisorBridge` in meerkat-mob) never takes over a
+        // live route, "whether the holder is another mob sharing this mob id or
+        // an earlier generation of this same authority", and it names the
+        // sanctioned succession: `shutdown()` on the predecessor, which reaches
+        // a generation-exact `retire_inproc_route` and frees the name.
+        //
+        // Retiring it here is what makes the assertions below about rehydration
+        // FROM DISK rather than about name displacement. Sibling restore tests
+        // pass only because they build their second state before anything
+        // publishes a supervisor route.
+        state
+            .handle_for(&mob_id)
+            .await
+            .expect("predecessor mob handle")
+            .shutdown()
+            .await
+            .expect("retire the predecessor supervisor route");
+
         let restored = Arc::new(
             MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
                 .with_persistent_storage_root(Some(root.path().to_path_buf())),

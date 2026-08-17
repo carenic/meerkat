@@ -4363,8 +4363,26 @@ async fn degraded_registration_cold_reloads_through_the_ordinary_registration_pa
         "recovery must publish a replacement registration cold-loaded from durable truth, not \
          republish the unreadable shell as healthy"
     );
+    // `reload_required_session_count` is a HEALTH accessor: it reads the session
+    // map with `try_read` and returns None when it cannot get a reading, so that
+    // a health probe can never block the runtime it is measuring. None therefore
+    // means "no measurement was taken", NOT "zero sessions owe a reload" - the
+    // exact distinction this release exists to enforce - and a single sample
+    // cannot prove anything about the successor. Sampling once made this test
+    // fail roughly one run in three, always with `left: None`, which reads as
+    // "the successor cannot execute" when it actually means "nobody looked".
+    //
+    // Await a real reading, then assert on it. A genuine nonzero still fails.
+    let mut reload_required = None;
+    for _ in 0..200 {
+        if let Some(count) = adapter.reload_required_session_count() {
+            reload_required = Some(count);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(
-        adapter.reload_required_session_count(),
+        reload_required,
         Some(0),
         "the successor must be able to execute against durable state"
     );
