@@ -60,6 +60,15 @@ them.
 - **`meerkat_contracts::JobHealthStatus` gains an `Unreadable` variant.** The
   census can now say it did not look, which it previously could not express;
   exhaustive matches must add the arm. SDK literal unions are regenerated.
+
+  For adopters folding this into a two-state surface: `Unreadable` is a THIRD
+  state and no boolean carries it. `stale_leases == 0` means none were SEEN, not
+  that none EXIST. Folding `Unreadable` into "healthy" reintroduces exactly the
+  blindness this change removes - a green board over an unexamined store.
+  Folding it into "degraded" pages an operator about a fleet that may be
+  entirely fine. If a boolean is unavoidable, prefer NOT-healthy so the failure
+  is visible rather than silent, but the intended consumption is to surface the
+  third state distinctly and say WHICH term could not be measured.
 - **`meerkat_contracts::JobHealthCoverage` is a new wire enum**
   (`complete` | `truncated { scanned, limit }`), so a saturated census window is
   a typed fact rather than a silent count.
