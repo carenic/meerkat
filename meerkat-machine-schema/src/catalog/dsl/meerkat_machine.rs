@@ -7161,6 +7161,18 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "unregister_draining" { self.registration_phase == RegistrationPhase::Draining }
             update {}
             to Idle
+            emit SessionRegistrationRejected {
+                session_id: session_id,
+                reason: SessionRegistrationRejectReasonKind::UnregisterTeardownInProgress,
+                registered_runtime_epoch_id: self.active_runtime_epoch_id,
+                attempted_runtime_epoch_id: runtime_epoch_id,
+                unregister_runtime_loop_drain_pending:
+                    self.unregister_runtime_loop_drain_pending,
+                unregister_comms_drain_exit_pending:
+                    self.unregister_comms_drain_exit_pending,
+                unregister_completion_waiter_drain_pending:
+                    self.unregister_completion_waiter_drain_pending
+            }
         }
 
         // 2c. RegisterSessionResumesStopped: the machine-owned re-admission
