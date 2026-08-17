@@ -3240,6 +3240,36 @@ fn normalize_rest_comms_send_error(
                 }
             }
         }
+        // An ambiguous delivery is NOT a failed send, and it must not arrive at
+        // a caller under a code that says it was. The envelope may already be on
+        // the receiver's queue and a later drain may still commit it, so the
+        // caller's next safe move is to RECONCILE against durable work truth -
+        // never to retry, which would duplicate. Folding this into
+        // `send_failed` would tell every caller the opposite, and a
+        // model-mediated caller reading the code or the prose will retry on the
+        // word "failed". Carries the envelope id as the correlation evidence
+        // reconciliation needs.
+        meerkat_core::comms::SendError::AmbiguousDelivery {
+            envelope_id,
+            detail,
+        } => {
+            let message = format!(
+                "delivery outcome for envelope {envelope_id} is unknown; it may already be \
+                 delivered. Reconcile against durable work truth before any new attempt - a \
+                 retry can duplicate. ({detail})"
+            );
+            ApiError::InternalWithData {
+                message: format!("send_ambiguous: {message}"),
+                code: "send_ambiguous".to_string(),
+                details: json!({
+                    "code": "send_ambiguous",
+                    "message": message,
+                    "envelope_id": envelope_id.to_string(),
+                    "retry_safe": false,
+                    "required_action": "reconcile",
+                }),
+            }
+        }
         other => ApiError::InternalWithData {
             message: format!("send_failed: {other}"),
             code: "send_failed".to_string(),
