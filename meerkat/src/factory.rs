@@ -2168,6 +2168,12 @@ struct ResolvedLlmClientPhase {
 }
 
 impl AgentFactory {
+    // Gated to match its only caller. `resolve_image_binding_for_provider` is
+    // `not(wasm32)`, and realm/auth-binding resolution is inherently host-side
+    // (token store, keyring, filesystem), so on wasm32 this function has no
+    // reachable caller and the workspace's dead-code lint denies it. Compiling
+    // what cannot be called is the thing to remove, not the lint.
+    #[cfg(not(target_arch = "wasm32"))]
     fn resolve_realm_binding_for_provider(
         config: &Config,
         provider: Provider,

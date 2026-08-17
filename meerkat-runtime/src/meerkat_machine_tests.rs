@@ -28006,6 +28006,32 @@ async fn await_runtime_recovery_stop(machine: &Arc<MeerkatMachine>, session_id: 
     .expect("abnormal runtime-loop teardown must reach generated Stopped");
 }
 
+/// Await a census READING instead of sampling once.
+///
+/// The four `*_session_count` accessors take the session map with `try_read`
+/// and return None when they cannot get one, so that a health probe can never
+/// block the runtime it is measuring. Tokio's `RwLock` is write-preferring, so
+/// a writer queued by a still-settling runtime loop makes `try_read` fail even
+/// while the map is merely read-locked. A single sample therefore proves
+/// nothing: None means NOBODY LOOKED, not a value.
+///
+/// Use this only where the assertion expects a MEASUREMENT. Sites that assert
+/// None mean "no census applies to this machine at all" (ephemeral, storeless)
+/// and must keep sampling directly - those two Nones are different facts that
+/// this accessor's `Option<usize>` currently conflates.
+async fn await_census_reading(mut sample: impl FnMut() -> Option<usize>) -> Option<usize> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(count) = sample() {
+                return count;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .ok()
+}
+
 fn machine_terminal_receipt(
     run_id: RunId,
     contributing_input_ids: Vec<InputId>,
@@ -44992,7 +45018,7 @@ async fn a_real_turn_arms_the_staged_run_window_and_reads_clear_after_completion
         );
     }
     assert_eq!(
-        machine.overdue_run_start_session_count(),
+        await_census_reading(|| machine.overdue_run_start_session_count()).await,
         Some(0),
         "a completed turn's window is stale in the harmless direction: the \
          census recomputes from machine truth and reads it Clear"
