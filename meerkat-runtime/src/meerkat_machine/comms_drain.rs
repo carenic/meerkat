@@ -148,7 +148,7 @@ pub enum SupervisorBinding {
 
 pub struct CommsDrainSlot {
     handle: Option<tokio::task::JoinHandle<()>>,
-    task_runtime: Option<Arc<dyn meerkat_core::agent::CommsRuntime>>,
+    task_runtime: Option<std::sync::Weak<dyn meerkat_core::agent::CommsRuntime>>,
 }
 
 /// Cancellation guard for the spawn-before-slot-publication interval.
@@ -260,7 +260,8 @@ impl CommsDrainSlot {
     ) -> bool {
         self.task_runtime
             .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, runtime))
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|current| Arc::ptr_eq(&current, runtime))
     }
 
     pub(crate) fn task_is_live_for(
@@ -275,7 +276,9 @@ impl CommsDrainSlot {
     }
 
     pub(crate) fn task_runtime(&self) -> Option<Arc<dyn meerkat_core::agent::CommsRuntime>> {
-        self.task_runtime.clone()
+        self.task_runtime
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
     }
 
     pub(crate) fn handle_present(&self) -> bool {
@@ -290,7 +293,7 @@ impl CommsDrainSlot {
         if let Some(existing) = self.handle.take() {
             existing.abort();
         }
-        self.task_runtime = Some(runtime);
+        self.task_runtime = Some(Arc::downgrade(&runtime));
         self.handle = Some(handle);
     }
 

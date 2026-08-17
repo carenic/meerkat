@@ -1564,13 +1564,61 @@ fn image_request(n: u128, target_model: &str) -> ImageOperationRoutingRequest {
 
 struct FakeDrainRuntime {
     notify: Arc<Notify>,
+    claim_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    dropped: Arc<AtomicBool>,
+}
+
+struct BlockingDrainRuntime {
+    notify: Arc<Notify>,
+    claim_started: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl BlockingDrainRuntime {
+    fn new() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            claim_started: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn claim_started(&self) -> bool {
+        self.claim_started.load(Ordering::SeqCst)
+    }
+
+    fn dropped_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.dropped)
+    }
+}
+
+impl Drop for BlockingDrainRuntime {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
 }
 
 impl FakeDrainRuntime {
     fn idle() -> Self {
         Self {
             notify: Arc::new(Notify::new()),
+            claim_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn claim_attempts(&self) -> usize {
+        self.claim_attempts.load(Ordering::SeqCst)
+    }
+
+    fn dropped_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.dropped)
+    }
+}
+
+impl Drop for FakeDrainRuntime {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
     }
 }
 
@@ -4232,7 +4280,23 @@ impl CommsRuntime for FakeDrainRuntime {
         &self,
     ) -> Result<Option<meerkat_core::interaction::PeerIngressQueueClaim>, CommsCapabilityError>
     {
+        self.claim_attempts.fetch_add(1, Ordering::SeqCst);
         Ok(None)
+    }
+}
+
+#[async_trait::async_trait]
+impl CommsRuntime for BlockingDrainRuntime {
+    fn inbox_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.notify)
+    }
+
+    async fn claim_classified_inbox_interaction(
+        &self,
+    ) -> Result<Option<meerkat_core::interaction::PeerIngressQueueClaim>, CommsCapabilityError>
+    {
+        self.claim_started.store(true, Ordering::SeqCst);
+        std::future::pending().await
     }
 }
 
@@ -42398,18 +42462,14 @@ async fn detach_ingress_clears_owner() {
 }
 
 #[tokio::test]
-async fn detach_drops_drain_task_runtime_clone_so_identity_claim_is_released() {
-    // Regression for the mob post-discard revival failure
-    // "Session identity already active". The spawned comms-drain task captures
-    // its own `Arc<dyn CommsRuntime>` clone, and a session-scoped inproc runtime
-    // owns the process-scoped session-identity `SessionClaim`, released ONLY when
-    // its LAST `Arc` is dropped. A fire-and-forget `handle.abort()` merely
-    // schedules cancellation, so on a single-threaded runtime the task's clone is
-    // still alive right after detach returns — and a same-id rebuild
-    // (`materialize_revived_member_session` -> `provision_member`) then collides
-    // with the still-held claim. The detach must JOIN the aborted drain task,
-    // dropping its captured clone before returning. We observe that here through a
-    // `Weak` handle: after detach, no strong `Arc` clone may survive.
+async fn drain_carriers_do_not_keep_the_host_runtime_or_identity_claim_alive() {
+    // Regression for in-process host restart failures under the one-live-claim
+    // rule. The comms runtime owns both its inproc route and the process-scoped
+    // session identity claim, released only when its last `Arc` is dropped. A
+    // persistent drain waits for Duration::MAX, so either a strong task capture
+    // or a strong drain-slot cache pins a dead host forever. Both carriers must
+    // be weak: once the host drops its last owner, the runtime's Drop runs before
+    // any explicit drain detach and a same-id successor can claim the route.
     let adapter = Arc::new(MeerkatMachine::ephemeral());
     let session_id = SessionId::new();
     adapter
@@ -42417,23 +42477,89 @@ async fn detach_drops_drain_task_runtime_clone_so_identity_claim_is_released() {
         .await
         .expect("register session");
 
-    let comms_runtime: Arc<dyn CommsRuntime> = Arc::new(FakeDrainRuntime::idle());
+    let comms_runtime = Arc::new(FakeDrainRuntime::idle());
+    let comms_runtime_dyn: Arc<dyn CommsRuntime> = comms_runtime.clone();
     let weak_runtime = Arc::downgrade(&comms_runtime);
+    let runtime_dropped = comms_runtime.dropped_signal();
     assert!(
         adapter
-            .update_peer_ingress_context(&session_id, true, Some(Arc::clone(&comms_runtime)))
+            .update_peer_ingress_context(&session_id, true, Some(comms_runtime_dyn.clone()))
+            .await
+            .expect("attach session-owned drain"),
+        "first session-owned attach should spawn the drain task"
+    );
+    drop(comms_runtime_dyn);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if comms_runtime.claim_attempts() > 0 && Arc::strong_count(&comms_runtime) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the drain must reach idle without retaining a strong runtime owner");
+
+    drop(comms_runtime);
+    assert!(
+        weak_runtime.upgrade().is_none(),
+        "the detached drain task and drain slot must not keep the host runtime alive"
+    );
+    assert!(
+        runtime_dropped.load(Ordering::SeqCst),
+        "dropping the host's last owner must run the comms runtime destructor"
+    );
+
+    adapter
+        .update_peer_ingress_context(&session_id, false, None)
+        .await
+        .expect("detach drain");
+
+    assert!(weak_runtime.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn detach_joins_an_in_flight_drain_upgrade_before_returning() {
+    // Weak carriers do not eliminate short-lived strong upgrades while a drain
+    // is processing one inbox operation. Explicit detach must still abort and
+    // join the task so that in-flight upgrade is gone before a same-id rebuild.
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    adapter
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+
+    let comms_runtime = Arc::new(BlockingDrainRuntime::new());
+    let comms_runtime_dyn: Arc<dyn CommsRuntime> = comms_runtime.clone();
+    let weak_runtime = Arc::downgrade(&comms_runtime);
+    let runtime_dropped = comms_runtime.dropped_signal();
+    assert!(
+        adapter
+            .update_peer_ingress_context(&session_id, true, Some(comms_runtime_dyn))
             .await
             .expect("attach session-owned drain"),
         "first session-owned attach should spawn the drain task"
     );
 
-    // Drop the test's own strong reference so the only remaining strong holders
-    // are the drain slot's `task_runtime` and the spawned drain task's captured
-    // clone — exactly the state a live keep-alive session is in before revival.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !comms_runtime.claim_started() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the drain must enter the blocking classified-inbox claim");
+    assert_eq!(
+        Arc::strong_count(&comms_runtime),
+        2,
+        "only the test owner and the in-flight drain upgrade may remain"
+    );
+
     drop(comms_runtime);
     assert!(
         weak_runtime.upgrade().is_some(),
-        "precondition: the drain slot + drain task must still hold the comms runtime"
+        "precondition: the in-flight drain upgrade still owns the runtime"
     );
 
     adapter
@@ -42443,9 +42569,11 @@ async fn detach_drops_drain_task_runtime_clone_so_identity_claim_is_released() {
 
     assert!(
         weak_runtime.upgrade().is_none(),
-        "after detach, every Arc<dyn CommsRuntime> clone (slot + drain task) must be \
-         dropped so the session-identity claim is released before any same-id rebuild; \
-         a lingering clone is the race that surfaces as 'Session identity already active'"
+        "detach must join the aborted drain and drop its in-flight runtime upgrade"
+    );
+    assert!(
+        runtime_dropped.load(Ordering::SeqCst),
+        "detach must return only after the comms runtime destructor has run"
     );
 }
 

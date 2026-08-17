@@ -26119,6 +26119,20 @@ default_model = "gpt-5.4"
             }),
         )
         .await;
+
+        // Dropping an in-process MobMcpState is not a process crash: the mob
+        // actor intentionally owns its command channel and supervisor bridge.
+        // Stop only the volatile actor tasks through the established crash
+        // seam so this same-process harness models the process boundary while
+        // preserving the durable work that the rebuilt context must recover.
+        ctx_a
+            .state
+            .handle_for(&meerkat_mob::MobId::from(mob_id.clone()))
+            .await
+            .expect("created mob handle should be registered")
+            .crash_stop_preserving_durable_work_for_test()
+            .await
+            .expect("first mob actor should crash-stop before context rebuild");
         drop(dispatcher_a);
         drop(ctx_a);
 

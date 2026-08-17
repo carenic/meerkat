@@ -8815,7 +8815,7 @@ impl MobBuilder {
         let mut active_ids = std::collections::HashSet::new();
         for summary in &listed_sessions {
             if session_service
-                .has_live_session(&summary.session_id)
+                .live_session_actor_registered(&summary.session_id)
                 .await?
             {
                 active_ids.insert(summary.session_id.clone());

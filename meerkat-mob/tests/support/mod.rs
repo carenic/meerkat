@@ -43,6 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use meerkat_core::agent::CommsRuntime as _;
 use meerkat_core::comms::TrustedPeerDescriptor;
 use meerkat_core::interaction::InteractionContent;
+use meerkat_core::service::SessionService as _;
 use meerkat_core::{CommsCommand, PeerCorrelationId};
 use meerkat_runtime::SessionServiceRuntimeExt as _;
 use meerkat_runtime::meerkat_machine::MeerkatMachine;
@@ -3699,7 +3700,33 @@ impl ControllingMob {
         // drops that volatile process and constructs a new one while retaining
         // both the SessionStore files and the singular RuntimeStore authority.
         let service = if mode == ControllingMobRestartMode::ActorAlreadyFailStopped {
+            let listed_sessions = service
+                .list(meerkat_core::service::SessionQuery::default())
+                .await
+                .expect("list process-local sessions before cold restart");
+            let mut runtime_release_witnesses = Vec::new();
+            for summary in listed_sessions {
+                if let Some(runtime) = service.comms_runtime(&summary.session_id).await {
+                    runtime_release_witnesses.push(Arc::downgrade(&runtime));
+                }
+            }
+            // A real process exit destroys its session actors before the next
+            // process can claim their comms names. This same-process fixture
+            // must establish the same boundary explicitly. Weak witnesses make
+            // the wait a direct regression check for detached task ownership:
+            // the pre-fix persistent drain kept one of these alive forever.
+            service.shutdown().await;
             drop(service);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while runtime_release_witnesses
+                    .iter()
+                    .any(|runtime| runtime.upgrade().is_some())
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cold restart waits for every old session runtime to be released");
             let paths = ControllingMobPaths::new(temp.path());
             persistent_service(&paths, Arc::clone(&runtime_store))
         } else {
