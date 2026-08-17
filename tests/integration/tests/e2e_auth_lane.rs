@@ -611,6 +611,7 @@ fn openai_oauth_config() -> Config {
             backend_kind: "chatgpt_backend".to_string(),
             base_url: None,
             options: Value::Null,
+            server: None,
         },
     );
     section.auth.insert(

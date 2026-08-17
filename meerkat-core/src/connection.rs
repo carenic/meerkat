@@ -447,6 +447,22 @@ pub struct BackendProfile {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub options: serde_json::Value,
+    /// Which `[self_hosted.servers.<id>]` endpoint this backend serves.
+    ///
+    /// [`Provider::SelfHosted`] is a provider CLASS, not an endpoint identity:
+    /// two unrelated servers (a cloud OpenAI-compatible gateway and a private
+    /// vLLM box) are both `self_hosted` and hold DIFFERENT secrets. This field
+    /// is the canonical owner of "which server this backend/credential
+    /// authenticates", so credential selection for a self-hosted model can be
+    /// constrained to the server that actually serves the model instead of to
+    /// the broad provider class. See
+    /// [`crate::self_hosted_binding::SelfHostedBindingServer`].
+    ///
+    /// Only meaningful for `provider = "self_hosted"`; setting it on any other
+    /// provider fails closed at ingestion
+    /// ([`ProviderBindingError::ServerRequiresSelfHostedProvider`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
 }
 
 /// Auth profile: how credentials are obtained, refreshed, constrained.
@@ -1290,7 +1306,7 @@ pub fn resolve_write_owner(
     })
 }
 
-fn materialize_connection_target(
+pub(crate) fn materialize_connection_target(
     realm: RealmConnectionSet,
     expected_provider: Option<Provider>,
     binding: BindingId,
@@ -1353,12 +1369,29 @@ impl RealmConnectionSet {
         for (id, cfg) in &section.backend {
             let provider = Provider::parse_strict(&cfg.provider)
                 .ok_or_else(|| ProviderBindingError::UnknownProviderName(cfg.provider.clone()))?;
+            let server = match cfg.server.as_deref() {
+                None => None,
+                Some(server) if server.trim().is_empty() => {
+                    return Err(ProviderBindingError::EmptySelfHostedServerId {
+                        backend: id.clone(),
+                    });
+                }
+                Some(server) if provider != Provider::SelfHosted => {
+                    return Err(ProviderBindingError::ServerRequiresSelfHostedProvider {
+                        backend: id.clone(),
+                        provider,
+                        server: server.to_string(),
+                    });
+                }
+                Some(server) => Some(server.to_string()),
+            };
             let backend = BackendProfile {
                 id: id.clone(),
                 provider,
                 backend_kind: cfg.backend_kind.clone(),
                 base_url: cfg.base_url.clone(),
                 options: cfg.options.clone(),
+                server,
             };
             // id uniqueness within a single BTreeMap key space is
             // guaranteed by the map itself; no extra check needed.
@@ -1463,6 +1496,9 @@ impl RealmConnectionSet {
             backend_kind: spec.backend_kind.to_string(),
             base_url: spec.base_url,
             options: spec.options,
+            // The synthetic env-var fallback names no self-hosted server: it
+            // is minted per provider class, never per endpoint.
+            server: None,
         };
         let source = CredentialSourceSpec::Env {
             env: spec.env_var.to_string(),
@@ -1582,6 +1618,22 @@ pub enum ProviderBindingError {
         realm: String,
         source: IdentityError,
     },
+    /// A backend profile named a self-hosted `server` while declaring a
+    /// provider other than [`Provider::SelfHosted`]. The server identity only
+    /// has meaning inside the self-hosted class, so this fails closed rather
+    /// than being ignored.
+    #[error(
+        "backend '{backend}' declares server '{server}' but provider is {provider:?}; \
+         the 'server' field is only valid for provider 'self_hosted'"
+    )]
+    ServerRequiresSelfHostedProvider {
+        backend: String,
+        provider: Provider,
+        server: String,
+    },
+    /// A backend profile declared an empty/blank self-hosted `server`.
+    #[error("backend '{backend}' declares an empty self-hosted server id")]
+    EmptySelfHostedServerId { backend: String },
 }
 
 // ---------------------------------------------------------------------
@@ -1667,6 +1719,7 @@ impl RealmConfigSection {
                     backend_kind: backend_kind.to_string(),
                     base_url: None,
                     options: serde_json::Value::Null,
+                    server: None,
                 },
             );
             auth.insert(
@@ -1841,6 +1894,10 @@ pub struct BackendProfileConfig {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub options: serde_json::Value,
+    /// Ingestion form of [`BackendProfile::server`]: the
+    /// `[self_hosted.servers.<id>]` endpoint this backend serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
 }
 
 /// Serialized auth profile (pre-normalization).

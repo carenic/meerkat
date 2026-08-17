@@ -62,6 +62,7 @@ fn realm_with_oauth_binding_no_refresh(auth_method: &str) -> RealmConnectionSet 
             backend_kind: "anthropic_api".into(),
             base_url: None,
             options: serde_json::json!({"realm_id": "dev"}),
+            server: None,
         },
     );
     let mut auth = BTreeMap::new();
@@ -112,6 +113,7 @@ fn realm_with_oauth_binding_source(
             backend_kind: "anthropic_api".into(),
             base_url: None,
             options: serde_json::json!({"realm_id": "dev"}),
+            server: None,
         },
     );
     let mut auth = BTreeMap::new();

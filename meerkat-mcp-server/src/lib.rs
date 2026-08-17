@@ -5199,6 +5199,7 @@ mod tests {
                 backend_kind: "google_code_assist".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         global.auth.insert(

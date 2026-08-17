@@ -2347,6 +2347,7 @@ mod tests {
                 backend_kind: "openai_api".into(),
                 base_url: None,
                 options: serde_json::json!({}),
+                server: None,
             },
         );
         section.auth.insert(
@@ -2384,6 +2385,7 @@ mod tests {
                 backend_kind: "chatgpt_backend".into(),
                 base_url: None,
                 options: serde_json::json!({}),
+                server: None,
             },
         );
         section.auth.insert(
@@ -2434,6 +2436,7 @@ mod tests {
                 backend_kind: "openai_api".into(),
                 base_url: None,
                 options: serde_json::json!({}),
+                server: None,
             },
         );
         section.auth.insert(
@@ -2473,6 +2476,7 @@ mod tests {
                 backend_kind: "google_genai".into(),
                 base_url: None,
                 options: serde_json::json!({}),
+                server: None,
             },
         );
         section.auth.insert(

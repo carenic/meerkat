@@ -923,6 +923,7 @@ mod tests {
             backend_kind: GoogleBackendKind::GoogleCodeAssist.as_str().into(),
             base_url: None,
             options: serde_json::Value::Null,
+            server: None,
         };
 
         assert_eq!(
@@ -963,6 +964,7 @@ mod tests {
             backend_kind: GoogleBackendKind::GoogleCodeAssist.as_str().into(),
             base_url: None,
             options: serde_json::Value::Null,
+            server: None,
         });
         let authorizer: Arc<dyn HttpAuthorizer> = Arc::new(NoopAuthorizer);
         let lease: Arc<dyn AuthLease> = Arc::new(

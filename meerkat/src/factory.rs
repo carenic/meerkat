@@ -1350,7 +1350,9 @@ impl CreateSessionModelResolutionError {
                     | meerkat_core::ProviderBindingError::UnknownAuth(_)
                     | meerkat_core::ProviderBindingError::ProviderMismatch { .. }
                     | meerkat_core::ProviderBindingError::UnknownProviderName(_)
-                    | meerkat_core::ProviderBindingError::InvalidRealmId { .. },
+                    | meerkat_core::ProviderBindingError::InvalidRealmId { .. }
+                    | meerkat_core::ProviderBindingError::ServerRequiresSelfHostedProvider { .. }
+                    | meerkat_core::ProviderBindingError::EmptySelfHostedServerId { .. },
                 ..
             }
             | meerkat_core::ConnectionTargetError::ProviderMismatch { .. }
@@ -4087,6 +4089,20 @@ impl AgentFactory {
         }
     }
 
+    /// Resolve the realm binding whose credential authenticates the server that
+    /// serves this self-hosted model.
+    ///
+    /// `self_hosted` is a provider CLASS, not an endpoint identity: two
+    /// unrelated servers share it and hold different secrets. Selection is
+    /// therefore constrained to `spec.server_id` through
+    /// [`meerkat_core::resolve_self_hosted_binding_for_server`], NOT to the
+    /// nearest realm's self-hosted default - the previous provider-keyed
+    /// selection sent a workspace realm's gateway key to a private endpoint
+    /// whenever both were classified `self_hosted`.
+    ///
+    /// An explicit `auth_binding` still wins (it is the operator's escape
+    /// hatch), but a binding whose backend DECLARES a different server is a
+    /// contradiction and fails closed.
     #[cfg(feature = "openai")]
     fn resolve_self_hosted_connection(
         &self,
@@ -4096,85 +4112,46 @@ impl AgentFactory {
         preferred_realm: Option<&RealmId>,
     ) -> Result<(RealmConnectionSet, AuthBindingRef, Option<AuthBindingRef>), FactoryError> {
         if let Some(auth_binding) = identity.auth_binding.as_ref() {
-            let (realm, _binding_id, resolved_auth_binding) =
-                Self::resolve_realm_binding_for_provider(
-                    config,
-                    Provider::SelfHosted,
-                    Some(auth_binding),
-                    None,
-                )
-                .map_err(FactoryError::ConnectionTarget)?;
+            let target = meerkat_core::resolve_auth_binding_or_default_for_provider(
+                config,
+                Provider::SelfHosted,
+                Some(auth_binding),
+                None,
+                true,
+            )
+            .map_err(FactoryError::ConnectionTarget)?;
+            meerkat_core::validate_explicit_self_hosted_target(
+                config,
+                &target,
+                &spec.server_id,
+                &identity.model,
+            )
+            .map_err(FactoryError::SelfHostedBinding)?;
             return Ok((
-                realm,
-                resolved_auth_binding.clone(),
-                Some(resolved_auth_binding),
-            ));
-        }
-
-        if let Some((realm, resolved_auth_binding)) =
-            Self::configured_self_hosted_connection(config, preferred_realm)?
-        {
-            return Ok((
-                realm,
-                resolved_auth_binding.clone(),
-                Some(resolved_auth_binding),
+                target.realm,
+                target.auth_binding.clone(),
+                Some(target.auth_binding),
             ));
         }
 
         // No transient `[self_hosted]` migration realm is synthesized: the
-        // canonical `RealmConnectionSet` (from `auth_binding` or a configured
-        // realm default binding resolved above) is the sole owner of the
+        // canonical `RealmConnectionSet` (from `auth_binding` or the
+        // server-constrained selection below) is the sole owner of the
         // self-hosted connection. A `[self_hosted]` server with no canonical
-        // realm binding fails closed rather than fabricating a parallel
+        // realm binding fails closed with a typed error naming the server and
+        // the bindings considered, rather than fabricating a parallel
         // `self_hosted_legacy` realm + FNV-hashed transient binding id.
-        Err(FactoryError::ClientCreationFailed(format!(
-            "self-hosted server '{}' has no canonical realm binding; define a realm with a self_hosted backend + binding and select it with auth_binding or a realm default binding",
-            spec.server_id
-        )))
-    }
-
-    #[cfg(feature = "openai")]
-    fn configured_self_hosted_connection(
-        config: &Config,
-        preferred_realm: Option<&RealmId>,
-    ) -> Result<Option<(RealmConnectionSet, AuthBindingRef)>, FactoryError> {
-        if let Some(realm_id) = preferred_realm
-            && config.realm.contains_key(realm_id.as_str())
-        {
-            let target = meerkat_core::resolve_realm_binding_target_for_provider(
-                config,
-                Provider::SelfHosted,
-                Some(realm_id),
-                None,
-                None,
-                None,
-                false,
-            )
-            .map_err(|err| {
-                FactoryError::ClientCreationFailed(format!(
-                    "selected realm '{}' self_hosted credential binding is unavailable: {err}",
-                    realm_id.as_str()
-                ))
-            })?;
-            return Ok(Some((target.realm, target.auth_binding)));
-        }
-
-        match meerkat_core::resolve_auth_binding_or_default_for_provider(
+        let target = meerkat_core::resolve_self_hosted_binding_for_server(
             config,
-            Provider::SelfHosted,
-            None,
+            &spec.server_id,
             preferred_realm,
-            false,
-        ) {
-            Ok(target) => Ok(Some((target.realm, target.auth_binding))),
-            Err(err) => {
-                tracing::debug!(
-                    error = %err,
-                    "self-hosted connection seam lookup did not find a configured realm binding; resolution will fail closed"
-                );
-                Ok(None)
-            }
-        }
+        )
+        .map_err(FactoryError::SelfHostedBinding)?;
+        Ok((
+            target.realm,
+            target.auth_binding.clone(),
+            Some(target.auth_binding),
+        ))
     }
 
     fn publish_auth_lease(
@@ -7329,6 +7306,7 @@ mod tests {
                 backend_kind: "test_backend".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -7833,6 +7811,7 @@ mod tests {
                 backend_kind: "openai_api".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -7939,6 +7918,7 @@ mod tests {
                 backend_kind: "openai_api".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -9450,6 +9430,7 @@ mod tests {
                 backend_kind: "openai_api".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         for (binding_id, secret) in bindings {
@@ -9845,6 +9826,7 @@ mod tests {
                     backend_kind: "azure_openai".to_string(),
                     base_url: Some("https://example.openai.azure.com".to_string()),
                     options: serde_json::Value::Null,
+                    server: None,
                 },
             );
             section.auth.insert(
@@ -10651,6 +10633,7 @@ mod tests {
                 backend_kind: "openai_api".into(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             }),
             auth_lease: Arc::new(StaticLease::inline_secret(
                 "managed-oauth-access".into(),
@@ -10689,6 +10672,7 @@ mod tests {
                 backend_kind: "anthropic_api".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -10748,6 +10732,7 @@ mod tests {
                 backend_kind: "openai_api".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -10818,6 +10803,7 @@ mod tests {
                 backend_kind: "openai_api".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -10934,6 +10920,7 @@ mod tests {
                 backend_kind: "openai_api".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -11077,6 +11064,7 @@ mod tests {
                 backend_kind: "anthropic_api".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -11136,6 +11124,7 @@ mod tests {
                 backend_kind: "anthropic_api".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         session_section.auth.insert(
@@ -11176,6 +11165,7 @@ mod tests {
                 backend_kind: "openai_responses".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         default_section.auth.insert(
@@ -11473,6 +11463,7 @@ mod tests {
                 backend_kind: "self_hosted".to_string(),
                 base_url: Some(base_url.to_string()),
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         realm.auth.insert(
@@ -11530,10 +11521,434 @@ mod tests {
             calls.lock().unwrap().is_empty(),
             "missing canonical realm binding must not synthesize a transient legacy connection"
         );
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("self-hosted")
-                && err.to_string().contains("no canonical realm binding"),
-            "unexpected error: {err}"
+            message.contains("localhost:11434") && message.contains("no credential binding"),
+            "the failure must name the server it could not authenticate: {err}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Server-constrained self-hosted credential selection.
+    //
+    // `self_hosted` is a provider CLASS: two unrelated servers share it and
+    // hold different secrets. These tests pin that selection follows the
+    // MODEL'S SERVER, not the nearest realm's self-hosted default.
+    // ---------------------------------------------------------------
+
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    fn self_hosted_model(server: &str, remote_model: &str) -> SelfHostedModelConfig {
+        SelfHostedModelConfig {
+            server: server.to_string(),
+            remote_model: remote_model.to_string(),
+            display_name: remote_model.to_string(),
+            family: "test".to_string(),
+            tier: meerkat_core::model_profile::catalog::ModelTier::Supported,
+            context_window: Some(128_000),
+            max_output_tokens: Some(8_192),
+            vision: false,
+            image_tool_results: false,
+            inline_video: false,
+            supports_temperature: true,
+            supports_thinking: false,
+            supports_reasoning: false,
+            supports_web_search: false,
+            call_timeout_secs: Some(600),
+        }
+    }
+
+    /// Two self-hosted servers, each serving one alias: the shape that makes
+    /// "self_hosted" ambiguous as a credential key.
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    fn config_with_two_self_hosted_servers() -> Config {
+        let mut config = Config::default();
+        config.self_hosted.servers.insert(
+            "muse_vllm".to_string(),
+            SelfHostedServerConfig {
+                transport: SelfHostedTransport::OpenAiCompatible,
+                base_url: "http://muse.invalid:8000".to_string(),
+                api_style: SelfHostedApiStyle::ChatCompletions,
+            },
+        );
+        config.self_hosted.servers.insert(
+            "cerebras".to_string(),
+            SelfHostedServerConfig {
+                transport: SelfHostedTransport::OpenAiCompatible,
+                base_url: "https://api.cerebras.invalid/v1".to_string(),
+                api_style: SelfHostedApiStyle::ChatCompletions,
+            },
+        );
+        config.self_hosted.models.insert(
+            "muse-glimmer-30b".to_string(),
+            self_hosted_model("muse_vllm", "muse-glimmer-30b"),
+        );
+        config.self_hosted.models.insert(
+            "cerebras-gpt-oss-120b".to_string(),
+            self_hosted_model("cerebras", "gpt-oss-120b"),
+        );
+        config.self_hosted.default_model = Some("muse-glimmer-30b".to_string());
+        config
+    }
+
+    /// Add one self-hosted binding to `realm_id`, optionally declaring the
+    /// server it authenticates and/or a default model, with an inline secret
+    /// that identifies it in `RecordedSelfHostedResolve.auth_source`.
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    fn insert_self_hosted_server_binding(
+        config: &mut Config,
+        realm_id: &str,
+        binding_id: &str,
+        declared_server: Option<&str>,
+        default_model: Option<&str>,
+        secret: &str,
+        realm_default: bool,
+    ) {
+        let backend_id = format!("{binding_id}_backend");
+        let auth_id = format!("{binding_id}_auth");
+        let realm = config.realm.entry(realm_id.to_string()).or_default();
+        realm.backend.insert(
+            backend_id.clone(),
+            BackendProfileConfig {
+                provider: "self_hosted".to_string(),
+                backend_kind: "self_hosted".to_string(),
+                base_url: None,
+                options: serde_json::Value::Null,
+                server: declared_server.map(str::to_string),
+            },
+        );
+        realm.auth.insert(
+            auth_id.clone(),
+            AuthProfileConfig {
+                provider: "self_hosted".to_string(),
+                auth_method: "static_bearer".to_string(),
+                source: CredentialSourceSpec::InlineSecret {
+                    secret: secret.to_string(),
+                },
+                constraints: Default::default(),
+                metadata_defaults: Default::default(),
+            },
+        );
+        realm.binding.insert(
+            binding_id.to_string(),
+            ProviderBindingConfig {
+                backend_profile: backend_id,
+                auth_profile: auth_id,
+                default_model: default_model.map(str::to_string),
+                policy: Default::default(),
+                provider_default: false,
+            },
+        );
+        if realm_default {
+            realm.default_binding = Some(binding_id.to_string());
+        }
+    }
+
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    fn recorded_secret(recorded: &RecordedSelfHostedResolve) -> String {
+        match &recorded.auth_source {
+            CredentialSourceSpec::InlineSecret { secret } => secret.clone(),
+            other => panic!("expected an inline secret, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    async fn build_self_hosted_agent(
+        config: &Config,
+        model: &str,
+        realm_id: &str,
+    ) -> (
+        Result<DynAgent, BuildAgentError>,
+        Arc<std::sync::Mutex<Vec<RecordedSelfHostedResolve>>>,
+        tempfile::TempDir,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let calls = install_recording_self_hosted_runtime(&mut factory);
+        let mut build = AgentBuildConfig::new(model);
+        build.provider = Some(Provider::SelfHosted);
+        build.realm_id = Some(RealmId::parse(realm_id).unwrap());
+        build.override_builtins = ToolCategoryOverride::Disable;
+        let result = factory.build_agent(build, config).await;
+        (result, calls, temp)
+    }
+
+    /// Two self-hosted bindings in ONE realm: the realm default authenticates
+    /// a different server than the selected model's. Selection must follow the
+    /// model's server, and the realm default's secret must never leave.
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn self_hosted_selection_follows_model_server_not_realm_default_binding() {
+        let mut config = config_with_two_self_hosted_servers();
+        insert_self_hosted_server_binding(
+            &mut config,
+            "ws",
+            "cerebras",
+            Some("cerebras"),
+            None,
+            "cerebras-secret",
+            /* realm_default = */ true,
+        );
+        insert_self_hosted_server_binding(
+            &mut config,
+            "ws",
+            "muse",
+            Some("muse_vllm"),
+            None,
+            "muse-secret",
+            false,
+        );
+
+        let (result, calls, _temp) =
+            build_self_hosted_agent(&config, "muse-glimmer-30b", "ws").await;
+        result.expect("the model's own server binding must resolve");
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one credential resolution");
+        assert_eq!(
+            calls[0].auth_binding.binding.as_str(),
+            "muse",
+            "the binding declaring the model's server must be selected, not the realm default"
+        );
+        assert_eq!(
+            recorded_secret(&calls[0]),
+            "muse-secret",
+            "the realm default's secret must never be sent to another server's endpoint"
+        );
+    }
+
+    /// Rule 8: when no binding authenticates the model's server, fail closed
+    /// with a typed error that names the server and the bindings considered -
+    /// not a far-end `Unauthorized` produced by our own wrong secret.
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn self_hosted_without_binding_for_model_server_fails_closed_naming_candidates() {
+        let mut config = config_with_two_self_hosted_servers();
+        insert_self_hosted_server_binding(
+            &mut config,
+            "ws",
+            "cerebras",
+            Some("cerebras"),
+            None,
+            "cerebras-secret",
+            true,
+        );
+
+        let (result, calls, _temp) =
+            build_self_hosted_agent(&config, "muse-glimmer-30b", "ws").await;
+        let err = match result {
+            Ok(_) => panic!("a model whose server has no binding must fail closed"),
+            Err(err) => err,
+        };
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no credential may be resolved when the server has no binding"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("muse_vllm"),
+            "the error must name the server we could not authenticate: {message}"
+        );
+        assert!(
+            message.contains("ws:cerebras"),
+            "the error must name the bindings considered: {message}"
+        );
+        assert!(
+            message.contains("cerebras") && message.contains("declared"),
+            "the error must say why the considered binding did not qualify: {message}"
+        );
+    }
+
+    /// The owner's reproduction, without any config annotation: a workspace
+    /// realm whose default self-hosted binding is another server's, and the
+    /// model's own binding inherited from `global`, identified only by its
+    /// `default_model`.
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn self_hosted_inherited_binding_beats_nearer_realm_default_for_model_server() {
+        let mut config = config_with_two_self_hosted_servers();
+        insert_self_hosted_server_binding(
+            &mut config,
+            "ws",
+            "cerebras",
+            /* declared_server = */ None,
+            /* default_model = */ None,
+            "cerebras-secret",
+            /* realm_default = */ true,
+        );
+        insert_self_hosted_server_binding(
+            &mut config,
+            "global",
+            "muse_vllm",
+            /* declared_server = */ None,
+            Some("muse-glimmer-30b"),
+            "muse-secret",
+            false,
+        );
+
+        let (result, calls, _temp) =
+            build_self_hosted_agent(&config, "muse-glimmer-30b", "ws").await;
+        result.expect("the inherited binding for the model's server must resolve");
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].auth_binding.realm.as_str(), "global");
+        assert_eq!(calls[0].auth_binding.binding.as_str(), "muse_vllm");
+        assert_eq!(
+            recorded_secret(&calls[0]),
+            "muse-secret",
+            "the workspace realm's unrelated self-hosted secret must not be sent to the model's server"
+        );
+    }
+
+    /// The co-resident model in the same unannotated config still resolves
+    /// through the single unconstrained binding: the compatibility tier is
+    /// live, so the documented one-server setup does not regress.
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn self_hosted_single_unconstrained_binding_still_serves_its_own_model() {
+        let mut config = config_with_two_self_hosted_servers();
+        insert_self_hosted_server_binding(
+            &mut config,
+            "ws",
+            "cerebras",
+            None,
+            None,
+            "cerebras-secret",
+            true,
+        );
+        insert_self_hosted_server_binding(
+            &mut config,
+            "global",
+            "muse_vllm",
+            None,
+            Some("muse-glimmer-30b"),
+            "muse-secret",
+            false,
+        );
+
+        let (result, calls, _temp) =
+            build_self_hosted_agent(&config, "cerebras-gpt-oss-120b", "ws").await;
+        result.expect("the single unconstrained binding must still resolve its own model");
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].auth_binding.binding.as_str(), "cerebras");
+        assert_eq!(recorded_secret(&calls[0]), "cerebras-secret");
+    }
+
+    /// The documented explicit escape hatch (`--auth-binding global:muse_vllm`)
+    /// keeps working across workspaces, and it is what a resumed session
+    /// replays from `SessionMetadata.auth_binding`.
+    ///
+    /// The workspace realm holds a NEARER binding for the same server, so
+    /// automatic selection would pick `ws:muse_local`: only honoring the
+    /// explicit request produces `global:muse_vllm`.
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn explicit_self_hosted_auth_binding_still_selects_named_binding() {
+        let mut config = config_with_two_self_hosted_servers();
+        insert_self_hosted_server_binding(
+            &mut config,
+            "ws",
+            "cerebras",
+            Some("cerebras"),
+            None,
+            "cerebras-secret",
+            true,
+        );
+        insert_self_hosted_server_binding(
+            &mut config,
+            "ws",
+            "muse_local",
+            Some("muse_vllm"),
+            None,
+            "muse-local-secret",
+            false,
+        );
+        insert_self_hosted_server_binding(
+            &mut config,
+            "global",
+            "muse_vllm",
+            Some("muse_vllm"),
+            None,
+            "muse-secret",
+            false,
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let calls = install_recording_self_hosted_runtime(&mut factory);
+        let mut build = AgentBuildConfig::new("muse-glimmer-30b");
+        build.provider = Some(Provider::SelfHosted);
+        build.realm_id = Some(RealmId::parse("ws").unwrap());
+        build.auth_binding = Some(AuthBindingRef {
+            realm: RealmId::global(),
+            binding: BindingId::parse("muse_vllm").unwrap(),
+            profile: None,
+            origin: BindingOrigin::Configured,
+        });
+        build.override_builtins = ToolCategoryOverride::Disable;
+
+        factory
+            .build_agent(build, &config)
+            .await
+            .expect("an explicit auth binding must keep working");
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].auth_binding.realm.as_str(), "global");
+        assert_eq!(calls[0].auth_binding.binding.as_str(), "muse_vllm");
+        assert_eq!(recorded_secret(&calls[0]), "muse-secret");
+    }
+
+    /// A durable/explicit binding that DECLARES another server is a
+    /// contradiction, not a preference: it fails closed instead of shipping
+    /// that server's secret. This is what protects sessions that persisted the
+    /// wrong binding before the constraint existed.
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn explicit_self_hosted_auth_binding_for_other_server_fails_closed() {
+        let mut config = config_with_two_self_hosted_servers();
+        insert_self_hosted_server_binding(
+            &mut config,
+            "ws",
+            "cerebras",
+            Some("cerebras"),
+            None,
+            "cerebras-secret",
+            true,
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let calls = install_recording_self_hosted_runtime(&mut factory);
+        let mut build = AgentBuildConfig::new("muse-glimmer-30b");
+        build.provider = Some(Provider::SelfHosted);
+        build.realm_id = Some(RealmId::parse("ws").unwrap());
+        build.auth_binding = Some(AuthBindingRef {
+            realm: RealmId::parse("ws").unwrap(),
+            binding: BindingId::parse("cerebras").unwrap(),
+            profile: None,
+            origin: BindingOrigin::Configured,
+        });
+        build.override_builtins = ToolCategoryOverride::Disable;
+
+        let err = match factory.build_agent(build, &config).await {
+            Ok(_) => panic!("an explicit binding for another server must fail closed"),
+            Err(err) => err,
+        };
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "the contradicting binding's secret must not be resolved"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("muse_vllm")
+                && message.contains("cerebras")
+                && message.contains("muse-glimmer-30b"),
+            "the error must name the model, its server, and the contradicting binding: {message}"
         );
     }
 
@@ -12183,10 +12598,10 @@ mod tests {
             Err(err) => err,
         };
 
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("self-hosted")
-                && err.to_string().contains("no canonical realm binding"),
-            "unexpected error: {err}"
+            message.contains("local") && message.contains("no credential binding"),
+            "the failure must name the server it could not authenticate: {err}"
         );
     }
 
@@ -12211,6 +12626,7 @@ mod tests {
                 backend_kind: "self_hosted".to_string(),
                 base_url: Some("http://127.0.0.1:9999/v1".to_string()),
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         realm.auth.insert(

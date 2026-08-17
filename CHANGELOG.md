@@ -30,6 +30,21 @@ them.
 
 ### Breaking
 
+- **`meerkat_core::BackendProfile` gains a `server: Option<String>` field** and
+  **`meerkat_core::BackendProfileConfig` gains a `server: Option<String>`
+  field**. Both are the canonical owner of "which `[self_hosted.servers.<id>]`
+  endpoint this backend authenticates". Struct-literal constructions of either
+  type must add `server: None`; `..Default::default()` and TOML ingestion are
+  unaffected (the field is `#[serde(default)]` and omitted when `None`, so no
+  wire break, no schema change, no SDK regeneration).
+- **`meerkat_core::ProviderBindingError` gains two variants**,
+  `ServerRequiresSelfHostedProvider { backend, provider, server }` and
+  `EmptySelfHostedServerId { backend }`: declaring `server` on a non-self-hosted
+  backend, or declaring it empty, now fails ingestion closed. Exhaustive matches
+  on this enum must add both arms.
+- **`meerkat_llm_core::FactoryError` gains a `SelfHostedBinding` variant**
+  carrying the new `meerkat_core::SelfHostedConnectionError`. Exhaustive matches
+  on `FactoryError` must add the arm.
 - **`meerkat::surface::RUNTIME_HEALTH_DIMENSIONS` is now `[&str; 5]`** (was
   `[&str; 4]`). The declared runtime-health coverage gains `session_run_start`;
   downstream code binding the constant by its exact array type must add the new
@@ -152,6 +167,30 @@ them.
   lane-truth probe exists. Clearing it on the strength of the staged-run
   census would have republished the one-reading-stands-for-the-whole-dimension
   defect 0.8.23 existed to remove, from inside the item that cited it.
+
+### Fixed
+
+- **A self-hosted model no longer resolves its credential by provider CLASS, so
+  one server's secret can no longer be sent to another server's endpoint.**
+  `self_hosted` classifies a private vLLM box and a hosted OpenAI-compatible
+  gateway identically, and credential selection keyed on that class alone: from
+  a workspace whose realm default binding was a different self-hosted server,
+  `rkat -m <model-on-another-server>` picked the workspace default, sent its key
+  to the model's endpoint, and surfaced the far end's `Unauthorized` - which
+  explains nothing about the fact that WE chose the wrong secret. Selection is
+  now constrained to the server that serves the model
+  (`meerkat_core::resolve_self_hosted_binding_for_server`), regardless of which
+  workspace the command runs from. A realm backend declares its endpoint with
+  `server = "<server_id>"`; a binding written before that field existed is
+  still identified by its `default_model`, and a lone unannotated self-hosted
+  binding still serves everything (the documented one-server setup is
+  unchanged). When the server cannot be identified honestly - no binding names
+  it, or several unannotated bindings are reachable - the build fails closed
+  with a typed error naming the server and every binding considered, instead of
+  guessing. An explicit `--auth-binding realm:binding` still wins, except when
+  that binding DECLARES a different server, which is a contradiction and fails
+  closed (this is what protects sessions that persisted the wrong binding
+  before the constraint existed).
 
 ### Changed
 

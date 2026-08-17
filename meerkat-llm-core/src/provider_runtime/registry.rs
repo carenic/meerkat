@@ -358,6 +358,7 @@ mod tests {
                 backend_kind: backend_kind.into(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         let mut auth_profiles = BTreeMap::new();

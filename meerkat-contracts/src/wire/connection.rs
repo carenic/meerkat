@@ -592,6 +592,7 @@ mod tests {
             backend_kind: "openai_api".into(),
             base_url: None,
             options: serde_json::Value::Null,
+            server: None,
         };
         let w: WireBackendProfile = (&bp).into();
         assert_eq!(w.provider, "openai");

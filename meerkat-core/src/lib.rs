@@ -72,6 +72,7 @@ pub mod retry;
 pub mod runtime_bootstrap;
 pub mod runtime_epoch;
 pub mod schema;
+pub mod self_hosted_binding;
 pub mod service;
 pub mod session;
 pub mod session_component_sidecar;
@@ -506,4 +507,9 @@ pub use connection::{
     RealmConfigSection, RealmConnectionSet, RealmId, ResolvedConnectionTarget, mob_realm_id,
     resolve_auth_binding_candidates_for_provider, resolve_auth_binding_or_default_for_provider,
     resolve_explicit_auth_binding_target, resolve_realm_binding_target_for_provider,
+};
+pub use self_hosted_binding::{
+    SelfHostedBindingCandidate, SelfHostedBindingServer, SelfHostedConnectionError,
+    resolve_self_hosted_binding_for_server, self_hosted_binding_server,
+    validate_explicit_self_hosted_target,
 };

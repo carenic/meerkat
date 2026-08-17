@@ -1838,6 +1838,7 @@ mod tests {
             backend_kind: "google_genai".into(),
             base_url: None,
             options: serde_json::Value::Null,
+            server: None,
         };
         let auth = AuthProfile {
             id: "auth".into(),
@@ -1884,6 +1885,7 @@ mod tests {
             backend_kind: backend_kind.into(),
             base_url: None,
             options: serde_json::Value::Null,
+            server: None,
         };
         let auth = AuthProfile {
             id: "managed".into(),
