@@ -1735,6 +1735,7 @@ rust_library(
     crate_root = "src/lib.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -1813,6 +1814,7 @@ rust_library(
     crate_root = "src/lib.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -1908,6 +1910,7 @@ rust_test(
     crate_root = "src/lib.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -1959,6 +1962,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat:meerkat_with_runtime_test_support",
         "//meerkat:meerkat_anthropic_agent_factory_build",
         "//meerkat:meerkat_atif_agent_factory_build",
         "//meerkat:meerkat_capabilities_agent_factory_build",
@@ -2004,6 +2008,7 @@ rust_test(
     crate_root = "tests/agent_builder_policy_canary.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -2134,6 +2139,7 @@ rust_test(
     crate_root = "tests/agent_factory_auth_binding.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -2230,6 +2236,7 @@ rust_test(
     crate_root = "tests/atif_reexport.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -2326,6 +2333,7 @@ rust_test(
     crate_root = "tests/catalog_control_agent_boundary.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -2422,6 +2430,7 @@ rust_test(
     crate_root = "tests/cold_restart_resume.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -2520,6 +2529,7 @@ rust_test(
     crate_root = "tests/cold_restart_resume_after_compaction.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -2618,6 +2628,7 @@ rust_test(
     crate_root = "tests/e2e_shell.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -2718,6 +2729,7 @@ rust_test(
     crate_root = "tests/embedded_skill_registration.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -2814,6 +2826,7 @@ rust_test(
     crate_root = "tests/factory_build_agent.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -2912,6 +2925,7 @@ rust_test(
     crate_root = "tests/integration.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -3011,6 +3025,7 @@ rust_test(
     crate_root = "tests/job_composition.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -3107,6 +3122,7 @@ rust_test(
     crate_root = "tests/job_delivery_projector.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -3202,6 +3218,7 @@ rust_test(
     crate_root = "tests/job_surface.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -3298,6 +3315,7 @@ rust_test(
     crate_root = "tests/live_meerkat_regression.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -3397,6 +3415,7 @@ rust_test(
     crate_root = "tests/live_meerkat_user_flows.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -3498,6 +3517,7 @@ rust_test(
     crate_root = "tests/live_pipeline_unit.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -3593,6 +3613,7 @@ rust_test(
     crate_root = "tests/live_video_uri_surface_smoke.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -3688,6 +3709,7 @@ rust_test(
     crate_root = "tests/persistence_contract.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -3784,6 +3806,7 @@ rust_test(
     crate_root = "tests/predicate_schedule.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -3880,6 +3903,7 @@ rust_test(
     crate_root = "tests/schedule_host_typed_mapping.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -3978,6 +4002,7 @@ rust_test(
     crate_root = "tests/sdk_agentfactory.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -4078,6 +4103,7 @@ rust_test(
     crate_root = "tests/sdk_config_ephemeral.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -4174,6 +4200,7 @@ rust_test(
     crate_root = "tests/sdk_structured_output.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -4271,6 +4298,7 @@ rust_test(
     crate_root = "tests/session_runtime_admission.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -4367,6 +4395,7 @@ rust_test(
     crate_root = "tests/session_runtime_builder.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -4463,6 +4492,7 @@ rust_test(
     crate_root = "tests/session_runtime_live_orchestration.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -4560,6 +4590,7 @@ rust_test(
     crate_root = "tests/session_runtime_llm_reconfigure.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -4656,6 +4687,7 @@ rust_test(
     crate_root = "tests/session_runtime_recovery.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -4752,6 +4784,7 @@ rust_test(
     crate_root = "tests/session_runtime_runtime_state.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -4848,6 +4881,7 @@ rust_test(
     crate_root = "tests/session_runtime_staged_promotion.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -4944,6 +4978,7 @@ rust_test(
     crate_root = "tests/smoke_meerkat_sdk.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",
@@ -5044,6 +5079,7 @@ rust_test(
     crate_root = "tests/storage_provider_seam.rs",
     crate_features = [
         "anthropic",
+        "atif",
         "comms",
         "gemini",
         "integration-real-tests",

@@ -2835,6 +2835,7 @@ dependencies = [
  "futures",
  "indexmap",
  "inventory",
+ "meerkat",
  "meerkat-anthropic",
  "meerkat-atif",
  "meerkat-capabilities",
