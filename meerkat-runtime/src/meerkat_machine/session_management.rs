@@ -3711,9 +3711,26 @@ impl MeerkatMachine {
                         // through its own owner.
                         let caller_owns_the_whole_registration =
                             expected_materialization_claim.is_none();
+                        // Registration can name no operation to retain, so it
+                        // enters disposal with no preservation request. A
+                        // non-terminal operation persists only on its terminal
+                        // transition and may therefore exist solely in this
+                        // process registry, where only an operation-aware
+                        // owner (the mob retire ladder, which passes an
+                        // OperationRetentionRequest) knows what to carry
+                        // across. Recovering here would trade a recoverable
+                        // brick for a silently dropped operation identity, so
+                        // a registration holding live operations keeps the
+                        // unchanged refusal and waits for that owner. An
+                        // unreadable registry refuses for the same reason.
+                        let discarding_this_shell_loses_no_operation = entry
+                            .ops_lifecycle
+                            .diagnostic_snapshot()
+                            .is_ok_and(|snapshot| snapshot.active_count == 0);
                         if minted_cold_reload
                             || !degraded_loop_released_its_executor
                             || !caller_owns_the_whole_registration
+                            || !discarding_this_shell_loses_no_operation
                         {
                             break ExistingExecutorClaim::Blocked(
                                 RuntimeDriverError::RecoveryRepairBlocked {

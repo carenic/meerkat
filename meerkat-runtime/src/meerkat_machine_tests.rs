@@ -44207,6 +44207,130 @@ async fn degraded_non_mob_registration_cold_reloads_instead_of_bricking() {
     );
 }
 
+/// The operation guard, pinned. Without this test the guard is unfalsifiable:
+/// deleting its clause from the refusal condition leaves every other test in
+/// this file green, which is how a plausible-but-unexercised guard ships.
+///
+/// The reroute disposes the degraded shell WITHOUT passing an
+/// `OperationRetentionRequest`, because registration has none to pass. A
+/// non-terminal operation may exist solely in the sealed process registry, so
+/// discarding a shell that still holds one drops operation identity the mob
+/// retire ladder would have preserved - the execution-custody-lost class. So a
+/// degraded registration holding live operations must keep the OLD refusal and
+/// wait for the operation-aware owner, even though the identical shell with no
+/// operations recovers.
+#[tokio::test]
+async fn degraded_registration_holding_live_operations_refuses_the_reroute() {
+    let machine = persistent_health_probe_machine();
+    let session_id = SessionId::new();
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    machine
+        .register_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+
+    // The only difference from the recovering case: this session owns a live
+    // operation.
+    let registry = machine
+        .ops_lifecycle_registry(&session_id)
+        .await
+        .expect("ops registry should exist for a registered session");
+    let operation_id = OperationId::new();
+    registry
+        .register_operation(OperationSpec {
+            id: operation_id.clone(),
+            kind: OperationKind::BackgroundToolOp,
+            owner_session_id: session_id.clone(),
+            display_name: "live op across a degraded reload".into(),
+            source_label: "meerkat_machine_test".into(),
+            operation_source: None,
+            child_session_id: None,
+            expect_peer_channel: false,
+        })
+        .expect("operation should register");
+    registry
+        .provisioning_succeeded(&operation_id)
+        .expect("operation should enter running");
+
+    assert!(
+        machine
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await,
+        "the fixture needs a genuinely degraded durability gate"
+    );
+
+    {
+        let mut sessions = machine.sessions.write().await;
+        let entry = sessions
+            .get_mut(&session_id)
+            .expect("registered session entry");
+        match &entry.attachment_slot {
+            RuntimeLoopAttachmentSlot::Pending(attachment)
+            | RuntimeLoopAttachmentSlot::Attached(attachment) => attachment.loop_handle.abort(),
+            RuntimeLoopAttachmentSlot::Empty => {
+                panic!("the fixture must have attached a real runtime loop")
+            }
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let sessions = machine.sessions.read().await;
+                let entry = sessions
+                    .get(&session_id)
+                    .expect("teardown must not remove a reload-required entry");
+                let finished = match &entry.attachment_slot {
+                    RuntimeLoopAttachmentSlot::Pending(attachment)
+                    | RuntimeLoopAttachmentSlot::Attached(attachment) => {
+                        attachment.loop_handle.is_finished()
+                    }
+                    RuntimeLoopAttachmentSlot::Empty => {
+                        panic!("blocked teardown must leave the dead shell in place")
+                    }
+                };
+                if finished {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the aborted loop task must actually finish");
+
+    // Same wedge as the recovering case - so the ONLY difference that can
+    // explain a different verdict is the live operation.
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(1),
+        "the session under test must actually owe a cold reload"
+    );
+    assert_eq!(
+        machine.dead_runtime_loop_session_count(),
+        Some(1),
+        "and it must actually be pointing at a dead loop"
+    );
+
+    let refused = machine
+        .register_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await;
+    assert!(
+        refused.is_err(),
+        "a degraded registration holding a live operation must NOT be rerouted: registration \
+         carries no OperationRetentionRequest, so disposing this shell would discard operation \
+         identity that only the sealed process registry holds"
+    );
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(1),
+        "the refusal must leave the degraded entry in place for the operation-aware owner, not \
+         half-dispose it"
+    );
+}
+
 /// `None` is the load-bearing half of both signatures, so it is pinned against
 /// the real condition it names rather than left as a documented intention.
 ///
