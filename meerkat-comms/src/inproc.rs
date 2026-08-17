@@ -623,6 +623,12 @@ impl InprocRegistry {
     /// inbox handoff — a second any-namespace lookup would open a window where
     /// the peer re-registers elsewhere and delivery crosses the namespace
     /// boundary.
+    // One argument over the lint's threshold, and the extra one is the
+    // `namespace` delivery authority that distinguishes this send from its
+    // any-namespace sibling. Bundling the envelope arguments into a params
+    // struct would only move the same values behind a name that adds no
+    // meaning, so the sibling signatures are kept identical instead.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_to_pubkey_in_namespace_with_id_wait(
         &self,
         namespace: &str,
