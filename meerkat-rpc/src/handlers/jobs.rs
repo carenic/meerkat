@@ -739,3 +739,97 @@ host_mutation!(
         value.acknowledged_at_ms
     )
 );
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::job_health_summary;
+    use meerkat::{JobHealthCoverage, JobHealthSnapshot};
+    use meerkat_contracts::JobHealthStatus;
+
+    fn healthy() -> JobHealthSnapshot {
+        JobHealthSnapshot {
+            queued: 2,
+            running: 1,
+            ..JobHealthSnapshot::default()
+        }
+    }
+
+    /// The one fold both `jobs/health` and `runtime/health` publish through,
+    /// pinned arm by arm.
+    ///
+    /// Two independent sub-reads, one rung, and the rule that decides it:
+    /// `Unreadable` outranks `Degraded` outranks `Ok`. The truncated arms are
+    /// the ones that matter - a census that stopped at its window must not
+    /// publish `degraded` either, because that asserts a specific wedge nobody
+    /// observed. Expectations are literals rather than values re-derived from
+    /// the function under test.
+    #[test]
+    fn the_two_delivery_reads_and_the_census_fold_worst_wins() {
+        assert_eq!(
+            job_health_summary(&healthy(), 0, 0).status,
+            JobHealthStatus::Ok
+        );
+        assert_eq!(
+            job_health_summary(&healthy(), 3, 0).status,
+            JobHealthStatus::Degraded,
+            "an undrained runtime inbox degrades on its own"
+        );
+        assert_eq!(
+            job_health_summary(
+                &JobHealthSnapshot {
+                    pending_outbox_jobs: 1,
+                    ..healthy()
+                },
+                0,
+                0
+            )
+            .status,
+            JobHealthStatus::Degraded,
+            "an owed outbox delivery degrades on its own"
+        );
+
+        let truncated = JobHealthSnapshot {
+            coverage: JobHealthCoverage::Truncated {
+                scanned: 10,
+                limit: 10,
+            },
+            ..healthy()
+        };
+        assert_eq!(
+            job_health_summary(&truncated, 0, 0).status,
+            JobHealthStatus::Unreadable,
+            "a census that stopped at its window established nothing"
+        );
+        assert_eq!(
+            job_health_summary(&truncated, 5, 0).status,
+            JobHealthStatus::Unreadable,
+            "unreadable outranks degraded: the unread rows may hold worse"
+        );
+    }
+
+    /// The two backlogs reach the wire separately.
+    ///
+    /// Merging them into one number - which `jobs/health` used to do by
+    /// summing - loses which side is wedged: work whose delivery was never
+    /// handed to a runtime is a different fault from a delivery a runtime
+    /// accepted and never drained.
+    #[test]
+    fn the_two_backlogs_are_reported_separately() {
+        let summary = job_health_summary(
+            &JobHealthSnapshot {
+                pending_outbox_jobs: 4,
+                ..healthy()
+            },
+            7,
+            2,
+        );
+        assert_eq!(summary.pending_outbox_jobs, 4);
+        assert_eq!(summary.runtime_inbox_backlog, 7);
+        assert_eq!(summary.awaiting_members, 2);
+        assert_eq!(
+            summary.coverage,
+            meerkat_contracts::JobHealthCoverage::Complete
+        );
+    }
+}
