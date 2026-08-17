@@ -5420,6 +5420,18 @@ async fn run_host_responder(
             Err(oneshot::error::TryRecvError::Empty) => {}
         }
     }
+
+    // HOST LOSS RELEASES ITS MEMBERS' PARTICIPANT ROUTES. Dropping the actor is
+    // not enough: each member route is held by its comms drain in a detached
+    // task, so the refcount never reaches zero and `Drop` never runs. Under the
+    // 0.8.24 one claim rule a successor may no longer rebind over a
+    // still-published name even holding the same durable identity, so without
+    // this an orphaned route refuses the very host that replaces it - and the
+    // successor has no handle to clear it. The supervisor axis already releases
+    // on shutdown; this is the member axis doing the same.
+    if let Some(materializer) = actor.materializer.as_mut() {
+        materializer.release_live_member_routes();
+    }
 }
 
 async fn certify_stale_pending_absent(
