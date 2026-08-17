@@ -329,13 +329,47 @@ them.
 
   The adapter now latches the derived `StopReason` instead of spending it,
   keeps consuming, emits `UsageUpdate` where it lands, and emits the single
-  terminal `Done` at `[DONE]` or end of stream. Two facts became typed to make
-  that expressible: `parse_chat_completions_line` returns
+  terminal `Done` at `[DONE]`, at end of stream, or when the post-finish
+  trailer window expires - whichever comes first. Two facts became typed to
+  make that expressible: `parse_chat_completions_line` returns
   `ChatCompletionsLine::{Chunk, Done, Ignored}` instead of an `Option` that
   collapsed "the turn is over" and "a line this adapter does not interpret"
   into one `None`; and the stop reason is a `latched_stop` spent exactly once.
   `ChatCompletionsChunk.choices` gains `#[serde(default)]` so a usage-only
   chunk deserializes.
+
+  **Latching the stop reason extended the read past `finish_reason`, so three
+  further shapes had to stop being able to destroy a delivered turn.** Every
+  byte in that new window is load-bearing, and none of it invalidates an answer
+  the caller has already read:
+  - **A bounded trailer window.** `DEFAULT_POST_FINISH_TRAILER_WINDOW` is 30s,
+    overridable per client with
+    `OpenAiCompatibleClient::with_post_finish_trailer_window`. It is ONE budget
+    measured from the latch instant and re-armed by nothing - notably not by
+    SSE keepalive comments, which carry no progress toward a trailer. Expiry is
+    END OF STREAM, never a turn failure. Without it, a server that holds the
+    connection open after finishing hung the turn indefinitely: there is no
+    HTTP client timeout, and keepalive comments re-arm the agent loop's stall
+    watchdog. 30s is deliberately an order of magnitude under the 300s
+    `stream_inactivity_timeout` so the two cannot race - equal windows would
+    have made the outcome a coin flip between this clean end-of-stream and the
+    loop's RETRYABLE `StreamStalled`.
+  - **A transport fault after the latch is end of stream, not failure.** A
+    truncated body once the answer is complete previously surfaced as
+    `ConnectionReset`, which is classified retryable - so the answer streamed,
+    the turn failed, and the retry answered again. That is the shape of the
+    defect above, on a different trigger.
+  - **A provider error envelope is typed.** `choices` gaining
+    `#[serde(default)]` made `{"object":"error",...}` and `{"error":{...}}`
+    decode as valid EMPTY chunks and fall into the ignore path, so a server
+    dying mid-stream presented as a SUCCESSFUL turn carrying truncated text.
+    `ChatCompletionsLine::ServerError` is now checked before chunk decoding.
+    Before the latch it fails the turn carrying the provider's own message
+    (the answer really is truncated); after the latch it does not (the answer
+    is complete and the engine is merely tearing down).
+
+  If usage never arrives at all, that stays an accounting fact owned
+  downstream - nothing here mints or substitutes accounting.
 
 - **Reasoning and content carried in the SAME delta are no longer emitted in
   reverse order** (`meerkat-openai`). A server emits both fields in one chunk
