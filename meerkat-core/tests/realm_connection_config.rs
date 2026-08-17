@@ -161,6 +161,7 @@ fn from_config_rejects_unknown_provider_name() {
             backend_kind: "openai_api".into(),
             base_url: None,
             options: serde_json::Value::Null,
+            server: None,
         },
     );
 
@@ -221,6 +222,7 @@ fn from_config_rejects_binding_pointing_at_missing_auth() {
             backend_kind: "openai_api".into(),
             base_url: None,
             options: serde_json::Value::Null,
+            server: None,
         },
     );
     section.binding.insert(
@@ -253,6 +255,7 @@ fn from_config_detects_provider_mismatch() {
             backend_kind: "openai_api".into(),
             base_url: None,
             options: serde_json::Value::Null,
+            server: None,
         },
     );
     section.auth.insert(

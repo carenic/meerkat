@@ -316,6 +316,7 @@ mod tests {
                     backend_kind: OpenAiBackendKind::OpenAiApi.as_str().to_string(),
                     base_url: None,
                     options: serde_json::Value::Null,
+                    server: None,
                 },
             );
             section.auth.insert(

@@ -382,6 +382,7 @@ mod tests {
                 backend_kind: "chatgpt_backend".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         global.auth.insert(

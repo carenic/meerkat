@@ -70,6 +70,7 @@ default_binding = "local"
 [realm.dev.backend.local]
 provider = "self_hosted"
 backend_kind = "self_hosted"
+server = "local"                           # the [self_hosted.servers.<id>] this key authenticates
 
 [realm.dev.auth.local_auth]
 provider = "self_hosted"
@@ -89,6 +90,34 @@ provider = "self_hosted"
 auth_method = "static_bearer"
 source = { kind = "env", env = "LOCAL_LLM_TOKEN" }
 ```
+
+### Which Binding Authenticates Which Server
+
+`self_hosted` is a provider **class**, not an endpoint identity: a private vLLM
+box and a hosted OpenAI-compatible gateway are both `self_hosted` and hold
+different secrets. Selecting a model therefore constrains credential resolution
+to the server that serves it - `[self_hosted.models.<alias>].server` - and not
+to whichever realm on the chain happens to declare a self-hosted default.
+
+A backend identifies its endpoint in one of two ways:
+
+| Declaration | Meaning |
+|-------------|---------|
+| `server = "<server_id>"` on the backend profile | Canonical. This binding authenticates that server. |
+| `default_model` on the binding | Inferred: the binding authenticates the server that serves its default model. Used for configs written before `server` existed. |
+
+A binding that declares neither is *unconstrained*: it is used only when it is
+the single unconstrained self-hosted binding reachable from the active realm, so
+one-server setups keep working with no annotation.
+
+When the server cannot be identified honestly - no binding names it, or several
+unconstrained bindings are reachable - the run fails closed with an error naming
+the server and every binding considered, rather than sending some other server's
+key and surfacing that endpoint's `Unauthorized`. Fix it by adding
+`server = "<server_id>"` to the backend profile that authenticates it, or by
+selecting the binding explicitly with `--auth-binding <realm>:<binding>`. An
+explicit selection wins, except when the named binding declares a *different*
+server: that contradiction fails closed too.
 
 ## Alias Shape
 
@@ -307,8 +336,9 @@ The expected result:
 - `rkat run -m ...` works without an explicit `--provider`.
 - The alias points at the exact upstream `remote_model` exposed by the server.
 
-If `rkat run` fails with "no canonical realm binding", add the
-[realm binding](#realm-binding) shown above.
+If `rkat run` fails with "no credential binding for self-hosted server", add the
+[realm binding](#realm-binding) shown above, and give its backend profile the
+`server = "<server_id>"` line so it names the endpoint it authenticates.
 
 ## See Also
 

@@ -132,6 +132,7 @@ mod tests {
                 backend_kind: "other_api".into(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             }),
             auth_lease: Arc::new(StaticLease::inline_secret(
                 "secret".into(),

@@ -5946,6 +5946,7 @@ fn ensure_cli_interactive_oauth_config(provider: LoginProvider, config: &mut Con
                 backend_kind: provider.backend_kind().to_string(),
                 base_url: provider.backend_base_url().map(str::to_string),
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         changed = true;
@@ -7424,39 +7425,19 @@ fn doctor_resolver_environment() -> meerkat_providers::ResolverEnvironment {
     env
 }
 
+/// Resolve the binding that authenticates THIS self-hosted server.
+///
+/// `doctor` probes each configured server in turn, so resolving by provider
+/// class would send one server's secret to every server's endpoint and report
+/// the far end's `401` as that server's health - the exact confusion this
+/// diagnostic exists to dispel.
 fn doctor_configured_self_hosted_target(
     config: &Config,
     preferred_realm: &meerkat_core::RealmId,
-) -> anyhow::Result<Option<meerkat_core::ResolvedConnectionTarget>> {
-    if config.realm.contains_key(preferred_realm.as_str()) {
-        let target = meerkat_core::resolve_realm_binding_target_for_provider(
-            config,
-            meerkat_core::Provider::SelfHosted,
-            Some(preferred_realm),
-            None,
-            None,
-            None,
-            false,
-        )
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "selected realm '{}' self_hosted credential binding is unavailable: {err}",
-                preferred_realm.as_str()
-            )
-        })?;
-        return Ok(Some(target));
-    }
-
-    match meerkat_core::resolve_auth_binding_or_default_for_provider(
-        config,
-        meerkat_core::Provider::SelfHosted,
-        None,
-        Some(preferred_realm),
-        false,
-    ) {
-        Ok(target) => Ok(Some(target)),
-        Err(_) => Ok(None),
-    }
+    server_id: &str,
+) -> anyhow::Result<meerkat_core::ResolvedConnectionTarget> {
+    meerkat_core::resolve_self_hosted_binding_for_server(config, server_id, Some(preferred_realm))
+        .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
 async fn resolve_doctor_self_hosted_probe_connection(
@@ -7465,12 +7446,7 @@ async fn resolve_doctor_self_hosted_probe_connection(
     server_id: &str,
     server: &meerkat_core::SelfHostedServerConfig,
 ) -> anyhow::Result<DoctorSelfHostedProbeConnection> {
-    let Some(target) = doctor_configured_self_hosted_target(config, preferred_realm)? else {
-        anyhow::bail!(
-            "self-hosted server '{server_id}' has no realm auth binding for provider self_hosted; \
-             configure a realm auth profile + binding (auth_binding) for this server"
-        );
-    };
+    let target = doctor_configured_self_hosted_target(config, preferred_realm, server_id)?;
     let (realm, auth_binding) = (target.realm, target.auth_binding);
 
     let connection = doctor_self_hosted_registry()
@@ -18079,6 +18055,7 @@ mod tests {
                 backend_kind: "openai_api".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -18616,6 +18593,7 @@ mod tests {
                 backend_kind: "chatgpt_backend".into(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -26620,6 +26598,7 @@ supports_reasoning = true
                 backend_kind: "google_code_assist".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -26677,6 +26656,7 @@ supports_reasoning = true
                 backend_kind: "google_code_assist".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(

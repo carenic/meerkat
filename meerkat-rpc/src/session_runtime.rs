@@ -13266,6 +13266,7 @@ mod tests {
                     .into(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(

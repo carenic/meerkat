@@ -40,6 +40,7 @@ fn test_binding() -> ValidatedBinding {
         backend_kind: "openai_api".into(),
         base_url: None,
         options: serde_json::Value::Null,
+        server: None,
     };
     let auth = AuthProfile {
         id: "host-oauth".into(),
@@ -481,6 +482,7 @@ async fn self_hosted_auth_binding_uses_registered_wasm_external_resolver() {
             backend_kind: "self_hosted".to_string(),
             base_url: Some("https://self-hosted.example/v1".to_string()),
             options: serde_json::Value::Null,
+            server: None,
         },
     );
     realm.auth.insert(

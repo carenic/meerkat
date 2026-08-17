@@ -35,6 +35,7 @@ fn sample_backend_profile() -> meerkat_core::BackendProfile {
         backend_kind: "openai_api".to_string(),
         base_url: Some("https://api.openai.com".to_string()),
         options: serde_json::json!({"region": "us-east-1"}),
+        server: None,
     }
 }
 

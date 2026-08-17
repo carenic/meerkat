@@ -684,6 +684,7 @@ mod tests {
                     .to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(

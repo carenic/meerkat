@@ -50,6 +50,7 @@ fn openai_realm_no_refresh(backend_kind: &str, auth_method: &str) -> RealmConnec
             backend_kind: backend_kind.into(),
             base_url: None,
             options: serde_json::json!({"realm_id": "dev"}),
+            server: None,
         },
     );
     let mut auth = BTreeMap::new();
@@ -104,6 +105,7 @@ fn openai_realm_with_source(
             backend_kind: backend_kind.into(),
             base_url: None,
             options: serde_json::json!({"realm_id": "dev"}),
+            server: None,
         },
     );
     let mut auth = BTreeMap::new();

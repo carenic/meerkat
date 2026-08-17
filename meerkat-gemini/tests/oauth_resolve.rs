@@ -36,6 +36,7 @@ fn code_assist_realm_no_refresh() -> RealmConnectionSet {
             backend_kind: "google_code_assist".into(),
             base_url: None,
             options: serde_json::json!({"realm_id": "dev", "project_id": "test-project"}),
+            server: None,
         },
     );
     let mut auth = BTreeMap::new();
@@ -86,6 +87,7 @@ fn code_assist_realm_with_source(source: CredentialSourceSpec) -> RealmConnectio
             backend_kind: "google_code_assist".into(),
             base_url: None,
             options: serde_json::json!({"realm_id": "dev", "project_id": "test-project"}),
+            server: None,
         },
     );
     let mut auth = BTreeMap::new();
