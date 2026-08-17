@@ -1206,7 +1206,13 @@ class AgentEventToolCallRequested(TypedDict, total=False):
 
 
 class AgentEventToolResultReceived(TypedDict, total=False):
-    """Tool result received (injected into conversation)
+    """Tool result received (injected into conversation).
+
+    The conversation-level fact for a tool call: this result entered the
+    transcript. [`AgentEvent::ToolExecutionCompleted`] is the paired
+    execution-level fact for the same `id` and currently carries a full
+    copy of these same blocks - see that variant before persisting both, or
+    a durable consumer stores every result body twice.
     """
     content: Required[list[ContentBlock]]
     id: Required[str]
@@ -1291,7 +1297,34 @@ class AgentEventToolExecutionStarted(TypedDict, total=False):
 
 
 class AgentEventToolExecutionCompleted(TypedDict, total=False):
-    """Tool execution completed
+    """Tool execution completed.
+
+    # This carries a SECOND COPY of the result body
+
+    This event and [`AgentEvent::ToolResultReceived`] are both emitted for
+    every tool call, and they differ by exactly one field: `duration_ms`.
+    Both carry the full `content` blocks. The two facts are genuinely
+    distinct and both deserve to exist - `ToolResultReceived` is the
+    CONVERSATION fact (this result was injected into the transcript),
+    this is the EXECUTION fact (the call finished, and here is how long it
+    took) - but the cost of the execution fact currently scales with the
+    size of the result rather than with the fact itself.
+
+    A consumer that durably persists BOTH events therefore stores every
+    tool result body twice. This is not hypothetical: it was measured
+    independently on two adopter fleets with different storage engines and
+    different payload shapes - a console frame store (~348 MB against
+    ~348 MB, pairwise-identical maxima, from 153 camera-tool calls) and a
+    warehouse events table (89,033 rows / 3.35 GB against 88,934 rows /
+    1.69 GB). Neither had configured it; both inherited it from this
+    vocabulary. Note it is a PER-CALL cost, not a scale problem: one tool
+    returning a large blob is enough.
+
+    `id` is present on both events and is already the join key. A consumer
+    persisting both should store the body once against `id` and join for
+    the execution fact, rather than capping bytes at its own writer - a cap
+    applied downstream still writes the body twice, only smaller, and every
+    consumer would have to reimplement it.
     """
     content: Required[list[ContentBlock]]
     duration_ms: Required[int]

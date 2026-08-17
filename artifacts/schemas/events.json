@@ -3348,7 +3348,7 @@
         "type": "object"
       },
       {
-        "description": "Tool result received (injected into conversation)",
+        "description": "Tool result received (injected into conversation).\n\nThe conversation-level fact for a tool call: this result entered the\ntranscript. [`AgentEvent::ToolExecutionCompleted`] is the paired\nexecution-level fact for the same `id` and currently carries a full\ncopy of these same blocks - see that variant before persisting both, or\na durable consumer stores every result body twice.",
         "properties": {
           "content": {
             "items": {
@@ -3470,10 +3470,10 @@
         "type": "object"
       },
       {
-        "description": "Tool execution completed",
+        "description": "Tool execution completed.\n\n# This carries a SECOND COPY of the result body\n\nThis event and [`AgentEvent::ToolResultReceived`] are both emitted for\nevery tool call, and they differ by exactly one field: `duration_ms`.\nBoth carry the full `content` blocks. The two facts are genuinely\ndistinct and both deserve to exist - `ToolResultReceived` is the\nCONVERSATION fact (this result was injected into the transcript),\nthis is the EXECUTION fact (the call finished, and here is how long it\ntook) - but the cost of the execution fact currently scales with the\nsize of the result rather than with the fact itself.\n\nA consumer that durably persists BOTH events therefore stores every\ntool result body twice. This is not hypothetical: it was measured\nindependently on two adopter fleets with different storage engines and\ndifferent payload shapes - a console frame store (~348 MB against\n~348 MB, pairwise-identical maxima, from 153 camera-tool calls) and a\nwarehouse events table (89,033 rows / 3.35 GB against 88,934 rows /\n1.69 GB). Neither had configured it; both inherited it from this\nvocabulary. Note it is a PER-CALL cost, not a scale problem: one tool\nreturning a large blob is enough.\n\n`id` is present on both events and is already the join key. A consumer\npersisting both should store the body once against `id` and join for\nthe execution fact, rather than capping bytes at its own writer - a cap\napplied downstream still writes the body twice, only smaller, and every\nconsumer would have to reimplement it.",
         "properties": {
           "content": {
-            "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.",
+            "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.\n\nDuplicates the blocks [`AgentEvent::ToolResultReceived`] carries\nfor the same `id`; see this variant's docs before persisting both.",
             "items": {
               "$ref": "#/$defs/ContentBlock"
             },
@@ -4793,7 +4793,7 @@
             "type": "object"
           },
           {
-            "description": "Tool result received (injected into conversation)",
+            "description": "Tool result received (injected into conversation).\n\nThe conversation-level fact for a tool call: this result entered the\ntranscript. [`AgentEvent::ToolExecutionCompleted`] is the paired\nexecution-level fact for the same `id` and currently carries a full\ncopy of these same blocks - see that variant before persisting both, or\na durable consumer stores every result body twice.",
             "properties": {
               "content": {
                 "items": {
@@ -4915,10 +4915,10 @@
             "type": "object"
           },
           {
-            "description": "Tool execution completed",
+            "description": "Tool execution completed.\n\n# This carries a SECOND COPY of the result body\n\nThis event and [`AgentEvent::ToolResultReceived`] are both emitted for\nevery tool call, and they differ by exactly one field: `duration_ms`.\nBoth carry the full `content` blocks. The two facts are genuinely\ndistinct and both deserve to exist - `ToolResultReceived` is the\nCONVERSATION fact (this result was injected into the transcript),\nthis is the EXECUTION fact (the call finished, and here is how long it\ntook) - but the cost of the execution fact currently scales with the\nsize of the result rather than with the fact itself.\n\nA consumer that durably persists BOTH events therefore stores every\ntool result body twice. This is not hypothetical: it was measured\nindependently on two adopter fleets with different storage engines and\ndifferent payload shapes - a console frame store (~348 MB against\n~348 MB, pairwise-identical maxima, from 153 camera-tool calls) and a\nwarehouse events table (89,033 rows / 3.35 GB against 88,934 rows /\n1.69 GB). Neither had configured it; both inherited it from this\nvocabulary. Note it is a PER-CALL cost, not a scale problem: one tool\nreturning a large blob is enough.\n\n`id` is present on both events and is already the join key. A consumer\npersisting both should store the body once against `id` and join for\nthe execution fact, rather than capping bytes at its own writer - a cap\napplied downstream still writes the body twice, only smaller, and every\nconsumer would have to reimplement it.",
             "properties": {
               "content": {
-                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.",
+                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.\n\nDuplicates the blocks [`AgentEvent::ToolResultReceived`] carries\nfor the same `id`; see this variant's docs before persisting both.",
                 "items": {
                   "$ref": "#/$defs/ContentBlock"
                 },
