@@ -826,6 +826,12 @@ pub enum SessionRegistrationRejectReasonKind {
     /// epoch: the registered entry was replaced underneath the caller.
     #[default]
     RuntimeEpochConflict,
+    /// The entry is inside its two-phase unregister drain window. This is a
+    /// RETRYABLE refusal, not a verdict that the session may never run again:
+    /// the open producer obligations named alongside it are what the caller
+    /// must wait for (or settle) before registration is legal. Never map this
+    /// to stale/replaced authority.
+    UnregisterTeardownInProgress,
 }
 
 /// Typed comms drain substate. Mirrors the closed set of literals the DSL
@@ -5186,6 +5192,12 @@ macro_rules! meerkat_catalog_machine_dsl {
                 reason: Enum<SessionRegistrationRejectReasonKind>,
                 registered_runtime_epoch_id: Option<RuntimeEpochId>,
                 attempted_runtime_epoch_id: Option<RuntimeEpochId>,
+                // The open producer obligations at refusal time. A teardown
+                // refusal that cannot name what is still draining is a warning,
+                // not a terminal outcome, so the verdict carries them.
+                unregister_runtime_loop_drain_pending: bool,
+                unregister_comms_drain_exit_pending: bool,
+                unregister_completion_waiter_drain_pending: bool,
             },
             OpLifecycleTransitionRejected {
                 operation_id: String,
@@ -7015,6 +7027,10 @@ macro_rules! meerkat_catalog_machine_dsl {
         // Draining is also excluded on every registration arm: it is the
         // machine-owned teardown tombstone that must fence service actor
         // rematerialization until final UnregisterSession removes the entry.
+        // That fence is NOT a guard rejection: arm 2e below owns the Draining
+        // verdict explicitly and names the still-open producer obligations, so
+        // the caller learns it may retry once teardown settles instead of
+        // reading an untyped "input validation failed".
         // Stopped is handled by the explicit revival arms below (2c/2d): a
         // stopped executor is a fact about the previous runtime epoch, so a
         // re-registration is the machine-owned resume intent, not a self-loop.
@@ -7097,8 +7113,54 @@ macro_rules! meerkat_catalog_machine_dsl {
                 session_id: session_id,
                 reason: SessionRegistrationRejectReasonKind::RuntimeEpochConflict,
                 registered_runtime_epoch_id: self.active_runtime_epoch_id,
-                attempted_runtime_epoch_id: runtime_epoch_id
+                attempted_runtime_epoch_id: runtime_epoch_id,
+                unregister_runtime_loop_drain_pending:
+                    self.unregister_runtime_loop_drain_pending,
+                unregister_comms_drain_exit_pending:
+                    self.unregister_comms_drain_exit_pending,
+                unregister_completion_waiter_drain_pending:
+                    self.unregister_completion_waiter_drain_pending
             }
+        }
+
+        // 2e. RegisterSessionRefusedUnregisterDraining: the machine-owned
+        // verdict for a registration that arrives inside the two-phase
+        // unregister drain window.
+        //
+        // Draining is deliberately absorbing FOR REGISTRATION - the five arms
+        // above all carry `not_draining`, and the only exit is the final
+        // `UnregisterSession` commit, which is itself guarded on every drain
+        // obligation being closed. That fence is correct: re-admitting a
+        // draining entry would move `registration_phase` off Draining while
+        // `RuntimeLoopStoppedForUnregister` / `CommsDrainExitedForUnregister` /
+        // `CompletionWaitersResolvedForUnregister` are still outstanding, and
+        // those three inputs are each guarded on `unregister_draining`. A
+        // producer that had not yet died would then find its own completion
+        // feedback unroutable - three named obligations abandoned outside the
+        // authority that owns them. So the escape from Draining is to CONCLUDE
+        // the drain, never to slip past it.
+        //
+        // What was missing is the verdict. Through 0.8.23 this arrived as
+        // `GuardRejected`, which surfaces as an untyped "input validation
+        // failed" and reads - correctly, from the caller's side - as "this
+        // session may never be registered again" (field, 0.8.23: a first turn
+        // that failed terminally left CLI shutdown warning "Unregister teardown
+        // is still in progress", and every later `--resume` died on
+        // "guard rejected transition from Idle for input::RegisterSession").
+        // An incomplete teardown is a warning about cleanup; it must not read
+        // as a permanent verdict on the session. This arm makes the refusal a
+        // typed, host-actionable outcome that names WHICH producer obligations
+        // are still open, so the caller can join or settle the owning teardown
+        // and retry.
+        //
+        // No state changes here: the drain window and its obligations belong to
+        // the unregister saga, and a refused registration must not perturb them.
+        transition RegisterSessionRefusedUnregisterDraining {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RegisterSession { session_id, runtime_epoch_id }
+            guard "unregister_draining" { self.registration_phase == RegistrationPhase::Draining }
+            update {}
+            to Idle
         }
 
         // 2c. RegisterSessionResumesStopped: the machine-owned re-admission
