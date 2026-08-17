@@ -4217,6 +4217,170 @@ async fn completed_boundary_commit_failure_stops_executor_without_false_durable_
     );
 }
 
+/// The non-mob half of the same durability contract, driven by the same real
+/// store fault and with no explicit disposal call anywhere in the test.
+///
+/// The test above proves disposal works when a caller explicitly asks for it.
+/// Nothing proved that an ordinary session ever gets that ask. A mob member
+/// does, through the retire ladder in
+/// meerkat-mob/src/runtime/provisioner.rs:2207. A CLI or RPC session has no
+/// such ladder, so the only caller it will ever have is registration itself -
+/// and registration used to answer a durability skew by handing the caller
+/// back a demand for a cold reload that only registration could mint. One
+/// durable fact, two consequences, decided by who owned the caller.
+///
+/// Built on the real fault deliberately. The reroute is guarded on the runtime
+/// loop's teardown state, and a hand-aborted loop is exactly how one would
+/// accidentally pin a state production never reaches.
+#[tokio::test]
+async fn degraded_registration_cold_reloads_through_the_ordinary_registration_path() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+
+    struct SuccessExecutor {
+        stop_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for SuccessExecutor {
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            self.stop_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let store = Arc::new(HarnessRuntimeStore::failing_atomic_apply());
+    let runtime_store: Arc<dyn RuntimeStore> = store.clone();
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        runtime_store,
+        memory_blob_store(),
+    ));
+    let sid = SessionId::new();
+    let stop_called = Arc::new(AtomicBool::new(false));
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(SuccessExecutor {
+                stop_called: Arc::clone(&stop_called),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+    let degraded_registration = adapter
+        .current_session_registration_witness(&sid)
+        .await
+        .expect("registered runtime should expose an exact registration witness");
+
+    adapter
+        .accept_input(&sid, make_prompt("loop boundary failure"))
+        .await
+        .unwrap();
+    wait_for_atomic_bool(
+        &stop_called,
+        "boundary commit failures should stop the dead executor path",
+    )
+    .await;
+
+    // Settle on the wedge itself rather than on the stop hook that precedes
+    // it, so this test pins a state instead of a moment. Both readings are the
+    // machine's own health vocabulary: the session owes a cold reload it
+    // cannot mint, and it is still registered pointing at a runtime loop that
+    // teardown refused to clear. Without this the test could race ahead of the
+    // loop's exit and report a scheduling accident as a verdict.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !(adapter.reload_required_session_count() == Some(1)
+            && adapter.dead_runtime_loop_session_count() == Some(1))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "a failed boundary commit must leave exactly the wedge this test exists for: one \
+         session owing a cold reload and still holding a dead runtime loop",
+    );
+
+    // The transient store fault is over. Durable truth is readable again, so a
+    // cold reload can succeed - which is precisely why leaving the session
+    // unusable would be a bookkeeping verdict rather than a real terminal.
+    store.set_fail_atomic_apply(false);
+
+    // The act under test, and the whole test: the ordinary registration entry
+    // point, called exactly as a CLI resume or an RPC re-attach calls it.
+    let recovered_stop_called = Arc::new(AtomicBool::new(false));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.register_session_with_executor(
+            sid.clone(),
+            Box::new(SuccessExecutor {
+                stop_called: Arc::clone(&recovered_stop_called),
+            }),
+        ),
+    )
+    .await
+    .expect("registration must not park on a degraded shell's disposal protocol")
+    .expect(
+        "registration owns the cold reload a durability-degraded session demands; refusing it \
+         here strands every non-mob session on a fault the machine can already recover from",
+    );
+
+    let cold_successor = adapter
+        .current_session_registration_witness(&sid)
+        .await
+        .expect("the recovered registration must expose an exact witness");
+    assert_ne!(
+        cold_successor, degraded_registration,
+        "recovery must publish a replacement registration cold-loaded from durable truth, not \
+         republish the unreadable shell as healthy"
+    );
+    assert_eq!(
+        adapter.reload_required_session_count(),
+        Some(0),
+        "the successor must be able to execute against durable state"
+    );
+    assert_eq!(
+        adapter.dead_runtime_loop_session_count(),
+        Some(0),
+        "and it must carry a live runtime loop rather than inherit the corpse"
+    );
+
+    // The successor is a working session, not merely a registered one.
+    adapter
+        .accept_input(&sid, make_prompt("post-recovery turn"))
+        .await
+        .expect("the recovered session must accept ordinary work again");
+}
+
 #[tokio::test]
 async fn persistent_machine_rejects_missing_durability_reload_cleanup_capability_before_publish() {
     use meerkat_core::lifecycle::core_executor::{
