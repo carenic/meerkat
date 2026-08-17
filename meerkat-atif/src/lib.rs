@@ -360,8 +360,14 @@ impl TrajectoryBuilder {
                 }),
             AgentEvent::TurnCompleted { usage, .. } => {
                 if let Some(turn) = pending.take() {
-                    append_agent_step(steps, turn, Some(usage));
-                    add_totals(&mut self.totals, usage);
+                    // An unaccounted turn is exported as a step with no usage
+                    // block and contributes nothing to the totals. Folding a
+                    // zero in would publish a measurement that was never made
+                    // and silently understate the trajectory's real cost.
+                    append_agent_step(steps, turn, usage.as_ref());
+                    if let Some(usage) = usage.as_ref() {
+                        add_totals(&mut self.totals, usage);
+                    }
                 }
             }
             AgentEvent::RunCompleted { result, .. } => {
@@ -720,7 +726,7 @@ mod tests {
                 None,
                 AgentEvent::TurnCompleted {
                     stop_reason: meerkat_core::StopReason::EndTurn,
-                    usage: TurnUsage::new(
+                    usage: Some(TurnUsage::new(
                         Usage {
                             input_tokens: 4,
                             output_tokens: 2,
@@ -729,7 +735,7 @@ mod tests {
                             provider_accounting: None,
                         },
                         meerkat_core::ProviderTokenAccounting::openai("test", 4),
-                    ),
+                    )),
                 },
             ),
         ];
@@ -830,7 +836,7 @@ mod tests {
                 None,
                 AgentEvent::TurnCompleted {
                     stop_reason: meerkat_core::StopReason::EndTurn,
-                    usage: TurnUsage::new(
+                    usage: Some(TurnUsage::new(
                         Usage {
                             input_tokens: 3,
                             output_tokens: 1,
@@ -839,7 +845,7 @@ mod tests {
                             provider_accounting: None,
                         },
                         meerkat_core::ProviderTokenAccounting::openai("test", 3),
-                    ),
+                    )),
                 },
             ),
             EventEnvelope::new_with_source(
@@ -950,10 +956,10 @@ mod tests {
                 None,
                 AgentEvent::TurnCompleted {
                     stop_reason: meerkat_core::StopReason::EndTurn,
-                    usage: TurnUsage::new(
+                    usage: Some(TurnUsage::new(
                         Usage::default(),
                         meerkat_core::ProviderTokenAccounting::openai("test", 0),
-                    ),
+                    )),
                 },
             ))
             .unwrap();

@@ -42,11 +42,31 @@ pub enum CompactionError {
     InvalidRebuild(String),
 }
 
+/// Normalize the compaction summary call's usage, reporting any identity
+/// dispute for routing rather than swallowing it.
+///
+/// Absent accounting still fails this call closed, and deliberately so: unlike
+/// the model turn, a refused compaction does not terminalize anything the
+/// caller has read. `Agent::maybe_compact` consumes the outcome as
+/// `if let Ok(outcome)`, so the failure preserves the untouched history and the
+/// run continues. The two sites therefore share a doctrine, not a verdict: each
+/// fault may only terminalize what it actually invalidates, and here that is
+/// one optional rewrite rather than a completed turn.
+///
+/// An identity dispute never refuses: the counters exist and are internally
+/// consistent, so they are charged exactly as reported and the dispute is
+/// returned for the caller to route.
 fn validated_compaction_summary_usage(
     usage: Usage,
     active_provider: crate::Provider,
     active_model: &str,
-) -> Result<TurnUsage, CompactionError> {
+) -> Result<
+    (
+        TurnUsage,
+        Option<crate::provider_evidence::DisputedTurnUsageAccountingIdentity>,
+    ),
+    CompactionError,
+> {
     let turn_usage = TurnUsage::try_from_usage(usage).map_err(|error| {
         CompactionError::LlmFailed(crate::error::AgentError::llm(
             active_provider.as_str(),
@@ -62,9 +82,15 @@ fn validated_compaction_summary_usage(
             error.to_string(),
         ))
     })?;
-    super::validate_provider_turn_usage_identity(&turn_usage, active_provider, active_model)
-        .map_err(CompactionError::LlmFailed)?;
-    Ok(turn_usage)
+    let dispute = match super::classify_provider_turn_usage_identity(
+        &turn_usage,
+        active_provider,
+        active_model,
+    ) {
+        super::TurnUsageIdentityVerdict::Agreed => None,
+        super::TurnUsageIdentityVerdict::Disputed(dispute) => Some(dispute),
+    };
+    Ok((turn_usage, dispute))
 }
 
 fn checked_offset(kind: &str, offset: u64, upper_bound: usize) -> Result<usize, CompactionError> {
@@ -649,6 +675,10 @@ where
     // 2/3. Produce the summary. A configured curator owns summary content
     // production outright: the summarization LLM call is skipped and a
     // curator failure is terminal for this compaction attempt (no fallback).
+    // Routed by the caller, which owns the session identity this dispute
+    // belongs to. A summary call charged under a foreign identity is still
+    // charged: only attribution is in question.
+    let mut summary_usage_identity_dispute = None;
     let (summary_text, summary_usage) = if let Some(curator) = curator {
         let curator_window = CompactionWindow {
             messages: model_messages,
@@ -725,11 +755,12 @@ where
                     }
                     return Err(CompactionError::EmptySummary);
                 }
-                let usage = validated_compaction_summary_usage(
+                let (usage, dispute) = validated_compaction_summary_usage(
                     result.usage().clone(),
                     client.provider(),
                     client.model(),
                 )?;
+                summary_usage_identity_dispute = dispute;
                 (summary, usage)
             }
             Err(e) if is_compaction_capacity_error(&e) => {
@@ -806,6 +837,7 @@ where
         new_messages: result.messages,
         discarded: result.discarded,
         summary_usage,
+        summary_usage_identity_dispute,
         session_boundary_index,
         messages_before: message_count,
         messages_after,
@@ -925,6 +957,11 @@ pub struct CompactionOutcome {
     pub discarded: Vec<CompactionDiscard>,
     /// Usage from the summary LLM call.
     pub summary_usage: TurnUsage,
+    /// Set when the summary call's accounting named a provider/model other
+    /// than the one requested. The usage above is charged exactly as reported;
+    /// the caller owns routing this dispute onto the session's event stream.
+    pub summary_usage_identity_dispute:
+        Option<crate::provider_evidence::DisputedTurnUsageAccountingIdentity>,
     /// Session boundary index at which compaction occurred.
     pub session_boundary_index: u64,
     /// Number of messages before compaction.
@@ -952,10 +989,86 @@ mod tests {
         (message, mapping)
     }
 
-    fn assert_compaction_usage_identity_rejected(usage: Usage) {
-        let error =
+    /// These two cases used to fail the compaction closed. They are now
+    /// reported disputes: the summary call happened and its counters are
+    /// internally consistent, so they are charged exactly as reported and the
+    /// contested attribution is handed back for routing. Refusing here would
+    /// discard a summary the provider already produced and paid for over a
+    /// disagreement about a name.
+    fn assert_compaction_usage_identity_disputed(
+        usage: Usage,
+        expected_reported_provider: crate::Provider,
+        expected_reported_model: &str,
+    ) {
+        let (turn_usage, dispute) =
             validated_compaction_summary_usage(usage, crate::Provider::OpenAI, "active-model")
-                .expect_err("compaction usage with a foreign identity must fail closed");
+                .expect("a contested identity must not fail the compaction");
+        let dispute = dispute.expect("the disagreement must be reported, not swallowed");
+        assert_eq!(dispute.active_provider, crate::Provider::OpenAI);
+        assert_eq!(dispute.active_model, "active-model");
+        assert_eq!(dispute.reported_provider, expected_reported_provider);
+        assert_eq!(
+            dispute.reported_model, expected_reported_model,
+            "the reported identity must survive verbatim"
+        );
+        assert_eq!(
+            turn_usage.presented_tokens(),
+            5,
+            "the disputed call is still charged exactly what it reported"
+        );
+    }
+
+    #[test]
+    fn compaction_summary_usage_disputes_wrong_provider() {
+        assert_compaction_usage_identity_disputed(
+            Usage {
+                input_tokens: 5,
+                output_tokens: 1,
+                provider_accounting: Some(crate::ProviderTokenAccounting::anthropic(
+                    "active-model",
+                    5,
+                    0,
+                    0,
+                )),
+                ..Usage::default()
+            },
+            crate::Provider::Anthropic,
+            "active-model",
+        );
+    }
+
+    #[test]
+    fn compaction_summary_usage_disputes_same_provider_wrong_model() {
+        assert_compaction_usage_identity_disputed(
+            Usage {
+                input_tokens: 5,
+                output_tokens: 1,
+                provider_accounting: Some(crate::ProviderTokenAccounting::openai("wrong-model", 5)),
+                ..Usage::default()
+            },
+            crate::Provider::OpenAI,
+            "wrong-model",
+        );
+    }
+
+    /// Absent accounting still fails the compaction closed, and that is a
+    /// different verdict for a reason: a refused compaction preserves the
+    /// untouched history and the run continues (`Agent::maybe_compact`
+    /// consumes this as `if let Ok(outcome)`), so nothing the caller has read
+    /// is terminalized. The model turn cannot say the same, which is why it
+    /// degrades instead.
+    #[test]
+    fn compaction_summary_usage_still_refuses_absent_accounting() {
+        let error = validated_compaction_summary_usage(
+            Usage {
+                input_tokens: 5,
+                output_tokens: 1,
+                ..Usage::default()
+            },
+            crate::Provider::OpenAI,
+            "active-model",
+        )
+        .expect_err("a compaction summary with no accounting is refused");
         assert!(matches!(
             error,
             CompactionError::LlmFailed(crate::error::AgentError::Llm {
@@ -963,31 +1076,6 @@ mod tests {
                 ..
             }) if provider_error.kind == crate::error::LlmProviderErrorKind::IncompleteResponse
         ));
-    }
-
-    #[test]
-    fn compaction_summary_usage_rejects_wrong_provider() {
-        assert_compaction_usage_identity_rejected(Usage {
-            input_tokens: 5,
-            output_tokens: 1,
-            provider_accounting: Some(crate::ProviderTokenAccounting::anthropic(
-                "active-model",
-                5,
-                0,
-                0,
-            )),
-            ..Usage::default()
-        });
-    }
-
-    #[test]
-    fn compaction_summary_usage_rejects_same_provider_wrong_model() {
-        assert_compaction_usage_identity_rejected(Usage {
-            input_tokens: 5,
-            output_tokens: 1,
-            provider_accounting: Some(crate::ProviderTokenAccounting::openai("wrong-model", 5)),
-            ..Usage::default()
-        });
     }
 
     #[test]

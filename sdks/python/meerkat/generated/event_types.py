@@ -498,6 +498,32 @@ class DiscardedCacheBreakpoint(TypedDict, total=False):
     reason: Required[CacheBreakpointDiscardReason]
 
 
+class DisputedTurnUsageAccountingIdentity(TypedDict, total=False):
+    """One turn's provider-authored accounting named a different provider/model
+    than the request it answered.
+
+    # Why this is not the same fault as absent accounting
+
+    A mismatched identity still arrives with a complete, internally consistent
+    measurement: the [`PresentedTokenConvention`] travels with the number, so
+    the counters mean what they say regardless of which name is attached. The
+    disputed fact is attribution alone, so the token axis still advances on the
+    number the provider actually sent. Absent accounting has no number at all
+    and therefore cannot advance anything. Collapsing the two would either kill
+    correct work over a name or fabricate counters over silence.
+
+    # Why the reported identity is preserved verbatim
+
+    Rewriting `reported_*` to the active identity would publish an agreement
+    that was never observed - a guess laundered as evidence. Both sides are
+    carried so a host can see exactly who disagreed with whom.
+    """
+    active_model: Required[str]
+    active_provider: Required[Provider]
+    reported_model: Required[str]
+    reported_provider: Required[Provider]
+
+
 class HookFailureReasonTimeout(TypedDict, total=False):
     """The hook runtime did not complete within its configured timeout.
     """
@@ -1004,6 +1030,36 @@ class TurnUsage(TypedDict, total=False):
     provider_accounting: NotRequired[Optional[ProviderTokenAccounting]]
 
 
+class UnmeasuredTurnUsageAccounting(TypedDict, total=False):
+    """Provider token accounting for one model turn was absent.
+
+    # What this makes untrue, and what it does not
+
+    A provider that streams a complete answer and no usage event has stated
+    nothing about tokens. The turn's SEMANTIC facts - what the model said,
+    which tools it asked for, what may be committed to the transcript - are
+    untouched by that silence, so this absence terminalizes none of them. Only
+    the accounting axis is affected, and it is affected by being left exactly
+    where it was: no counter advances, no per-call row is published, and no
+    value is substituted for the one the provider did not send.
+
+    This value states the absence and nothing more. It does not assert that the
+    turn completed: the turn's own terminal fact has its own owner, and a turn
+    whose accounting went missing can still fail afterwards on unrelated
+    grounds.
+
+    # Why the identity here is not accounting
+
+    `provider` and `model` name the REQUEST this turn was lowered for. They are
+    the address of the missing measurement, not a reconstruction of it, and
+    carry no counters. This is exactly the line
+    [`ProviderTokenAccounting::host_declared`] would cross: it would mint
+    provider attribution for numbers no provider issued.
+    """
+    model: Required[str]
+    provider: Required[Provider]
+
+
 class AgentEventRunStarted(TypedDict, total=False):
     """Agent run started
     """
@@ -1160,11 +1216,70 @@ class AgentEventToolResultReceived(TypedDict, total=False):
 
 
 class AgentEventTurnCompleted(TypedDict, total=False):
-    """Turn completed
+    """Turn completed.
+
+    # Why `usage` is optional
+
+    This event states one semantic fact - a model turn reached its terminal
+    and its assistant message is committed - and carries one accounting
+    fact beside it. The two have different owners and different failure
+    modes: a provider stream that ends without ever sending a usage event
+    has said nothing about tokens while having said everything about the
+    answer. Absence is therefore representable here, because the only
+    alternatives are to fabricate counters no provider issued or to
+    suppress the completion of a turn the caller has already read.
+
+    `usage: None` means exactly "no accounting exists for this turn": no
+    counter advanced, and no per-call row should be reconciled for it. The
+    paired [`AgentEvent::TurnUsageAccountingUnmeasured`] carries the
+    explanation (which provider and model went unaccounted); this field
+    owns only the number's presence or absence. Consumers must skip an
+    absent row, never treat it as zero.
     """
     stop_reason: Required[StopReason]
     type: Required[Literal['turn_completed']]
-    usage: Required[TurnUsage]
+    usage: NotRequired[Optional[TurnUsage]]
+
+
+class AgentEventTurnUsageAccountingUnmeasured(TypedDict, total=False):
+    """One model turn's provider token accounting was absent.
+
+    The routed form of the `unmeasured:turn_usage_accounting` marker. It
+    states exactly one thing: the provider stream for this turn carried no
+    normalized accounting, so no accounting axis advanced for it - no
+    budget charge, no session usage, no presented-token update.
+
+    It deliberately does NOT claim the turn completed. This is published at
+    the model boundary, before the boundary effects and terminal hooks that
+    can still fail the turn on their own (unrelated) grounds, and the
+    absence of accounting is true either way. Whether the turn completed is
+    owned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the
+    turns this marker names - and a turn that fails afterwards publishes
+    its own terminal fact.
+
+    What this is not is a cause of failure. A number nobody has cannot
+    invalidate an answer the user has already read; see
+    [`crate::UnmeasuredTurnUsageAccounting`].
+    """
+    session_id: Required[SessionId]
+    type: Required[Literal['turn_usage_accounting_unmeasured']]
+    unmeasured: Required[UnmeasuredTurnUsageAccounting]
+
+
+class AgentEventTurnUsageAccountingIdentityDisputed(TypedDict, total=False):
+    """One model turn's accounting named a provider/model other than the
+    request it answered.
+
+    The routed form of the `disputed:turn_usage_accounting_identity`
+    marker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the
+    counters exist and are internally consistent, so the token axis still
+    advances on them; what is in dispute is attribution. The reported
+    identity is published exactly as the adapter minted it and is never
+    rewritten to the active identity.
+    """
+    dispute: Required[DisputedTurnUsageAccountingIdentity]
+    session_id: Required[SessionId]
+    type: Required[Literal['turn_usage_accounting_identity_disputed']]
 
 
 class AgentEventToolExecutionStarted(TypedDict, total=False):
@@ -1381,7 +1496,7 @@ class AgentEventPeerContentIngested(TypedDict, total=False):
 # Events emitted during agent execution
 #
 # These events form the streaming API for consumers.
-AgentEvent = AgentEventRunStarted | AgentEventRunCompleted | AgentEventExtractionSucceeded | AgentEventExtractionFailed | AgentEventRunFailed | AgentEventHookStarted | AgentEventHookCompleted | AgentEventHookFailed | AgentEventHookDenied | AgentEventTurnStarted | AgentEventReasoningDelta | AgentEventReasoningComplete | AgentEventTextDelta | AgentEventTextComplete | AgentEventServerToolContent | AgentEventAssistantImageAppended | AgentEventToolCallRequested | AgentEventToolResultReceived | AgentEventTurnCompleted | AgentEventToolExecutionStarted | AgentEventToolExecutionCompleted | AgentEventToolExecutionTimedOut | AgentEventCompactionStarted | AgentEventCompactionCompleted | AgentEventCompactionFailed | AgentEventBudgetWarning | AgentEventRetrying | AgentEventSkillsResolved | AgentEventSkillResolutionFailed | AgentEventInteractionComplete | AgentEventInteractionCallbackPending | AgentEventInteractionFailed | AgentEventStreamTruncated | AgentEventToolConfigChanged | AgentEventBackgroundJobCompleted | AgentEventTranscriptRewriteCommitted | AgentEventTranscriptRewriteAuditReceiptCommitted | AgentEventProviderCacheBreakpointsDiscarded | AgentEventPeerContentIngested
+AgentEvent = AgentEventRunStarted | AgentEventRunCompleted | AgentEventExtractionSucceeded | AgentEventExtractionFailed | AgentEventRunFailed | AgentEventHookStarted | AgentEventHookCompleted | AgentEventHookFailed | AgentEventHookDenied | AgentEventTurnStarted | AgentEventReasoningDelta | AgentEventReasoningComplete | AgentEventTextDelta | AgentEventTextComplete | AgentEventServerToolContent | AgentEventAssistantImageAppended | AgentEventToolCallRequested | AgentEventToolResultReceived | AgentEventTurnCompleted | AgentEventTurnUsageAccountingUnmeasured | AgentEventTurnUsageAccountingIdentityDisputed | AgentEventToolExecutionStarted | AgentEventToolExecutionCompleted | AgentEventToolExecutionTimedOut | AgentEventCompactionStarted | AgentEventCompactionCompleted | AgentEventCompactionFailed | AgentEventBudgetWarning | AgentEventRetrying | AgentEventSkillsResolved | AgentEventSkillResolutionFailed | AgentEventInteractionComplete | AgentEventInteractionCallbackPending | AgentEventInteractionFailed | AgentEventStreamTruncated | AgentEventToolConfigChanged | AgentEventBackgroundJobCompleted | AgentEventTranscriptRewriteCommitted | AgentEventTranscriptRewriteAuditReceiptCommitted | AgentEventProviderCacheBreakpointsDiscarded | AgentEventPeerContentIngested
 
 
 class StreamScopeFramePrimary(TypedDict, total=False):

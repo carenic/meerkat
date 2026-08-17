@@ -1104,6 +1104,35 @@
         ],
         "type": "object"
       },
+      "DisputedTurnUsageAccountingIdentity": {
+        "additionalProperties": false,
+        "description": "One turn's provider-authored accounting named a different provider/model\nthan the request it answered.\n\n# Why this is not the same fault as absent accounting\n\nA mismatched identity still arrives with a complete, internally consistent\nmeasurement: the [`PresentedTokenConvention`] travels with the number, so\nthe counters mean what they say regardless of which name is attached. The\ndisputed fact is attribution alone, so the token axis still advances on the\nnumber the provider actually sent. Absent accounting has no number at all\nand therefore cannot advance anything. Collapsing the two would either kill\ncorrect work over a name or fabricate counters over silence.\n\n# Why the reported identity is preserved verbatim\n\nRewriting `reported_*` to the active identity would publish an agreement\nthat was never observed - a guess laundered as evidence. Both sides are\ncarried so a host can see exactly who disagreed with whom.",
+        "properties": {
+          "active_model": {
+            "description": "Model of the request this turn was lowered for.",
+            "type": "string"
+          },
+          "active_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request this turn was lowered for."
+          },
+          "reported_model": {
+            "description": "Model the accounting claims, exactly as the adapter minted it.",
+            "type": "string"
+          },
+          "reported_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider the accounting claims, exactly as the adapter minted it."
+          }
+        },
+        "required": [
+          "active_provider",
+          "active_model",
+          "reported_provider",
+          "reported_model"
+        ],
+        "type": "object"
+      },
       "ExternalToolDeltaPhase": {
         "description": "Canonical lifecycle phase for external-tool boundary deltas.",
         "enum": [
@@ -2833,6 +2862,25 @@
         ],
         "type": "object"
       },
+      "UnmeasuredTurnUsageAccounting": {
+        "additionalProperties": false,
+        "description": "Provider token accounting for one model turn was absent.\n\n# What this makes untrue, and what it does not\n\nA provider that streams a complete answer and no usage event has stated\nnothing about tokens. The turn's SEMANTIC facts - what the model said,\nwhich tools it asked for, what may be committed to the transcript - are\nuntouched by that silence, so this absence terminalizes none of them. Only\nthe accounting axis is affected, and it is affected by being left exactly\nwhere it was: no counter advances, no per-call row is published, and no\nvalue is substituted for the one the provider did not send.\n\nThis value states the absence and nothing more. It does not assert that the\nturn completed: the turn's own terminal fact has its own owner, and a turn\nwhose accounting went missing can still fail afterwards on unrelated\ngrounds.\n\n# Why the identity here is not accounting\n\n`provider` and `model` name the REQUEST this turn was lowered for. They are\nthe address of the missing measurement, not a reconstruction of it, and\ncarry no counters. This is exactly the line\n[`ProviderTokenAccounting::host_declared`] would cross: it would mint\nprovider attribution for numbers no provider issued.",
+        "properties": {
+          "model": {
+            "description": "Model of the request that produced the unaccounted turn.",
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request that produced the unaccounted turn."
+          }
+        },
+        "required": [
+          "provider",
+          "model"
+        ],
+        "type": "object"
+      },
       "Usage": {
         "description": "Token usage statistics.\n\n# The same field names carry two different denominators\n\nThis shape is reused for two semantically different accounts, and\n`input_tokens` does not mean the same thing in both:\n\n- **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw\n  provider counters for exactly one provider request. For Anthropic\n  `input_tokens` is the *uncached* input only, with cache-write and\n  cache-read input reported separately in `cache_creation_tokens` and\n  `cache_read_tokens`. The normalized presented-input total for that one\n  call is [`TurnUsage::presented_tokens`].\n- **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a\n  running total over every provider call recorded on the *session*, not on\n  one run. Its `input_tokens` is the saturating sum of each call's\n  *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache\n  detail fields are always `None` because their relationship to the input\n  total is provider-specific.\n\n# What consumers must not sum\n\n- Never sum `run_completed.usage` with per-call usage, and never sum\n  `run_completed.usage` across runs: each value is already the whole\n  session's total to date, so adding two of them double-counts everything\n  before the later one. Take the latest value.\n- Never sum per-call `input_tokens` and expect it to match\n  `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the\n  two use different denominators and will not agree. Sum\n  `turn_completed.usage.accounting.presented_tokens` (that is,\n  [`TurnUsage::presented_tokens`]) instead, which is exactly what\n  [`CumulativeUsage::add_turn`] does.\n- Do not expect the per-call rows to reconcile with the cumulative account\n  either. Intermediate tool-loop calls, the structured-output extraction\n  call, and the compaction summary call are all charged to the cumulative\n  account and publish no `turn_completed` row, so the rows cover a strict\n  subset of the tokens.\n\nThe worked example lives in `docs/reference/usage-accounting.mdx`. Its\nnumbers are pinned against the agent loop by\n`turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`\n(`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's\narithmetic by `cumulative_usage_matches_documented_aggregation_example`.",
         "properties": {
@@ -3332,7 +3380,7 @@
         "type": "object"
       },
       {
-        "description": "Turn completed",
+        "description": "Turn completed.\n\n# Why `usage` is optional\n\nThis event states one semantic fact - a model turn reached its terminal\nand its assistant message is committed - and carries one accounting\nfact beside it. The two have different owners and different failure\nmodes: a provider stream that ends without ever sending a usage event\nhas said nothing about tokens while having said everything about the\nanswer. Absence is therefore representable here, because the only\nalternatives are to fabricate counters no provider issued or to\nsuppress the completion of a turn the caller has already read.\n\n`usage: None` means exactly \"no accounting exists for this turn\": no\ncounter advanced, and no per-call row should be reconciled for it. The\npaired [`AgentEvent::TurnUsageAccountingUnmeasured`] carries the\nexplanation (which provider and model went unaccounted); this field\nowns only the number's presence or absence. Consumers must skip an\nabsent row, never treat it as zero.",
         "properties": {
           "stop_reason": {
             "$ref": "#/$defs/StopReason"
@@ -3342,13 +3390,61 @@
             "type": "string"
           },
           "usage": {
-            "$ref": "#/$defs/TurnUsage"
+            "anyOf": [
+              {
+                "$ref": "#/$defs/TurnUsage"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
           "type",
-          "stop_reason",
-          "usage"
+          "stop_reason"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "One model turn's provider token accounting was absent.\n\nThe routed form of the `unmeasured:turn_usage_accounting` marker. It\nstates exactly one thing: the provider stream for this turn carried no\nnormalized accounting, so no accounting axis advanced for it - no\nbudget charge, no session usage, no presented-token update.\n\nIt deliberately does NOT claim the turn completed. This is published at\nthe model boundary, before the boundary effects and terminal hooks that\ncan still fail the turn on their own (unrelated) grounds, and the\nabsence of accounting is true either way. Whether the turn completed is\nowned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the\nturns this marker names - and a turn that fails afterwards publishes\nits own terminal fact.\n\nWhat this is not is a cause of failure. A number nobody has cannot\ninvalidate an answer the user has already read; see\n[`crate::UnmeasuredTurnUsageAccounting`].",
+        "properties": {
+          "session_id": {
+            "$ref": "#/$defs/SessionId"
+          },
+          "type": {
+            "const": "turn_usage_accounting_unmeasured",
+            "type": "string"
+          },
+          "unmeasured": {
+            "$ref": "#/$defs/UnmeasuredTurnUsageAccounting"
+          }
+        },
+        "required": [
+          "type",
+          "session_id",
+          "unmeasured"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "One model turn's accounting named a provider/model other than the\nrequest it answered.\n\nThe routed form of the `disputed:turn_usage_accounting_identity`\nmarker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the\ncounters exist and are internally consistent, so the token axis still\nadvances on them; what is in dispute is attribution. The reported\nidentity is published exactly as the adapter minted it and is never\nrewritten to the active identity.",
+        "properties": {
+          "dispute": {
+            "$ref": "#/$defs/DisputedTurnUsageAccountingIdentity"
+          },
+          "session_id": {
+            "$ref": "#/$defs/SessionId"
+          },
+          "type": {
+            "const": "turn_usage_accounting_identity_disputed",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "session_id",
+          "dispute"
         ],
         "type": "object"
       },
@@ -4729,7 +4825,7 @@
             "type": "object"
           },
           {
-            "description": "Turn completed",
+            "description": "Turn completed.\n\n# Why `usage` is optional\n\nThis event states one semantic fact - a model turn reached its terminal\nand its assistant message is committed - and carries one accounting\nfact beside it. The two have different owners and different failure\nmodes: a provider stream that ends without ever sending a usage event\nhas said nothing about tokens while having said everything about the\nanswer. Absence is therefore representable here, because the only\nalternatives are to fabricate counters no provider issued or to\nsuppress the completion of a turn the caller has already read.\n\n`usage: None` means exactly \"no accounting exists for this turn\": no\ncounter advanced, and no per-call row should be reconciled for it. The\npaired [`AgentEvent::TurnUsageAccountingUnmeasured`] carries the\nexplanation (which provider and model went unaccounted); this field\nowns only the number's presence or absence. Consumers must skip an\nabsent row, never treat it as zero.",
             "properties": {
               "stop_reason": {
                 "$ref": "#/$defs/StopReason"
@@ -4739,13 +4835,61 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/$defs/TurnUsage"
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TurnUsage"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
               "type",
-              "stop_reason",
-              "usage"
+              "stop_reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's provider token accounting was absent.\n\nThe routed form of the `unmeasured:turn_usage_accounting` marker. It\nstates exactly one thing: the provider stream for this turn carried no\nnormalized accounting, so no accounting axis advanced for it - no\nbudget charge, no session usage, no presented-token update.\n\nIt deliberately does NOT claim the turn completed. This is published at\nthe model boundary, before the boundary effects and terminal hooks that\ncan still fail the turn on their own (unrelated) grounds, and the\nabsence of accounting is true either way. Whether the turn completed is\nowned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the\nturns this marker names - and a turn that fails afterwards publishes\nits own terminal fact.\n\nWhat this is not is a cause of failure. A number nobody has cannot\ninvalidate an answer the user has already read; see\n[`crate::UnmeasuredTurnUsageAccounting`].",
+            "properties": {
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_unmeasured",
+                "type": "string"
+              },
+              "unmeasured": {
+                "$ref": "#/$defs/UnmeasuredTurnUsageAccounting"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "unmeasured"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's accounting named a provider/model other than the\nrequest it answered.\n\nThe routed form of the `disputed:turn_usage_accounting_identity`\nmarker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the\ncounters exist and are internally consistent, so the token axis still\nadvances on them; what is in dispute is attribution. The reported\nidentity is published exactly as the adapter minted it and is never\nrewritten to the active identity.",
+            "properties": {
+              "dispute": {
+                "$ref": "#/$defs/DisputedTurnUsageAccountingIdentity"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_identity_disputed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "dispute"
             ],
             "type": "object"
           },
@@ -6018,6 +6162,35 @@
           "provider",
           "model",
           "boundary"
+        ],
+        "type": "object"
+      },
+      "DisputedTurnUsageAccountingIdentity": {
+        "additionalProperties": false,
+        "description": "One turn's provider-authored accounting named a different provider/model\nthan the request it answered.\n\n# Why this is not the same fault as absent accounting\n\nA mismatched identity still arrives with a complete, internally consistent\nmeasurement: the [`PresentedTokenConvention`] travels with the number, so\nthe counters mean what they say regardless of which name is attached. The\ndisputed fact is attribution alone, so the token axis still advances on the\nnumber the provider actually sent. Absent accounting has no number at all\nand therefore cannot advance anything. Collapsing the two would either kill\ncorrect work over a name or fabricate counters over silence.\n\n# Why the reported identity is preserved verbatim\n\nRewriting `reported_*` to the active identity would publish an agreement\nthat was never observed - a guess laundered as evidence. Both sides are\ncarried so a host can see exactly who disagreed with whom.",
+        "properties": {
+          "active_model": {
+            "description": "Model of the request this turn was lowered for.",
+            "type": "string"
+          },
+          "active_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request this turn was lowered for."
+          },
+          "reported_model": {
+            "description": "Model the accounting claims, exactly as the adapter minted it.",
+            "type": "string"
+          },
+          "reported_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider the accounting claims, exactly as the adapter minted it."
+          }
+        },
+        "required": [
+          "active_provider",
+          "active_model",
+          "reported_provider",
+          "reported_model"
         ],
         "type": "object"
       },
@@ -7793,6 +7966,25 @@
         ],
         "type": "object"
       },
+      "UnmeasuredTurnUsageAccounting": {
+        "additionalProperties": false,
+        "description": "Provider token accounting for one model turn was absent.\n\n# What this makes untrue, and what it does not\n\nA provider that streams a complete answer and no usage event has stated\nnothing about tokens. The turn's SEMANTIC facts - what the model said,\nwhich tools it asked for, what may be committed to the transcript - are\nuntouched by that silence, so this absence terminalizes none of them. Only\nthe accounting axis is affected, and it is affected by being left exactly\nwhere it was: no counter advances, no per-call row is published, and no\nvalue is substituted for the one the provider did not send.\n\nThis value states the absence and nothing more. It does not assert that the\nturn completed: the turn's own terminal fact has its own owner, and a turn\nwhose accounting went missing can still fail afterwards on unrelated\ngrounds.\n\n# Why the identity here is not accounting\n\n`provider` and `model` name the REQUEST this turn was lowered for. They are\nthe address of the missing measurement, not a reconstruction of it, and\ncarry no counters. This is exactly the line\n[`ProviderTokenAccounting::host_declared`] would cross: it would mint\nprovider attribution for numbers no provider issued.",
+        "properties": {
+          "model": {
+            "description": "Model of the request that produced the unaccounted turn.",
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request that produced the unaccounted turn."
+          }
+        },
+        "required": [
+          "provider",
+          "model"
+        ],
+        "type": "object"
+      },
       "Usage": {
         "description": "Token usage statistics.\n\n# The same field names carry two different denominators\n\nThis shape is reused for two semantically different accounts, and\n`input_tokens` does not mean the same thing in both:\n\n- **Per-call** ([`TurnUsage`], carried by `turn_completed.usage`): raw\n  provider counters for exactly one provider request. For Anthropic\n  `input_tokens` is the *uncached* input only, with cache-write and\n  cache-read input reported separately in `cache_creation_tokens` and\n  `cache_read_tokens`. The normalized presented-input total for that one\n  call is [`TurnUsage::presented_tokens`].\n- **Cumulative** ([`CumulativeUsage`], carried by `run_completed.usage`): a\n  running total over every provider call recorded on the *session*, not on\n  one run. Its `input_tokens` is the saturating sum of each call's\n  *presented* tokens (see [`CumulativeUsage::add_turn`]), and its cache\n  detail fields are always `None` because their relationship to the input\n  total is provider-specific.\n\n# What consumers must not sum\n\n- Never sum `run_completed.usage` with per-call usage, and never sum\n  `run_completed.usage` across runs: each value is already the whole\n  session's total to date, so adding two of them double-counts everything\n  before the later one. Take the latest value.\n- Never sum per-call `input_tokens` and expect it to match\n  `run_completed.usage.input_tokens`. On a cache-heavy Anthropic session the\n  two use different denominators and will not agree. Sum\n  `turn_completed.usage.accounting.presented_tokens` (that is,\n  [`TurnUsage::presented_tokens`]) instead, which is exactly what\n  [`CumulativeUsage::add_turn`] does.\n- Do not expect the per-call rows to reconcile with the cumulative account\n  either. Intermediate tool-loop calls, the structured-output extraction\n  call, and the compaction summary call are all charged to the cumulative\n  account and publish no `turn_completed` row, so the rows cover a strict\n  subset of the tokens.\n\nThe worked example lives in `docs/reference/usage-accounting.mdx`. Its\nnumbers are pinned against the agent loop by\n`turn_rows_cover_one_call_while_the_run_total_is_session_cumulative`\n(`meerkat-core/src/agent/usage_accounting_tests.rs`) and against this type's\narithmetic by `cumulative_usage_matches_documented_aggregation_example`.",
         "properties": {
@@ -7886,6 +8078,8 @@
       "tool_call_requested",
       "tool_result_received",
       "turn_completed",
+      "turn_usage_accounting_unmeasured",
+      "turn_usage_accounting_identity_disputed",
       "tool_execution_started",
       "tool_execution_completed",
       "tool_execution_timed_out",

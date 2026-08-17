@@ -382,6 +382,33 @@ export type DiscardedCacheBreakpoint = {
 };
 
 /**
+ * One turn's provider-authored accounting named a different provider/model
+ * than the request it answered.
+ *
+ * # Why this is not the same fault as absent accounting
+ *
+ * A mismatched identity still arrives with a complete, internally consistent
+ * measurement: the [`PresentedTokenConvention`] travels with the number, so
+ * the counters mean what they say regardless of which name is attached. The
+ * disputed fact is attribution alone, so the token axis still advances on the
+ * number the provider actually sent. Absent accounting has no number at all
+ * and therefore cannot advance anything. Collapsing the two would either kill
+ * correct work over a name or fabricate counters over silence.
+ *
+ * # Why the reported identity is preserved verbatim
+ *
+ * Rewriting `reported_*` to the active identity would publish an agreement
+ * that was never observed - a guess laundered as evidence. Both sides are
+ * carried so a host can see exactly who disagreed with whom.
+ */
+export interface DisputedTurnUsageAccountingIdentity {
+  active_model: string;
+  active_provider: Provider;
+  reported_model: string;
+  reported_provider: Provider;
+}
+
+/**
  * Typed reason a hook execution failed (engine-level fault, not a guardrail
  * denial).
  *
@@ -732,6 +759,37 @@ export type TurnUsage = {
 };
 
 /**
+ * Provider token accounting for one model turn was absent.
+ *
+ * # What this makes untrue, and what it does not
+ *
+ * A provider that streams a complete answer and no usage event has stated
+ * nothing about tokens. The turn's SEMANTIC facts - what the model said,
+ * which tools it asked for, what may be committed to the transcript - are
+ * untouched by that silence, so this absence terminalizes none of them. Only
+ * the accounting axis is affected, and it is affected by being left exactly
+ * where it was: no counter advances, no per-call row is published, and no
+ * value is substituted for the one the provider did not send.
+ *
+ * This value states the absence and nothing more. It does not assert that the
+ * turn completed: the turn's own terminal fact has its own owner, and a turn
+ * whose accounting went missing can still fail afterwards on unrelated
+ * grounds.
+ *
+ * # Why the identity here is not accounting
+ *
+ * `provider` and `model` name the REQUEST this turn was lowered for. They are
+ * the address of the missing measurement, not a reconstruction of it, and
+ * carry no counters. This is exactly the line
+ * [`ProviderTokenAccounting::host_declared`] would cross: it would mint
+ * provider attribution for numbers no provider issued.
+ */
+export interface UnmeasuredTurnUsageAccounting {
+  model: string;
+  provider: Provider;
+}
+
+/**
  * Events emitted during agent execution
  *
  * These events form the streaming API for consumers.
@@ -822,7 +880,15 @@ export type AgentEvent = {
 } | {
   stop_reason: StopReason;
   type: "turn_completed";
-  usage: TurnUsage;
+  usage?: TurnUsage | null;
+} | {
+  session_id: SessionId;
+  type: "turn_usage_accounting_unmeasured";
+  unmeasured: UnmeasuredTurnUsageAccounting;
+} | {
+  dispute: DisputedTurnUsageAccountingIdentity;
+  session_id: SessionId;
+  type: "turn_usage_accounting_identity_disputed";
 } | {
   id: string;
   name: string;

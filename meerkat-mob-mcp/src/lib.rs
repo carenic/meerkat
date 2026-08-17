@@ -3628,11 +3628,11 @@ impl SessionService for LocalSessionService {
                 None,
                 AgentEvent::TurnCompleted {
                     stop_reason: meerkat_core::types::StopReason::EndTurn,
-                    usage: meerkat_core::TurnUsage::host_declared(
+                    usage: Some(meerkat_core::TurnUsage::host_declared(
                         meerkat_core::Provider::Other,
                         "mob-mcp-test-agent",
                         turn_usage,
-                    ),
+                    )),
                 },
             ));
             let _ = event_tx.send(EventEnvelope::new_session(

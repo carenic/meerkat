@@ -387,7 +387,11 @@ function handleEvent(event: AgentEvent): string {
     case 'turn_started':
       return `turn ${event.turn_number}`;
     case 'turn_completed':
-      return `${event.stop_reason} ${event.usage.input_tokens}+${event.usage.output_tokens}`;
+      // `usage` is absent when the provider accounted for nothing; an
+      // unaccounted turn is still a completed turn.
+      return event.usage
+        ? `${event.stop_reason} ${event.usage.input_tokens}+${event.usage.output_tokens}`
+        : `${event.stop_reason} unmeasured`;
     case 'run_completed':
       return event.result;
     case 'run_failed':

@@ -490,11 +490,11 @@ fn agent_event_all_variants_roundtrip() {
         },
         AgentEvent::TurnCompleted {
             stop_reason: StopReason::EndTurn,
-            usage: meerkat_core::TurnUsage::host_declared(
+            usage: Some(meerkat_core::TurnUsage::host_declared(
                 meerkat_core::Provider::Other,
                 "wire-test",
                 Usage::default(),
-            ),
+            )),
         },
         AgentEvent::ToolExecutionStarted {
             id: "tc2".to_string(),
@@ -744,11 +744,11 @@ fn documented_event_catalog_covers_core_agent_event_discriminators() {
         },
         AgentEvent::TurnCompleted {
             stop_reason: StopReason::EndTurn,
-            usage: meerkat_core::TurnUsage::host_declared(
+            usage: Some(meerkat_core::TurnUsage::host_declared(
                 meerkat_core::Provider::Other,
                 "wire-test",
                 Usage::default(),
-            ),
+            )),
         },
         AgentEvent::ToolExecutionStarted {
             id: "tool-1".to_string(),

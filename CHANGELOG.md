@@ -45,6 +45,25 @@ them.
 - **`meerkat_llm_core::FactoryError` gains a `SelfHostedBinding` variant**
   carrying the new `meerkat_core::SelfHostedConnectionError`. Exhaustive matches
   on `FactoryError` must add the arm.
+- **`AgentEvent` gains two variants**, `TurnUsageAccountingUnmeasured` and
+  `TurnUsageAccountingIdentityDisputed`. The enum is `#[non_exhaustive]`, so a
+  match with a wildcard arm keeps compiling; both discriminators are added to
+  `meerkat_contracts::KNOWN_AGENT_EVENT_TYPES` and to every generated SDK
+  inventory, without which a version-matched Python/TypeScript client would
+  reject them as `UNKNOWN_EVENT_TYPE`.
+
+- **`AgentEvent::TurnCompleted.usage` is now `Option<TurnUsage>`** (was
+  `TurnUsage`), and `meerkat_core::agent`'s internal
+  `validate_provider_turn_usage_identity` is replaced by
+  `classify_provider_turn_usage_identity` returning a `TurnUsageIdentityVerdict`
+  instead of a `Result`. `agent::compact::CompactionOutcome` gains
+  `summary_usage_identity_dispute`. On the wire the measured case is unchanged:
+  `usage` is skipped when absent, so every existing `turn_completed` row
+  serializes byte-for-byte as before. Consumers that unconditionally read
+  `event.usage` must handle the absent case, and must SKIP it rather than fold
+  it in as zero. The Python and TypeScript SDKs type it optional
+  (`TurnCompleted.usage: Usage | None`, `TurnCompletedEvent.usage?: Usage`).
+
 - **`meerkat::surface::RUNTIME_HEALTH_DIMENSIONS` is now `[&str; 5]`** (was
   `[&str; 4]`). The declared runtime-health coverage gains `session_run_start`;
   downstream code binding the constant by its exact array type must add the new
@@ -234,6 +253,38 @@ them.
   in the handler doc rather than left to be discovered: a turn that BEGINS and
   then produces nothing (mid-turn progress) is a distinct dimension with no
   probe and no declared name yet.
+- **A completed turn is no longer killed because token accounting was absent.**
+  A provider stream that ends without ever sending a usage event used to fail
+  the turn - after the caller had already streamed and read the answer, and
+  before the assistant message was committed, so the transcript lost a turn the
+  user had seen. The absent number is an accounting fact, and a fault may only
+  terminalize what it actually invalidates: the turn now completes, the
+  assistant message commits, and the absence is published as a typed marker.
+  `turn_completed` carries no `usage`, and a companion
+  `turn_usage_accounting_unmeasured` event names the provider and model that
+  went unaccounted under the operator marker `unmeasured:turn_usage_accounting`
+  (the vocabulary `runtime/health` already publishes). That marker claims only
+  the absence and that no axis moved for it; whether the turn completed stays
+  owned by `turn_completed`, because the marker is published at the model
+  boundary and a turn can still fail after it on unrelated grounds. The token
+  axis does not move: nothing is charged to the budget, nothing is added to
+  session usage, and `last_input_tokens` keeps the value the last measured turn
+  left. Nothing is substituted for the missing measurement - not raw
+  `input_tokens` (a different denominator on cache-heavy sessions) and not
+  `TurnUsage::host_declared` (which would mint provider attribution for
+  counters no provider issued). Budget enforcement on measured turns is
+  unchanged.
+
+- **A turn-usage accounting identity mismatch is now disputed, not fatal.** The
+  counters in that case exist and are internally consistent - the
+  presented-token convention travels with the number - so only attribution is
+  in question. The number is recorded and the token axis advances as usual,
+  while a `turn_usage_accounting_identity_disputed` event publishes BOTH the
+  active and the reported provider/model under the marker
+  `disputed:turn_usage_accounting_identity`. The reported identity is never
+  rewritten to the active one: an agreement nobody observed is worse than a
+  stated disagreement. The same classification now routes the compaction
+  summary call's accounting identity instead of failing the compaction.
 
 - **`runtime/health` measures `session_run_start` on both surfaces** (JSON-RPC
   `runtime/health` and REST `GET /runtime/health`): `degraded` while any
