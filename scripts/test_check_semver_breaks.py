@@ -126,25 +126,32 @@ class ReportParsingTests(unittest.TestCase):
             (
                 "enum_variant_missing",
                 "variant RegistrationOutcome::ReboundOwnName, previously in file "
-                "/Users/luka/Library/Caches/meerkat-comms-0.8.23/src/inproc.rs:110",
+                "/Users/luka/Library/Caches/rust-workspaces/meerkat-7f595016ca/"
+                "cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/"
+                "meerkat-comms-0.8.23/src/inproc.rs:110",
                 ("RegistrationOutcome", "ReboundOwnName"),
             ),
             (
                 "inherent_method_missing",
                 "JobHealthSnapshot::is_degraded, previously in file "
-                "/Users/luka/Library/Caches/meerkat-jobs-0.8.23/src/types.rs:761",
+                "/Users/luka/Library/Caches/rust-workspaces/meerkat-7f595016ca/"
+                "cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/"
+                "meerkat-jobs-0.8.23/src/types.rs:761",
                 ("JobHealthSnapshot", "is_degraded"),
             ),
             (
                 "struct_pub_field_missing",
                 "field delivery_backlog of struct JobHealthSummary, previously in file "
-                "/Users/luka/Library/Caches/meerkat-contracts-0.8.23/src/wire/jobs.rs:293",
+                "/Users/luka/Library/Caches/rust-workspaces/meerkat-7f595016ca/"
+                "cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/"
+                "meerkat-contracts-0.8.23/src/wire/jobs.rs:293",
                 ("JobHealthSummary", "delivery_backlog"),
             ),
             (
                 "trait_method_added",
                 "trait method meerkat_jobs::DetachedJobStore::count_pending_outbox_jobs "
-                "in file /Users/luka/meerkat/meerkat-jobs/src/store.rs:167",
+                "in file /Users/luka/.codex/worktrees/release-0824/meerkat/"
+                "meerkat-jobs/src/store.rs:167",
                 ("DetachedJobStore", "count_pending_outbox_jobs"),
             ),
         ]
