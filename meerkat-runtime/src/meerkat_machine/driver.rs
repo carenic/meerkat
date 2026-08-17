@@ -2263,8 +2263,34 @@ impl DriverEntry {
                             batch_key,
                             outbox.candidate_digest.clone(),
                             outbox.completion_input_ids_digest.clone(),
+                            matches!(
+                                &outbox.phase,
+                                crate::input_state::InteractionTerminalOutboxPhase::Published { .. }
+                            ),
                         )
                     })
+            })
+            .collect::<std::collections::HashSet<_>>();
+        // Whether the batch has a directed outbox at all drives the existing
+        // recovery plumbing. Whether that outbox is still UNPUBLISHED is a
+        // different question, and it is the one that decides whether dropping
+        // the batch would swallow a user-visible terminal event.
+        let unpublished_interaction_terminal_batch_identities =
+            interaction_terminal_batch_identities
+                .iter()
+                .filter(|(_, _, _, published)| !*published)
+                .map(|(batch_key, candidate_digest, input_ids_digest, _)| {
+                    (
+                        batch_key.clone(),
+                        candidate_digest.clone(),
+                        input_ids_digest.clone(),
+                    )
+                })
+                .collect::<std::collections::HashSet<_>>();
+        let interaction_terminal_batch_identities = interaction_terminal_batch_identities
+            .into_iter()
+            .map(|(batch_key, candidate_digest, input_ids_digest, _)| {
+                (batch_key, candidate_digest, input_ids_digest)
             })
             .collect::<std::collections::HashSet<_>>();
         let mut grouped = std::collections::HashMap::<
@@ -2291,26 +2317,92 @@ impl DriverEntry {
                     .push(completion);
             }
         }
-        let mut pending_run_id: Option<RunId> = None;
-        let mut batches = Vec::new();
-        for (batch_key, mut rows) in grouped {
+        // Validate every group and drop the finalized ones BEFORE any
+        // disposition is taken, and iterate in a deterministic order: the
+        // correlatable choice below must not depend on hash-map iteration.
+        let mut grouped_batches = grouped.into_iter().collect::<Vec<_>>();
+        grouped_batches.sort_by_key(|(batch_key, _)| batch_key.audit_key());
+        let mut pending_batches = Vec::with_capacity(grouped_batches.len());
+        for (batch_key, mut rows) in grouped_batches {
             rows.sort_by_key(|row| row.batch_ordinal);
-            let owner = validate_input_terminal_completion_batch(&rows)
-                .map_err(|reason| RuntimeDriverError::RecoveryCorruption { reason })?;
-            if matches!(&owner.phase, InputTerminalCompletionPhase::Finalized { .. }) {
+            let owner_finalized = {
+                let owner = validate_input_terminal_completion_batch(&rows)
+                    .map_err(|reason| RuntimeDriverError::RecoveryCorruption { reason })?;
+                matches!(&owner.phase, InputTerminalCompletionPhase::Finalized { .. })
+            };
+            if owner_finalized {
                 continue;
             }
-            if let Some(run_id) = batch_key.run_id() {
-                if let Some(existing) = pending_run_id.as_ref()
-                    && existing != run_id
-                {
-                    return Err(RuntimeDriverError::RecoveryCorruption {
+            pending_batches.push((batch_key, rows));
+        }
+
+        // The completion correlation is a single slot, and these rows carry no
+        // runtime-binding identity (unlike InteractionTerminalOutbox, which
+        // carries owner_fence_token / owner_runtime_generation /
+        // owner_runtime_epoch_id), so two pending run-scoped batches cannot be
+        // ordered against each other. One is the ordinary case and re-binds
+        // exactly as before. Two or more means the machine cannot know which
+        // run its recovered terminal facts belong to, so none is offered for
+        // re-binding and each is classified on its own merits. Runless
+        // (RuntimeTermination) batches never contend for the slot -
+        // ResolveRuntimeCompletionResultRuntimeTerminated carries no run
+        // correlation guard - so they are always re-bindable.
+        //
+        // Before this, the loop below simply refused: two distinct pending runs
+        // raised RecoveryCorruption and the runtime could not recover at all.
+        // That is the failure an adopter member hit in production.
+        let run_scoped_pending = pending_batches
+            .iter()
+            .filter(|(batch_key, _)| batch_key.run_id().is_some())
+            .count();
+
+        let mut batches = Vec::new();
+        for (batch_key, rows) in pending_batches {
+            let owner = validate_input_terminal_completion_batch(&rows)
+                .map_err(|reason| RuntimeDriverError::RecoveryCorruption { reason })?;
+            let batch_audit_key = batch_key.audit_key();
+            let directed_publication_pending = unpublished_interaction_terminal_batch_identities
+                .contains(&(
+                    batch_key.clone(),
+                    owner.candidate_digest.clone(),
+                    owner.completion_input_ids_digest.clone(),
+                ));
+            let disposition = machine_classify_recovered_terminal_completion_batch(
+                &batch_audit_key,
+                batch_key.run_id().is_none() || run_scoped_pending == 1,
+                owner.candidate.is_some(),
+                directed_publication_pending,
+            )?;
+            match disposition {
+                crate::meerkat_machine::dsl::RecoveredTerminalCompletionDisposition::Recover => {}
+                crate::meerkat_machine::dsl::RecoveredTerminalCompletionDisposition::DiscardUnrecoverable => {
+                    let reason = machine_declare_recovered_terminal_completion_unrecoverable(
+                        &batch_audit_key,
+                        if owner.candidate.is_some() {
+                            crate::meerkat_machine::dsl::RecoveredTerminalCompletionUnrecoverableReasonKind::UncorrelatableRun
+                        } else {
+                            crate::meerkat_machine::dsl::RecoveredTerminalCompletionUnrecoverableReasonKind::OwnerCandidatePayloadLost
+                        },
+                    )?;
+                    tracing::warn!(
+                        batch = %batch_audit_key,
+                        reason = %reason,
+                        "recovery discarded an unrecoverable terminal completion batch"
+                    );
+                    continue;
+                }
+                crate::meerkat_machine::dsl::RecoveredTerminalCompletionDisposition::Blocked => {
+                    let reason = machine_declare_recovered_terminal_completion_unrecoverable(
+                        &batch_audit_key,
+                        crate::meerkat_machine::dsl::RecoveredTerminalCompletionUnrecoverableReasonKind::DirectedPublicationUnresolved,
+                    )?;
+                    return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                        evidence_digest: None,
                         reason: format!(
-                            "terminal completion recovery found pending batches for distinct runs {existing} and {run_id}"
+                            "terminal completion batch {batch_audit_key} cannot be recovered: {reason}"
                         ),
                     });
                 }
-                pending_run_id = Some(run_id.clone());
             }
             let candidate =
                 owner
@@ -6077,6 +6169,107 @@ pub(crate) fn machine_apply_recovered_input_normalization(
     }
 
     Ok(delta)
+}
+
+/// Generated disposition authority for one recovered pending terminal-completion
+/// batch. Recovery may not retain, drop, or refuse a batch on its own reading of
+/// the durable evidence; it presents the facts and consumes the verdict.
+pub(crate) fn machine_classify_recovered_terminal_completion_batch(
+    batch_audit_key: &str,
+    correlatable: bool,
+    owner_candidate_present: bool,
+    directed_publication_pending: bool,
+) -> Result<crate::meerkat_machine::dsl::RecoveredTerminalCompletionDisposition, RuntimeDriverError>
+{
+    let mut authority = crate::meerkat_machine::dsl::MeerkatMachineAuthority::new();
+    let transition = crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        crate::meerkat_machine::dsl::MeerkatMachineInput::ClassifyRecoveredTerminalCompletionBatch {
+            batch_key: batch_audit_key.to_string(),
+            correlatable,
+            owner_candidate_present,
+            directed_publication_pending,
+        },
+    )
+    .map_err(|err| {
+        RuntimeDriverError::Internal(format!(
+            "ClassifyRecoveredTerminalCompletionBatch rejected batch '{batch_audit_key}': {err:?}"
+        ))
+    })?;
+
+    let Some((effect_batch_key, disposition)) =
+        transition.into_effects().into_iter().find_map(|effect| match effect {
+            crate::meerkat_machine::dsl::MeerkatMachineEffect::RecoveredTerminalCompletionBatchClassified {
+                batch_key,
+                disposition,
+            } => Some((batch_key, disposition)),
+            _ => None,
+        })
+    else {
+        return Err(RuntimeDriverError::Internal(format!(
+            "ClassifyRecoveredTerminalCompletionBatch emitted no disposition for '{batch_audit_key}'"
+        )));
+    };
+
+    if effect_batch_key != batch_audit_key {
+        return Err(RuntimeDriverError::Internal(format!(
+            "ClassifyRecoveredTerminalCompletionBatch returned batch '{effect_batch_key}' for \
+             '{batch_audit_key}'"
+        )));
+    }
+
+    Ok(disposition)
+}
+
+/// Machine-owned terminal for a recovered batch that will not be carried
+/// forward. Both non-`Recover` dispositions pass through here, so the reason a
+/// batch was dropped or refused is generated authority rather than shell prose
+/// (Rule 8: a discard with no named outcome is a warning, not a terminal).
+pub(crate) fn machine_declare_recovered_terminal_completion_unrecoverable(
+    batch_audit_key: &str,
+    reason: crate::meerkat_machine::dsl::RecoveredTerminalCompletionUnrecoverableReasonKind,
+) -> Result<
+    crate::meerkat_machine::dsl::RecoveredTerminalCompletionUnrecoverableReasonKind,
+    RuntimeDriverError,
+> {
+    let mut authority = crate::meerkat_machine::dsl::MeerkatMachineAuthority::new();
+    let transition = crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        crate::meerkat_machine::dsl::MeerkatMachineInput::DeclareRecoveredTerminalCompletionUnrecoverable {
+            batch_key: batch_audit_key.to_string(),
+            reason,
+        },
+    )
+    .map_err(|err| {
+        RuntimeDriverError::Internal(format!(
+            "DeclareRecoveredTerminalCompletionUnrecoverable rejected batch \
+             '{batch_audit_key}': {err:?}"
+        ))
+    })?;
+
+    let Some((effect_batch_key, declared)) =
+        transition.into_effects().into_iter().find_map(|effect| match effect {
+            crate::meerkat_machine::dsl::MeerkatMachineEffect::RecoveredTerminalCompletionDeclaredUnrecoverable {
+                batch_key,
+                reason,
+            } => Some((batch_key, reason)),
+            _ => None,
+        })
+    else {
+        return Err(RuntimeDriverError::Internal(format!(
+            "DeclareRecoveredTerminalCompletionUnrecoverable emitted no terminal for \
+             '{batch_audit_key}'"
+        )));
+    };
+
+    if effect_batch_key != batch_audit_key {
+        return Err(RuntimeDriverError::Internal(format!(
+            "DeclareRecoveredTerminalCompletionUnrecoverable returned batch \
+             '{effect_batch_key}' for '{batch_audit_key}'"
+        )));
+    }
+
+    Ok(declared)
 }
 
 pub(crate) fn machine_classify_recovered_input_durability(

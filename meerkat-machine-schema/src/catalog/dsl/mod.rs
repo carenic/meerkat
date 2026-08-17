@@ -2218,6 +2218,18 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 &["Retain", "Discard"],
             ),
             NamedTypeBinding::string_enum(
+                "RecoveredTerminalCompletionDisposition",
+                &["Recover", "DiscardUnrecoverable", "Blocked"],
+            ),
+            NamedTypeBinding::string_enum(
+                "RecoveredTerminalCompletionUnrecoverableReasonKind",
+                &[
+                    "UncorrelatableRun",
+                    "OwnerCandidatePayloadLost",
+                    "DirectedPublicationUnresolved",
+                ],
+            ),
+            NamedTypeBinding::string_enum(
                 "RecoveredRunApplyBoundary",
                 &["RunStart", "RunCheckpoint", "Immediate"],
             ),

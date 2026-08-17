@@ -44823,3 +44823,153 @@ async fn overdue_run_start_session_count_sees_a_wedged_staged_run() {
          the moment the authority is readable"
     );
 }
+// ---------------------------------------------------------------------------
+// Unfinalizable pending terminal-completion batches.
+//
+// The completion correlation is a single slot and every
+// `ResolveRuntimeCompletionResult*` arm is guarded on it, so clearing the slot
+// for a new run permanently un-resolves the previous run's durable
+// terminal-completion batch. These tests pin the two halves of the fix: the
+// producer no longer moves the slot off an unresolved run, and recovery has a
+// generated disposition for batches that can never be re-bound.
+// ---------------------------------------------------------------------------
+
+fn dsl_run_failed_input(run_id: &str) -> mm_dsl::MeerkatMachineInput {
+    mm_dsl::MeerkatMachineInput::RunFailed {
+        run_id: mm_dsl::RunId(run_id.to_string()),
+        runtime_apply_failure_cause: None,
+        runtime_apply_failure_message: None,
+        machine_terminal_failure_observed: false,
+        terminal_failure_source: Some(mm_dsl::RunFailureSourceKind::Llm),
+        error: "cache breakpoint prefix mismatch".to_string(),
+    }
+}
+
+fn dsl_prepare_run(
+    authority: &mut mm_dsl::MeerkatMachineAuthority,
+    session_id: &str,
+    run_id: &str,
+) {
+    mm_dsl::MeerkatMachineMutator::apply(
+        authority,
+        mm_dsl::MeerkatMachineInput::Prepare {
+            session_id: mm_dsl::SessionId(session_id.to_string()),
+            run_id: mm_dsl::RunId(run_id.to_string()),
+        },
+    )
+    .unwrap_or_else(|error| panic!("Prepare for {run_id} must be admitted: {error:?}"));
+}
+
+fn dsl_fail_run_back_to_idle(authority: &mut mm_dsl::MeerkatMachineAuthority, run_id: &str) {
+    mm_dsl::MeerkatMachineMutator::apply(authority, dsl_run_failed_input(run_id))
+        .unwrap_or_else(|error| panic!("RunFailed for {run_id} must be admitted: {error:?}"));
+    mm_dsl::MeerkatMachineMutator::apply(
+        authority,
+        mm_dsl::MeerkatMachineInput::Fail {
+            run_id: mm_dsl::RunId(run_id.to_string()),
+        },
+    )
+    .unwrap_or_else(|error| panic!("Fail for {run_id} must return the lifecycle: {error:?}"));
+}
+
+fn dsl_resolve_completion(
+    authority: &mut mm_dsl::MeerkatMachineAuthority,
+    run_id: &str,
+) -> Result<(), String> {
+    mm_dsl::MeerkatMachineMutator::apply(
+        authority,
+        mm_dsl::MeerkatMachineInput::ResolveRuntimeCompletionResult {
+            run_id: Some(mm_dsl::RunId(run_id.to_string())),
+            terminal: mm_dsl::RuntimeCompletionTerminalObservation::NoResult,
+            finalization: mm_dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| format!("{error:?}"))
+}
+
+#[test]
+fn starting_a_new_run_must_not_orphan_the_previous_runs_completion_batch() {
+    let session = "session-completion-orphan";
+    let mut authority = registered_dsl_authority_for_session(session);
+
+    // Run 1 terminalizes on the fail lane. Its terminal commit stages a durable
+    // terminal-completion batch and binds the correlation to run-1.
+    dsl_prepare_run(&mut authority, session, "run-1");
+    dsl_fail_run_back_to_idle(&mut authority, "run-1");
+
+    // Run 2 starts before run-1's completion has been published. Through
+    // 0.8.23 this cleared the correlation slot and run-1's batch became
+    // permanently unfinalizable.
+    dsl_prepare_run(&mut authority, session, "run-2");
+
+    // Run 1's late completion must still be resolvable.
+    dsl_resolve_completion(&mut authority, "run-1").expect(
+        "a completion for the previous run must still resolve after a new run has been prepared",
+    );
+}
+
+#[test]
+fn a_settled_correlation_is_still_cleared_by_the_next_run() {
+    let session = "session-completion-settled";
+    let mut authority = registered_dsl_authority_for_session(session);
+
+    dsl_prepare_run(&mut authority, session, "run-1");
+    dsl_fail_run_back_to_idle(&mut authority, "run-1");
+    dsl_resolve_completion(&mut authority, "run-1").expect("run-1 must resolve while correlated");
+
+    // With run-1 settled there is no obligation left to protect, so the next
+    // run takes the slot exactly as it always did, and a replayed resolve for
+    // the retired run is refused rather than misattributed.
+    dsl_prepare_run(&mut authority, session, "run-2");
+    let replayed = dsl_resolve_completion(&mut authority, "run-1");
+    assert!(
+        replayed.is_err(),
+        "a settled correlation must still be cleared by the next run, so a replayed \
+         resolve for the retired run is refused; got {replayed:?}"
+    );
+}
+
+#[test]
+fn recovered_terminal_completion_batches_have_a_generated_disposition() {
+    use crate::meerkat_machine::driver::{
+        machine_classify_recovered_terminal_completion_batch,
+        machine_declare_recovered_terminal_completion_unrecoverable,
+    };
+    use crate::meerkat_machine::dsl::{
+        RecoveredTerminalCompletionDisposition as Disposition,
+        RecoveredTerminalCompletionUnrecoverableReasonKind as Reason,
+    };
+
+    assert_eq!(
+        machine_classify_recovered_terminal_completion_batch("run:run-1", true, true, false)
+            .expect("classifier must admit a correlatable batch"),
+        Disposition::Recover,
+    );
+    assert_eq!(
+        machine_classify_recovered_terminal_completion_batch("run:run-2", false, true, false)
+            .expect("classifier must decide an uncorrelatable batch"),
+        Disposition::DiscardUnrecoverable,
+        "an uncorrelatable batch with no directed publication at risk is dropped, not refused",
+    );
+    assert_eq!(
+        machine_classify_recovered_terminal_completion_batch("run:run-3", true, false, false)
+            .expect("classifier must decide a payload-less batch"),
+        Disposition::DiscardUnrecoverable,
+    );
+    assert_eq!(
+        machine_classify_recovered_terminal_completion_batch("run:run-4", false, true, true)
+            .expect("classifier must decide a batch with an unpublished directed terminal"),
+        Disposition::Blocked,
+        "dropping a batch that still owes a user-visible terminal event must fail closed",
+    );
+
+    assert_eq!(
+        machine_declare_recovered_terminal_completion_unrecoverable(
+            "run:run-4",
+            Reason::DirectedPublicationUnresolved,
+        )
+        .expect("blocked batches must reach a named machine-owned terminal"),
+        Reason::DirectedPublicationUnresolved,
+    );
+}
