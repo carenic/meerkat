@@ -50,6 +50,34 @@ them.
   downstream code binding the constant by its exact array type must add the new
   dimension. The `checks` map itself is an open string map on the wire, so the
   new key is additive: no wire break, no schema change, no SDK regeneration.
+- **`meerkat_contracts::JobHealthSummary` loses `delivery_backlog: u64`** and
+  gains `pending_outbox_jobs: u64`, `runtime_inbox_backlog: u64` and
+  `coverage: JobHealthCoverage`. The single `delivery_backlog` number conflated
+  two different queues - jobs owing an outbox notification, and deliveries a
+  runtime has not drained - so one of them could be zero for the wrong reason.
+  The struct is not `#[non_exhaustive]`, so struct-literal constructions and
+  exhaustive field reads must be updated.
+- **`meerkat_contracts::JobHealthStatus` gains an `Unreadable` variant.** The
+  census can now say it did not look, which it previously could not express;
+  exhaustive matches must add the arm. SDK literal unions are regenerated.
+- **`meerkat_contracts::JobHealthCoverage` is a new wire enum**
+  (`complete` | `truncated { scanned, limit }`), so a saturated census window is
+  a typed fact rather than a silent count.
+- **`meerkat_jobs::JobHealthSnapshot::is_degraded()` is REMOVED**, replaced by
+  `reading() -> JobHealthReading`. The removal is deliberate rather than a
+  deprecation: `is_degraded()` collapsed "nothing is wrong" and "I could not
+  look" into one boolean, and deleting it made the compiler find every consumer.
+  `delivery_backlog` on the same type is likewise renamed to
+  `pending_outbox_jobs`, and `coverage` is added.
+- **`meerkat_jobs::DetachedJobStore` gains two REQUIRED methods**,
+  `count_pending_outbox_jobs(realm_id)` and
+  `list_census_candidates(realm_id, limit)`. They are deliberately not
+  defaulted: a default falling back to a capped scan would silently reintroduce
+  exactly the age-blindness this change exists to remove. Out-of-tree
+  implementors must implement both.
+- **`meerkat_runtime::RuntimeStore` gains `list_runtime_delivery_authorities()`**,
+  which IS defaulted (returning `Unsupported`, which the census maps to
+  `Unreadable`), so existing implementors do not break.
 
 ### Added
 
@@ -153,22 +181,6 @@ them.
   rather than their contents, and is mutation-proven: restoring the 0.8.23
   order turns it red with the intended diagnostic.
 
-### Corrected
-
-- **The 0.8.23 notes claimed `session_liveness` "needs a watchdog bridge that
-  is 0.8.24 work". That was wrong, and this release does not clear that key.**
-  `session_liveness` names the PRE-staging class - a live, open session parked
-  while machine-owned lane truth still holds selectable queued work that never
-  gets staged at all. The staged-run watchdog (and the new `session_run_start`
-  dimension built on its classification) observes the POST-staging window,
-  which opens at the durable `StageForRun` commit; it structurally cannot see
-  work that never reaches staging. The two are disjoint classes.
-  `unmeasured:session_liveness` therefore remains published, honestly, until a
-  lane-truth probe exists. Clearing it on the strength of the staged-run
-  census would have republished the one-reading-stands-for-the-whole-dimension
-  defect 0.8.23 existed to remove, from inside the item that cited it.
-
-### Fixed
 
 - **A self-hosted model no longer resolves its credential by provider CLASS, so
   one server's secret can no longer be sent to another server's endpoint.**
@@ -191,6 +203,21 @@ them.
   that binding DECLARES a different server, which is a contradiction and fails
   closed (this is what protects sessions that persisted the wrong binding
   before the constraint existed).
+
+### Corrected
+
+- **The 0.8.23 notes claimed `session_liveness` "needs a watchdog bridge that
+  is 0.8.24 work". That was wrong, and this release does not clear that key.**
+  `session_liveness` names the PRE-staging class - a live, open session parked
+  while machine-owned lane truth still holds selectable queued work that never
+  gets staged at all. The staged-run watchdog (and the new `session_run_start`
+  dimension built on its classification) observes the POST-staging window,
+  which opens at the durable `StageForRun` commit; it structurally cannot see
+  work that never reaches staging. The two are disjoint classes.
+  `unmeasured:session_liveness` therefore remains published, honestly, until a
+  lane-truth probe exists. Clearing it on the strength of the staged-run
+  census would have republished the one-reading-stands-for-the-whole-dimension
+  defect 0.8.23 existed to remove, from inside the item that cited it.
 
 ### Changed
 
