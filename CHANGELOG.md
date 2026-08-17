@@ -444,6 +444,31 @@ them.
   `meerkat-runtime` already used) enabling the full non-live set, so coverage
   no longer depends on which sibling crates happen to share the build graph.
 
+- **A host that goes away now releases its members' participant routes**
+  (`meerkat-mob`). A member's route is held by its comms drain, which runs in
+  PersistentHost mode inside a detached task holding an owned `Arc`, so dropping
+  the host actor never brought the reference count to zero and the route was
+  never freed. Through 0.8.23 that leak was harmless: the in-process registry
+  admitted a same-key rebind over a still-published route
+  (`RegistrationOutcome::ReboundOwnName`), so a successor holding the same
+  durable identity simply took the name back. This release removes that arm
+  deliberately - see the `### Breaking` notes - which turns the leak into a
+  typed refusal: the orphaned route refuses the very host that replaces it, and
+  the successor has neither a handle to it nor any action that clears it.
+
+  Fail-closed against a LIVE incumbent is the rule working as intended.
+  Fail-closed against a corpse is not, so the release now happens on the
+  incumbent side, which is the rule's own first admitted evidence - the
+  incumbent released the name. Per-session disposal frees the route it
+  published, and host teardown frees every route the host still holds, mirroring
+  the supervisor bridge's shutdown-time release that the member path never had.
+  Retirement is generation-exact, so it can never remove a successor that has
+  since rebound the same key.
+
+  An operator who hits this on 0.8.23 sees "already has a live route" after a
+  restart and goes looking for a live incumbent that does not exist. If you have
+  read that message as a test-isolation problem, this is the other cause.
+
 - **`@rkat/web` did not handle the two new turn-accounting events.** The Web
   SDK's compile-time exhaustiveness assertion over `AgentEvent` had no arms for
   `turn_usage_accounting_unmeasured` or
@@ -455,6 +480,39 @@ them.
   counters do exist and neither side is ever rewritten to agree.
 
 ### Known issues
+
+- **`delegate` with inherited tooling does not work for a host that registers
+  its own tools** (`meerkat-core`, `meerkat-tools`, `meerkat-mob-mcp`). NOT new
+  in this release, and documented here because two adopter fleets diagnosed it
+  during this train and the workaround is not discoverable from the error.
+
+  The tool-visibility witness is derived from one field:
+  `filter_witness_for_tool` builds `ToolVisibilityWitness` from
+  `ToolDef.provenance`, and `has_identity_witness()` is `is_some()`. Tools that
+  arrive through meerkat's own MCP client are stamped with provenance; tools
+  registered through the host SDK are not, because `ToolDef::new` creates a
+  `ToolDef` WITHOUT provenance. So a delegation that INHERITS parent tooling
+  cannot satisfy the witness for any host-registered tool, and the refusal names
+  the tool rather than the reason - a caller is told a tool is not inheritable
+  and cannot discover that the real answer is "this tool never carried the field
+  the check reads".
+
+  Measured on a live fleet: of 10 real `delegate` calls, the 5 that inherited
+  parent tooling (`{"mode":"inherit_parent"}`, `null`, or a `deny_overlay` over
+  inherit) all failed, and the 5 that declared a fresh inline profile all
+  succeeded - zero exceptions over three days. The 57 tools ever reported
+  missing a witness were an exact partition: every one was host-registered,
+  while `shell`, `peers`, `send_message`, `delegate`, `workgraph_create` and the
+  other builtins never appeared once. A host that proxies MCP in-process, or
+  simply registers its own tools - which is what the host SDK is for - therefore
+  sees a 100% failure rate on the inheriting path and will read it as an
+  intermittent fault.
+
+  WORKAROUND until this is fixed: declare an explicit tool profile on the
+  delegation instead of inheriting, e.g.
+  `{"mode":"profile","source":{"type":"inline","tools":{...}}}`. Do not stamp
+  provenance from the host: the platform contract puts that on the registry, and
+  a host-side stamp would be asserting an identity the host does not own.
 
 - **Every tool result body is carried TWICE in the event vocabulary**
   (`meerkat-core`). `AgentEvent::ToolResultReceived` and

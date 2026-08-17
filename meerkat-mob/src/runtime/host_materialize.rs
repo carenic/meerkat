@@ -893,39 +893,6 @@ pub struct LiveMemberRuntime {
     pub ack_keypair: Arc<meerkat_comms::Keypair>,
 }
 
-/// Release the participant route a disposed member published.
-///
-/// WHY REMOVING THE INDEX ENTRY IS NOT ENOUGH. Dropping the last `Arc` frees the
-/// name, but a member's route is also held by its comms drain, which runs in
-/// PersistentHost mode (`idle_timeout: Duration::MAX`) inside a detached task
-/// holding an OWNED `Arc`. So a disposed member's `Arc` count never reaches
-/// zero, `Drop` never runs, and the name stays claimed by an incumbent nobody
-/// can reach - a corpse, not a live holder.
-///
-/// Through 0.8.23 that leak was invisible: the in-process registry admitted a
-/// same-key rebind over a still-live route (`ReboundOwnName`), so a successor
-/// holding the same durable identity simply took the name back. The 0.8.24 one
-/// claim rule removed that arm deliberately, which turns the leak into a typed
-/// refusal - exactly the class the rule exists to expose. The supervisor axis
-/// already got its release seam (`MobSupervisorBridge::shutdown` ->
-/// generation-exact `retire_inproc_route`); the member axis did not, and this is
-/// that seam.
-///
-/// `retire_inproc_route` is HOLDER-INDEPENDENT and generation-exact: it frees
-/// the name whatever else still holds an `Arc`, and can never remove a successor
-/// that has since rebound the same key.
-fn release_disposed_member_route(session_id: &SessionId, live: Option<LiveMemberRuntime>) {
-    let Some(live) = live else {
-        return;
-    };
-    if live.runtime.retire_inproc_route() {
-        tracing::debug!(
-            %session_id,
-            "released the disposed member participant route so a successor is not refused by it"
-        );
-    }
-}
-
 /// Outcome of one successful member build — the ack material plus the
 /// concrete runtime handle the actor registers post-commit (DEC-P3H-7).
 pub struct MaterializedBuildOutcome {
@@ -1120,9 +1087,14 @@ impl HostMemberMaterializer {
     }
 
     /// Release every live member's participant route because this host is going
-    /// away. Call this on host teardown, NOT on member disposal - the
-    /// per-session paths already release through
-    /// [`release_disposed_member_route`].
+    /// away.
+    ///
+    /// HOST TEARDOWN ONLY. Per-session disposal deliberately does NOT release
+    /// here: those paths remove and in some cases re-establish the index entry,
+    /// and retiring the route there took a live member's name away from it -
+    /// measured as "local member session exposes a comms runtime" failing. A
+    /// disposed member's own route release belongs with whatever also settles
+    /// its session claim, which is separate work.
     ///
     /// A member route outlives the actor without this. It is held by the
     /// member's comms drain, which runs in PersistentHost mode inside a detached
@@ -1138,11 +1110,22 @@ impl HostMemberMaterializer {
     /// shutdown-time `retire_inproc_route`, which the member path never got.
     /// Retirement is generation-exact, so this can only ever remove routes this
     /// host published.
+    /// Releases the NAMES only, and deliberately leaves the index intact.
+    ///
+    /// Clearing `live_runtimes` here was wrong: callers still read a member's
+    /// comms runtime after the host stops serving (the fixtures assert "local
+    /// member session exposes a comms runtime"), and taking the map turned a
+    /// name release into a missing-runtime failure. The index dies with the
+    /// actor anyway, so the only thing that must happen here is giving up the
+    /// registry claims, which is what a successor needs.
     pub fn release_live_member_routes(&mut self) {
-        let released = std::mem::take(&mut self.live_runtimes);
-        self.upcall_binding_stamps.clear();
-        for (session_id, live) in released {
-            release_disposed_member_route(&session_id, Some(live));
+        for (session_id, live) in &self.live_runtimes {
+            if live.runtime.retire_inproc_route() {
+                tracing::debug!(
+                    %session_id,
+                    "released a member participant route on host teardown"
+                );
+            }
         }
     }
 
@@ -1463,7 +1446,7 @@ impl HostMemberMaterializer {
                 ),
             })??;
 
-            release_disposed_member_route(session_id, self.live_runtimes.remove(session_id));
+            self.live_runtimes.remove(session_id);
             self.upcall_binding_stamps.remove(session_id);
             Ok(())
         }
@@ -1485,7 +1468,7 @@ impl HostMemberMaterializer {
         session_id: &SessionId,
     ) -> Result<MemberSessionDisposalVerdict, SessionError> {
         let verdict = self.disposal.dispose(session_id).await?;
-        release_disposed_member_route(session_id, self.live_runtimes.remove(session_id));
+        self.live_runtimes.remove(session_id);
         self.upcall_binding_stamps.remove(session_id);
         Ok(verdict)
     }
@@ -1497,7 +1480,7 @@ impl HostMemberMaterializer {
         session_id: &SessionId,
     ) -> Result<(), SessionError> {
         self.disposal.release_runtime_only(session_id).await?;
-        release_disposed_member_route(session_id, self.live_runtimes.remove(session_id));
+        self.live_runtimes.remove(session_id);
         self.upcall_binding_stamps.remove(session_id);
         Ok(())
     }
@@ -1559,7 +1542,7 @@ impl HostMemberMaterializer {
     /// to quiesce) its machine attachment, service actor, and sidecar under B.
     /// This method deliberately performs no SessionId-wide lifecycle action.
     pub fn forget_runtime_after_exact_publication_abort(&mut self, session_id: &SessionId) {
-        release_disposed_member_route(session_id, self.live_runtimes.remove(session_id));
+        self.live_runtimes.remove(session_id);
         self.upcall_binding_stamps.remove(session_id);
     }
 
