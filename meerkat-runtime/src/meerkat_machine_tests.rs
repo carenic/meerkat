@@ -5771,13 +5771,21 @@ async fn unregister_progress_persist_failure_requires_cold_reload_from_durable_p
         .register_session(session_id.clone())
         .await
         .expect("fresh registration should recover the exact durable unregister prefix");
+    // 0.8.24: cold registration CONCLUDES the recovered drain rather than
+    // leaving it open, so there is no longer an intermediate all-pending
+    // authority to observe between register and unregister. The property that
+    // assertion protected - that recovery resumes from the DURABLE prefix and
+    // not from the live (false, true, true) that was never persisted - is now
+    // carried by the republished all-pending prefix asserted below: had
+    // recovery trusted the lost live state, that write would read
+    // (false, true, true).
     let recovered_authority = recovered
         .session_dsl_state(&session_id)
         .await
-        .expect("cold-recovered unregister authority");
-    assert!(recovered_authority.unregister_runtime_loop_drain_pending);
-    assert!(recovered_authority.unregister_comms_drain_exit_pending);
-    assert!(recovered_authority.unregister_completion_waiter_drain_pending);
+        .expect("cold-recovered registration authority");
+    assert!(!recovered_authority.unregister_runtime_loop_drain_pending);
+    assert!(!recovered_authority.unregister_comms_drain_exit_pending);
+    assert!(!recovered_authority.unregister_completion_waiter_drain_pending);
 
     recovered
         .unregister_session(&session_id)
@@ -8536,14 +8544,33 @@ fn revival_arms_preserve_identity_reset_placement_and_refuse_while_draining() {
     };
     let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(draining_state())
         .expect("draining state must be recoverable");
-    mm_dsl::MeerkatMachineMutator::apply(
+    // 0.8.24: the draining refusal is a MACHINE-OWNED VERDICT, not a guard
+    // rejection - an incomplete teardown is a warning about cleanup and must
+    // not read as "this session may never be registered again". The refusal
+    // still must not perturb the drain window, which the phase assertion
+    // below enforces. The obligation flags are exercised on a path that
+    // actually sets them in `unregister_drain_contract.rs`; this state pokes
+    // `registration_phase` directly, so they are all false here by
+    // construction and are deliberately not asserted.
+    let refusal = mm_dsl::MeerkatMachineMutator::apply(
         &mut authority,
         mm_dsl::MeerkatMachineInput::RegisterSession {
             session_id: mm_dsl::SessionId("session-revive".to_string()),
             runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-2".to_string())),
         },
     )
-    .expect_err("revival must refuse while the unregister drain window is open");
+    .expect("the draining refusal is a typed verdict, not a guard rejection");
+    let effects = refusal.into_effects();
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            mm_dsl::MeerkatMachineEffect::SessionRegistrationRejected {
+                reason: mm_dsl::SessionRegistrationRejectReasonKind::UnregisterTeardownInProgress,
+                ..
+            }
+        )),
+        "revival while draining must name the teardown verdict, got {effects:?}"
+    );
     assert_eq!(
         authority.state().lifecycle_phase,
         mm_dsl::MeerkatPhase::Stopped,
