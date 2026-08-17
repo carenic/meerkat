@@ -410,6 +410,15 @@ export type SourceUuid = string;
 
 export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled";
 
+export type StreamScopeFrame = {
+  scope: "primary";
+  session_id: string;
+} | {
+  agent_identity: string;
+  flow_run_id: string;
+  scope: "mob_member";
+};
+
 export type StreamTruncationReason = {
   kind: "channel_full";
 } | {

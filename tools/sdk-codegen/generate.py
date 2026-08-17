@@ -3095,6 +3095,7 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
         "    is_known_agent_event_type,\n"
         ")\n"
     )
+    init_content += "from .event_types import *  # noqa: F401,F403\n"
     init_content += (
         "from .version_compat import is_compatible_with  # noqa: F401\n"
     )
@@ -4503,6 +4504,7 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
         "export * from './types.js';\n"
         "export * from './errors.js';\n"
         "export * from './events.js';\n"
+        "export * from './event_types.js';\n"
         "export * from './version_compat.js';\n"
     )
     (output_dir / "index.ts").write_text(index_content)
@@ -4581,13 +4583,275 @@ def _web_events_ts_type(root: dict[str, Any], schema: Any) -> str:
     return "unknown"
 
 
+def _event_type_defs(schemas: dict) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return ``(resolution_root, named_defs)`` for the agent-event payloads.
+
+    ``events.json`` repeats the same ``$defs`` under ``AgentEvent`` and
+    ``ScopedAgentEvent``. ``ScopedAgentEvent`` is a strict superset: it adds the
+    ``AgentEvent`` union itself plus ``StreamScopeFrame``, and every shared body
+    is byte-identical to its ``AgentEvent`` twin. It is therefore the single
+    authority for "every named event payload type".
+
+    This one helper feeds the Python, TypeScript and web emitters, and
+    ``scripts/verify_sdk_event_inventory.py`` asserts the same union. Deriving
+    generator and gate from one rule is deliberate: the defect this closes was a
+    gate that passed because it checked event *names* while no SDK emitted the
+    corresponding *types*.
+    """
+
+    events_schema = schemas.get("events", {})
+    merged: dict[str, Any] = {}
+    for root_name in ("ScopedAgentEvent", "AgentEvent"):
+        root = events_schema.get(root_name, {})
+        if not isinstance(root, dict):
+            continue
+        for name, schema in root.get("$defs", {}).items():
+            merged.setdefault(name, schema)
+    resolution_root = dict(events_schema.get("ScopedAgentEvent", {}))
+    resolution_root["$defs"] = merged
+    return resolution_root, merged
+
+
+def _declared_python_names(path: Path) -> set[str]:
+    """Top-level class/assignment names declared by a generated Python module."""
+
+    if not path.is_file():
+        return set()
+    text = path.read_text()
+    return set(re.findall(r"^class\s+(\w+)\s*\(", text, re.M)) | set(
+        re.findall(r"^(\w+)\s*=", text, re.M)
+    )
+
+
+def _declared_typescript_names(path: Path) -> set[str]:
+    """Exported type names declared by a generated TypeScript module."""
+
+    if not path.is_file():
+        return set()
+    return set(
+        re.findall(
+            r"^export\s+(?:interface|type|enum|const)\s+(\w+)",
+            path.read_text(),
+            re.M,
+        )
+    )
+
+
+def _event_type_doc_lines(schema: Any) -> list[str]:
+    """Return the description of a named event def as clean text lines."""
+
+    if not isinstance(schema, dict):
+        return []
+    description = schema.get("description")
+    if not isinstance(description, str):
+        return []
+    return [line.rstrip() for line in description.strip().splitlines()]
+
+
+def generate_python_event_types(schemas: dict, output_dir: Path) -> None:
+    """Emit a typed Python definition for every named agent-event payload.
+
+    The Python SDK previously generated only the *inventory* of event names
+    (``event_inventory.py``), so every typed reason enum and payload record the
+    runtime publishes -- ``CompactionFailureReason``, ``HookFailureReason``,
+    ``LlmRetryPlan`` and the rest -- had no name in the SDK and callers were
+    forced to re-declare them by hand against a schema they could not see.
+    """
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    root_schema, defs = _event_type_defs(schemas)
+    order = _reachable_local_schema_defs(defs, set(defs))
+    # Every named def is emitted as its own type below, so a `$ref` must render
+    # as that name. `local_defs` is the *inline-me* set for `_python_type_from_schema`;
+    # leaving it empty is what keeps `error_class: AgentErrorClass` a reference
+    # instead of a re-inlined 25-arm Literal.
+    local_defs: set[str] = set()
+    # `types.py` already declares part of this set. Re-declaring those names here
+    # would give the package two definitions of one contract type and let
+    # `from .event_types import *` silently shadow the other. This module is the
+    # complement, not a competing copy.
+    types_module = output_dir / "types.py"
+    if not types_module.is_file():
+        raise SystemExit(
+            "generate_python_event_types must run after generate_python_types: "
+            f"{types_module} does not exist yet. Emitting without it would "
+            "re-declare types that module owns and shadow them on star-import."
+        )
+    already_declared = _declared_python_names(types_module)
+    reused = sorted(set(defs) & already_declared)
+
+    lines: list[str] = [
+        '"""Generated agent-event payload types for the Meerkat Python SDK.',
+        "",
+        "Source: artifacts/schemas/events.json (named ``$defs`` of the event roots)",
+        "",
+        "Every named payload definition in the event schema is emitted here so a",
+        "consumer can name the reason enums and payload records the runtime",
+        "publishes instead of mirroring them by hand. Coverage is asserted by",
+        "``scripts/verify_sdk_event_inventory.py``.",
+        '"""',
+        "",
+        "from __future__ import annotations",
+        "",
+        "from typing import Any, Literal, NotRequired, Optional, Required, TypedDict",
+        "",
+    ]
+    if reused:
+        lines.append("from .types import (  # noqa: F401")
+        lines.extend(f"    {name}," for name in reused)
+        lines.append(")")
+        lines.append("")
+    lines.extend(["Value = Any", ""])
+
+    def append_typed_dict(
+        type_name: str, variant: dict[str, Any], doc: list[str]
+    ) -> None:
+        properties = variant.get("properties", {})
+        required = set(variant.get("required", []))
+        lines.append("")
+        lines.append(f"class {type_name}(TypedDict, total=False):")
+        if doc:
+            lines.append(f'    """{doc[0]}')
+            lines.extend(f"    {line}" if line else "" for line in doc[1:])
+            lines.append('    """')
+        if not properties:
+            lines.append("    pass")
+        for field_name, field_schema in properties.items():
+            field_type, optional_by_shape = _python_type_from_schema(
+                root_schema, field_schema, local_defs
+            )
+            if field_name in required and not optional_by_shape:
+                annotation = f"Required[{field_type}]"
+            else:
+                annotation = f"NotRequired[{field_type}]"
+            lines.append(f"    {_python_identifier(field_name)}: {annotation}")
+        lines.append("")
+
+    for name in order:
+        if name in already_declared:
+            continue
+        schema = defs[name]
+        doc_lines = _event_type_doc_lines(schema)
+        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        tagged = _one_of_typed_dict_variants(root_schema, schema)
+        if tagged is not None:
+            # Externally/internally tagged union: Python has no anonymous record
+            # type, so each arm becomes a named TypedDict and the alias unions
+            # them. This is the shape `generate_python_types` already uses for
+            # tagged wire enums, so the reason enums read the same in both files.
+            discriminator, arms = tagged
+            minted = [
+                _typed_dict_variant_name(name, value, disambiguate=False)
+                for value, _ in arms
+            ]
+            if len(set(minted)) != len(minted):
+                minted = [
+                    _typed_dict_variant_name(
+                        name,
+                        value,
+                        discriminator=discriminator,
+                        variant=variant,
+                        disambiguate=True,
+                    )
+                    for value, variant in arms
+                ]
+            for arm_name, (_, variant) in zip(minted, arms, strict=True):
+                append_typed_dict(arm_name, variant, _event_type_doc_lines(variant))
+            lines.append("")
+            for line in doc_lines:
+                lines.append(f"# {line}" if line else "#")
+            lines.append(f"{name} = {' | '.join(minted)}")
+            lines.append("")
+        elif _is_plain_object_schema(schema) and properties:
+            append_typed_dict(name, schema, doc_lines)
+        else:
+            alias, _ = _python_type_from_schema(root_schema, schema, local_defs)
+            lines.append("")
+            for line in doc_lines:
+                lines.append(f"# {line}" if line else "#")
+            lines.append(f"{name} = {alias}")
+            lines.append("")
+
+    (output_dir / "event_types.py").write_text("\n".join(lines).rstrip() + "\n")
+
+
+def generate_typescript_event_types(schemas: dict, output_dir: Path) -> None:
+    """Emit a typed TypeScript definition for every named agent-event payload.
+
+    The TypeScript SDK generated only ``KNOWN_AGENT_EVENT_TYPES``; the payload
+    and reason types the web SDK has always emitted were absent here. This is
+    the same emission the web SDK gets, from the same schema authority.
+    """
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    root_schema, defs = _event_type_defs(schemas)
+    order = _reachable_local_schema_defs(defs, set(defs))
+    # `types.ts` already exports part of this set. Re-declaring those names here
+    # would make `export * from './event_types.js'` ambiguous (TS2308), so this
+    # module is the complement and re-uses the existing declarations.
+    types_module = output_dir / "types.ts"
+    if not types_module.is_file():
+        raise SystemExit(
+            "generate_typescript_event_types must run after "
+            f"generate_typescript_types: {types_module} does not exist yet. "
+            "Emitting without it would re-declare exported names and make the "
+            "generated index ambiguous (TS2308)."
+        )
+    already_declared = _declared_typescript_names(types_module)
+    reused = sorted(set(defs) & already_declared)
+
+    lines: list[str] = [
+        "// Generated agent-event payload types for the Meerkat TypeScript SDK",
+        "// Source: artifacts/schemas/events.json (named $defs of the event roots)",
+        "//",
+        "// Every named payload definition in the event schema is emitted here so a",
+        "// consumer can name the reason enums and payload records the runtime",
+        "// publishes instead of mirroring them by hand. Coverage is asserted by",
+        "// scripts/verify_sdk_event_inventory.py.",
+        "",
+    ]
+    if reused:
+        lines.append("import type {")
+        lines.extend(f"  {name}," for name in reused)
+        lines.append("} from './types.js';")
+        lines.append("")
+
+    for name in order:
+        if name in already_declared:
+            continue
+        schema = defs[name]
+        doc_lines = _event_type_doc_lines(schema)
+        if doc_lines:
+            lines.append("/**")
+            lines.extend(f" * {line}" if line else " *" for line in doc_lines)
+            lines.append(" */")
+        # Same emitter the web SDK uses, so the two TypeScript surfaces render
+        # identical shapes: tagged unions stay narrowable instead of widening to
+        # `Record<string, unknown>`.
+        alias_type = _web_events_ts_type(root_schema, schema)
+        stripped = alias_type.strip()
+        if stripped.startswith("{") and stripped.endswith("}") and " | " not in stripped:
+            body = stripped[1:-1].strip()
+            lines.append(f"export interface {name} {{")
+            if body:
+                lines.extend(
+                    f"  {line}" if not line.startswith("  ") else line
+                    for line in body.splitlines()
+                )
+            lines.append("}")
+        else:
+            lines.append(f"export type {name} = {alias_type};")
+        lines.append("")
+
+    (output_dir / "event_types.ts").write_text("\n".join(lines))
+
+
 def generate_web_event_types(schemas: dict, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     events_schema = schemas.get("events", {})
-    agent_schema = events_schema.get("AgentEvent", {})
-    defs = agent_schema.get("$defs", {})
+    agent_schema, defs = _event_type_defs(schemas)
     known_event_types = _known_event_types(schemas)
-    variants = agent_schema.get("oneOf", [])
+    variants = events_schema.get("AgentEvent", {}).get("oneOf", [])
 
     def is_simple_object_literal(type_string: str) -> bool:
         stripped = type_string.strip()
@@ -4604,6 +4868,10 @@ def generate_web_event_types(schemas: dict, output_dir: Path) -> None:
     ]
 
     for def_name, def_schema in defs.items():
+        if def_name == "AgentEvent":
+            # The discriminated union below is this SDK's `AgentEvent`; emitting
+            # the schema def as well would redeclare the name.
+            continue
         alias_type = _web_events_ts_type(agent_schema, def_schema)
         if is_simple_object_literal(alias_type):
             lines.append(f"export interface {def_name} {{")
@@ -6226,6 +6494,11 @@ def main():
     print(f"Generated Python types in {py_output}")
     generate_python_event_inventory(schemas, py_output)
     print(f"Generated Python event inventory in {py_output}")
+    # Must follow generate_python_types: the event payload module emits only the
+    # complement of what types.py already declares, and reads that module to
+    # learn it. Reordering these fails closed rather than double-declaring.
+    generate_python_event_types(schemas, py_output)
+    print(f"Generated Python event payload types in {py_output}")
     generate_python_version_compat(schemas, py_output)
     print(f"Generated Python version compat helper in {py_output}")
 
@@ -6235,6 +6508,10 @@ def main():
     print(f"Generated TypeScript types in {ts_output}")
     generate_typescript_event_inventory(schemas, ts_output)
     print(f"Generated TypeScript event inventory in {ts_output}")
+    # Must follow generate_typescript_types, for the same reason as the Python
+    # pair above.
+    generate_typescript_event_types(schemas, ts_output)
+    print(f"Generated TypeScript event payload types in {ts_output}")
     generate_typescript_version_compat(schemas, ts_output)
     print(f"Generated TypeScript version compat helper in {ts_output}")
 
