@@ -1,5 +1,10 @@
 //! OpenAI-compatible client for self-hosted endpoints.
 
+// The bounded post-finish read below is compiled for wasm32 too, and the wasm
+// glue behind `crate::tokio` (tokio_with_wasm) is what provides `time::timeout`
+// there. Native builds use the real tokio crate.
+#[cfg(target_arch = "wasm32")]
+use crate::tokio;
 use async_trait::async_trait;
 use futures::StreamExt;
 use meerkat_core::schema::{CompiledSchema, SchemaError};
@@ -15,8 +20,49 @@ use meerkat_llm_core::{http, streaming};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::client::{OpenAiReplayProjectionMode, project_openai_replay_messages_for_capabilities};
+
+/// How long the chat-completions stream keeps reading after a finish reason has
+/// been latched, before it calls the end of the trailer.
+///
+/// Latching the stop reason (rather than spending it at `finish_reason`) is what
+/// lets a usage-only SSE event that follows the finish event still be read. It
+/// also extended the read window past the point where the turn is semantically
+/// complete, and nothing else bounds that window: `meerkat-llm-core`'s HTTP
+/// client carries no timeout, and the agent loop's stream-inactivity watchdog
+/// re-arms on every yielded item - including the `WireLiveness` this adapter
+/// emits for an SSE keepalive comment - so a server that comments forever after
+/// the finish event is, to that watchdog, a healthy stream.
+///
+/// The window is measured from the latch instant and nothing re-arms it. That is
+/// deliberate: post-latch there is exactly one thing left to wait for (the
+/// accounting trailer and/or `[DONE]`), and keepalive bytes are not progress
+/// toward it.
+///
+/// The value is bounded from BOTH sides, which is why it is 30s and not
+/// something rounder:
+///
+/// - It must be long enough that no legitimate trailer is ever cut off. A
+///   compliant server computes usage as bookkeeping and flushes it immediately
+///   behind the finish event, so the only real cost is transport latency. If the
+///   window did cut a trailer off, the turn would reach the commit with no
+///   normalized accounting and fail there - the mirror of the P0 the latch
+///   fixed. 30s is one to two orders of magnitude above any plausible trailer
+///   latency.
+/// - It must be strictly SHORTER than
+///   [`meerkat_core::DEFAULT_STREAM_INACTIVITY_TIMEOUT`], and by a wide margin.
+///   That watchdog re-arms on the finish-event chunk, so its window and this one
+///   start at ~the same instant; if the two were equal, finish-then-silence
+///   would be a coin flip between this adapter's non-destructive end-of-stream
+///   and the agent loop's RETRYABLE `StreamStalled` - a retryable failure after
+///   the answer already reached the caller, which is the exact user-visible
+///   shape of the original P0. `post_finish_trailer_window_is_well_inside_the_stall_window`
+///   guards the ordering.
+///
+/// Per-client override: [`OpenAiCompatibleClient::with_post_finish_trailer_window`].
+pub const DEFAULT_POST_FINISH_TRAILER_WINDOW: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiCompatibleMode {
@@ -44,6 +90,7 @@ pub struct OpenAiCompatibleClient {
     supports_thinking: bool,
     supports_reasoning: bool,
     supports_image_tool_results: bool,
+    post_finish_trailer_window: Duration,
 }
 
 impl OpenAiCompatibleClient {
@@ -96,7 +143,22 @@ impl OpenAiCompatibleClient {
             supports_thinking: options.supports_thinking,
             supports_reasoning: options.supports_reasoning,
             supports_image_tool_results: options.supports_image_tool_results,
+            post_finish_trailer_window: DEFAULT_POST_FINISH_TRAILER_WINDOW,
         }
+    }
+
+    /// Override how long the chat-completions stream is read after a finish
+    /// reason has been latched.
+    ///
+    /// See [`DEFAULT_POST_FINISH_TRAILER_WINDOW`] for what the window bounds and
+    /// why its default sits where it does. Shortening it trades trailer patience
+    /// for a tighter bound on a completed-but-unclosed stream; a value that is
+    /// too short surfaces as turns that complete with no accounting evidence,
+    /// which the commit path rejects.
+    #[must_use]
+    pub fn with_post_finish_trailer_window(mut self, window: Duration) -> Self {
+        self.post_finish_trailer_window = window;
+        self
     }
 
     fn request_with_remote_model(&self, request: &LlmRequest) -> LlmRequest {
@@ -665,9 +727,60 @@ impl LlmClient for OpenAiCompatibleClient {
                     // request asked for. The latch is spent exactly once, by
                     // the terminal emission below.
                     let mut latched_stop: Option<StopReason> = None;
+                    // The instant the latch was taken, which is where the
+                    // post-finish trailer window starts. `time_compat::Instant`
+                    // is the browser-safe monotonic clock; this path is compiled
+                    // for wasm32, where `tokio::time::Instant` does not exist.
+                    let mut latched_at: Option<meerkat_core::time_compat::Instant> = None;
                     let mut saw_done_sentinel = false;
+                    let trailer_window = self.post_finish_trailer_window;
 
-                    'consume: while let Some(chunk) = stream.next().await {
+                    'consume: loop {
+                        // POST-LATCH, THE WAIT FOR THE NEXT CHUNK IS BOUNDED.
+                        //
+                        // Pre-latch it is not, and must not be: the model may
+                        // legitimately think for a long time before emitting
+                        // anything, and a bound there is a different policy with
+                        // a different owner (the agent loop's call timeout and
+                        // stream-inactivity watchdog). Post-latch the turn is
+                        // already semantically complete and exactly one thing is
+                        // outstanding - the accounting trailer and/or `[DONE]` -
+                        // so an unbounded wait here is an unbounded wait for a
+                        // finished turn. Nothing else closes it: the shared HTTP
+                        // client carries no timeout, and a server emitting SSE
+                        // keepalive comments forever re-arms the agent loop's
+                        // watchdog through the `WireLiveness` below, so the
+                        // liveness signal meant to prove the stream is healthy is
+                        // what would keep it hanging.
+                        //
+                        // ONE budget measured from the latch, not a per-chunk
+                        // idle window: keepalive bytes are not progress toward
+                        // the trailer, so they must not buy more time.
+                        let next = match latched_at {
+                            None => stream.next().await,
+                            Some(latched_at) => {
+                                let remaining =
+                                    trailer_window.saturating_sub(latched_at.elapsed());
+                                match tokio::time::timeout(remaining, stream.next()).await {
+                                    Ok(next) => next,
+                                    // EXPIRY IS END OF STREAM, NOT TURN FAILURE
+                                    // - the same rule the post-latch read and
+                                    // parse faults follow. The model finished and
+                                    // its answer already reached the caller, so
+                                    // there is nothing here to invalidate;
+                                    // failing would turn a delivered turn into a
+                                    // retryable one. Nothing is laundered
+                                    // either: no accounting is minted or
+                                    // substituted, so a trailer that never
+                                    // arrived is still absent when the commit
+                                    // path looks for it.
+                                    Err(_) => break 'consume,
+                                }
+                            }
+                        };
+                        let Some(chunk) = next else {
+                            break 'consume;
+                        };
                         // Latching the stop reason extended the read window past
                         // the finish event, so bytes this adapter never used to
                         // read are now load-bearing. Post-latch, a transport
@@ -888,8 +1001,10 @@ impl LlmClient for OpenAiCompatibleClient {
                                     // end of the stream, whichever comes
                                     // first, so a usage-only event that
                                     // follows this finish event is still
-                                    // read.
+                                    // read. The trailer window starts here.
                                     latched_stop = Some(stop_reason);
+                                    latched_at =
+                                        Some(meerkat_core::time_compat::Instant::now());
                                 }
                             }
                         }
@@ -1188,6 +1303,135 @@ mod tests {
             axum::serve(listener, app).await.expect("serve test server");
         });
         (format!("http://{addr}/v1"), handle)
+    }
+
+    /// What the raw stub does after the scripted head bytes are on the wire.
+    #[derive(Debug, Clone, Copy)]
+    enum RawStubTail {
+        /// Hold the connection open and write nothing more, ever.
+        Silence,
+        /// Write SSE keepalive comment lines forever.
+        KeepaliveComments,
+    }
+
+    /// A raw HTTP/1.1 stub that can leave a response body OPEN after the finish
+    /// event.
+    ///
+    /// The axum stub above cannot express this shape at all: `axum::serve`
+    /// always completes the body it is handed, so every stream it serves ends by
+    /// itself and the post-finish read window is closed for it by the server. A
+    /// test written against that stub therefore cannot construct the hang and
+    /// cannot witness the bound.
+    ///
+    /// The response deliberately carries NEITHER `content-length` NOR
+    /// `transfer-encoding`, which per RFC 7230 3.3.3 makes the body end at
+    /// connection close. "Hold open" is then just "stop writing", with no chunk
+    /// framing to get wrong - and a framing bug here would show up as an early
+    /// transport error, which the post-latch read-fault path already turns into
+    /// the SAME observable outcome as the bound firing. The elapsed-time
+    /// assertions in the tests below exist to tell those two apart.
+    async fn spawn_raw_chat_stub(
+        head: String,
+        tail: RawStubTail,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw chat stub");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            let Ok((mut socket, _peer)) = listener.accept().await else {
+                return;
+            };
+            // Read to the end of the request head. The POST body is small
+            // enough to sit in the socket buffer, so it never needs draining.
+            let mut request = Vec::new();
+            let mut read_buffer = [0u8; 1024];
+            loop {
+                match socket.read(&mut read_buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => {
+                        request.extend_from_slice(&read_buffer[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            let response =
+                format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{head}");
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+            if socket.flush().await.is_err() {
+                return;
+            }
+            match tail {
+                // Park forever holding the connection open, so only the
+                // client's own bound can end this stream.
+                RawStubTail::Silence => std::future::pending::<()>().await,
+                RawStubTail::KeepaliveComments => loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if socket.write_all(b": keep-alive\n\n").await.is_err() {
+                        return;
+                    }
+                    if socket.flush().await.is_err() {
+                        return;
+                    }
+                },
+            }
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    struct RawStreamObservation {
+        events: Vec<LlmEvent>,
+        elapsed: Duration,
+    }
+
+    /// Streams one raw-stub body and reports both the events and how long the
+    /// stream took to terminate.
+    ///
+    /// The elapsed time is part of every assertion below. Without it a stub that
+    /// failed to hold the connection open would produce a transport error, the
+    /// post-latch read-fault path would break out with the same
+    /// `Done{Success}` + preserved usage, and the test would pass while proving
+    /// nothing at all.
+    async fn collect_raw_chat_stream(
+        head: &str,
+        tail: RawStubTail,
+        trailer_window: Duration,
+    ) -> RawStreamObservation {
+        let (base_url, handle) = spawn_raw_chat_stub(head.to_string(), tail).await;
+        let client = OpenAiCompatibleClient::new_with_options(
+            OpenAiCompatibleMode::ChatCompletions,
+            "remote-model".to_string(),
+            base_url,
+            None,
+            options(true, false, false, false),
+        )
+        .with_post_finish_trailer_window(trailer_window);
+        let request = LlmRequest::new(
+            "qwen3.8-27b",
+            vec![Message::User(UserMessage::text("Hello".to_string()))],
+        );
+        let started = std::time::Instant::now();
+        let events: Vec<LlmEvent> = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.stream(&request).collect::<Vec<_>>(),
+        )
+        .await
+        .expect(
+            "the post-finish trailer window must end a stream the server never closes; \
+             without it this read is unbounded",
+        )
+        .into_iter()
+        .map(|event| event.expect("stream event"))
+        .collect();
+        let elapsed = started.elapsed();
+        handle.abort();
+        RawStreamObservation { events, elapsed }
     }
 
     async fn spawn_responses_stub_server(
@@ -1568,6 +1812,169 @@ mod tests {
                 stop_reason: StopReason::EndTurn
             })
         ));
+    }
+
+    /// The post-finish window must sit well inside the agent loop's
+    /// stream-inactivity watchdog.
+    ///
+    /// Both windows start at ~the finish-event chunk (the watchdog re-arms on
+    /// it), so if this one were equal or longer, finish-then-silence would race
+    /// the adapter's non-destructive end-of-stream against the loop's RETRYABLE
+    /// `StreamStalled` - a retryable failure after the answer already reached
+    /// the caller, which is the original P0's user-visible shape.
+    #[test]
+    fn post_finish_trailer_window_is_well_inside_the_stall_window() {
+        let stall = meerkat_core::DEFAULT_STREAM_INACTIVITY_TIMEOUT;
+        assert!(
+            DEFAULT_POST_FINISH_TRAILER_WINDOW * 2 < stall,
+            "the post-finish trailer window ({DEFAULT_POST_FINISH_TRAILER_WINDOW:?}) must be \
+             well inside the stream-inactivity window ({stall:?}), or the adapter's \
+             end-of-stream races the agent loop's retryable stall verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_finish_then_held_open_connection_terminates_with_usage() {
+        // The shape the latch introduced and nothing bounded: the server sends
+        // the finish event and the accounting trailer, then holds the connection
+        // open without closing the body. Before the bound, this read never
+        // returned - the HTTP client has no timeout, so the only remaining
+        // authority was the agent loop's stall watchdog, whose expiry is a
+        // RETRYABLE failure of an already-delivered turn.
+        let window = Duration::from_millis(300);
+        let observation = collect_raw_chat_stream(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":56,\"completion_tokens\":16,\"total_tokens\":72}}\n\n",
+            ),
+            RawStubTail::Silence,
+            window,
+        )
+        .await;
+
+        let events = &observation.events;
+        assert!(
+            matches!(
+                observed_done_outcome(events),
+                Some(LlmDoneOutcome::Success {
+                    stop_reason: StopReason::EndTurn
+                })
+            ),
+            "an unclosed body after the latch is END OF STREAM carrying the latched stop \
+             reason, not a turn failure and not a retryable one; got {events:?}"
+        );
+        assert_eq!(
+            done_count(events),
+            1,
+            "exactly one terminal Done: {events:?}"
+        );
+        let usage = observed_usage(events)
+            .expect("the accounting that arrived before the silence must be preserved");
+        assert_eq!(usage.as_usage().input_tokens, 56);
+        assert_eq!(usage.as_usage().output_tokens, 16);
+        assert_eq!(usage.accounting().model, "qwen3.8-27b");
+        assert!(
+            observation.elapsed >= window,
+            "the stream must have ended because the trailer window expired, not because the \
+             stub closed early and tripped the post-latch read-fault path: elapsed \
+             {:?} < window {window:?}",
+            observation.elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_keepalive_comments_after_finish_do_not_extend_the_window() {
+        // Keepalive comments are the case the agent loop's watchdog cannot see:
+        // each comment-only chunk yields `WireLiveness`, every yielded item
+        // re-arms that watchdog, so a server commenting forever after the finish
+        // event is a permanently healthy stream to it. The trailer window is
+        // therefore measured from the latch and re-armed by nothing - including
+        // these comments.
+        let window = Duration::from_millis(300);
+        let observation = collect_raw_chat_stream(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":56,\"completion_tokens\":16,\"total_tokens\":72}}\n\n",
+            ),
+            RawStubTail::KeepaliveComments,
+            window,
+        )
+        .await;
+
+        let events = &observation.events;
+        assert!(
+            matches!(
+                observed_done_outcome(events),
+                Some(LlmDoneOutcome::Success {
+                    stop_reason: StopReason::EndTurn
+                })
+            ),
+            "endless keepalive comments after the latch must end the stream successfully; \
+             got {events:?}"
+        );
+        assert_eq!(
+            done_count(events),
+            1,
+            "exactly one terminal Done: {events:?}"
+        );
+        let usage = observed_usage(events)
+            .expect("the accounting that arrived before the keepalives must be preserved");
+        assert_eq!(usage.as_usage().input_tokens, 56);
+        assert!(
+            observation.elapsed >= window,
+            "elapsed {:?} < window {window:?}: the stub closed early instead of commenting",
+            observation.elapsed
+        );
+        // A window re-armed by wire liveness never expires against a stub that
+        // comments every 20ms, so a finite elapsed at all is the assertion. The
+        // ceiling is deliberately many multiples of the window so that a loaded
+        // build host cannot fail it.
+        assert!(
+            observation.elapsed < window * 16,
+            "keepalive comments must not buy more trailer time: elapsed {:?} against a \
+             {window:?} window",
+            observation.elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_finish_then_silence_without_usage_mints_no_accounting() {
+        // Finish, then silence, and the server never sent accounting at all. The
+        // bound must still end the stream - and must NOT invent usage to make
+        // the turn look accounted for. Absent accounting is owned downstream, by
+        // the commit path, which is the only place that can report it honestly.
+        let window = Duration::from_millis(300);
+        let observation = collect_raw_chat_stream(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            RawStubTail::Silence,
+            window,
+        )
+        .await;
+
+        let events = &observation.events;
+        assert!(
+            matches!(
+                observed_done_outcome(events),
+                Some(LlmDoneOutcome::Success {
+                    stop_reason: StopReason::EndTurn
+                })
+            ),
+            "an unclosed body with no trailer at all is still END OF STREAM; got {events:?}"
+        );
+        assert_eq!(
+            done_count(events),
+            1,
+            "exactly one terminal Done: {events:?}"
+        );
+        assert!(
+            usage_update_index(events).is_none(),
+            "no accounting arrived, so none may be minted or substituted here: {events:?}"
+        );
+        assert!(
+            observation.elapsed >= window,
+            "elapsed {:?} < window {window:?}: the stub closed early instead of holding open",
+            observation.elapsed
+        );
     }
 
     #[tokio::test]
