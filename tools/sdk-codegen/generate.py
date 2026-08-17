@@ -4670,7 +4670,14 @@ def generate_python_event_types(schemas: dict, output_dir: Path) -> None:
     # would give the package two definitions of one contract type and let
     # `from .event_types import *` silently shadow the other. This module is the
     # complement, not a competing copy.
-    already_declared = _declared_python_names(output_dir / "types.py")
+    types_module = output_dir / "types.py"
+    if not types_module.is_file():
+        raise SystemExit(
+            "generate_python_event_types must run after generate_python_types: "
+            f"{types_module} does not exist yet. Emitting without it would "
+            "re-declare types that module owns and shadow them on star-import."
+        )
+    already_declared = _declared_python_names(types_module)
     reused = sorted(set(defs) & already_declared)
 
     lines: list[str] = [
@@ -4782,7 +4789,15 @@ def generate_typescript_event_types(schemas: dict, output_dir: Path) -> None:
     # `types.ts` already exports part of this set. Re-declaring those names here
     # would make `export * from './event_types.js'` ambiguous (TS2308), so this
     # module is the complement and re-uses the existing declarations.
-    already_declared = _declared_typescript_names(output_dir / "types.ts")
+    types_module = output_dir / "types.ts"
+    if not types_module.is_file():
+        raise SystemExit(
+            "generate_typescript_event_types must run after "
+            f"generate_typescript_types: {types_module} does not exist yet. "
+            "Emitting without it would re-declare exported names and make the "
+            "generated index ambiguous (TS2308)."
+        )
+    already_declared = _declared_typescript_names(types_module)
     reused = sorted(set(defs) & already_declared)
 
     lines: list[str] = [
@@ -6479,6 +6494,9 @@ def main():
     print(f"Generated Python types in {py_output}")
     generate_python_event_inventory(schemas, py_output)
     print(f"Generated Python event inventory in {py_output}")
+    # Must follow generate_python_types: the event payload module emits only the
+    # complement of what types.py already declares, and reads that module to
+    # learn it. Reordering these fails closed rather than double-declaring.
     generate_python_event_types(schemas, py_output)
     print(f"Generated Python event payload types in {py_output}")
     generate_python_version_compat(schemas, py_output)
@@ -6490,6 +6508,8 @@ def main():
     print(f"Generated TypeScript types in {ts_output}")
     generate_typescript_event_inventory(schemas, ts_output)
     print(f"Generated TypeScript event inventory in {ts_output}")
+    # Must follow generate_typescript_types, for the same reason as the Python
+    # pair above.
     generate_typescript_event_types(schemas, ts_output)
     print(f"Generated TypeScript event payload types in {ts_output}")
     generate_typescript_version_compat(schemas, ts_output)
