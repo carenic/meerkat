@@ -27,13 +27,47 @@ fn every_registration_and_binding_arm_rejects_while_draining() {
             "expected at least one generated {input} transition"
         );
         for transition in transitions {
+            // THE PROPERTY IS "NOTHING REMATERIALIZES DURING TEARDOWN", NOT
+            // "EVERY ARM CARRIES not_draining". Those were the same thing until
+            // the drain window acquired a TYPED REFUSAL: an arm that fires
+            // precisely BECAUSE registration is Draining, in order to reject
+            // with a named reason instead of a bare guard rejection. That arm
+            // cannot carry `not_draining` - it is the negation of its own
+            // trigger - and it rematerializes nothing.
+            //
+            // Asserting the guard NAME made this test fail when the machine was
+            // IMPROVED, which is the worst kind of false red: it fires exactly
+            // when someone does the right thing. So both legitimate shapes are
+            // named structurally, and anything that is neither still fails.
+            let fences_off_draining = transition
+                .guards
+                .iter()
+                .any(|guard| guard.name == "not_draining");
+            let refuses_because_draining = transition
+                .guards
+                .iter()
+                .any(|guard| guard.name == "unregister_draining")
+                // It must not write state...
+                && transition.updates.is_empty()
+                // ...and it must publish a typed verdict rather than silently
+                // swallowing the request.
+                && !transition.emit.is_empty();
+
             assert!(
+                fences_off_draining || refuses_because_draining,
+                "{} must either carry the generated not_draining guard, or be a \
+                 typed refusal arm (guarded on unregister_draining, no state \
+                 updates, emitting a rejection). Neither holds, so a surface \
+                 resource can rematerialize during teardown.\n  guards: {:?}\n  \
+                 updates: {}\n  emits: {}",
+                transition.name,
                 transition
                     .guards
                     .iter()
-                    .any(|guard| guard.name == "not_draining"),
-                "{} must carry the generated not_draining guard so surface resources cannot rematerialize during teardown",
-                transition.name
+                    .map(|guard| guard.name.as_str())
+                    .collect::<Vec<_>>(),
+                transition.updates.len(),
+                transition.emit.len()
             );
         }
     }
