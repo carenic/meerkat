@@ -475,6 +475,15 @@ impl OpenAiCompatibleClient {
             if data == "[DONE]" {
                 return Ok(ChatCompletionsLine::Done);
             }
+            // Check for an error envelope BEFORE decoding as a chunk. With
+            // `choices` defaulted, an error envelope decodes as a perfectly
+            // valid empty chunk and would be ignored - turning a dead server
+            // into a successful turn with truncated output.
+            if let Ok(envelope) = serde_json::from_str::<ChatCompletionsErrorEnvelope>(data)
+                && let Some(message) = envelope.into_message()
+            {
+                return Ok(ChatCompletionsLine::ServerError { message });
+            }
             serde_json::from_str(data)
                 .map(ChatCompletionsLine::Chunk)
                 .map_err(|err| LlmError::StreamParseError {
@@ -659,7 +668,24 @@ impl LlmClient for OpenAiCompatibleClient {
                     let mut saw_done_sentinel = false;
 
                     'consume: while let Some(chunk) = stream.next().await {
-                        let chunk = chunk.map_err(|_| LlmError::ConnectionReset)?;
+                        // Latching the stop reason extended the read window past
+                        // the finish event, so bytes this adapter never used to
+                        // read are now load-bearing. Post-latch, a transport
+                        // fault is END OF STREAM, not turn failure: the model
+                        // already finished and its answer already reached the
+                        // caller, so failing here would convert a complete turn
+                        // into a RETRYABLE `ConnectionReset` - answer streams,
+                        // turn fails, retry answers again. That is the exact
+                        // shape of the P0 this latch was added to fix, on a new
+                        // trigger (truncated body, proxy drop, ingress idle
+                        // close). Nothing is laundered: if usage never arrived,
+                        // the absent-accounting path downstream still owns that
+                        // verdict.
+                        let chunk = match chunk {
+                            Ok(chunk) => chunk,
+                            Err(_) if latched_stop.is_some() => break 'consume,
+                            Err(_) => Err(LlmError::ConnectionReset)?,
+                        };
                         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
                         let chunk_yielded = std::cell::Cell::new(false);
@@ -675,15 +701,42 @@ impl LlmClient for OpenAiCompatibleClient {
                             };
                             buffer.drain(..=newline_pos);
 
-                            // A malformed `data:` line fails the turn even after
-                            // the stop reason is latched: past the finish event
-                            // the most likely undecodable line is the usage
-                            // event itself, and swallowing it would reproduce
-                            // the missing-accounting failure with no diagnosis.
-                            // Truncated trailing bytes are treated differently
-                            // below, because they carry no decodable claim.
-                            let event = match parsed? {
+                            // Post-latch, an undecodable line is also end of
+                            // stream rather than turn failure. The original
+                            // rationale here was that the undecodable line is
+                            // probably the usage event, so failing preserves a
+                            // diagnosis - but a server is free to emit keepalive
+                            // text or `{"choices":null,...}` after the finish
+                            // event, and both are ordinary. Failing a completed,
+                            // already-delivered turn to preserve a diagnosis
+                            // trades a real outage for a log line. If usage
+                            // genuinely never arrived, that fact is owned
+                            // downstream where it can be reported without
+                            // destroying the turn.
+                            let parsed = match parsed {
+                                Ok(parsed) => parsed,
+                                Err(_) if latched_stop.is_some() => break 'consume,
+                                Err(err) => Err(err)?,
+                            };
+                            let event = match parsed {
                                 ChatCompletionsLine::Ignored => continue,
+                                // A provider error BEFORE the stop reason is
+                                // latched invalidates the turn: the model had
+                                // not finished, so whatever text reached the
+                                // caller is truncated and must not be presented
+                                // as a complete answer. AFTER the latch the
+                                // model already finished and its answer already
+                                // landed, so a late server error - an engine
+                                // tearing down after completing the request -
+                                // invalidates nothing and ends the stream.
+                                ChatCompletionsLine::ServerError { message } => {
+                                    if latched_stop.is_some() {
+                                        break 'consume;
+                                    }
+                                    Err(LlmError::StreamParseError {
+                                        message: format!("provider error event: {message}"),
+                                    })?
+                                }
                                 ChatCompletionsLine::Done => {
                                     // The protocol's terminal sentinel closes
                                     // the turn without waiting for the server
@@ -933,6 +986,50 @@ enum ChatCompletionsLine {
     Chunk(ChatCompletionsChunk),
     Done,
     Ignored,
+    /// A provider error envelope, e.g. `{"object":"error","message":"engine
+    /// core proc died"}` or `{"error":{"message":...}}`.
+    ///
+    /// This variant exists because `choices` is `#[serde(default)]` - which a
+    /// usage-only event genuinely needs - and without an error arm an error
+    /// envelope decodes as an EMPTY CHUNK and is silently ignored. A server
+    /// that dies mid-stream then presents as a SUCCESSFUL turn carrying
+    /// truncated text, which is worse than the failure it replaced. The
+    /// sibling adapter already models this (`text_adapter.rs`,
+    /// `ServerEvent::Error => Err(map_server_error(error))?`).
+    ServerError { message: String },
+}
+
+/// Provider error envelope. Both shapes are seen in the wild: a top-level
+/// `{"object":"error","message":...}` and a nested `{"error":{"message":...}}`.
+#[derive(Debug, Deserialize)]
+struct ChatCompletionsErrorEnvelope {
+    #[serde(default)]
+    object: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    error: Option<ChatCompletionsNestedError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionsNestedError {
+    #[serde(default)]
+    message: Option<String>,
+}
+
+impl ChatCompletionsErrorEnvelope {
+    /// `Some(message)` only when this really is an error envelope. A normal
+    /// chunk deserializes into this struct too (every field is optional), so
+    /// presence of an error marker - not successful decoding - is the test.
+    fn into_message(self) -> Option<String> {
+        if let Some(nested) = self.error.and_then(|nested| nested.message) {
+            return Some(nested);
+        }
+        if self.object.as_deref() == Some("error") {
+            return Some(self.message.unwrap_or_else(|| "provider error".to_string()));
+        }
+        None
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1257,6 +1354,84 @@ mod tests {
             LlmEvent::Done { outcome } => Some(outcome),
             _ => None,
         })
+    }
+
+    /// A provider error envelope BEFORE the finish event must fail the turn.
+    ///
+    /// Regression guard for the second-order defect introduced by making
+    /// `choices` `#[serde(default)]`: with that default and no error arm, this
+    /// envelope decodes as a valid EMPTY CHUNK and is silently ignored, so a
+    /// server that dies mid-stream presents as a SUCCESSFUL turn carrying
+    /// truncated text. Silent truncation reported as success is strictly worse
+    /// than the parse failure it replaced.
+    #[tokio::test]
+    async fn chat_completions_provider_error_before_finish_fails_the_turn() {
+        let events = collect_chat_stream_events(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"object\":\"error\",\"message\":\"engine core proc died\"}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+
+        let outcome = observed_done_outcome(&events).expect("terminal done");
+        match outcome {
+            LlmDoneOutcome::Error { error } => {
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains("engine core proc died"),
+                    "the provider's own message must survive to the caller, got {rendered}"
+                );
+            }
+            LlmDoneOutcome::Success { .. } => panic!(
+                "a provider error before the finish event must not present as a successful \
+                 turn carrying truncated text; got {events:?}"
+            ),
+        }
+    }
+
+    /// The nested `{"error":{...}}` envelope shape, same rule.
+    #[tokio::test]
+    async fn chat_completions_nested_provider_error_before_finish_fails_the_turn() {
+        let events = collect_chat_stream_events(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"upstream exploded\"}}\n\n"
+        ))
+        .await;
+
+        let outcome = observed_done_outcome(&events).expect("terminal done");
+        assert!(
+            matches!(outcome, LlmDoneOutcome::Error { .. }),
+            "nested provider error envelope must fail the turn, got {events:?}"
+        );
+    }
+
+    /// An undecodable line AFTER the stop reason is latched must NOT fail a
+    /// turn whose answer already reached the caller.
+    ///
+    /// Regression guard for the read-window defect: latching the stop reason
+    /// extended the read past the finish event, so bytes the adapter never used
+    /// to read became load-bearing. A keepalive or any other undecodable line
+    /// there previously turned a complete, delivered turn into a RETRYABLE
+    /// failure - answer streams, turn fails, retry answers again, which is the
+    /// exact shape of the P0 the latch was added to fix.
+    #[tokio::test]
+    async fn chat_completions_undecodable_line_after_finish_does_not_fail_the_turn() {
+        let events = collect_chat_stream_events(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"usage\":{\"prompt_tokens\":56,\"completion_tokens\":16,\"total_tokens\":72}}\n\n",
+            "data: keep-alive\n\n"
+        ))
+        .await;
+
+        let outcome = observed_done_outcome(&events).expect("terminal done");
+        assert!(
+            matches!(outcome, LlmDoneOutcome::Success { .. }),
+            "an undecodable line after the latch must end the stream, not fail a \
+             delivered turn; got {events:?}"
+        );
+        let usage = observed_usage(&events).expect("usage captured before the undecodable line");
+        assert_eq!(usage.as_usage().input_tokens, 56);
+        assert_eq!(done_count(&events), 1, "exactly one terminal Done");
     }
 
     #[tokio::test]
