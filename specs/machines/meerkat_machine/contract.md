@@ -424,8 +424,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RegisterAcceptedIdempotency`(input_id: String, idempotency_key: String)
 - `NormalizeRecoveredInputLifecycle`(input_id: String, phase: RecoveredInputObservedPhase, applied_boundary_committed: Option<Bool>)
 - `ClassifyRecoveredInputDurability`(input_id: String, durability: InputDurabilityKind)
-- `ClassifyRecoveredTerminalCompletionBatch`(batch_key: String, correlatable: Bool, owner_candidate_present: Bool, directed_publication_pending: Bool)
-- `DeclareRecoveredTerminalCompletionUnrecoverable`(batch_key: String, reason: RecoveredTerminalCompletionUnrecoverableReasonKind)
 - `ResolveInputPublicLifecycle`(input_id: String, phase: RecoveredInputObservedPhase)
 - `ResolveInputPublicTerminalOutcome`(input_id: String, phase: RecoveredInputObservedPhase, terminal_kind: Option<InputTerminalKind>, abandon_reason: Option<InputAbandonReason>)
 - `ClassifyInputTerminality`(input_id: String, phase: RecoveredInputObservedPhase, terminal_kind: Option<InputTerminalKind>, abandon_reason: Option<InputAbandonReason>)
@@ -630,6 +628,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `AuthorizeSupervisorMobPeerOverlay`(supervisor_peer_id: String, supervisor_epoch: u64, recipient_peer_id: String, overlay_epoch: u64, endpoints: Set<PeerEndpoint>, endpoint_count: u64, command_peer_id: String, command_endpoint: PeerEndpoint, command_kind: MobPeerOverlayCommandKind)
 - `ApplyMobPeerOverlay`(epoch: u64, endpoints: Set<PeerEndpoint>)
 - `AuthorizeInteractionTerminalOutboxAdoption`(batch_key: String, candidate_digest: String, session_id: SessionId, previous_agent_runtime_id: AgentRuntimeId, previous_fence_token: FenceToken, previous_runtime_generation: Generation, previous_runtime_epoch_id: Option<RuntimeEpochId>)
+- `ClassifyRecoveredTerminalCompletionBatch`(batch_key: String, correlatable: Bool, owner_candidate_present: Bool, directed_publication_pending: Bool)
+- `DeclareRecoveredTerminalCompletionUnrecoverable`(batch_key: String, reason: RecoveredTerminalCompletionUnrecoverableReasonKind)
 
 ## Signals
 - `Initialize`
@@ -688,8 +688,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `AdmissionIdempotencyResolved`(input_id: String, result: AdmissionIdempotencyResultKind, existing_input_id: Option<String>)
 - `RecoveredInputLifecycleNormalized`(input_id: String, phase: InputPhase, terminal_kind: Option<InputTerminalKind>, recovered: Bool, abandoned: Bool, requeued: Bool, history_reason: Option<RecoveredInputNormalizationReasonKind>)
 - `RecoveredInputDurabilityClassified`(input_id: String, disposition: RecoveredInputRecoveryDisposition)
-- `RecoveredTerminalCompletionBatchClassified`(batch_key: String, disposition: RecoveredTerminalCompletionDisposition)
-- `RecoveredTerminalCompletionDeclaredUnrecoverable`(batch_key: String, reason: RecoveredTerminalCompletionUnrecoverableReasonKind)
 - `InputPublicLifecycleResolved`(input_id: String, phase: InputPublicLifecycleState)
 - `InputPublicTerminalOutcomeResolved`(input_id: String, terminal_outcome: Option<InputPublicTerminalOutcome>)
 - `InputBehavioralTerminalityResolved`(input_id: String, terminal: Bool)
@@ -809,6 +807,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RequestCommsDrainExitForUnregister`(session_id: SessionId)
 - `RequestCompletionWaiterResolutionForUnregister`(session_id: SessionId)
 - `InteractionTerminalOutboxAdoptionAuthorized`(batch_key: String, candidate_digest: String, session_id: SessionId, previous_agent_runtime_id: AgentRuntimeId, previous_fence_token: FenceToken, previous_runtime_generation: Generation, previous_runtime_epoch_id: Option<RuntimeEpochId>, next_agent_runtime_id: AgentRuntimeId, next_fence_token: FenceToken, next_runtime_generation: Generation, next_runtime_epoch_id: Option<RuntimeEpochId>)
+- `RecoveredTerminalCompletionBatchClassified`(batch_key: String, disposition: RecoveredTerminalCompletionDisposition)
+- `RecoveredTerminalCompletionDeclaredUnrecoverable`(batch_key: String, reason: RecoveredTerminalCompletionUnrecoverableReasonKind)
 
 ## Helpers
 - `runtime_authority_reconcile_decision`(observation_kind: RuntimeAuthorityObservationKind, state: Option<RuntimeLifecycleObservedState>, agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>, current_run_id: Option<RunId>, pre_run_phase: Option<PreRunPhase>, malformed_reclaim_safe: Bool) -> `RuntimeAuthorityReconcileDecision`

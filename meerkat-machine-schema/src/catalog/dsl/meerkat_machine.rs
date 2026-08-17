@@ -4127,25 +4127,6 @@ macro_rules! meerkat_catalog_machine_dsl {
                 input_id: String,
                 durability: Enum<InputDurabilityKind>,
             },
-            ClassifyRecoveredTerminalCompletionBatch {
-                batch_key: String,
-                // The shell has established that this batch's run is the one
-                // the single completion correlation can still admit. With no
-                // runtime-binding identity on the rows there is no ordering
-                // evidence, so at most one batch may carry this.
-                correlatable: bool,
-                // The owner row still carries the candidate payload the public
-                // completion class is derived from.
-                owner_candidate_present: bool,
-                // An unpublished directed interaction-terminal outbox still
-                // exists for this batch, i.e. discarding it would drop a
-                // user-visible terminal event and not merely a waiter receipt.
-                directed_publication_pending: bool,
-            },
-            DeclareRecoveredTerminalCompletionUnrecoverable {
-                batch_key: String,
-                reason: Enum<RecoveredTerminalCompletionUnrecoverableReasonKind>,
-            },
             ResolveInputPublicLifecycle {
                 input_id: String,
                 phase: Enum<RecoveredInputObservedPhase>,
@@ -4912,6 +4893,25 @@ macro_rules! meerkat_catalog_machine_dsl {
                 previous_runtime_generation: Generation,
                 previous_runtime_epoch_id: Option<RuntimeEpochId>,
             },
+            ClassifyRecoveredTerminalCompletionBatch {
+                batch_key: String,
+                // The shell has established that this batch's run is the one
+                // the single completion correlation can still admit. With no
+                // runtime-binding identity on the rows there is no ordering
+                // evidence, so at most one batch may carry this.
+                correlatable: bool,
+                // The owner row still carries the candidate payload the public
+                // completion class is derived from.
+                owner_candidate_present: bool,
+                // An unpublished directed interaction-terminal outbox still
+                // exists for this batch, i.e. discarding it would drop a
+                // user-visible terminal event and not merely a waiter receipt.
+                directed_publication_pending: bool,
+            },
+            DeclareRecoveredTerminalCompletionUnrecoverable {
+                batch_key: String,
+                reason: Enum<RecoveredTerminalCompletionUnrecoverableReasonKind>,
+            },
         }
 
         surface_only [
@@ -5137,14 +5137,6 @@ macro_rules! meerkat_catalog_machine_dsl {
             RecoveredInputDurabilityClassified {
                 input_id: String,
                 disposition: Enum<RecoveredInputRecoveryDisposition>,
-            },
-            RecoveredTerminalCompletionBatchClassified {
-                batch_key: String,
-                disposition: Enum<RecoveredTerminalCompletionDisposition>,
-            },
-            RecoveredTerminalCompletionDeclaredUnrecoverable {
-                batch_key: String,
-                reason: Enum<RecoveredTerminalCompletionUnrecoverableReasonKind>,
             },
             InputPublicLifecycleResolved {
                 input_id: String,
@@ -5658,6 +5650,14 @@ macro_rules! meerkat_catalog_machine_dsl {
                 next_fence_token: FenceToken,
                 next_runtime_generation: Generation,
                 next_runtime_epoch_id: Option<RuntimeEpochId>,
+            },
+            RecoveredTerminalCompletionBatchClassified {
+                batch_key: String,
+                disposition: Enum<RecoveredTerminalCompletionDisposition>,
+            },
+            RecoveredTerminalCompletionDeclaredUnrecoverable {
+                batch_key: String,
+                reason: Enum<RecoveredTerminalCompletionUnrecoverableReasonKind>,
             },
         }
 
@@ -7114,6 +7114,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
         }
 
+        // Transition declaration order is runtime semantics: the production
+        // dispatcher preserves it for same-trigger first-match chains. Never
+        // reorder transition bodies to repair generated Rust enum ordinals;
+        // the kernel renderer owns its append-only public TransitionId order.
+        //
         // 2. RegisterSession: per-phase self-loop. Binding a NEW session id
         // resets the per-session LLM state. Destroyed is intentionally absent:
         // RegisterSession is a resurrection input the DestroyedShapeInvariant

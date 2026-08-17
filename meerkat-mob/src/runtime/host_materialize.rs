@@ -165,20 +165,6 @@ pub enum MaterializeServeError {
     Build(#[from] crate::error::MobError),
     #[error("member comms runtime construction failed: {detail}")]
     Comms { detail: String },
-    /// The member participant name could not be published because a
-    /// *different* live public key already holds that route.
-    ///
-    /// Re-carries [`meerkat_comms::RegistrationRejection::NameOccupied`]'s
-    /// `holder_pubkey` verbatim rather than flattening it into [`Self::Comms`]'s
-    /// prose. Construct only from `crate::error::comms_name_occupancy_holder`.
-    #[error(
-        "{}",
-        crate::error::participant_name_occupied_message(participant_name, holder_pubkey)
-    )]
-    ParticipantNameOccupied {
-        participant_name: String,
-        holder_pubkey: meerkat_comms::PubKey,
-    },
     #[error("host-seeded supervisor bind failed: {detail}")]
     SupervisorBind { detail: String },
     #[error("member session service failed: {0}")]
@@ -211,6 +197,20 @@ pub enum MaterializeServeError {
         "revived member keypair diverged from the recorded pubkey (recorded '{recorded}', derived '{derived}')"
     )]
     RevivedIdentityDiverged { recorded: String, derived: String },
+    /// The member participant name could not be published because a
+    /// *different* live public key already holds that route.
+    ///
+    /// Re-carries [`meerkat_comms::RegistrationRejection::NameOccupied`]'s
+    /// `holder_pubkey` verbatim rather than flattening it into [`Self::Comms`]'s
+    /// prose. Construct only from `crate::error::comms_name_occupancy_holder`.
+    #[error(
+        "{}",
+        crate::error::participant_name_occupied_message(participant_name, holder_pubkey)
+    )]
+    ParticipantNameOccupied {
+        participant_name: String,
+        holder_pubkey: meerkat_comms::PubKey,
+    },
 }
 
 impl MaterializeServeError {

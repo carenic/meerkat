@@ -2187,43 +2187,6 @@ pub enum AgentEvent {
         usage: Option<crate::types::TurnUsage>,
     },
 
-    /// One model turn's provider token accounting was absent.
-    ///
-    /// The routed form of the `unmeasured:turn_usage_accounting` marker. It
-    /// states exactly one thing: the provider stream for this turn carried no
-    /// normalized accounting, so no accounting axis advanced for it - no
-    /// budget charge, no session usage, no presented-token update.
-    ///
-    /// It deliberately does NOT claim the turn completed. This is published at
-    /// the model boundary, before the boundary effects and terminal hooks that
-    /// can still fail the turn on their own (unrelated) grounds, and the
-    /// absence of accounting is true either way. Whether the turn completed is
-    /// owned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the
-    /// turns this marker names - and a turn that fails afterwards publishes
-    /// its own terminal fact.
-    ///
-    /// What this is not is a cause of failure. A number nobody has cannot
-    /// invalidate an answer the user has already read; see
-    /// [`crate::UnmeasuredTurnUsageAccounting`].
-    TurnUsageAccountingUnmeasured {
-        session_id: SessionId,
-        unmeasured: crate::provider_evidence::UnmeasuredTurnUsageAccounting,
-    },
-
-    /// One model turn's accounting named a provider/model other than the
-    /// request it answered.
-    ///
-    /// The routed form of the `disputed:turn_usage_accounting_identity`
-    /// marker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the
-    /// counters exist and are internally consistent, so the token axis still
-    /// advances on them; what is in dispute is attribution. The reported
-    /// identity is published exactly as the adapter minted it and is never
-    /// rewritten to the active identity.
-    TurnUsageAccountingIdentityDisputed {
-        session_id: SessionId,
-        dispute: crate::provider_evidence::DisputedTurnUsageAccountingIdentity,
-    },
-
     // === Tool Execution ===
     /// Starting tool execution
     ToolExecutionStarted { id: String, name: String },
@@ -2453,6 +2416,43 @@ pub enum AgentEvent {
         /// third state that consumers must never coalesce into `Clean`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sender_taint: Option<crate::comms::SenderContentTaint>,
+    },
+
+    /// One model turn's provider token accounting was absent.
+    ///
+    /// The routed form of the `unmeasured:turn_usage_accounting` marker. It
+    /// states exactly one thing: the provider stream for this turn carried no
+    /// normalized accounting, so no accounting axis advanced for it - no
+    /// budget charge, no session usage, no presented-token update.
+    ///
+    /// It deliberately does NOT claim the turn completed. This is published at
+    /// the model boundary, before the boundary effects and terminal hooks that
+    /// can still fail the turn on their own (unrelated) grounds, and the
+    /// absence of accounting is true either way. Whether the turn completed is
+    /// owned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the
+    /// turns this marker names - and a turn that fails afterwards publishes
+    /// its own terminal fact.
+    ///
+    /// What this is not is a cause of failure. A number nobody has cannot
+    /// invalidate an answer the user has already read; see
+    /// [`crate::UnmeasuredTurnUsageAccounting`].
+    TurnUsageAccountingUnmeasured {
+        session_id: SessionId,
+        unmeasured: crate::provider_evidence::UnmeasuredTurnUsageAccounting,
+    },
+
+    /// One model turn's accounting named a provider/model other than the
+    /// request it answered.
+    ///
+    /// The routed form of the `disputed:turn_usage_accounting_identity`
+    /// marker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the
+    /// counters exist and are internally consistent, so the token axis still
+    /// advances on them; what is in dispute is attribution. The reported
+    /// identity is published exactly as the adapter minted it and is never
+    /// rewritten to the active identity.
+    TurnUsageAccountingIdentityDisputed {
+        session_id: SessionId,
+        dispute: crate::provider_evidence::DisputedTurnUsageAccountingIdentity,
     },
 }
 

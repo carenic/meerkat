@@ -196,6 +196,15 @@ pub enum MobHostActorError {
     /// Host comms runtime composition or trust seam failed.
     #[error("host comms runtime fault: {detail}")]
     Comms { detail: String },
+    /// Descriptor publication (file sink or pairing watch) failed.
+    #[error("host binding descriptor publication failed: {detail}")]
+    Descriptor { detail: String },
+    /// Tier-1 provider presence probe failed (credential backend fault).
+    #[error(transparent)]
+    Probe(#[from] ProviderPresenceProbeError),
+    /// Internal invariant violation.
+    #[error("mob host actor internal fault: {detail}")]
+    Internal { detail: String },
     /// The host participant name could not be published because a *different*
     /// live public key already holds that route.
     ///
@@ -211,15 +220,6 @@ pub enum MobHostActorError {
         participant_name: String,
         holder_pubkey: meerkat_comms::PubKey,
     },
-    /// Descriptor publication (file sink or pairing watch) failed.
-    #[error("host binding descriptor publication failed: {detail}")]
-    Descriptor { detail: String },
-    /// Tier-1 provider presence probe failed (credential backend fault).
-    #[error(transparent)]
-    Probe(#[from] ProviderPresenceProbeError),
-    /// Internal invariant violation.
-    #[error("mob host actor internal fault: {detail}")]
-    Internal { detail: String },
 }
 
 impl MobHostActorError {

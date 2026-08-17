@@ -6250,12 +6250,6 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RecoveredInputDurabilityClassified`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
-- `RecoveredTerminalCompletionBatchClassified`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
-- `RecoveredTerminalCompletionDeclaredUnrecoverable`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
 - `InputPublicLifecycleResolved`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -6611,6 +6605,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `InteractionTerminalOutboxAdoptionAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoveredTerminalCompletionBatchClassified`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoveredTerminalCompletionDeclaredUnrecoverable`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 

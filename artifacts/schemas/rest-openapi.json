@@ -856,48 +856,6 @@
             "type": "object"
           },
           {
-            "description": "One model turn's provider token accounting was absent.\n\nThe routed form of the `unmeasured:turn_usage_accounting` marker. It\nstates exactly one thing: the provider stream for this turn carried no\nnormalized accounting, so no accounting axis advanced for it - no\nbudget charge, no session usage, no presented-token update.\n\nIt deliberately does NOT claim the turn completed. This is published at\nthe model boundary, before the boundary effects and terminal hooks that\ncan still fail the turn on their own (unrelated) grounds, and the\nabsence of accounting is true either way. Whether the turn completed is\nowned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the\nturns this marker names - and a turn that fails afterwards publishes\nits own terminal fact.\n\nWhat this is not is a cause of failure. A number nobody has cannot\ninvalidate an answer the user has already read; see\n[`crate::UnmeasuredTurnUsageAccounting`].",
-            "properties": {
-              "session_id": {
-                "$ref": "#/components/schemas/SessionId"
-              },
-              "type": {
-                "const": "turn_usage_accounting_unmeasured",
-                "type": "string"
-              },
-              "unmeasured": {
-                "$ref": "#/components/schemas/UnmeasuredTurnUsageAccounting"
-              }
-            },
-            "required": [
-              "type",
-              "session_id",
-              "unmeasured"
-            ],
-            "type": "object"
-          },
-          {
-            "description": "One model turn's accounting named a provider/model other than the\nrequest it answered.\n\nThe routed form of the `disputed:turn_usage_accounting_identity`\nmarker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the\ncounters exist and are internally consistent, so the token axis still\nadvances on them; what is in dispute is attribution. The reported\nidentity is published exactly as the adapter minted it and is never\nrewritten to the active identity.",
-            "properties": {
-              "dispute": {
-                "$ref": "#/components/schemas/DisputedTurnUsageAccountingIdentity"
-              },
-              "session_id": {
-                "$ref": "#/components/schemas/SessionId"
-              },
-              "type": {
-                "const": "turn_usage_accounting_identity_disputed",
-                "type": "string"
-              }
-            },
-            "required": [
-              "type",
-              "session_id",
-              "dispute"
-            ],
-            "type": "object"
-          },
-          {
             "description": "Starting tool execution",
             "properties": {
               "id": {
@@ -1438,6 +1396,48 @@
             "required": [
               "type",
               "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's provider token accounting was absent.\n\nThe routed form of the `unmeasured:turn_usage_accounting` marker. It\nstates exactly one thing: the provider stream for this turn carried no\nnormalized accounting, so no accounting axis advanced for it - no\nbudget charge, no session usage, no presented-token update.\n\nIt deliberately does NOT claim the turn completed. This is published at\nthe model boundary, before the boundary effects and terminal hooks that\ncan still fail the turn on their own (unrelated) grounds, and the\nabsence of accounting is true either way. Whether the turn completed is\nowned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the\nturns this marker names - and a turn that fails afterwards publishes\nits own terminal fact.\n\nWhat this is not is a cause of failure. A number nobody has cannot\ninvalidate an answer the user has already read; see\n[`crate::UnmeasuredTurnUsageAccounting`].",
+            "properties": {
+              "session_id": {
+                "$ref": "#/components/schemas/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_unmeasured",
+                "type": "string"
+              },
+              "unmeasured": {
+                "$ref": "#/components/schemas/UnmeasuredTurnUsageAccounting"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "unmeasured"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's accounting named a provider/model other than the\nrequest it answered.\n\nThe routed form of the `disputed:turn_usage_accounting_identity`\nmarker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the\ncounters exist and are internally consistent, so the token axis still\nadvances on them; what is in dispute is attribution. The reported\nidentity is published exactly as the adapter minted it and is never\nrewritten to the active identity.",
+            "properties": {
+              "dispute": {
+                "$ref": "#/components/schemas/DisputedTurnUsageAccountingIdentity"
+              },
+              "session_id": {
+                "$ref": "#/components/schemas/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_identity_disputed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "dispute"
             ],
             "type": "object"
           }

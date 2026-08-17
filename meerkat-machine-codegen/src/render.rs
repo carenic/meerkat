@@ -346,6 +346,80 @@ pub fn render_machine_kernel_module(schema: &MachineSchema) -> String {
     render_canonical_stub_modeled_module(schema)
 }
 
+// Rust enum order is a public compatibility surface, while transition schema
+// order is a runtime semantic surface: the production proc-macro dispatcher
+// preserves declaration order when it builds same-trigger first-match chains.
+// Keep additions that landed inside the MeerkatMachine transition catalog in
+// this append-only emission tail instead of moving their transition bodies.
+#[cfg(not(test))]
+const MEERKAT_TRANSITION_ENUM_TAIL: &[&str] = &[
+    "RegisterSessionRefusedUnregisterDrainingIdle",
+    "RegisterSessionRefusedUnregisterDrainingAttached",
+    "RegisterSessionRefusedUnregisterDrainingRunning",
+    "RegisterSessionRefusedUnregisterDrainingRetired",
+    "RegisterSessionRefusedUnregisterDrainingStopped",
+    "ClassifyRecoveredTerminalCompletionBatchRecoverInitializing",
+    "ClassifyRecoveredTerminalCompletionBatchRecoverIdle",
+    "ClassifyRecoveredTerminalCompletionBatchRecoverAttached",
+    "ClassifyRecoveredTerminalCompletionBatchRecoverRunning",
+    "ClassifyRecoveredTerminalCompletionBatchRecoverRetired",
+    "ClassifyRecoveredTerminalCompletionBatchRecoverStopped",
+    "ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableInitializing",
+    "ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableIdle",
+    "ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableAttached",
+    "ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRunning",
+    "ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRetired",
+    "ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableStopped",
+    "ClassifyRecoveredTerminalCompletionBatchBlockedInitializing",
+    "ClassifyRecoveredTerminalCompletionBatchBlockedIdle",
+    "ClassifyRecoveredTerminalCompletionBatchBlockedAttached",
+    "ClassifyRecoveredTerminalCompletionBatchBlockedRunning",
+    "ClassifyRecoveredTerminalCompletionBatchBlockedRetired",
+    "ClassifyRecoveredTerminalCompletionBatchBlockedStopped",
+    "DeclareRecoveredTerminalCompletionUnrecoverableInitializing",
+    "DeclareRecoveredTerminalCompletionUnrecoverableIdle",
+    "DeclareRecoveredTerminalCompletionUnrecoverableAttached",
+    "DeclareRecoveredTerminalCompletionUnrecoverableRunning",
+    "DeclareRecoveredTerminalCompletionUnrecoverableRetired",
+    "DeclareRecoveredTerminalCompletionUnrecoverableStopped",
+    "PrepareIdleRetainingUnsettledCompletion",
+    "PrepareAttachedRetainingUnsettledCompletion",
+    "DrainQueuedRunRetiredRetainingUnsettledCompletion",
+];
+
+#[cfg(not(test))]
+fn transitions_in_public_enum_order(schema: &MachineSchema) -> Vec<&TransitionSchema> {
+    if schema.machine.as_ref() != "MeerkatMachine" {
+        return schema.transitions.iter().collect();
+    }
+
+    let mut ordered = Vec::with_capacity(schema.transitions.len());
+    ordered.extend(
+        schema
+            .transitions
+            .iter()
+            .filter(|transition| !MEERKAT_TRANSITION_ENUM_TAIL.contains(&transition.name.as_ref())),
+    );
+    for expected_name in MEERKAT_TRANSITION_ENUM_TAIL {
+        let transition = schema
+            .transitions
+            .iter()
+            .find(|transition| transition.name.as_ref() == *expected_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "MeerkatMachine public TransitionId tail names missing schema transition `{expected_name}`"
+                )
+            });
+        ordered.push(transition);
+    }
+    assert_eq!(
+        ordered.len(),
+        schema.transitions.len(),
+        "MeerkatMachine public TransitionId tail must name unique schema transitions"
+    );
+    ordered
+}
+
 #[cfg(not(test))]
 fn render_canonical_stub_modeled_module(schema: &MachineSchema) -> String {
     let mut out = String::new();
@@ -595,7 +669,7 @@ fn render_canonical_stub_modeled_module(schema: &MachineSchema) -> String {
         "#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]"
     );
     pushln!(&mut out, "pub enum TransitionId {{");
-    for transition in &schema.transitions {
+    for transition in transitions_in_public_enum_order(schema) {
         pushln!(&mut out, "    {},", rust_ident(&transition.name));
     }
     pushln!(&mut out, "}}");

@@ -882,14 +882,6 @@ export type AgentEvent = {
   type: "turn_completed";
   usage?: TurnUsage | null;
 } | {
-  session_id: SessionId;
-  type: "turn_usage_accounting_unmeasured";
-  unmeasured: UnmeasuredTurnUsageAccounting;
-} | {
-  dispute: DisputedTurnUsageAccountingIdentity;
-  session_id: SessionId;
-  type: "turn_usage_accounting_identity_disputed";
-} | {
   id: string;
   name: string;
   type: "tool_execution_started";
@@ -982,6 +974,14 @@ export type AgentEvent = {
   request_id?: string | null;
   sender_taint?: SenderContentTaint | null;
   type: "peer_content_ingested";
+} | {
+  session_id: SessionId;
+  type: "turn_usage_accounting_unmeasured";
+  unmeasured: UnmeasuredTurnUsageAccounting;
+} | {
+  dispute: DisputedTurnUsageAccountingIdentity;
+  session_id: SessionId;
+  type: "turn_usage_accounting_identity_disputed";
 };
 
 /**

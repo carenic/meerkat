@@ -705,18 +705,6 @@ export interface TurnCompletedEvent {
   usage?: TurnUsage | null;
 }
 
-export interface TurnUsageAccountingUnmeasuredEvent {
-  session_id: SessionId;
-  type: "turn_usage_accounting_unmeasured";
-  unmeasured: UnmeasuredTurnUsageAccounting;
-}
-
-export interface TurnUsageAccountingIdentityDisputedEvent {
-  dispute: DisputedTurnUsageAccountingIdentity;
-  session_id: SessionId;
-  type: "turn_usage_accounting_identity_disputed";
-}
-
 export interface ToolExecutionStartedEvent {
   id: string;
   name: string;
@@ -850,6 +838,18 @@ export interface PeerContentIngestedEvent {
   type: "peer_content_ingested";
 }
 
+export interface TurnUsageAccountingUnmeasuredEvent {
+  session_id: SessionId;
+  type: "turn_usage_accounting_unmeasured";
+  unmeasured: UnmeasuredTurnUsageAccounting;
+}
+
+export interface TurnUsageAccountingIdentityDisputedEvent {
+  dispute: DisputedTurnUsageAccountingIdentity;
+  session_id: SessionId;
+  type: "turn_usage_accounting_identity_disputed";
+}
+
 export const KNOWN_AGENT_EVENT_TYPES = [
   "run_started",
   "run_completed",
@@ -914,8 +914,6 @@ export type AgentEvent =
   ToolCallRequestedEvent |
   ToolResultReceivedEvent |
   TurnCompletedEvent |
-  TurnUsageAccountingUnmeasuredEvent |
-  TurnUsageAccountingIdentityDisputedEvent |
   ToolExecutionStartedEvent |
   ToolExecutionCompletedEvent |
   ToolExecutionTimedOutEvent |
@@ -935,4 +933,6 @@ export type AgentEvent =
   TranscriptRewriteCommittedEvent |
   TranscriptRewriteAuditReceiptCommittedEvent |
   ProviderCacheBreakpointsDiscardedEvent |
-  PeerContentIngestedEvent;
+  PeerContentIngestedEvent |
+  TurnUsageAccountingUnmeasuredEvent |
+  TurnUsageAccountingIdentityDisputedEvent;

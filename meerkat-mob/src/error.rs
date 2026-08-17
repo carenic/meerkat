@@ -709,6 +709,10 @@ pub enum MobError {
         kind: FlowStepDispatchRejectKind,
     },
 
+    /// An internal error (unexpected state, logic errors).
+    #[error("internal error: {0}")]
+    Internal(String),
+
     /// Publishing a comms participant name was refused because a *different*
     /// live public key already holds that route.
     ///
@@ -734,10 +738,6 @@ pub enum MobError {
         participant_name: String,
         holder_pubkey: meerkat_comms::PubKey,
     },
-
-    /// An internal error (unexpected state, logic errors).
-    #[error("internal error: {0}")]
-    Internal(String),
 }
 
 /// THE single owner of the operator-facing name-occupancy remedy text, shared

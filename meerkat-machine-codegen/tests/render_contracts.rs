@@ -567,6 +567,39 @@ fn typed_kernel_module_contract_rejects_legacy_kernel_surface() {
 }
 
 #[test]
+fn generated_meerkat_transition_enum_order_is_decoupled_from_dispatch_order() {
+    let schema = meerkat_machine();
+    let draining_dispatch_index = schema
+        .transitions
+        .iter()
+        .position(|transition| {
+            transition.name.as_ref() == "RegisterSessionRefusedUnregisterDrainingIdle"
+        })
+        .expect("draining registration transition must exist");
+    let later_registration_dispatch_index = schema
+        .transitions
+        .iter()
+        .position(|transition| transition.name.as_ref() == "RegisterSessionResumesStopped")
+        .expect("stopped registration transition must exist");
+    assert!(
+        draining_dispatch_index < later_registration_dispatch_index,
+        "schema transition order must retain first-match dispatch semantics"
+    );
+
+    let rendered = render_machine_kernel_module(&schema);
+    let old_final = rendered
+        .find("    ResolveTurnSurfaceResultStructuredOutputValidationFailedHardFailureIdle,")
+        .expect("old final TransitionId must be rendered");
+    let appended = rendered
+        .find("    RegisterSessionRefusedUnregisterDrainingIdle,")
+        .expect("appended TransitionId must be rendered");
+    assert!(
+        old_final < appended,
+        "new TransitionId variants must be emitted after every pre-0.8.24 variant"
+    );
+}
+
+#[test]
 fn generated_meerkat_operation_status_is_closed_enum() {
     let rendered = render_machine_kernel_module(&meerkat_machine());
 
