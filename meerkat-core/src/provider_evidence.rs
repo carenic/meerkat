@@ -945,15 +945,21 @@ mod degradation_marker_tests {
     /// same laundering the type exists to prevent.
     #[test]
     fn disputed_identity_renders_both_sides() {
+        // Synthetic model ids on purpose. meerkat-core carries ZERO
+        // provider-specific model data, tests included (xtask's
+        // no_provider_data_in_core gate bans `"gpt-N`/`"claude-N`/`"gemini-N`
+        // literals anywhere under meerkat-core/src), and naming the two sides
+        // for what they are reads better here than a real catalog id would.
         let dispute = DisputedTurnUsageAccountingIdentity {
             active_provider: Provider::OpenAI,
-            active_model: "gpt-5.5".to_string(),
+            active_model: "active-model".to_string(),
             reported_provider: Provider::OpenAI,
-            reported_model: "gpt-5.4".to_string(),
+            reported_model: "reported-model".to_string(),
         };
         assert_eq!(
             dispute.to_string(),
-            "disputed:turn_usage_accounting_identity{active=openai/gpt-5.5, reported=openai/gpt-5.4}"
+            "disputed:turn_usage_accounting_identity{active=openai/active-model, \
+             reported=openai/reported-model}"
         );
     }
 }
