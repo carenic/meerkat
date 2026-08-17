@@ -171,6 +171,72 @@ them.
 - **`meerkat_mcp_server::BudgetLimitsInput` gains
   `max_turn_duration_secs: Option<u64>`** (`#[serde(default)]`, additive on the
   MCP tool input schema; struct-literal constructors must add the field).
+- **`meerkat_core::LimitsConfig` gains
+  `max_turn_duration: Option<Duration>`.** This is the configuration twin of
+  `BudgetLimits::max_turn_duration`; struct-literal constructors must add the
+  field (`None` preserves the previous unbounded behavior).
+- **The generated Meerkat machine API gains explicit terminal-completion
+  recovery and unregister-drain facts.** Struct and struct-variant constructors
+  and destructuring patterns must add the fields (or use `..` where legal), and
+  exhaustive enum matches must add the new variants. The additions are:
+  - `SessionRegistrationRejectReasonKind::UnregisterTeardownInProgress`;
+  - `SessionRegistrationRejected` gains
+    `unregister_runtime_loop_drain_pending`,
+    `unregister_comms_drain_exit_pending`, and
+    `unregister_completion_waiter_drain_pending`;
+  - `State` and `MeerkatMachineState` gain
+    `runtime_completion_result_resolved`;
+  - `MeerkatMachineEffect::SessionRegistrationRejected` gains
+    `unregister_runtime_loop_drain_pending`,
+    `unregister_comms_drain_exit_pending`, and
+    `unregister_completion_waiter_drain_pending`;
+  - `Effect`, `EffectKind`, `MeerkatMachineEffect`, and
+    `MeerkatMachineEffectVariant` gain
+    `RecoveredTerminalCompletionBatchClassified` and
+    `RecoveredTerminalCompletionDeclaredUnrecoverable`;
+  - `Input`, `InputKind`, `MeerkatMachineInput`, and
+    `MeerkatMachineInputVariant` gain
+    `ClassifyRecoveredTerminalCompletionBatch` and
+    `DeclareRecoveredTerminalCompletionUnrecoverable`.
+- **The generated Meerkat machine `TransitionId` enum gains 32 variants.**
+  Exhaustive matches must add the new arms. The exact additions are
+  `RegisterSessionRefusedUnregisterDrainingIdle`,
+  `RegisterSessionRefusedUnregisterDrainingAttached`,
+  `RegisterSessionRefusedUnregisterDrainingRunning`,
+  `RegisterSessionRefusedUnregisterDrainingRetired`,
+  `RegisterSessionRefusedUnregisterDrainingStopped`,
+  `ClassifyRecoveredTerminalCompletionBatchRecoverInitializing`,
+  `ClassifyRecoveredTerminalCompletionBatchRecoverIdle`,
+  `ClassifyRecoveredTerminalCompletionBatchRecoverAttached`,
+  `ClassifyRecoveredTerminalCompletionBatchRecoverRunning`,
+  `ClassifyRecoveredTerminalCompletionBatchRecoverRetired`,
+  `ClassifyRecoveredTerminalCompletionBatchRecoverStopped`,
+  `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableInitializing`,
+  `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableIdle`,
+  `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableAttached`,
+  `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRunning`,
+  `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRetired`,
+  `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableStopped`,
+  `ClassifyRecoveredTerminalCompletionBatchBlockedInitializing`,
+  `ClassifyRecoveredTerminalCompletionBatchBlockedIdle`,
+  `ClassifyRecoveredTerminalCompletionBatchBlockedAttached`,
+  `ClassifyRecoveredTerminalCompletionBatchBlockedRunning`,
+  `ClassifyRecoveredTerminalCompletionBatchBlockedRetired`,
+  `ClassifyRecoveredTerminalCompletionBatchBlockedStopped`,
+  `DeclareRecoveredTerminalCompletionUnrecoverableInitializing`,
+  `DeclareRecoveredTerminalCompletionUnrecoverableIdle`,
+  `DeclareRecoveredTerminalCompletionUnrecoverableAttached`,
+  `DeclareRecoveredTerminalCompletionUnrecoverableRunning`,
+  `DeclareRecoveredTerminalCompletionUnrecoverableRetired`,
+  `DeclareRecoveredTerminalCompletionUnrecoverableStopped`,
+  `PrepareIdleRetainingUnsettledCompletion`,
+  `PrepareAttachedRetainingUnsettledCompletion`, and
+  `DrainQueuedRunRetiredRetainingUnsettledCompletion`.
+- **`meerkat_mob::runtime::host_actor::MobHostActorError` and
+  `meerkat_mob::runtime::host_materialize::MaterializeServeError` each gain a
+  `ParticipantNameOccupied` variant.** Exhaustive matches must handle the typed
+  refusal. This is the host-side surface of the one-live-participant rule
+  described above; the same additions are also discussed under Corrected.
 
 ### Added
 
