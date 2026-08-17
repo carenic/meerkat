@@ -198,7 +198,10 @@ ALL_CRATES=(rkat meerkat-rpc meerkat-rest meerkat-mcp-server meerkat-scratch)
 
 # 1. Every enumeration agrees: the gate passes.
 build_fixture "${ALL_CRATES[@]}"
-mapfile -t fixture_crates < <(release_list)
+fixture_crates=()
+while IFS= read -r crate; do
+  fixture_crates+=("$crate")
+done < <(release_list)
 status="$(run_gate "${TEST_ROOT}/consistent.log" "${fixture_crates[@]}")"
 if [[ "$status" -ne 0 ]]; then
   fail "a consistent scratch workspace was rejected" "$(cat "${TEST_ROOT}/consistent.log")"
@@ -219,7 +222,10 @@ expect_not_named "documented count" "${TEST_ROOT}/docs.log" "internal path deps"
 
 # 3. The new member is absent from the publish order itself.
 build_fixture rkat meerkat-rpc meerkat-rest meerkat-mcp-server
-mapfile -t short_crates < <(release_list)
+short_crates=()
+while IFS= read -r crate; do
+  short_crates+=("$crate")
+done < <(release_list)
 status="$(run_gate "${TEST_ROOT}/release-list.log" "${short_crates[@]}")"
 if [[ "$status" -eq 0 ]]; then
   fail "a publishable member missing from the release list was accepted"
