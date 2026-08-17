@@ -7847,6 +7847,29 @@ pub trait RuntimeStore: Send + Sync {
         ))
     }
 
+    /// List every generated delivery-authority record in this store, keyed by
+    /// the runtime that owns it.
+    ///
+    /// This is the only cross-runtime delivery read. Every other delivery verb
+    /// is scoped to one `runtime_id`, which makes a caller that wants a
+    /// store-wide answer invent a candidate runtime set from somewhere else -
+    /// and any such set can be wrong in the direction that matters: a runtime
+    /// holding committed-but-undrained rows whose originating jobs have aged
+    /// out of the caller's window is invisible, which is exactly the field
+    /// symptom this exists to make visible.
+    ///
+    /// Deliberately uncapped. A limit here would restore the same class of
+    /// miss one layer down. The pending arithmetic is NOT done here: how many
+    /// rows are undrained is a fact of the generated delivery machine, and the
+    /// store retains that machine's state without interpreting it.
+    async fn list_runtime_delivery_authorities(
+        &self,
+    ) -> Result<Vec<(LogicalRuntimeId, RuntimeDeliveryAuthorityRecord)>, RuntimeStoreError> {
+        Err(RuntimeStoreError::Unsupported(
+            "list_runtime_delivery_authorities".into(),
+        ))
+    }
+
     /// List durable inbox rows in generated sequence order.
     async fn list_runtime_delivery_records(
         &self,

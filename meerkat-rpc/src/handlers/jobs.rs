@@ -510,27 +510,54 @@ pub async fn handle_health(id: Option<RpcId>, runtime: &Arc<SessionRuntime>) -> 
                     return RpcResponse::error(id, error.code, error.message);
                 }
             };
-            let delivery_backlog = health.delivery_backlog.saturating_add(runtime_backlog);
             RpcResponse::success(
                 id,
                 JobsHealthResult {
-                    detached_jobs: JobHealthSummary {
-                        status: if health.is_degraded() || runtime_backlog > 0 {
-                            JobHealthStatus::Degraded
-                        } else {
-                            JobHealthStatus::Ok
-                        },
-                        queued: health.queued,
-                        running: health.running,
-                        awaiting_members,
-                        stale_leases: health.stale_leases,
-                        needs_attention: health.needs_attention,
-                        delivery_backlog,
-                    },
+                    detached_jobs: job_health_summary(&health, runtime_backlog, awaiting_members),
                 },
             )
         }
         Err(error) => response_error(id, error),
+    }
+}
+
+/// The single fold from the two delivery sub-reads plus the job census onto
+/// one published rung.
+///
+/// Both `runtime/health` and `jobs/health` route through here so there is one
+/// owner of "what does this combination mean". The two backlogs stay separate
+/// on the wire because merging them into one number loses which side is
+/// wedged, but the RUNG folds worst-wins across them.
+pub(crate) fn job_health_summary(
+    health: &meerkat::JobHealthSnapshot,
+    runtime_inbox_backlog: u64,
+    awaiting_members: u64,
+) -> JobHealthSummary {
+    let inbox_reading = if runtime_inbox_backlog > 0 {
+        meerkat::JobHealthReading::Degraded
+    } else {
+        meerkat::JobHealthReading::Ok
+    };
+    let status = match health.reading().worst(inbox_reading) {
+        meerkat::JobHealthReading::Ok => JobHealthStatus::Ok,
+        meerkat::JobHealthReading::Degraded => JobHealthStatus::Degraded,
+        meerkat::JobHealthReading::Unreadable => JobHealthStatus::Unreadable,
+    };
+    JobHealthSummary {
+        status,
+        queued: health.queued,
+        running: health.running,
+        awaiting_members,
+        stale_leases: health.stale_leases,
+        needs_attention: health.needs_attention,
+        pending_outbox_jobs: health.pending_outbox_jobs,
+        runtime_inbox_backlog,
+        coverage: match health.coverage {
+            meerkat::JobHealthCoverage::Complete => meerkat_contracts::JobHealthCoverage::Complete,
+            meerkat::JobHealthCoverage::Truncated { scanned, limit } => {
+                meerkat_contracts::JobHealthCoverage::Truncated { scanned, limit }
+            }
+        },
     }
 }
 

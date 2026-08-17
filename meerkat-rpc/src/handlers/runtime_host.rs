@@ -129,9 +129,17 @@ pub async fn handle_health(id: Option<RpcId>, runtime: &Arc<SessionRuntime>) -> 
 /// ## Covered
 ///
 /// - `jobs` - detached-job service health for the active realm (or process-wide
-///   when no realm is bound) plus the in-process delivery backlog. `Degraded`
-///   when a snapshot that was read says the service is degraded, or a backlog
-///   that was read is non-empty.
+///   when no realm is bound) plus the durable runtime delivery backlog.
+///   `Degraded` when a snapshot that was read says the service is degraded, or
+///   a backlog that was read is non-empty. The two sub-reads stay separate all
+///   the way to the wire (`pending_outbox_jobs` is work whose delivery was
+///   never handed to a runtime; `runtime_inbox_backlog` is a delivery a runtime
+///   accepted and never drained) because a single merged number would say a
+///   delivery is stuck without saying which side is holding it. Only the RUNG
+///   folds. `unreadable:jobs` when either read failed, and also when the job
+///   census came back TRUNCATED: a scan that stopped at its window did not
+///   establish that the rows behind it are healthy, and its zero counts are a
+///   lower bound rather than a census.
 /// - `session_durability` - registered sessions whose shared durability gate
 ///   demands a cold reload before they may execute or mutate durable state.
 ///   `Degraded` when any session is in that state. A storeless session has no
@@ -168,7 +176,7 @@ pub async fn handle_health(id: Option<RpcId>, runtime: &Arc<SessionRuntime>) -> 
 /// a per-session authority or driver ledger that could not be read without
 /// blocking, the holder of which is the prime suspect for the wedge itself;
 /// for `jobs` it is a job-service snapshot or a delivery backlog that
-/// returned an error. This is the same rule the paragraph above
+/// returned an error, or a census that filled its window. This is the same rule the paragraph above
 /// states, applied to this function's own checks: a `jobs: degraded` published
 /// off a failed snapshot read would be asserting a specific and actionable
 /// fault - the job service is in trouble - that nobody observed, and it is a
@@ -215,18 +223,34 @@ async fn runtime_health(runtime: &SessionRuntime) -> meerkat_contracts::RuntimeH
     // A snapshot this probe could not read is not a degraded job service. The
     // two sub-reads are folded worst-wins, but a failure of EITHER read makes
     // the dimension unreadable rather than degraded: only a reading that came
-    // back may publish a rung under the plain `jobs` key.
+    // back may publish a rung under the plain `jobs` key. A census that came
+    // back TRUNCATED is the same class of non-answer - it stopped at its
+    // window, not at the end of the population - and the shared fold in
+    // `handlers::jobs` is what says so, so this surface and `jobs/health`
+    // cannot drift on what the same store state means.
     let jobs = match job_snapshot {
         Err(_) => meerkat::surface::RuntimeHealthObservation::Unreadable,
         Ok(snapshot) => match runtime.runtime_job_delivery_backlog().await {
             Err(_) => meerkat::surface::RuntimeHealthObservation::Unreadable,
-            Ok(backlog) => meerkat::surface::RuntimeHealthObservation::Measured(
-                if snapshot.is_degraded() || backlog != 0 {
-                    meerkat_contracts::RuntimeHostHealthStatus::Degraded
-                } else {
-                    meerkat_contracts::RuntimeHostHealthStatus::Ok
-                },
-            ),
+            // `awaiting_members` is not a rung term and costs a per-session
+            // scan, so this probe does not pay for it.
+            Ok(backlog) => {
+                match crate::handlers::jobs::job_health_summary(&snapshot, backlog, 0).status {
+                    meerkat_contracts::JobHealthStatus::Ok => {
+                        meerkat::surface::RuntimeHealthObservation::Measured(
+                            meerkat_contracts::RuntimeHostHealthStatus::Ok,
+                        )
+                    }
+                    meerkat_contracts::JobHealthStatus::Degraded => {
+                        meerkat::surface::RuntimeHealthObservation::Measured(
+                            meerkat_contracts::RuntimeHostHealthStatus::Degraded,
+                        )
+                    }
+                    meerkat_contracts::JobHealthStatus::Unreadable => {
+                        meerkat::surface::RuntimeHealthObservation::Unreadable
+                    }
+                }
+            }
         },
     };
     // All five probes are attempted unconditionally, so every dimension this

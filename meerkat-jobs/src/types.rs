@@ -746,7 +746,65 @@ pub struct JobDescription {
     pub delivery_backlog: u64,
 }
 
+/// Whether a census read every row it needed to answer.
+///
+/// The phase counts below are derived from a bounded scan. When that scan
+/// fills its window the rows behind it were never looked at, so the counts
+/// are a labelled lower bound rather than a census. That distinction is the
+/// whole point of the type: a truncated scan that reported plain numbers
+/// would let a store report `queued: 0` because it never reached the queued
+/// rows, which is a fabricated answer, not a partial one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JobHealthCoverage {
+    /// Every candidate row was read; the counts are exact.
+    #[default]
+    Complete,
+    /// The scan window filled. `scanned` rows were read out of an unknown
+    /// larger population, so nothing below is a census.
+    Truncated { scanned: u64, limit: u64 },
+}
+
+impl JobHealthCoverage {
+    pub const fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+/// The rung a census may publish.
+///
+/// `Unreadable` is not a rung between `Ok` and `Degraded`: it says the census
+/// did not establish anything. It is deliberately separate from `Degraded`
+/// because `Degraded` asserts a specific, actionable fault - some job is
+/// wedged - and a truncated scan observed no such thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobHealthReading {
+    Ok,
+    Degraded,
+    Unreadable,
+}
+
+impl JobHealthReading {
+    /// Fold two independent readings worst-wins.
+    ///
+    /// `Unreadable` outranks `Degraded`: a dimension that could not be read
+    /// may be hiding anything, including the fault the other dimension found,
+    /// so the caller is told to look rather than told a rung.
+    pub const fn worst(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unreadable, _) | (_, Self::Unreadable) => Self::Unreadable,
+            (Self::Degraded, _) | (_, Self::Degraded) => Self::Degraded,
+            (Self::Ok, Self::Ok) => Self::Ok,
+        }
+    }
+}
+
 /// Derived operational census over generated job authority.
+///
+/// `pending_outbox_jobs` counts JOBS carrying at least one unapplied outbox
+/// entry, not entries. The name carries the unit because the count comes from
+/// an exact indexed column read rather than from decoding every job document,
+/// and a job-count published under an entry-count name would be a substituted
+/// value.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct JobHealthSnapshot {
     pub queued: u64,
@@ -754,11 +812,27 @@ pub struct JobHealthSnapshot {
     pub awaiting_members: u64,
     pub stale_leases: u64,
     pub needs_attention: u64,
-    pub delivery_backlog: u64,
+    pub pending_outbox_jobs: u64,
+    pub coverage: JobHealthCoverage,
 }
 
 impl JobHealthSnapshot {
-    pub const fn is_degraded(&self) -> bool {
-        self.stale_leases > 0 || self.needs_attention > 0 || self.delivery_backlog > 0
+    /// The rung this census may publish.
+    ///
+    /// Truncated coverage answers `Unreadable` before any count is consulted:
+    /// the phase counts came off a window that did not reach every row, so
+    /// `stale_leases == 0` means "none seen", not "none exist".
+    pub const fn reading(&self) -> JobHealthReading {
+        match self.coverage {
+            JobHealthCoverage::Truncated { .. } => JobHealthReading::Unreadable,
+            JobHealthCoverage::Complete => {
+                if self.stale_leases > 0 || self.needs_attention > 0 || self.pending_outbox_jobs > 0
+                {
+                    JobHealthReading::Degraded
+                } else {
+                    JobHealthReading::Ok
+                }
+            }
+        }
     }
 }

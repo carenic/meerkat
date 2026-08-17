@@ -140,6 +140,56 @@ rust_test(
 )
 
 rust_test(
+    name = "health_census_test",
+    aliases = aliases(
+        package_name = "meerkat-jobs",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "health_census",
+    crate_root = "tests/health_census.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/health_census.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.8.23",
+        "CARGO_BIN_NAME": "health_census",
+        "CARGO_MANIFEST_DIR": "./meerkat-jobs",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-jobs",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-core:meerkat_core",
+        "//meerkat-jobs:meerkat_jobs",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-sqlite:meerkat_sqlite",
+    ] + all_crate_deps(
+        package_name = "meerkat-jobs",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "machine_contract_test",
     aliases = aliases(
         package_name = "meerkat-jobs",
@@ -592,6 +642,7 @@ rust_test(
 test_suite(
     name = "fast_tests",
     tests = [
+        ":health_census_test",
         ":machine_contract_test",
         ":meerkat_jobs_unit_test",
         ":notification_outbox_test",

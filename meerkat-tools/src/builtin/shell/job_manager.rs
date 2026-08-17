@@ -3235,6 +3235,13 @@ mod durable_tests {
             self.inner.list_all(limit).await
         }
 
+        async fn count_pending_outbox_jobs(
+            &self,
+            realm_id: Option<&str>,
+        ) -> Result<u64, DetachedJobError> {
+            self.inner.count_pending_outbox_jobs(realm_id).await
+        }
+
         fn is_persistent(&self) -> bool {
             true
         }

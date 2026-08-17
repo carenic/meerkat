@@ -644,6 +644,40 @@ impl DetachedJobStore for SqliteDetachedJobStore {
         })
     }
 
+    /// One indexed aggregate over `idx_detached_jobs_pending_outbox`.
+    ///
+    /// `has_pending_outbox` leads the index, so the `= 1` predicate is a range
+    /// scan over pending rows only and `realm_id` filters from the row. No
+    /// document is decoded, no window is applied, and no lifecycle phase is
+    /// consulted - a terminal job holding an unapplied terminal delivery is
+    /// precisely what this must count.
+    async fn count_pending_outbox_jobs(
+        &self,
+        realm_id: Option<&str>,
+    ) -> Result<u64, DetachedJobError> {
+        self.with_connection(|conn| {
+            let count: i64 = match realm_id {
+                Some(realm_id) => conn.query_row(
+                    "SELECT COUNT(*) FROM detached_jobs
+                      WHERE has_pending_outbox = 1 AND realm_id = ?1",
+                    [realm_id],
+                    |row| row.get(0),
+                ),
+                None => conn.query_row(
+                    "SELECT COUNT(*) FROM detached_jobs WHERE has_pending_outbox = 1",
+                    [],
+                    |row| row.get(0),
+                ),
+            }
+            .map_err(raw_sqlite_error)?;
+            u64::try_from(count).map_err(|_| {
+                DetachedJobError::Store(format!(
+                    "pending outbox count {count} is not a valid population"
+                ))
+            })
+        })
+    }
+
     fn is_persistent(&self) -> bool {
         true
     }

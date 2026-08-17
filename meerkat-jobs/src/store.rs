@@ -108,6 +108,25 @@ pub trait DetachedJobStore: Send + Sync {
     /// to decide whether a row is runnable, reconcilable, or terminal.
     async fn list_all(&self, limit: usize) -> Result<Vec<StoredJob>, DetachedJobError>;
 
+    /// Exact, uncapped count of jobs carrying at least one unapplied outbox
+    /// entry, optionally narrowed to one realm.
+    ///
+    /// This is deliberately NOT expressible as a bounded [`Self::list_all`]
+    /// scan: an outbox backlog is exactly the condition that persists while
+    /// rows accumulate, so a capped window answers a different question as the
+    /// store ages. It is also deliberately phase-blind - a terminal job whose
+    /// terminal delivery never applied is the canonical case this counts.
+    ///
+    /// The unit is JOBS, not entries: entry counts live inside the job
+    /// document, and decoding every document is the cost this method exists
+    /// to avoid. There is no default implementation, because a default that
+    /// fell back to a capped scan would silently reintroduce the blindness in
+    /// every store that forgot to override it.
+    async fn count_pending_outbox_jobs(
+        &self,
+        realm_id: Option<&str>,
+    ) -> Result<u64, DetachedJobError>;
+
     fn is_persistent(&self) -> bool;
 }
 
@@ -398,6 +417,23 @@ impl DetachedJobStore for MemoryDetachedJobStore {
             .take(limit)
             .cloned()
             .collect())
+    }
+
+    async fn count_pending_outbox_jobs(
+        &self,
+        realm_id: Option<&str>,
+    ) -> Result<u64, DetachedJobError> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .jobs
+            .values()
+            .filter(|job| realm_id.is_none_or(|realm_id| job.spec.realm_id == realm_id))
+            .filter(|job| job.outbox.iter().any(|entry| !entry.applied))
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX))
     }
 
     fn is_persistent(&self) -> bool {

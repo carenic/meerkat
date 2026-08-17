@@ -88,6 +88,7 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "MobkitJobFailParams": schema_for!(crate::wire::MobkitJobFailParams),
         "MobkitJobCancelAckParams": schema_for!(crate::wire::MobkitJobCancelAckParams),
         "MobkitJobMutationResult": schema_for!(crate::wire::MobkitJobMutationResult),
+        "JobHealthCoverage": schema_for!(crate::wire::JobHealthCoverage),
         "JobHealthSummary": schema_for!(crate::wire::JobHealthSummary),
         "JobExecutionActivity": schema_for!(crate::wire::JobExecutionActivity),
         "DetachedJobsActivitySummary": schema_for!(crate::wire::DetachedJobsActivitySummary),

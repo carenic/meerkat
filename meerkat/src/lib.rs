@@ -371,11 +371,11 @@ pub use meerkat_jobs::{
     AttemptClaim, AttemptClaimReceipt, AttemptId, AttemptWriteAuthority, CanonicalArgumentsHash,
     CheckpointRef, DetachedJobError, DetachedJobService, DetachedJobStore, ExecutionIntentId,
     FenceToken, InteractionLineageId, JobDeliveryKind, JobDescription, JobFailureCode,
-    JobHealthCondition, JobId, JobNotification, JobOutboxEntry, JobPhase, JobProgress,
-    JobProgressKind, JobReceipt, JobReference, JobResultRef, JobSnapshot, JobSpec,
-    JobSubmissionKey, JobSubscription, JobSubscriptionId, JobTerminalKind, JobTerminalResult,
-    MemoryDetachedJobStore, OriginMemberId, RestartClass, RunnerHandleRef, RunnerIdentity,
-    RunnerSpecificationRef, ToolIdentity, WorkerId,
+    JobHealthCondition, JobHealthCoverage, JobHealthReading, JobHealthSnapshot, JobId,
+    JobNotification, JobOutboxEntry, JobPhase, JobProgress, JobProgressKind, JobReceipt,
+    JobReference, JobResultRef, JobSnapshot, JobSpec, JobSubmissionKey, JobSubscription,
+    JobSubscriptionId, JobTerminalKind, JobTerminalResult, MemoryDetachedJobStore, OriginMemberId,
+    RestartClass, RunnerHandleRef, RunnerIdentity, RunnerSpecificationRef, ToolIdentity, WorkerId,
 };
 pub use meerkat_runtime::{InMemoryRuntimeStore, Input, PromptInput, RuntimeStore};
 #[cfg(feature = "session-compaction")]
