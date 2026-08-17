@@ -168,23 +168,7 @@ pub fn spawn_comms_drain(
                         error = %err,
                         "comms_drain: classified inbox drain failed; exiting via typed Failed terminal (not idle/dismiss)"
                     );
-                    if let Err(notify_err) = adapter
-                        .notify_comms_drain_exited(&session_id, DrainExitReason::Failed)
-                        .await
-                    {
-                        // Detached-task boundary: the typed control fault has
-                        // nowhere left to propagate; surface it explicitly and
-                        // run the projection safety net so slot mechanics
-                        // cannot silently diverge from the drain authority.
-                        tracing::error!(
-                            session_id = %session_id,
-                            error = %notify_err,
-                            "comms_drain: NotifyDrainExited(Failed) rejected by machine authority"
-                        );
-                        adapter
-                            .project_comms_drain_failed_safety_net(&session_id)
-                            .await;
-                    }
+                    notify_claim_mechanism_failure(&adapter, &session_id).await;
                     return;
                 }
             };
@@ -827,6 +811,22 @@ fn commit_non_runtime_claim(claim: RoutedPeerIngressClaim, handled_as: &'static 
     }
 }
 
+/// Publish the typed `Failed` exit for this drain, then ask the machine to
+/// re-arm it.
+///
+/// A peer-ingress mechanism error used to be a PERMANENT drain death: the
+/// claim was dropped (releasing the item back to the queue head), the queue
+/// stayed open, respawn was caller-driven, and nothing polled. Every later peer
+/// message for this session was then admitted and never drained. The machine
+/// already models the recovery - `NotifyDrainExited { Failed }` on a persistent
+/// host drain lands in `DrainPhase::ExitedRespawnable` and the slot deliberately
+/// RETAINS the peer-ingress runtime - it simply had no consumer.
+///
+/// ORDERING IS LOAD-BEARING: `notify_comms_drain_exited` must run to completion
+/// before the re-arm. Both descend through machine commands that take the same
+/// non-reentrant per-session mutation gate, so folding the re-arm inside the
+/// exit notification (or into `notify_comms_drain_exited_inner`) would wedge
+/// the session instead of recovering it.
 async fn notify_claim_mechanism_failure(adapter: &Arc<MeerkatMachine>, session_id: &SessionId) {
     if let Err(error) = adapter
         .notify_comms_drain_exited(session_id, DrainExitReason::Failed)
@@ -840,6 +840,45 @@ async fn notify_claim_mechanism_failure(adapter: &Arc<MeerkatMachine>, session_i
         adapter
             .project_comms_drain_failed_safety_net(session_id)
             .await;
+    }
+    rearm_drain_after_mechanism_failure(adapter, session_id).await;
+}
+
+/// Backoff between a mechanism-error exit and the re-arm attempt.
+///
+/// The failing head item is released back to the queue head, so a
+/// deterministically failing item would otherwise respawn the drain in a tight
+/// loop. This rate-limits that loop. It is NOT a give-up policy: whether the
+/// drain may respawn at all is the machine's `drain_phase`, and inventing a
+/// shell-side attempt counter here would put that classification in a second
+/// place.
+#[cfg(not(test))]
+const DRAIN_REARM_BACKOFF: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const DRAIN_REARM_BACKOFF: Duration = Duration::from_millis(20);
+
+async fn rearm_drain_after_mechanism_failure(
+    adapter: &Arc<MeerkatMachine>,
+    session_id: &SessionId,
+) {
+    crate::tokio::time::sleep(DRAIN_REARM_BACKOFF).await;
+    match adapter
+        .rearm_comms_drain_after_failed_exit(session_id)
+        .await
+    {
+        Ok(true) => tracing::warn!(
+            %session_id,
+            "comms_drain: re-armed peer ingress drain after a mechanism-error exit"
+        ),
+        Ok(false) => tracing::warn!(
+            %session_id,
+            "comms_drain: mechanism-error exit is not respawnable per drain authority; peer ingress stays stopped"
+        ),
+        Err(error) => tracing::error!(
+            %session_id,
+            %error,
+            "comms_drain: re-arm after mechanism-error exit was refused"
+        ),
     }
 }
 

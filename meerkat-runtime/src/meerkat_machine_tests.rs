@@ -4236,6 +4236,53 @@ impl CommsRuntime for FakeDrainRuntime {
     }
 }
 
+/// Peer-ingress runtime whose FIRST classified drain fails with a mechanism
+/// error and whose later drains are ordinary idle drains.
+///
+/// One failure is enough to kill the drain task permanently on the pre-fix
+/// tree; making later drains succeed keeps the re-arm assertion free of a hot
+/// respawn loop.
+struct FailFirstDrainRuntime {
+    notify: Arc<Notify>,
+    claims: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FailFirstDrainRuntime {
+    fn new() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            claims: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn claim_attempts(&self) -> usize {
+        self.claims.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl CommsRuntime for FailFirstDrainRuntime {
+    fn inbox_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.notify)
+    }
+
+    async fn claim_classified_inbox_interaction(
+        &self,
+    ) -> Result<Option<meerkat_core::interaction::PeerIngressQueueClaim>, CommsCapabilityError>
+    {
+        if self
+            .claims
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            return Err(CommsCapabilityError::Unsupported(
+                "test-injected peer-ingress mechanism error".to_string(),
+            ));
+        }
+        Ok(None)
+    }
+}
+
 async fn spawn_test_comms_drain(
     adapter: &Arc<MeerkatMachine>,
     session_id: &SessionId,
@@ -41892,6 +41939,248 @@ async fn refresh_session_owned_peer_ingress_respawns_authorized_drain_without_re
         ),
         "refresh must preserve the existing session-owned runtime id, got {owner:?}"
     );
+
+    adapter
+        .unregister_session(&session_id)
+        .await
+        .expect("session should unregister cleanly");
+}
+
+/// WIRING: a peer-ingress mechanism error must not be a permanent drain death.
+///
+/// The drain's first classified claim fails, which drives the typed `Failed`
+/// exit. Before this fix that exit was terminal - the claim was released, the
+/// queue stayed open, and respawn was caller-driven with nothing polling - so
+/// the session stopped draining peer ingress for good. The machine already
+/// classified that exit as `ExitedRespawnable` and deliberately retained the
+/// peer-ingress runtime; nothing consumed the answer.
+#[tokio::test]
+async fn mechanism_error_drain_exit_is_rearmed_not_terminal() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    adapter
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+
+    let failing = Arc::new(FailFirstDrainRuntime::new());
+    let comms_runtime: Arc<dyn CommsRuntime> = Arc::clone(&failing) as Arc<dyn CommsRuntime>;
+    let expected_id = crate::meerkat_machine::dsl::CommsRuntimeId::from_runtime(&comms_runtime);
+
+    assert!(
+        adapter
+            .update_peer_ingress_context(&session_id, true, Some(Arc::clone(&comms_runtime)))
+            .await
+            .expect("peer ingress context update"),
+        "peer ingress attach must spawn the persistent host drain"
+    );
+
+    // The first drain dies on the injected mechanism error; the re-armed drain
+    // is the one that makes a SECOND claim attempt.
+    let rearmed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if failing.claim_attempts() >= 2
+                && current_phase(&adapter, &session_id).await == Some(CommsDrainPhase::Running)
+                && handle_present(&adapter, &session_id).await
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    if rearmed.is_err() {
+        let phase = current_phase(&adapter, &session_id).await;
+        let handle = handle_present(&adapter, &session_id).await;
+        panic!(
+            "a mechanism-error drain exit must be re-armed, not terminal: \
+             claim_attempts={}, phase={phase:?}, handle_present={handle}",
+            failing.claim_attempts()
+        );
+    }
+
+    let owner = adapter.peer_ingress_owner(&session_id).await;
+    assert!(
+        matches!(
+            owner,
+            crate::meerkat_machine::PeerIngressOwner::SessionOwned { ref comms_runtime_id }
+                if *comms_runtime_id == expected_id
+        ),
+        "the re-arm must reuse the owned peer-ingress runtime, not attach a new one: {owner:?}"
+    );
+
+    adapter
+        .unregister_session(&session_id)
+        .await
+        .expect("session should unregister cleanly");
+}
+
+/// A mechanism error kills a MOB-owned member drain exactly as it kills a
+/// session-owned one, so the re-arm must cover both ownership shapes.
+/// `refresh_session_owned_peer_ingress` deliberately does not.
+#[tokio::test]
+async fn rearm_after_failed_exit_respawns_mob_owned_drain() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    adapter
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+
+    let comms_runtime: Arc<dyn CommsRuntime> = Arc::new(FakeDrainRuntime::idle());
+    let expected_id = crate::meerkat_machine::dsl::CommsRuntimeId::from_runtime(&comms_runtime);
+    let mob_id = crate::meerkat_machine::dsl::MobId::from("mob-rearm-after-failed-exit");
+    {
+        let mut sessions = adapter.sessions.write().await;
+        let entry = sessions
+            .get_mut(&session_id)
+            .expect("registered session entry");
+        {
+            let mut authority = entry
+                .dsl_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::AttachMobIngress {
+                    comms_runtime_id: expected_id.clone(),
+                    mob_id: mob_id.clone(),
+                },
+            )
+            .expect("mob ingress attach should stage");
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::SpawnDrain {
+                    mode: crate::meerkat_machine::dsl::DrainMode::PersistentHost,
+                },
+            )
+            .expect("spawn drain should stage");
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::NotifyDrainExited {
+                    reason: crate::meerkat_machine::dsl::DrainExitReason::Failed,
+                },
+            )
+            .expect("failed persistent drain should become respawnable");
+        }
+        entry
+            .drain_slot
+            .install_task(Arc::clone(&comms_runtime), tokio::spawn(async {}));
+        entry.drain_slot.clear_after_exit(true);
+    }
+
+    assert_eq!(
+        current_phase(&adapter, &session_id).await,
+        Some(CommsDrainPhase::ExitedRespawnable)
+    );
+    assert!(
+        !handle_present(&adapter, &session_id).await,
+        "fixture must retain runtime identity with no live drain handle"
+    );
+    assert!(
+        !adapter
+            .refresh_session_owned_peer_ingress(&session_id)
+            .await
+            .expect("session-owned refresh runs"),
+        "the session-owned refresh must keep leaving mob-owned ingress alone"
+    );
+
+    assert!(
+        adapter
+            .rearm_comms_drain_after_failed_exit(&session_id)
+            .await
+            .expect("re-arm after failed exit"),
+        "a respawnable mob-owned drain must be re-armed"
+    );
+
+    assert_eq!(
+        current_phase(&adapter, &session_id).await,
+        Some(CommsDrainPhase::Running)
+    );
+    assert!(handle_present(&adapter, &session_id).await);
+    let owner = adapter.peer_ingress_owner(&session_id).await;
+    assert!(
+        matches!(
+            owner,
+            crate::meerkat_machine::PeerIngressOwner::MobOwned { ref comms_runtime_id, .. }
+                if *comms_runtime_id == expected_id
+        ),
+        "re-arm must preserve mob ownership, got {owner:?}"
+    );
+
+    adapter
+        .unregister_session(&session_id)
+        .await
+        .expect("session should unregister cleanly");
+}
+
+/// The re-arm consults the machine, not the slot: a drain the machine says is
+/// `Stopped` is never silently restarted, even with a retained runtime.
+#[tokio::test]
+async fn rearm_after_failed_exit_refuses_a_stopped_drain() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    adapter
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+
+    let comms_runtime: Arc<dyn CommsRuntime> = Arc::new(FakeDrainRuntime::idle());
+    let expected_id = crate::meerkat_machine::dsl::CommsRuntimeId::from_runtime(&comms_runtime);
+    {
+        let mut sessions = adapter.sessions.write().await;
+        let entry = sessions
+            .get_mut(&session_id)
+            .expect("registered session entry");
+        {
+            let mut authority = entry
+                .dsl_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::AttachSessionIngress {
+                    comms_runtime_id: expected_id.clone(),
+                },
+            )
+            .expect("session ingress attach should stage");
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::SpawnDrain {
+                    mode: crate::meerkat_machine::dsl::DrainMode::PersistentHost,
+                },
+            )
+            .expect("spawn drain should stage");
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::StopDrain,
+            )
+            .expect("explicit stop should stage");
+        }
+        // Retain the runtime anyway: the slot must not be able to override the
+        // machine's `Stopped` answer.
+        entry
+            .drain_slot
+            .install_task(Arc::clone(&comms_runtime), tokio::spawn(async {}));
+        entry.drain_slot.clear_after_exit(true);
+    }
+
+    assert_eq!(
+        current_phase(&adapter, &session_id).await,
+        Some(CommsDrainPhase::Stopped)
+    );
+    assert!(
+        !adapter
+            .rearm_comms_drain_after_failed_exit(&session_id)
+            .await
+            .expect("re-arm call runs"),
+        "a stopped drain must not be respawned by the mechanism-error re-arm"
+    );
+    assert_eq!(
+        current_phase(&adapter, &session_id).await,
+        Some(CommsDrainPhase::Stopped)
+    );
+    assert!(!handle_present(&adapter, &session_id).await);
 
     adapter
         .unregister_session(&session_id)

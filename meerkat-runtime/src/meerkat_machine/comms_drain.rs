@@ -764,6 +764,65 @@ impl MeerkatMachine {
             .await
     }
 
+    /// Re-arm a drain task that exited on a peer-ingress mechanism error.
+    ///
+    /// A mechanism-error exit publishes `NotifyDrainExited { Failed }`, and the
+    /// GENERATED machine - not this shell - decides what that exit means:
+    /// `DrainPhase::ExitedRespawnable` (peer-ingress transport is still owned
+    /// and the drain may be respawned) or `DrainPhase::Stopped`. Without this
+    /// call the respawnable answer had no consumer, so a mechanism error was a
+    /// permanently dead drain with nothing polling: a logged error standing in
+    /// for a handled failure.
+    ///
+    /// This method invents no policy. It acts only when the machine already
+    /// says the exit was respawnable, and it still refuses when peer-ingress
+    /// ownership moved, when the retained runtime is no longer the owned one,
+    /// or when the session is gone - all of which return `Ok(false)`, the
+    /// machine's terminal answer.
+    ///
+    /// Both ownership shapes are covered: a mechanism error kills a mob-owned
+    /// member drain exactly as it kills a session-owned one.
+    pub(crate) async fn rearm_comms_drain_after_failed_exit(
+        self: &Arc<Self>,
+        session_id: &SessionId,
+    ) -> Result<bool, RuntimeDriverError> {
+        if !self.sessions.read().await.contains_key(session_id) {
+            return Ok(false);
+        }
+        if matches!(
+            self.existing_session_runtime_state(session_id).await,
+            Some(RuntimeState::Destroyed)
+        ) && !self
+            .has_terminal_supervisor_cleanup_authority(session_id)
+            .await
+        {
+            return Ok(false);
+        }
+
+        let _gate_guard = self
+            .lock_current_durability_ready_session_mutation_gate(session_id)
+            .await?;
+
+        // The machine's own typed statement that this exit is respawnable. A
+        // `Stopped` drain is not silently restarted here.
+        let respawnable = self
+            .drain_authority_state(session_id)
+            .await
+            .is_some_and(|state| {
+                state.phase == crate::meerkat_machine::dsl::DrainPhase::ExitedRespawnable
+            });
+        if !respawnable {
+            return Ok(false);
+        }
+
+        let Some(comms_runtime) = self.owned_drain_runtime(session_id, None).await else {
+            return Ok(false);
+        };
+
+        self.update_peer_ingress_context_inner(session_id, true, Some(comms_runtime))
+            .await
+    }
+
     pub(super) async fn has_terminal_supervisor_cleanup_authority(
         &self,
         session_id: &SessionId,
@@ -940,6 +999,25 @@ impl MeerkatMachine {
         &self,
         session_id: &SessionId,
     ) -> Option<Arc<dyn meerkat_core::agent::CommsRuntime>> {
+        self.owned_drain_runtime(
+            session_id,
+            Some(crate::meerkat_machine::dsl::PeerIngressOwnerKind::SessionOwned),
+        )
+        .await
+    }
+
+    /// The retained drain runtime, iff the generated authority still owns it.
+    ///
+    /// `require_owner_kind` narrows the answer to one ownership shape (the
+    /// session-owned refresh path deliberately leaves mob-owned ingress alone);
+    /// `None` accepts any owner that is not `Unattached`. In every case the
+    /// answer is the machine's, not the slot's: a retained task runtime that no
+    /// longer matches `peer_ingress_comms_runtime_id` is refused.
+    async fn owned_drain_runtime(
+        &self,
+        session_id: &SessionId,
+        require_owner_kind: Option<crate::meerkat_machine::dsl::PeerIngressOwnerKind>,
+    ) -> Option<Arc<dyn meerkat_core::agent::CommsRuntime>> {
         let sessions = self.sessions.read().await;
         let entry = sessions.get(session_id)?;
         let authority = entry
@@ -947,10 +1025,14 @@ impl MeerkatMachine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = authority.state();
-        if state.peer_ingress_owner_kind
-            != crate::meerkat_machine::dsl::PeerIngressOwnerKind::SessionOwned
-        {
-            return None;
+        match require_owner_kind {
+            Some(required) if state.peer_ingress_owner_kind != required => return None,
+            None if state.peer_ingress_owner_kind
+                == crate::meerkat_machine::dsl::PeerIngressOwnerKind::Unattached =>
+            {
+                return None;
+            }
+            _ => {}
         }
         let expected_runtime_id = state.peer_ingress_comms_runtime_id.as_ref()?;
         let runtime = entry.drain_slot.task_runtime()?;
