@@ -112,9 +112,10 @@ impl meerkat_core::CompactionCurator for TestCompactionCurator {
 /// fact, so durable active-run and remote-turn custody survive exactly as they
 /// would across a crash. It is also the more conservative substitute for the
 /// pre-0.8.24 behaviour, under which the predecessor kept running and merely
-/// lost its route. It replies only after teardown, which is what makes it
-/// awaitable; the [`await_supervisor_route_release`] call below is the assertion
-/// that it did what this helper claims.
+/// lost its route. Its reply is retained until the actor loop has quiesced and
+/// dropped the actor-owned runtime adapter, which makes the simulated process
+/// death awaitable; the [`await_supervisor_route_release`] call below
+/// independently asserts that the supervisor route is gone.
 ///
 /// Use `handle.shutdown()` instead where the test's subject is a graceful stop.
 async fn crash_stop_and_release_routes(handle: MobHandle) {

@@ -1941,6 +1941,18 @@ async fn mob_cold_restart_resume_after_kill_between_commit_points() {
         .resolve_bridge_session_id(&AgentIdentity::from("w-1"))
         .await
         .expect("w1 session id");
+    let lead_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead session id");
+    let mut runtime_release_witnesses = Vec::new();
+    for session_id in [&lead_sid, &w1_sid] {
+        let runtime = service_1
+            .comms_runtime(session_id)
+            .await
+            .unwrap_or_else(|| panic!("comms runtime missing for {session_id}"));
+        runtime_release_witnesses.push(Arc::downgrade(&runtime));
+    }
 
     // Turn A commits cleanly to the co-tenant canonical head and retained
     // runtime boundary in one SQLite resource.
@@ -2078,14 +2090,32 @@ async fn mob_cold_restart_resume_after_kill_between_commit_points() {
         .crash_stop_preserving_durable_work_for_test()
         .await
         .expect("crash-stop lifetime-1 actor before restoring power");
+    assert!(
+        handle_1.actor_command_channel_closed_for_test(),
+        "crash-stop must not acknowledge before the actor receiver and actor-owned runtimes are dropped"
+    );
     assert_eq!(
         power_store.legacy_boundary_commit_rejections(),
         0,
         "HeadCanonical lifetime must reach only the prepared boundary seam"
     );
+    // A real process loss destroys the session-service actors as well as the
+    // mob actor. This same-process fixture must establish that boundary
+    // explicitly before lifetime 2 can claim the same participant names.
+    service_1.shutdown().await;
     drop(handle_1);
     drop(service_1);
     drop(store_1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runtime_release_witnesses
+            .iter()
+            .any(|runtime| runtime.upgrade().is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("process-loss fixture waits for every old session runtime to be released");
 
     // ---------------- Lifetime 2 (power restored) ----------------
     power_store.set_cut(false);
@@ -2122,6 +2152,7 @@ async fn mob_cold_restart_resume_after_kill_between_commit_points() {
     // physical head, runtime authority, receipt, lifecycle, and input effects
     // in one transaction. A wrapper that merely advertises HeadCanonical or a
     // split JSONL/runtime topology cannot satisfy these assertions.
+    assert_member_active(&lead_after, "kill-window-post-resume-orchestrator");
     assert_member_active(&w1_after, "kill-window-post-resume");
     wait_for_head_canonical_authority_convergence(
         store_2.as_ref(),
