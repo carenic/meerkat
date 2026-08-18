@@ -36,10 +36,10 @@ bool_enabled() {
 
 if command -v gh >/dev/null 2>&1; then
   pass "GitHub CLI is installed"
-  if gh auth status >/dev/null 2>&1; then
-    pass "GitHub CLI is authenticated"
+  if gh auth status --hostname github.com >/dev/null 2>&1; then
+    pass "GitHub CLI is authenticated for github.com"
   else
-    bad "GitHub CLI is not authenticated; run gh auth login before release dispatch"
+    bad "GitHub CLI is not authenticated for github.com; run gh auth login before release dispatch"
   fi
 else
   bad "GitHub CLI is not installed; release workflow dispatch needs gh"
@@ -68,8 +68,8 @@ else
   bad "release hook Python '${release_python}' is too old (${release_python_version:-unknown}); require >= 3.10"
 fi
 
-if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-  gh_user="$(gh api user --jq '.login' 2>/dev/null || true)"
+if command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1; then
+  gh_user="$(gh api --hostname github.com user --jq '.login' 2>/dev/null || true)"
   owner_release_account=false
   if [[ "${gh_user}" == "lukacf" ]]; then
     owner_release_account=true
@@ -79,7 +79,7 @@ if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
   fi
 
   release_bb="$(
-    gh api repos/lukacf/meerkat/actions/variables/MEERKAT_RELEASE_BUILDBUDDY \
+    gh api --hostname github.com repos/lukacf/meerkat/actions/variables/MEERKAT_RELEASE_BUILDBUDDY \
       --jq '.value' 2>/dev/null || true
   )"
   if [[ "${owner_release_account}" == "true" ]]; then
@@ -95,7 +95,7 @@ if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
   fi
 
   runner_value="$(
-    gh api repos/lukacf/meerkat/actions/variables/MEERKAT_CI_RUNNER \
+    gh api --hostname github.com repos/lukacf/meerkat/actions/variables/MEERKAT_CI_RUNNER \
       --jq '.value' 2>/dev/null || true
   )"
   if [[ -n "${runner_value}" ]]; then
@@ -105,7 +105,7 @@ if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
   fi
 
   for secret_name in CARGO_REGISTRY_TOKEN PYPI_API_TOKEN NPM_TOKEN HOMEBREW_TAP_TOKEN; do
-    if gh api "repos/lukacf/meerkat/actions/secrets/${secret_name}" --jq '.name' >/dev/null 2>&1; then
+    if gh api --hostname github.com "repos/lukacf/meerkat/actions/secrets/${secret_name}" --jq '.name' >/dev/null 2>&1; then
       pass "GitHub Actions secret ${secret_name} exists"
     elif [[ "${owner_release_account}" == "true" ]]; then
       bad "GitHub Actions secret ${secret_name} is missing"
