@@ -88,6 +88,7 @@ async fn restart_revives_member_from_stored_spec_with_zero_bridge_traffic() {
     let limits = meerkat_core::BudgetLimits {
         max_tokens: None,
         max_duration: None,
+        max_turn_duration: None,
         max_tool_calls: Some(2),
     };
     spec.overlay.budget_limits = Some(limits.clone());

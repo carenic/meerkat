@@ -23,6 +23,11 @@ const localPackages = new Map(
     .filter((pkg) => pkg.source === null && workspaceMembers.has(pkg.id))
     .map((pkg) => [pkg.id, pkg]),
 );
+const inTreePathPackages = metadata.packages.filter((pkg) => {
+  if (pkg.source !== null || workspaceMembers.has(pkg.id)) return false;
+  const rel = relative(root, dirname(pkg.manifest_path));
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`);
+});
 const byName = new Map(
   [...localPackages.values()].map((pkg) => [pkg.name, pkg]),
 );
@@ -970,12 +975,14 @@ function testTags(pkg, target) {
   return [...new Set(tags)].sort();
 }
 
-const packageRunfileLabels = [...localPackages.values()]
-  .map((pkg) => relative(root, packageDir(pkg)))
-  .filter((dir) => dir !== "")
-  .sort()
-  .map((dir) => `//${dir}:package_runfiles`);
-packageRunfileLabels.sort();
+const packageRunfileLabels = [
+  ...new Set(
+    [...localPackages.values(), ...inTreePathPackages]
+      .map((pkg) => relative(root, packageDir(pkg)))
+      .filter((dir) => dir !== "")
+      .map((dir) => `//${dir}:package_runfiles`),
+  ),
+].sort();
 
 function writeRootBuild(fastTestLabels, e2eSystemTestLabels, surfaceFeatureMatrixLabels) {
   const lines = [
@@ -1087,6 +1094,14 @@ function writeRootBuild(fastTestLabels, e2eSystemTestLabels, surfaceFeatureMatri
     `        allow_empty = True,`,
     `    ) + ${listExpr(packageRunfileLabels, 8)},`,
     `    visibility = ["//visibility:public"],`,
+    `)`,
+    ``,
+    `sh_test(`,
+    `    name = "bazel_path_patch_runfiles_test",`,
+    `    srcs = ["scripts/buildbuddy-path-patch-runfiles-test"],`,
+    `    data = [":workspace_runfiles"],`,
+    `    size = "small",`,
+    `    tags = ["buildbuddy", "fast"],`,
     `)`,
     ``,
     `sh_test(`,

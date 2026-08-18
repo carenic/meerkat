@@ -55,26 +55,80 @@ run_head_canonical_kill_window() {
 
 prebuild_e2e_system_rkat_tests() {
   # System scenarios enforce behavior timeouts around their nested commands.
-  # Compile every exact rkat feature graph used by the canonical system lane
-  # before those timers start, so a cold output root cannot spend the behavior
-  # allowance compiling and then kill shared artifact progress at the deadline.
+  # Compile each test target separately so Cargo uses the same dev-dependency
+  # feature graph as the nested scenario command. Combining targets can unify a
+  # broader graph that the single-target command then rebuilds under its timer.
   "${cargo_bin}" test \
     -p rkat \
     --features integration-real-tests \
-    --test system_cli_init \
-    --test live_smoke_cli \
     --test cli_mobpack_live_smoke \
-    --no-run
-  "${cargo_bin}" test \
-    -p rkat \
-    --features integration-real-tests,mob,comms \
-    --test system_mob_host_daemon \
-    --test system_mob_cli_verbs \
     --no-run
   "${cargo_bin}" test \
     -p rkat \
     --features integration-real-tests,memory-store-session \
     --test system_cli_resume \
+    --no-run
+  "${cargo_bin}" test \
+    -p rkat \
+    --features integration-real-tests,mob,comms \
+    --test system_mob_cli_verbs \
+    --no-run
+  "${cargo_bin}" test \
+    -p rkat \
+    --features integration-real-tests,mob \
+    --test system_mob_run_custody \
+    --no-run
+  "${cargo_bin}" test \
+    -p rkat \
+    --features integration-real-tests,mob,comms \
+    --test system_mob_host_daemon \
+    --no-run
+  "${cargo_bin}" test \
+    -p rkat \
+    --features integration-real-tests \
+    --test system_cli_mcp_pending \
+    --no-run
+  "${cargo_bin}" test \
+    -p rkat \
+    --features integration-real-tests \
+    --test system_cli_init \
+    --no-run
+  "${cargo_bin}" test \
+    -p rkat \
+    --features integration-real-tests \
+    --test system_cli_export_atif \
+    --no-run
+  "${cargo_bin}" test \
+    -p rkat \
+    --features integration-real-tests \
+    --test live_smoke_cli \
+    --no-run
+}
+
+prebuild_e2e_system_other_tests() {
+  "${cargo_bin}" test \
+    -p meerkat-rest \
+    --features integration-real-tests \
+    --test system_rest_resume \
+    --no-run
+  "${cargo_bin}" test \
+    -p meerkat-integration-tests \
+    --test system_realm_inheritance \
+    --no-run
+  "${cargo_bin}" test \
+    -p meerkat-integration-tests \
+    --test system_shared_realm \
+    --no-run
+}
+
+prebuild_e2e_system_harness() {
+  # Build the harness before the nested rkat graphs. Compiling the harness
+  # unifies test-support features across its dependency graph; doing that after
+  # the rkat prebuild can invalidate those artifacts and force recompilation
+  # inside the first scenario's behavior timeout.
+  "${cargo_bin}" test \
+    -p meerkat-integration-tests \
+    --test e2e_system_lane \
     --no-run
 }
 
@@ -140,6 +194,13 @@ case "${lane}" in
     if meerkat_buildbuddy_enabled; then
       exec "${root}/scripts/buildbuddy-dev" e2e-system
     fi
+    # The system harness forces this value for every nested scenario to avoid
+    # macOS relink/signature races. Use the same compiler fingerprint while
+    # prebuilding or Cargo will rebuild the graph inside the scenario timeout.
+    export CARGO_INCREMENTAL=0
+    export RUST_MIN_STACK=$((16 * 1024 * 1024))
+    prebuild_e2e_system_harness
+    prebuild_e2e_system_other_tests
     prebuild_e2e_system_rkat_tests
     exec "${cargo_bin}" e2e-system
     ;;

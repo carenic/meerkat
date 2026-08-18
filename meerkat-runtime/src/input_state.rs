@@ -339,6 +339,18 @@ impl InputTerminalCompletionBatchKey {
             Self::RuntimeTermination { .. } => None,
         }
     }
+
+    /// Stable, total textual identity for machine-authority inputs and audit
+    /// records. Also the deterministic sort key recovery uses, so that a
+    /// disposition can never depend on hash-map iteration order.
+    pub(crate) fn audit_key(&self) -> String {
+        match self {
+            Self::Run { run_id } => format!("run:{run_id}"),
+            Self::RuntimeTermination { owner_input_id } => {
+                format!("runtime-termination:{owner_input_id}")
+            }
+        }
+    }
 }
 
 /// Machine-authorized verdict for the post-terminal finalization step.

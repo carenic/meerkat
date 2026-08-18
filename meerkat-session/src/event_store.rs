@@ -6699,7 +6699,7 @@ mod tests {
                 &session_id,
                 &[AgentEvent::TurnCompleted {
                     stop_reason: meerkat_core::StopReason::EndTurn,
-                    usage: usage.clone(),
+                    usage: Some(usage.clone()),
                 }],
             )
             .await?;
@@ -6719,6 +6719,9 @@ mod tests {
             )
             .into());
         };
+        let stored_usage = stored_usage
+            .as_ref()
+            .expect("a measured turn must round-trip its accounting");
         assert_eq!(stored_usage, &usage);
         assert_eq!(
             stored_usage.accounting().provider,

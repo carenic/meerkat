@@ -2103,6 +2103,23 @@ pub enum SendError {
     /// caller, which must reconcile against durable work truth before deciding
     /// whether a new delivery attempt is safe. No process-local retry authority
     /// is implied.
+    ///
+    /// RECONCILIATION ONLY WORKS IF THE DEDUP KEY IS COARSER THAN THE RETRY.
+    /// This is the trap next to the tool, and it is not hypothetical: an adopter
+    /// on this exact path was safe only because their key was
+    /// `{schedule_id}:{YYYYMMDD}` for a once-daily cycle, so a retry after an
+    /// ambiguous timeout collapsed onto the delivery that might still commit -
+    /// and they disclosed that the key had been per-attempt-timestamped first
+    /// and was changed only after it bit them. A per-attempt or timestamped key
+    /// gives ZERO protection while looking exactly like idempotency, and it is
+    /// the natural first draft.
+    ///
+    /// Surfaces must also not render this as a plain failure. A wrapper may add
+    /// CONTEXT (which operation, which peer) but must never add an OUTCOME the
+    /// inner error did not assert: a status code or a leading "failed to ..."
+    /// tells a caller - including a model-mediated one reading prose - to try
+    /// again, which is precisely the unsafe action here. Name the ambiguity and
+    /// carry the envelope id.
     #[error("peer delivery outcome is ambiguous for envelope {envelope_id}: {detail}")]
     AmbiguousDelivery {
         envelope_id: uuid::Uuid,

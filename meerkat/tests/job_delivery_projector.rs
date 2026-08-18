@@ -13,6 +13,7 @@ use meerkat::{
 use meerkat_core::HandlingMode;
 use meerkat_runtime::{
     InMemoryRuntimeStore, LogicalRuntimeId, RuntimeDeliveryId, RuntimeDeliveryInbox,
+    RuntimeDeliveryKind, RuntimeDeliverySubmission,
 };
 use meerkat_tools::builtin::shell::ShellJobDeliveryProjector;
 use tokio::sync::Mutex;
@@ -132,6 +133,118 @@ async fn realm_scoped_projection_leaves_other_realm_outbox_pending() {
             .outbox
             .iter()
             .any(|entry| !entry.applied)
+    );
+}
+
+/// A runtime holding committed-but-undrained deliveries is counted even when
+/// no job row points at it.
+///
+/// This is the miss, not a lag. The old backlog probe built its candidate
+/// session set from `job_store.list_all(10_000)` and then asked each of those
+/// sessions for its pending inbox. Every delivery verb on `RuntimeStore` is
+/// per-runtime, so that derived set was the only thing standing between the
+/// probe and the rows - and a session whose jobs aged out of that bounded,
+/// `ORDER BY job_id` window contributed nothing while still holding undrained
+/// deliveries. Accepted-and-undrained is the field symptom, so the probe was
+/// blind to exactly the state it existed to report.
+///
+/// The fixture is the endpoint of that aging: inbox rows with no job rows at
+/// all. The old algorithm is reproduced inline as a control so the two answers
+/// sit next to each other - `0` from the derived set, `2` from the delivery
+/// authority.
+#[tokio::test]
+async fn undrained_deliveries_are_counted_for_runtimes_no_job_row_names() {
+    let job_store = Arc::new(MemoryDetachedJobStore::new());
+    let inbox = RuntimeDeliveryInbox::new(Arc::new(InMemoryRuntimeStore::new()));
+
+    let orphaned_session = SessionId::new();
+    let orphaned_runtime = LogicalRuntimeId::for_session(&orphaned_session);
+    for sequence in 1..=2_u64 {
+        inbox
+            .submit(
+                &orphaned_runtime,
+                RuntimeDeliverySubmission::new(
+                    RuntimeDeliveryId::new(format!("delivery-{sequence}")).expect("delivery id"),
+                    RuntimeDeliveryKind::JobTerminal,
+                    "job-source",
+                    sequence,
+                    "lineage",
+                    b"payload".to_vec(),
+                )
+                .expect("submission"),
+            )
+            .await
+            .expect("submit delivery");
+    }
+
+    // Control: the pre-fix discovery path. The candidate set comes from job
+    // rows, and there are none, so the loop never asks the inbox anything.
+    let jobs = job_store.list_all(10_000).await.expect("list jobs");
+    assert!(
+        jobs.is_empty(),
+        "fixture precondition: the jobs whose deliveries these are have aged out"
+    );
+    let mut derived_from_jobs = 0_u64;
+    for job in &jobs {
+        let pending = inbox
+            .list_pending(
+                &LogicalRuntimeId::for_session(&job.spec.origin_session_id),
+                10_000,
+            )
+            .await
+            .expect("pending");
+        derived_from_jobs += u64::try_from(pending.len()).expect("count");
+    }
+    assert_eq!(
+        derived_from_jobs, 0,
+        "a session set derived from job rows cannot see these rows at all"
+    );
+
+    assert_eq!(
+        inbox
+            .pending_delivery_total()
+            .await
+            .expect("cross-runtime pending total"),
+        2,
+        "the delivery authority knows about runtimes no job row names"
+    );
+
+    // Draining is what clears it - the count tracks the generated cursor, not
+    // the presence of rows (inbox rows are retained after application).
+    let pending = inbox
+        .list_pending(&orphaned_runtime, 10)
+        .await
+        .expect("pending");
+    inbox
+        .mark_applied(
+            &orphaned_runtime,
+            pending[0].submission.delivery_id(),
+            pending[0].sequence,
+        )
+        .await
+        .expect("mark applied");
+    assert_eq!(
+        inbox
+            .pending_delivery_total()
+            .await
+            .expect("cross-runtime pending total after drain"),
+        1
+    );
+}
+
+/// A store where durable delivery was never used answers a readable zero.
+///
+/// The known negative for the probe: no delivery domain on disk is not an
+/// unreadable dimension and must not publish a fault.
+#[tokio::test]
+async fn a_store_with_no_delivery_state_reports_zero_rather_than_failing() {
+    let inbox = RuntimeDeliveryInbox::new(Arc::new(InMemoryRuntimeStore::new()));
+    assert_eq!(
+        inbox
+            .pending_delivery_total()
+            .await
+            .expect("empty store is readable"),
+        0
     );
 }
 
@@ -731,6 +844,21 @@ impl DetachedJobStore for HidingJobStore {
         limit: usize,
     ) -> Result<Vec<meerkat_jobs::StoredJob>, meerkat::DetachedJobError> {
         self.inner.list_all(limit).await
+    }
+
+    async fn count_pending_outbox_jobs(
+        &self,
+        realm_id: Option<&str>,
+    ) -> Result<u64, meerkat::DetachedJobError> {
+        self.inner.count_pending_outbox_jobs(realm_id).await
+    }
+
+    async fn list_census_candidates(
+        &self,
+        realm_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<meerkat_jobs::StoredJob>, meerkat::DetachedJobError> {
+        self.inner.list_census_candidates(realm_id, limit).await
     }
 
     fn is_persistent(&self) -> bool {

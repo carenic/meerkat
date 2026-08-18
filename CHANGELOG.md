@@ -4,14 +4,696 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 **Versioning policy (pre-1.0):** meerkat 0.x PATCH releases may contain
-breaking public-API changes — this project ships deliberate clean breaks
+breaking public-API changes - this project ships deliberate clean breaks
 instead of compatibility shims. Downstreams must EXACT-PIN the meerkat crate
 family (e.g. `meerkat = "=0.7.24"`) and bump deliberately. In exchange, every
 release that breaks public API declares it under a `### Breaking` heading
-naming the changed signatures (enforced by the `semver-breaks` release gate
-via cargo-semver-checks against the published baselines).
+naming the changed signatures.
+
+**What the `semver-breaks` gate actually enforces**, so this file does not
+claim more than it measures: it runs cargo-semver-checks over the publishable
+workspace against the published baselines, and it fails the release unless
+(1) every crate the release publishes was reached by the run, (2) every break
+the tool reports is NAMED in the pending section's `### Breaking` body at the
+granularity of the individual finding, and (3) that pending section is stamped
+`## [VERSION] - DATE` against the version being released. "Named" means the
+symbols of the finding appear in the `### Breaking` body: a type gaining a
+field and the same type losing a derive are two findings, and naming one does
+not declare the other.
+
+Behaviour-only breaks - a public signature that keeps its shape and changes
+what it does - are invisible to cargo-semver-checks and therefore invisible to
+the gate. They are declared by hand and tagged inline, and nothing enforces
+them.
 
 ## [Unreleased]
+
+### Breaking
+
+- **`meerkat_core::BackendProfile` gains a `server: Option<String>` field** and
+  **`meerkat_core::BackendProfileConfig` gains a `server: Option<String>`
+  field**. Both are the canonical owner of "which `[self_hosted.servers.<id>]`
+  endpoint this backend authenticates". Struct-literal constructions of either
+  type must add `server: None`; `..Default::default()` and TOML ingestion are
+  unaffected (the field is `#[serde(default)]` and omitted when `None`, so no
+  wire break, no schema change, no SDK regeneration).
+- **`meerkat_core::ProviderBindingError` gains two variants**,
+  `ServerRequiresSelfHostedProvider { backend, provider, server }` and
+  `EmptySelfHostedServerId { backend }`: declaring `server` on a non-self-hosted
+  backend, or declaring it empty, now fails ingestion closed. Exhaustive matches
+  on this enum must add both arms.
+- **`meerkat_llm_core::FactoryError` gains a `SelfHostedBinding` variant**
+  carrying the new `meerkat_core::SelfHostedConnectionError`. Exhaustive matches
+  on `FactoryError` must add the arm.
+- **`AgentEvent` gains two variants**, `TurnUsageAccountingUnmeasured` and
+  `TurnUsageAccountingIdentityDisputed`. The enum is `#[non_exhaustive]`, so a
+  match with a wildcard arm keeps compiling; both discriminators are added to
+  `meerkat_contracts::KNOWN_AGENT_EVENT_TYPES` and to every generated SDK
+  inventory, without which a version-matched Python/TypeScript client would
+  reject them as `UNKNOWN_EVENT_TYPE`.
+
+- **`AgentEvent::TurnCompleted.usage` is now `Option<TurnUsage>`** (was
+  `TurnUsage`), and `meerkat_core::agent`'s internal
+  `validate_provider_turn_usage_identity` is replaced by
+  `classify_provider_turn_usage_identity` returning a `TurnUsageIdentityVerdict`
+  instead of a `Result`. `agent::compact::CompactionOutcome` gains
+  `summary_usage_identity_dispute`. On the wire the measured case is unchanged:
+  `usage` is skipped when absent, so every existing `turn_completed` row
+  serializes byte-for-byte as before. Consumers that unconditionally read
+  `event.usage` must handle the absent case, and must SKIP it rather than fold
+  it in as zero. The Python and TypeScript SDKs type it optional
+  (`TurnCompleted.usage: Usage | None`, `TurnCompletedEvent.usage?: Usage`).
+
+- **`meerkat::surface::RUNTIME_HEALTH_DIMENSIONS` is now `[&str; 5]`** (was
+  `[&str; 4]`). The declared runtime-health coverage gains `session_run_start`;
+  downstream code binding the constant by its exact array type must add the new
+  dimension. The `checks` map itself is an open string map on the wire, so the
+  new key is additive: no wire break, no schema change, no SDK regeneration.
+- **`meerkat_contracts::JobHealthSummary` loses `delivery_backlog: u64`** and
+  gains `pending_outbox_jobs: u64`, `runtime_inbox_backlog: u64` and
+  `coverage: JobHealthCoverage`. The single `delivery_backlog` number conflated
+  two different queues - jobs owing an outbox notification, and deliveries a
+  runtime has not drained - so one of them could be zero for the wrong reason.
+  The struct is not `#[non_exhaustive]`, so struct-literal constructions and
+  exhaustive field reads must be updated.
+- **`meerkat_contracts::JobHealthStatus` gains an `Unreadable` variant.** The
+  census can now say it did not look, which it previously could not express;
+  exhaustive matches must add the arm. SDK literal unions are regenerated.
+
+  For adopters folding this into a two-state surface: `Unreadable` is a THIRD
+  state and no boolean carries it. `stale_leases == 0` means none were SEEN, not
+  that none EXIST. Folding `Unreadable` into "healthy" reintroduces exactly the
+  blindness this change removes - a green board over an unexamined store.
+  Folding it into "degraded" pages an operator about a fleet that may be
+  entirely fine. If a boolean is unavoidable, prefer NOT-healthy so the failure
+  is visible rather than silent, but the intended consumption is to surface the
+  third state distinctly and say WHICH term could not be measured.
+- **`meerkat_contracts::JobHealthCoverage` is a new wire enum**
+  (`complete` | `truncated { scanned, limit }`), so a saturated census window is
+  a typed fact rather than a silent count.
+- **`meerkat_jobs::JobHealthSnapshot::is_degraded()` is REMOVED**, replaced by
+  `reading() -> JobHealthReading`. The removal is deliberate rather than a
+  deprecation: `is_degraded()` collapsed "nothing is wrong" and "I could not
+  look" into one boolean, and deleting it made the compiler find every consumer.
+  `delivery_backlog` on the same type is likewise renamed to
+  `pending_outbox_jobs`, and `coverage` is added.
+- **`meerkat_jobs::DetachedJobStore` gains two REQUIRED methods**,
+  `count_pending_outbox_jobs(realm_id)` and
+  `list_census_candidates(realm_id, limit)`. They are deliberately not
+  defaulted: a default falling back to a capped scan would silently reintroduce
+  exactly the age-blindness this change exists to remove. Out-of-tree
+  implementors must implement both.
+- **`meerkat_runtime::RuntimeStore` gains `list_runtime_delivery_authorities()`**,
+  which IS defaulted (returning `Unsupported`, which the census maps to
+  `Unreadable`), so existing implementors do not break.
+- **`meerkat_comms::RegistrationOutcome::ReboundOwnName` is removed.** The enum
+  is not `#[non_exhaustive]`, so any `match` naming that variant, and any
+  exhaustive `match` that relied on it existing, stops compiling. There are now
+  three outcomes: `Registered`, `ReplacedPubkey { evicted_name }`,
+  `Rejected { reason }`.
+- **BEHAVIOUR-ONLY, NO TOOL WILL CATCH THIS: there is now ONE claim rule for a
+  comms participant name - publish only while the name is UNBOUND.**
+  `InprocRegistry::register_with_meta_in_namespace` (and everything reaching it:
+  `InprocRegistry::register`, `CommsRuntime::inproc_only*`,
+  `PreparedCommsRuntime::publish`, and therefore `MobSupervisorBridge::new`)
+  used to fork on key identity: a FOREIGN key was refused, while the SAME key
+  rebound the live route onto its newer inbox generation and reported
+  `ReboundOwnName`. That same-key arm is gone. A live route under the claimed
+  name is now refused whichever key holds it, with the same
+  `RegistrationRejection::NameOccupied { holder_pubkey }` - `holder_pubkey` may
+  now be the claimant's own key, and it is evidence of who holds the name, not a
+  statement that the claimant is a different peer.
+
+  What flips from silent success to typed failure: **building a second runtime
+  for one participant name while the predecessor is still published.** In mob
+  terms, constructing a second `MobSupervisorBridge`/mob runtime for one mob id
+  under the same persisted supervisor authority while the predecessor actor is
+  alive. This was never safe: nothing above comms excluded two live hosts of one
+  mob, so in-proc route occupancy was in practice the only guard, and the
+  same-key case is exactly where the displaced route is most likely still live.
+
+  Succession is admitted on EVIDENCE, in one of two forms, both of which already
+  existed:
+  - the incumbent declares a generation-exact release -
+    `CommsRuntime::retire_inproc_route`, reached by `MobHandle::shutdown()` (and
+    by the test-support `crash_stop_preserving_durable_work_for_test`) via
+    `MobSupervisorBridge::shutdown` - after which the name is unbound and the
+    successor publishes ordinarily, including under the SAME authority key;
+  - or the successor hands in the exact predecessor generation through
+    `PreparedCommsRuntime::publish_replacing` /
+    `InprocRegistry::replace_sender_in_namespace`. Supervisor rotation already
+    took this path, so live rotation is unaffected.
+
+  Not changed: `ReplacedPubkey` (one key renaming itself onto a FREE name) is
+  still admitted - the claimed name is unbound, which is the one rule. Session
+  identities are unaffected in ordering terms: `SessionClaimHandle::try_acquire`
+  still fails closed with `SessionIdentityInUse` before registration is reached.
+
+  The refusal message changed on both layers and is now remedy-first: it says
+  the incumbent has not released the route and must be retired first, names
+  `MobHandle::shutdown`, states that holding the same authority key is not a
+  claim on the route, and marks the public key as evidence rather than a
+  key/trust failure. Code matching the old prose must match the typed variant
+  (`MobError::ParticipantNameOccupied`, or
+  `CommsRuntimeError::InprocRegistrationRejected`).
+- **`meerkat_core::BudgetLimits` gains the field `max_turn_duration:
+  Option<Duration>`.** Struct-literal constructors of `BudgetLimits` must add
+  it (`max_turn_duration: None` preserves today's behaviour exactly); builder
+  and `..Default::default()` users are unaffected. The field is
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`, so persisted
+  and wire payloads written by older versions still deserialize, and `None` -
+  the default - keeps every existing deployment on exactly the behaviour it
+  has today. The skip is load-bearing: a spec carrying no turn ceiling keeps
+  its historical canonical bytes, so the frozen portable-spec digest pin and
+  every `spec_digest` already recorded in host stores still match, exactly as
+  `PortableToolConfig.read_only` did in 0.8.23. No default value is being
+  turned on in this release: see the proposal under Added.
+- **`meerkat_mcp_server::BudgetLimitsInput` gains
+  `max_turn_duration_secs: Option<u64>`** (`#[serde(default)]`, additive on the
+  MCP tool input schema; struct-literal constructors must add the field).
+- **`meerkat_core::LimitsConfig` gains
+  `max_turn_duration: Option<Duration>`.** This is the configuration twin of
+  `BudgetLimits::max_turn_duration`; struct-literal constructors must add the
+  field (`None` preserves the previous unbounded behavior).
+- **The generated Meerkat machine API gains explicit terminal-completion
+  recovery and unregister-drain facts.** Struct and struct-variant constructors
+  and destructuring patterns must add the fields (or use `..` where legal), and
+  exhaustive enum matches must add the new variants. The additions are:
+  - `SessionRegistrationRejectReasonKind::UnregisterTeardownInProgress`;
+  - `SessionRegistrationRejected` gains
+    `unregister_runtime_loop_drain_pending`,
+    `unregister_comms_drain_exit_pending`, and
+    `unregister_completion_waiter_drain_pending`;
+  - `State` and `MeerkatMachineState` gain
+    `runtime_completion_result_resolved`;
+  - `MeerkatMachineEffect::SessionRegistrationRejected` gains
+    `unregister_runtime_loop_drain_pending`,
+    `unregister_comms_drain_exit_pending`, and
+    `unregister_completion_waiter_drain_pending`;
+  - `Effect`, `EffectKind`, `MeerkatMachineEffect`, and
+    `MeerkatMachineEffectVariant` gain
+    `RecoveredTerminalCompletionBatchClassified` and
+    `RecoveredTerminalCompletionDeclaredUnrecoverable`;
+  - `Input`, `InputKind`, `MeerkatMachineInput`, and
+    `MeerkatMachineInputVariant` gain
+    `ClassifyRecoveredTerminalCompletionBatch` and
+    `DeclareRecoveredTerminalCompletionUnrecoverable`.
+- **The generated Meerkat machine `TransitionId` enum gains 32 variants.**
+  Exhaustive matches must add the new arms. The exact additions are
+  `RegisterSessionRefusedUnregisterDrainingIdle`,
+  `RegisterSessionRefusedUnregisterDrainingAttached`,
+  `RegisterSessionRefusedUnregisterDrainingRunning`,
+  `RegisterSessionRefusedUnregisterDrainingRetired`,
+  `RegisterSessionRefusedUnregisterDrainingStopped`,
+  `ClassifyRecoveredTerminalCompletionBatchRecoverInitializing`,
+  `ClassifyRecoveredTerminalCompletionBatchRecoverIdle`,
+  `ClassifyRecoveredTerminalCompletionBatchRecoverAttached`,
+  `ClassifyRecoveredTerminalCompletionBatchRecoverRunning`,
+  `ClassifyRecoveredTerminalCompletionBatchRecoverRetired`,
+  `ClassifyRecoveredTerminalCompletionBatchRecoverStopped`,
+  `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableInitializing`,
+  `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableIdle`,
+  `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableAttached`,
+  `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRunning`,
+  `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRetired`,
+  `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableStopped`,
+  `ClassifyRecoveredTerminalCompletionBatchBlockedInitializing`,
+  `ClassifyRecoveredTerminalCompletionBatchBlockedIdle`,
+  `ClassifyRecoveredTerminalCompletionBatchBlockedAttached`,
+  `ClassifyRecoveredTerminalCompletionBatchBlockedRunning`,
+  `ClassifyRecoveredTerminalCompletionBatchBlockedRetired`,
+  `ClassifyRecoveredTerminalCompletionBatchBlockedStopped`,
+  `DeclareRecoveredTerminalCompletionUnrecoverableInitializing`,
+  `DeclareRecoveredTerminalCompletionUnrecoverableIdle`,
+  `DeclareRecoveredTerminalCompletionUnrecoverableAttached`,
+  `DeclareRecoveredTerminalCompletionUnrecoverableRunning`,
+  `DeclareRecoveredTerminalCompletionUnrecoverableRetired`,
+  `DeclareRecoveredTerminalCompletionUnrecoverableStopped`,
+  `PrepareIdleRetainingUnsettledCompletion`,
+  `PrepareAttachedRetainingUnsettledCompletion`, and
+  `DrainQueuedRunRetiredRetainingUnsettledCompletion`.
+- **`meerkat_mob::runtime::host_actor::MobHostActorError` and
+  `meerkat_mob::runtime::host_materialize::MaterializeServeError` each gain a
+  `ParticipantNameOccupied` variant.** Exhaustive matches must handle the typed
+  refusal. This is the host-side surface of the one-live-participant rule
+  described above; the same additions are also discussed under Corrected.
+
+### Added
+
+- **A turn's aggregate wall-clock has an owner: `limits.max_turn_duration`.**
+  Every segment of a turn was already bounded - the per-call LLM timeout, the
+  300s stream-inactivity watchdog, the 600s per-tool-call timeout - and their
+  SUM was bounded by nothing. Five slow-but-legal tool calls is fifty minutes
+  of entirely legal non-advance, and no owner ever asked whether the turn was
+  ALLOWED to take that long. `BudgetLimits::max_turn_duration` is that owner.
+  Its epoch is re-armed at every run entry by `Budget::begin_turn`, which is
+  the fact the pre-existing `max_duration` cannot express: `Budget::new` runs
+  once when a session's agent is built, so `max_duration` measures the AGENT'S
+  LIFETIME, including the idle wall-clock between turns, and would terminalize
+  a turn that had done nothing. Exhaustion is deliberately a TERMINAL and not
+  a report: a turn past its deadline has been invalidated - we can no longer
+  say when or whether it will produce output - so unlike an accounting or
+  observability fault it fails closed. It travels the EXISTING terminal path
+  (`BudgetDimension::Time` -> `TurnExecutionInput::BudgetLimitExceeded` ->
+  `TurnTerminalOutcome::TimeBudgetExceeded`); there is no second terminal for
+  "ran out of time". The generated authority already encoded that judgement
+  and the new horizon inherits it unchanged: in
+  `generated::terminal_surface_mapping`, an exhausted token/tool-call budget
+  classifies as `Success` (an orderly stop that still answers the caller)
+  while an exhausted TIME budget classifies as `HardFailure`, surfacing as
+  `AgentError::TerminalFailure { outcome: TimeBudgetExceeded, cause_kind:
+  TimeBudgetExceeded, .. }`. Enforcement is at SEGMENT BOUNDARIES: an expired
+  horizon never pre-empts a tool call that is already executing, so the loop cannot
+  tear a tool down mid-write. The honest ceiling is therefore
+  `max_turn_duration + the longest segment already in flight` - for a tool
+  batch that is the largest single per-call tool timeout, since every call in
+  a batch starts its clock together and its timeout wraps its concurrency
+  wait, so a batch cannot sum; for an LLM call it is zero, because each call
+  is wrapped with the horizon's remaining time. One known gap: a barrier-ops
+  wait (`ops_lifecycle.wait_all`) is not interrupted by the horizon and stays
+  unbounded - a separate seam, not closed here. Retries cannot double-count:
+  the horizon is one monotonic clock from run entry. Configure with
+  `[limits] max_turn_duration = "30m"`, `BudgetLimits::with_max_turn_duration`,
+  the `budget_limits` field on REST/RPC/portable-spec requests, or
+  `max_turn_duration_secs` on the MCP surface. `0` is rejected at config
+  validation rather than producing a fleet of instantly-dead turns.
+- **PROPOSED, NOT SHIPPED - a non-`None` default for
+  `limits.max_turn_duration`.** The default in this release is `None`:
+  unbounded turns, byte-identical behaviour to 0.8.23. That means this release
+  does not by itself fix a mute member; it gives the bound an owner, a way to
+  declare it, and one terminal when it blows. Turning a ceiling on by default
+  is a behaviour break for every fleet at once and a wrong number kills
+  legitimate long turns, so the value goes to the fleets before it ships. The
+  proposal on the table is **30 minutes**, which is roughly three of today's
+  600s tool calls back to back; a fleet that legitimately runs longer turns
+  declares its own. If accepted, that default lands under `### Breaking` with
+  the terminal it introduces named explicitly.
+- **`runtime/health` measures `session_liveness` on both surfaces** - the
+  dimension 0.8.23 shipped honestly unmeasured, closed by the incident that
+  proved it out: a household member wrote no transcript row for five days,
+  resumed ACTIVE on every boot, and read 17/17 green on every board, because
+  every existing probe measured registration state while the wedge lived in
+  lane truth. The new probe reports `degraded` while any registered session is
+  PARKED ON QUEUED WORK, on either of two axes, both requiring the executor
+  registration `Active` and no run in flight. The AGED axis: an input in the
+  machine's queued phase whose `updated_at` - the instant it entered its
+  current state - is older than the notice bound (120s, deliberately the same
+  constant as `session_run_start` so "overdue" means one thing across the
+  pipeline). The STAGE-CHURN axis: an input the machine has staged and rolled
+  back at least twice (`input_attempt_counts`, the DSL's own count) that is
+  queued again, with a `created_at` floor of the same bound. The second axis
+  exists because the first is structurally defeated by exactly the state it
+  most needs to see: every Staged -> Queued rollback re-stamps `updated_at`,
+  so an input flapping through stage -> fail -> rollback faster than the
+  bound reads as forever-fresh on the age axis - and the flapping member is
+  the more alarming one. Queued work behind a live turn is a backlog, not a
+  wedge, and is never counted; a session whose registration cannot stage
+  anything is not accused of failing to. The verdict is recomputed per scrape
+  from existing owners only - machine lane truth (`input_phases`,
+  `input_attempt_counts`) and the ledger's per-input clocks; no new state
+  exists anywhere for this probe, so there is nothing to go stale. Both reads
+  are non-blocking tries taken strictly in sequence, never nested; a miss on
+  either publishes `unreadable:session_liveness`, never a rung. With this,
+  every declared dimension is measured on the RPC surface (REST still
+  publishes `unmeasured:jobs`), and the remaining coverage boundary is stated
+  in the handler doc rather than left to be discovered: a turn that BEGINS and
+  then produces nothing (mid-turn progress) is a distinct dimension with no
+  probe and no declared name yet.
+- **A completed turn is no longer killed because token accounting was absent.**
+  A provider stream that ends without ever sending a usage event used to fail
+  the turn - after the caller had already streamed and read the answer, and
+  before the assistant message was committed, so the transcript lost a turn the
+  user had seen. The absent number is an accounting fact, and a fault may only
+  terminalize what it actually invalidates: the turn now completes, the
+  assistant message commits, and the absence is published as a typed marker.
+  `turn_completed` carries no `usage`, and a companion
+  `turn_usage_accounting_unmeasured` event names the provider and model that
+  went unaccounted under the operator marker `unmeasured:turn_usage_accounting`
+  (the vocabulary `runtime/health` already publishes). That marker claims only
+  the absence and that no axis moved for it; whether the turn completed stays
+  owned by `turn_completed`, because the marker is published at the model
+  boundary and a turn can still fail after it on unrelated grounds. The token
+  axis does not move: nothing is charged to the budget, nothing is added to
+  session usage, and `last_input_tokens` keeps the value the last measured turn
+  left. Nothing is substituted for the missing measurement - not raw
+  `input_tokens` (a different denominator on cache-heavy sessions) and not
+  `TurnUsage::host_declared` (which would mint provider attribution for
+  counters no provider issued). Budget enforcement on measured turns is
+  unchanged.
+
+- **A turn-usage accounting identity mismatch is now disputed, not fatal.** The
+  counters in that case exist and are internally consistent - the
+  presented-token convention travels with the number - so only attribution is
+  in question. The number is recorded and the token axis advances as usual,
+  while a `turn_usage_accounting_identity_disputed` event publishes BOTH the
+  active and the reported provider/model under the marker
+  `disputed:turn_usage_accounting_identity`. The reported identity is never
+  rewritten to the active one: an agreement nobody observed is worse than a
+  stated disagreement. The same classification now routes the compaction
+  summary call's accounting identity instead of failing the compaction.
+
+- **`runtime/health` measures `session_run_start` on both surfaces** (JSON-RPC
+  `runtime/health` and REST `GET /runtime/health`): `degraded` while any
+  registered session holds a staged run that is overdue to begin executing -
+  staged more than the watchdog's notice bound (120s) ago while machine
+  authority still shows the run current with its primitive un-applied and its
+  turn start signalled. The verdict is recomputed from machine truth on every
+  scrape via the same classification the staged-run watchdog logs, so the wire
+  claim and that log line cannot disagree; there is no latched flag anywhere,
+  which is what makes a stale window degrade to clear instead of into a false
+  or missing alarm. A window whose run is no longer current is positively
+  resolved and never counted - including the appends-empty and retired-drain
+  classes that never signal a turn start, whose stale windows must not stand a
+  healthy idle session amber. A past-bound window whose run IS still current
+  but cannot be interpreted (unbound runtime, unsignalled turn start), or
+  whose authority cannot be read without blocking, publishes
+  `unreadable:session_run_start` rather than a rung: an absence of observation
+  may not publish as health, and the holder of an unreadable authority is the
+  prime suspect for the wedge itself, so "could not look" must reach the
+  operator instead of rolling up as `ok`. (The watchdog's own refusal to
+  ESCALATE on unobservable classes is deliberately not copied here - dropping
+  an apply future on an unproven condition is forbidden, but health has no
+  such constraint and the opposite duty.) The observation is
+  mechanical and read-only by declared contract: the moment anything other
+  than the health census branches on it, it becomes a semantic fact needing a
+  machine owner, and a source-grep test
+  (`run_start_window_stays_out_of_machine_authority`) enforces that boundary.
+
+### Fixed
+
+- **An OpenAI-compatible provider that reports usage in a separate SSE event
+  no longer fails every turn** (`meerkat-openai`). The chat-completions
+  adapter requests `stream_options.include_usage: true`, then emitted the
+  terminal `LlmEvent::Done` the moment it saw `finish_reason`. Because
+  `streaming::ensure_terminal_done` stops consuming at `Done`, a usage-only
+  event arriving afterwards was never read, and the turn then failed in
+  `Agent::commit_calling_llm_response` with "provider turn usage is missing
+  normalized accounting evidence" - AFTER the model's answer had already been
+  streamed to the user, and again on every retry. vLLM emits exactly this
+  order (metadata, deltas, `finish_reason`, usage-only event with empty
+  `choices`, `[DONE]`), so whole self-hosted deployments were unusable.
+
+  The adapter now latches the derived `StopReason` instead of spending it,
+  keeps consuming, emits `UsageUpdate` where it lands, and emits the single
+  terminal `Done` at `[DONE]`, at end of stream, or when the post-finish
+  trailer window expires - whichever comes first. Two facts became typed to
+  make that expressible: `parse_chat_completions_line` returns
+  `ChatCompletionsLine::{Chunk, Done, Ignored}` instead of an `Option` that
+  collapsed "the turn is over" and "a line this adapter does not interpret"
+  into one `None`; and the stop reason is a `latched_stop` spent exactly once.
+  `ChatCompletionsChunk.choices` gains `#[serde(default)]` so a usage-only
+  chunk deserializes.
+
+  **Latching the stop reason extended the read past `finish_reason`, so three
+  further shapes had to stop being able to destroy a delivered turn.** Every
+  byte in that new window is load-bearing, and none of it invalidates an answer
+  the caller has already read:
+  - **A bounded trailer window.** `DEFAULT_POST_FINISH_TRAILER_WINDOW` is 30s,
+    overridable per client with
+    `OpenAiCompatibleClient::with_post_finish_trailer_window`. It is ONE budget
+    measured from the latch instant and re-armed by nothing - notably not by
+    SSE keepalive comments, which carry no progress toward a trailer. Expiry is
+    END OF STREAM, never a turn failure. Without it, a server that holds the
+    connection open after finishing hung the turn indefinitely: there is no
+    HTTP client timeout, and keepalive comments re-arm the agent loop's stall
+    watchdog. 30s is deliberately an order of magnitude under the 300s
+    `stream_inactivity_timeout` so the two cannot race - equal windows would
+    have made the outcome a coin flip between this clean end-of-stream and the
+    loop's RETRYABLE `StreamStalled`.
+  - **A transport fault after the latch is end of stream, not failure.** A
+    truncated body once the answer is complete previously surfaced as
+    `ConnectionReset`, which is classified retryable - so the answer streamed,
+    the turn failed, and the retry answered again. That is the shape of the
+    defect above, on a different trigger.
+  - **A provider error envelope is typed.** `choices` gaining
+    `#[serde(default)]` made `{"object":"error",...}` and `{"error":{...}}`
+    decode as valid EMPTY chunks and fall into the ignore path, so a server
+    dying mid-stream presented as a SUCCESSFUL turn carrying truncated text.
+    `ChatCompletionsLine::ServerError` is now checked before chunk decoding.
+    Before the latch it fails the turn carrying the provider's own message
+    (the answer really is truncated); after the latch it does not (the answer
+    is complete and the engine is merely tearing down).
+
+  If usage never arrives at all, that stays an accounting fact owned
+  downstream - nothing here mints or substitutes accounting.
+
+- **Reasoning and content carried in the SAME delta are no longer emitted in
+  reverse order** (`meerkat-openai`). A server emits both fields in one chunk
+  on the reasoning-to-content transition; the reasoning in such a chunk was
+  produced BEFORE the content beside it, and 0.8.23 emitted the content first.
+  Field-reported as output that reads as corruption, and nothing downstream can
+  repair it: by the time the events leave the adapter, the interleaving IS the
+  stream. `ReasoningDelta` now precedes `TextDelta` within a chunk.
+
+  Why the existing reasoning test could not catch it, which is the part worth
+  keeping: every chunk in that fixture carries reasoning OR content, never
+  both, so no ordering question ever arose. The usage defect above has the same
+  shape - every fixture co-located usage with `finish_reason`. A corpus
+  assembled from one provider's chunking encodes that chunking as if it were
+  the protocol. The new test records the ORDER the two channels arrive in
+  rather than their contents, and is mutation-proven: restoring the 0.8.23
+  order turns it red with the intended diagnostic.
+
+
+- **A self-hosted model no longer resolves its credential by provider CLASS, so
+  one server's secret can no longer be sent to another server's endpoint.**
+  `self_hosted` classifies a private vLLM box and a hosted OpenAI-compatible
+  gateway identically, and credential selection keyed on that class alone: from
+  a workspace whose realm default binding was a different self-hosted server,
+  `rkat -m <model-on-another-server>` picked the workspace default, sent its key
+  to the model's endpoint, and surfaced the far end's `Unauthorized` - which
+  explains nothing about the fact that WE chose the wrong secret. Selection is
+  now constrained to the server that serves the model
+  (`meerkat_core::resolve_self_hosted_binding_for_server`), regardless of which
+  workspace the command runs from. A realm backend declares its endpoint with
+  `server = "<server_id>"`; a binding written before that field existed is
+  still identified by its `default_model`, and a lone unannotated self-hosted
+  binding still serves everything (the documented one-server setup is
+  unchanged). When the server cannot be identified honestly - no binding names
+  it, or several unannotated bindings are reachable - the build fails closed
+  with a typed error naming the server and every binding considered, instead of
+  guessing. An explicit `--auth-binding realm:binding` still wins, except when
+  that binding DECLARES a different server, which is a contradiction and fails
+  closed (this is what protects sessions that persisted the wrong binding
+  before the constraint existed).
+
+- **An ambiguous peer delivery no longer reaches a REST caller as a failed
+  send** (`meerkat-rest`, `meerkat-core`). `SendError::AmbiguousDelivery` -
+  which means the envelope may already be on the receiver's queue and a later
+  drain may still commit it - fell into the `send_failed` catch-all of
+  `normalize_rest_comms_send_error`. "Failed" is the one word that must not
+  reach this caller, because the action it invites is a retry and a retry can
+  duplicate work; a model-mediated caller reading the prose will retry on that
+  word alone. It now normalizes to a distinct `send_ambiguous` code carrying
+  `retry_safe: false`, `required_action: "reconcile"`, and the `envelope_id`
+  as the correlation evidence reconciliation needs.
+
+  `SendError::AmbiguousDelivery`'s own documentation now states the
+  precondition the recovery advice depends on: reconciliation only works if
+  the dedup key is COARSER than the retry. An adopter on this exact path was
+  safe because their key was `{schedule_id}:{YYYYMMDD}` - and it had been
+  per-attempt timestamped first, changed only after it bit them. A per-attempt
+  or timestamped key gives zero protection while looking exactly like
+  idempotency.
+
+- **`cargo test -p meerkat` reported success over zero tests** (`meerkat`). The
+  facade's feature-gated tests compiled away entirely in a package-scoped lane
+  because `session-store` is not a default feature there - 28 tests in
+  `src/persistence.rs` (including the pre-0.8.10 bridge tests that guard a
+  field-reported P0), another 28 behind `jsonl-store`, and 5 behind `comms`.
+  The failure mode was silence, not a red lane. CI was never affected, because
+  `cargo unit` is `--workspace` and rpc/rest/mcp-server/mob all enable
+  `session-store` on the facade, so feature unification built the files on -
+  which is exactly why it survived: the evidence was intact in the lane nobody
+  doubted and absent from the one a developer actually runs. The facade now
+  carries a path-only self dev-dependency (stripped at publish, same remedy
+  `meerkat-runtime` already used) enabling the full non-live set, so coverage
+  no longer depends on which sibling crates happen to share the build graph.
+
+- **A host that goes away now releases its members' participant routes**
+  (`meerkat-mob`). A member's route is held by its comms drain, which runs in
+  PersistentHost mode inside a detached task holding an owned `Arc`, so dropping
+  the host actor never brought the reference count to zero and the route was
+  never freed. Through 0.8.23 that leak was harmless: the in-process registry
+  admitted a same-key rebind over a still-published route
+  (`RegistrationOutcome::ReboundOwnName`), so a successor holding the same
+  durable identity simply took the name back. This release removes that arm
+  deliberately - see the `### Breaking` notes - which turns the leak into a
+  typed refusal: the orphaned route refuses the very host that replaces it, and
+  the successor has neither a handle to it nor any action that clears it.
+
+  Fail-closed against a LIVE incumbent is the rule working as intended.
+  Fail-closed against a corpse is not, so the release now happens on the
+  incumbent side, which is the rule's own first admitted evidence - the
+  incumbent released the name. Per-session disposal frees the route it
+  published, and host teardown frees every route the host still holds, mirroring
+  the supervisor bridge's shutdown-time release that the member path never had.
+  Retirement is generation-exact, so it can never remove a successor that has
+  since rebound the same key.
+
+  An operator who hits this on 0.8.23 sees "already has a live route" after a
+  restart and goes looking for a live incumbent that does not exist. If you have
+  read that message as a test-isolation problem, this is the other cause.
+
+- **`@rkat/web` did not handle the two new turn-accounting events.** The Web
+  SDK's compile-time exhaustiveness assertion over `AgentEvent` had no arms for
+  `turn_usage_accounting_unmeasured` or
+  `turn_usage_accounting_identity_disputed`, so the package failed to build
+  against its own generated types. Both are now rendered with the distinction
+  that matters: the unmeasured marker names the provider/model that went
+  unaccounted and must be SKIPPED rather than read as zero, while the disputed
+  marker shows the reported and active identities side by side, since the
+  counters do exist and neither side is ever rewritten to agree.
+
+### Known issues
+
+- **`delegate` with inherited tooling does not work for a host that registers
+  its own tools** (`meerkat-core`, `meerkat-tools`, `meerkat-mob-mcp`). NOT new
+  in this release, and documented here because two adopter fleets diagnosed it
+  during this train and the workaround is not discoverable from the error.
+
+  The tool-visibility witness is derived from one field:
+  `filter_witness_for_tool` builds `ToolVisibilityWitness` from
+  `ToolDef.provenance`, and `has_identity_witness()` is `is_some()`. Tools that
+  arrive through meerkat's own MCP client are stamped with provenance; tools
+  registered through the host SDK are not, because `ToolDef::new` creates a
+  `ToolDef` WITHOUT provenance. So a delegation that INHERITS parent tooling
+  cannot satisfy the witness for any host-registered tool, and the refusal names
+  the tool rather than the reason - a caller is told a tool is not inheritable
+  and cannot discover that the real answer is "this tool never carried the field
+  the check reads".
+
+  Measured on a live fleet: of 10 real `delegate` calls, the 5 that inherited
+  parent tooling (`{"mode":"inherit_parent"}`, `null`, or a `deny_overlay` over
+  inherit) all failed, and the 5 that declared a fresh inline profile all
+  succeeded - zero exceptions over three days. The 57 tools ever reported
+  missing a witness were an exact partition: every one was host-registered,
+  while `shell`, `peers`, `send_message`, `delegate`, `workgraph_create` and the
+  other builtins never appeared once. A host that proxies MCP in-process, or
+  simply registers its own tools - which is what the host SDK is for - therefore
+  sees a 100% failure rate on the inheriting path and will read it as an
+  intermittent fault.
+
+  WORKAROUND until this is fixed: declare an explicit tool profile on the
+  delegation instead of inheriting, e.g.
+  `{"mode":"profile","source":{"type":"inline","tools":{...}}}`. Do not stamp
+  provenance from the host: the platform contract puts that on the registry, and
+  a host-side stamp would be asserting an identity the host does not own.
+
+- **Every tool result body is carried TWICE in the event vocabulary**
+  (`meerkat-core`). `AgentEvent::ToolResultReceived` and
+  `AgentEvent::ToolExecutionCompleted` are both emitted for every tool call
+  and differ by exactly one field, `duration_ms`; both carry the full
+  `content` blocks. Any consumer that durably persists both therefore stores
+  every result body twice. Measured independently on two adopter fleets with
+  different storage engines: a console frame store (~348 MB against ~348 MB,
+  pairwise-identical maxima, from 153 camera-tool calls) and a warehouse
+  events table (89,033 rows / 3.35 GB against 88,934 rows / 1.69 GB). It is a
+  PER-CALL cost, not a scale problem - one tool returning a large blob is
+  enough.
+
+  Both events are legitimate and both should exist: one is the conversation
+  fact (this result entered the transcript), the other the execution fact (the
+  call finished, and here is how long it took). What is wrong is that the
+  execution fact's cost scales with the size of the result instead of with the
+  fact itself. This release documents it on both variants rather than
+  half-fixing it: `id` is present on both and is already the join key, so a
+  consumer persisting both should store the body once against `id`. Note that
+  capping bytes at a downstream writer does NOT fix this - it still writes the
+  body twice, only smaller, and every consumer has to reimplement the cap.
+  Removing `content` from the execution event is a wire break and is deferred
+  to the next release rather than rushed into this one.
+
+- **Streaming events carry no turn identity, so a durable consumer cannot
+  group a turn's frames** (`meerkat-core`). `AgentEvent::TextDelta` and
+  `AgentEvent::TextComplete` carry only their text. The agent emits bare
+  `AgentEvent`s, and the envelope - whose `source` is the only slot that could
+  carry identity - is attached downstream by a wrapper that does not know
+  which turn produced the frame. Identity therefore lives in delivery context,
+  which is exactly what a durable consumer does not keep.
+
+  What this costs in the field: an adopter could not run a coverage check
+  before pruning streamed deltas, because the correlation column was populated
+  on 747 of 532,190 delta rows (0.14%). Of the 15 turns that were correlatable,
+  2 had no terminal text frame at all - meaning for those turns the delta
+  stream was the only surviving record of what the agent said. They correctly
+  declined to prune. The fix is not an optional envelope field: populated from
+  the paths that already carry an interaction, it would be absent on exactly
+  the scheduled turns that need it, reproducing the same hole inside a wire
+  contract that asserts the field exists. It needs a turn identifier minted
+  unconditionally by the emitter, which is design work for the next release.
+
+### Corrected
+
+- **The 0.8.23 notes claimed `session_liveness` "needs a watchdog bridge that
+  is 0.8.24 work". That was wrong, and this release does not clear that key.**
+  `session_liveness` names the PRE-staging class - a live, open session parked
+  while machine-owned lane truth still holds selectable queued work that never
+  gets staged at all. The staged-run watchdog (and the new `session_run_start`
+  dimension built on its classification) observes the POST-staging window,
+  which opens at the durable `StageForRun` commit; it structurally cannot see
+  work that never reaches staging. The two are disjoint classes.
+  `unmeasured:session_liveness` therefore remains published, honestly, until a
+  lane-truth probe exists. Clearing it on the strength of the staged-run
+  census would have republished the one-reading-stands-for-the-whole-dimension
+  defect 0.8.23 existed to remove, from inside the item that cited it.
+
+### Changed
+
+- The `semver-breaks` release gate now checks that reported breaks are
+  declared, not merely that a `### Breaking` heading exists. It diffs the
+  cargo-semver-checks findings against the section body per finding, requires
+  the pending section to be stamped against the workspace version (notes left
+  under `## [Unreleased]` after the version bump are now a failure), and fails
+  closed when the tool run did not reach every publishable library crate. It
+  also prints the three published crates cargo-semver-checks cannot look at
+  (`meerkat-machine-derive`, `meerkat-machine-dsl`, `rkat`). The gate also
+  runs in the release workflow now (job `release_semver_gate`), gating
+  `publish_github_release`, `publish_registries`, and
+  `publish_unix_release_and_homebrew`; previously it only existed in
+  `make release-preflight`.
+
+- The release now STAMPS its own notes (`scripts/stamp-changelog-release.py`,
+  wired into `scripts/release-hook.sh`). The gate above requires the section a
+  release is declared in to name the version being released, and nothing
+  produced that - which made the requirement unsatisfiable by hand: stamping
+  before the bump is rejected as "declared against a different version", and
+  stamping after the tag publishes notes titled "Unreleased". The hook is the
+  only point where the stamp and the version bump are the same commit, so the
+  stamp is owned there. It leaves the empty `## [Unreleased]` stub the gate
+  expects, is idempotent across hook re-entry, and fails closed on missing
+  notes, a duplicate version, or a malformed date rather than inventing a
+  heading. Covered by `make semver-breaks-selftest`, which now asserts the
+  round trip - stamp, then judge the output with the gate's own checker.
+
+- Three `meerkat-mob` error enums gain a `ParticipantNameOccupied {
+  participant_name: String, holder_pubkey: meerkat_comms::PubKey }` variant.
+  NONE of the three is `#[non_exhaustive]`, so any downstream `match` without a
+  wildcard arm stops compiling:
+  - `meerkat_mob::MobError` (also `meerkat_mob::error::MobError`)
+  - `meerkat_mob::runtime::host_actor::MobHostActorError`
+  - `meerkat_mob::runtime::host_materialize::MaterializeServeError`
+- BEHAVIOUR-ONLY, NO TOOL WILL CATCH THIS: the three publish/construct sites
+  that previously flattened a comms name-occupancy refusal into a string now
+  return the typed variant instead, so the OLD MESSAGE TEXT IS GONE. Code that
+  matched prose must match the variant.
+  - `MobError::Internal("failed to publish prepared mob supervisor comms
+    runtime: ...")` (supervisor bridge publish)
+  - `MobHostActorError::Comms { detail: "failed to construct host comms runtime
+    '<name>': ..." }` (host comms runtime construction)
+  - `MaterializeServeError::Comms { detail: <CommsRuntimeError display> }`
+    (member materialize)
+
+  Only the name-occupancy case changes; every other comms failure still lands
+  on the same string variant it did before. The new message is remedy-first
+  ("retire the incumbent ... before publishing this name again") and explicitly
+  disclaims the crypto reading that the 0.8.23 wording invited.
+- NOT changed: `MaterializeServeError::wire_cause()` still projects the
+  name-occupancy case to `BridgeRejectionCause::Internal`, exactly as the
+  flattened `Comms` variant did. Remote bridge controllers see no wire change;
+  the typed fact is available to in-process embedders only. Minting a dedicated
+  `BridgeRejectionCause` is a `meerkat-contracts` change and was deliberately
+  left out of this item.
 
 ## [0.8.23] - 2026-08-16
 

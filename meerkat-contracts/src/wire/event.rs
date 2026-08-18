@@ -247,7 +247,7 @@ mod tests {
             sequence: 7,
             event: AgentEvent::TurnCompleted {
                 stop_reason: meerkat_core::StopReason::EndTurn,
-                usage: usage.clone(),
+                usage: Some(usage.clone()),
             },
             contract_version: ContractVersion::CURRENT,
         };
@@ -273,7 +273,7 @@ mod tests {
             AgentEvent::TurnCompleted {
                 usage: decoded_usage,
                 ..
-            } => assert_eq!(decoded_usage, usage),
+            } => assert_eq!(decoded_usage, Some(usage.clone())),
             other => panic!("expected turn_completed, got {other:?}"),
         }
 

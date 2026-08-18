@@ -88,6 +88,10 @@ const SUPERVISOR_RESPONSE_ROUTE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// The task runs until its idle timeout expires or the returned `JoinHandle`
 /// is aborted by the drain lifecycle authority. Lifecycle dismissal is a typed
 /// signal owned by that authority, never a peer message body.
+///
+/// The caller remains the lifetime owner of `comms_runtime`. The spawned task
+/// keeps only a weak reference and upgrades it for bounded active work, so an
+/// abandoned drain cannot pin the runtime's route or session identity claim.
 pub fn spawn_comms_drain(
     adapter: Arc<MeerkatMachine>,
     session_id: SessionId,
@@ -96,8 +100,13 @@ pub fn spawn_comms_drain(
 ) -> crate::tokio::task::JoinHandle<()> {
     let timeout_dur = idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT);
     let runtime_id = MeerkatMachine::logical_runtime_id(&session_id);
+    let comms_runtime_weak = Arc::downgrade(&comms_runtime);
 
     crate::tokio::spawn(async move {
+        let Some(comms_runtime) = comms_runtime_weak.upgrade() else {
+            tracing::debug!(%session_id, "comms drain host was gone before startup");
+            return;
+        };
         if std::env::var_os("RKAT_TRACE_COMMS_DRAIN_BIND").is_some() {
             tracing::info!(
                 %session_id,
@@ -136,8 +145,13 @@ pub fn spawn_comms_drain(
         // Bridge-command dispatch resolves binding-sensitive admission
         // through generated MeerkatMachine feedback before staging DSL
         // transitions; no shell-local mirror.
+        drop(comms_runtime);
 
         loop {
+            let Some(comms_runtime) = comms_runtime_weak.upgrade() else {
+                tracing::debug!(%session_id, "comms drain host is gone; exiting");
+                return;
+            };
             // Register the waiter BEFORE draining. `notify_waiters()` only wakes
             // waiters that are already registered, and a `Notified` future is not
             // registered until it is first polled — so we pin and `enable()` it
@@ -168,23 +182,7 @@ pub fn spawn_comms_drain(
                         error = %err,
                         "comms_drain: classified inbox drain failed; exiting via typed Failed terminal (not idle/dismiss)"
                     );
-                    if let Err(notify_err) = adapter
-                        .notify_comms_drain_exited(&session_id, DrainExitReason::Failed)
-                        .await
-                    {
-                        // Detached-task boundary: the typed control fault has
-                        // nowhere left to propagate; surface it explicitly and
-                        // run the projection safety net so slot mechanics
-                        // cannot silently diverge from the drain authority.
-                        tracing::error!(
-                            session_id = %session_id,
-                            error = %notify_err,
-                            "comms_drain: NotifyDrainExited(Failed) rejected by machine authority"
-                        );
-                        adapter
-                            .project_comms_drain_failed_safety_net(&session_id)
-                            .await;
-                    }
+                    notify_claim_mechanism_failure(&adapter, &session_id).await;
                     return;
                 }
             };
@@ -197,6 +195,14 @@ pub fn spawn_comms_drain(
                 // here only honors the idle-timeout terminal below. This branch
                 // is reached only on a genuinely empty (Ok) drain, never on a
                 // drain error.
+                //
+                // The detached drain is not a lifetime owner for the comms
+                // runtime. Release the iteration-scoped upgrade before the
+                // potentially unbounded idle wait so dropping the host's last
+                // owner runs the concrete runtime's `Drop` implementation and
+                // unregisters its route. A later wake upgrades again at the top
+                // of the loop; if the host is gone, the drain exits.
+                drop(comms_runtime);
                 if crate::tokio::time::timeout(timeout_dur, notified.as_mut())
                     .await
                     .is_err()
@@ -827,6 +833,22 @@ fn commit_non_runtime_claim(claim: RoutedPeerIngressClaim, handled_as: &'static 
     }
 }
 
+/// Publish the typed `Failed` exit for this drain, then ask the machine to
+/// re-arm it.
+///
+/// A peer-ingress mechanism error used to be a PERMANENT drain death: the
+/// claim was dropped (releasing the item back to the queue head), the queue
+/// stayed open, respawn was caller-driven, and nothing polled. Every later peer
+/// message for this session was then admitted and never drained. The machine
+/// already models the recovery - `NotifyDrainExited { Failed }` on a persistent
+/// host drain lands in `DrainPhase::ExitedRespawnable` and the slot deliberately
+/// RETAINS the peer-ingress runtime - it simply had no consumer.
+///
+/// ORDERING IS LOAD-BEARING: `notify_comms_drain_exited` must run to completion
+/// before the re-arm. Both descend through machine commands that take the same
+/// non-reentrant per-session mutation gate, so folding the re-arm inside the
+/// exit notification (or into `notify_comms_drain_exited_inner`) would wedge
+/// the session instead of recovering it.
 async fn notify_claim_mechanism_failure(adapter: &Arc<MeerkatMachine>, session_id: &SessionId) {
     if let Err(error) = adapter
         .notify_comms_drain_exited(session_id, DrainExitReason::Failed)
@@ -840,6 +862,45 @@ async fn notify_claim_mechanism_failure(adapter: &Arc<MeerkatMachine>, session_i
         adapter
             .project_comms_drain_failed_safety_net(session_id)
             .await;
+    }
+    rearm_drain_after_mechanism_failure(adapter, session_id).await;
+}
+
+/// Backoff between a mechanism-error exit and the re-arm attempt.
+///
+/// The failing head item is released back to the queue head, so a
+/// deterministically failing item would otherwise respawn the drain in a tight
+/// loop. This rate-limits that loop. It is NOT a give-up policy: whether the
+/// drain may respawn at all is the machine's `drain_phase`, and inventing a
+/// shell-side attempt counter here would put that classification in a second
+/// place.
+#[cfg(not(test))]
+const DRAIN_REARM_BACKOFF: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const DRAIN_REARM_BACKOFF: Duration = Duration::from_millis(20);
+
+async fn rearm_drain_after_mechanism_failure(
+    adapter: &Arc<MeerkatMachine>,
+    session_id: &SessionId,
+) {
+    crate::tokio::time::sleep(DRAIN_REARM_BACKOFF).await;
+    match adapter
+        .rearm_comms_drain_after_failed_exit(session_id)
+        .await
+    {
+        Ok(true) => tracing::warn!(
+            %session_id,
+            "comms_drain: re-armed peer ingress drain after a mechanism-error exit"
+        ),
+        Ok(false) => tracing::warn!(
+            %session_id,
+            "comms_drain: mechanism-error exit is not respawnable per drain authority; peer ingress stays stopped"
+        ),
+        Err(error) => tracing::error!(
+            %session_id,
+            %error,
+            "comms_drain: re-arm after mechanism-error exit was refused"
+        ),
     }
 }
 
@@ -2929,7 +2990,7 @@ async fn start_supervisor_rotation_worker_if_pending(
     let operation_id = receipt.operation_id.clone();
     let worker_adapter = Arc::clone(adapter);
     let worker_session_id = session_id.clone();
-    let worker_runtime = Arc::clone(comms_runtime);
+    let worker_runtime_weak = Arc::downgrade(comms_runtime);
     let slot_runtime = Arc::clone(comms_runtime);
     let task_operation_id = operation_id.clone();
     let (start_tx, start_rx) = crate::tokio::sync::oneshot::channel::<()>();
@@ -2939,6 +3000,14 @@ async fn start_supervisor_rotation_worker_if_pending(
         }
         let mut retry_delay = std::time::Duration::from_millis(25);
         loop {
+            let Some(worker_runtime) = worker_runtime_weak.upgrade() else {
+                tracing::debug!(
+                    session_id = %worker_session_id,
+                    operation_id = %task_operation_id,
+                    "supervisor rotation worker host is gone; exiting"
+                );
+                return;
+            };
             match worker_adapter
                 .peer_ingress_runtime_is_current(&worker_session_id, &worker_runtime)
                 .await
@@ -3027,6 +3096,7 @@ async fn start_supervisor_rotation_worker_if_pending(
                         ?retry_delay,
                         "supervisor rotation remains pending; session-owned worker will retry"
                     );
+                    drop(worker_runtime);
                     crate::tokio::time::sleep(retry_delay).await;
                     retry_delay = std::cmp::min(
                         retry_delay.saturating_mul(2),
@@ -8380,6 +8450,7 @@ mod tests {
     struct ClassifiedDrainOutcomeRuntime {
         notify: Arc<tokio::sync::Notify>,
         fail_classified_drain: bool,
+        claim_attempts: std::sync::atomic::AtomicUsize,
     }
 
     impl ClassifiedDrainOutcomeRuntime {
@@ -8387,7 +8458,13 @@ mod tests {
             Self {
                 notify: Arc::new(tokio::sync::Notify::new()),
                 fail_classified_drain,
+                claim_attempts: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        fn claim_attempts(&self) -> usize {
+            self.claim_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -8497,6 +8574,8 @@ mod tests {
             &self,
         ) -> Result<Option<PeerIngressQueueClaim>, meerkat_core::agent::CommsCapabilityError>
         {
+            self.claim_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fail_classified_drain {
                 Err(meerkat_core::agent::CommsCapabilityError::Unsupported(
                     "synthetic classification fault".to_string(),
@@ -8590,6 +8669,68 @@ mod tests {
                 .is_err(),
             "an empty (Ok) inbox must idle, not exit promptly"
         );
+    }
+
+    #[tokio::test]
+    async fn idle_drain_wake_exits_when_the_host_runtime_is_gone() {
+        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+
+        let runtime = Arc::new(ClassifiedDrainOutcomeRuntime::new(false));
+        let notify = Arc::clone(&runtime.notify);
+        let weak_runtime = Arc::downgrade(&runtime);
+        let drain =
+            spawn_authorized_test_comms_drain(adapter, session_id, runtime.clone(), Duration::MAX)
+                .await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime.claim_attempts() > 0 && Arc::strong_count(&runtime) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the drain must reach its idle wait without owning the runtime");
+
+        drop(runtime);
+        assert!(
+            weak_runtime.upgrade().is_none(),
+            "dropping the host owner must destroy the runtime while the drain idles"
+        );
+
+        notify.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .expect("an idle drain must exit promptly when its host is gone")
+            .expect("the host-gone drain exit must not panic");
+    }
+
+    #[tokio::test]
+    async fn pending_completion_bridge_does_not_own_the_host_runtime() {
+        let runtime: Arc<dyn CommsRuntime> = Arc::new(ClassifiedDrainOutcomeRuntime::new(false));
+        let weak_runtime = Arc::downgrade(&runtime);
+        let mut pending_completion = crate::completion::CompletionHandle::pending_for_test();
+
+        spawn_completion_bridge(
+            Some(runtime.clone()),
+            InteractionId(Uuid::new_v4()),
+            None,
+            Some(pending_completion.take_handle()),
+        );
+
+        drop(runtime);
+        assert!(
+            weak_runtime.upgrade().is_none(),
+            "a detached completion bridge must not pin the host comms runtime while completion is pending"
+        );
+
+        drop(pending_completion);
     }
 
     #[tokio::test]
@@ -16691,6 +16832,7 @@ fn spawn_completion_bridge(
     subscriber: Option<mpsc::Sender<AgentEvent>>,
     handle: Option<crate::completion::CompletionHandle>,
 ) {
+    let comms_runtime = comms_runtime.map(|runtime| Arc::downgrade(&runtime));
     crate::tokio::spawn(async move {
         let delivered_terminal = if let Some(handle) = handle {
             match handle.try_wait().await {
@@ -16744,7 +16886,9 @@ fn spawn_completion_bridge(
             false
         };
 
-        if !delivered_terminal && let Some(runtime) = comms_runtime {
+        if !delivered_terminal
+            && let Some(runtime) = comms_runtime.and_then(|runtime| runtime.upgrade())
+        {
             runtime.abandon_interaction_stream(
                 &interaction_id,
                 meerkat_core::InteractionStreamAbandonReason::TerminalDeliveryFailed,

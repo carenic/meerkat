@@ -1294,7 +1294,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum(
                 "SessionRegistrationRejectReasonKind",
-                &["RuntimeEpochConflict"],
+                &["RuntimeEpochConflict", "UnregisterTeardownInProgress"],
             ),
             NamedTypeBinding::string_enum(
                 "OperationPublicResultClass",
@@ -2218,6 +2218,18 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 &["Retain", "Discard"],
             ),
             NamedTypeBinding::string_enum(
+                "RecoveredTerminalCompletionDisposition",
+                &["Recover", "DiscardUnrecoverable", "Blocked"],
+            ),
+            NamedTypeBinding::string_enum(
+                "RecoveredTerminalCompletionUnrecoverableReasonKind",
+                &[
+                    "UncorrelatableRun",
+                    "OwnerCandidatePayloadLost",
+                    "DirectedPublicationUnresolved",
+                ],
+            ),
+            NamedTypeBinding::string_enum(
                 "RecoveredRunApplyBoundary",
                 &["RunStart", "RunCheckpoint", "Immediate"],
             ),
@@ -2432,6 +2444,14 @@ runtime_internal_inputs!(
         ObserveSupervisorRotation,
         ResolveSupervisorCleanupCommandAdmission,
         AuthorizeDurableTailRecovery,
+        // Recovered-terminal-completion disposition. Dispatched by the runtime
+        // itself from meerkat_machine/driver.rs during durable-tail recovery -
+        // there is no caller-facing command for either, which is exactly what
+        // this list is for. Declared here rather than given command variants
+        // because a caller cannot ask for them: they exist only while the
+        // runtime is reconciling a recovered batch against durable truth.
+        ClassifyRecoveredTerminalCompletionBatch,
+        DeclareRecoveredTerminalCompletionUnrecoverable,
         BeginUnregisterSession,
         BeginUnregisterUnservedAttachment,
         BindSupervisor,

@@ -5,8 +5,9 @@ use std::sync::Arc;
 use meerkat_core::SessionId;
 use meerkat_jobs::{
     AttemptClaim, AttemptWriteAuthority, CanonicalArgumentsHash, DetachedJobService,
-    ExecutionIntentId, InteractionLineageId, JobResultRef, JobSpec, JobSubmissionKey,
-    MemoryDetachedJobStore, RestartClass, RunnerHandleRef, RunnerIdentity, ToolIdentity, WorkerId,
+    ExecutionIntentId, InteractionLineageId, JobHealthCoverage, JobHealthReading, JobResultRef,
+    JobSpec, JobSubmissionKey, MemoryDetachedJobStore, RestartClass, RunnerHandleRef,
+    RunnerIdentity, ToolIdentity, WorkerId,
 };
 
 fn spec(session_id: SessionId) -> JobSpec {
@@ -96,8 +97,9 @@ async fn health_keeps_live_work_healthy_and_degrades_only_fault_conditions() {
     assert_eq!(live.queued, 1);
     assert_eq!(live.running, 1);
     assert_eq!(live.stale_leases, 0);
-    assert_eq!(live.delivery_backlog, 0);
-    assert!(!live.is_degraded());
+    assert_eq!(live.pending_outbox_jobs, 0);
+    assert_eq!(live.coverage, JobHealthCoverage::Complete);
+    assert_eq!(live.reading(), JobHealthReading::Ok);
 
     service
         .complete_attempt(
@@ -114,8 +116,8 @@ async fn health_keeps_live_work_healthy_and_degrades_only_fault_conditions() {
     let backlog = service.health_snapshot(101, 100).await.unwrap();
     assert_eq!(backlog.queued, 1);
     assert_eq!(backlog.running, 0);
-    assert_eq!(backlog.delivery_backlog, 1);
-    assert!(backlog.is_degraded());
+    assert_eq!(backlog.pending_outbox_jobs, 1);
+    assert_eq!(backlog.reading(), JobHealthReading::Degraded);
 
     assert_eq!(queued.phase, meerkat_jobs::JobPhase::Queued);
 }
@@ -143,7 +145,7 @@ async fn health_detects_expired_lease_without_mutating_attempt_authority() {
     let after = service.get(&receipt.job_id).await.unwrap().unwrap();
 
     assert_eq!(health.stale_leases, 1);
-    assert!(health.is_degraded());
+    assert_eq!(health.reading(), JobHealthReading::Degraded);
     assert_eq!(after.current_attempt_id, Some(claim.attempt_id));
     assert_eq!(after.current_fence, claim.fence);
     assert_eq!(after.lease_expires_at_ms, before.lease_expires_at_ms);

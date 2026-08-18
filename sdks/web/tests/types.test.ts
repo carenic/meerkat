@@ -387,7 +387,11 @@ function handleEvent(event: AgentEvent): string {
     case 'turn_started':
       return `turn ${event.turn_number}`;
     case 'turn_completed':
-      return `${event.stop_reason} ${event.usage.input_tokens}+${event.usage.output_tokens}`;
+      // `usage` is absent when the provider accounted for nothing; an
+      // unaccounted turn is still a completed turn.
+      return event.usage
+        ? `${event.stop_reason} ${event.usage.input_tokens}+${event.usage.output_tokens}`
+        : `${event.stop_reason} unmeasured`;
     case 'run_completed':
       return event.result;
     case 'run_failed':
@@ -453,6 +457,18 @@ function handleEvent(event: AgentEvent): string {
       return `${event.type}:${event.retained}:${event.discarded
         .map((discard) => `${discard.origin}/${discard.identity?.model ?? 'unnamed'}`)
         .join(',')}`;
+    case 'turn_usage_accounting_unmeasured':
+      // No accounting exists for this turn: no counter advanced and no
+      // per-call row should be reconciled for it. A host must SKIP the row,
+      // never render it as zero - zero is a measurement, this is its absence.
+      // Which provider/model went unaccounted is the whole payload.
+      return `${event.type}:${event.unmeasured.provider}/${event.unmeasured.model}`;
+    case 'turn_usage_accounting_identity_disputed':
+      // Unlike the unmeasured marker the counters DO exist and the token axis
+      // advances on them; what is disputed is attribution. Both sides are
+      // published exactly as minted and neither is ever rewritten to agree,
+      // so a renderer must show both rather than picking a winner.
+      return `${event.type}:${event.dispute.reported_provider}/${event.dispute.reported_model} vs ${event.dispute.active_provider}/${event.dispute.active_model}`;
     default: {
       const _exhaustive: never = event;
       return _exhaustive;

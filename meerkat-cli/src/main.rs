@@ -17,6 +17,7 @@ mod mcp;
     feature = "rpc-surface"
 ))]
 mod mob_host;
+mod shutdown_signal;
 #[cfg(feature = "comms")]
 mod stdin_events;
 mod storage_migrate;
@@ -5946,6 +5947,7 @@ fn ensure_cli_interactive_oauth_config(provider: LoginProvider, config: &mut Con
                 backend_kind: provider.backend_kind().to_string(),
                 base_url: provider.backend_base_url().map(str::to_string),
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         changed = true;
@@ -7424,39 +7426,19 @@ fn doctor_resolver_environment() -> meerkat_providers::ResolverEnvironment {
     env
 }
 
+/// Resolve the binding that authenticates THIS self-hosted server.
+///
+/// `doctor` probes each configured server in turn, so resolving by provider
+/// class would send one server's secret to every server's endpoint and report
+/// the far end's `401` as that server's health - the exact confusion this
+/// diagnostic exists to dispel.
 fn doctor_configured_self_hosted_target(
     config: &Config,
     preferred_realm: &meerkat_core::RealmId,
-) -> anyhow::Result<Option<meerkat_core::ResolvedConnectionTarget>> {
-    if config.realm.contains_key(preferred_realm.as_str()) {
-        let target = meerkat_core::resolve_realm_binding_target_for_provider(
-            config,
-            meerkat_core::Provider::SelfHosted,
-            Some(preferred_realm),
-            None,
-            None,
-            None,
-            false,
-        )
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "selected realm '{}' self_hosted credential binding is unavailable: {err}",
-                preferred_realm.as_str()
-            )
-        })?;
-        return Ok(Some(target));
-    }
-
-    match meerkat_core::resolve_auth_binding_or_default_for_provider(
-        config,
-        meerkat_core::Provider::SelfHosted,
-        None,
-        Some(preferred_realm),
-        false,
-    ) {
-        Ok(target) => Ok(Some(target)),
-        Err(_) => Ok(None),
-    }
+    server_id: &str,
+) -> anyhow::Result<meerkat_core::ResolvedConnectionTarget> {
+    meerkat_core::resolve_self_hosted_binding_for_server(config, server_id, Some(preferred_realm))
+        .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
 async fn resolve_doctor_self_hosted_probe_connection(
@@ -7465,12 +7447,7 @@ async fn resolve_doctor_self_hosted_probe_connection(
     server_id: &str,
     server: &meerkat_core::SelfHostedServerConfig,
 ) -> anyhow::Result<DoctorSelfHostedProbeConnection> {
-    let Some(target) = doctor_configured_self_hosted_target(config, preferred_realm)? else {
-        anyhow::bail!(
-            "self-hosted server '{server_id}' has no realm auth binding for provider self_hosted; \
-             configure a realm auth profile + binding (auth_binding) for this server"
-        );
-    };
+    let target = doctor_configured_self_hosted_target(config, preferred_realm, server_id)?;
     let (realm, auth_binding) = (target.realm, target.auth_binding);
 
     let connection = doctor_self_hosted_registry()
@@ -11255,7 +11232,7 @@ async fn run_agent(
             );
             // Block until SIGINT/SIGTERM. The runtime loop, comms drain, and
             // detached wake tasks continue running in background tokio tasks.
-            mob_host::wait_for_shutdown_signal().await?;
+            shutdown_signal::wait_for_shutdown_signal().await?;
             eprintln!("\nShutting down...");
         }
 
@@ -11947,7 +11924,7 @@ async fn resume_session_with_llm_override(
             eprintln!(
                 "Keep-alive: resume turn complete, waiting for events (Ctrl+C or SIGTERM to exit)..."
             );
-            mob_host::wait_for_shutdown_signal().await?;
+            shutdown_signal::wait_for_shutdown_signal().await?;
             eprintln!("\nShutting down...");
         }
 
@@ -14998,6 +14975,11 @@ mod mob_typed_exit_tests {
 #[cfg(feature = "mob")]
 const PACK_RUN_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Optional usage enrichment must not hold a reached Flow terminal or process
+/// shutdown hostage to a member whose status projection is still blocked.
+#[cfg(feature = "mob")]
+const MOB_RUN_ACCOUNTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Which future finished first while a foreground pack flow run waited for
 /// its terminal state.
 #[cfg(feature = "mob")]
@@ -15046,7 +15028,7 @@ async fn run_pack_flow_foreground(
         .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
     match select_pack_flow_terminal_or_shutdown(
         wait_for_terminal_flow_run(state, mob_id.as_str(), &run_id),
-        mob_host::wait_for_shutdown_signal(),
+        shutdown_signal::wait_for_shutdown_signal(),
     )
     .await
     {
@@ -15131,6 +15113,18 @@ mod pack_run_shutdown_seam_tests {
                 panic!("terminal-first run must not report a shutdown signal")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn reached_terminal_is_not_held_by_stalled_optional_accounting() {
+        let accounting = collect_mob_run_accounting_with_timeout(
+            std::time::Duration::from_millis(1),
+            std::future::pending::<
+                Result<meerkat_contracts::WireMobRunAccounting, meerkat_mob::MobError>,
+            >(),
+        )
+        .await;
+        assert!(accounting.is_none());
     }
 }
 
@@ -15258,13 +15252,34 @@ async fn collect_mob_run_accounting(
     state: &meerkat_mob_mcp::MobMcpState,
     mob_id: &str,
 ) -> Option<meerkat_contracts::WireMobRunAccounting> {
-    match state
-        .mob_run_accounting(&meerkat_mob::MobId::from(mob_id.to_string()))
-        .await
-    {
-        Ok(accounting) => Some(accounting),
-        Err(error) => {
+    collect_mob_run_accounting_with_timeout(
+        MOB_RUN_ACCOUNTING_TIMEOUT,
+        state.mob_run_accounting(&meerkat_mob::MobId::from(mob_id.to_string())),
+    )
+    .await
+}
+
+#[cfg(feature = "mob")]
+async fn collect_mob_run_accounting_with_timeout<F>(
+    timeout: std::time::Duration,
+    accounting: F,
+) -> Option<meerkat_contracts::WireMobRunAccounting>
+where
+    F: std::future::Future<
+            Output = Result<meerkat_contracts::WireMobRunAccounting, meerkat_mob::MobError>,
+        >,
+{
+    match tokio::time::timeout(timeout, accounting).await {
+        Ok(Ok(accounting)) => Some(accounting),
+        Ok(Err(error)) => {
             eprintln!("warning\tmob run accounting unavailable: {error}");
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "warning\tmob run accounting unavailable: projection exceeded {}s",
+                timeout.as_secs_f64()
+            );
             None
         }
     }
@@ -15624,21 +15639,18 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
     } = &command
         && std::path::Path::new(target).exists()
     {
+        let invocation = OwnedMobRunPackInvocation {
+            pack: PathBuf::from(target),
+            flow: flow.clone(),
+            prompt: prompt.clone(),
+            raw_params: params.clone(),
+            detach: *detach,
+            json: *json,
+            cli_trust_policy: *trust_policy,
+        };
         println!(
             "{}",
-            Box::pin(execute_mob_run_pack(
-                scope,
-                MobRunPackInvocation {
-                    pack: std::path::Path::new(target),
-                    flow: flow.as_deref(),
-                    prompt: prompt.as_deref(),
-                    raw_params: params,
-                    detach: *detach,
-                    json: *json,
-                    cli_trust_policy: *trust_policy,
-                },
-            ))
-            .await?
+            execute_mob_run_pack_with_stack_relief(scope.clone(), invocation).await?
         );
         return Ok(());
     }
@@ -16706,6 +16718,49 @@ struct MobRunPackInvocation<'a> {
     detach: bool,
     json: bool,
     cli_trust_policy: Option<TrustPolicyArg>,
+}
+
+#[cfg(feature = "mob")]
+struct OwnedMobRunPackInvocation {
+    pack: PathBuf,
+    flow: Option<String>,
+    prompt: Option<String>,
+    raw_params: Vec<String>,
+    detach: bool,
+    json: bool,
+    cli_trust_policy: Option<TrustPolicyArg>,
+}
+
+/// Materialize the large mobpack run future at the top of a fresh Tokio task
+/// instead of below the CLI main command-dispatch poll chain. In debug builds,
+/// the inline chain exceeds the process main-thread stack even though the
+/// command itself fits the runtime's 2 MiB worker-stack contract.
+///
+/// The fresh task weakens synchronous drop cancellation, but this command's
+/// effects are durable, machine-fenced, and idempotent. Its foreground flow
+/// path also owns the SIGINT/SIGTERM race and durable cancellation convergence,
+/// so process shutdown still reaches the same typed terminalization path.
+#[cfg(feature = "mob")]
+async fn execute_mob_run_pack_with_stack_relief(
+    scope: RuntimeScope,
+    invocation: OwnedMobRunPackInvocation,
+) -> anyhow::Result<String> {
+    meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
+        execute_mob_run_pack(
+            &scope,
+            MobRunPackInvocation {
+                pack: &invocation.pack,
+                flow: invocation.flow.as_deref(),
+                prompt: invocation.prompt.as_deref(),
+                raw_params: &invocation.raw_params,
+                detach: invocation.detach,
+                json: invocation.json,
+                cli_trust_policy: invocation.cli_trust_policy,
+            },
+        )
+        .await
+    })
+    .await
 }
 
 #[cfg(feature = "mob")]
@@ -18024,6 +18079,48 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mob")]
+    #[test]
+    fn mobpack_run_stack_relief_moves_work_off_compact_caller_within_worker_contract() {
+        const CALLER_STACK_BUDGET: usize = 1024 * 1024;
+        const WORKER_STACK_BUDGET: usize = 2 * 1024 * 1024;
+
+        let caller = std::thread::Builder::new()
+            .name("mobpack-run-compact-caller".to_string())
+            .stack_size(CALLER_STACK_BUDGET)
+            .spawn(|| {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let scope = test_scope(temp.path().to_path_buf(), "mobpack-stack-budget");
+                let invocation = OwnedMobRunPackInvocation {
+                    pack: temp.path().join("missing.mobpack"),
+                    flow: Some("main".to_string()),
+                    prompt: Some("stack budget probe".to_string()),
+                    raw_params: Vec::new(),
+                    detach: false,
+                    json: true,
+                    cli_trust_policy: Some(TrustPolicyArg::Permissive),
+                };
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_stack_size(WORKER_STACK_BUDGET)
+                    .enable_all()
+                    .build()
+                    .expect("compact-stack test runtime");
+                let error = runtime
+                    .block_on(execute_mob_run_pack_with_stack_relief(scope, invocation))
+                    .expect_err("missing mobpack must fail");
+                assert!(
+                    error.to_string().contains("failed reading pack"),
+                    "typed missing-pack error should escape the relieved future: {error}"
+                );
+            })
+            .expect("compact-stack caller should start");
+
+        caller
+            .join()
+            .expect("mobpack run future must move off the compact caller and fit the two MiB worker contract");
+    }
+
     #[test]
     fn fresh_run_storage_fallback_is_workspace_only_and_forces_durable_sqlite() {
         let state_root = tempfile::tempdir().expect("tempdir");
@@ -18079,6 +18176,7 @@ mod tests {
                 backend_kind: "openai_api".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -18616,6 +18714,7 @@ mod tests {
                 backend_kind: "chatgpt_backend".into(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -26141,6 +26240,20 @@ default_model = "gpt-5.4"
             }),
         )
         .await;
+
+        // Dropping an in-process MobMcpState is not a process crash: the mob
+        // actor intentionally owns its command channel and supervisor bridge.
+        // Stop only the volatile actor tasks through the established crash
+        // seam so this same-process harness models the process boundary while
+        // preserving the durable work that the rebuilt context must recover.
+        ctx_a
+            .state
+            .handle_for(&meerkat_mob::MobId::from(mob_id.clone()))
+            .await
+            .expect("created mob handle should be registered")
+            .crash_stop_preserving_durable_work_for_test()
+            .await
+            .expect("first mob actor should crash-stop before context rebuild");
         drop(dispatcher_a);
         drop(ctx_a);
 
@@ -26620,6 +26733,7 @@ supports_reasoning = true
                 backend_kind: "google_code_assist".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(
@@ -26677,6 +26791,7 @@ supports_reasoning = true
                 backend_kind: "google_code_assist".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(

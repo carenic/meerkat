@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${RUNFILES_DIR:-}" && -d "${RUNFILES_DIR}/_main" ]]; then
+  workspace_root="${RUNFILES_DIR}/_main"
+else
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  workspace_root="$(cd -- "${script_dir}/.." && pwd)"
+fi
+
+required=(
+  "Cargo.toml"
+  "third-party/oai-rt-rs/Cargo.toml"
+  "third-party/oai-rt-rs/src/lib.rs"
+)
+
+for path in "${required[@]}"; do
+  if [[ ! -f "${workspace_root}/${path}" ]]; then
+    echo "error: Bazel workspace runfiles omit Cargo path-patch input ${path}" >&2
+    exit 1
+  fi
+done
+
+if ! grep -Fq 'oai-rt-rs = { path = "third-party/oai-rt-rs" }' "${workspace_root}/Cargo.toml"; then
+  echo "error: test fixture no longer describes the oai-rt-rs Cargo path patch" >&2
+  exit 1
+fi
+
+echo "Bazel workspace runfiles contain the oai-rt-rs Cargo path patch"

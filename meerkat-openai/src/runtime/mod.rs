@@ -720,6 +720,7 @@ mod tests {
             backend_kind: kind.into(),
             base_url: None,
             options: serde_json::Value::Null,
+            server: None,
         }
     }
 

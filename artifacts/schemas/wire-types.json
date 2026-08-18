@@ -797,7 +797,7 @@
             "type": "object"
           },
           {
-            "description": "Tool result received (injected into conversation)",
+            "description": "Tool result received (injected into conversation).\n\nThe conversation-level fact for a tool call: this result entered the\ntranscript. [`AgentEvent::ToolExecutionCompleted`] is the paired\nexecution-level fact for the same `id` and currently carries a full\ncopy of these same blocks - see that variant before persisting both, or\na durable consumer stores every result body twice.",
             "properties": {
               "content": {
                 "items": {
@@ -829,7 +829,7 @@
             "type": "object"
           },
           {
-            "description": "Turn completed",
+            "description": "Turn completed.\n\n# Why `usage` is optional\n\nThis event states one semantic fact - a model turn reached its terminal\nand its assistant message is committed - and carries one accounting\nfact beside it. The two have different owners and different failure\nmodes: a provider stream that ends without ever sending a usage event\nhas said nothing about tokens while having said everything about the\nanswer. Absence is therefore representable here, because the only\nalternatives are to fabricate counters no provider issued or to\nsuppress the completion of a turn the caller has already read.\n\n`usage: None` means exactly \"no accounting exists for this turn\": no\ncounter advanced, and no per-call row should be reconciled for it. The\npaired [`AgentEvent::TurnUsageAccountingUnmeasured`] carries the\nexplanation (which provider and model went unaccounted); this field\nowns only the number's presence or absence. Consumers must skip an\nabsent row, never treat it as zero.",
             "properties": {
               "stop_reason": {
                 "$ref": "#/$defs/StopReason"
@@ -839,13 +839,19 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/$defs/TurnUsage"
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TurnUsage"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
               "type",
-              "stop_reason",
-              "usage"
+              "stop_reason"
             ],
             "type": "object"
           },
@@ -871,10 +877,10 @@
             "type": "object"
           },
           {
-            "description": "Tool execution completed",
+            "description": "Tool execution completed.\n\n# This carries a SECOND COPY of the result body\n\nThis event and [`AgentEvent::ToolResultReceived`] are both emitted for\nevery tool call, and they differ by exactly one field: `duration_ms`.\nBoth carry the full `content` blocks. The two facts are genuinely\ndistinct and both deserve to exist - `ToolResultReceived` is the\nCONVERSATION fact (this result was injected into the transcript),\nthis is the EXECUTION fact (the call finished, and here is how long it\ntook) - but the cost of the execution fact currently scales with the\nsize of the result rather than with the fact itself.\n\nA consumer that durably persists BOTH events therefore stores every\ntool result body twice. This is not hypothetical: it was measured\nindependently on two adopter fleets with different storage engines and\ndifferent payload shapes - a console frame store (~348 MB against\n~348 MB, pairwise-identical maxima, from 153 camera-tool calls) and a\nwarehouse events table (89,033 rows / 3.35 GB against 88,934 rows /\n1.69 GB). Neither had configured it; both inherited it from this\nvocabulary. Note it is a PER-CALL cost, not a scale problem: one tool\nreturning a large blob is enough.\n\n`id` is present on both events and is already the join key. A consumer\npersisting both should store the body once against `id` and join for\nthe execution fact, rather than capping bytes at its own writer - a cap\napplied downstream still writes the body twice, only smaller, and every\nconsumer would have to reimplement it.",
             "properties": {
               "content": {
-                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.",
+                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.\n\nDuplicates the blocks [`AgentEvent::ToolResultReceived`] carries\nfor the same `id`; see this variant's docs before persisting both.",
                 "items": {
                   "$ref": "#/$defs/ContentBlock"
                 },
@@ -1390,6 +1396,48 @@
             "required": [
               "type",
               "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's provider token accounting was absent.\n\nThe routed form of the `unmeasured:turn_usage_accounting` marker. It\nstates exactly one thing: the provider stream for this turn carried no\nnormalized accounting, so no accounting axis advanced for it - no\nbudget charge, no session usage, no presented-token update.\n\nIt deliberately does NOT claim the turn completed. This is published at\nthe model boundary, before the boundary effects and terminal hooks that\ncan still fail the turn on their own (unrelated) grounds, and the\nabsence of accounting is true either way. Whether the turn completed is\nowned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the\nturns this marker names - and a turn that fails afterwards publishes\nits own terminal fact.\n\nWhat this is not is a cause of failure. A number nobody has cannot\ninvalidate an answer the user has already read; see\n[`crate::UnmeasuredTurnUsageAccounting`].",
+            "properties": {
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_unmeasured",
+                "type": "string"
+              },
+              "unmeasured": {
+                "$ref": "#/$defs/UnmeasuredTurnUsageAccounting"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "unmeasured"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's accounting named a provider/model other than the\nrequest it answered.\n\nThe routed form of the `disputed:turn_usage_accounting_identity`\nmarker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the\ncounters exist and are internally consistent, so the token axis still\nadvances on them; what is in dispute is attribution. The reported\nidentity is published exactly as the adapter minted it and is never\nrewritten to the active identity.",
+            "properties": {
+              "dispute": {
+                "$ref": "#/$defs/DisputedTurnUsageAccountingIdentity"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_identity_disputed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "dispute"
             ],
             "type": "object"
           }
@@ -2118,6 +2166,35 @@
           "provider",
           "model",
           "boundary"
+        ],
+        "type": "object"
+      },
+      "DisputedTurnUsageAccountingIdentity": {
+        "additionalProperties": false,
+        "description": "One turn's provider-authored accounting named a different provider/model\nthan the request it answered.\n\n# Why this is not the same fault as absent accounting\n\nA mismatched identity still arrives with a complete, internally consistent\nmeasurement: the [`PresentedTokenConvention`] travels with the number, so\nthe counters mean what they say regardless of which name is attached. The\ndisputed fact is attribution alone, so the token axis still advances on the\nnumber the provider actually sent. Absent accounting has no number at all\nand therefore cannot advance anything. Collapsing the two would either kill\ncorrect work over a name or fabricate counters over silence.\n\n# Why the reported identity is preserved verbatim\n\nRewriting `reported_*` to the active identity would publish an agreement\nthat was never observed - a guess laundered as evidence. Both sides are\ncarried so a host can see exactly who disagreed with whom.",
+        "properties": {
+          "active_model": {
+            "description": "Model of the request this turn was lowered for.",
+            "type": "string"
+          },
+          "active_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request this turn was lowered for."
+          },
+          "reported_model": {
+            "description": "Model the accounting claims, exactly as the adapter minted it.",
+            "type": "string"
+          },
+          "reported_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider the accounting claims, exactly as the adapter minted it."
+          }
+        },
+        "required": [
+          "active_provider",
+          "active_model",
+          "reported_provider",
+          "reported_model"
         ],
         "type": "object"
       },
@@ -3928,6 +4005,25 @@
           "input_tokens",
           "output_tokens",
           "accounting"
+        ],
+        "type": "object"
+      },
+      "UnmeasuredTurnUsageAccounting": {
+        "additionalProperties": false,
+        "description": "Provider token accounting for one model turn was absent.\n\n# What this makes untrue, and what it does not\n\nA provider that streams a complete answer and no usage event has stated\nnothing about tokens. The turn's SEMANTIC facts - what the model said,\nwhich tools it asked for, what may be committed to the transcript - are\nuntouched by that silence, so this absence terminalizes none of them. Only\nthe accounting axis is affected, and it is affected by being left exactly\nwhere it was: no counter advances, no per-call row is published, and no\nvalue is substituted for the one the provider did not send.\n\nThis value states the absence and nothing more. It does not assert that the\nturn completed: the turn's own terminal fact has its own owner, and a turn\nwhose accounting went missing can still fail afterwards on unrelated\ngrounds.\n\n# Why the identity here is not accounting\n\n`provider` and `model` name the REQUEST this turn was lowered for. They are\nthe address of the missing measurement, not a reconstruction of it, and\ncarry no counters. This is exactly the line\n[`ProviderTokenAccounting::host_declared`] would cross: it would mint\nprovider attribution for numbers no provider issued.",
+        "properties": {
+          "model": {
+            "description": "Model of the request that produced the unaccounted turn.",
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request that produced the unaccounted turn."
+          }
+        },
+        "required": [
+          "provider",
+          "model"
         ],
         "type": "object"
       },
@@ -8683,7 +8779,7 @@
         "type": "object"
       },
       "BudgetLimits": {
-        "description": "Resource limits for an agent run",
+        "description": "Resource limits for an agent run\n\n# Two time horizons, one owner\n\n[`Budget`] is the single owner of \"may this run continue in time\". It\ncarries two independent horizons because they answer different questions\nand are measured from different epochs:\n\n- [`BudgetLimits::max_duration`] is the **agent-lifetime** horizon. Its\n  epoch is [`Budget::new`], which service-backed surfaces call once when the\n  session's agent is built, not once per turn. It therefore spans every turn\n  of that agent, including the idle wall-clock between turns.\n- [`BudgetLimits::max_turn_duration`] is the **per-turn aggregate** horizon.\n  Its epoch is re-armed by [`Budget::begin_turn`] at each run entry, so it\n  bounds one turn end-to-end regardless of how many LLM calls, retries, and\n  tool batches that turn contains.\n\nEvery segment of a turn already carries its own bound (per-call LLM timeout,\nstream-inactivity watchdog, per-tool-call timeout). Before\n`max_turn_duration` existed, the *sum* of those segments was unbounded: a\nturn could legally spend an hour without any owner asking whether it was\nallowed to. `max_turn_duration` is that owner.",
         "properties": {
           "max_duration": {
             "anyOf": [
@@ -8694,7 +8790,7 @@
                 "type": "null"
               }
             ],
-            "description": "Maximum duration"
+            "description": "Maximum agent-lifetime duration, measured from [`Budget::new`].\n\nThis is NOT a per-turn deadline: the epoch is agent construction, which\nfor `SessionService`-backed surfaces is session creation, and it is\nnever re-armed. Use [`BudgetLimits::max_turn_duration`] to bound one\nturn."
           },
           "max_tokens": {
             "description": "Maximum tokens to consume",
@@ -8713,6 +8809,17 @@
               "integer",
               "null"
             ]
+          },
+          "max_turn_duration": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Duration"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Maximum aggregate wall-clock for a single turn, re-armed at each run\nentry by [`Budget::begin_turn`].\n\n`None` (the default) means turns are unbounded in aggregate: every\nsegment still carries its own timeout, but their sum has no ceiling.\nAbsence is representable and never substituted with an invented\ndefault; a deployment that leaves this unset has chosen unbounded\nturns.\n\n`skip_serializing_if` is load-bearing, not style: a spec carrying no\nturn ceiling must keep its historical canonical bytes so the frozen\n`spec_digest` pin (`meerkat_contracts::wire::spec_digest`) and every\ndigest already recorded in host stores still match. Same reasoning as\n`PortableToolConfig.read_only` in 0.8.23."
           }
         },
         "type": "object"
@@ -16481,7 +16588,7 @@
         "type": "integer"
       },
       "BudgetLimits": {
-        "description": "Resource limits for an agent run",
+        "description": "Resource limits for an agent run\n\n# Two time horizons, one owner\n\n[`Budget`] is the single owner of \"may this run continue in time\". It\ncarries two independent horizons because they answer different questions\nand are measured from different epochs:\n\n- [`BudgetLimits::max_duration`] is the **agent-lifetime** horizon. Its\n  epoch is [`Budget::new`], which service-backed surfaces call once when the\n  session's agent is built, not once per turn. It therefore spans every turn\n  of that agent, including the idle wall-clock between turns.\n- [`BudgetLimits::max_turn_duration`] is the **per-turn aggregate** horizon.\n  Its epoch is re-armed by [`Budget::begin_turn`] at each run entry, so it\n  bounds one turn end-to-end regardless of how many LLM calls, retries, and\n  tool batches that turn contains.\n\nEvery segment of a turn already carries its own bound (per-call LLM timeout,\nstream-inactivity watchdog, per-tool-call timeout). Before\n`max_turn_duration` existed, the *sum* of those segments was unbounded: a\nturn could legally spend an hour without any owner asking whether it was\nallowed to. `max_turn_duration` is that owner.",
         "properties": {
           "max_duration": {
             "anyOf": [
@@ -16492,7 +16599,7 @@
                 "type": "null"
               }
             ],
-            "description": "Maximum duration"
+            "description": "Maximum agent-lifetime duration, measured from [`Budget::new`].\n\nThis is NOT a per-turn deadline: the epoch is agent construction, which\nfor `SessionService`-backed surfaces is session creation, and it is\nnever re-armed. Use [`BudgetLimits::max_turn_duration`] to bound one\nturn."
           },
           "max_tokens": {
             "description": "Maximum tokens to consume",
@@ -16511,6 +16618,17 @@
               "integer",
               "null"
             ]
+          },
+          "max_turn_duration": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Duration"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Maximum aggregate wall-clock for a single turn, re-armed at each run\nentry by [`Budget::begin_turn`].\n\n`None` (the default) means turns are unbounded in aggregate: every\nsegment still carries its own timeout, but their sum has no ceiling.\nAbsence is representable and never substituted with an invented\ndefault; a deployment that leaves this unset has chosen unbounded\nturns.\n\n`skip_serializing_if` is load-bearing, not style: a spec carrying no\nturn ceiling must keep its historical canonical bytes so the frozen\n`spec_digest` pin (`meerkat_contracts::wire::spec_digest`) and every\ndigest already recorded in host stores still match. Same reasoning as\n`PortableToolConfig.read_only` in 0.8.23."
           }
         },
         "type": "object"
@@ -19076,7 +19194,7 @@
             "type": "object"
           },
           {
-            "description": "Tool result received (injected into conversation)",
+            "description": "Tool result received (injected into conversation).\n\nThe conversation-level fact for a tool call: this result entered the\ntranscript. [`AgentEvent::ToolExecutionCompleted`] is the paired\nexecution-level fact for the same `id` and currently carries a full\ncopy of these same blocks - see that variant before persisting both, or\na durable consumer stores every result body twice.",
             "properties": {
               "content": {
                 "items": {
@@ -19108,7 +19226,7 @@
             "type": "object"
           },
           {
-            "description": "Turn completed",
+            "description": "Turn completed.\n\n# Why `usage` is optional\n\nThis event states one semantic fact - a model turn reached its terminal\nand its assistant message is committed - and carries one accounting\nfact beside it. The two have different owners and different failure\nmodes: a provider stream that ends without ever sending a usage event\nhas said nothing about tokens while having said everything about the\nanswer. Absence is therefore representable here, because the only\nalternatives are to fabricate counters no provider issued or to\nsuppress the completion of a turn the caller has already read.\n\n`usage: None` means exactly \"no accounting exists for this turn\": no\ncounter advanced, and no per-call row should be reconciled for it. The\npaired [`AgentEvent::TurnUsageAccountingUnmeasured`] carries the\nexplanation (which provider and model went unaccounted); this field\nowns only the number's presence or absence. Consumers must skip an\nabsent row, never treat it as zero.",
             "properties": {
               "stop_reason": {
                 "$ref": "#/$defs/StopReason"
@@ -19118,13 +19236,19 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/$defs/TurnUsage"
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TurnUsage"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
               "type",
-              "stop_reason",
-              "usage"
+              "stop_reason"
             ],
             "type": "object"
           },
@@ -19150,10 +19274,10 @@
             "type": "object"
           },
           {
-            "description": "Tool execution completed",
+            "description": "Tool execution completed.\n\n# This carries a SECOND COPY of the result body\n\nThis event and [`AgentEvent::ToolResultReceived`] are both emitted for\nevery tool call, and they differ by exactly one field: `duration_ms`.\nBoth carry the full `content` blocks. The two facts are genuinely\ndistinct and both deserve to exist - `ToolResultReceived` is the\nCONVERSATION fact (this result was injected into the transcript),\nthis is the EXECUTION fact (the call finished, and here is how long it\ntook) - but the cost of the execution fact currently scales with the\nsize of the result rather than with the fact itself.\n\nA consumer that durably persists BOTH events therefore stores every\ntool result body twice. This is not hypothetical: it was measured\nindependently on two adopter fleets with different storage engines and\ndifferent payload shapes - a console frame store (~348 MB against\n~348 MB, pairwise-identical maxima, from 153 camera-tool calls) and a\nwarehouse events table (89,033 rows / 3.35 GB against 88,934 rows /\n1.69 GB). Neither had configured it; both inherited it from this\nvocabulary. Note it is a PER-CALL cost, not a scale problem: one tool\nreturning a large blob is enough.\n\n`id` is present on both events and is already the join key. A consumer\npersisting both should store the body once against `id` and join for\nthe execution fact, rather than capping bytes at its own writer - a cap\napplied downstream still writes the body twice, only smaller, and every\nconsumer would have to reimplement it.",
             "properties": {
               "content": {
-                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.",
+                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.\n\nDuplicates the blocks [`AgentEvent::ToolResultReceived`] carries\nfor the same `id`; see this variant's docs before persisting both.",
                 "items": {
                   "$ref": "#/$defs/ContentBlock"
                 },
@@ -19669,6 +19793,48 @@
             "required": [
               "type",
               "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's provider token accounting was absent.\n\nThe routed form of the `unmeasured:turn_usage_accounting` marker. It\nstates exactly one thing: the provider stream for this turn carried no\nnormalized accounting, so no accounting axis advanced for it - no\nbudget charge, no session usage, no presented-token update.\n\nIt deliberately does NOT claim the turn completed. This is published at\nthe model boundary, before the boundary effects and terminal hooks that\ncan still fail the turn on their own (unrelated) grounds, and the\nabsence of accounting is true either way. Whether the turn completed is\nowned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the\nturns this marker names - and a turn that fails afterwards publishes\nits own terminal fact.\n\nWhat this is not is a cause of failure. A number nobody has cannot\ninvalidate an answer the user has already read; see\n[`crate::UnmeasuredTurnUsageAccounting`].",
+            "properties": {
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_unmeasured",
+                "type": "string"
+              },
+              "unmeasured": {
+                "$ref": "#/$defs/UnmeasuredTurnUsageAccounting"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "unmeasured"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's accounting named a provider/model other than the\nrequest it answered.\n\nThe routed form of the `disputed:turn_usage_accounting_identity`\nmarker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the\ncounters exist and are internally consistent, so the token axis still\nadvances on them; what is in dispute is attribution. The reported\nidentity is published exactly as the adapter minted it and is never\nrewritten to the active identity.",
+            "properties": {
+              "dispute": {
+                "$ref": "#/$defs/DisputedTurnUsageAccountingIdentity"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_identity_disputed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "dispute"
             ],
             "type": "object"
           }
@@ -20489,6 +20655,35 @@
           "provider",
           "model",
           "boundary"
+        ],
+        "type": "object"
+      },
+      "DisputedTurnUsageAccountingIdentity": {
+        "additionalProperties": false,
+        "description": "One turn's provider-authored accounting named a different provider/model\nthan the request it answered.\n\n# Why this is not the same fault as absent accounting\n\nA mismatched identity still arrives with a complete, internally consistent\nmeasurement: the [`PresentedTokenConvention`] travels with the number, so\nthe counters mean what they say regardless of which name is attached. The\ndisputed fact is attribution alone, so the token axis still advances on the\nnumber the provider actually sent. Absent accounting has no number at all\nand therefore cannot advance anything. Collapsing the two would either kill\ncorrect work over a name or fabricate counters over silence.\n\n# Why the reported identity is preserved verbatim\n\nRewriting `reported_*` to the active identity would publish an agreement\nthat was never observed - a guess laundered as evidence. Both sides are\ncarried so a host can see exactly who disagreed with whom.",
+        "properties": {
+          "active_model": {
+            "description": "Model of the request this turn was lowered for.",
+            "type": "string"
+          },
+          "active_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request this turn was lowered for."
+          },
+          "reported_model": {
+            "description": "Model the accounting claims, exactly as the adapter minted it.",
+            "type": "string"
+          },
+          "reported_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider the accounting claims, exactly as the adapter minted it."
+          }
+        },
+        "required": [
+          "active_provider",
+          "active_model",
+          "reported_provider",
+          "reported_model"
         ],
         "type": "object"
       },
@@ -22371,6 +22566,25 @@
           "input_tokens",
           "output_tokens",
           "accounting"
+        ],
+        "type": "object"
+      },
+      "UnmeasuredTurnUsageAccounting": {
+        "additionalProperties": false,
+        "description": "Provider token accounting for one model turn was absent.\n\n# What this makes untrue, and what it does not\n\nA provider that streams a complete answer and no usage event has stated\nnothing about tokens. The turn's SEMANTIC facts - what the model said,\nwhich tools it asked for, what may be committed to the transcript - are\nuntouched by that silence, so this absence terminalizes none of them. Only\nthe accounting axis is affected, and it is affected by being left exactly\nwhere it was: no counter advances, no per-call row is published, and no\nvalue is substituted for the one the provider did not send.\n\nThis value states the absence and nothing more. It does not assert that the\nturn completed: the turn's own terminal fact has its own owner, and a turn\nwhose accounting went missing can still fail afterwards on unrelated\ngrounds.\n\n# Why the identity here is not accounting\n\n`provider` and `model` name the REQUEST this turn was lowered for. They are\nthe address of the missing measurement, not a reconstruction of it, and\ncarry no counters. This is exactly the line\n[`ProviderTokenAccounting::host_declared`] would cross: it would mint\nprovider attribution for numbers no provider issued.",
+        "properties": {
+          "model": {
+            "description": "Model of the request that produced the unaccounted turn.",
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request that produced the unaccounted turn."
+          }
+        },
+        "required": [
+          "provider",
+          "model"
         ],
         "type": "object"
       },
@@ -28085,7 +28299,7 @@
             "type": "object"
           },
           {
-            "description": "Tool result received (injected into conversation)",
+            "description": "Tool result received (injected into conversation).\n\nThe conversation-level fact for a tool call: this result entered the\ntranscript. [`AgentEvent::ToolExecutionCompleted`] is the paired\nexecution-level fact for the same `id` and currently carries a full\ncopy of these same blocks - see that variant before persisting both, or\na durable consumer stores every result body twice.",
             "properties": {
               "content": {
                 "items": {
@@ -28117,7 +28331,7 @@
             "type": "object"
           },
           {
-            "description": "Turn completed",
+            "description": "Turn completed.\n\n# Why `usage` is optional\n\nThis event states one semantic fact - a model turn reached its terminal\nand its assistant message is committed - and carries one accounting\nfact beside it. The two have different owners and different failure\nmodes: a provider stream that ends without ever sending a usage event\nhas said nothing about tokens while having said everything about the\nanswer. Absence is therefore representable here, because the only\nalternatives are to fabricate counters no provider issued or to\nsuppress the completion of a turn the caller has already read.\n\n`usage: None` means exactly \"no accounting exists for this turn\": no\ncounter advanced, and no per-call row should be reconciled for it. The\npaired [`AgentEvent::TurnUsageAccountingUnmeasured`] carries the\nexplanation (which provider and model went unaccounted); this field\nowns only the number's presence or absence. Consumers must skip an\nabsent row, never treat it as zero.",
             "properties": {
               "stop_reason": {
                 "$ref": "#/$defs/StopReason"
@@ -28127,13 +28341,19 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/$defs/TurnUsage"
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TurnUsage"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
               "type",
-              "stop_reason",
-              "usage"
+              "stop_reason"
             ],
             "type": "object"
           },
@@ -28159,10 +28379,10 @@
             "type": "object"
           },
           {
-            "description": "Tool execution completed",
+            "description": "Tool execution completed.\n\n# This carries a SECOND COPY of the result body\n\nThis event and [`AgentEvent::ToolResultReceived`] are both emitted for\nevery tool call, and they differ by exactly one field: `duration_ms`.\nBoth carry the full `content` blocks. The two facts are genuinely\ndistinct and both deserve to exist - `ToolResultReceived` is the\nCONVERSATION fact (this result was injected into the transcript),\nthis is the EXECUTION fact (the call finished, and here is how long it\ntook) - but the cost of the execution fact currently scales with the\nsize of the result rather than with the fact itself.\n\nA consumer that durably persists BOTH events therefore stores every\ntool result body twice. This is not hypothetical: it was measured\nindependently on two adopter fleets with different storage engines and\ndifferent payload shapes - a console frame store (~348 MB against\n~348 MB, pairwise-identical maxima, from 153 camera-tool calls) and a\nwarehouse events table (89,033 rows / 3.35 GB against 88,934 rows /\n1.69 GB). Neither had configured it; both inherited it from this\nvocabulary. Note it is a PER-CALL cost, not a scale problem: one tool\nreturning a large blob is enough.\n\n`id` is present on both events and is already the join key. A consumer\npersisting both should store the body once against `id` and join for\nthe execution fact, rather than capping bytes at its own writer - a cap\napplied downstream still writes the body twice, only smaller, and every\nconsumer would have to reimplement it.",
             "properties": {
               "content": {
-                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.",
+                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.\n\nDuplicates the blocks [`AgentEvent::ToolResultReceived`] carries\nfor the same `id`; see this variant's docs before persisting both.",
                 "items": {
                   "$ref": "#/$defs/ContentBlock"
                 },
@@ -28678,6 +28898,48 @@
             "required": [
               "type",
               "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's provider token accounting was absent.\n\nThe routed form of the `unmeasured:turn_usage_accounting` marker. It\nstates exactly one thing: the provider stream for this turn carried no\nnormalized accounting, so no accounting axis advanced for it - no\nbudget charge, no session usage, no presented-token update.\n\nIt deliberately does NOT claim the turn completed. This is published at\nthe model boundary, before the boundary effects and terminal hooks that\ncan still fail the turn on their own (unrelated) grounds, and the\nabsence of accounting is true either way. Whether the turn completed is\nowned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the\nturns this marker names - and a turn that fails afterwards publishes\nits own terminal fact.\n\nWhat this is not is a cause of failure. A number nobody has cannot\ninvalidate an answer the user has already read; see\n[`crate::UnmeasuredTurnUsageAccounting`].",
+            "properties": {
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_unmeasured",
+                "type": "string"
+              },
+              "unmeasured": {
+                "$ref": "#/$defs/UnmeasuredTurnUsageAccounting"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "unmeasured"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's accounting named a provider/model other than the\nrequest it answered.\n\nThe routed form of the `disputed:turn_usage_accounting_identity`\nmarker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the\ncounters exist and are internally consistent, so the token axis still\nadvances on them; what is in dispute is attribution. The reported\nidentity is published exactly as the adapter minted it and is never\nrewritten to the active identity.",
+            "properties": {
+              "dispute": {
+                "$ref": "#/$defs/DisputedTurnUsageAccountingIdentity"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_identity_disputed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "dispute"
             ],
             "type": "object"
           }
@@ -30946,6 +31208,35 @@
           "provider",
           "model",
           "boundary"
+        ],
+        "type": "object"
+      },
+      "DisputedTurnUsageAccountingIdentity": {
+        "additionalProperties": false,
+        "description": "One turn's provider-authored accounting named a different provider/model\nthan the request it answered.\n\n# Why this is not the same fault as absent accounting\n\nA mismatched identity still arrives with a complete, internally consistent\nmeasurement: the [`PresentedTokenConvention`] travels with the number, so\nthe counters mean what they say regardless of which name is attached. The\ndisputed fact is attribution alone, so the token axis still advances on the\nnumber the provider actually sent. Absent accounting has no number at all\nand therefore cannot advance anything. Collapsing the two would either kill\ncorrect work over a name or fabricate counters over silence.\n\n# Why the reported identity is preserved verbatim\n\nRewriting `reported_*` to the active identity would publish an agreement\nthat was never observed - a guess laundered as evidence. Both sides are\ncarried so a host can see exactly who disagreed with whom.",
+        "properties": {
+          "active_model": {
+            "description": "Model of the request this turn was lowered for.",
+            "type": "string"
+          },
+          "active_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request this turn was lowered for."
+          },
+          "reported_model": {
+            "description": "Model the accounting claims, exactly as the adapter minted it.",
+            "type": "string"
+          },
+          "reported_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider the accounting claims, exactly as the adapter minted it."
+          }
+        },
+        "required": [
+          "active_provider",
+          "active_model",
+          "reported_provider",
+          "reported_model"
         ],
         "type": "object"
       },
@@ -33524,6 +33815,25 @@
           "input_tokens",
           "output_tokens",
           "accounting"
+        ],
+        "type": "object"
+      },
+      "UnmeasuredTurnUsageAccounting": {
+        "additionalProperties": false,
+        "description": "Provider token accounting for one model turn was absent.\n\n# What this makes untrue, and what it does not\n\nA provider that streams a complete answer and no usage event has stated\nnothing about tokens. The turn's SEMANTIC facts - what the model said,\nwhich tools it asked for, what may be committed to the transcript - are\nuntouched by that silence, so this absence terminalizes none of them. Only\nthe accounting axis is affected, and it is affected by being left exactly\nwhere it was: no counter advances, no per-call row is published, and no\nvalue is substituted for the one the provider did not send.\n\nThis value states the absence and nothing more. It does not assert that the\nturn completed: the turn's own terminal fact has its own owner, and a turn\nwhose accounting went missing can still fail afterwards on unrelated\ngrounds.\n\n# Why the identity here is not accounting\n\n`provider` and `model` name the REQUEST this turn was lowered for. They are\nthe address of the missing measurement, not a reconstruction of it, and\ncarry no counters. This is exactly the line\n[`ProviderTokenAccounting::host_declared`] would cross: it would mint\nprovider attribution for numbers no provider issued.",
+        "properties": {
+          "model": {
+            "description": "Model of the request that produced the unaccounted turn.",
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request that produced the unaccounted turn."
+          }
+        },
+        "required": [
+          "provider",
+          "model"
         ],
         "type": "object"
       },
@@ -39096,7 +39406,7 @@
             "type": "object"
           },
           {
-            "description": "Tool result received (injected into conversation)",
+            "description": "Tool result received (injected into conversation).\n\nThe conversation-level fact for a tool call: this result entered the\ntranscript. [`AgentEvent::ToolExecutionCompleted`] is the paired\nexecution-level fact for the same `id` and currently carries a full\ncopy of these same blocks - see that variant before persisting both, or\na durable consumer stores every result body twice.",
             "properties": {
               "content": {
                 "items": {
@@ -39128,7 +39438,7 @@
             "type": "object"
           },
           {
-            "description": "Turn completed",
+            "description": "Turn completed.\n\n# Why `usage` is optional\n\nThis event states one semantic fact - a model turn reached its terminal\nand its assistant message is committed - and carries one accounting\nfact beside it. The two have different owners and different failure\nmodes: a provider stream that ends without ever sending a usage event\nhas said nothing about tokens while having said everything about the\nanswer. Absence is therefore representable here, because the only\nalternatives are to fabricate counters no provider issued or to\nsuppress the completion of a turn the caller has already read.\n\n`usage: None` means exactly \"no accounting exists for this turn\": no\ncounter advanced, and no per-call row should be reconciled for it. The\npaired [`AgentEvent::TurnUsageAccountingUnmeasured`] carries the\nexplanation (which provider and model went unaccounted); this field\nowns only the number's presence or absence. Consumers must skip an\nabsent row, never treat it as zero.",
             "properties": {
               "stop_reason": {
                 "$ref": "#/$defs/StopReason"
@@ -39138,13 +39448,19 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/$defs/TurnUsage"
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TurnUsage"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
               "type",
-              "stop_reason",
-              "usage"
+              "stop_reason"
             ],
             "type": "object"
           },
@@ -39170,10 +39486,10 @@
             "type": "object"
           },
           {
-            "description": "Tool execution completed",
+            "description": "Tool execution completed.\n\n# This carries a SECOND COPY of the result body\n\nThis event and [`AgentEvent::ToolResultReceived`] are both emitted for\nevery tool call, and they differ by exactly one field: `duration_ms`.\nBoth carry the full `content` blocks. The two facts are genuinely\ndistinct and both deserve to exist - `ToolResultReceived` is the\nCONVERSATION fact (this result was injected into the transcript),\nthis is the EXECUTION fact (the call finished, and here is how long it\ntook) - but the cost of the execution fact currently scales with the\nsize of the result rather than with the fact itself.\n\nA consumer that durably persists BOTH events therefore stores every\ntool result body twice. This is not hypothetical: it was measured\nindependently on two adopter fleets with different storage engines and\ndifferent payload shapes - a console frame store (~348 MB against\n~348 MB, pairwise-identical maxima, from 153 camera-tool calls) and a\nwarehouse events table (89,033 rows / 3.35 GB against 88,934 rows /\n1.69 GB). Neither had configured it; both inherited it from this\nvocabulary. Note it is a PER-CALL cost, not a scale problem: one tool\nreturning a large blob is enough.\n\n`id` is present on both events and is already the join key. A consumer\npersisting both should store the body once against `id` and join for\nthe execution fact, rather than capping bytes at its own writer - a cap\napplied downstream still writes the body twice, only smaller, and every\nconsumer would have to reimplement it.",
             "properties": {
               "content": {
-                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.",
+                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.\n\nDuplicates the blocks [`AgentEvent::ToolResultReceived`] carries\nfor the same `id`; see this variant's docs before persisting both.",
                 "items": {
                   "$ref": "#/$defs/ContentBlock"
                 },
@@ -39689,6 +40005,48 @@
             "required": [
               "type",
               "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's provider token accounting was absent.\n\nThe routed form of the `unmeasured:turn_usage_accounting` marker. It\nstates exactly one thing: the provider stream for this turn carried no\nnormalized accounting, so no accounting axis advanced for it - no\nbudget charge, no session usage, no presented-token update.\n\nIt deliberately does NOT claim the turn completed. This is published at\nthe model boundary, before the boundary effects and terminal hooks that\ncan still fail the turn on their own (unrelated) grounds, and the\nabsence of accounting is true either way. Whether the turn completed is\nowned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the\nturns this marker names - and a turn that fails afterwards publishes\nits own terminal fact.\n\nWhat this is not is a cause of failure. A number nobody has cannot\ninvalidate an answer the user has already read; see\n[`crate::UnmeasuredTurnUsageAccounting`].",
+            "properties": {
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_unmeasured",
+                "type": "string"
+              },
+              "unmeasured": {
+                "$ref": "#/$defs/UnmeasuredTurnUsageAccounting"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "unmeasured"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's accounting named a provider/model other than the\nrequest it answered.\n\nThe routed form of the `disputed:turn_usage_accounting_identity`\nmarker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the\ncounters exist and are internally consistent, so the token axis still\nadvances on them; what is in dispute is attribution. The reported\nidentity is published exactly as the adapter minted it and is never\nrewritten to the active identity.",
+            "properties": {
+              "dispute": {
+                "$ref": "#/$defs/DisputedTurnUsageAccountingIdentity"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_identity_disputed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "dispute"
             ],
             "type": "object"
           }
@@ -43630,7 +43988,7 @@
         "type": "object"
       },
       "BudgetLimits": {
-        "description": "Resource limits for an agent run",
+        "description": "Resource limits for an agent run\n\n# Two time horizons, one owner\n\n[`Budget`] is the single owner of \"may this run continue in time\". It\ncarries two independent horizons because they answer different questions\nand are measured from different epochs:\n\n- [`BudgetLimits::max_duration`] is the **agent-lifetime** horizon. Its\n  epoch is [`Budget::new`], which service-backed surfaces call once when the\n  session's agent is built, not once per turn. It therefore spans every turn\n  of that agent, including the idle wall-clock between turns.\n- [`BudgetLimits::max_turn_duration`] is the **per-turn aggregate** horizon.\n  Its epoch is re-armed by [`Budget::begin_turn`] at each run entry, so it\n  bounds one turn end-to-end regardless of how many LLM calls, retries, and\n  tool batches that turn contains.\n\nEvery segment of a turn already carries its own bound (per-call LLM timeout,\nstream-inactivity watchdog, per-tool-call timeout). Before\n`max_turn_duration` existed, the *sum* of those segments was unbounded: a\nturn could legally spend an hour without any owner asking whether it was\nallowed to. `max_turn_duration` is that owner.",
         "properties": {
           "max_duration": {
             "anyOf": [
@@ -43641,7 +43999,7 @@
                 "type": "null"
               }
             ],
-            "description": "Maximum duration"
+            "description": "Maximum agent-lifetime duration, measured from [`Budget::new`].\n\nThis is NOT a per-turn deadline: the epoch is agent construction, which\nfor `SessionService`-backed surfaces is session creation, and it is\nnever re-armed. Use [`BudgetLimits::max_turn_duration`] to bound one\nturn."
           },
           "max_tokens": {
             "description": "Maximum tokens to consume",
@@ -43660,6 +44018,17 @@
               "integer",
               "null"
             ]
+          },
+          "max_turn_duration": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Duration"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Maximum aggregate wall-clock for a single turn, re-armed at each run\nentry by [`Budget::begin_turn`].\n\n`None` (the default) means turns are unbounded in aggregate: every\nsegment still carries its own timeout, but their sum has no ceiling.\nAbsence is representable and never substituted with an invented\ndefault; a deployment that leaves this unset has chosen unbounded\nturns.\n\n`skip_serializing_if` is load-bearing, not style: a spec carrying no\nturn ceiling must keep its historical canonical bytes so the frozen\n`spec_digest` pin (`meerkat_contracts::wire::spec_digest`) and every\ndigest already recorded in host stores still match. Same reasoning as\n`PortableToolConfig.read_only` in 0.8.23."
           }
         },
         "type": "object"
@@ -44496,6 +44865,35 @@
           "provider",
           "model",
           "boundary"
+        ],
+        "type": "object"
+      },
+      "DisputedTurnUsageAccountingIdentity": {
+        "additionalProperties": false,
+        "description": "One turn's provider-authored accounting named a different provider/model\nthan the request it answered.\n\n# Why this is not the same fault as absent accounting\n\nA mismatched identity still arrives with a complete, internally consistent\nmeasurement: the [`PresentedTokenConvention`] travels with the number, so\nthe counters mean what they say regardless of which name is attached. The\ndisputed fact is attribution alone, so the token axis still advances on the\nnumber the provider actually sent. Absent accounting has no number at all\nand therefore cannot advance anything. Collapsing the two would either kill\ncorrect work over a name or fabricate counters over silence.\n\n# Why the reported identity is preserved verbatim\n\nRewriting `reported_*` to the active identity would publish an agreement\nthat was never observed - a guess laundered as evidence. Both sides are\ncarried so a host can see exactly who disagreed with whom.",
+        "properties": {
+          "active_model": {
+            "description": "Model of the request this turn was lowered for.",
+            "type": "string"
+          },
+          "active_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request this turn was lowered for."
+          },
+          "reported_model": {
+            "description": "Model the accounting claims, exactly as the adapter minted it.",
+            "type": "string"
+          },
+          "reported_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider the accounting claims, exactly as the adapter minted it."
+          }
+        },
+        "required": [
+          "active_provider",
+          "active_model",
+          "reported_provider",
+          "reported_model"
         ],
         "type": "object"
       },
@@ -48194,6 +48592,25 @@
           "input_tokens",
           "output_tokens",
           "accounting"
+        ],
+        "type": "object"
+      },
+      "UnmeasuredTurnUsageAccounting": {
+        "additionalProperties": false,
+        "description": "Provider token accounting for one model turn was absent.\n\n# What this makes untrue, and what it does not\n\nA provider that streams a complete answer and no usage event has stated\nnothing about tokens. The turn's SEMANTIC facts - what the model said,\nwhich tools it asked for, what may be committed to the transcript - are\nuntouched by that silence, so this absence terminalizes none of them. Only\nthe accounting axis is affected, and it is affected by being left exactly\nwhere it was: no counter advances, no per-call row is published, and no\nvalue is substituted for the one the provider did not send.\n\nThis value states the absence and nothing more. It does not assert that the\nturn completed: the turn's own terminal fact has its own owner, and a turn\nwhose accounting went missing can still fail afterwards on unrelated\ngrounds.\n\n# Why the identity here is not accounting\n\n`provider` and `model` name the REQUEST this turn was lowered for. They are\nthe address of the missing measurement, not a reconstruction of it, and\ncarry no counters. This is exactly the line\n[`ProviderTokenAccounting::host_declared`] would cross: it would mint\nprovider attribution for numbers no provider issued.",
+        "properties": {
+          "model": {
+            "description": "Model of the request that produced the unaccounted turn.",
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request that produced the unaccounted turn."
+          }
+        },
+        "required": [
+          "provider",
+          "model"
         ],
         "type": "object"
       },
@@ -52919,7 +53336,7 @@
         "type": "object"
       },
       "BudgetLimits": {
-        "description": "Resource limits for an agent run",
+        "description": "Resource limits for an agent run\n\n# Two time horizons, one owner\n\n[`Budget`] is the single owner of \"may this run continue in time\". It\ncarries two independent horizons because they answer different questions\nand are measured from different epochs:\n\n- [`BudgetLimits::max_duration`] is the **agent-lifetime** horizon. Its\n  epoch is [`Budget::new`], which service-backed surfaces call once when the\n  session's agent is built, not once per turn. It therefore spans every turn\n  of that agent, including the idle wall-clock between turns.\n- [`BudgetLimits::max_turn_duration`] is the **per-turn aggregate** horizon.\n  Its epoch is re-armed by [`Budget::begin_turn`] at each run entry, so it\n  bounds one turn end-to-end regardless of how many LLM calls, retries, and\n  tool batches that turn contains.\n\nEvery segment of a turn already carries its own bound (per-call LLM timeout,\nstream-inactivity watchdog, per-tool-call timeout). Before\n`max_turn_duration` existed, the *sum* of those segments was unbounded: a\nturn could legally spend an hour without any owner asking whether it was\nallowed to. `max_turn_duration` is that owner.",
         "properties": {
           "max_duration": {
             "anyOf": [
@@ -52930,7 +53347,7 @@
                 "type": "null"
               }
             ],
-            "description": "Maximum duration"
+            "description": "Maximum agent-lifetime duration, measured from [`Budget::new`].\n\nThis is NOT a per-turn deadline: the epoch is agent construction, which\nfor `SessionService`-backed surfaces is session creation, and it is\nnever re-armed. Use [`BudgetLimits::max_turn_duration`] to bound one\nturn."
           },
           "max_tokens": {
             "description": "Maximum tokens to consume",
@@ -52949,6 +53366,17 @@
               "integer",
               "null"
             ]
+          },
+          "max_turn_duration": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Duration"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Maximum aggregate wall-clock for a single turn, re-armed at each run\nentry by [`Budget::begin_turn`].\n\n`None` (the default) means turns are unbounded in aggregate: every\nsegment still carries its own timeout, but their sum has no ceiling.\nAbsence is representable and never substituted with an invented\ndefault; a deployment that leaves this unset has chosen unbounded\nturns.\n\n`skip_serializing_if` is load-bearing, not style: a spec carrying no\nturn ceiling must keep its historical canonical bytes so the frozen\n`spec_digest` pin (`meerkat_contracts::wire::spec_digest`) and every\ndigest already recorded in host stores still match. Same reasoning as\n`PortableToolConfig.read_only` in 0.8.23."
           }
         },
         "type": "object"
@@ -56144,7 +56572,7 @@
             "type": "object"
           },
           {
-            "description": "Tool result received (injected into conversation)",
+            "description": "Tool result received (injected into conversation).\n\nThe conversation-level fact for a tool call: this result entered the\ntranscript. [`AgentEvent::ToolExecutionCompleted`] is the paired\nexecution-level fact for the same `id` and currently carries a full\ncopy of these same blocks - see that variant before persisting both, or\na durable consumer stores every result body twice.",
             "properties": {
               "content": {
                 "items": {
@@ -56176,7 +56604,7 @@
             "type": "object"
           },
           {
-            "description": "Turn completed",
+            "description": "Turn completed.\n\n# Why `usage` is optional\n\nThis event states one semantic fact - a model turn reached its terminal\nand its assistant message is committed - and carries one accounting\nfact beside it. The two have different owners and different failure\nmodes: a provider stream that ends without ever sending a usage event\nhas said nothing about tokens while having said everything about the\nanswer. Absence is therefore representable here, because the only\nalternatives are to fabricate counters no provider issued or to\nsuppress the completion of a turn the caller has already read.\n\n`usage: None` means exactly \"no accounting exists for this turn\": no\ncounter advanced, and no per-call row should be reconciled for it. The\npaired [`AgentEvent::TurnUsageAccountingUnmeasured`] carries the\nexplanation (which provider and model went unaccounted); this field\nowns only the number's presence or absence. Consumers must skip an\nabsent row, never treat it as zero.",
             "properties": {
               "stop_reason": {
                 "$ref": "#/$defs/StopReason"
@@ -56186,13 +56614,19 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/$defs/TurnUsage"
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TurnUsage"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
               "type",
-              "stop_reason",
-              "usage"
+              "stop_reason"
             ],
             "type": "object"
           },
@@ -56218,10 +56652,10 @@
             "type": "object"
           },
           {
-            "description": "Tool execution completed",
+            "description": "Tool execution completed.\n\n# This carries a SECOND COPY of the result body\n\nThis event and [`AgentEvent::ToolResultReceived`] are both emitted for\nevery tool call, and they differ by exactly one field: `duration_ms`.\nBoth carry the full `content` blocks. The two facts are genuinely\ndistinct and both deserve to exist - `ToolResultReceived` is the\nCONVERSATION fact (this result was injected into the transcript),\nthis is the EXECUTION fact (the call finished, and here is how long it\ntook) - but the cost of the execution fact currently scales with the\nsize of the result rather than with the fact itself.\n\nA consumer that durably persists BOTH events therefore stores every\ntool result body twice. This is not hypothetical: it was measured\nindependently on two adopter fleets with different storage engines and\ndifferent payload shapes - a console frame store (~348 MB against\n~348 MB, pairwise-identical maxima, from 153 camera-tool calls) and a\nwarehouse events table (89,033 rows / 3.35 GB against 88,934 rows /\n1.69 GB). Neither had configured it; both inherited it from this\nvocabulary. Note it is a PER-CALL cost, not a scale problem: one tool\nreturning a large blob is enough.\n\n`id` is present on both events and is already the join key. A consumer\npersisting both should store the body once against `id` and join for\nthe execution fact, rather than capping bytes at its own writer - a cap\napplied downstream still writes the body twice, only smaller, and every\nconsumer would have to reimplement it.",
             "properties": {
               "content": {
-                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.",
+                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.\n\nDuplicates the blocks [`AgentEvent::ToolResultReceived`] carries\nfor the same `id`; see this variant's docs before persisting both.",
                 "items": {
                   "$ref": "#/$defs/ContentBlock"
                 },
@@ -56737,6 +57171,48 @@
             "required": [
               "type",
               "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's provider token accounting was absent.\n\nThe routed form of the `unmeasured:turn_usage_accounting` marker. It\nstates exactly one thing: the provider stream for this turn carried no\nnormalized accounting, so no accounting axis advanced for it - no\nbudget charge, no session usage, no presented-token update.\n\nIt deliberately does NOT claim the turn completed. This is published at\nthe model boundary, before the boundary effects and terminal hooks that\ncan still fail the turn on their own (unrelated) grounds, and the\nabsence of accounting is true either way. Whether the turn completed is\nowned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the\nturns this marker names - and a turn that fails afterwards publishes\nits own terminal fact.\n\nWhat this is not is a cause of failure. A number nobody has cannot\ninvalidate an answer the user has already read; see\n[`crate::UnmeasuredTurnUsageAccounting`].",
+            "properties": {
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_unmeasured",
+                "type": "string"
+              },
+              "unmeasured": {
+                "$ref": "#/$defs/UnmeasuredTurnUsageAccounting"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "unmeasured"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's accounting named a provider/model other than the\nrequest it answered.\n\nThe routed form of the `disputed:turn_usage_accounting_identity`\nmarker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the\ncounters exist and are internally consistent, so the token axis still\nadvances on them; what is in dispute is attribution. The reported\nidentity is published exactly as the adapter minted it and is never\nrewritten to the active identity.",
+            "properties": {
+              "dispute": {
+                "$ref": "#/$defs/DisputedTurnUsageAccountingIdentity"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_identity_disputed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "dispute"
             ],
             "type": "object"
           }
@@ -59716,6 +60192,35 @@
         ],
         "type": "object"
       },
+      "DisputedTurnUsageAccountingIdentity": {
+        "additionalProperties": false,
+        "description": "One turn's provider-authored accounting named a different provider/model\nthan the request it answered.\n\n# Why this is not the same fault as absent accounting\n\nA mismatched identity still arrives with a complete, internally consistent\nmeasurement: the [`PresentedTokenConvention`] travels with the number, so\nthe counters mean what they say regardless of which name is attached. The\ndisputed fact is attribution alone, so the token axis still advances on the\nnumber the provider actually sent. Absent accounting has no number at all\nand therefore cannot advance anything. Collapsing the two would either kill\ncorrect work over a name or fabricate counters over silence.\n\n# Why the reported identity is preserved verbatim\n\nRewriting `reported_*` to the active identity would publish an agreement\nthat was never observed - a guess laundered as evidence. Both sides are\ncarried so a host can see exactly who disagreed with whom.",
+        "properties": {
+          "active_model": {
+            "description": "Model of the request this turn was lowered for.",
+            "type": "string"
+          },
+          "active_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request this turn was lowered for."
+          },
+          "reported_model": {
+            "description": "Model the accounting claims, exactly as the adapter minted it.",
+            "type": "string"
+          },
+          "reported_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider the accounting claims, exactly as the adapter minted it."
+          }
+        },
+        "required": [
+          "active_provider",
+          "active_model",
+          "reported_provider",
+          "reported_model"
+        ],
+        "type": "object"
+      },
       "EventEnvelope": {
         "description": "Canonical event envelope for stream transport and ordering.",
         "properties": {
@@ -62291,6 +62796,25 @@
           "input_tokens",
           "output_tokens",
           "accounting"
+        ],
+        "type": "object"
+      },
+      "UnmeasuredTurnUsageAccounting": {
+        "additionalProperties": false,
+        "description": "Provider token accounting for one model turn was absent.\n\n# What this makes untrue, and what it does not\n\nA provider that streams a complete answer and no usage event has stated\nnothing about tokens. The turn's SEMANTIC facts - what the model said,\nwhich tools it asked for, what may be committed to the transcript - are\nuntouched by that silence, so this absence terminalizes none of them. Only\nthe accounting axis is affected, and it is affected by being left exactly\nwhere it was: no counter advances, no per-call row is published, and no\nvalue is substituted for the one the provider did not send.\n\nThis value states the absence and nothing more. It does not assert that the\nturn completed: the turn's own terminal fact has its own owner, and a turn\nwhose accounting went missing can still fail afterwards on unrelated\ngrounds.\n\n# Why the identity here is not accounting\n\n`provider` and `model` name the REQUEST this turn was lowered for. They are\nthe address of the missing measurement, not a reconstruction of it, and\ncarry no counters. This is exactly the line\n[`ProviderTokenAccounting::host_declared`] would cross: it would mint\nprovider attribution for numbers no provider issued.",
+        "properties": {
+          "model": {
+            "description": "Model of the request that produced the unaccounted turn.",
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request that produced the unaccounted turn."
+          }
+        },
+        "required": [
+          "provider",
+          "model"
         ],
         "type": "object"
       },
@@ -65879,7 +66403,7 @@
             "type": "object"
           },
           {
-            "description": "Tool result received (injected into conversation)",
+            "description": "Tool result received (injected into conversation).\n\nThe conversation-level fact for a tool call: this result entered the\ntranscript. [`AgentEvent::ToolExecutionCompleted`] is the paired\nexecution-level fact for the same `id` and currently carries a full\ncopy of these same blocks - see that variant before persisting both, or\na durable consumer stores every result body twice.",
             "properties": {
               "content": {
                 "items": {
@@ -65911,7 +66435,7 @@
             "type": "object"
           },
           {
-            "description": "Turn completed",
+            "description": "Turn completed.\n\n# Why `usage` is optional\n\nThis event states one semantic fact - a model turn reached its terminal\nand its assistant message is committed - and carries one accounting\nfact beside it. The two have different owners and different failure\nmodes: a provider stream that ends without ever sending a usage event\nhas said nothing about tokens while having said everything about the\nanswer. Absence is therefore representable here, because the only\nalternatives are to fabricate counters no provider issued or to\nsuppress the completion of a turn the caller has already read.\n\n`usage: None` means exactly \"no accounting exists for this turn\": no\ncounter advanced, and no per-call row should be reconciled for it. The\npaired [`AgentEvent::TurnUsageAccountingUnmeasured`] carries the\nexplanation (which provider and model went unaccounted); this field\nowns only the number's presence or absence. Consumers must skip an\nabsent row, never treat it as zero.",
             "properties": {
               "stop_reason": {
                 "$ref": "#/$defs/StopReason"
@@ -65921,13 +66445,19 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/$defs/TurnUsage"
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TurnUsage"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
               "type",
-              "stop_reason",
-              "usage"
+              "stop_reason"
             ],
             "type": "object"
           },
@@ -65953,10 +66483,10 @@
             "type": "object"
           },
           {
-            "description": "Tool execution completed",
+            "description": "Tool execution completed.\n\n# This carries a SECOND COPY of the result body\n\nThis event and [`AgentEvent::ToolResultReceived`] are both emitted for\nevery tool call, and they differ by exactly one field: `duration_ms`.\nBoth carry the full `content` blocks. The two facts are genuinely\ndistinct and both deserve to exist - `ToolResultReceived` is the\nCONVERSATION fact (this result was injected into the transcript),\nthis is the EXECUTION fact (the call finished, and here is how long it\ntook) - but the cost of the execution fact currently scales with the\nsize of the result rather than with the fact itself.\n\nA consumer that durably persists BOTH events therefore stores every\ntool result body twice. This is not hypothetical: it was measured\nindependently on two adopter fleets with different storage engines and\ndifferent payload shapes - a console frame store (~348 MB against\n~348 MB, pairwise-identical maxima, from 153 camera-tool calls) and a\nwarehouse events table (89,033 rows / 3.35 GB against 88,934 rows /\n1.69 GB). Neither had configured it; both inherited it from this\nvocabulary. Note it is a PER-CALL cost, not a scale problem: one tool\nreturning a large blob is enough.\n\n`id` is present on both events and is already the join key. A consumer\npersisting both should store the body once against `id` and join for\nthe execution fact, rather than capping bytes at its own writer - a cap\napplied downstream still writes the body twice, only smaller, and every\nconsumer would have to reimplement it.",
             "properties": {
               "content": {
-                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.",
+                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.\n\nDuplicates the blocks [`AgentEvent::ToolResultReceived`] carries\nfor the same `id`; see this variant's docs before persisting both.",
                 "items": {
                   "$ref": "#/$defs/ContentBlock"
                 },
@@ -66472,6 +67002,48 @@
             "required": [
               "type",
               "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's provider token accounting was absent.\n\nThe routed form of the `unmeasured:turn_usage_accounting` marker. It\nstates exactly one thing: the provider stream for this turn carried no\nnormalized accounting, so no accounting axis advanced for it - no\nbudget charge, no session usage, no presented-token update.\n\nIt deliberately does NOT claim the turn completed. This is published at\nthe model boundary, before the boundary effects and terminal hooks that\ncan still fail the turn on their own (unrelated) grounds, and the\nabsence of accounting is true either way. Whether the turn completed is\nowned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the\nturns this marker names - and a turn that fails afterwards publishes\nits own terminal fact.\n\nWhat this is not is a cause of failure. A number nobody has cannot\ninvalidate an answer the user has already read; see\n[`crate::UnmeasuredTurnUsageAccounting`].",
+            "properties": {
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_unmeasured",
+                "type": "string"
+              },
+              "unmeasured": {
+                "$ref": "#/$defs/UnmeasuredTurnUsageAccounting"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "unmeasured"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's accounting named a provider/model other than the\nrequest it answered.\n\nThe routed form of the `disputed:turn_usage_accounting_identity`\nmarker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the\ncounters exist and are internally consistent, so the token axis still\nadvances on them; what is in dispute is attribution. The reported\nidentity is published exactly as the adapter minted it and is never\nrewritten to the active identity.",
+            "properties": {
+              "dispute": {
+                "$ref": "#/$defs/DisputedTurnUsageAccountingIdentity"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_identity_disputed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "dispute"
             ],
             "type": "object"
           }
@@ -67226,6 +67798,35 @@
           "provider",
           "model",
           "boundary"
+        ],
+        "type": "object"
+      },
+      "DisputedTurnUsageAccountingIdentity": {
+        "additionalProperties": false,
+        "description": "One turn's provider-authored accounting named a different provider/model\nthan the request it answered.\n\n# Why this is not the same fault as absent accounting\n\nA mismatched identity still arrives with a complete, internally consistent\nmeasurement: the [`PresentedTokenConvention`] travels with the number, so\nthe counters mean what they say regardless of which name is attached. The\ndisputed fact is attribution alone, so the token axis still advances on the\nnumber the provider actually sent. Absent accounting has no number at all\nand therefore cannot advance anything. Collapsing the two would either kill\ncorrect work over a name or fabricate counters over silence.\n\n# Why the reported identity is preserved verbatim\n\nRewriting `reported_*` to the active identity would publish an agreement\nthat was never observed - a guess laundered as evidence. Both sides are\ncarried so a host can see exactly who disagreed with whom.",
+        "properties": {
+          "active_model": {
+            "description": "Model of the request this turn was lowered for.",
+            "type": "string"
+          },
+          "active_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request this turn was lowered for."
+          },
+          "reported_model": {
+            "description": "Model the accounting claims, exactly as the adapter minted it.",
+            "type": "string"
+          },
+          "reported_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider the accounting claims, exactly as the adapter minted it."
+          }
+        },
+        "required": [
+          "active_provider",
+          "active_model",
+          "reported_provider",
+          "reported_model"
         ],
         "type": "object"
       },
@@ -69099,6 +69700,25 @@
           "input_tokens",
           "output_tokens",
           "accounting"
+        ],
+        "type": "object"
+      },
+      "UnmeasuredTurnUsageAccounting": {
+        "additionalProperties": false,
+        "description": "Provider token accounting for one model turn was absent.\n\n# What this makes untrue, and what it does not\n\nA provider that streams a complete answer and no usage event has stated\nnothing about tokens. The turn's SEMANTIC facts - what the model said,\nwhich tools it asked for, what may be committed to the transcript - are\nuntouched by that silence, so this absence terminalizes none of them. Only\nthe accounting axis is affected, and it is affected by being left exactly\nwhere it was: no counter advances, no per-call row is published, and no\nvalue is substituted for the one the provider did not send.\n\nThis value states the absence and nothing more. It does not assert that the\nturn completed: the turn's own terminal fact has its own owner, and a turn\nwhose accounting went missing can still fail afterwards on unrelated\ngrounds.\n\n# Why the identity here is not accounting\n\n`provider` and `model` name the REQUEST this turn was lowered for. They are\nthe address of the missing measurement, not a reconstruction of it, and\ncarry no counters. This is exactly the line\n[`ProviderTokenAccounting::host_declared`] would cross: it would mint\nprovider attribution for numbers no provider issued.",
+        "properties": {
+          "model": {
+            "description": "Model of the request that produced the unaccounted turn.",
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request that produced the unaccounted turn."
+          }
+        },
+        "required": [
+          "provider",
+          "model"
         ],
         "type": "object"
       },
@@ -73904,12 +74524,98 @@
     "title": "JobExecutionActivity",
     "type": "object"
   },
+  "JobHealthCoverage": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Whether the census behind a [`JobHealthSummary`] read every row it needed.\n\n`complete` means every candidate row was read and the phase counts are\nexact. `truncated` means the scan window filled at `scanned` rows out of an\nunknown larger population: the phase counts are a lower bound over the rows\nthat were read, and `status` is `unreadable`.",
+    "oneOf": [
+      {
+        "properties": {
+          "kind": {
+            "const": "complete",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "kind": {
+            "const": "truncated",
+            "type": "string"
+          },
+          "limit": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scanned": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "scanned",
+          "limit"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "JobHealthCoverage"
+  },
   "JobHealthSummary": {
     "$defs": {
+      "JobHealthCoverage": {
+        "description": "Whether the census behind a [`JobHealthSummary`] read every row it needed.\n\n`complete` means every candidate row was read and the phase counts are\nexact. `truncated` means the scan window filled at `scanned` rows out of an\nunknown larger population: the phase counts are a lower bound over the rows\nthat were read, and `status` is `unreadable`.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "complete",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "truncated",
+                "type": "string"
+              },
+              "limit": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "scanned": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "scanned",
+              "limit"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "JobHealthStatus": {
+        "description": "Rung of a job-health census.\n\n`unreadable` is not a rung between `ok` and `degraded`: it says the census\ndid not establish anything, because a read failed or the scan stopped at\nits window. It is distinct from `degraded` on purpose - `degraded` asserts\nthat some job is wedged, and a scan that never reached the rows observed no\nsuch thing, so an operator paging on `degraded` can trust that something\nwas actually seen.",
         "enum": [
           "ok",
-          "degraded"
+          "degraded",
+          "unreadable"
         ],
         "type": "string"
       }
@@ -73921,12 +74627,16 @@
         "minimum": 0,
         "type": "integer"
       },
-      "delivery_backlog": {
+      "coverage": {
+        "$ref": "#/$defs/JobHealthCoverage"
+      },
+      "needs_attention": {
         "format": "uint64",
         "minimum": 0,
         "type": "integer"
       },
-      "needs_attention": {
+      "pending_outbox_jobs": {
+        "description": "Jobs holding at least one unapplied outbox entry, in this realm.\n\nExact and uncapped, and counted in JOBS rather than entries. Kept\nseparate from `runtime_inbox_backlog` because the two name different\nwedges: this one is a job whose delivery was never handed to a runtime,\nthat one is a delivery a runtime accepted and never drained.",
         "format": "uint64",
         "minimum": 0,
         "type": "integer"
@@ -73937,6 +74647,12 @@
         "type": "integer"
       },
       "running": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "runtime_inbox_backlog": {
+        "description": "Committed-but-undrained runtime deliveries in this host's store.\n\nHost-store scoped, not realm scoped: one durable runtime store serves\nevery session the host built, including sessions under other logical\nrealm ids, and a runtime id carries no realm.",
         "format": "uint64",
         "minimum": 0,
         "type": "integer"
@@ -73957,7 +74673,9 @@
       "awaiting_members",
       "stale_leases",
       "needs_attention",
-      "delivery_backlog"
+      "pending_outbox_jobs",
+      "runtime_inbox_backlog",
+      "coverage"
     ],
     "title": "JobHealthSummary",
     "type": "object"
@@ -74756,10 +75474,53 @@
   },
   "JobsHealthResult": {
     "$defs": {
+      "JobHealthCoverage": {
+        "description": "Whether the census behind a [`JobHealthSummary`] read every row it needed.\n\n`complete` means every candidate row was read and the phase counts are\nexact. `truncated` means the scan window filled at `scanned` rows out of an\nunknown larger population: the phase counts are a lower bound over the rows\nthat were read, and `status` is `unreadable`.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "complete",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "truncated",
+                "type": "string"
+              },
+              "limit": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "scanned": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "scanned",
+              "limit"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "JobHealthStatus": {
+        "description": "Rung of a job-health census.\n\n`unreadable` is not a rung between `ok` and `degraded`: it says the census\ndid not establish anything, because a read failed or the scan stopped at\nits window. It is distinct from `degraded` on purpose - `degraded` asserts\nthat some job is wedged, and a scan that never reached the rows observed no\nsuch thing, so an operator paging on `degraded` can trust that something\nwas actually seen.",
         "enum": [
           "ok",
-          "degraded"
+          "degraded",
+          "unreadable"
         ],
         "type": "string"
       },
@@ -74770,12 +75531,16 @@
             "minimum": 0,
             "type": "integer"
           },
-          "delivery_backlog": {
+          "coverage": {
+            "$ref": "#/$defs/JobHealthCoverage"
+          },
+          "needs_attention": {
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
           },
-          "needs_attention": {
+          "pending_outbox_jobs": {
+            "description": "Jobs holding at least one unapplied outbox entry, in this realm.\n\nExact and uncapped, and counted in JOBS rather than entries. Kept\nseparate from `runtime_inbox_backlog` because the two name different\nwedges: this one is a job whose delivery was never handed to a runtime,\nthat one is a delivery a runtime accepted and never drained.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
@@ -74786,6 +75551,12 @@
             "type": "integer"
           },
           "running": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "runtime_inbox_backlog": {
+            "description": "Committed-but-undrained runtime deliveries in this host's store.\n\nHost-store scoped, not realm scoped: one durable runtime store serves\nevery session the host built, including sessions under other logical\nrealm ids, and a runtime id carries no realm.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
@@ -74806,7 +75577,9 @@
           "awaiting_members",
           "stale_leases",
           "needs_attention",
-          "delivery_backlog"
+          "pending_outbox_jobs",
+          "runtime_inbox_backlog",
+          "coverage"
         ],
         "type": "object"
       }
@@ -93374,7 +94147,7 @@
         "type": "string"
       },
       "BudgetLimits": {
-        "description": "Resource limits for an agent run",
+        "description": "Resource limits for an agent run\n\n# Two time horizons, one owner\n\n[`Budget`] is the single owner of \"may this run continue in time\". It\ncarries two independent horizons because they answer different questions\nand are measured from different epochs:\n\n- [`BudgetLimits::max_duration`] is the **agent-lifetime** horizon. Its\n  epoch is [`Budget::new`], which service-backed surfaces call once when the\n  session's agent is built, not once per turn. It therefore spans every turn\n  of that agent, including the idle wall-clock between turns.\n- [`BudgetLimits::max_turn_duration`] is the **per-turn aggregate** horizon.\n  Its epoch is re-armed by [`Budget::begin_turn`] at each run entry, so it\n  bounds one turn end-to-end regardless of how many LLM calls, retries, and\n  tool batches that turn contains.\n\nEvery segment of a turn already carries its own bound (per-call LLM timeout,\nstream-inactivity watchdog, per-tool-call timeout). Before\n`max_turn_duration` existed, the *sum* of those segments was unbounded: a\nturn could legally spend an hour without any owner asking whether it was\nallowed to. `max_turn_duration` is that owner.",
         "properties": {
           "max_duration": {
             "anyOf": [
@@ -93385,7 +94158,7 @@
                 "type": "null"
               }
             ],
-            "description": "Maximum duration"
+            "description": "Maximum agent-lifetime duration, measured from [`Budget::new`].\n\nThis is NOT a per-turn deadline: the epoch is agent construction, which\nfor `SessionService`-backed surfaces is session creation, and it is\nnever re-armed. Use [`BudgetLimits::max_turn_duration`] to bound one\nturn."
           },
           "max_tokens": {
             "description": "Maximum tokens to consume",
@@ -93404,6 +94177,17 @@
               "integer",
               "null"
             ]
+          },
+          "max_turn_duration": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Duration"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Maximum aggregate wall-clock for a single turn, re-armed at each run\nentry by [`Budget::begin_turn`].\n\n`None` (the default) means turns are unbounded in aggregate: every\nsegment still carries its own timeout, but their sum has no ceiling.\nAbsence is representable and never substituted with an invented\ndefault; a deployment that leaves this unset has chosen unbounded\nturns.\n\n`skip_serializing_if` is load-bearing, not style: a spec carrying no\nturn ceiling must keep its historical canonical bytes so the frozen\n`spec_digest` pin (`meerkat_contracts::wire::spec_digest`) and every\ndigest already recorded in host stores still match. Same reasoning as\n`PortableToolConfig.read_only` in 0.8.23."
           }
         },
         "type": "object"
@@ -96070,7 +96854,7 @@
         "type": "string"
       },
       "BudgetLimits": {
-        "description": "Resource limits for an agent run",
+        "description": "Resource limits for an agent run\n\n# Two time horizons, one owner\n\n[`Budget`] is the single owner of \"may this run continue in time\". It\ncarries two independent horizons because they answer different questions\nand are measured from different epochs:\n\n- [`BudgetLimits::max_duration`] is the **agent-lifetime** horizon. Its\n  epoch is [`Budget::new`], which service-backed surfaces call once when the\n  session's agent is built, not once per turn. It therefore spans every turn\n  of that agent, including the idle wall-clock between turns.\n- [`BudgetLimits::max_turn_duration`] is the **per-turn aggregate** horizon.\n  Its epoch is re-armed by [`Budget::begin_turn`] at each run entry, so it\n  bounds one turn end-to-end regardless of how many LLM calls, retries, and\n  tool batches that turn contains.\n\nEvery segment of a turn already carries its own bound (per-call LLM timeout,\nstream-inactivity watchdog, per-tool-call timeout). Before\n`max_turn_duration` existed, the *sum* of those segments was unbounded: a\nturn could legally spend an hour without any owner asking whether it was\nallowed to. `max_turn_duration` is that owner.",
         "properties": {
           "max_duration": {
             "anyOf": [
@@ -96081,7 +96865,7 @@
                 "type": "null"
               }
             ],
-            "description": "Maximum duration"
+            "description": "Maximum agent-lifetime duration, measured from [`Budget::new`].\n\nThis is NOT a per-turn deadline: the epoch is agent construction, which\nfor `SessionService`-backed surfaces is session creation, and it is\nnever re-armed. Use [`BudgetLimits::max_turn_duration`] to bound one\nturn."
           },
           "max_tokens": {
             "description": "Maximum tokens to consume",
@@ -96100,6 +96884,17 @@
               "integer",
               "null"
             ]
+          },
+          "max_turn_duration": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Duration"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Maximum aggregate wall-clock for a single turn, re-armed at each run\nentry by [`Budget::begin_turn`].\n\n`None` (the default) means turns are unbounded in aggregate: every\nsegment still carries its own timeout, but their sum has no ceiling.\nAbsence is representable and never substituted with an invented\ndefault; a deployment that leaves this unset has chosen unbounded\nturns.\n\n`skip_serializing_if` is load-bearing, not style: a spec carrying no\nturn ceiling must keep its historical canonical bytes so the frozen\n`spec_digest` pin (`meerkat_contracts::wire::spec_digest`) and every\ndigest already recorded in host stores still match. Same reasoning as\n`PortableToolConfig.read_only` in 0.8.23."
           }
         },
         "type": "object"
@@ -112448,7 +113243,7 @@
             "type": "object"
           },
           {
-            "description": "Tool result received (injected into conversation)",
+            "description": "Tool result received (injected into conversation).\n\nThe conversation-level fact for a tool call: this result entered the\ntranscript. [`AgentEvent::ToolExecutionCompleted`] is the paired\nexecution-level fact for the same `id` and currently carries a full\ncopy of these same blocks - see that variant before persisting both, or\na durable consumer stores every result body twice.",
             "properties": {
               "content": {
                 "items": {
@@ -112480,7 +113275,7 @@
             "type": "object"
           },
           {
-            "description": "Turn completed",
+            "description": "Turn completed.\n\n# Why `usage` is optional\n\nThis event states one semantic fact - a model turn reached its terminal\nand its assistant message is committed - and carries one accounting\nfact beside it. The two have different owners and different failure\nmodes: a provider stream that ends without ever sending a usage event\nhas said nothing about tokens while having said everything about the\nanswer. Absence is therefore representable here, because the only\nalternatives are to fabricate counters no provider issued or to\nsuppress the completion of a turn the caller has already read.\n\n`usage: None` means exactly \"no accounting exists for this turn\": no\ncounter advanced, and no per-call row should be reconciled for it. The\npaired [`AgentEvent::TurnUsageAccountingUnmeasured`] carries the\nexplanation (which provider and model went unaccounted); this field\nowns only the number's presence or absence. Consumers must skip an\nabsent row, never treat it as zero.",
             "properties": {
               "stop_reason": {
                 "$ref": "#/$defs/StopReason"
@@ -112490,13 +113285,19 @@
                 "type": "string"
               },
               "usage": {
-                "$ref": "#/$defs/TurnUsage"
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TurnUsage"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
               "type",
-              "stop_reason",
-              "usage"
+              "stop_reason"
             ],
             "type": "object"
           },
@@ -112522,10 +113323,10 @@
             "type": "object"
           },
           {
-            "description": "Tool execution completed",
+            "description": "Tool execution completed.\n\n# This carries a SECOND COPY of the result body\n\nThis event and [`AgentEvent::ToolResultReceived`] are both emitted for\nevery tool call, and they differ by exactly one field: `duration_ms`.\nBoth carry the full `content` blocks. The two facts are genuinely\ndistinct and both deserve to exist - `ToolResultReceived` is the\nCONVERSATION fact (this result was injected into the transcript),\nthis is the EXECUTION fact (the call finished, and here is how long it\ntook) - but the cost of the execution fact currently scales with the\nsize of the result rather than with the fact itself.\n\nA consumer that durably persists BOTH events therefore stores every\ntool result body twice. This is not hypothetical: it was measured\nindependently on two adopter fleets with different storage engines and\ndifferent payload shapes - a console frame store (~348 MB against\n~348 MB, pairwise-identical maxima, from 153 camera-tool calls) and a\nwarehouse events table (89,033 rows / 3.35 GB against 88,934 rows /\n1.69 GB). Neither had configured it; both inherited it from this\nvocabulary. Note it is a PER-CALL cost, not a scale problem: one tool\nreturning a large blob is enough.\n\n`id` is present on both events and is already the join key. A consumer\npersisting both should store the body once against `id` and join for\nthe execution fact, rather than capping bytes at its own writer - a cap\napplied downstream still writes the body twice, only smaller, and every\nconsumer would have to reimplement it.",
             "properties": {
               "content": {
-                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.",
+                "description": "Canonical typed tool-result content. Display text is derived from\nthese blocks at the consumer edge, never carried beside them.\n\nDuplicates the blocks [`AgentEvent::ToolResultReceived`] carries\nfor the same `id`; see this variant's docs before persisting both.",
                 "items": {
                   "$ref": "#/$defs/ContentBlock"
                 },
@@ -113041,6 +113842,48 @@
             "required": [
               "type",
               "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's provider token accounting was absent.\n\nThe routed form of the `unmeasured:turn_usage_accounting` marker. It\nstates exactly one thing: the provider stream for this turn carried no\nnormalized accounting, so no accounting axis advanced for it - no\nbudget charge, no session usage, no presented-token update.\n\nIt deliberately does NOT claim the turn completed. This is published at\nthe model boundary, before the boundary effects and terminal hooks that\ncan still fail the turn on their own (unrelated) grounds, and the\nabsence of accounting is true either way. Whether the turn completed is\nowned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the\nturns this marker names - and a turn that fails afterwards publishes\nits own terminal fact.\n\nWhat this is not is a cause of failure. A number nobody has cannot\ninvalidate an answer the user has already read; see\n[`crate::UnmeasuredTurnUsageAccounting`].",
+            "properties": {
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_unmeasured",
+                "type": "string"
+              },
+              "unmeasured": {
+                "$ref": "#/$defs/UnmeasuredTurnUsageAccounting"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "unmeasured"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One model turn's accounting named a provider/model other than the\nrequest it answered.\n\nThe routed form of the `disputed:turn_usage_accounting_identity`\nmarker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the\ncounters exist and are internally consistent, so the token axis still\nadvances on them; what is in dispute is attribution. The reported\nidentity is published exactly as the adapter minted it and is never\nrewritten to the active identity.",
+            "properties": {
+              "dispute": {
+                "$ref": "#/$defs/DisputedTurnUsageAccountingIdentity"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": {
+                "const": "turn_usage_accounting_identity_disputed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "dispute"
             ],
             "type": "object"
           }
@@ -113769,6 +114612,35 @@
           "provider",
           "model",
           "boundary"
+        ],
+        "type": "object"
+      },
+      "DisputedTurnUsageAccountingIdentity": {
+        "additionalProperties": false,
+        "description": "One turn's provider-authored accounting named a different provider/model\nthan the request it answered.\n\n# Why this is not the same fault as absent accounting\n\nA mismatched identity still arrives with a complete, internally consistent\nmeasurement: the [`PresentedTokenConvention`] travels with the number, so\nthe counters mean what they say regardless of which name is attached. The\ndisputed fact is attribution alone, so the token axis still advances on the\nnumber the provider actually sent. Absent accounting has no number at all\nand therefore cannot advance anything. Collapsing the two would either kill\ncorrect work over a name or fabricate counters over silence.\n\n# Why the reported identity is preserved verbatim\n\nRewriting `reported_*` to the active identity would publish an agreement\nthat was never observed - a guess laundered as evidence. Both sides are\ncarried so a host can see exactly who disagreed with whom.",
+        "properties": {
+          "active_model": {
+            "description": "Model of the request this turn was lowered for.",
+            "type": "string"
+          },
+          "active_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request this turn was lowered for."
+          },
+          "reported_model": {
+            "description": "Model the accounting claims, exactly as the adapter minted it.",
+            "type": "string"
+          },
+          "reported_provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider the accounting claims, exactly as the adapter minted it."
+          }
+        },
+        "required": [
+          "active_provider",
+          "active_model",
+          "reported_provider",
+          "reported_model"
         ],
         "type": "object"
       },
@@ -115617,6 +116489,25 @@
           "input_tokens",
           "output_tokens",
           "accounting"
+        ],
+        "type": "object"
+      },
+      "UnmeasuredTurnUsageAccounting": {
+        "additionalProperties": false,
+        "description": "Provider token accounting for one model turn was absent.\n\n# What this makes untrue, and what it does not\n\nA provider that streams a complete answer and no usage event has stated\nnothing about tokens. The turn's SEMANTIC facts - what the model said,\nwhich tools it asked for, what may be committed to the transcript - are\nuntouched by that silence, so this absence terminalizes none of them. Only\nthe accounting axis is affected, and it is affected by being left exactly\nwhere it was: no counter advances, no per-call row is published, and no\nvalue is substituted for the one the provider did not send.\n\nThis value states the absence and nothing more. It does not assert that the\nturn completed: the turn's own terminal fact has its own owner, and a turn\nwhose accounting went missing can still fail afterwards on unrelated\ngrounds.\n\n# Why the identity here is not accounting\n\n`provider` and `model` name the REQUEST this turn was lowered for. They are\nthe address of the missing measurement, not a reconstruction of it, and\ncarry no counters. This is exactly the line\n[`ProviderTokenAccounting::host_declared`] would cross: it would mint\nprovider attribution for numbers no provider issued.",
+        "properties": {
+          "model": {
+            "description": "Model of the request that produced the unaccounted turn.",
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider",
+            "description": "Provider of the request that produced the unaccounted turn."
+          }
+        },
+        "required": [
+          "provider",
+          "model"
         ],
         "type": "object"
       },

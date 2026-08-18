@@ -64,6 +64,23 @@ TerminalStutter ==
     /\ phase = "Succeeded" \/ phase = "Failed" \/ phase = "Cancelled" \/ phase = "WorkerLost" \/ phase = "NeedsAttention"
     /\ UNCHANGED vars
 
+\* Named UNCHANGED frames. One definition per distinct frame; every action
+\* that leaves those variables unchanged references the definition by name.
+UnchangedFrame_00a452fa4cc718bb == UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+UnchangedFrame_3a5843a4ed579a65 == UNCHANGED << job_id, restart_class, checkpoint_ref, progress_cursor, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+UnchangedFrame_45de88d8b6f2bd60 == UNCHANGED << attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+UnchangedFrame_5e36bcf22033484b == UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+UnchangedFrame_62df8988a689d1a1 == UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+UnchangedFrame_67cc11bdbd6b59f8 == UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence >>
+UnchangedFrame_6a2368947c4d0d9a == UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+UnchangedFrame_7468de882ad45281 == UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+UnchangedFrame_8369fc6d372f51cc == UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+UnchangedFrame_a18023e59389a49e == UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+UnchangedFrame_b0c9d3b6b38c4ae5 == UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+UnchangedFrame_c1c16a30acd6351c == UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+UnchangedFrame_cb074d8a0d7ceda7 == UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+UnchangedFrame_fbd9e3fab5adcf39 == UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+
 SubmitQueued(arg_job_id, arg_restart_class) ==
     /\ phase = "Unsubmitted"
     /\ (arg_job_id # "")
@@ -71,7 +88,7 @@ SubmitQueued(arg_job_id, arg_restart_class) ==
     /\ model_step_count' = model_step_count + 1
     /\ job_id' = arg_job_id
     /\ restart_class' = arg_restart_class
-    /\ UNCHANGED << attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_45de88d8b6f2bd60
 
 
 ClaimQueued(attempt_id, worker_id, claimed_at_ms, arg_lease_expires_at_ms, arg_runner_handle) ==
@@ -89,7 +106,7 @@ ClaimQueued(attempt_id, worker_id, claimed_at_ms, arg_lease_expires_at_ms, arg_r
     /\ lease_expired' = FALSE
     /\ retry_due_at_ms' = None
     /\ cancel_requested' = FALSE
-    /\ UNCHANGED << job_id, restart_class, checkpoint_ref, progress_cursor, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_3a5843a4ed579a65
 
 
 ClaimRetryScheduled(attempt_id, worker_id, claimed_at_ms, arg_lease_expires_at_ms, arg_runner_handle) ==
@@ -107,7 +124,7 @@ ClaimRetryScheduled(attempt_id, worker_id, claimed_at_ms, arg_lease_expires_at_m
     /\ lease_expired' = FALSE
     /\ retry_due_at_ms' = None
     /\ cancel_requested' = FALSE
-    /\ UNCHANGED << job_id, restart_class, checkpoint_ref, progress_cursor, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_3a5843a4ed579a65
 
 
 RenewRunningLease(attempt_id, fence, arg_heartbeat_at_ms, arg_lease_expires_at_ms) ==
@@ -117,7 +134,7 @@ RenewRunningLease(attempt_id, fence, arg_heartbeat_at_ms, arg_lease_expires_at_m
     /\ model_step_count' = model_step_count + 1
     /\ lease_expires_at_ms' = Some(arg_lease_expires_at_ms)
     /\ heartbeat_at_ms' = Some(arg_heartbeat_at_ms)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_8369fc6d372f51cc
 
 
 RenewExternalWaitLease(attempt_id, fence, arg_heartbeat_at_ms, arg_lease_expires_at_ms) ==
@@ -127,7 +144,7 @@ RenewExternalWaitLease(attempt_id, fence, arg_heartbeat_at_ms, arg_lease_expires
     /\ model_step_count' = model_step_count + 1
     /\ lease_expires_at_ms' = Some(arg_lease_expires_at_ms)
     /\ heartbeat_at_ms' = Some(arg_heartbeat_at_ms)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_8369fc6d372f51cc
 
 
 ReportRunningProgress(attempt_id, fence, cursor, observed_at_ms) ==
@@ -136,7 +153,7 @@ ReportRunningProgress(attempt_id, fence, cursor, observed_at_ms) ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ progress_cursor' = cursor
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_00a452fa4cc718bb
 
 
 ReportExternalWaitProgress(attempt_id, fence, cursor, observed_at_ms) ==
@@ -145,7 +162,7 @@ ReportExternalWaitProgress(attempt_id, fence, cursor, observed_at_ms) ==
     /\ phase' = "WaitingExternal"
     /\ model_step_count' = model_step_count + 1
     /\ progress_cursor' = cursor
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_00a452fa4cc718bb
 
 
 EmitRunningNotification(attempt_id, fence, notification_id, idempotency_key, runtime_delivery_id, observed_at_ms) ==
@@ -159,7 +176,7 @@ EmitRunningNotification(attempt_id, fence, notification_id, idempotency_key, run
     /\ notification_id_by_key' = MapSet(notification_id_by_key, idempotency_key, notification_id)
     /\ notification_delivery_ids' = MapSet(notification_delivery_ids, notification_id, runtime_delivery_id)
     /\ notification_sequences' = MapSet(notification_sequences, notification_id, (delivery_sequence) + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_62df8988a689d1a1
 
 
 EmitExternalWaitNotification(attempt_id, fence, notification_id, idempotency_key, runtime_delivery_id, observed_at_ms) ==
@@ -173,7 +190,7 @@ EmitExternalWaitNotification(attempt_id, fence, notification_id, idempotency_key
     /\ notification_id_by_key' = MapSet(notification_id_by_key, idempotency_key, notification_id)
     /\ notification_delivery_ids' = MapSet(notification_delivery_ids, notification_id, runtime_delivery_id)
     /\ notification_sequences' = MapSet(notification_sequences, notification_id, (delivery_sequence) + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_62df8988a689d1a1
 
 
 SuppressRunningNotificationReplay(attempt_id, fence, notification_id, idempotency_key, runtime_delivery_id, observed_at_ms) ==
@@ -181,7 +198,7 @@ SuppressRunningNotificationReplay(attempt_id, fence, notification_id, idempotenc
     /\ ((current_attempt_id = Some(attempt_id)) /\ (current_fence = fence) /\ (lease_expired = FALSE) /\ (lease_expires_at_ms # None) /\ (observed_at_ms <= (IF "value" \in DOMAIN lease_expires_at_ms THEN lease_expires_at_ms["value"] ELSE None)) /\ (notification_id # "") /\ (runtime_delivery_id # "") /\ (idempotency_key \in notification_idempotency_keys))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 SuppressExternalWaitNotificationReplay(attempt_id, fence, notification_id, idempotency_key, runtime_delivery_id, observed_at_ms) ==
@@ -189,7 +206,7 @@ SuppressExternalWaitNotificationReplay(attempt_id, fence, notification_id, idemp
     /\ ((current_attempt_id = Some(attempt_id)) /\ (current_fence = fence) /\ (lease_expired = FALSE) /\ (lease_expires_at_ms # None) /\ (observed_at_ms <= (IF "value" \in DOMAIN lease_expires_at_ms THEN lease_expires_at_ms["value"] ELSE None)) /\ (notification_id # "") /\ (runtime_delivery_id # "") /\ (idempotency_key \in notification_idempotency_keys))
     /\ phase' = "WaitingExternal"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 RecordRunningCheckpoint(attempt_id, fence, arg_checkpoint_ref, observed_at_ms) ==
@@ -198,7 +215,7 @@ RecordRunningCheckpoint(attempt_id, fence, arg_checkpoint_ref, observed_at_ms) =
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ checkpoint_ref' = Some(arg_checkpoint_ref)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_7468de882ad45281
 
 
 RecordExternalWaitCheckpoint(attempt_id, fence, arg_checkpoint_ref, observed_at_ms) ==
@@ -207,7 +224,7 @@ RecordExternalWaitCheckpoint(attempt_id, fence, arg_checkpoint_ref, observed_at_
     /\ phase' = "WaitingExternal"
     /\ model_step_count' = model_step_count + 1
     /\ checkpoint_ref' = Some(arg_checkpoint_ref)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_7468de882ad45281
 
 
 WaitExternalFromRunning(attempt_id, fence, observed_at_ms) ==
@@ -215,7 +232,7 @@ WaitExternalFromRunning(attempt_id, fence, observed_at_ms) ==
     /\ ((current_attempt_id = Some(attempt_id)) /\ (current_fence = fence) /\ (lease_expired = FALSE) /\ (lease_expires_at_ms # None) /\ (observed_at_ms <= (IF "value" \in DOMAIN lease_expires_at_ms THEN lease_expires_at_ms["value"] ELSE None)))
     /\ phase' = "WaitingExternal"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ResumeRunningFromExternal(attempt_id, fence, observed_at_ms) ==
@@ -223,7 +240,7 @@ ResumeRunningFromExternal(attempt_id, fence, observed_at_ms) ==
     /\ ((current_attempt_id = Some(attempt_id)) /\ (current_fence = fence) /\ (lease_expired = FALSE) /\ (lease_expires_at_ms # None) /\ (observed_at_ms <= (IF "value" \in DOMAIN lease_expires_at_ms THEN lease_expires_at_ms["value"] ELSE None)))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 RequestCancelRunning ==
@@ -232,7 +249,7 @@ RequestCancelRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ cancel_requested' = TRUE
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_c1c16a30acd6351c
 
 
 RequestCancelWaitingExternal ==
@@ -241,7 +258,7 @@ RequestCancelWaitingExternal ==
     /\ phase' = "WaitingExternal"
     /\ model_step_count' = model_step_count + 1
     /\ cancel_requested' = TRUE
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_c1c16a30acd6351c
 
 
 RequestCancelAlreadyRequestedRunning ==
@@ -249,7 +266,7 @@ RequestCancelAlreadyRequestedRunning ==
     /\ cancel_requested
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 RequestCancelAlreadyRequestedWaitingExternal ==
@@ -257,14 +274,14 @@ RequestCancelAlreadyRequestedWaitingExternal ==
     /\ cancel_requested
     /\ phase' = "WaitingExternal"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 RequestCancelAlreadyCancelled ==
     /\ phase = "Cancelled"
     /\ phase' = "Cancelled"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 RequestCancelQueued ==
@@ -275,7 +292,7 @@ RequestCancelQueued ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("Cancelled")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_a18023e59389a49e
 
 
 RequestCancelRetryScheduled ==
@@ -286,7 +303,7 @@ RequestCancelRetryScheduled ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("Cancelled")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_a18023e59389a49e
 
 
 RequestCancelLossObserved ==
@@ -297,7 +314,7 @@ RequestCancelLossObserved ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("Cancelled")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_a18023e59389a49e
 
 
 LeaseExpiresRunning(attempt_id, fence, observed_at_ms) ==
@@ -306,7 +323,7 @@ LeaseExpiresRunning(attempt_id, fence, observed_at_ms) ==
     /\ phase' = "LossObserved"
     /\ model_step_count' = model_step_count + 1
     /\ lease_expired' = TRUE
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_fbd9e3fab5adcf39
 
 
 LeaseExpiresWaitingExternal(attempt_id, fence, observed_at_ms) ==
@@ -315,7 +332,7 @@ LeaseExpiresWaitingExternal(attempt_id, fence, observed_at_ms) ==
     /\ phase' = "LossObserved"
     /\ model_step_count' = model_step_count + 1
     /\ lease_expired' = TRUE
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_fbd9e3fab5adcf39
 
 
 ScheduleRetryAfterLoss(arg_retry_due_at_ms) ==
@@ -324,7 +341,7 @@ ScheduleRetryAfterLoss(arg_retry_due_at_ms) ==
     /\ phase' = "RetryScheduled"
     /\ model_step_count' = model_step_count + 1
     /\ retry_due_at_ms' = Some(arg_retry_due_at_ms)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_cb074d8a0d7ceda7
 
 
 ClassifyNonResumableWorkerLoss(observed_at_ms) ==
@@ -335,7 +352,7 @@ ClassifyNonResumableWorkerLoss(observed_at_ms) ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("WorkerLost")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_5e36bcf22033484b
 
 
 CompleteRunningAttempt(attempt_id, fence, completed_at_ms) ==
@@ -346,7 +363,7 @@ CompleteRunningAttempt(attempt_id, fence, completed_at_ms) ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("Succeeded")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_5e36bcf22033484b
 
 
 CompleteWaitingExternalAttempt(attempt_id, fence, completed_at_ms) ==
@@ -357,7 +374,7 @@ CompleteWaitingExternalAttempt(attempt_id, fence, completed_at_ms) ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("Succeeded")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_5e36bcf22033484b
 
 
 FailRunningAttempt(attempt_id, fence, failed_at_ms) ==
@@ -368,7 +385,7 @@ FailRunningAttempt(attempt_id, fence, failed_at_ms) ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("Failed")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_5e36bcf22033484b
 
 
 FailWaitingExternalAttempt(attempt_id, fence, failed_at_ms) ==
@@ -379,7 +396,7 @@ FailWaitingExternalAttempt(attempt_id, fence, failed_at_ms) ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("Failed")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_5e36bcf22033484b
 
 
 AcknowledgeRunningCancel(attempt_id, fence, acknowledged_at_ms) ==
@@ -390,7 +407,7 @@ AcknowledgeRunningCancel(attempt_id, fence, acknowledged_at_ms) ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("Cancelled")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_5e36bcf22033484b
 
 
 AcknowledgeWaitingExternalCancel(attempt_id, fence, acknowledged_at_ms) ==
@@ -401,7 +418,7 @@ AcknowledgeWaitingExternalCancel(attempt_id, fence, acknowledged_at_ms) ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("Cancelled")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_5e36bcf22033484b
 
 
 MarkQueuedNeedsAttention(observed_at_ms) ==
@@ -412,7 +429,7 @@ MarkQueuedNeedsAttention(observed_at_ms) ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("NeedsAttention")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_5e36bcf22033484b
 
 
 MarkRunningNeedsAttention(observed_at_ms) ==
@@ -423,7 +440,7 @@ MarkRunningNeedsAttention(observed_at_ms) ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("NeedsAttention")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_5e36bcf22033484b
 
 
 MarkWaitingExternalNeedsAttention(observed_at_ms) ==
@@ -434,7 +451,7 @@ MarkWaitingExternalNeedsAttention(observed_at_ms) ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("NeedsAttention")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_5e36bcf22033484b
 
 
 MarkLossObservedNeedsAttention(observed_at_ms) ==
@@ -445,7 +462,7 @@ MarkLossObservedNeedsAttention(observed_at_ms) ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("NeedsAttention")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_5e36bcf22033484b
 
 
 MarkRetryScheduledNeedsAttention(observed_at_ms) ==
@@ -456,7 +473,7 @@ MarkRetryScheduledNeedsAttention(observed_at_ms) ==
     /\ delivery_sequence' = (delivery_sequence) + 1
     /\ terminal_kind' = Some("NeedsAttention")
     /\ terminal_delivery_sequence' = (delivery_sequence + 1)
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_delivery_applied >>
+    /\ UnchangedFrame_5e36bcf22033484b
 
 
 ApplySucceededDelivery(delivery_id, arg_delivery_sequence) ==
@@ -465,7 +482,7 @@ ApplySucceededDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "Succeeded"
     /\ model_step_count' = model_step_count + 1
     /\ terminal_delivery_applied' = TRUE
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence >>
+    /\ UnchangedFrame_67cc11bdbd6b59f8
 
 
 ApplyFailedDelivery(delivery_id, arg_delivery_sequence) ==
@@ -474,7 +491,7 @@ ApplyFailedDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "Failed"
     /\ model_step_count' = model_step_count + 1
     /\ terminal_delivery_applied' = TRUE
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence >>
+    /\ UnchangedFrame_67cc11bdbd6b59f8
 
 
 ApplyCancelledDelivery(delivery_id, arg_delivery_sequence) ==
@@ -483,7 +500,7 @@ ApplyCancelledDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "Cancelled"
     /\ model_step_count' = model_step_count + 1
     /\ terminal_delivery_applied' = TRUE
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence >>
+    /\ UnchangedFrame_67cc11bdbd6b59f8
 
 
 ApplyWorkerLostDelivery(delivery_id, arg_delivery_sequence) ==
@@ -492,7 +509,7 @@ ApplyWorkerLostDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "WorkerLost"
     /\ model_step_count' = model_step_count + 1
     /\ terminal_delivery_applied' = TRUE
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence >>
+    /\ UnchangedFrame_67cc11bdbd6b59f8
 
 
 ApplyNeedsAttentionDelivery(delivery_id, arg_delivery_sequence) ==
@@ -501,7 +518,7 @@ ApplyNeedsAttentionDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "NeedsAttention"
     /\ model_step_count' = model_step_count + 1
     /\ terminal_delivery_applied' = TRUE
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence >>
+    /\ UnchangedFrame_67cc11bdbd6b59f8
 
 
 ObserveSucceededDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -509,7 +526,7 @@ ObserveSucceededDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
     /\ ((delivery_id = "terminal") /\ terminal_delivery_applied /\ (arg_delivery_sequence = terminal_delivery_sequence))
     /\ phase' = "Succeeded"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ObserveFailedDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -517,7 +534,7 @@ ObserveFailedDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
     /\ ((delivery_id = "terminal") /\ terminal_delivery_applied /\ (arg_delivery_sequence = terminal_delivery_sequence))
     /\ phase' = "Failed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ObserveCancelledDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -525,7 +542,7 @@ ObserveCancelledDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
     /\ ((delivery_id = "terminal") /\ terminal_delivery_applied /\ (arg_delivery_sequence = terminal_delivery_sequence))
     /\ phase' = "Cancelled"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ObserveWorkerLostDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -533,7 +550,7 @@ ObserveWorkerLostDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
     /\ ((delivery_id = "terminal") /\ terminal_delivery_applied /\ (arg_delivery_sequence = terminal_delivery_sequence))
     /\ phase' = "WorkerLost"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ObserveNeedsAttentionDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -541,7 +558,7 @@ ObserveNeedsAttentionDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) 
     /\ ((delivery_id = "terminal") /\ terminal_delivery_applied /\ (arg_delivery_sequence = terminal_delivery_sequence))
     /\ phase' = "NeedsAttention"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ApplyRunningNotificationDelivery(delivery_id, arg_delivery_sequence) ==
@@ -550,7 +567,7 @@ ApplyRunningNotificationDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ notification_applied' = (notification_applied \cup {delivery_id})
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_6a2368947c4d0d9a
 
 
 ApplyWaitingExternalNotificationDelivery(delivery_id, arg_delivery_sequence) ==
@@ -559,7 +576,7 @@ ApplyWaitingExternalNotificationDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "WaitingExternal"
     /\ model_step_count' = model_step_count + 1
     /\ notification_applied' = (notification_applied \cup {delivery_id})
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_6a2368947c4d0d9a
 
 
 ApplyLossObservedNotificationDelivery(delivery_id, arg_delivery_sequence) ==
@@ -568,7 +585,7 @@ ApplyLossObservedNotificationDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "LossObserved"
     /\ model_step_count' = model_step_count + 1
     /\ notification_applied' = (notification_applied \cup {delivery_id})
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_6a2368947c4d0d9a
 
 
 ApplyRetryScheduledNotificationDelivery(delivery_id, arg_delivery_sequence) ==
@@ -577,7 +594,7 @@ ApplyRetryScheduledNotificationDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "RetryScheduled"
     /\ model_step_count' = model_step_count + 1
     /\ notification_applied' = (notification_applied \cup {delivery_id})
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_6a2368947c4d0d9a
 
 
 ApplySucceededNotificationDelivery(delivery_id, arg_delivery_sequence) ==
@@ -586,7 +603,7 @@ ApplySucceededNotificationDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "Succeeded"
     /\ model_step_count' = model_step_count + 1
     /\ notification_applied' = (notification_applied \cup {delivery_id})
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_6a2368947c4d0d9a
 
 
 ApplyFailedNotificationDelivery(delivery_id, arg_delivery_sequence) ==
@@ -595,7 +612,7 @@ ApplyFailedNotificationDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "Failed"
     /\ model_step_count' = model_step_count + 1
     /\ notification_applied' = (notification_applied \cup {delivery_id})
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_6a2368947c4d0d9a
 
 
 ApplyCancelledNotificationDelivery(delivery_id, arg_delivery_sequence) ==
@@ -604,7 +621,7 @@ ApplyCancelledNotificationDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "Cancelled"
     /\ model_step_count' = model_step_count + 1
     /\ notification_applied' = (notification_applied \cup {delivery_id})
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_6a2368947c4d0d9a
 
 
 ApplyWorkerLostNotificationDelivery(delivery_id, arg_delivery_sequence) ==
@@ -613,7 +630,7 @@ ApplyWorkerLostNotificationDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "WorkerLost"
     /\ model_step_count' = model_step_count + 1
     /\ notification_applied' = (notification_applied \cup {delivery_id})
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_6a2368947c4d0d9a
 
 
 ApplyNeedsAttentionNotificationDelivery(delivery_id, arg_delivery_sequence) ==
@@ -622,7 +639,7 @@ ApplyNeedsAttentionNotificationDelivery(delivery_id, arg_delivery_sequence) ==
     /\ phase' = "NeedsAttention"
     /\ model_step_count' = model_step_count + 1
     /\ notification_applied' = (notification_applied \cup {delivery_id})
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_6a2368947c4d0d9a
 
 
 ObserveRunningNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -630,7 +647,7 @@ ObserveRunningNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_seque
     /\ ((delivery_id \in notification_ids) /\ (delivery_id \in notification_applied) /\ ((IF "value" \in DOMAIN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None) THEN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None)["value"] ELSE None) = arg_delivery_sequence))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ObserveWaitingExternalNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -638,7 +655,7 @@ ObserveWaitingExternalNotificationDeliveryAlreadyApplied(delivery_id, arg_delive
     /\ ((delivery_id \in notification_ids) /\ (delivery_id \in notification_applied) /\ ((IF "value" \in DOMAIN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None) THEN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None)["value"] ELSE None) = arg_delivery_sequence))
     /\ phase' = "WaitingExternal"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ObserveLossObservedNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -646,7 +663,7 @@ ObserveLossObservedNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_
     /\ ((delivery_id \in notification_ids) /\ (delivery_id \in notification_applied) /\ ((IF "value" \in DOMAIN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None) THEN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None)["value"] ELSE None) = arg_delivery_sequence))
     /\ phase' = "LossObserved"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ObserveRetryScheduledNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -654,7 +671,7 @@ ObserveRetryScheduledNotificationDeliveryAlreadyApplied(delivery_id, arg_deliver
     /\ ((delivery_id \in notification_ids) /\ (delivery_id \in notification_applied) /\ ((IF "value" \in DOMAIN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None) THEN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None)["value"] ELSE None) = arg_delivery_sequence))
     /\ phase' = "RetryScheduled"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ObserveSucceededNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -662,7 +679,7 @@ ObserveSucceededNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_seq
     /\ ((delivery_id \in notification_ids) /\ (delivery_id \in notification_applied) /\ ((IF "value" \in DOMAIN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None) THEN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None)["value"] ELSE None) = arg_delivery_sequence))
     /\ phase' = "Succeeded"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ObserveFailedNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -670,7 +687,7 @@ ObserveFailedNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_sequen
     /\ ((delivery_id \in notification_ids) /\ (delivery_id \in notification_applied) /\ ((IF "value" \in DOMAIN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None) THEN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None)["value"] ELSE None) = arg_delivery_sequence))
     /\ phase' = "Failed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ObserveCancelledNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -678,7 +695,7 @@ ObserveCancelledNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_seq
     /\ ((delivery_id \in notification_ids) /\ (delivery_id \in notification_applied) /\ ((IF "value" \in DOMAIN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None) THEN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None)["value"] ELSE None) = arg_delivery_sequence))
     /\ phase' = "Cancelled"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ObserveWorkerLostNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -686,7 +703,7 @@ ObserveWorkerLostNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_se
     /\ ((delivery_id \in notification_ids) /\ (delivery_id \in notification_applied) /\ ((IF "value" \in DOMAIN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None) THEN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None)["value"] ELSE None) = arg_delivery_sequence))
     /\ phase' = "WorkerLost"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 ObserveNeedsAttentionNotificationDeliveryAlreadyApplied(delivery_id, arg_delivery_sequence) ==
@@ -694,7 +711,7 @@ ObserveNeedsAttentionNotificationDeliveryAlreadyApplied(delivery_id, arg_deliver
     /\ ((delivery_id \in notification_ids) /\ (delivery_id \in notification_applied) /\ ((IF "value" \in DOMAIN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None) THEN (IF (delivery_id \in DOMAIN notification_sequences) THEN Some((IF delivery_id \in DOMAIN notification_sequences THEN notification_sequences[delivery_id] ELSE 0)) ELSE None)["value"] ELSE None) = arg_delivery_sequence))
     /\ phase' = "NeedsAttention"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << job_id, restart_class, attempt_count, current_attempt_id, current_fence, current_worker_id, lease_expires_at_ms, heartbeat_at_ms, checkpoint_ref, runner_handle, progress_cursor, lease_expired, retry_due_at_ms, cancel_requested, delivery_sequence, notification_ids, notification_idempotency_keys, notification_id_by_key, notification_delivery_ids, notification_sequences, notification_applied, terminal_kind, terminal_delivery_sequence, terminal_delivery_applied >>
+    /\ UnchangedFrame_b0c9d3b6b38c4ae5
 
 
 Next ==

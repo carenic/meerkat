@@ -53,6 +53,17 @@ pub enum FactoryError {
     /// opaque, display-only message — no production code branches on its text.
     #[error("Failed to create client: {0}")]
     ClientCreationFailed(String),
+
+    /// Server-constrained self-hosted credential selection failed, carrying the
+    /// typed [`meerkat_core::SelfHostedConnectionError`] cause.
+    ///
+    /// `self_hosted` is a provider CLASS, so "which binding authenticates this
+    /// endpoint" is a distinct question from "which binding serves this
+    /// provider": the selection either names the model's server or fails
+    /// closed here, instead of shipping some other server's secret and letting
+    /// the far end answer `Unauthorized`.
+    #[error("self-hosted server binding resolution failed: {0}")]
+    SelfHostedBinding(#[from] meerkat_core::SelfHostedConnectionError),
 }
 
 #[cfg(test)]

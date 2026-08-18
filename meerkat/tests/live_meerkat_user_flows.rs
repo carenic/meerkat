@@ -818,6 +818,7 @@ mod budget_exhaustion {
             .budget(BudgetLimits {
                 max_tokens: Some(150), // Very low budget
                 max_duration: None,
+                max_turn_duration: None,
                 max_tool_calls: None,
             })
             .build(llm_adapter, tools, store_adapter)
@@ -889,6 +890,7 @@ mod budget_exhaustion {
             .budget(BudgetLimits {
                 max_tokens: Some(10000),
                 max_duration: None,
+                max_turn_duration: None,
                 max_tool_calls: Some(2), // Very low tool call limit
             })
             .build(llm_adapter, tools, store_adapter)
@@ -1406,6 +1408,7 @@ mod sanity {
         let limits = BudgetLimits {
             max_tokens: Some(1000),
             max_duration: None,
+            max_turn_duration: None,
             max_tool_calls: Some(10),
         };
         assert_eq!(limits.max_tokens, Some(1000));

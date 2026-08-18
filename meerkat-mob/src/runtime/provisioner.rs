@@ -54,12 +54,12 @@ use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 
 type TurnEventTx = tokio::sync::mpsc::Sender<meerkat_core::EventEnvelope<meerkat_core::AgentEvent>>;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 type ArchiveDisposalFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ArchiveDisposalOutcome, SessionError>> + Send + 'a>,
 >;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(feature = "runtime-adapter", target_arch = "wasm32"))]
 type ArchiveDisposalFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ArchiveDisposalOutcome, SessionError>> + 'a>,
 >;

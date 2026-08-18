@@ -18,7 +18,7 @@
 //! A `TypeRef::Named` referenced without a matching binding is rejected by
 //! `MachineSchema::validate()` — there is no name-based fallback.
 
-use meerkat_machine_codegen::render_machine_kernel_module;
+use meerkat_machine_codegen::render_machine_kernel_module as try_render_machine_kernel_module;
 use meerkat_machine_schema::identity::{
     EnumVariantId, FieldId, MachineId, NamedTypeBinding, NamedTypeId, PhaseId, RustTypeAtom,
 };
@@ -26,6 +26,10 @@ use meerkat_machine_schema::{
     EnumSchema, Expr, FieldInit, FieldSchema, InitSchema, MachineSchema, MachineSchemaError,
     RustBinding, StateSchema, TypeRef, VariantSchema,
 };
+
+fn render_machine_kernel_module(schema: &MachineSchema) -> String {
+    try_render_machine_kernel_module(schema).expect("machine kernel rendering must succeed")
+}
 
 /// Build a minimal machine schema that references a single named type via
 /// one state field. The schema has an empty input/signal/effect surface,

@@ -826,6 +826,12 @@ pub enum SessionRegistrationRejectReasonKind {
     /// epoch: the registered entry was replaced underneath the caller.
     #[default]
     RuntimeEpochConflict,
+    /// The entry is inside its two-phase unregister drain window. This is a
+    /// RETRYABLE refusal, not a verdict that the session may never run again:
+    /// the open producer obligations named alongside it are what the caller
+    /// must wait for (or settle) before registration is legal. Never map this
+    /// to stale/replaced authority.
+    UnregisterTeardownInProgress,
 }
 
 /// Typed comms drain substate. Mirrors the closed set of literals the DSL
@@ -2245,6 +2251,48 @@ pub enum RecoveredInputRecoveryDisposition {
     Discard,
 }
 
+/// Generated disposition for one recovered durable terminal-completion batch.
+///
+/// A pending batch is the recovery witness for a run whose in-memory completion
+/// correlation died with its process. Exactly one such batch can be re-bound,
+/// because the correlation is a single slot and every
+/// `ResolveRuntimeCompletionResult*` arm is guarded on it. Recovery therefore
+/// has to DECIDE about the others rather than carry them forward, which is what
+/// this vocabulary makes explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RecoveredTerminalCompletionDisposition {
+    /// Re-bind this batch to the machine correlation and finish its saga.
+    #[default]
+    Recover,
+    /// The batch can never be resolved again. Recovery excludes it and records
+    /// the discard durably; the row is kept, phase-marked, for forensics.
+    DiscardUnrecoverable,
+    /// Neither outcome is authorized on the evidence available. Recovery must
+    /// not proceed past this batch until
+    /// `DeclareRecoveredTerminalCompletionUnrecoverable` supplies the terminal.
+    Blocked,
+}
+
+/// Why a recovered terminal-completion batch is unrecoverable. This is the
+/// reason carried by the explicit terminal declaration, so that a `Blocked`
+/// disposition resolves through a named machine-owned outcome instead of
+/// leaving the shell to narrate a warning (Rule 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RecoveredTerminalCompletionUnrecoverableReasonKind {
+    /// Another pending batch already owns the single completion correlation,
+    /// and these rows carry no runtime-binding identity to order them by.
+    #[default]
+    UncorrelatableRun,
+    /// The owner row lost the candidate payload that its public completion
+    /// class would have been derived from.
+    OwnerCandidatePayloadLost,
+    /// The batch cannot be resolved AND still owns an unpublished directed
+    /// interaction-terminal outbox. Discarding it would silently drop a
+    /// user-visible terminal event, so recovery fails closed and hands the
+    /// batch to the operator repair path instead.
+    DirectedPublicationUnresolved,
+}
+
 /// Typed persisted runtime apply boundary carried by recovered-admission
 /// witnesses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -2788,6 +2836,28 @@ macro_rules! meerkat_catalog_machine_dsl {
             last_runtime_apply_failure_cause: Option<Enum<RuntimeApplyFailureCause>>,
             last_runtime_apply_failure_message: Option<String>,
             runtime_completion_result_run_id: Option<RunId>,
+            // Whether the run named by `runtime_completion_result_run_id` has
+            // had its completion result RESOLVED, i.e. whether the durable
+            // terminal-completion batch staged in that run's terminal commit
+            // has been handed a public completion class.
+            //
+            // The correlation slot alone cannot answer this: it is Some for
+            // every run that terminalized, resolved or not. Without the
+            // distinction the Prepare family cleared the slot unconditionally
+            // (field, 0.8.23: one adopter member accumulated SIX pending
+            // terminal-completion batches, an operator cleared them, and a new
+            // one appeared within hours; a second member grew two and its cold
+            // recovery then failed closed on
+            // "terminal completion recovery found pending batches for distinct
+            // runs"). Once the slot moves off run N, every
+            // `ResolveRuntimeCompletionResult*` arm's `run_correlated` guard
+            // rejects run N forever, so its batch can never be finalized -
+            // an obligation abandoned outside the authority that owns it
+            // (Rule 2).
+            //
+            // True while the slot is None: there is no outstanding obligation
+            // to protect.
+            runtime_completion_result_resolved: bool,
             extraction_attempts: u64,
             max_extraction_retries: u64,
             // Dogma K9: machine-owned, total answer to "is this turn inside
@@ -3314,6 +3384,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             last_runtime_apply_failure_cause = None,
             last_runtime_apply_failure_message = None,
             runtime_completion_result_run_id = None,
+            runtime_completion_result_resolved = true,
             extraction_attempts = 0,
             max_extraction_retries = 0,
             extraction_active = false,
@@ -4822,6 +4893,25 @@ macro_rules! meerkat_catalog_machine_dsl {
                 previous_runtime_generation: Generation,
                 previous_runtime_epoch_id: Option<RuntimeEpochId>,
             },
+            ClassifyRecoveredTerminalCompletionBatch {
+                batch_key: String,
+                // The shell has established that this batch's run is the one
+                // the single completion correlation can still admit. With no
+                // runtime-binding identity on the rows there is no ordering
+                // evidence, so at most one batch may carry this.
+                correlatable: bool,
+                // The owner row still carries the candidate payload the public
+                // completion class is derived from.
+                owner_candidate_present: bool,
+                // An unpublished directed interaction-terminal outbox still
+                // exists for this batch, i.e. discarding it would drop a
+                // user-visible terminal event and not merely a waiter receipt.
+                directed_publication_pending: bool,
+            },
+            DeclareRecoveredTerminalCompletionUnrecoverable {
+                batch_key: String,
+                reason: Enum<RecoveredTerminalCompletionUnrecoverableReasonKind>,
+            },
         }
 
         surface_only [
@@ -5186,6 +5276,12 @@ macro_rules! meerkat_catalog_machine_dsl {
                 reason: Enum<SessionRegistrationRejectReasonKind>,
                 registered_runtime_epoch_id: Option<RuntimeEpochId>,
                 attempted_runtime_epoch_id: Option<RuntimeEpochId>,
+                // The open producer obligations at refusal time. A teardown
+                // refusal that cannot name what is still draining is a warning,
+                // not a terminal outcome, so the verdict carries them.
+                unregister_runtime_loop_drain_pending: bool,
+                unregister_comms_drain_exit_pending: bool,
+                unregister_completion_waiter_drain_pending: bool,
             },
             OpLifecycleTransitionRejected {
                 operation_id: String,
@@ -5555,6 +5651,14 @@ macro_rules! meerkat_catalog_machine_dsl {
                 next_runtime_generation: Generation,
                 next_runtime_epoch_id: Option<RuntimeEpochId>,
             },
+            RecoveredTerminalCompletionBatchClassified {
+                batch_key: String,
+                disposition: Enum<RecoveredTerminalCompletionDisposition>,
+            },
+            RecoveredTerminalCompletionDeclaredUnrecoverable {
+                batch_key: String,
+                reason: Enum<RecoveredTerminalCompletionUnrecoverableReasonKind>,
+            },
         }
 
         // =====================================================================
@@ -5610,6 +5714,8 @@ macro_rules! meerkat_catalog_machine_dsl {
         disposition AdmissionIdempotencyResolved => local seam NoOwnerRealization,
         disposition RecoveredInputLifecycleNormalized => local seam NoOwnerRealization,
         disposition RecoveredInputDurabilityClassified => local seam NoOwnerRealization,
+        disposition RecoveredTerminalCompletionBatchClassified => local seam NoOwnerRealization,
+        disposition RecoveredTerminalCompletionDeclaredUnrecoverable => local seam NoOwnerRealization,
         disposition InputPublicLifecycleResolved => local seam SurfaceResultAlignment,
         disposition InputPublicTerminalOutcomeResolved => local seam SurfaceResultAlignment,
         disposition InputBehavioralTerminalityResolved => local seam SurfaceResultAlignment,
@@ -7008,6 +7114,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
         }
 
+        // Transition declaration order is runtime semantics: the production
+        // dispatcher preserves it for same-trigger first-match chains. Never
+        // reorder transition bodies to repair generated Rust enum ordinals;
+        // the kernel renderer owns its append-only public TransitionId order.
+        //
         // 2. RegisterSession: per-phase self-loop. Binding a NEW session id
         // resets the per-session LLM state. Destroyed is intentionally absent:
         // RegisterSession is a resurrection input the DestroyedShapeInvariant
@@ -7015,6 +7126,10 @@ macro_rules! meerkat_catalog_machine_dsl {
         // Draining is also excluded on every registration arm: it is the
         // machine-owned teardown tombstone that must fence service actor
         // rematerialization until final UnregisterSession removes the entry.
+        // That fence is NOT a guard rejection: arm 2e below owns the Draining
+        // verdict explicitly and names the still-open producer obligations, so
+        // the caller learns it may retry once teardown settles instead of
+        // reading an untyped "input validation failed".
         // Stopped is handled by the explicit revival arms below (2c/2d): a
         // stopped executor is a fact about the previous runtime epoch, so a
         // re-registration is the machine-owned resume intent, not a self-loop.
@@ -7097,7 +7212,65 @@ macro_rules! meerkat_catalog_machine_dsl {
                 session_id: session_id,
                 reason: SessionRegistrationRejectReasonKind::RuntimeEpochConflict,
                 registered_runtime_epoch_id: self.active_runtime_epoch_id,
-                attempted_runtime_epoch_id: runtime_epoch_id
+                attempted_runtime_epoch_id: runtime_epoch_id,
+                unregister_runtime_loop_drain_pending:
+                    self.unregister_runtime_loop_drain_pending,
+                unregister_comms_drain_exit_pending:
+                    self.unregister_comms_drain_exit_pending,
+                unregister_completion_waiter_drain_pending:
+                    self.unregister_completion_waiter_drain_pending
+            }
+        }
+
+        // 2e. RegisterSessionRefusedUnregisterDraining: the machine-owned
+        // verdict for a registration that arrives inside the two-phase
+        // unregister drain window.
+        //
+        // Draining is deliberately absorbing FOR REGISTRATION - the five arms
+        // above all carry `not_draining`, and the only exit is the final
+        // `UnregisterSession` commit, which is itself guarded on every drain
+        // obligation being closed. That fence is correct: re-admitting a
+        // draining entry would move `registration_phase` off Draining while
+        // `RuntimeLoopStoppedForUnregister` / `CommsDrainExitedForUnregister` /
+        // `CompletionWaitersResolvedForUnregister` are still outstanding, and
+        // those three inputs are each guarded on `unregister_draining`. A
+        // producer that had not yet died would then find its own completion
+        // feedback unroutable - three named obligations abandoned outside the
+        // authority that owns them. So the escape from Draining is to CONCLUDE
+        // the drain, never to slip past it.
+        //
+        // What was missing is the verdict. Through 0.8.23 this arrived as
+        // `GuardRejected`, which surfaces as an untyped "input validation
+        // failed" and reads - correctly, from the caller's side - as "this
+        // session may never be registered again" (field, 0.8.23: a first turn
+        // that failed terminally left CLI shutdown warning "Unregister teardown
+        // is still in progress", and every later `--resume` died on
+        // "guard rejected transition from Idle for input::RegisterSession").
+        // An incomplete teardown is a warning about cleanup; it must not read
+        // as a permanent verdict on the session. This arm makes the refusal a
+        // typed, host-actionable outcome that names WHICH producer obligations
+        // are still open, so the caller can join or settle the owning teardown
+        // and retry.
+        //
+        // No state changes here: the drain window and its obligations belong to
+        // the unregister saga, and a refused registration must not perturb them.
+        transition RegisterSessionRefusedUnregisterDraining {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RegisterSession { session_id, runtime_epoch_id }
+            guard "unregister_draining" { self.registration_phase == RegistrationPhase::Draining }
+            update {}
+            to Idle
+            emit SessionRegistrationRejected {
+                session_id: session_id,
+                reason: SessionRegistrationRejectReasonKind::UnregisterTeardownInProgress,
+                registered_runtime_epoch_id: self.active_runtime_epoch_id,
+                attempted_runtime_epoch_id: runtime_epoch_id,
+                unregister_runtime_loop_drain_pending:
+                    self.unregister_runtime_loop_drain_pending,
+                unregister_comms_drain_exit_pending:
+                    self.unregister_comms_drain_exit_pending,
+                unregister_completion_waiter_drain_pending:
+                    self.unregister_completion_waiter_drain_pending
             }
         }
 
@@ -10493,6 +10666,9 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
             update {
                 self.runtime_completion_result_run_id = Some(run_id);
+                // Recovery only ever surfaces PENDING durable batches, so the
+                // rehydrated correlation is by construction an open obligation.
+                self.runtime_completion_result_resolved = false;
                 if terminal_outcome != None {
                     self.terminal_outcome = terminal_outcome;
                     self.terminal_cause_kind = terminal_cause_kind;
@@ -10514,7 +10690,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
             guard "finalization_succeeded" { finalization == RuntimeCompletionFinalizationObservation::Succeeded }
             guard "terminal_run_result" { terminal == RuntimeCompletionTerminalObservation::RunResult }
-            update {}
+            update {
+                if self.runtime_completion_result_run_id == run_id {
+                    self.runtime_completion_result_resolved = true;
+                }
+            }
             to Idle
             emit RuntimeCompletionResultResolved {
                 session_id: self.session_id.get("value"),
@@ -10538,7 +10718,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
             guard "finalization_succeeded" { finalization == RuntimeCompletionFinalizationObservation::Succeeded }
             guard "terminal_no_result" { terminal == RuntimeCompletionTerminalObservation::NoResult }
-            update {}
+            update {
+                if self.runtime_completion_result_run_id == run_id {
+                    self.runtime_completion_result_resolved = true;
+                }
+            }
             to Idle
             emit RuntimeCompletionResultResolved {
                 session_id: self.session_id.get("value"),
@@ -10562,7 +10746,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
             guard "finalization_succeeded" { finalization == RuntimeCompletionFinalizationObservation::Succeeded }
             guard "terminal_callback_pending" { terminal == RuntimeCompletionTerminalObservation::CallbackPending }
-            update {}
+            update {
+                if self.runtime_completion_result_run_id == run_id {
+                    self.runtime_completion_result_resolved = true;
+                }
+            }
             to Idle
             emit RuntimeCompletionResultResolved {
                 session_id: self.session_id.get("value"),
@@ -10587,7 +10775,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "finalization_succeeded" { finalization == RuntimeCompletionFinalizationObservation::Succeeded }
             guard "terminal_machine" { terminal == RuntimeCompletionTerminalObservation::MachineTerminal }
             guard "machine_cancelled" { self.terminal_outcome == Some(TurnTerminalOutcome::Cancelled) }
-            update {}
+            update {
+                if self.runtime_completion_result_run_id == run_id {
+                    self.runtime_completion_result_resolved = true;
+                }
+            }
             to Idle
             emit RuntimeCompletionResultResolved {
                 session_id: self.session_id.get("value"),
@@ -10624,7 +10816,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "machine_runtime_apply_failed" {
                 self.terminal_cause_kind == Some(TurnTerminalCauseKind::RuntimeApplyFailure)
             }
-            update {}
+            update {
+                if self.runtime_completion_result_run_id == run_id {
+                    self.runtime_completion_result_resolved = true;
+                }
+            }
             to Idle
             emit RuntimeCompletionResultResolved {
                 session_id: self.session_id.get("value"),
@@ -10661,7 +10857,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "machine_not_runtime_apply_failed" {
                 self.terminal_cause_kind != Some(TurnTerminalCauseKind::RuntimeApplyFailure)
             }
-            update {}
+            update {
+                if self.runtime_completion_result_run_id == run_id {
+                    self.runtime_completion_result_resolved = true;
+                }
+            }
             to Idle
             emit RuntimeCompletionResultResolved {
                 session_id: self.session_id.get("value"),
@@ -10688,7 +10888,16 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
             guard "finalization_failed" { finalization == RuntimeCompletionFinalizationObservation::Failed }
             guard "terminal_run_result" { terminal == RuntimeCompletionTerminalObservation::RunResult }
-            update {}
+            // This arm's `run_correlated` also admits `current_run_id == run_id`,
+            // so it can fire for a run that is NOT the slot's run. Marking the
+            // slot resolved off a different run's resolve would let the Prepare
+            // family clear a still-unresolved correlation - exactly the leak
+            // this fact exists to prevent - so the write is conditional.
+            update {
+                if self.runtime_completion_result_run_id == run_id {
+                    self.runtime_completion_result_resolved = true;
+                }
+            }
             to Idle
             emit RuntimeCompletionResultResolved {
                 session_id: self.session_id.get("value"),
@@ -10719,7 +10928,12 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || terminal == RuntimeCompletionTerminalObservation::CallbackPending
                 || terminal == RuntimeCompletionTerminalObservation::MachineTerminal
             }
-            update {}
+            // Same loose `run_correlated` as the sibling arm above: conditional.
+            update {
+                if self.runtime_completion_result_run_id == run_id {
+                    self.runtime_completion_result_resolved = true;
+                }
+            }
             to Idle
             emit RuntimeCompletionResultResolved {
                 session_id: self.session_id.get("value"),
@@ -11959,6 +12173,124 @@ macro_rules! meerkat_catalog_machine_dsl {
             emit RecoveredInputDurabilityClassified {
                 input_id: input_id,
                 disposition: RecoveredInputRecoveryDisposition::Retain
+            }
+        }
+
+        // 26c-bis. ClassifyRecoveredTerminalCompletionBatch: generated
+        // disposition authority for durable PENDING terminal-completion
+        // batches found at cold recovery.
+        //
+        // Why a decision is needed at all: the completion correlation is one
+        // slot, so at most one recovered batch can be re-bound. Before this
+        // family the shell simply refused - `input_terminal_completion_recovery_batches`
+        // raised RecoveryCorruption on finding pending batches for two distinct
+        // runs - which turned a leaked row into a runtime that cannot recover.
+        // A member in the field degraded exactly that way.
+        //
+        // Why the evidence is this thin: `InputTerminalCompletion` carries no
+        // runtime-binding identity, unlike `InteractionTerminalOutbox`, which
+        // carries owner_fence_token / owner_runtime_generation /
+        // owner_runtime_epoch_id. The accumulating rows are precisely the ones
+        // with no ordering evidence, and on cold recovery the correlation slot
+        // is not persisted either, so every batch looks equally correlatable.
+        // Recovery is therefore conservative by construction: the shell names
+        // at most one batch `correlatable`, and everything else is a discard.
+        // Closing that asymmetry is a durable-format change, tracked separately.
+        transition ClassifyRecoveredTerminalCompletionBatchRecover {
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
+            on input ClassifyRecoveredTerminalCompletionBatch {
+                batch_key,
+                correlatable,
+                owner_candidate_present,
+                directed_publication_pending
+            }
+            guard "batch_key_present" { batch_key != "" }
+            guard "recoverable" {
+                correlatable == true
+                && owner_candidate_present == true
+            }
+            update {}
+            to Idle
+            emit RecoveredTerminalCompletionBatchClassified {
+                batch_key: batch_key,
+                disposition: RecoveredTerminalCompletionDisposition::Recover
+            }
+        }
+
+        // A batch that can never be re-bound carries only waiter receipts once
+        // its directed publication is already out. The waiters died with the
+        // process that owned them, so dropping it from recovery loses nothing
+        // a caller can still observe - and it is strictly better than the prior
+        // behaviour, which refused to recover the runtime at all.
+        transition ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverable {
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
+            on input ClassifyRecoveredTerminalCompletionBatch {
+                batch_key,
+                correlatable,
+                owner_candidate_present,
+                directed_publication_pending
+            }
+            guard "batch_key_present" { batch_key != "" }
+            guard "not_recoverable" {
+                correlatable == false
+                || owner_candidate_present == false
+            }
+            guard "no_directed_publication_at_risk" {
+                directed_publication_pending == false
+            }
+            update {}
+            to Idle
+            emit RecoveredTerminalCompletionBatchClassified {
+                batch_key: batch_key,
+                disposition: RecoveredTerminalCompletionDisposition::DiscardUnrecoverable
+            }
+        }
+
+        // Blocked is reachable only when discarding would destroy semantics:
+        // the batch cannot be re-bound AND it still owns an unpublished
+        // directed interaction-terminal outbox, so a discard would silently
+        // swallow a user-visible terminal event. Failing closed is correct
+        // here (Rule 8), and it is a real state with a named exit rather than
+        // a wedge - see the declaration transition below.
+        transition ClassifyRecoveredTerminalCompletionBatchBlocked {
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
+            on input ClassifyRecoveredTerminalCompletionBatch {
+                batch_key,
+                correlatable,
+                owner_candidate_present,
+                directed_publication_pending
+            }
+            guard "batch_key_present" { batch_key != "" }
+            guard "not_recoverable" {
+                correlatable == false
+                || owner_candidate_present == false
+            }
+            guard "directed_publication_at_risk" {
+                directed_publication_pending == true
+            }
+            update {}
+            to Idle
+            emit RecoveredTerminalCompletionBatchClassified {
+                batch_key: batch_key,
+                disposition: RecoveredTerminalCompletionDisposition::Blocked
+            }
+        }
+
+        // DeclareRecoveredTerminalCompletionUnrecoverable: the terminal for a
+        // batch that recovery will not carry forward. Every non-Recover
+        // disposition passes through here, so the reason a batch was dropped or
+        // refused is machine-owned rather than shell prose. A `Blocked` batch
+        // reaches its outcome by this same path, which is what stops it from
+        // being an unterminated warning (Rule 8).
+        transition DeclareRecoveredTerminalCompletionUnrecoverable {
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
+            on input DeclareRecoveredTerminalCompletionUnrecoverable { batch_key, reason }
+            guard "batch_key_present" { batch_key != "" }
+            update {}
+            to Idle
+            emit RecoveredTerminalCompletionDeclaredUnrecoverable {
+                batch_key: batch_key,
+                reason: reason
             }
         }
 
@@ -15061,15 +15393,66 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         // 28. Prepare: Idle→Running, Attached→Running
+        //
+        // Starting a new run may not MOVE the completion correlation off a run
+        // whose durable terminal-completion batch is still unresolved.
+        //
+        // Every ResolveRuntimeCompletionResult* arm is guarded on
+        // `run_correlated { slot == run_id }`, and the slot is single-valued.
+        // Clearing it for run N+1 therefore permanently un-resolves run N's
+        // batch: `finalize_input_terminal_completion_batch` can never be
+        // reached, the row stays Pending forever, and cold recovery later fails
+        // closed with "terminal completion recovery found pending batches for
+        // distinct runs". That is a named obligation abandoned outside the
+        // authority that owns it (Rule 2), and it is exactly what the field
+        // reports show accumulating.
+        //
+        // The prohibition is on the CLEAR, not on the Prepare. Refusing the
+        // Prepare would be the worse bug: on the fail lane the resolve is
+        // precisely what is missing, so a refusal would convert a leaked row
+        // into a session that can never start another turn, and on the cancel
+        // lane it would refuse for the whole normal stage-then-publish window.
+        // So the unsettled arms ACCEPT, bind the new run, and simply leave the
+        // correlation where it is. Run N's late resolve still carries its own
+        // `run_id`, and `run_correlated` still compares it, so it lands
+        // correctly during run N+1.
+        //
+        // Scope, stated exactly: this does not make the class unreachable. Run
+        // N+1's own terminal (RunCompleted / RunFailed / RunCancelled)
+        // overwrites the slot unconditionally, so the orphaning window shrinks
+        // from "any later Prepare" to "the next run terminal" - a full turn of
+        // drain time instead of none. Routing that displaced run through the
+        // recovered-batch discard authority is the remaining gap.
         transition PrepareIdle {
             on input Prepare { session_id, run_id }
             guard { self.lifecycle_phase == Phase::Idle }
             guard "session_registered" { self.session_id != None }
+            guard "completion_correlation_settled" {
+                self.runtime_completion_result_run_id == None
+                || self.runtime_completion_result_resolved == true
+            }
             update {
                 self.current_run_id = Some(run_id);
                 self.pre_run_phase = Some(PreRunPhase::Idle);
                 self.turn_terminal_run_id = None;
                 self.runtime_completion_result_run_id = None;
+                self.runtime_completion_result_resolved = true;
+            }
+            to Running
+            emit SubmitRunPrimitive
+        }
+        transition PrepareIdleRetainingUnsettledCompletion {
+            on input Prepare { session_id, run_id }
+            guard { self.lifecycle_phase == Phase::Idle }
+            guard "session_registered" { self.session_id != None }
+            guard "completion_correlation_unsettled" {
+                self.runtime_completion_result_run_id != None
+                && self.runtime_completion_result_resolved == false
+            }
+            update {
+                self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Idle);
+                self.turn_terminal_run_id = None;
             }
             to Running
             emit SubmitRunPrimitive
@@ -15078,11 +15461,32 @@ macro_rules! meerkat_catalog_machine_dsl {
             on input Prepare { session_id, run_id }
             guard { self.lifecycle_phase == Phase::Attached }
             guard "session_registered" { self.session_id != None }
+            guard "completion_correlation_settled" {
+                self.runtime_completion_result_run_id == None
+                || self.runtime_completion_result_resolved == true
+            }
             update {
                 self.current_run_id = Some(run_id);
                 self.pre_run_phase = Some(PreRunPhase::Attached);
                 self.turn_terminal_run_id = None;
                 self.runtime_completion_result_run_id = None;
+                self.runtime_completion_result_resolved = true;
+            }
+            to Running
+            emit SubmitRunPrimitive
+        }
+        transition PrepareAttachedRetainingUnsettledCompletion {
+            on input Prepare { session_id, run_id }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "session_registered" { self.session_id != None }
+            guard "completion_correlation_unsettled" {
+                self.runtime_completion_result_run_id != None
+                && self.runtime_completion_result_resolved == false
+            }
+            update {
+                self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Attached);
+                self.turn_terminal_run_id = None;
             }
             to Running
             emit SubmitRunPrimitive
@@ -15092,11 +15496,31 @@ macro_rules! meerkat_catalog_machine_dsl {
         transition DrainQueuedRunRetired {
             on signal DrainQueuedRun { run_id }
             guard { self.lifecycle_phase == Phase::Retired }
+            guard "completion_correlation_settled" {
+                self.runtime_completion_result_run_id == None
+                || self.runtime_completion_result_resolved == true
+            }
             update {
                 self.current_run_id = Some(run_id);
                 self.pre_run_phase = Some(PreRunPhase::Retired);
                 self.turn_terminal_run_id = None;
                 self.runtime_completion_result_run_id = None;
+                self.runtime_completion_result_resolved = true;
+            }
+            to Running
+            emit SubmitRunPrimitive
+        }
+        transition DrainQueuedRunRetiredRetainingUnsettledCompletion {
+            on signal DrainQueuedRun { run_id }
+            guard { self.lifecycle_phase == Phase::Retired }
+            guard "completion_correlation_unsettled" {
+                self.runtime_completion_result_run_id != None
+                && self.runtime_completion_result_resolved == false
+            }
+            update {
+                self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Retired);
+                self.turn_terminal_run_id = None;
             }
             to Running
             emit SubmitRunPrimitive
@@ -16005,6 +16429,11 @@ macro_rules! meerkat_catalog_machine_dsl {
                 }
                 self.turn_terminal_run_id = Some(run_id);
                 self.runtime_completion_result_run_id = Some(run_id);
+                // The same terminal commit stages this run's durable
+                // terminal-completion batch, so the correlation is now an OPEN
+                // obligation until a ResolveRuntimeCompletionResult* arm gives
+                // it a public class.
+                self.runtime_completion_result_resolved = false;
             }
             to Running
         }
@@ -16153,6 +16582,11 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.last_runtime_apply_failure_cause = runtime_apply_failure_cause;
                 self.last_runtime_apply_failure_message = runtime_apply_failure_message;
                 self.runtime_completion_result_run_id = Some(run_id);
+                // Open obligation, as in RunCompleted. This is the lane the
+                // adopter measured: 32 of 34 leaking turn failures were
+                // cache-breakpoint prefix mismatches, which stage a batch here
+                // and were then orphaned by the next Prepare.
+                self.runtime_completion_result_resolved = false;
             }
             to Running
             emit TurnRunFailed {
@@ -16173,6 +16607,12 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.turn_terminal_run_id = Some(run_id);
                 self.terminal_outcome = Some(TurnTerminalOutcome::Cancelled);
                 self.runtime_completion_result_run_id = Some(run_id);
+                // Open obligation, as in RunCompleted. Cancellation stages the
+                // batch and abandons the same contributors inside ONE terminal
+                // commit and publishes later, so abandoned-plus-pending is the
+                // NORMAL intermediate state here; the obligation closes when
+                // that publication resolves, not when the inputs are abandoned.
+                self.runtime_completion_result_resolved = false;
             }
             to Running
         }
@@ -18241,7 +18681,15 @@ macro_rules! meerkat_catalog_machine_dsl {
                 } else {
                     self.live_boundary_context_sequence_by_run.insert(run_id, 1);
                 }
-                self.runtime_completion_result_run_id = Some(run_id);
+                // Same rule as the Prepare family: a live mid-run checkpoint is
+                // not a terminal commit and stages no completion batch, so it
+                // may bind the correlation when nothing is outstanding, but it
+                // may not move it off a run whose durable batch is unresolved.
+                if self.runtime_completion_result_run_id == None
+                    || self.runtime_completion_result_resolved == true {
+                    self.runtime_completion_result_run_id = Some(run_id);
+                    self.runtime_completion_result_resolved = true;
+                }
             }
             to Running
             emit LiveBoundaryContextReceiptResolved {

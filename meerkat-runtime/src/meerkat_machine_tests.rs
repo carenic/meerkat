@@ -1564,13 +1564,61 @@ fn image_request(n: u128, target_model: &str) -> ImageOperationRoutingRequest {
 
 struct FakeDrainRuntime {
     notify: Arc<Notify>,
+    claim_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    dropped: Arc<AtomicBool>,
+}
+
+struct BlockingDrainRuntime {
+    notify: Arc<Notify>,
+    claim_started: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl BlockingDrainRuntime {
+    fn new() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            claim_started: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn claim_started(&self) -> bool {
+        self.claim_started.load(Ordering::SeqCst)
+    }
+
+    fn dropped_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.dropped)
+    }
+}
+
+impl Drop for BlockingDrainRuntime {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
 }
 
 impl FakeDrainRuntime {
     fn idle() -> Self {
         Self {
             notify: Arc::new(Notify::new()),
+            claim_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn claim_attempts(&self) -> usize {
+        self.claim_attempts.load(Ordering::SeqCst)
+    }
+
+    fn dropped_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.dropped)
+    }
+}
+
+impl Drop for FakeDrainRuntime {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
     }
 }
 
@@ -4232,6 +4280,69 @@ impl CommsRuntime for FakeDrainRuntime {
         &self,
     ) -> Result<Option<meerkat_core::interaction::PeerIngressQueueClaim>, CommsCapabilityError>
     {
+        self.claim_attempts.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    }
+}
+
+#[async_trait::async_trait]
+impl CommsRuntime for BlockingDrainRuntime {
+    fn inbox_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.notify)
+    }
+
+    async fn claim_classified_inbox_interaction(
+        &self,
+    ) -> Result<Option<meerkat_core::interaction::PeerIngressQueueClaim>, CommsCapabilityError>
+    {
+        self.claim_started.store(true, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+/// Peer-ingress runtime whose FIRST classified drain fails with a mechanism
+/// error and whose later drains are ordinary idle drains.
+///
+/// One failure is enough to kill the drain task permanently on the pre-fix
+/// tree; making later drains succeed keeps the re-arm assertion free of a hot
+/// respawn loop.
+struct FailFirstDrainRuntime {
+    notify: Arc<Notify>,
+    claims: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FailFirstDrainRuntime {
+    fn new() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            claims: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn claim_attempts(&self) -> usize {
+        self.claims.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl CommsRuntime for FailFirstDrainRuntime {
+    fn inbox_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.notify)
+    }
+
+    async fn claim_classified_inbox_interaction(
+        &self,
+    ) -> Result<Option<meerkat_core::interaction::PeerIngressQueueClaim>, CommsCapabilityError>
+    {
+        if self
+            .claims
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            return Err(CommsCapabilityError::Unsupported(
+                "test-injected peer-ingress mechanism error".to_string(),
+            ));
+        }
         Ok(None)
     }
 }
@@ -4374,7 +4485,7 @@ async fn idle_timeout_updates_authority_before_join() {
         &adapter,
         &session_id,
         CommsDrainMode::Timed,
-        comms_runtime,
+        Arc::clone(&comms_runtime),
         Duration::from_millis(25),
     )
     .await;
@@ -5771,13 +5882,21 @@ async fn unregister_progress_persist_failure_requires_cold_reload_from_durable_p
         .register_session(session_id.clone())
         .await
         .expect("fresh registration should recover the exact durable unregister prefix");
+    // 0.8.24: cold registration CONCLUDES the recovered drain rather than
+    // leaving it open, so there is no longer an intermediate all-pending
+    // authority to observe between register and unregister. The property that
+    // assertion protected - that recovery resumes from the DURABLE prefix and
+    // not from the live (false, true, true) that was never persisted - is now
+    // carried by the republished all-pending prefix asserted below: had
+    // recovery trusted the lost live state, that write would read
+    // (false, true, true).
     let recovered_authority = recovered
         .session_dsl_state(&session_id)
         .await
-        .expect("cold-recovered unregister authority");
-    assert!(recovered_authority.unregister_runtime_loop_drain_pending);
-    assert!(recovered_authority.unregister_comms_drain_exit_pending);
-    assert!(recovered_authority.unregister_completion_waiter_drain_pending);
+        .expect("cold-recovered registration authority");
+    assert!(!recovered_authority.unregister_runtime_loop_drain_pending);
+    assert!(!recovered_authority.unregister_comms_drain_exit_pending);
+    assert!(!recovered_authority.unregister_completion_waiter_drain_pending);
 
     recovered
         .unregister_session(&session_id)
@@ -5834,47 +5953,48 @@ async fn cold_recovery_resumes_typed_v3_unregister_progress() {
         store.clone() as Arc<dyn crate::store::RuntimeStore>,
         memory_blob_store(),
     ));
+    // The typed v3 prefix above is what a fresh process replays; that replay is
+    // pinned directly by
+    // `session_management::unregister_progress_recovery_tests::durable_unregister_progress_replays_through_generated_feedback`.
+    // What this test owns from here is what the recovering process DOES with it.
+    //
+    // Through 0.8.23 that was: nothing. The cold registration reconstructed the
+    // Draining image and stopped, and this test asserted that a second
+    // `register_session`, `prepare_bindings`, and `prepare_local_session_bindings`
+    // must then all FAIL - the resume wedge encoded as contract. Nothing
+    // concludes a drain whose producers died with their process, so those
+    // refusals were permanent: the session could never be registered again. A
+    // registration now CONCLUDES the recovered teardown through its owning
+    // authority and re-admits on a fresh one.
     recovered_machine
         .register_session(session_id.clone())
         .await
-        .expect("fresh process should recover the partial Draining epoch");
-    let recovered = recovered_machine
+        .expect("a registration must conclude a cold-recovered drain, not wedge behind it");
+    let settled = recovered_machine
         .session_dsl_state(&session_id)
         .await
-        .expect("recovered generated unregister authority");
-    assert_eq!(
-        recovered.registration_phase,
-        mm_dsl::RegistrationPhase::Draining
+        .expect("settled authority remains registered");
+    assert_ne!(
+        settled.registration_phase,
+        mm_dsl::RegistrationPhase::Draining,
+        "concluded teardown must leave a registrable authority"
     );
-    assert!(!recovered.unregister_runtime_loop_drain_pending);
-    assert!(recovered.unregister_comms_drain_exit_pending);
-    assert!(recovered.unregister_completion_waiter_drain_pending);
-    assert!(
-        recovered_machine
-            .register_session(session_id.clone())
-            .await
-            .is_err(),
-        "only the insertion that mechanically recovers Draining may succeed; an existing Draining entry must still receive the generated RegisterSession rejection"
-    );
-    assert!(
-        recovered_machine
-            .prepare_bindings(session_id.clone())
-            .await
-            .is_err(),
-        "cold-recovered Draining must not expose authoritative actor bindings"
-    );
-    assert!(
-        recovered_machine
-            .prepare_local_session_bindings(session_id.clone())
-            .await
-            .is_err(),
-        "cold-recovered Draining must not expose local actor resources"
-    );
+    assert!(!settled.unregister_runtime_loop_drain_pending);
+    assert!(!settled.unregister_comms_drain_exit_pending);
+    assert!(!settled.unregister_completion_waiter_drain_pending);
+    recovered_machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("a settled session exposes authoritative actor bindings");
+    recovered_machine
+        .prepare_local_session_bindings(session_id.clone())
+        .await
+        .expect("a settled session exposes local actor resources");
 
     recovered_machine
         .unregister_session(&session_id)
         .await
-        .expect("cold-recovered saga should close only its remaining obligations");
+        .expect("the re-admitted session unregisters cleanly");
     assert!(!recovered_machine.contains_session(&session_id).await);
     let durable_final = crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id)
         .await
@@ -5882,6 +6002,80 @@ async fn cold_recovery_resumes_typed_v3_unregister_progress() {
         .expect("final lifecycle record should remain queryable");
     assert_eq!(durable_final.unregister_progress(), None);
     assert_eq!(durable_final.binding().agent_runtime_id(), None);
+}
+
+/// OWNER REPRO (0.8.23): a first turn that fails terminally leaves the CLI
+/// unable to finish teardown ("Unregister teardown is still in progress for
+/// runtime rt:session:..."), and the process exits with the drain window
+/// durably open. Every later `rkat --resume` then died on
+/// "DSL authority (RegisterSession): guard rejected transition from Idle for
+/// input::RegisterSession" - a durable dead end, not a race that clears.
+///
+/// An incomplete teardown is a warning about cleanup. It must not be a verdict
+/// that the session may never run again.
+#[tokio::test]
+async fn failed_first_turn_with_incomplete_teardown_still_resumes() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store = Arc::new(RuntimeCommitAtomicityStore::pass_through(Arc::clone(
+        &inner,
+    )));
+    let runtime_id;
+    let session_id = SessionId::new();
+
+    // Process A: the session runs, the turn fails terminally, and CLI shutdown
+    // cannot finish teardown before the process goes away.
+    {
+        let first_process = Arc::new(MeerkatMachine::persistent(
+            store.clone() as Arc<dyn crate::store::RuntimeStore>,
+            memory_blob_store(),
+        ));
+        runtime_id = runtime_id_for_session(&session_id);
+        first_process
+            .prepare_bindings(session_id.clone())
+            .await
+            .expect("first turn prepares its runtime bindings");
+        // Fail the comms drain disposition write, leaving a real typed partial
+        // drain prefix durable - the shape a process loss mid-teardown leaves.
+        let calls_before = store.commit_machine_lifecycle_calls();
+        store.fail_commit_machine_lifecycle_on_call(calls_before + 3);
+        first_process
+            .unregister_session(&session_id)
+            .await
+            .expect_err("CLI shutdown cannot conclude teardown");
+    }
+    let durable_partial = crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id)
+        .await
+        .expect("load partial lifecycle")
+        .expect("a partial teardown must leave a durable retry record")
+        .unregister_progress()
+        .cloned()
+        .expect("the durable record must carry the open drain obligations");
+    assert!(
+        durable_partial.comms_drain_exit_pending()
+            || durable_partial.completion_waiter_drain_pending()
+            || durable_partial.runtime_loop_drain_pending(),
+        "the repro requires at least one obligation left open across the process boundary"
+    );
+
+    // Process B: `rkat --resume`.
+    let resumed_process = Arc::new(MeerkatMachine::persistent(
+        store.clone() as Arc<dyn crate::store::RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let bindings = resumed_process
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("resume after a failed first turn must not be permanently refused");
+    assert_eq!(bindings.session_id(), &session_id);
+    let resumed = resumed_process
+        .session_dsl_state(&session_id)
+        .await
+        .expect("resumed authority is registered");
+    assert_ne!(
+        resumed.registration_phase,
+        mm_dsl::RegistrationPhase::Draining,
+        "a resumed session must not remain inside the previous process's drain window"
+    );
 }
 
 #[tokio::test]
@@ -8461,14 +8655,33 @@ fn revival_arms_preserve_identity_reset_placement_and_refuse_while_draining() {
     };
     let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(draining_state())
         .expect("draining state must be recoverable");
-    mm_dsl::MeerkatMachineMutator::apply(
+    // 0.8.24: the draining refusal is a MACHINE-OWNED VERDICT, not a guard
+    // rejection - an incomplete teardown is a warning about cleanup and must
+    // not read as "this session may never be registered again". The refusal
+    // still must not perturb the drain window, which the phase assertion
+    // below enforces. The obligation flags are exercised on a path that
+    // actually sets them in `unregister_drain_contract.rs`; this state pokes
+    // `registration_phase` directly, so they are all false here by
+    // construction and are deliberately not asserted.
+    let refusal = mm_dsl::MeerkatMachineMutator::apply(
         &mut authority,
         mm_dsl::MeerkatMachineInput::RegisterSession {
             session_id: mm_dsl::SessionId("session-revive".to_string()),
             runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-2".to_string())),
         },
     )
-    .expect_err("revival must refuse while the unregister drain window is open");
+    .expect("the draining refusal is a typed verdict, not a guard rejection");
+    let effects = refusal.into_effects();
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            mm_dsl::MeerkatMachineEffect::SessionRegistrationRejected {
+                reason: mm_dsl::SessionRegistrationRejectReasonKind::UnregisterTeardownInProgress,
+                ..
+            }
+        )),
+        "revival while draining must name the teardown verdict, got {effects:?}"
+    );
     assert_eq!(
         authority.state().lifecycle_phase,
         mm_dsl::MeerkatPhase::Stopped,
@@ -8960,6 +9173,9 @@ fn re_registration_is_idempotent_on_same_epoch_and_a_typed_verdict_on_a_differen
             reason: mm_dsl::SessionRegistrationRejectReasonKind::RuntimeEpochConflict,
             registered_runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-a".to_string())),
             attempted_runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("epoch-b".to_string())),
+            unregister_runtime_loop_drain_pending: false,
+            unregister_comms_drain_exit_pending: false,
+            unregister_completion_waiter_drain_pending: false,
         }],
         "the refusal must name both epochs so the surface can align its error"
     );
@@ -27854,6 +28070,32 @@ async fn await_runtime_recovery_stop(machine: &Arc<MeerkatMachine>, session_id: 
     .expect("abnormal runtime-loop teardown must reach generated Stopped");
 }
 
+/// Await a census READING instead of sampling once.
+///
+/// The four `*_session_count` accessors take the session map with `try_read`
+/// and return None when they cannot get one, so that a health probe can never
+/// block the runtime it is measuring. Tokio's `RwLock` is write-preferring, so
+/// a writer queued by a still-settling runtime loop makes `try_read` fail even
+/// while the map is merely read-locked. A single sample therefore proves
+/// nothing: None means NOBODY LOOKED, not a value.
+///
+/// Use this only where the assertion expects a MEASUREMENT. Sites that assert
+/// None mean "no census applies to this machine at all" (ephemeral, storeless)
+/// and must keep sampling directly - those two Nones are different facts that
+/// this accessor's `Option<usize>` currently conflates.
+async fn await_census_reading(mut sample: impl FnMut() -> Option<usize>) -> Option<usize> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(count) = sample() {
+                return count;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .ok()
+}
+
 fn machine_terminal_receipt(
     run_id: RunId,
     contributing_input_ids: Vec<InputId>,
@@ -41794,6 +42036,248 @@ async fn refresh_session_owned_peer_ingress_respawns_authorized_drain_without_re
         .expect("session should unregister cleanly");
 }
 
+/// WIRING: a peer-ingress mechanism error must not be a permanent drain death.
+///
+/// The drain's first classified claim fails, which drives the typed `Failed`
+/// exit. Before this fix that exit was terminal - the claim was released, the
+/// queue stayed open, and respawn was caller-driven with nothing polling - so
+/// the session stopped draining peer ingress for good. The machine already
+/// classified that exit as `ExitedRespawnable` and deliberately retained the
+/// peer-ingress runtime; nothing consumed the answer.
+#[tokio::test]
+async fn mechanism_error_drain_exit_is_rearmed_not_terminal() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    adapter
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+
+    let failing = Arc::new(FailFirstDrainRuntime::new());
+    let comms_runtime: Arc<dyn CommsRuntime> = Arc::clone(&failing) as Arc<dyn CommsRuntime>;
+    let expected_id = crate::meerkat_machine::dsl::CommsRuntimeId::from_runtime(&comms_runtime);
+
+    assert!(
+        adapter
+            .update_peer_ingress_context(&session_id, true, Some(Arc::clone(&comms_runtime)))
+            .await
+            .expect("peer ingress context update"),
+        "peer ingress attach must spawn the persistent host drain"
+    );
+
+    // The first drain dies on the injected mechanism error; the re-armed drain
+    // is the one that makes a SECOND claim attempt.
+    let rearmed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if failing.claim_attempts() >= 2
+                && current_phase(&adapter, &session_id).await == Some(CommsDrainPhase::Running)
+                && handle_present(&adapter, &session_id).await
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    if rearmed.is_err() {
+        let phase = current_phase(&adapter, &session_id).await;
+        let handle = handle_present(&adapter, &session_id).await;
+        panic!(
+            "a mechanism-error drain exit must be re-armed, not terminal: \
+             claim_attempts={}, phase={phase:?}, handle_present={handle}",
+            failing.claim_attempts()
+        );
+    }
+
+    let owner = adapter.peer_ingress_owner(&session_id).await;
+    assert!(
+        matches!(
+            owner,
+            crate::meerkat_machine::PeerIngressOwner::SessionOwned { ref comms_runtime_id }
+                if *comms_runtime_id == expected_id
+        ),
+        "the re-arm must reuse the owned peer-ingress runtime, not attach a new one: {owner:?}"
+    );
+
+    adapter
+        .unregister_session(&session_id)
+        .await
+        .expect("session should unregister cleanly");
+}
+
+/// A mechanism error kills a MOB-owned member drain exactly as it kills a
+/// session-owned one, so the re-arm must cover both ownership shapes.
+/// `refresh_session_owned_peer_ingress` deliberately does not.
+#[tokio::test]
+async fn rearm_after_failed_exit_respawns_mob_owned_drain() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    adapter
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+
+    let comms_runtime: Arc<dyn CommsRuntime> = Arc::new(FakeDrainRuntime::idle());
+    let expected_id = crate::meerkat_machine::dsl::CommsRuntimeId::from_runtime(&comms_runtime);
+    let mob_id = crate::meerkat_machine::dsl::MobId::from("mob-rearm-after-failed-exit");
+    {
+        let mut sessions = adapter.sessions.write().await;
+        let entry = sessions
+            .get_mut(&session_id)
+            .expect("registered session entry");
+        {
+            let mut authority = entry
+                .dsl_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::AttachMobIngress {
+                    comms_runtime_id: expected_id.clone(),
+                    mob_id: mob_id.clone(),
+                },
+            )
+            .expect("mob ingress attach should stage");
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::SpawnDrain {
+                    mode: crate::meerkat_machine::dsl::DrainMode::PersistentHost,
+                },
+            )
+            .expect("spawn drain should stage");
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::NotifyDrainExited {
+                    reason: crate::meerkat_machine::dsl::DrainExitReason::Failed,
+                },
+            )
+            .expect("failed persistent drain should become respawnable");
+        }
+        entry
+            .drain_slot
+            .install_task(Arc::clone(&comms_runtime), tokio::spawn(async {}));
+        entry.drain_slot.clear_after_exit(true);
+    }
+
+    assert_eq!(
+        current_phase(&adapter, &session_id).await,
+        Some(CommsDrainPhase::ExitedRespawnable)
+    );
+    assert!(
+        !handle_present(&adapter, &session_id).await,
+        "fixture must retain runtime identity with no live drain handle"
+    );
+    assert!(
+        !adapter
+            .refresh_session_owned_peer_ingress(&session_id)
+            .await
+            .expect("session-owned refresh runs"),
+        "the session-owned refresh must keep leaving mob-owned ingress alone"
+    );
+
+    assert!(
+        adapter
+            .rearm_comms_drain_after_failed_exit(&session_id)
+            .await
+            .expect("re-arm after failed exit"),
+        "a respawnable mob-owned drain must be re-armed"
+    );
+
+    assert_eq!(
+        current_phase(&adapter, &session_id).await,
+        Some(CommsDrainPhase::Running)
+    );
+    assert!(handle_present(&adapter, &session_id).await);
+    let owner = adapter.peer_ingress_owner(&session_id).await;
+    assert!(
+        matches!(
+            owner,
+            crate::meerkat_machine::PeerIngressOwner::MobOwned { ref comms_runtime_id, .. }
+                if *comms_runtime_id == expected_id
+        ),
+        "re-arm must preserve mob ownership, got {owner:?}"
+    );
+
+    adapter
+        .unregister_session(&session_id)
+        .await
+        .expect("session should unregister cleanly");
+}
+
+/// The re-arm consults the machine, not the slot: a drain the machine says is
+/// `Stopped` is never silently restarted, even with a retained runtime.
+#[tokio::test]
+async fn rearm_after_failed_exit_refuses_a_stopped_drain() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    adapter
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+
+    let comms_runtime: Arc<dyn CommsRuntime> = Arc::new(FakeDrainRuntime::idle());
+    let expected_id = crate::meerkat_machine::dsl::CommsRuntimeId::from_runtime(&comms_runtime);
+    {
+        let mut sessions = adapter.sessions.write().await;
+        let entry = sessions
+            .get_mut(&session_id)
+            .expect("registered session entry");
+        {
+            let mut authority = entry
+                .dsl_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::AttachSessionIngress {
+                    comms_runtime_id: expected_id.clone(),
+                },
+            )
+            .expect("session ingress attach should stage");
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::SpawnDrain {
+                    mode: crate::meerkat_machine::dsl::DrainMode::PersistentHost,
+                },
+            )
+            .expect("spawn drain should stage");
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::StopDrain,
+            )
+            .expect("explicit stop should stage");
+        }
+        // Retain the runtime anyway: the slot must not be able to override the
+        // machine's `Stopped` answer.
+        entry
+            .drain_slot
+            .install_task(Arc::clone(&comms_runtime), tokio::spawn(async {}));
+        entry.drain_slot.clear_after_exit(true);
+    }
+
+    assert_eq!(
+        current_phase(&adapter, &session_id).await,
+        Some(CommsDrainPhase::Stopped)
+    );
+    assert!(
+        !adapter
+            .rearm_comms_drain_after_failed_exit(&session_id)
+            .await
+            .expect("re-arm call runs"),
+        "a stopped drain must not be respawned by the mechanism-error re-arm"
+    );
+    assert_eq!(
+        current_phase(&adapter, &session_id).await,
+        Some(CommsDrainPhase::Stopped)
+    );
+    assert!(!handle_present(&adapter, &session_id).await);
+
+    adapter
+        .unregister_session(&session_id)
+        .await
+        .expect("session should unregister cleanly");
+}
+
 #[tokio::test]
 async fn attach_mob_ingress_exact_reassertion_is_idempotent() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
@@ -41978,18 +42462,14 @@ async fn detach_ingress_clears_owner() {
 }
 
 #[tokio::test]
-async fn detach_drops_drain_task_runtime_clone_so_identity_claim_is_released() {
-    // Regression for the mob post-discard revival failure
-    // "Session identity already active". The spawned comms-drain task captures
-    // its own `Arc<dyn CommsRuntime>` clone, and a session-scoped inproc runtime
-    // owns the process-scoped session-identity `SessionClaim`, released ONLY when
-    // its LAST `Arc` is dropped. A fire-and-forget `handle.abort()` merely
-    // schedules cancellation, so on a single-threaded runtime the task's clone is
-    // still alive right after detach returns — and a same-id rebuild
-    // (`materialize_revived_member_session` -> `provision_member`) then collides
-    // with the still-held claim. The detach must JOIN the aborted drain task,
-    // dropping its captured clone before returning. We observe that here through a
-    // `Weak` handle: after detach, no strong `Arc` clone may survive.
+async fn drain_carriers_do_not_keep_the_host_runtime_or_identity_claim_alive() {
+    // Regression for in-process host restart failures under the one-live-claim
+    // rule. The comms runtime owns both its inproc route and the process-scoped
+    // session identity claim, released only when its last `Arc` is dropped. A
+    // persistent drain waits for Duration::MAX, so either a strong task capture
+    // or a strong drain-slot cache pins a dead host forever. Both carriers must
+    // be weak: once the host drops its last owner, the runtime's Drop runs before
+    // any explicit drain detach and a same-id successor can claim the route.
     let adapter = Arc::new(MeerkatMachine::ephemeral());
     let session_id = SessionId::new();
     adapter
@@ -41997,23 +42477,89 @@ async fn detach_drops_drain_task_runtime_clone_so_identity_claim_is_released() {
         .await
         .expect("register session");
 
-    let comms_runtime: Arc<dyn CommsRuntime> = Arc::new(FakeDrainRuntime::idle());
+    let comms_runtime = Arc::new(FakeDrainRuntime::idle());
+    let comms_runtime_dyn: Arc<dyn CommsRuntime> = comms_runtime.clone();
     let weak_runtime = Arc::downgrade(&comms_runtime);
+    let runtime_dropped = comms_runtime.dropped_signal();
     assert!(
         adapter
-            .update_peer_ingress_context(&session_id, true, Some(Arc::clone(&comms_runtime)))
+            .update_peer_ingress_context(&session_id, true, Some(comms_runtime_dyn.clone()))
+            .await
+            .expect("attach session-owned drain"),
+        "first session-owned attach should spawn the drain task"
+    );
+    drop(comms_runtime_dyn);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if comms_runtime.claim_attempts() > 0 && Arc::strong_count(&comms_runtime) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the drain must reach idle without retaining a strong runtime owner");
+
+    drop(comms_runtime);
+    assert!(
+        weak_runtime.upgrade().is_none(),
+        "the detached drain task and drain slot must not keep the host runtime alive"
+    );
+    assert!(
+        runtime_dropped.load(Ordering::SeqCst),
+        "dropping the host's last owner must run the comms runtime destructor"
+    );
+
+    adapter
+        .update_peer_ingress_context(&session_id, false, None)
+        .await
+        .expect("detach drain");
+
+    assert!(weak_runtime.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn detach_joins_an_in_flight_drain_upgrade_before_returning() {
+    // Weak carriers do not eliminate short-lived strong upgrades while a drain
+    // is processing one inbox operation. Explicit detach must still abort and
+    // join the task so that in-flight upgrade is gone before a same-id rebuild.
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    adapter
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+
+    let comms_runtime = Arc::new(BlockingDrainRuntime::new());
+    let comms_runtime_dyn: Arc<dyn CommsRuntime> = comms_runtime.clone();
+    let weak_runtime = Arc::downgrade(&comms_runtime);
+    let runtime_dropped = comms_runtime.dropped_signal();
+    assert!(
+        adapter
+            .update_peer_ingress_context(&session_id, true, Some(comms_runtime_dyn))
             .await
             .expect("attach session-owned drain"),
         "first session-owned attach should spawn the drain task"
     );
 
-    // Drop the test's own strong reference so the only remaining strong holders
-    // are the drain slot's `task_runtime` and the spawned drain task's captured
-    // clone — exactly the state a live keep-alive session is in before revival.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !comms_runtime.claim_started() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the drain must enter the blocking classified-inbox claim");
+    assert_eq!(
+        Arc::strong_count(&comms_runtime),
+        2,
+        "only the test owner and the in-flight drain upgrade may remain"
+    );
+
     drop(comms_runtime);
     assert!(
         weak_runtime.upgrade().is_some(),
-        "precondition: the drain slot + drain task must still hold the comms runtime"
+        "precondition: the in-flight drain upgrade still owns the runtime"
     );
 
     adapter
@@ -42023,9 +42569,11 @@ async fn detach_drops_drain_task_runtime_clone_so_identity_claim_is_released() {
 
     assert!(
         weak_runtime.upgrade().is_none(),
-        "after detach, every Arc<dyn CommsRuntime> clone (slot + drain task) must be \
-         dropped so the session-identity claim is released before any same-id rebuild; \
-         a lingering clone is the race that surfaces as 'Session identity already active'"
+        "detach must join the aborted drain and drop its in-flight runtime upgrade"
+    );
+    assert!(
+        runtime_dropped.load(Ordering::SeqCst),
+        "detach must return only after the comms runtime destructor has run"
     );
 }
 
@@ -43986,6 +44534,273 @@ async fn dead_runtime_loop_session_count_sees_a_real_corpse_and_not_a_clean_shut
     );
 }
 
+/// The exact registration identity of a session's shell.
+///
+/// A cold reload publishes a brand new entry carrying a brand new mutation
+/// gate, so holding these two `Arc`s and comparing them distinguishes "the
+/// machine minted a replacement registration from durable truth" from
+/// "something flipped the same wedged shell back to Ready". Keeping the `Arc`
+/// alive is deliberate: a raw-pointer comparison could alias a freed
+/// allocation and report a replacement as the original.
+async fn registration_shell_identity(
+    machine: &Arc<MeerkatMachine>,
+    session_id: &SessionId,
+) -> Arc<crate::tokio::sync::Mutex<()>> {
+    let sessions = machine.sessions.read().await;
+    Arc::clone(
+        &sessions
+            .get(session_id)
+            .expect("registered session entry")
+            .mutation_gate,
+    )
+}
+
+/// A durability skew is a condition to recover from, not a life sentence.
+///
+/// The degraded shell emits a demand for a registration-authorized cold
+/// reload, and registration is the only authority that can mint one. A mob
+/// member gets that reload because the mob retire ladder calls the disposal
+/// path (meerkat-mob/src/runtime/provisioner.rs:2207). A plain CLI/RPC session
+/// used to get nothing: `register_session_with_executor` read the same durable
+/// fact and returned the demand back to a caller with no capability to satisfy
+/// it, forever. One fact, two consequences, decided by who owned the caller.
+///
+/// The fixture reaches the wedge the way the corpse probe above does, and for
+/// the same documented reason: a durability-degraded session whose loop has
+/// died is exactly the state `observe_runtime_loop_teardown` refuses to clean
+/// up, so the shell stays registered pointing at a dead loop. That refusal is
+/// also what makes this test answer the open question about the disposal
+/// path's precondition - it can only reach `Discarded` if the refused teardown
+/// handoff survived in the entry.
+#[tokio::test]
+async fn degraded_non_mob_registration_cold_reloads_instead_of_bricking() {
+    let machine = persistent_health_probe_machine();
+    let session_id = SessionId::new();
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    machine
+        .register_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+    let bricked_shell = registration_shell_identity(&machine, &session_id).await;
+
+    assert!(
+        machine
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await,
+        "the fixture needs a genuinely degraded durability gate"
+    );
+
+    // Kill the task WITHOUT touching the slot, so the entry keeps its channels
+    // and its join handle. The teardown watcher wakes, asks the durability
+    // gate, and refuses - leaving the registered shell wedged.
+    {
+        let mut sessions = machine.sessions.write().await;
+        let entry = sessions
+            .get_mut(&session_id)
+            .expect("registered session entry");
+        match &entry.attachment_slot {
+            RuntimeLoopAttachmentSlot::Pending(attachment)
+            | RuntimeLoopAttachmentSlot::Attached(attachment) => attachment.loop_handle.abort(),
+            RuntimeLoopAttachmentSlot::Empty => {
+                panic!("the fixture must have attached a real runtime loop")
+            }
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let sessions = machine.sessions.read().await;
+                let entry = sessions
+                    .get(&session_id)
+                    .expect("teardown must not remove a reload-required entry");
+                let finished = match &entry.attachment_slot {
+                    RuntimeLoopAttachmentSlot::Pending(attachment)
+                    | RuntimeLoopAttachmentSlot::Attached(attachment) => {
+                        attachment.loop_handle.is_finished()
+                    }
+                    RuntimeLoopAttachmentSlot::Empty => {
+                        panic!("blocked teardown must leave the dead shell in place")
+                    }
+                };
+                if finished {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the aborted loop task must actually finish");
+
+    // The wedge, stated in the machine's own health vocabulary. Without these
+    // the test could pass by never having reached the broken state at all.
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(1),
+        "the session under test must actually owe a cold reload"
+    );
+    assert_eq!(
+        machine.dead_runtime_loop_session_count(),
+        Some(1),
+        "and it must actually be pointing at a dead loop that teardown refused \
+         to clear, which is the state that used to be terminal"
+    );
+
+    // The act under test: the ordinary non-mob registration entry point, with
+    // no mob adapter, no retire ladder, and no explicit disposal call.
+    machine
+        .register_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect(
+            "registration owns the cold reload the degraded shell demanded; refusing it here \
+             leaves a non-mob session permanently unusable",
+        );
+
+    let reloaded_shell = registration_shell_identity(&machine, &session_id).await;
+    assert!(
+        !Arc::ptr_eq(&bricked_shell, &reloaded_shell),
+        "recovery must publish a replacement registration cold-loaded from durable truth, not \
+         republish the unreadable shell as healthy"
+    );
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(0),
+        "the successor must be able to execute against durable state"
+    );
+    assert_eq!(
+        machine.dead_runtime_loop_session_count(),
+        Some(0),
+        "and it must carry a live runtime loop, not inherit the corpse"
+    );
+}
+
+/// The operation guard, pinned. Without this test the guard is unfalsifiable:
+/// deleting its clause from the refusal condition leaves every other test in
+/// this file green, which is how a plausible-but-unexercised guard ships.
+///
+/// The reroute disposes the degraded shell WITHOUT passing an
+/// `OperationRetentionRequest`, because registration has none to pass. A
+/// non-terminal operation may exist solely in the sealed process registry, so
+/// discarding a shell that still holds one drops operation identity the mob
+/// retire ladder would have preserved - the execution-custody-lost class. So a
+/// degraded registration holding live operations must keep the OLD refusal and
+/// wait for the operation-aware owner, even though the identical shell with no
+/// operations recovers.
+#[tokio::test]
+async fn degraded_registration_holding_live_operations_refuses_the_reroute() {
+    let machine = persistent_health_probe_machine();
+    let session_id = SessionId::new();
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    machine
+        .register_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+
+    // The only difference from the recovering case: this session owns a live
+    // operation.
+    let registry = machine
+        .ops_lifecycle_registry(&session_id)
+        .await
+        .expect("ops registry should exist for a registered session");
+    let operation_id = OperationId::new();
+    registry
+        .register_operation(OperationSpec {
+            id: operation_id.clone(),
+            kind: OperationKind::BackgroundToolOp,
+            owner_session_id: session_id.clone(),
+            display_name: "live op across a degraded reload".into(),
+            source_label: "meerkat_machine_test".into(),
+            operation_source: None,
+            child_session_id: None,
+            expect_peer_channel: false,
+        })
+        .expect("operation should register");
+    registry
+        .provisioning_succeeded(&operation_id)
+        .expect("operation should enter running");
+
+    assert!(
+        machine
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await,
+        "the fixture needs a genuinely degraded durability gate"
+    );
+
+    {
+        let mut sessions = machine.sessions.write().await;
+        let entry = sessions
+            .get_mut(&session_id)
+            .expect("registered session entry");
+        match &entry.attachment_slot {
+            RuntimeLoopAttachmentSlot::Pending(attachment)
+            | RuntimeLoopAttachmentSlot::Attached(attachment) => attachment.loop_handle.abort(),
+            RuntimeLoopAttachmentSlot::Empty => {
+                panic!("the fixture must have attached a real runtime loop")
+            }
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let sessions = machine.sessions.read().await;
+                let entry = sessions
+                    .get(&session_id)
+                    .expect("teardown must not remove a reload-required entry");
+                let finished = match &entry.attachment_slot {
+                    RuntimeLoopAttachmentSlot::Pending(attachment)
+                    | RuntimeLoopAttachmentSlot::Attached(attachment) => {
+                        attachment.loop_handle.is_finished()
+                    }
+                    RuntimeLoopAttachmentSlot::Empty => {
+                        panic!("blocked teardown must leave the dead shell in place")
+                    }
+                };
+                if finished {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the aborted loop task must actually finish");
+
+    // Same wedge as the recovering case - so the ONLY difference that can
+    // explain a different verdict is the live operation.
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(1),
+        "the session under test must actually owe a cold reload"
+    );
+    assert_eq!(
+        machine.dead_runtime_loop_session_count(),
+        Some(1),
+        "and it must actually be pointing at a dead loop"
+    );
+
+    let refused = machine
+        .register_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await;
+    assert!(
+        refused.is_err(),
+        "a degraded registration holding a live operation must NOT be rerouted: registration \
+         carries no OperationRetentionRequest, so disposing this shell would discard operation \
+         identity that only the sealed process registry holds"
+    );
+    assert_eq!(
+        machine.reload_required_session_count(),
+        Some(1),
+        "the refusal must leave the degraded entry in place for the operation-aware owner, not \
+         half-dispose it"
+    );
+}
+
 /// `None` is the load-bearing half of both signatures, so it is pinned against
 /// the real condition it names rather than left as a documented intention.
 ///
@@ -44029,6 +44844,16 @@ async fn health_probes_answer_none_when_the_session_registry_cannot_be_read() {
         None,
         "an unreadable registry is not an empty registry"
     );
+    assert_eq!(
+        machine.overdue_run_start_session_count(),
+        None,
+        "an unreadable registry is not an empty registry"
+    );
+    assert_eq!(
+        machine.parked_queued_input_session_count(),
+        None,
+        "an unreadable registry is not an empty registry"
+    );
     drop(registry_guard);
 
     assert_eq!(
@@ -44042,5 +44867,552 @@ async fn health_probes_answer_none_when_the_session_registry_cannot_be_read() {
         Some(0),
         "and the refusal is per-probe, not sticky: it clears the moment the \
          registry is readable again"
+    );
+    assert_eq!(
+        machine.overdue_run_start_session_count(),
+        Some(0),
+        "and the refusal is per-probe, not sticky: it clears the moment the \
+         registry is readable again"
+    );
+    assert_eq!(
+        machine.parked_queued_input_session_count(),
+        Some(0),
+        "and the refusal is per-probe, not sticky: it clears the moment the \
+         registry is readable again"
+    );
+}
+
+/// The `session_liveness` census end to end: the exact field shape of the
+/// five-day outage. A session that registered cleanly, attached a real
+/// executor (registration `Active`, loop alive, channels open), holds an
+/// input in the machine's queued phase past the notice bound, and is running
+/// nothing. Every prior dimension reads this session as healthy - which is
+/// the point; this one must not.
+///
+/// Also pins the production key correspondence the census relies on: the DSL
+/// keys `input_phases` by `InputId::to_string()`, and the ledger keys rows by
+/// `InputId`, so a real accepted input must be visible to both reads under
+/// the same identity.
+///
+/// Count assertions POLL rather than read once. On this test's current-thread
+/// runtime the post-turn terminal commit can sit parked holding a registry
+/// guard across an await until the test next yields, and a scrape landing on
+/// that instant correctly answers `None` - the per-scrape unreadable blip the
+/// protocol documents, frozen in place by the single-threaded scheduler. The
+/// polls therefore admit `None` as a legal transient and assert two things: a
+/// count other than the expected one is NEVER observed (a `Some(0)` while the
+/// wedge exists would be the real lie), and the expected count arrives.
+#[tokio::test]
+async fn parked_queued_input_session_count_sees_the_five_day_wedge_shape() {
+    /// Poll until the census publishes `expected`, admitting only `None`
+    /// (transient unreadable) on the way; any other count is a wrong reading
+    /// and fails immediately.
+    async fn census_settles_at(machine: &Arc<MeerkatMachine>, expected: usize, claim: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match machine.parked_queued_input_session_count() {
+                    Some(count) if count == expected => break,
+                    Some(count) => {
+                        panic!("census read {count} while exactly {expected} was true: {claim}")
+                    }
+                    None => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("census never settled at {expected}: {claim}"));
+    }
+    let machine = persistent_health_probe_machine();
+    let session_id = SessionId::new();
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    machine
+        .ensure_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+
+    census_settles_at(
+        &machine,
+        0,
+        "a freshly attached session with no work owes nothing",
+    )
+    .await;
+
+    // Key-correspondence pin on a REAL accepted input: the same identity must
+    // appear in the DSL phase map (as `to_string()`) and in the ledger.
+    let (accept_outcome, completion_handle) = machine
+        .accept_input_with_completion(&session_id, make_prompt("parked census key pin"))
+        .await
+        .expect("input should be accepted");
+    assert!(matches!(accept_outcome, AcceptOutcome::Accepted { .. }));
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("registered session entry");
+        // The turn is live, so the loop may legitimately hold the driver;
+        // the TEST waits for it (only the census itself must never block).
+        let driver = entry.driver.lock().await;
+        let ledger_ids: Vec<_> = driver.ledger().iter().map(|(id, _)| id.clone()).collect();
+        assert!(
+            !ledger_ids.is_empty(),
+            "a real accepted input must have a ledger row"
+        );
+        let phase_keys: std::collections::BTreeSet<String> = entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state()
+            .input_phases
+            .keys()
+            .cloned()
+            .collect();
+        for input_id in &ledger_ids {
+            assert!(
+                phase_keys.contains(&input_id.to_string()),
+                "the DSL phase map must key this ledger row as `InputId::to_string()`; \
+                 the parked census depends on that correspondence"
+            );
+        }
+    }
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        completion_handle
+            .expect("accepted input should register a completion waiter")
+            .wait(),
+    )
+    .await
+    .expect("completion waiter should resolve")
+    .expect("the noop turn should complete");
+    census_settles_at(&machine, 0, "a consumed input is not parked work").await;
+
+    // Manufacture the wedge: a queued phase entry in the shared authority
+    // (written through the same recover path production uses for projection
+    // previews) paired with a ledger row whose clock is past the bound. The
+    // session's real registration stays Active and no run is in flight -
+    // exactly the field state.
+    let parked_input = meerkat_core::lifecycle::InputId::new();
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("registered session entry");
+        {
+            // Post-turn bookkeeping may still hold the driver briefly; the
+            // fixture waits for it rather than racing it.
+            let mut driver = entry.driver.lock().await;
+            let mut state = crate::input_state::InputState::new_accepted(parked_input.clone());
+            state.updated_at = chrono::Utc::now() - chrono::Duration::seconds(3_660);
+            driver.insert_input_state_for_test(state);
+        }
+        let mut state = entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state()
+            .clone();
+        assert_eq!(
+            state.registration_phase,
+            mm_dsl::RegistrationPhase::Active,
+            "the fixture is only the field shape if registration is genuinely Active"
+        );
+        assert!(
+            state.current_run_id.is_none(),
+            "the fixture is only the field shape if nothing is running"
+        );
+        state
+            .input_phases
+            .insert(parked_input.to_string(), mm_dsl::InputPhase::Queued);
+        state
+            .input_lane
+            .insert(parked_input.to_string(), mm_dsl::InputLane::Queue);
+        *entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            crate::meerkat_machine::recover_projected_authority(
+                state,
+                "parked census state must recover",
+            );
+    }
+    census_settles_at(
+        &machine,
+        1,
+        "an Active session holding hour-old queued work while running nothing \
+         is exactly what this accessor exists to report",
+    )
+    .await;
+
+    // Both unreadable directions, at the accessor level: each of the two
+    // locks the probe reads, held the way the wedged party holds it, must
+    // propagate as None - never block, never publish a rung nobody read.
+    {
+        let authority = {
+            let sessions = machine.sessions.read().await;
+            Arc::clone(
+                &sessions
+                    .get(&session_id)
+                    .expect("registered session entry")
+                    .dsl_authority,
+            )
+        };
+        let held = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            machine.parked_queued_input_session_count(),
+            None,
+            "a held authority with nothing positively parked elsewhere must \
+             propagate as unreadable"
+        );
+        drop(held);
+    }
+    {
+        let driver = {
+            let sessions = machine.sessions.read().await;
+            Arc::clone(
+                &sessions
+                    .get(&session_id)
+                    .expect("registered session entry")
+                    .driver,
+            )
+        };
+        let held = driver.lock().await;
+        assert_eq!(
+            machine.parked_queued_input_session_count(),
+            None,
+            "a held driver ledger with nothing positively parked elsewhere \
+             must propagate as unreadable"
+        );
+        drop(held);
+    }
+    census_settles_at(
+        &machine,
+        1,
+        "and the refusal is per-probe, not sticky: the wedge is visible again \
+         the moment both locks are readable",
+    )
+    .await;
+}
+
+/// The loop-side arming pin for `session_run_start`: a real turn through the
+/// real runtime loop must arm the session's staged-run window, because the
+/// census reads nothing else. Every other census assertion arms the window by
+/// hand, so without this test the `arm` call in the runtime loop could be
+/// deleted and the whole suite would stay green while the dimension went
+/// permanently, silently `Some(0)`.
+#[tokio::test]
+async fn a_real_turn_arms_the_staged_run_window_and_reads_clear_after_completion() {
+    let machine = persistent_health_probe_machine();
+    let session_id = SessionId::new();
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    machine
+        .ensure_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("registered session entry");
+        assert!(
+            entry.run_start_window.snapshot().is_none(),
+            "no run was staged yet, so nothing may have armed the window"
+        );
+    }
+
+    let (accept_outcome, completion_handle) = machine
+        .accept_input_with_completion(&session_id, make_prompt("run start census arming"))
+        .await
+        .expect("input should be accepted");
+    assert!(matches!(accept_outcome, AcceptOutcome::Accepted { .. }));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        completion_handle
+            .expect("accepted input should register a completion waiter")
+            .wait(),
+    )
+    .await
+    .expect("completion waiter should resolve")
+    .expect("the noop turn should complete");
+
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("registered session entry");
+        assert!(
+            entry.run_start_window.snapshot().is_some(),
+            "the runtime loop must arm the staged-run window at the durable \
+             StageForRun commit"
+        );
+    }
+    assert_eq!(
+        await_census_reading(|| machine.overdue_run_start_session_count()).await,
+        Some(0),
+        "a completed turn's window is stale in the harmless direction: the \
+         census recomputes from machine truth and reads it Clear"
+    );
+}
+
+/// The `session_run_start` census against a manufactured wedge, at the
+/// accessor level: the run is current, its turn start was signalled, its
+/// primitive is provably un-applied, and the notice bound has elapsed. Also
+/// pins the deliberate failure direction that differs from
+/// `dead_runtime_loop_session_count`: a past-bound window whose authority
+/// cannot be read propagates as `None` rather than counting, because unlike a
+/// dead shell nothing here was established lock-free - a past-bound window is
+/// also what a healthy long turn looks like.
+#[tokio::test(start_paused = true)]
+async fn overdue_run_start_session_count_sees_a_wedged_staged_run() {
+    let machine = persistent_health_probe_machine();
+    let session_id = SessionId::new();
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    machine
+        .ensure_session_with_executor(session_id.clone(), Box::new(HealthProbeNoopExecutor))
+        .await
+        .expect("runtime executor registration should succeed");
+
+    // Arm the window and wedge the shared authority: current run staged with
+    // its turn start signalled, primitive still un-applied. The state is
+    // written through the entry's own authority Arc - the same object the
+    // runtime loop's supervisors observe - via the same recover path
+    // production uses for projection previews.
+    let run = uuid::Uuid::new_v4();
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("registered session entry");
+        let turn_start = crate::run_progress::TurnStartSignalCell::default();
+        turn_start.mark_signalled();
+        entry.run_start_window.arm(
+            meerkat_core::lifecycle::RunId::from_uuid(run),
+            crate::run_progress::Instant::now(),
+            turn_start,
+        );
+        let mut state = entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state()
+            .clone();
+        assert!(
+            state.active_runtime_id.is_some(),
+            "an attached executor leaves the runtime bound; the census must \
+             read the same fact"
+        );
+        state.current_run_id = Some(mm_dsl::RunId(run.to_string()));
+        // Recovery enforces `current_run_only_while_running_or_retired` and
+        // `current_run_has_pre_run_phase`.
+        state.lifecycle_phase = mm_dsl::MeerkatPhase::Running;
+        state.pre_run_phase = Some(mm_dsl::PreRunPhase::Attached);
+        state.turn_phase = mm_dsl::TurnPhase::ApplyingPrimitive;
+        *entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            crate::meerkat_machine::recover_projected_authority(
+                state,
+                "wedged census state must recover",
+            );
+    }
+
+    assert_eq!(
+        machine.overdue_run_start_session_count(),
+        Some(0),
+        "inside the notice bound the same facts are ordinary staging latency"
+    );
+
+    tokio::time::advance(crate::run_progress::RUN_EXECUTION_START_NOTICE + Duration::from_secs(1))
+        .await;
+    assert_eq!(
+        machine.overdue_run_start_session_count(),
+        Some(1),
+        "a staged run past the notice bound with its primitive provably \
+         un-applied is exactly what this accessor exists to report"
+    );
+
+    // The unreadable direction. Holding the authority is what the wedged
+    // pre-apply consumer itself does, so the probe must neither block on it
+    // nor publish a rung it did not establish.
+    {
+        let authority = {
+            let sessions = machine.sessions.read().await;
+            Arc::clone(
+                &sessions
+                    .get(&session_id)
+                    .expect("registered session entry")
+                    .dsl_authority,
+            )
+        };
+        // Nothing below awaits, so this synchronous guard cannot be held
+        // across a suspension point.
+        let held = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            machine.overdue_run_start_session_count(),
+            None,
+            "a past-bound window whose authority cannot be read establishes \
+             nothing; publishing a count either way would be a claim nobody \
+             observed"
+        );
+        drop(held);
+    }
+    assert_eq!(
+        machine.overdue_run_start_session_count(),
+        Some(1),
+        "and the refusal is per-probe, not sticky: the wedge is visible again \
+         the moment the authority is readable"
+    );
+}
+// ---------------------------------------------------------------------------
+// Unfinalizable pending terminal-completion batches.
+//
+// The completion correlation is a single slot and every
+// `ResolveRuntimeCompletionResult*` arm is guarded on it, so clearing the slot
+// for a new run permanently un-resolves the previous run's durable
+// terminal-completion batch. These tests pin the two halves of the fix: the
+// producer no longer moves the slot off an unresolved run, and recovery has a
+// generated disposition for batches that can never be re-bound.
+// ---------------------------------------------------------------------------
+
+fn dsl_run_failed_input(run_id: &str) -> mm_dsl::MeerkatMachineInput {
+    mm_dsl::MeerkatMachineInput::RunFailed {
+        run_id: mm_dsl::RunId(run_id.to_string()),
+        runtime_apply_failure_cause: None,
+        runtime_apply_failure_message: None,
+        machine_terminal_failure_observed: false,
+        terminal_failure_source: Some(mm_dsl::RunFailureSourceKind::Llm),
+        error: "cache breakpoint prefix mismatch".to_string(),
+    }
+}
+
+fn dsl_prepare_run(
+    authority: &mut mm_dsl::MeerkatMachineAuthority,
+    session_id: &str,
+    run_id: &str,
+) {
+    mm_dsl::MeerkatMachineMutator::apply(
+        authority,
+        mm_dsl::MeerkatMachineInput::Prepare {
+            session_id: mm_dsl::SessionId(session_id.to_string()),
+            run_id: mm_dsl::RunId(run_id.to_string()),
+        },
+    )
+    .unwrap_or_else(|error| panic!("Prepare for {run_id} must be admitted: {error:?}"));
+}
+
+fn dsl_fail_run_back_to_idle(authority: &mut mm_dsl::MeerkatMachineAuthority, run_id: &str) {
+    mm_dsl::MeerkatMachineMutator::apply(authority, dsl_run_failed_input(run_id))
+        .unwrap_or_else(|error| panic!("RunFailed for {run_id} must be admitted: {error:?}"));
+    mm_dsl::MeerkatMachineMutator::apply(
+        authority,
+        mm_dsl::MeerkatMachineInput::Fail {
+            run_id: mm_dsl::RunId(run_id.to_string()),
+        },
+    )
+    .unwrap_or_else(|error| panic!("Fail for {run_id} must return the lifecycle: {error:?}"));
+}
+
+fn dsl_resolve_completion(
+    authority: &mut mm_dsl::MeerkatMachineAuthority,
+    run_id: &str,
+) -> Result<(), String> {
+    mm_dsl::MeerkatMachineMutator::apply(
+        authority,
+        mm_dsl::MeerkatMachineInput::ResolveRuntimeCompletionResult {
+            run_id: Some(mm_dsl::RunId(run_id.to_string())),
+            terminal: mm_dsl::RuntimeCompletionTerminalObservation::NoResult,
+            finalization: mm_dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| format!("{error:?}"))
+}
+
+#[test]
+fn starting_a_new_run_must_not_orphan_the_previous_runs_completion_batch() {
+    let session = "session-completion-orphan";
+    let mut authority = registered_dsl_authority_for_session(session);
+
+    // Run 1 terminalizes on the fail lane. Its terminal commit stages a durable
+    // terminal-completion batch and binds the correlation to run-1.
+    dsl_prepare_run(&mut authority, session, "run-1");
+    dsl_fail_run_back_to_idle(&mut authority, "run-1");
+
+    // Run 2 starts before run-1's completion has been published. Through
+    // 0.8.23 this cleared the correlation slot and run-1's batch became
+    // permanently unfinalizable.
+    dsl_prepare_run(&mut authority, session, "run-2");
+
+    // Run 1's late completion must still be resolvable.
+    dsl_resolve_completion(&mut authority, "run-1").expect(
+        "a completion for the previous run must still resolve after a new run has been prepared",
+    );
+}
+
+#[test]
+fn a_settled_correlation_is_still_cleared_by_the_next_run() {
+    let session = "session-completion-settled";
+    let mut authority = registered_dsl_authority_for_session(session);
+
+    dsl_prepare_run(&mut authority, session, "run-1");
+    dsl_fail_run_back_to_idle(&mut authority, "run-1");
+    dsl_resolve_completion(&mut authority, "run-1").expect("run-1 must resolve while correlated");
+
+    // With run-1 settled there is no obligation left to protect, so the next
+    // run takes the slot exactly as it always did, and a replayed resolve for
+    // the retired run is refused rather than misattributed.
+    dsl_prepare_run(&mut authority, session, "run-2");
+    let replayed = dsl_resolve_completion(&mut authority, "run-1");
+    assert!(
+        replayed.is_err(),
+        "a settled correlation must still be cleared by the next run, so a replayed \
+         resolve for the retired run is refused; got {replayed:?}"
+    );
+}
+
+#[test]
+fn recovered_terminal_completion_batches_have_a_generated_disposition() {
+    use crate::meerkat_machine::driver::{
+        machine_classify_recovered_terminal_completion_batch,
+        machine_declare_recovered_terminal_completion_unrecoverable,
+    };
+    use crate::meerkat_machine::dsl::{
+        RecoveredTerminalCompletionDisposition as Disposition,
+        RecoveredTerminalCompletionUnrecoverableReasonKind as Reason,
+    };
+
+    assert_eq!(
+        machine_classify_recovered_terminal_completion_batch("run:run-1", true, true, false)
+            .expect("classifier must admit a correlatable batch"),
+        Disposition::Recover,
+    );
+    assert_eq!(
+        machine_classify_recovered_terminal_completion_batch("run:run-2", false, true, false)
+            .expect("classifier must decide an uncorrelatable batch"),
+        Disposition::DiscardUnrecoverable,
+        "an uncorrelatable batch with no directed publication at risk is dropped, not refused",
+    );
+    assert_eq!(
+        machine_classify_recovered_terminal_completion_batch("run:run-3", true, false, false)
+            .expect("classifier must decide a payload-less batch"),
+        Disposition::DiscardUnrecoverable,
+    );
+    assert_eq!(
+        machine_classify_recovered_terminal_completion_batch("run:run-4", false, true, true)
+            .expect("classifier must decide a batch with an unpublished directed terminal"),
+        Disposition::Blocked,
+        "dropping a batch that still owes a user-visible terminal event must fail closed",
+    );
+
+    assert_eq!(
+        machine_declare_recovered_terminal_completion_unrecoverable(
+            "run:run-4",
+            Reason::DirectedPublicationUnresolved,
+        )
+        .expect("blocked batches must reach a named machine-owned terminal"),
+        Reason::DirectedPublicationUnresolved,
     );
 }

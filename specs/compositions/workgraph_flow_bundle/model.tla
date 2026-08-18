@@ -67,6 +67,36 @@ RouteTargetActor(route_name) == ActorOfMachine(RouteTargetMachine(route_name))
 VARIABLES work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, model_step_count, pending_inputs, observed_inputs, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs
 vars == << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, model_step_count, pending_inputs, observed_inputs, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
 
+\* Named UNCHANGED frames. One definition per distinct frame; every action
+\* that leaves those variables unchanged references the definition by name.
+UnchangedFrame_01c5c5c26fe104c3 == UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_0a24b0a9815bff81 == UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_1eb4735f61fd60ac == UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_200ffc0060c74508 == UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+UnchangedFrame_315673c263c47bfd == UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_3de6261a21bd344d == UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+UnchangedFrame_5dd7d648a23596a6 == UNCHANGED << work_execution_binding_id, work_execution_run_id, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_6da688a13f8a6f43 == UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_71eb061ce3c69fe6 == UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_79f3e86b7290e9f5 == UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_7ca0a3794d2bfdc6 == UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+UnchangedFrame_932d08003e4e619d == UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_a2479c921439746b == UNCHANGED << obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+UnchangedFrame_a2a13c8cc26dadb5 == UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_aadcaeaaa5488654 == UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_b20dd0068997aa3e == UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_b4a6d6a85f2cba01 == UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+UnchangedFrame_bcb8917e76f5fc09 == UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+UnchangedFrame_d029cf0d3e83cf55 == UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_d063a6d561bc8142 == UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection >>
+UnchangedFrame_d1d90666ffe4859e == UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_d2e8cf6c034eddd0 == UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_e7d524a4c3f938ee == UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+UnchangedFrame_eb1b34b9f4544149 == UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+UnchangedFrame_ef196b98e0ca2516 == UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+UnchangedFrame_fc1db005e292de48 == UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+UnchangedFrame_ff767348ef3f1efe == UNCHANGED << witness_current_script_input, witness_remaining_script_inputs >>
+
 RoutePackets == SeqElements(pending_routes) \cup delivered_routes
 PendingActors == {ActorOfMachine(packet.machine) : packet \in SeqElements(pending_inputs)}
 HigherPriorityReady(actor) == \E priority \in ActorPriorities : /\ priority[2] = actor /\ priority[1] \in PendingActors
@@ -150,7 +180,7 @@ work_execution_BindExecution(arg_binding_id, arg_run_id) ==
        /\ work_execution_revision' = (work_execution_revision) + 1
        /\ work_execution_last_failure_detail' = None
        /\ work_execution_evidence_kind' = None
-       /\ UNCHANGED << witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_ff767348ef3f1efe
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -158,7 +188,7 @@ work_execution_BindExecution(arg_binding_id, arg_run_id) ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowLaunchRequested", payload |-> [binding_id |-> packet.payload.binding_id, run_id |-> packet.payload.run_id], effect_id |-> (model_step_count + 1), source_transition |-> "BindExecution"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "BindExecution", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchRequested"]}
        /\ obligation_work_execution_work_execution_flow_launch' = obligation_work_execution_work_execution_flow_launch \cup {[effect_id |-> (model_step_count + 1), binding_id |-> packet.payload.binding_id, run_id |-> packet.payload.run_id]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_a2479c921439746b
        /\ model_step_count' = model_step_count + 1
 
 
@@ -169,7 +199,7 @@ work_execution_RecoverLaunchRequest ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "LaunchRequested"
        /\ work_execution_phase' = "LaunchRequested"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -177,7 +207,7 @@ work_execution_RecoverLaunchRequest ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowLaunchRequested", payload |-> [binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverLaunchRequest"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverLaunchRequest", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchRequested"]}
        /\ obligation_work_execution_work_execution_flow_launch' = obligation_work_execution_work_execution_flow_launch \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_a2479c921439746b
        /\ model_step_count' = model_step_count + 1
 
 
@@ -188,7 +218,7 @@ work_execution_RecoverUncertainLaunch ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "LaunchUncertain"
        /\ work_execution_phase' = "LaunchUncertain"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -196,7 +226,7 @@ work_execution_RecoverUncertainLaunch ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowLaunchUncertain", payload |-> [binding_id |-> work_execution_binding_id, detail |-> (IF "value" \in DOMAIN work_execution_last_failure_detail THEN work_execution_last_failure_detail["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverUncertainLaunch"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverUncertainLaunch", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchUncertain"]}
        /\ obligation_work_execution_work_execution_uncertain_launch_resolution' = obligation_work_execution_work_execution_uncertain_launch_resolution \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, detail |-> (IF "value" \in DOMAIN work_execution_last_failure_detail THEN work_execution_last_failure_detail["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_b4a6d6a85f2cba01
        /\ model_step_count' = model_step_count + 1
 
 
@@ -207,7 +237,7 @@ work_execution_RecoverQuarantinedLaunch ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "LaunchQuarantined"
        /\ work_execution_phase' = "LaunchQuarantined"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -215,7 +245,7 @@ work_execution_RecoverQuarantinedLaunch ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowLaunchQuarantined", payload |-> [binding_id |-> work_execution_binding_id, detail |-> (IF "value" \in DOMAIN work_execution_last_failure_detail THEN work_execution_last_failure_detail["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverQuarantinedLaunch"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverQuarantinedLaunch", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchQuarantined"]}
        /\ obligation_work_execution_work_execution_quarantined_launch_resolution' = obligation_work_execution_work_execution_quarantined_launch_resolution \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, detail |-> (IF "value" \in DOMAIN work_execution_last_failure_detail THEN work_execution_last_failure_detail["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_ef196b98e0ca2516
        /\ model_step_count' = model_step_count + 1
 
 
@@ -226,7 +256,7 @@ work_execution_RecoverRunning ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "Running"
        /\ work_execution_phase' = "Running"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -234,7 +264,7 @@ work_execution_RecoverRunning ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowLaunchAccepted", payload |-> [binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverRunning"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverRunning", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "Running"]}
        /\ obligation_work_execution_work_execution_flow_observation' = obligation_work_execution_work_execution_flow_observation \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_e7d524a4c3f938ee
        /\ model_step_count' = model_step_count + 1
 
 
@@ -245,7 +275,7 @@ work_execution_RecoverEvidenceProjection ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "EvidenceProjectionRequested"
        /\ work_execution_phase' = "EvidenceProjectionRequested"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -253,7 +283,7 @@ work_execution_RecoverEvidenceProjection ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "EvidenceProjectionRequested", payload |-> [binding_id |-> work_execution_binding_id, kind |-> (IF "value" \in DOMAIN work_execution_evidence_kind THEN work_execution_evidence_kind["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverEvidenceProjection"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverEvidenceProjection", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "EvidenceProjectionRequested"]}
        /\ obligation_work_execution_work_execution_success_evidence_projection' = obligation_work_execution_work_execution_success_evidence_projection \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, kind |-> (IF "value" \in DOMAIN work_execution_evidence_kind THEN work_execution_evidence_kind["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_200ffc0060c74508
        /\ model_step_count' = model_step_count + 1
 
 
@@ -264,7 +294,7 @@ work_execution_RecoverWorkClosure ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "WorkClosureRequested"
        /\ work_execution_phase' = "WorkClosureRequested"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -272,7 +302,7 @@ work_execution_RecoverWorkClosure ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "WorkClosureRequested", payload |-> [binding_id |-> work_execution_binding_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverWorkClosure"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverWorkClosure", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "WorkClosureRequested"]}
        /\ obligation_work_execution_work_execution_work_closure' = obligation_work_execution_work_execution_work_closure \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection >>
+       /\ UnchangedFrame_d063a6d561bc8142
        /\ model_step_count' = model_step_count + 1
 
 
@@ -283,7 +313,7 @@ work_execution_RecoverFlowFailureEvidenceProjection ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "FailureEvidenceProjectionRequested"
        /\ work_execution_phase' = "FailureEvidenceProjectionRequested"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -291,7 +321,7 @@ work_execution_RecoverFlowFailureEvidenceProjection ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowFailureEvidenceProjectionRequested", payload |-> [binding_id |-> work_execution_binding_id, kind |-> (IF "value" \in DOMAIN work_execution_evidence_kind THEN work_execution_evidence_kind["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverFlowFailureEvidenceProjection"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverFlowFailureEvidenceProjection", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "FailureEvidenceProjectionRequested"]}
        /\ obligation_work_execution_work_execution_failure_evidence_projection' = obligation_work_execution_work_execution_failure_evidence_projection \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, kind |-> (IF "value" \in DOMAIN work_execution_evidence_kind THEN work_execution_evidence_kind["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_3de6261a21bd344d
        /\ model_step_count' = model_step_count + 1
 
 
@@ -302,7 +332,7 @@ work_execution_RecoverFlowCancellationEvidenceProjection ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "CancellationEvidenceProjectionRequested"
        /\ work_execution_phase' = "CancellationEvidenceProjectionRequested"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -310,7 +340,7 @@ work_execution_RecoverFlowCancellationEvidenceProjection ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowCancellationEvidenceProjectionRequested", payload |-> [binding_id |-> work_execution_binding_id, kind |-> (IF "value" \in DOMAIN work_execution_evidence_kind THEN work_execution_evidence_kind["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverFlowCancellationEvidenceProjection"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverFlowCancellationEvidenceProjection", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "CancellationEvidenceProjectionRequested"]}
        /\ obligation_work_execution_work_execution_cancellation_evidence_projection' = obligation_work_execution_work_execution_cancellation_evidence_projection \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, kind |-> (IF "value" \in DOMAIN work_execution_evidence_kind THEN work_execution_evidence_kind["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_fc1db005e292de48
        /\ model_step_count' = model_step_count + 1
 
 
@@ -321,7 +351,7 @@ work_execution_RecoverLaunchFailureEvidenceProjection ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "LaunchFailureEvidenceProjectionRequested"
        /\ work_execution_phase' = "LaunchFailureEvidenceProjectionRequested"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -329,7 +359,7 @@ work_execution_RecoverLaunchFailureEvidenceProjection ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "LaunchFailureEvidenceProjectionRequested", payload |-> [binding_id |-> work_execution_binding_id, detail |-> (IF "value" \in DOMAIN work_execution_last_failure_detail THEN work_execution_last_failure_detail["value"] ELSE None), kind |-> (IF "value" \in DOMAIN work_execution_evidence_kind THEN work_execution_evidence_kind["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverLaunchFailureEvidenceProjection"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverLaunchFailureEvidenceProjection", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchFailureEvidenceProjectionRequested"]}
        /\ obligation_work_execution_work_execution_launch_failure_evidence_projection' = obligation_work_execution_work_execution_launch_failure_evidence_projection \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, detail |-> (IF "value" \in DOMAIN work_execution_last_failure_detail THEN work_execution_last_failure_detail["value"] ELSE None), kind |-> (IF "value" \in DOMAIN work_execution_evidence_kind THEN work_execution_evidence_kind["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_bcb8917e76f5fc09
        /\ model_step_count' = model_step_count + 1
 
 
@@ -340,14 +370,14 @@ work_execution_RecoverFlowFailure ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "FlowFailed"
        /\ work_execution_phase' = "FlowFailed"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowFailed", payload |-> [binding_id |-> work_execution_binding_id, detail |-> work_execution_last_failure_detail, run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverFlowFailure"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverFlowFailure", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "FlowFailed"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -358,14 +388,14 @@ work_execution_RecoverFlowCancellation ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "FlowCanceled"
        /\ work_execution_phase' = "FlowCanceled"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowCanceled", payload |-> [binding_id |-> work_execution_binding_id, detail |-> work_execution_last_failure_detail, run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverFlowCancellation"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverFlowCancellation", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "FlowCanceled"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -376,14 +406,14 @@ work_execution_RecoverEvidenceProjected ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "EvidenceProjected"
        /\ work_execution_phase' = "EvidenceProjected"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "EvidenceProjected", payload |-> [binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverEvidenceProjected"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverEvidenceProjected", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "EvidenceProjected"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -394,14 +424,14 @@ work_execution_RecoverClosedWork ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "WorkClosed"
        /\ work_execution_phase' = "WorkClosed"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "WorkClosed", payload |-> [binding_id |-> work_execution_binding_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverClosedWork"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverClosedWork", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "WorkClosed"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -412,14 +442,14 @@ work_execution_RecoverLaunchFailure ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "LaunchFailed"
        /\ work_execution_phase' = "LaunchFailed"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "LaunchFailed", payload |-> [binding_id |-> work_execution_binding_id, detail |-> (IF "value" \in DOMAIN work_execution_last_failure_detail THEN work_execution_last_failure_detail["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecoverLaunchFailure"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecoverLaunchFailure", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchFailed"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -433,7 +463,7 @@ work_execution_AcceptFlowLaunch ==
        /\ work_execution_revision' = (work_execution_revision) + 1
        /\ work_execution_last_failure_detail' = None
        /\ work_execution_evidence_kind' = None
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_5dd7d648a23596a6
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -441,7 +471,7 @@ work_execution_AcceptFlowLaunch ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowLaunchAccepted", payload |-> [binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "AcceptFlowLaunch"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "AcceptFlowLaunch", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "Running"]}
        /\ obligation_work_execution_work_execution_flow_observation' = obligation_work_execution_work_execution_flow_observation \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_e7d524a4c3f938ee
        /\ model_step_count' = model_step_count + 1
 
 
@@ -455,7 +485,7 @@ work_execution_ObserveRunningFlow ==
        /\ work_execution_revision' = (work_execution_revision) + 1
        /\ work_execution_last_failure_detail' = None
        /\ work_execution_evidence_kind' = None
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_5dd7d648a23596a6
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -463,7 +493,7 @@ work_execution_ObserveRunningFlow ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowLaunchAccepted", payload |-> [binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveRunningFlow"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ObserveRunningFlow", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "Running"]}
        /\ obligation_work_execution_work_execution_flow_observation' = obligation_work_execution_work_execution_flow_observation \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_e7d524a4c3f938ee
        /\ model_step_count' = model_step_count + 1
 
 
@@ -477,7 +507,7 @@ work_execution_ObserveCompletedFlow ==
        /\ work_execution_revision' = (work_execution_revision) + 1
        /\ work_execution_last_failure_detail' = None
        /\ work_execution_evidence_kind' = Some("Completed")
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_5dd7d648a23596a6
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -485,7 +515,7 @@ work_execution_ObserveCompletedFlow ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "EvidenceProjectionRequested", payload |-> [binding_id |-> work_execution_binding_id, kind |-> (IF "value" \in DOMAIN Some("Completed") THEN Some("Completed")["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveCompletedFlow"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ObserveCompletedFlow", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "EvidenceProjectionRequested"]}
        /\ obligation_work_execution_work_execution_success_evidence_projection' = obligation_work_execution_work_execution_success_evidence_projection \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, kind |-> (IF "value" \in DOMAIN Some("Completed") THEN Some("Completed")["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_200ffc0060c74508
        /\ model_step_count' = model_step_count + 1
 
 
@@ -500,7 +530,7 @@ work_execution_ObserveFailedFlow(arg_detail) ==
        /\ work_execution_revision' = (work_execution_revision) + 1
        /\ work_execution_last_failure_detail' = packet.payload.detail
        /\ work_execution_evidence_kind' = Some("Failed")
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_5dd7d648a23596a6
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -508,7 +538,7 @@ work_execution_ObserveFailedFlow(arg_detail) ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowFailureEvidenceProjectionRequested", payload |-> [binding_id |-> work_execution_binding_id, kind |-> (IF "value" \in DOMAIN Some("Failed") THEN Some("Failed")["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveFailedFlow"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ObserveFailedFlow", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "FailureEvidenceProjectionRequested"]}
        /\ obligation_work_execution_work_execution_failure_evidence_projection' = obligation_work_execution_work_execution_failure_evidence_projection \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, kind |-> (IF "value" \in DOMAIN Some("Failed") THEN Some("Failed")["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_3de6261a21bd344d
        /\ model_step_count' = model_step_count + 1
 
 
@@ -523,7 +553,7 @@ work_execution_ObserveCanceledFlow(arg_detail) ==
        /\ work_execution_revision' = (work_execution_revision) + 1
        /\ work_execution_last_failure_detail' = packet.payload.detail
        /\ work_execution_evidence_kind' = Some("Canceled")
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_5dd7d648a23596a6
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -531,7 +561,7 @@ work_execution_ObserveCanceledFlow(arg_detail) ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowCancellationEvidenceProjectionRequested", payload |-> [binding_id |-> work_execution_binding_id, kind |-> (IF "value" \in DOMAIN Some("Canceled") THEN Some("Canceled")["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveCanceledFlow"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ObserveCanceledFlow", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "CancellationEvidenceProjectionRequested"]}
        /\ obligation_work_execution_work_execution_cancellation_evidence_projection' = obligation_work_execution_work_execution_cancellation_evidence_projection \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, kind |-> (IF "value" \in DOMAIN Some("Canceled") THEN Some("Canceled")["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_fc1db005e292de48
        /\ model_step_count' = model_step_count + 1
 
 
@@ -546,7 +576,7 @@ work_execution_ObserveLostRun(arg_detail) ==
        /\ work_execution_revision' = (work_execution_revision) + 1
        /\ work_execution_last_failure_detail' = Some(packet.payload.detail)
        /\ work_execution_evidence_kind' = Some("RunLost")
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_5dd7d648a23596a6
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -554,7 +584,7 @@ work_execution_ObserveLostRun(arg_detail) ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowFailureEvidenceProjectionRequested", payload |-> [binding_id |-> work_execution_binding_id, kind |-> (IF "value" \in DOMAIN Some("RunLost") THEN Some("RunLost")["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveLostRun"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ObserveLostRun", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "FailureEvidenceProjectionRequested"]}
        /\ obligation_work_execution_work_execution_failure_evidence_projection' = obligation_work_execution_work_execution_failure_evidence_projection \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, kind |-> (IF "value" \in DOMAIN Some("RunLost") THEN Some("RunLost")["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_3de6261a21bd344d
        /\ model_step_count' = model_step_count + 1
 
 
@@ -569,7 +599,7 @@ work_execution_ObserveLostCompletedRunBeforeEvidence(arg_detail) ==
        /\ work_execution_revision' = (work_execution_revision) + 1
        /\ work_execution_last_failure_detail' = Some(packet.payload.detail)
        /\ work_execution_evidence_kind' = Some("RunLost")
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_5dd7d648a23596a6
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -577,7 +607,7 @@ work_execution_ObserveLostCompletedRunBeforeEvidence(arg_detail) ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowFailureEvidenceProjectionRequested", payload |-> [binding_id |-> work_execution_binding_id, kind |-> (IF "value" \in DOMAIN Some("RunLost") THEN Some("RunLost")["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveLostCompletedRunBeforeEvidence"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ObserveLostCompletedRunBeforeEvidence", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "FailureEvidenceProjectionRequested"]}
        /\ obligation_work_execution_work_execution_failure_evidence_projection' = obligation_work_execution_work_execution_failure_evidence_projection \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, kind |-> (IF "value" \in DOMAIN Some("RunLost") THEN Some("RunLost")["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_3de6261a21bd344d
        /\ model_step_count' = model_step_count + 1
 
 
@@ -592,7 +622,7 @@ work_execution_RecordUncertainLaunch(arg_detail) ==
        /\ work_execution_revision' = (work_execution_revision) + 1
        /\ work_execution_last_failure_detail' = Some(packet.payload.detail)
        /\ work_execution_evidence_kind' = None
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_5dd7d648a23596a6
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -600,7 +630,7 @@ work_execution_RecordUncertainLaunch(arg_detail) ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowLaunchUncertain", payload |-> [binding_id |-> work_execution_binding_id, detail |-> (IF "value" \in DOMAIN Some(packet.payload.detail) THEN Some(packet.payload.detail)["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecordUncertainLaunch"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecordUncertainLaunch", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchUncertain"]}
        /\ obligation_work_execution_work_execution_uncertain_launch_resolution' = obligation_work_execution_work_execution_uncertain_launch_resolution \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, detail |-> (IF "value" \in DOMAIN Some(packet.payload.detail) THEN Some(packet.payload.detail)["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_b4a6d6a85f2cba01
        /\ model_step_count' = model_step_count + 1
 
 
@@ -615,7 +645,7 @@ work_execution_QuarantineLaunch(arg_detail) ==
        /\ work_execution_revision' = (work_execution_revision) + 1
        /\ work_execution_last_failure_detail' = Some(packet.payload.detail)
        /\ work_execution_evidence_kind' = None
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_5dd7d648a23596a6
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -623,7 +653,7 @@ work_execution_QuarantineLaunch(arg_detail) ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowLaunchQuarantined", payload |-> [binding_id |-> work_execution_binding_id, detail |-> (IF "value" \in DOMAIN Some(packet.payload.detail) THEN Some(packet.payload.detail)["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "QuarantineLaunch"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "QuarantineLaunch", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchQuarantined"]}
        /\ obligation_work_execution_work_execution_quarantined_launch_resolution' = obligation_work_execution_work_execution_quarantined_launch_resolution \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, detail |-> (IF "value" \in DOMAIN Some(packet.payload.detail) THEN Some(packet.payload.detail)["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_ef196b98e0ca2516
        /\ model_step_count' = model_step_count + 1
 
 
@@ -638,7 +668,7 @@ work_execution_FailLaunch(arg_detail) ==
        /\ work_execution_revision' = (work_execution_revision) + 1
        /\ work_execution_last_failure_detail' = Some(packet.payload.detail)
        /\ work_execution_evidence_kind' = Some("LaunchFailed")
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_5dd7d648a23596a6
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -646,7 +676,7 @@ work_execution_FailLaunch(arg_detail) ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "LaunchFailureEvidenceProjectionRequested", payload |-> [binding_id |-> work_execution_binding_id, detail |-> (IF "value" \in DOMAIN Some(packet.payload.detail) THEN Some(packet.payload.detail)["value"] ELSE None), kind |-> (IF "value" \in DOMAIN Some("LaunchFailed") THEN Some("LaunchFailed")["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "FailLaunch"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "FailLaunch", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchFailureEvidenceProjectionRequested"]}
        /\ obligation_work_execution_work_execution_launch_failure_evidence_projection' = obligation_work_execution_work_execution_launch_failure_evidence_projection \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id, detail |-> (IF "value" \in DOMAIN Some(packet.payload.detail) THEN Some(packet.payload.detail)["value"] ELSE None), kind |-> (IF "value" \in DOMAIN Some("LaunchFailed") THEN Some("LaunchFailed")["value"] ELSE None)]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_bcb8917e76f5fc09
        /\ model_step_count' = model_step_count + 1
 
 
@@ -658,14 +688,14 @@ work_execution_CommitLaunchFailureEvidenceProjection ==
        /\ work_execution_phase = "LaunchFailureEvidenceProjectionRequested"
        /\ work_execution_phase' = "LaunchFailed"
        /\ work_execution_revision' = (work_execution_revision) + 1
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_0a24b0a9815bff81
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "LaunchFailed", payload |-> [binding_id |-> work_execution_binding_id, detail |-> (IF "value" \in DOMAIN work_execution_last_failure_detail THEN work_execution_last_failure_detail["value"] ELSE None), run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "CommitLaunchFailureEvidenceProjection"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "CommitLaunchFailureEvidenceProjection", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchFailed"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -677,7 +707,7 @@ work_execution_CommitEvidenceProjection ==
        /\ work_execution_phase = "EvidenceProjectionRequested"
        /\ work_execution_phase' = "WorkClosureRequested"
        /\ work_execution_revision' = (work_execution_revision) + 1
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_0a24b0a9815bff81
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
@@ -685,7 +715,7 @@ work_execution_CommitEvidenceProjection ==
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "WorkClosureRequested", payload |-> [binding_id |-> work_execution_binding_id], effect_id |-> (model_step_count + 1), source_transition |-> "CommitEvidenceProjection"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "CommitEvidenceProjection", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "WorkClosureRequested"]}
        /\ obligation_work_execution_work_execution_work_closure' = obligation_work_execution_work_execution_work_closure \cup {[effect_id |-> (model_step_count + 1), binding_id |-> work_execution_binding_id]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection >>
+       /\ UnchangedFrame_d063a6d561bc8142
        /\ model_step_count' = model_step_count + 1
 
 
@@ -697,14 +727,14 @@ work_execution_CommitFlowFailureEvidenceProjection ==
        /\ work_execution_phase = "FailureEvidenceProjectionRequested"
        /\ work_execution_phase' = "FlowFailed"
        /\ work_execution_revision' = (work_execution_revision) + 1
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_0a24b0a9815bff81
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowFailed", payload |-> [binding_id |-> work_execution_binding_id, detail |-> work_execution_last_failure_detail, run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "CommitFlowFailureEvidenceProjection"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "CommitFlowFailureEvidenceProjection", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "FlowFailed"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -716,14 +746,14 @@ work_execution_CommitFlowCancellationEvidenceProjection ==
        /\ work_execution_phase = "CancellationEvidenceProjectionRequested"
        /\ work_execution_phase' = "FlowCanceled"
        /\ work_execution_revision' = (work_execution_revision) + 1
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_0a24b0a9815bff81
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "FlowCanceled", payload |-> [binding_id |-> work_execution_binding_id, detail |-> work_execution_last_failure_detail, run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "CommitFlowCancellationEvidenceProjection"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "CommitFlowCancellationEvidenceProjection", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "FlowCanceled"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -736,14 +766,14 @@ work_execution_CommitWorkClosure ==
        /\ work_execution_phase' = "WorkClosed"
        /\ work_execution_revision' = (work_execution_revision) + 1
        /\ work_execution_last_failure_detail' = None
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_315673c263c47bfd
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "WorkClosed", payload |-> [binding_id |-> work_execution_binding_id], effect_id |-> (model_step_count + 1), source_transition |-> "CommitWorkClosure"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "CommitWorkClosure", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "WorkClosed"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -757,14 +787,14 @@ work_execution_RecordWorkClosureRefusal(arg_detail) ==
        /\ work_execution_phase' = "EvidenceProjected"
        /\ work_execution_revision' = (work_execution_revision) + 1
        /\ work_execution_last_failure_detail' = Some(packet.payload.detail)
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_315673c263c47bfd
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "EvidenceProjected", payload |-> [binding_id |-> work_execution_binding_id, run_id |-> work_execution_run_id], effect_id |-> (model_step_count + 1), source_transition |-> "RecordWorkClosureRefusal"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "RecordWorkClosureRefusal", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "EvidenceProjected"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -775,14 +805,14 @@ work_execution_ClassifyRetryEligibilityTerminalFlowFailed ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "FlowFailed"
        /\ work_execution_phase' = "FlowFailed"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> TRUE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityTerminalFlowFailed"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityTerminalFlowFailed", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "FlowFailed"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -793,14 +823,14 @@ work_execution_ClassifyRetryEligibilityTerminalFlowCanceled ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "FlowCanceled"
        /\ work_execution_phase' = "FlowCanceled"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> TRUE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityTerminalFlowCanceled"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityTerminalFlowCanceled", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "FlowCanceled"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -811,14 +841,14 @@ work_execution_ClassifyRetryEligibilityTerminalEvidenceProjected ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "EvidenceProjected"
        /\ work_execution_phase' = "EvidenceProjected"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> TRUE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityTerminalEvidenceProjected"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityTerminalEvidenceProjected", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "EvidenceProjected"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -829,14 +859,14 @@ work_execution_ClassifyRetryEligibilityTerminalWorkClosed ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "WorkClosed"
        /\ work_execution_phase' = "WorkClosed"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> TRUE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityTerminalWorkClosed"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityTerminalWorkClosed", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "WorkClosed"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -847,14 +877,14 @@ work_execution_ClassifyRetryEligibilityTerminalLaunchFailed ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "LaunchFailed"
        /\ work_execution_phase' = "LaunchFailed"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> TRUE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityTerminalLaunchFailed"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityTerminalLaunchFailed", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchFailed"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -865,14 +895,14 @@ work_execution_ClassifyRetryEligibilityLiveAbsent ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "Absent"
        /\ work_execution_phase' = "Absent"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> FALSE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityLiveAbsent"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityLiveAbsent", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "Absent"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -883,14 +913,14 @@ work_execution_ClassifyRetryEligibilityLiveLaunchRequested ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "LaunchRequested"
        /\ work_execution_phase' = "LaunchRequested"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> FALSE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityLiveLaunchRequested"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityLiveLaunchRequested", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchRequested"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -901,14 +931,14 @@ work_execution_ClassifyRetryEligibilityLiveLaunchUncertain ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "LaunchUncertain"
        /\ work_execution_phase' = "LaunchUncertain"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> FALSE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityLiveLaunchUncertain"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityLiveLaunchUncertain", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchUncertain"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -919,14 +949,14 @@ work_execution_ClassifyRetryEligibilityLiveLaunchQuarantined ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "LaunchQuarantined"
        /\ work_execution_phase' = "LaunchQuarantined"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> FALSE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityLiveLaunchQuarantined"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityLiveLaunchQuarantined", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchQuarantined"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -937,14 +967,14 @@ work_execution_ClassifyRetryEligibilityLiveRunning ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "Running"
        /\ work_execution_phase' = "Running"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> FALSE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityLiveRunning"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityLiveRunning", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "Running"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -955,14 +985,14 @@ work_execution_ClassifyRetryEligibilityLiveEvidenceProjectionRequested ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "EvidenceProjectionRequested"
        /\ work_execution_phase' = "EvidenceProjectionRequested"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> FALSE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityLiveEvidenceProjectionRequested"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityLiveEvidenceProjectionRequested", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "EvidenceProjectionRequested"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -973,14 +1003,14 @@ work_execution_ClassifyRetryEligibilityLiveFailureEvidenceProjectionRequested ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "FailureEvidenceProjectionRequested"
        /\ work_execution_phase' = "FailureEvidenceProjectionRequested"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> FALSE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityLiveFailureEvidenceProjectionRequested"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityLiveFailureEvidenceProjectionRequested", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "FailureEvidenceProjectionRequested"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -991,14 +1021,14 @@ work_execution_ClassifyRetryEligibilityLiveCancellationEvidenceProjectionRequest
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "CancellationEvidenceProjectionRequested"
        /\ work_execution_phase' = "CancellationEvidenceProjectionRequested"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> FALSE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityLiveCancellationEvidenceProjectionRequested"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityLiveCancellationEvidenceProjectionRequested", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "CancellationEvidenceProjectionRequested"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -1009,14 +1039,14 @@ work_execution_ClassifyRetryEligibilityLiveLaunchFailureEvidenceProjectionReques
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "LaunchFailureEvidenceProjectionRequested"
        /\ work_execution_phase' = "LaunchFailureEvidenceProjectionRequested"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> FALSE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityLiveLaunchFailureEvidenceProjectionRequested"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityLiveLaunchFailureEvidenceProjectionRequested", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "LaunchFailureEvidenceProjectionRequested"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -1027,14 +1057,14 @@ work_execution_ClassifyRetryEligibilityLiveWorkClosureRequested ==
        /\ ~HigherPriorityReady("work_execution_authority")
        /\ work_execution_phase = "WorkClosureRequested"
        /\ work_execution_phase' = "WorkClosureRequested"
-       /\ UNCHANGED << work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_d029cf0d3e83cf55
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "work_execution", variant |-> "RetryEligibilityClassified", payload |-> [eligible |-> FALSE], effect_id |-> (model_step_count + 1), source_transition |-> "ClassifyRetryEligibilityLiveWorkClosureRequested"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "work_execution", transition |-> "ClassifyRetryEligibilityLiveWorkClosureRequested", actor |-> "work_execution_authority", step |-> (model_step_count + 1), from_phase |-> work_execution_phase, to_phase |-> "WorkClosureRequested"]}
-       /\ UNCHANGED << obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure >>
+       /\ UnchangedFrame_7ca0a3794d2bfdc6
        /\ model_step_count' = model_step_count + 1
 
 
@@ -1100,7 +1130,7 @@ Inject_bind_execution(arg_binding_id, arg_run_id) ==
     /\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "Bind", payload |-> [binding_id |-> arg_binding_id, run_id |-> arg_run_id], source_kind |-> "entry", source_route |-> "bind_execution", source_machine |-> "external_entry", source_effect |-> "Bind", effect_id |-> 0])
     /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "Bind", payload |-> [binding_id |-> arg_binding_id, run_id |-> arg_run_id], source_kind |-> "entry", source_route |-> "bind_execution", source_machine |-> "external_entry", source_effect |-> "Bind", effect_id |-> 0]}
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_d1d90666ffe4859e
 
 DeliverQueuedRoute ==
     /\ Len(pending_routes) > 0
@@ -1110,7 +1140,7 @@ DeliverQueuedRoute ==
        /\ model_step_count' = model_step_count + 1
        /\ pending_inputs' = AppendIfMissing(pending_inputs, [machine |-> route.target_machine, variant |-> route.target_input, payload |-> route.payload, source_kind |-> "route", source_route |-> route.route, source_machine |-> route.source_machine, source_effect |-> route.effect, effect_id |-> route.effect_id])
        /\ observed_inputs' = observed_inputs \cup {[machine |-> route.target_machine, variant |-> route.target_input, payload |-> route.payload, source_kind |-> "route", source_route |-> route.route, source_machine |-> route.source_machine, source_effect |-> route.effect, effect_id |-> route.effect_id]}
-       /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_79f3e86b7290e9f5
 
 RejectPendingEntryInput ==
     /\ \E packet \in SeqElements(pending_inputs) :
@@ -1123,7 +1153,7 @@ RejectPendingEntryInput ==
        /\ emitted_effects' = emitted_effects
        /\ observed_transitions' = observed_transitions
        /\ model_step_count' = model_step_count + 1
-       /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, witness_current_script_input, witness_remaining_script_inputs >>
+       /\ UnchangedFrame_a2a13c8cc26dadb5
 
 QuiescentStutter ==
     /\ Len(pending_routes) = 0
@@ -1266,193 +1296,193 @@ OwnerFeedback_work_execution_work_execution_flow_launch_ConfirmFlowStarted ==
     /\ obligation_work_execution_work_execution_flow_launch /= {}
     /\ \E token \in obligation_work_execution_work_execution_flow_launch :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ConfirmFlowStarted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ConfirmFlowStarted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_flow_launch' = obligation_work_execution_work_execution_flow_launch \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_01c5c5c26fe104c3
 
 OwnerFeedback_work_execution_work_execution_flow_launch_ObserveFlowRunning ==
     /\ obligation_work_execution_work_execution_flow_launch /= {}
     /\ \E token \in obligation_work_execution_work_execution_flow_launch :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowRunning", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowRunning", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_flow_launch' = obligation_work_execution_work_execution_flow_launch \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_01c5c5c26fe104c3
 
 OwnerFeedback_work_execution_work_execution_flow_launch_ObserveFlowCompleted ==
     /\ obligation_work_execution_work_execution_flow_launch /= {}
     /\ \E token \in obligation_work_execution_work_execution_flow_launch :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowCompleted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowCompleted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_flow_launch' = obligation_work_execution_work_execution_flow_launch \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_01c5c5c26fe104c3
 
 OwnerFeedback_work_execution_work_execution_flow_launch_ObserveFlowFailed ==
     /\ obligation_work_execution_work_execution_flow_launch /= {}
     /\ \E token \in obligation_work_execution_work_execution_flow_launch :
         /\ \E owner_ctx_observed_failure_detail \in OptionStringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowFailed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_failure_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowFailed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_failure_detail]]} /\ obligation_work_execution_work_execution_flow_launch' = obligation_work_execution_work_execution_flow_launch \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_01c5c5c26fe104c3
 
 OwnerFeedback_work_execution_work_execution_flow_launch_ObserveFlowCanceled ==
     /\ obligation_work_execution_work_execution_flow_launch /= {}
     /\ \E token \in obligation_work_execution_work_execution_flow_launch :
         /\ \E owner_ctx_observed_cancellation_detail \in OptionStringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowCanceled", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_cancellation_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowCanceled", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_cancellation_detail]]} /\ obligation_work_execution_work_execution_flow_launch' = obligation_work_execution_work_execution_flow_launch \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_01c5c5c26fe104c3
 
 OwnerFeedback_work_execution_work_execution_flow_launch_MarkLaunchUncertain ==
     /\ obligation_work_execution_work_execution_flow_launch /= {}
     /\ \E token \in obligation_work_execution_work_execution_flow_launch :
         /\ \E owner_ctx_launch_uncertainty_detail \in StringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "MarkLaunchUncertain", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_launch_uncertainty_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "MarkLaunchUncertain", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_launch_uncertainty_detail]]} /\ obligation_work_execution_work_execution_flow_launch' = obligation_work_execution_work_execution_flow_launch \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_01c5c5c26fe104c3
 
 OwnerFeedback_work_execution_work_execution_flow_launch_QuarantineLaunch ==
     /\ obligation_work_execution_work_execution_flow_launch /= {}
     /\ \E token \in obligation_work_execution_work_execution_flow_launch :
         /\ \E owner_ctx_launch_quarantine_detail \in StringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "QuarantineLaunch", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_launch_quarantine_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "QuarantineLaunch", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_launch_quarantine_detail]]} /\ obligation_work_execution_work_execution_flow_launch' = obligation_work_execution_work_execution_flow_launch \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_01c5c5c26fe104c3
 
 OwnerFeedback_work_execution_work_execution_flow_launch_ResolveLaunchFailed ==
     /\ obligation_work_execution_work_execution_flow_launch /= {}
     /\ \E token \in obligation_work_execution_work_execution_flow_launch :
         /\ \E owner_ctx_launch_failure_detail \in StringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ResolveLaunchFailed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_launch_failure_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ResolveLaunchFailed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_launch_failure_detail]]} /\ obligation_work_execution_work_execution_flow_launch' = obligation_work_execution_work_execution_flow_launch \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_01c5c5c26fe104c3
 
 OwnerFeedback_work_execution_work_execution_flow_observation_ObserveFlowRunning ==
     /\ obligation_work_execution_work_execution_flow_observation /= {}
     /\ \E token \in obligation_work_execution_work_execution_flow_observation :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowRunning", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchAccepted", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowRunning", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchAccepted", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_flow_observation' = obligation_work_execution_work_execution_flow_observation \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_1eb4735f61fd60ac
 
 OwnerFeedback_work_execution_work_execution_flow_observation_ObserveFlowCompleted ==
     /\ obligation_work_execution_work_execution_flow_observation /= {}
     /\ \E token \in obligation_work_execution_work_execution_flow_observation :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowCompleted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchAccepted", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowCompleted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchAccepted", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_flow_observation' = obligation_work_execution_work_execution_flow_observation \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_1eb4735f61fd60ac
 
 OwnerFeedback_work_execution_work_execution_flow_observation_ObserveFlowFailed ==
     /\ obligation_work_execution_work_execution_flow_observation /= {}
     /\ \E token \in obligation_work_execution_work_execution_flow_observation :
         /\ \E owner_ctx_observed_failure_detail \in OptionStringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowFailed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchAccepted", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_failure_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowFailed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchAccepted", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_failure_detail]]} /\ obligation_work_execution_work_execution_flow_observation' = obligation_work_execution_work_execution_flow_observation \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_1eb4735f61fd60ac
 
 OwnerFeedback_work_execution_work_execution_flow_observation_ObserveFlowCanceled ==
     /\ obligation_work_execution_work_execution_flow_observation /= {}
     /\ \E token \in obligation_work_execution_work_execution_flow_observation :
         /\ \E owner_ctx_observed_cancellation_detail \in OptionStringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowCanceled", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchAccepted", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_cancellation_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowCanceled", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchAccepted", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_cancellation_detail]]} /\ obligation_work_execution_work_execution_flow_observation' = obligation_work_execution_work_execution_flow_observation \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_1eb4735f61fd60ac
 
 OwnerFeedback_work_execution_work_execution_flow_observation_ObserveRunLost ==
     /\ obligation_work_execution_work_execution_flow_observation /= {}
     /\ \E token \in obligation_work_execution_work_execution_flow_observation :
         /\ \E owner_ctx_lost_run_detail \in StringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveRunLost", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchAccepted", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_lost_run_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveRunLost", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchAccepted", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_lost_run_detail]]} /\ obligation_work_execution_work_execution_flow_observation' = obligation_work_execution_work_execution_flow_observation \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_1eb4735f61fd60ac
 
 OwnerFeedback_work_execution_work_execution_uncertain_launch_resolution_ConfirmFlowStarted ==
     /\ obligation_work_execution_work_execution_uncertain_launch_resolution /= {}
     /\ \E token \in obligation_work_execution_work_execution_uncertain_launch_resolution :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ConfirmFlowStarted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ConfirmFlowStarted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_uncertain_launch_resolution' = obligation_work_execution_work_execution_uncertain_launch_resolution \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_eb1b34b9f4544149
 
 OwnerFeedback_work_execution_work_execution_uncertain_launch_resolution_ObserveFlowRunning ==
     /\ obligation_work_execution_work_execution_uncertain_launch_resolution /= {}
     /\ \E token \in obligation_work_execution_work_execution_uncertain_launch_resolution :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowRunning", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowRunning", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_uncertain_launch_resolution' = obligation_work_execution_work_execution_uncertain_launch_resolution \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_eb1b34b9f4544149
 
 OwnerFeedback_work_execution_work_execution_uncertain_launch_resolution_ObserveFlowCompleted ==
     /\ obligation_work_execution_work_execution_uncertain_launch_resolution /= {}
     /\ \E token \in obligation_work_execution_work_execution_uncertain_launch_resolution :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowCompleted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowCompleted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_uncertain_launch_resolution' = obligation_work_execution_work_execution_uncertain_launch_resolution \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_eb1b34b9f4544149
 
 OwnerFeedback_work_execution_work_execution_uncertain_launch_resolution_ObserveFlowFailed ==
     /\ obligation_work_execution_work_execution_uncertain_launch_resolution /= {}
     /\ \E token \in obligation_work_execution_work_execution_uncertain_launch_resolution :
         /\ \E owner_ctx_observed_failure_detail \in OptionStringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowFailed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_failure_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowFailed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_failure_detail]]} /\ obligation_work_execution_work_execution_uncertain_launch_resolution' = obligation_work_execution_work_execution_uncertain_launch_resolution \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_eb1b34b9f4544149
 
 OwnerFeedback_work_execution_work_execution_uncertain_launch_resolution_ObserveFlowCanceled ==
     /\ obligation_work_execution_work_execution_uncertain_launch_resolution /= {}
     /\ \E token \in obligation_work_execution_work_execution_uncertain_launch_resolution :
         /\ \E owner_ctx_observed_cancellation_detail \in OptionStringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowCanceled", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_cancellation_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowCanceled", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_cancellation_detail]]} /\ obligation_work_execution_work_execution_uncertain_launch_resolution' = obligation_work_execution_work_execution_uncertain_launch_resolution \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_eb1b34b9f4544149
 
 OwnerFeedback_work_execution_work_execution_uncertain_launch_resolution_ResolveLaunchFailed ==
     /\ obligation_work_execution_work_execution_uncertain_launch_resolution /= {}
     /\ \E token \in obligation_work_execution_work_execution_uncertain_launch_resolution :
         /\ \E owner_ctx_launch_failure_detail \in StringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ResolveLaunchFailed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_launch_failure_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ResolveLaunchFailed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_launch_failure_detail]]} /\ obligation_work_execution_work_execution_uncertain_launch_resolution' = obligation_work_execution_work_execution_uncertain_launch_resolution \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_eb1b34b9f4544149
 
 OwnerFeedback_work_execution_work_execution_uncertain_launch_resolution_QuarantineLaunch ==
     /\ obligation_work_execution_work_execution_uncertain_launch_resolution /= {}
     /\ \E token \in obligation_work_execution_work_execution_uncertain_launch_resolution :
         /\ \E owner_ctx_launch_quarantine_detail \in StringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "QuarantineLaunch", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_launch_quarantine_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "QuarantineLaunch", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchUncertain", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_launch_quarantine_detail]]} /\ obligation_work_execution_work_execution_uncertain_launch_resolution' = obligation_work_execution_work_execution_uncertain_launch_resolution \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_eb1b34b9f4544149
 
 OwnerFeedback_work_execution_work_execution_quarantined_launch_resolution_ConfirmFlowStarted ==
     /\ obligation_work_execution_work_execution_quarantined_launch_resolution /= {}
     /\ \E token \in obligation_work_execution_work_execution_quarantined_launch_resolution :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ConfirmFlowStarted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchQuarantined", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ConfirmFlowStarted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchQuarantined", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_quarantined_launch_resolution' = obligation_work_execution_work_execution_quarantined_launch_resolution \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_71eb061ce3c69fe6
 
 OwnerFeedback_work_execution_work_execution_quarantined_launch_resolution_ObserveFlowRunning ==
     /\ obligation_work_execution_work_execution_quarantined_launch_resolution /= {}
     /\ \E token \in obligation_work_execution_work_execution_quarantined_launch_resolution :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowRunning", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchQuarantined", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowRunning", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchQuarantined", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_quarantined_launch_resolution' = obligation_work_execution_work_execution_quarantined_launch_resolution \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_71eb061ce3c69fe6
 
 OwnerFeedback_work_execution_work_execution_quarantined_launch_resolution_ObserveFlowCompleted ==
     /\ obligation_work_execution_work_execution_quarantined_launch_resolution /= {}
     /\ \E token \in obligation_work_execution_work_execution_quarantined_launch_resolution :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowCompleted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchQuarantined", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowCompleted", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchQuarantined", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_quarantined_launch_resolution' = obligation_work_execution_work_execution_quarantined_launch_resolution \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_71eb061ce3c69fe6
 
 OwnerFeedback_work_execution_work_execution_quarantined_launch_resolution_ObserveFlowFailed ==
     /\ obligation_work_execution_work_execution_quarantined_launch_resolution /= {}
     /\ \E token \in obligation_work_execution_work_execution_quarantined_launch_resolution :
         /\ \E owner_ctx_observed_failure_detail \in OptionStringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowFailed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchQuarantined", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_failure_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowFailed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchQuarantined", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_failure_detail]]} /\ obligation_work_execution_work_execution_quarantined_launch_resolution' = obligation_work_execution_work_execution_quarantined_launch_resolution \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_71eb061ce3c69fe6
 
 OwnerFeedback_work_execution_work_execution_quarantined_launch_resolution_ObserveFlowCanceled ==
     /\ obligation_work_execution_work_execution_quarantined_launch_resolution /= {}
     /\ \E token \in obligation_work_execution_work_execution_quarantined_launch_resolution :
         /\ \E owner_ctx_observed_cancellation_detail \in OptionStringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveFlowCanceled", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchQuarantined", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_cancellation_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveFlowCanceled", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowLaunchQuarantined", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_observed_cancellation_detail]]} /\ obligation_work_execution_work_execution_quarantined_launch_resolution' = obligation_work_execution_work_execution_quarantined_launch_resolution \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_71eb061ce3c69fe6
 
 OwnerFeedback_work_execution_work_execution_success_evidence_projection_ConfirmEvidenceProjected ==
     /\ obligation_work_execution_work_execution_success_evidence_projection /= {}
     /\ \E token \in obligation_work_execution_work_execution_success_evidence_projection :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ConfirmEvidenceProjected", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "EvidenceProjectionRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ConfirmEvidenceProjected", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "EvidenceProjectionRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_success_evidence_projection' = obligation_work_execution_work_execution_success_evidence_projection \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_d2e8cf6c034eddd0
 
 OwnerFeedback_work_execution_work_execution_success_evidence_projection_ObserveRunLost ==
     /\ obligation_work_execution_work_execution_success_evidence_projection /= {}
     /\ \E token \in obligation_work_execution_work_execution_success_evidence_projection :
         /\ \E owner_ctx_lost_run_detail \in StringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ObserveRunLost", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "EvidenceProjectionRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_lost_run_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ObserveRunLost", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "EvidenceProjectionRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_lost_run_detail]]} /\ obligation_work_execution_work_execution_success_evidence_projection' = obligation_work_execution_work_execution_success_evidence_projection \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_d2e8cf6c034eddd0
 
 OwnerFeedback_work_execution_work_execution_failure_evidence_projection_ConfirmFlowFailureEvidenceProjected ==
     /\ obligation_work_execution_work_execution_failure_evidence_projection /= {}
     /\ \E token \in obligation_work_execution_work_execution_failure_evidence_projection :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ConfirmFlowFailureEvidenceProjected", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowFailureEvidenceProjectionRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ConfirmFlowFailureEvidenceProjected", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowFailureEvidenceProjectionRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_failure_evidence_projection' = obligation_work_execution_work_execution_failure_evidence_projection \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_932d08003e4e619d
 
 OwnerFeedback_work_execution_work_execution_cancellation_evidence_projection_ConfirmFlowCancellationEvidenceProjected ==
     /\ obligation_work_execution_work_execution_cancellation_evidence_projection /= {}
     /\ \E token \in obligation_work_execution_work_execution_cancellation_evidence_projection :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ConfirmFlowCancellationEvidenceProjected", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowCancellationEvidenceProjectionRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ConfirmFlowCancellationEvidenceProjected", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "FlowCancellationEvidenceProjectionRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_cancellation_evidence_projection' = obligation_work_execution_work_execution_cancellation_evidence_projection \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_b20dd0068997aa3e
 
 OwnerFeedback_work_execution_work_execution_launch_failure_evidence_projection_ConfirmLaunchFailureEvidenceProjected ==
     /\ obligation_work_execution_work_execution_launch_failure_evidence_projection /= {}
     /\ \E token \in obligation_work_execution_work_execution_launch_failure_evidence_projection :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ConfirmLaunchFailureEvidenceProjected", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "LaunchFailureEvidenceProjectionRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ConfirmLaunchFailureEvidenceProjected", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "LaunchFailureEvidenceProjectionRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_launch_failure_evidence_projection' = obligation_work_execution_work_execution_launch_failure_evidence_projection \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_work_closure, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_6da688a13f8a6f43
 
 OwnerFeedback_work_execution_work_execution_work_closure_ConfirmWorkClosed ==
     /\ obligation_work_execution_work_execution_work_closure /= {}
     /\ \E token \in obligation_work_execution_work_execution_work_closure :
         /\ (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "ConfirmWorkClosed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "WorkClosureRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "ConfirmWorkClosed", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "WorkClosureRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [tag |-> "unit"]]} /\ obligation_work_execution_work_execution_work_closure' = obligation_work_execution_work_execution_work_closure \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_aadcaeaaa5488654
 
 OwnerFeedback_work_execution_work_execution_work_closure_RefuseWorkClosure ==
     /\ obligation_work_execution_work_execution_work_closure /= {}
     /\ \E token \in obligation_work_execution_work_execution_work_closure :
         /\ \E owner_ctx_work_closure_refusal_detail \in StringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "work_execution", variant |-> "RefuseWorkClosure", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "WorkClosureRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_work_closure_refusal_detail]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "work_execution", variant |-> "RefuseWorkClosure", source_kind |-> "owner", source_machine |-> "work_execution", source_effect |-> "WorkClosureRequested", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [detail |-> owner_ctx_work_closure_refusal_detail]]} /\ obligation_work_execution_work_execution_work_closure' = obligation_work_execution_work_execution_work_closure \ {token} /\ model_step_count' = model_step_count + 1)
-    /\ UNCHANGED << work_execution_phase, work_execution_binding_id, work_execution_run_id, work_execution_revision, work_execution_last_failure_detail, work_execution_evidence_kind, obligation_work_execution_work_execution_flow_launch, obligation_work_execution_work_execution_flow_observation, obligation_work_execution_work_execution_uncertain_launch_resolution, obligation_work_execution_work_execution_quarantined_launch_resolution, obligation_work_execution_work_execution_success_evidence_projection, obligation_work_execution_work_execution_failure_evidence_projection, obligation_work_execution_work_execution_cancellation_evidence_projection, obligation_work_execution_work_execution_launch_failure_evidence_projection, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+    /\ UnchangedFrame_aadcaeaaa5488654
 
 CoreNext ==
     \/ RejectPendingEntryInput

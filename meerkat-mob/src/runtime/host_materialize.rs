@@ -197,6 +197,20 @@ pub enum MaterializeServeError {
         "revived member keypair diverged from the recorded pubkey (recorded '{recorded}', derived '{derived}')"
     )]
     RevivedIdentityDiverged { recorded: String, derived: String },
+    /// The member participant name could not be published because a
+    /// *different* live public key already holds that route.
+    ///
+    /// Re-carries [`meerkat_comms::RegistrationRejection::NameOccupied`]'s
+    /// `holder_pubkey` verbatim rather than flattening it into [`Self::Comms`]'s
+    /// prose. Construct only from `crate::error::comms_name_occupancy_holder`.
+    #[error(
+        "{}",
+        crate::error::participant_name_occupied_message(participant_name, holder_pubkey)
+    )]
+    ParticipantNameOccupied {
+        participant_name: String,
+        holder_pubkey: meerkat_comms::PubKey,
+    },
 }
 
 impl MaterializeServeError {
@@ -247,8 +261,16 @@ impl MaterializeServeError {
                 },
                 format!("materialize rejected: {}", failure.public_message()),
             ),
+            // `ParticipantNameOccupied` deliberately keeps the pre-existing
+            // `Internal` wire projection: there is no `BridgeRejectionCause`
+            // that means "participant name held by a live incumbent", and
+            // minting one is a `meerkat-contracts` change (schema regen + SDK
+            // codegen + version parity). Remote controllers see exactly what
+            // they see today, with the operator remedy in the detail string;
+            // in-process embedders get the typed variant.
             Self::Build(_)
             | Self::Comms { .. }
+            | Self::ParticipantNameOccupied { .. }
             | Self::SupervisorBind { .. }
             | Self::SessionService(_)
             | Self::IdentityMismatch { .. }
@@ -1062,6 +1084,49 @@ impl HostMemberMaterializer {
 
     pub fn substrate(&self) -> &HostMemberSubstrate {
         &self.substrate
+    }
+
+    /// Release every live member's participant route because this host is going
+    /// away.
+    ///
+    /// HOST TEARDOWN ONLY. Per-session disposal deliberately does NOT release
+    /// here: those paths remove and in some cases re-establish the index entry,
+    /// and retiring the route there took a live member's name away from it -
+    /// measured as "local member session exposes a comms runtime" failing. A
+    /// disposed member's own route release belongs with whatever also settles
+    /// its session claim, which is separate work.
+    ///
+    /// A member route outlives the actor without this. It is held by the
+    /// member's comms drain, which runs in PersistentHost mode inside a detached
+    /// task holding an owned `Arc`, so dropping the actor never brings the
+    /// refcount to zero and `Drop` never fires. Through 0.8.23 that leak was
+    /// harmless because a successor holding the same durable identity was
+    /// allowed to rebind over the still-published name; the 0.8.24 one claim
+    /// rule removed that arm on purpose, so an orphaned route now REFUSES its
+    /// own successor - and the successor has no handle to it and nothing it can
+    /// do to clear it.
+    ///
+    /// This is the member-axis analogue of the supervisor bridge's
+    /// shutdown-time `retire_inproc_route`, which the member path never got.
+    /// Retirement is generation-exact, so this can only ever remove routes this
+    /// host published.
+    /// Releases the NAMES only, and deliberately leaves the index intact.
+    ///
+    /// Clearing `live_runtimes` here was wrong: callers still read a member's
+    /// comms runtime after the host stops serving (the fixtures assert "local
+    /// member session exposes a comms runtime"), and taking the map turned a
+    /// name release into a missing-runtime failure. The index dies with the
+    /// actor anyway, so the only thing that must happen here is giving up the
+    /// registry claims, which is what a successor needs.
+    pub fn release_live_member_routes(&mut self) {
+        for (session_id, live) in &self.live_runtimes {
+            if live.runtime.retire_inproc_route() {
+                tracing::debug!(
+                    %session_id,
+                    "released a member participant route on host teardown"
+                );
+            }
+        }
     }
 
     pub fn live_runtime(&self, session_id: &SessionId) -> Option<&LiveMemberRuntime> {
@@ -2760,9 +2825,17 @@ impl HostMemberMaterializer {
             claim_handle,
         )
         .await
-        .map_err(|err| MaterializeServeError::Comms {
-            detail: err.to_string(),
-        })?;
+        .map_err(
+            |err| match crate::error::comms_name_occupancy_holder(&err) {
+                Some(holder_pubkey) => MaterializeServeError::ParticipantNameOccupied {
+                    participant_name: comms_name.to_string(),
+                    holder_pubkey,
+                },
+                None => MaterializeServeError::Comms {
+                    detail: err.to_string(),
+                },
+            },
+        )?;
         if let Some(meta) = config.peer_meta.clone() {
             runtime.set_peer_meta(meta);
         }
@@ -3030,6 +3103,7 @@ mod tests {
                 budget_limits: Some(meerkat_core::BudgetLimits {
                     max_tokens: Some(100_000),
                     max_duration: None,
+                    max_turn_duration: None,
                     max_tool_calls: Some(50),
                 }),
                 runtime_mode: meerkat_contracts::wire::WireMobRuntimeMode::TurnDriven,

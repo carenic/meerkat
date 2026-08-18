@@ -73,6 +73,66 @@ These checks keep the Rust workspace version, Python package version,
 TypeScript package version, and generated contract artifacts aligned before any
 registry publish happens.
 
+## Declared Breaks (`semver-breaks`)
+
+0.x patch releases may break public API; every break must be declared. The
+`semver-breaks` gate runs cargo-semver-checks over the publishable workspace
+against the published crates.io baselines and fails the release unless all
+three hold:
+
+1. **Measured.** The run reached every crate the release publishes, and its
+   exit code agrees with its content. A run that died halfway, or failed for a
+   reason other than a detected break, is a failure rather than a pass.
+2. **Named.** Every finding the tool reports is named in the pending release
+   section's `### Breaking` body, at the granularity of the finding. A type
+   gaining a field and the same type losing a derive are two findings; naming
+   one does not declare the other.
+3. **Stamped.** The pending section is stamped `## [VERSION] - DATE` against
+   the version being released. Notes still sitting under `## [Unreleased]`
+   after the version bump has landed would publish as release notes titled
+   "Unreleased", and that is a failure.
+
+Behaviour-only breaks - a public signature that keeps its shape and changes
+what it does - are invisible to cargo-semver-checks and therefore to this gate.
+Declare them by hand in `### Breaking`.
+
+Three published crates are outside what cargo-semver-checks looks at, and the
+gate prints them on every run rather than hiding the gap: `meerkat-machine-derive`
+and `meerkat-machine-dsl` are proc-macro crates (a `--workspace` run emits no
+output for them at all), and `rkat` has no lib target. Breaks in those three are
+declared by hand or not at all.
+
+### Stamping is a manual step
+
+Nothing stamps `CHANGELOG.md` automatically: neither `cargo release` nor
+`scripts/release-hook.sh` touches it. The order is:
+
+1. Write the release notes under `## [Unreleased]`. `make release-preflight`
+   runs before the version bump, so `## [Unreleased]` is the correct home at
+   that point and the gate accepts it.
+2. Before running `cargo release <patch|minor|major>`, rename that heading to
+   `## [<next version>] - <YYYY-MM-DD>` and leave a fresh empty
+   `## [Unreleased]` stub above it.
+3. Run `cargo release`, which bumps the version, commits, and pushes the tag.
+
+Skipping step 2 is what happened in 0.8.23, and it is what
+`release_semver_gate` now fails the tag for: at the tag the workspace version
+has moved but the notes have not, so the release would publish notes titled
+"Unreleased".
+
+Where it runs:
+
+| Lane | Entry point |
+|------|-------------|
+| Local preflight | `make semver-breaks` (part of `make release-preflight`) |
+| Release workflow | job `release_semver_gate`, required by `publish_github_release`, `publish_registries`, and `publish_unix_release_and_homebrew` |
+| Every PR | `make semver-breaks-selftest` in the CI `ratchets` job: unit-tests the report parser against committed real reports, without needing cargo-semver-checks installed |
+
+The judgement lives in `scripts/check_semver_breaks.py`, which is a pure
+function of (report, changelog, version, tool exit code) and has no environment
+override that relaxes it. `scripts/check-semver-breaks.sh` only produces the
+report and hands it over.
+
 ## Binary Artifacts
 
 Release assets are built for these binaries:

@@ -1549,20 +1549,18 @@ impl MeerkatMachine {
         }
     }
 
-    pub(super) async fn register_session_inner(
-        &self,
-        session_id: SessionId,
-    ) -> Result<RegisterSessionInnerOutcome, RuntimeDriverError> {
-        self.register_session_inner_with_materialization_origin(session_id, None)
-            .await
-    }
-
     pub(super) async fn register_session_inner_for_actor_materialization(
         &self,
         session_id: SessionId,
         claim_state: Arc<std::sync::Mutex<crate::RuntimeActorMaterializationClaimState>>,
     ) -> Result<bool, RuntimeDriverError> {
-        self.register_session_inner_with_materialization_origin(session_id, Some(claim_state))
+        // Settle a cold-recovered unregister drain before reporting the
+        // registration. Collapsing the witness to a bool here (as this did
+        // through 0.8.23) hid `InsertedColdRecoveredDraining` from actor
+        // materialization, which then staged RegisterSession into a Draining
+        // authority and got a bare guard rejection - the permanent
+        // resume wedge.
+        self.register_session_settling_cold_recovered_drain(&session_id, Some(claim_state))
             .await
             .map(RegisterSessionInnerOutcome::inserted)
     }
@@ -1734,6 +1732,7 @@ impl MeerkatMachine {
             None,
         )?;
         let control_projection = entry.control_projection_handle();
+        let run_start_window = entry.run_start_window_handle();
         let handle_teardown_gate = crate::handles::HandleTeardownGate::open();
         let tool_visibility_owner = Arc::new(MachineToolVisibilityOwner::new());
         tool_visibility_owner.bind_dsl_authority(Arc::clone(&dsl_authority));
@@ -1747,6 +1746,7 @@ impl MeerkatMachine {
             live_lifecycle_gate: Arc::new(Mutex::new(())),
             supervisor_rotation_task: Arc::new(SupervisorRotationTaskSlot::new()),
             control_projection,
+            run_start_window,
             driver: Arc::new(Mutex::new(entry)),
             ops_lifecycle,
             ops_lifecycle_persistence_worker: None,
@@ -1910,6 +1910,7 @@ impl MeerkatMachine {
             return Err(err);
         }
         let control_projection = entry.control_projection_handle();
+        let run_start_window = entry.run_start_window_handle();
 
         let handle_teardown_gate = crate::handles::HandleTeardownGate::open();
         let tool_visibility_owner = Arc::new(MachineToolVisibilityOwner::new());
@@ -1924,6 +1925,7 @@ impl MeerkatMachine {
             live_lifecycle_gate: Arc::new(Mutex::new(())),
             supervisor_rotation_task: Arc::new(SupervisorRotationTaskSlot::new()),
             control_projection,
+            run_start_window,
             driver: Arc::new(Mutex::new(entry)),
             ops_lifecycle,
             ops_lifecycle_persistence_worker: None,
@@ -2113,6 +2115,7 @@ impl MeerkatMachine {
                 .registration_phase
                 == crate::meerkat_machine::dsl::RegistrationPhase::Draining;
         let control_projection = entry.control_projection_handle();
+        let run_start_window = entry.run_start_window_handle();
 
         let (ops_lifecycle, epoch_id, cursor_state) = ops_state;
         tracing::debug!(
@@ -2136,6 +2139,7 @@ impl MeerkatMachine {
             live_lifecycle_gate: Arc::new(Mutex::new(())),
             supervisor_rotation_task: Arc::new(SupervisorRotationTaskSlot::new()),
             control_projection,
+            run_start_window,
             driver: Arc::new(Mutex::new(entry)),
             ops_lifecycle,
             ops_lifecycle_persistence_worker: None,
@@ -2417,6 +2421,82 @@ impl MeerkatMachine {
                 Ok(RegisterSessionInnerOutcome::Inserted)
             }
         }
+    }
+
+    /// Register, concluding a cold-recovered unregister drain window first.
+    ///
+    /// A `Draining` image reconstructed from the durable unregister retry
+    /// record names producer obligations that belonged to a process which is
+    /// gone; `UnregisterTeardownMechanicalObservations::
+    /// from_durable_process_recovery` already records closing them as a
+    /// forced, process-loss disposition rather than clean quiescence. So the
+    /// escape from `Draining` is to CONCLUDE the teardown through its owning
+    /// authority, never to re-admit past open obligations: the three drain
+    /// feedback inputs are each guarded on `unregister_draining`, so moving
+    /// `registration_phase` off `Draining` while any obligation is open would
+    /// make a late producer's own completion unroutable.
+    ///
+    /// Through 0.8.23 no caller concluded it. A first turn that failed
+    /// terminally left the CLI unable to finish teardown, and every later
+    /// registration - resume included - was guard-rejected by construction,
+    /// which is why an incomplete cleanup read as a permanent verdict on the
+    /// session. This is the same settlement `ensure_runtime_executor_attachment`
+    /// already performs through `ExistingExecutorClaim::JoinUnregister`; it is
+    /// reused, not reimplemented.
+    ///
+    /// Called with NO session mutation gate held: the teardown takes the
+    /// session registration transaction and the exact mutation gate itself.
+    pub(super) async fn register_session_settling_cold_recovered_drain(
+        &self,
+        session_id: &SessionId,
+        materialization_claim_state: Option<
+            Arc<std::sync::Mutex<crate::RuntimeActorMaterializationClaimState>>,
+        >,
+    ) -> Result<RegisterSessionInnerOutcome, RuntimeDriverError> {
+        let outcome = self
+            .register_session_inner_with_materialization_origin(
+                session_id.clone(),
+                materialization_claim_state.clone(),
+            )
+            .await?;
+        if outcome != RegisterSessionInnerOutcome::InsertedColdRecoveredDraining {
+            return Ok(outcome);
+        }
+        let epoch_id = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(session_id)
+                .map(|entry| entry.epoch_id.clone())
+                .ok_or(RuntimeDriverError::NotReady {
+                    state: RuntimeState::Destroyed,
+                })?
+        };
+        self.join_or_start_unregister_teardown_with_admission(
+            session_id,
+            Some(&epoch_id),
+            UnregisterTeardownCaller::Explicit,
+            UnregisterTeardownAdmission::AnyCurrentRegistration,
+            None,
+            UnregisterTeardownWait::UntilTerminal,
+        )
+        .await?;
+        // The settled teardown removed the exact entry, so this registration
+        // starts on a fresh authority. One retry only: a second cold-recovered
+        // drain here would mean the settlement did not remove what it just
+        // concluded, which is an authority defect and not something to spin on.
+        let readmitted = self
+            .register_session_inner_with_materialization_origin(
+                session_id.clone(),
+                materialization_claim_state,
+            )
+            .await?;
+        if readmitted == RegisterSessionInnerOutcome::InsertedColdRecoveredDraining {
+            return Err(RuntimeDriverError::Internal(format!(
+                "session {session_id} re-entered a cold-recovered unregister drain window \
+                 immediately after its teardown was concluded"
+            )));
+        }
+        Ok(readmitted)
     }
 
     pub(super) async fn unregister_session_inner_if_epoch(
@@ -3523,6 +3603,13 @@ impl MeerkatMachine {
             JoinUnregister {
                 epoch_id: meerkat_core::RuntimeEpochId,
             },
+            /// This exact registration lost durable authority and its runtime
+            /// loop has already handed its executor back, so registration can
+            /// mint the cold reload the degraded shell demands but cannot
+            /// perform itself.
+            ColdReloadDegradedRegistration {
+                witness: RuntimeSessionRegistrationWitness,
+            },
             Claimed {
                 gate: Arc<Mutex<()>>,
                 driver: SharedDriver,
@@ -3536,6 +3623,11 @@ impl MeerkatMachine {
             },
         }
 
+        // One registration call mints at most one cold reload. A successor
+        // that is itself already degraded is a fresh durable fault, not this
+        // caller's to keep re-disposing, so the second observation reports the
+        // degradation instead of looping.
+        let mut minted_cold_reload = false;
         let (
             driver,
             completions,
@@ -3591,12 +3683,70 @@ impl MeerkatMachine {
                         };
                     }
                     if let Err(required) = entry.require_durability_ready() {
-                        break ExistingExecutorClaim::Blocked(
-                            RuntimeDriverError::RecoveryRepairBlocked {
-                                evidence_digest: None,
-                                reason: required.to_string(),
-                            },
-                        );
+                        // The degraded shell demands a registration-authorized
+                        // cold reload that it has no capability to mint. This
+                        // IS registration, and disposal already returns its
+                        // outcome as the typed
+                        // `ReloadRequiredRegistrationDisposition`, so route
+                        // through that owned path rather than reporting the
+                        // demand back to a caller who cannot satisfy it. Only
+                        // the mob retire ladder used to do this, which made one
+                        // durable fact mean "recoverable" or "permanently
+                        // unusable" purely by who owned the caller.
+                        //
+                        // Two states are deliberately still refused, because
+                        // disposal would park rather than converge: a runtime
+                        // loop that has not yet handed its executor back may
+                        // run arbitrarily long before publishing, and a
+                        // handoff mid-claim by another cleanup owner is not
+                        // this caller's to consume.
+                        let degraded_loop_released_its_executor = entry
+                            .runtime_loop_teardown
+                            .as_ref()
+                            .is_some_and(|slot| slot.exit_handoff_is_settled());
+                        // A claim-bound caller is not the registration owner
+                        // here: it arrived holding an actor-materialization
+                        // claim that disposal would clear underneath it. That
+                        // caller keeps the unchanged refusal and retries
+                        // through its own owner.
+                        let caller_owns_the_whole_registration =
+                            expected_materialization_claim.is_none();
+                        // Registration can name no operation to retain, so it
+                        // enters disposal with no preservation request. A
+                        // non-terminal operation persists only on its terminal
+                        // transition and may therefore exist solely in this
+                        // process registry, where only an operation-aware
+                        // owner (the mob retire ladder, which passes an
+                        // OperationRetentionRequest) knows what to carry
+                        // across. Recovering here would trade a recoverable
+                        // brick for a silently dropped operation identity, so
+                        // a registration holding live operations keeps the
+                        // unchanged refusal and waits for that owner. An
+                        // unreadable registry refuses for the same reason.
+                        let discarding_this_shell_loses_no_operation = entry
+                            .ops_lifecycle
+                            .diagnostic_snapshot()
+                            .is_ok_and(|snapshot| snapshot.active_count == 0);
+                        if minted_cold_reload
+                            || !degraded_loop_released_its_executor
+                            || !caller_owns_the_whole_registration
+                            || !discarding_this_shell_loses_no_operation
+                        {
+                            break ExistingExecutorClaim::Blocked(
+                                RuntimeDriverError::RecoveryRepairBlocked {
+                                    evidence_digest: None,
+                                    reason: required.to_string(),
+                                },
+                            );
+                        }
+                        break ExistingExecutorClaim::ColdReloadDegradedRegistration {
+                            witness: RuntimeSessionRegistrationWitness::new(
+                                Arc::downgrade(&self.shared),
+                                session_id.clone(),
+                                entry.epoch_id.clone(),
+                                Arc::downgrade(&entry.mutation_gate),
+                            ),
+                        };
                     }
                     if let Some(error) = entry.registration_blocked_by_unregister(&session_id) {
                         break ExistingExecutorClaim::Blocked(error);
@@ -3803,6 +3953,7 @@ impl MeerkatMachine {
                 }
 
                 let control_projection = recovered_entry.control_projection_handle();
+                let run_start_window = recovered_entry.run_start_window_handle();
                 let driver = Arc::new(Mutex::new(recovered_entry));
                 let completions =
                     Arc::new(Mutex::new(crate::completion::CompletionRegistry::new()));
@@ -3831,6 +3982,7 @@ impl MeerkatMachine {
                         live_lifecycle_gate: Arc::new(Mutex::new(())),
                         supervisor_rotation_task: Arc::new(SupervisorRotationTaskSlot::new()),
                         control_projection,
+                        run_start_window,
                         driver: driver.clone(),
                         ops_lifecycle: recovered_ops.clone(),
                         ops_lifecycle_persistence_worker: None,
@@ -3923,6 +4075,27 @@ impl MeerkatMachine {
                     return Err(self
                         .classify_session_dsl_rejection(&session_id, reason)
                         .await);
+                }
+                ExistingExecutorClaim::ColdReloadDegradedRegistration { witness } => {
+                    // T and M are both released above, exactly as the
+                    // JoinUnregister arm requires, before entering a saga that
+                    // takes the stable registration transaction itself. The
+                    // executor factory is still unconsumed, so the reclaim
+                    // below re-runs this full transaction against whatever
+                    // registration disposal published. A stale witness is an
+                    // idempotent `NotCurrent` and can never remove a
+                    // same-SessionId successor.
+                    minted_cold_reload = true;
+                    let disposition = self
+                        .recover_or_discard_reload_required_registration_if_current(&witness)
+                        .await?;
+                    tracing::info!(
+                        %session_id,
+                        ?disposition,
+                        "executor registration minted the cold reload a durability-degraded \
+                         registration required"
+                    );
+                    continue 'settle_unregister;
                 }
                 ExistingExecutorClaim::JoinUnregister { epoch_id } => {
                     self.join_or_start_unregister_teardown_with_admission(

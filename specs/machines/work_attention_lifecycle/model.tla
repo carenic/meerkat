@@ -54,6 +54,12 @@ TerminalStutter ==
     /\ phase = "Superseded" \/ phase = "Stopped"
     /\ UNCHANGED vars
 
+\* Named UNCHANGED frames. One definition per distinct frame; every action
+\* that leaves those variables unchanged references the definition by name.
+UnchangedFrame_024845ab0769188e == UNCHANGED << superseded_by_binding_key, terminal_at_utc_ms >>
+UnchangedFrame_54b3270812b7dd30 == UNCHANGED << superseded_by_binding_key >>
+UnchangedFrame_f9316463938f5738 == UNCHANGED << revision, paused_until_utc_ms, superseded_by_binding_key, terminal_at_utc_ms >>
+
 PauseActive(expected_revision, until_utc_ms) ==
     /\ phase = "Active"
     /\ (revision = expected_revision)
@@ -61,7 +67,7 @@ PauseActive(expected_revision, until_utc_ms) ==
     /\ model_step_count' = model_step_count + 1
     /\ revision' = (revision) + 1
     /\ paused_until_utc_ms' = until_utc_ms
-    /\ UNCHANGED << superseded_by_binding_key, terminal_at_utc_ms >>
+    /\ UnchangedFrame_024845ab0769188e
 
 
 PausePaused(expected_revision, until_utc_ms) ==
@@ -71,7 +77,7 @@ PausePaused(expected_revision, until_utc_ms) ==
     /\ model_step_count' = model_step_count + 1
     /\ revision' = (revision) + 1
     /\ paused_until_utc_ms' = until_utc_ms
-    /\ UNCHANGED << superseded_by_binding_key, terminal_at_utc_ms >>
+    /\ UnchangedFrame_024845ab0769188e
 
 
 ResumePaused(expected_revision) ==
@@ -81,7 +87,7 @@ ResumePaused(expected_revision) ==
     /\ model_step_count' = model_step_count + 1
     /\ revision' = (revision) + 1
     /\ paused_until_utc_ms' = None
-    /\ UNCHANGED << superseded_by_binding_key, terminal_at_utc_ms >>
+    /\ UnchangedFrame_024845ab0769188e
 
 
 SupersedeActive(expected_revision, arg_superseded_by_binding_key, at_utc_ms) ==
@@ -114,7 +120,7 @@ StopActive(expected_revision, at_utc_ms) ==
     /\ revision' = (revision) + 1
     /\ paused_until_utc_ms' = None
     /\ terminal_at_utc_ms' = Some(at_utc_ms)
-    /\ UNCHANGED << superseded_by_binding_key >>
+    /\ UnchangedFrame_54b3270812b7dd30
 
 
 StopPaused(expected_revision, at_utc_ms) ==
@@ -125,14 +131,14 @@ StopPaused(expected_revision, at_utc_ms) ==
     /\ revision' = (revision) + 1
     /\ paused_until_utc_ms' = None
     /\ terminal_at_utc_ms' = Some(at_utc_ms)
-    /\ UNCHANGED << superseded_by_binding_key >>
+    /\ UnchangedFrame_54b3270812b7dd30
 
 
 ClassifyEligibilityActive(now_utc_ms) ==
     /\ phase = "Active"
     /\ phase' = "Active"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << revision, paused_until_utc_ms, superseded_by_binding_key, terminal_at_utc_ms >>
+    /\ UnchangedFrame_f9316463938f5738
 
 
 ClassifyEligibilityPausedElapsed(now_utc_ms) ==
@@ -140,7 +146,7 @@ ClassifyEligibilityPausedElapsed(now_utc_ms) ==
     /\ ((paused_until_utc_ms # None) /\ ((IF "value" \in DOMAIN paused_until_utc_ms THEN paused_until_utc_ms["value"] ELSE None) <= now_utc_ms))
     /\ phase' = "Paused"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << revision, paused_until_utc_ms, superseded_by_binding_key, terminal_at_utc_ms >>
+    /\ UnchangedFrame_f9316463938f5738
 
 
 ClassifyEligibilityPausedPending(now_utc_ms) ==
@@ -148,49 +154,49 @@ ClassifyEligibilityPausedPending(now_utc_ms) ==
     /\ (IF (paused_until_utc_ms = None) THEN TRUE ELSE ((IF "value" \in DOMAIN paused_until_utc_ms THEN paused_until_utc_ms["value"] ELSE None) > now_utc_ms))
     /\ phase' = "Paused"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << revision, paused_until_utc_ms, superseded_by_binding_key, terminal_at_utc_ms >>
+    /\ UnchangedFrame_f9316463938f5738
 
 
 ClassifyEligibilitySuperseded(now_utc_ms) ==
     /\ phase = "Superseded"
     /\ phase' = "Superseded"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << revision, paused_until_utc_ms, superseded_by_binding_key, terminal_at_utc_ms >>
+    /\ UnchangedFrame_f9316463938f5738
 
 
 ClassifyEligibilityStopped(now_utc_ms) ==
     /\ phase = "Stopped"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << revision, paused_until_utc_ms, superseded_by_binding_key, terminal_at_utc_ms >>
+    /\ UnchangedFrame_f9316463938f5738
 
 
 ClassifyAuthorityActive(mode, delegated_authority) ==
     /\ phase = "Active"
     /\ phase' = "Active"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << revision, paused_until_utc_ms, superseded_by_binding_key, terminal_at_utc_ms >>
+    /\ UnchangedFrame_f9316463938f5738
 
 
 ClassifyAuthorityPaused(mode, delegated_authority) ==
     /\ phase = "Paused"
     /\ phase' = "Paused"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << revision, paused_until_utc_ms, superseded_by_binding_key, terminal_at_utc_ms >>
+    /\ UnchangedFrame_f9316463938f5738
 
 
 ClassifyAuthoritySuperseded(mode, delegated_authority) ==
     /\ phase = "Superseded"
     /\ phase' = "Superseded"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << revision, paused_until_utc_ms, superseded_by_binding_key, terminal_at_utc_ms >>
+    /\ UnchangedFrame_f9316463938f5738
 
 
 ClassifyAuthorityStopped(mode, delegated_authority) ==
     /\ phase = "Stopped"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << revision, paused_until_utc_ms, superseded_by_binding_key, terminal_at_utc_ms >>
+    /\ UnchangedFrame_f9316463938f5738
 
 
 Next ==

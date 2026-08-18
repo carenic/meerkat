@@ -38,7 +38,8 @@ use tokio::sync::mpsc;
 
 use super::{
     Agent, AgentLlmClient, AgentLlmFallbackSwitch, AgentSessionStore, AgentToolDispatcher,
-    LlmStreamResult, select_tool_catalog_mode, validate_provider_turn_usage_identity,
+    LlmStreamResult, TurnUsageIdentityVerdict, classify_provider_turn_usage_identity,
+    select_tool_catalog_mode,
 };
 
 /// Pre-selected timeout source — determined before the LLM await, not inferred after.
@@ -576,7 +577,10 @@ struct CallingLlmAssistantTurn {
     assistant_msg: BlockAssistantMessage,
     assistant_text: String,
     stop_reason: crate::types::StopReason,
-    usage: TurnUsage,
+    /// `None` when the provider stream carried no normalized accounting. The
+    /// turn is otherwise ordinary; only the accounting axis is absent, and
+    /// absence is carried as absence rather than substituted.
+    usage: Option<TurnUsage>,
 }
 
 /// Accumulated outcome of one dispatched tool batch.
@@ -2360,6 +2364,31 @@ where
                             // can silently refund usage.
                             self.session.record_turn_usage(&outcome.summary_usage);
                             self.budget.record_turn_usage(&outcome.summary_usage);
+                            // The summary call's accounting identity is routed,
+                            // not repaired: the counters above are charged as
+                            // reported and the disagreement is published.
+                            if let Some(dispute) = outcome.summary_usage_identity_dispute.clone() {
+                                tracing::warn!(
+                                    session_id = %self.session.id(),
+                                    marker = dispute.marker(),
+                                    dispute = %dispute,
+                                    "compaction summary usage accounting identity is disputed; counters are charged exactly as reported"
+                                );
+                                if !crate::event_tap::tap_emit(
+                                    &self.event_tap,
+                                    event_tx.as_ref(),
+                                    AgentEvent::TurnUsageAccountingIdentityDisputed {
+                                        session_id: self.session.id().clone(),
+                                        dispute,
+                                    },
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        "compaction event stream receiver dropped before TurnUsageAccountingIdentityDisputed"
+                                    );
+                                }
+                            }
                             // Prepare the transcript rewrite on an isolated
                             // session value. Its exact TranscriptRewriteCommit
                             // becomes the identity of any paired memory stage.
@@ -3566,6 +3595,26 @@ where
         let mut tool_call_count = 0u32;
         let mut event_stream_open = true;
         let mut run_has_visible_or_actionable_output = false;
+        // Arm the per-turn aggregate horizon. Every segment of a turn is
+        // separately bounded (per-call LLM timeout, stream-inactivity
+        // watchdog, per-tool-call timeout); this is the only owner of their
+        // sum. Arming happens once per run entry and before the first
+        // suspension point, so `budget.observe()` at every existing
+        // enforcement point below measures this turn rather than the agent's
+        // whole lifetime.
+        //
+        // Enforcement is at segment boundaries, deliberately: an expired
+        // horizon never pre-empts a tool call that is already executing, so
+        // the loop cannot tear a tool down mid-write. The resulting ceiling is
+        // `max_turn_duration + the longest segment already in flight`: for
+        // tool batches that is the largest single per-call tool timeout
+        // (`dispatch_tool_calls_boxed` starts every call's clock together and
+        // wraps its concurrency wait, so a batch cannot sum), and for LLM
+        // calls it is zero because the call is itself wrapped with the
+        // horizon's remaining time. A barrier-ops wait
+        // (`ops_lifecycle.wait_all`) is NOT interrupted by the horizon; that
+        // park is a separate seam and remains unbounded here.
+        self.budget.begin_turn();
         self.extraction_state.reset();
         // RuntimeStore holds the pre-run Session snapshot until an explicit
         // sticky-fallback CAS advances its control projection. Seal that exact
@@ -5051,24 +5100,94 @@ where
                 self.client.provider(),
                 self.client.model(),
             );
-        let turn_usage = TurnUsage::try_from_usage(result.usage.clone()).map_err(|error| {
-            AgentError::llm(
-                self.client.provider().as_str(),
-                LlmFailureReason::ProviderError(crate::error::LlmProviderError::non_retryable(
-                    crate::error::LlmProviderErrorKind::IncompleteResponse,
-                    serde_json::json!({
-                        "reason": "normalized_provider_accounting_unavailable",
-                        "model": self.client.model(),
-                    }),
-                )),
-                error.to_string(),
-            )
-        })?;
-        validate_provider_turn_usage_identity(
-            &turn_usage,
-            self.client.provider(),
-            self.client.model(),
-        )?;
+        // A FAULT MAY ONLY TERMINALIZE WHAT IT ACTUALLY INVALIDATES.
+        //
+        // By the time this frame runs the provider has already streamed the
+        // answer and the caller has already read it (`TextDelta` reaches the
+        // host at `meerkat-llm-core/src/adapter.rs`, long before the assistant
+        // message is committed below). Whether a usage event ever arrived says
+        // nothing about what the model said, which tools it asked for, or what
+        // the transcript may carry. Killing a completed turn over an absent
+        // number told the user their turn failed after they had read its
+        // answer, and dropped that turn out of the durable transcript.
+        //
+        // So absent accounting DEGRADES: this gate no longer fails the turn, so
+        // the turn goes on to complete and commit its assistant message on the
+        // ordinary path, and the absence is published as a typed marker. The
+        // token axis is the exact scope of the fault, so it is the exact scope
+        // of the consequence - no counter advances, and `last_input_tokens`
+        // keeps the value the last measured turn left, because resetting it
+        // would state a context size nothing measured.
+        //
+        // Two substitutions are deliberately refused here. `input_tokens` is
+        // not a stand-in for presented tokens (different denominators on
+        // cache-heavy sessions; see the `Usage` doc in types.rs), and
+        // `TurnUsage::host_declared` is not a stand-in for provider evidence
+        // (it mints provider attribution for counters no provider issued). A
+        // fabricated value is strictly worse than the honest absence: it turns
+        // "no answer" into a wrong answer that looks right.
+        let turn_usage = match TurnUsage::try_from_usage(result.usage.clone()) {
+            Ok(turn_usage) => Some(turn_usage),
+            Err(error) => {
+                let unmeasured = crate::provider_evidence::UnmeasuredTurnUsageAccounting::new(
+                    self.client.provider(),
+                    self.client.model(),
+                );
+                tracing::warn!(
+                    session_id = %self.session.id(),
+                    marker = unmeasured.marker(),
+                    provider = unmeasured.provider.as_str(),
+                    model = %unmeasured.model,
+                    error = %error,
+                    "provider turn usage accounting is absent; no accounting axis advances, and the turn is not failed for it"
+                );
+                // A degradation that only reaches tracing is an unrouted
+                // signal, and a warning is not a terminal outcome. The same
+                // fact rides the ordinary event stream so a host can page on
+                // it without scraping logs.
+                emit_phase_event!(
+                    self,
+                    ctx,
+                    AgentEvent::TurnUsageAccountingUnmeasured {
+                        session_id: self.session.id().clone(),
+                        unmeasured,
+                    }
+                );
+                None
+            }
+        };
+        // An identity dispute is the OTHER asymmetry: the counters exist and
+        // are internally consistent (the presented-token convention travels
+        // with the number), so the token axis still advances on them. Only
+        // attribution is in question, and it is published as disputed rather
+        // than overwritten with the active identity - an agreement that was
+        // never observed is a guess laundered as evidence.
+        if let Some(turn_usage) = turn_usage.as_ref()
+            && let TurnUsageIdentityVerdict::Disputed(dispute) =
+                classify_provider_turn_usage_identity(
+                    turn_usage,
+                    self.client.provider(),
+                    self.client.model(),
+                )
+        {
+            tracing::warn!(
+                session_id = %self.session.id(),
+                marker = dispute.marker(),
+                active_provider = dispute.active_provider.as_str(),
+                active_model = %dispute.active_model,
+                reported_provider = dispute.reported_provider.as_str(),
+                reported_model = %dispute.reported_model,
+                "provider turn usage accounting identity is disputed; counters are recorded exactly as reported"
+            );
+            emit_phase_event!(
+                self,
+                ctx,
+                AgentEvent::TurnUsageAccountingIdentityDisputed {
+                    session_id: self.session.id().clone(),
+                    dispute,
+                }
+            );
+        }
         // A provider-authored cache breakpoint is an optimization artifact
         // anchored to one exact transcript head. It must never be able to fail
         // a completed provider turn: an anchor the committed transcript has
@@ -5120,10 +5239,16 @@ where
                 }
             );
         }
-        // Update budget + session usage only from normalized provider evidence.
-        self.budget.record_turn_usage(&turn_usage);
-        self.last_input_tokens = turn_usage.presented_tokens();
-        self.session.record_turn_usage(&turn_usage);
+        // Update budget + session usage only from normalized provider
+        // evidence. With no evidence there is nothing to update: every axis
+        // below keeps the value the last measured turn left it at. The budget
+        // is still OBSERVED, because an unmeasured turn does not un-exceed a
+        // limit an earlier measured turn already crossed.
+        if let Some(turn_usage) = turn_usage.as_ref() {
+            self.budget.record_turn_usage(turn_usage);
+            self.last_input_tokens = turn_usage.presented_tokens();
+            self.session.record_turn_usage(turn_usage);
+        }
         if let Some(exceeded) = self.budget.observe().exceeded() {
             emit_phase_event!(self, ctx, budget_warning_event(exceeded));
             if in_extraction {
@@ -5224,7 +5349,10 @@ where
                     .map(|call| call.name.to_string())
                     .collect(),
                 stop_reason: Some(stop_reason),
-                usage: Some(turn_usage.clone().into_inner()),
+                // Absent accounting reaches the hook as absent. A hook that
+                // sees no usage must not be handed zeros it would treat as a
+                // measurement.
+                usage: turn_usage.clone().map(TurnUsage::into_inner),
                 // Typed projection of the response's provider-executed
                 // server-tool evidence blocks, in block order, so a
                 // foreground PostLlmResponse hook classifies
@@ -6496,9 +6624,9 @@ fn dispatch_tool_calls_boxed<T: AgentToolDispatcher + ?Sized + 'static>(
 )]
 mod tests {
     use super::{
-        SystemNoticeKind, ToolCallOwned, background_job_completion_notice,
+        SystemNoticeKind, ToolCallOwned, TurnUsageIdentityVerdict,
+        background_job_completion_notice, classify_provider_turn_usage_identity,
         dispatch_tool_calls_boxed, is_synthetic_notice, promote_cache_breakpoint_claims,
-        validate_provider_turn_usage_identity,
     };
     use crate::agent::{AgentBuilder, AgentLlmClient, AgentSessionStore, AgentToolDispatcher};
     use crate::blob::{BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError};
@@ -6917,8 +7045,12 @@ mod tests {
         );
     }
 
+    /// This case used to fail the turn closed. It is now a dispute: the
+    /// counters are internally consistent (their presented-token convention
+    /// travels with them), so the only thing in question is attribution, and
+    /// attribution is reported rather than repaired or enforced.
     #[test]
-    fn same_provider_wrong_model_accounting_is_rejected() {
+    fn same_provider_wrong_model_accounting_is_disputed_not_rejected() {
         let turn_usage = crate::TurnUsage::new(
             Usage {
                 input_tokens: 5,
@@ -6928,19 +7060,49 @@ mod tests {
             crate::ProviderTokenAccounting::openai("wrong-model", 5),
         );
 
-        let error = validate_provider_turn_usage_identity(
+        let verdict = classify_provider_turn_usage_identity(
             &turn_usage,
             crate::Provider::OpenAI,
             "active-model",
-        )
-        .expect_err("same-provider wrong-model accounting must fail closed");
-        assert!(matches!(
-            error,
-            AgentError::Llm {
-                reason: LlmFailureReason::ProviderError(ref provider_error),
-                ..
-            } if provider_error.kind == LlmProviderErrorKind::IncompleteResponse
-        ));
+        );
+        let TurnUsageIdentityVerdict::Disputed(dispute) = verdict else {
+            panic!("same-provider wrong-model accounting must be disputed: {verdict:?}");
+        };
+        assert_eq!(dispute.active_provider, crate::Provider::OpenAI);
+        assert_eq!(dispute.active_model, "active-model");
+        assert_eq!(dispute.reported_provider, crate::Provider::OpenAI);
+        assert_eq!(
+            dispute.reported_model, "wrong-model",
+            "the reported identity must survive verbatim; overwriting it would publish an agreement nobody observed"
+        );
+        assert_eq!(
+            turn_usage.presented_tokens(),
+            5,
+            "a disputed identity does not disturb the counters it disputes"
+        );
+    }
+
+    /// The agreeing case must stay silent: a dispute event on every ordinary
+    /// turn would make the marker worthless.
+    #[test]
+    fn matching_accounting_identity_agrees() {
+        let turn_usage = crate::TurnUsage::new(
+            Usage {
+                input_tokens: 5,
+                output_tokens: 1,
+                ..Usage::default()
+            },
+            crate::ProviderTokenAccounting::openai("active-model", 5),
+        );
+
+        assert_eq!(
+            classify_provider_turn_usage_identity(
+                &turn_usage,
+                crate::Provider::OpenAI,
+                "active-model",
+            ),
+            TurnUsageIdentityVerdict::Agreed
+        );
     }
 
     /// Attach an in-core phase-tracking `TurnStateHandle` to a raw
@@ -16555,6 +16717,7 @@ mod tests {
         agent.budget = Budget::new(BudgetLimits {
             max_tokens: Some(100),
             max_duration: None,
+            max_turn_duration: None,
             max_tool_calls: None,
         });
 
@@ -16582,6 +16745,7 @@ mod tests {
         agent.budget = Budget::new(BudgetLimits {
             max_tokens: None,
             max_duration: None,
+            max_turn_duration: None,
             max_tool_calls: Some(0),
         });
 
@@ -16596,6 +16760,278 @@ mod tests {
         assert_eq!(
             agent.state().expect("loop state projects"),
             LoopState::Completed
+        );
+    }
+
+    /// LLM client that never stops asking for tools, so the loop keeps taking
+    /// individually well-bounded segments until some owner stops it.
+    struct EndlessToolCallClient {
+        call_count: Mutex<u32>,
+    }
+
+    impl EndlessToolCallClient {
+        fn new() -> Self {
+            Self {
+                call_count: Mutex::new(0),
+            }
+        }
+
+        fn calls(&self) -> u32 {
+            *self.call_count.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl AgentLlmClient for EndlessToolCallClient {
+        async fn stream_response(
+            &self,
+            _messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            let count = {
+                let mut calls = self.call_count.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            let id = format!("call-{count}");
+            Ok(super::LlmStreamResult::new(
+                vec![AssistantBlock::ToolUse {
+                    id,
+                    name: "steady_tool".into(),
+                    args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+                normalized_test_usage(self, Usage::default()),
+            ))
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::Other
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+    }
+
+    /// Tool that always finishes inside its own per-call timeout, and records
+    /// starts and completions separately so a torn-down call is visible.
+    struct SteadyToolDispatcher {
+        tools: Arc<[Arc<ToolDef>]>,
+        started: Arc<std::sync::atomic::AtomicU32>,
+        completed: Arc<std::sync::atomic::AtomicU32>,
+        work: std::time::Duration,
+    }
+
+    #[async_trait]
+    impl AgentToolDispatcher for SteadyToolDispatcher {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            Arc::clone(&self.tools)
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.work).await;
+            self.completed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::ops::ToolDispatchOutcome::from(ToolResult::new(
+                call.id.to_string(),
+                "ok".to_string(),
+                false,
+            )))
+        }
+    }
+
+    /// The item this test exists for: every segment of a turn is bounded and
+    /// the aggregate was not. Each LLM call is instant and each tool call
+    /// finishes far inside its own timeout, yet their sum is what runs the
+    /// turn past its ceiling. `max_turn_duration` is the owner of that sum,
+    /// and its exhaustion travels the existing time terminal.
+    #[tokio::test]
+    async fn turn_horizon_terminalizes_an_aggregate_of_in_bound_segments() {
+        let client = Arc::new(EndlessToolCallClient::new());
+        let started = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let completed = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let tools = Arc::new(SteadyToolDispatcher {
+            tools: Arc::from([Arc::new(ToolDef::new(
+                "steady_tool",
+                "finishes well inside its own timeout",
+                serde_json::json!({ "type": "object" }),
+            ))]),
+            started: Arc::clone(&started),
+            completed: Arc::clone(&completed),
+            work: Duration::from_millis(50),
+        });
+
+        // Per-tool-call bound: 30s. Per-call work: 50ms. No segment is close
+        // to its own limit; only the aggregate is.
+        let tools_config = crate::config::ToolsConfig {
+            default_timeout: Duration::from_secs(30),
+            ..crate::config::ToolsConfig::default()
+        };
+
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .with_tools_config(tools_config)
+            .build_standalone(Arc::clone(&client), tools, Arc::new(NoopStore))
+            .await;
+        // High enough that the turn cap cannot be the thing that stops us.
+        agent.config.max_turns = Some(1000);
+        agent.budget = Budget::new(BudgetLimits {
+            max_tokens: None,
+            max_duration: None,
+            max_turn_duration: Some(Duration::from_secs(2)),
+            max_tool_calls: None,
+        });
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(60),
+            agent.run("keep going".to_string().into()),
+        )
+        .await
+        .expect("the aggregate horizon must stop the turn, not the test timeout")
+        .expect_err("an exhausted time horizon is a hard failure, not a completed turn");
+
+        // The exact terminal the generated authority already owns for "this
+        // run ran out of time". Note the asymmetry the machine encodes and
+        // this horizon inherits for free: a token/tool-call budget terminal
+        // classifies as Success (an orderly stop), while a TIME terminal
+        // classifies as HardFailure - a turn past its deadline is invalidated,
+        // not merely finished early.
+        assert!(
+            matches!(
+                error,
+                AgentError::TerminalFailure {
+                    outcome: crate::TurnTerminalOutcome::TimeBudgetExceeded,
+                    cause_kind: crate::TurnTerminalCauseKind::TimeBudgetExceeded,
+                    ..
+                }
+            ),
+            "the aggregate turn horizon must reach the existing time terminal, got: {error:?}"
+        );
+        assert!(
+            client.calls() >= 2,
+            "the turn must be stopped by the SUM of segments, not by one \
+             oversized segment; llm calls = {}",
+            client.calls()
+        );
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            "an expired horizon must never tear down a tool call mid-write"
+        );
+    }
+
+    /// LLM client that answers immediately with text.
+    struct ImmediateTextClient;
+
+    #[async_trait]
+    impl AgentLlmClient for ImmediateTextClient {
+        async fn stream_response(
+            &self,
+            _messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            Ok(super::LlmStreamResult::new(
+                vec![AssistantBlock::Text {
+                    text: "done".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+                normalized_test_usage(self, Usage::default()),
+            ))
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::Other
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+    }
+
+    /// The horizon is a per-turn fact, so it is re-armed at every run entry.
+    /// A session that sat idle between turns has not spent this turn's
+    /// ceiling: the second turn is judged on its own wall-clock.
+    #[tokio::test]
+    async fn turn_horizon_rearms_per_run_and_ignores_idle_between_turns() {
+        let mut agent = build_agent(Arc::new(ImmediateTextClient)).await;
+        agent.config.max_turns = Some(10);
+        agent.budget = Budget::new(BudgetLimits {
+            max_tokens: None,
+            max_duration: None,
+            max_turn_duration: Some(Duration::from_secs(3)),
+            max_tool_calls: None,
+        });
+
+        let first = agent
+            .run("first".to_string().into())
+            .await
+            .expect("the first turn is well inside its ceiling");
+        assert_eq!(first.terminal_cause_kind, None);
+
+        // Idle longer than one turn's whole ceiling. This is the wall-clock
+        // an agent-lifetime horizon would charge to the next turn.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        let second = agent
+            .run("second".to_string().into())
+            .await
+            .expect("the second turn is judged on its own wall-clock");
+        assert_eq!(
+            second.terminal_cause_kind, None,
+            "idle time between turns must not be charged to the next turn"
+        );
+        assert_eq!(
+            agent.state().expect("loop state projects"),
+            LoopState::Completed
+        );
+    }
+
+    /// Characterization of today's `max_duration`, kept as the evidence for
+    /// why the turn ceiling could not simply be that knob: its epoch is agent
+    /// construction, so on a long-lived agent it charges a later turn for
+    /// wall-clock that turn never spent. This asserts current behavior, not
+    /// desired behavior.
+    #[tokio::test]
+    async fn characterization_agent_lifetime_horizon_charges_idle_time_to_a_later_turn() {
+        let mut agent = build_agent(Arc::new(ImmediateTextClient)).await;
+        agent.config.max_turns = Some(10);
+        agent.budget = Budget::new(BudgetLimits {
+            max_tokens: None,
+            max_duration: Some(Duration::from_millis(300)),
+            max_turn_duration: None,
+            max_tool_calls: None,
+        });
+
+        // No work at all: only idle wall-clock since agent construction.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let error = agent
+            .run("first real turn".to_string().into())
+            .await
+            .expect_err("an exhausted time horizon is a hard failure");
+        assert!(
+            matches!(
+                error,
+                AgentError::TerminalFailure {
+                    outcome: crate::TurnTerminalOutcome::TimeBudgetExceeded,
+                    ..
+                }
+            ),
+            "max_duration measures the agent's lifetime, so a turn that did \
+             nothing is still terminalized by it, got: {error:?}"
         );
     }
 
@@ -19242,6 +19678,7 @@ mod tests {
         agent.budget = Budget::new(BudgetLimits {
             max_tokens: None,
             max_duration: Some(Duration::from_millis(100)),
+            max_turn_duration: None,
             max_tool_calls: None,
         });
 

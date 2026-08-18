@@ -108,6 +108,21 @@ impl DetachedJobStore for PausingDeliveryAckStore {
         self.inner.list_all(limit).await
     }
 
+    async fn count_pending_outbox_jobs(
+        &self,
+        realm_id: Option<&str>,
+    ) -> Result<u64, meerkat_jobs::DetachedJobError> {
+        self.inner.count_pending_outbox_jobs(realm_id).await
+    }
+
+    async fn list_census_candidates(
+        &self,
+        realm_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredJob>, meerkat_jobs::DetachedJobError> {
+        self.inner.list_census_candidates(realm_id, limit).await
+    }
+
     fn is_persistent(&self) -> bool {
         self.inner.is_persistent()
     }

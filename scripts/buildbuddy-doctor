@@ -109,6 +109,14 @@ else
 fi
 rm -f "${generate_check_log}"
 
+path_patch_python="$(command -v python3.11 2>/dev/null || command -v python3)"
+if "${path_patch_python}" scripts/check-bazel-path-patch-runfiles.py . >/dev/null 2>&1 &&
+  scripts/test-bazel-path-patch-runfiles-gate.sh >/dev/null 2>&1; then
+  pass "Cargo path patches are complete in Bazel workspace runfiles"
+else
+  bad "Cargo path-patch Bazel runfiles contract is incomplete"
+fi
+
 module_lock_check_log="${TMPDIR:-/tmp}/meerkat-bazel-module-lock-check.$$"
 if [[ -n "${bb_bin}" ]]; then
   if "${bb_bin}" mod deps --lockfile_mode=error >"${module_lock_check_log}" 2>&1; then
@@ -227,16 +235,15 @@ fi
 
 oai_rt_rs_version="$(awk -F'"' '/^oai-rt-rs = / { print $2; exit }' Cargo.toml)"
 if [[ -n "${oai_rt_rs_version}" ]] &&
-  [[ ! -e vendor/oai-rt-rs ]] &&
-  ! grep -Fq '//vendor/oai-rt-rs:package_runfiles' BUILD.bazel xtask/BUILD.bazel &&
-  ! grep -Fq 'crate = "oai-rt-rs"' MODULE.bazel &&
-  ! grep -Fq 'additive_build_file_content' MODULE.bazel &&
-  ! grep -Fq 'vendor/oai-rt-rs' MODULE.bazel.lock &&
-  ! grep -Fq 'crates__oai-rt-rs-0.2.1' MODULE.bazel.lock &&
+  grep -Fq 'oai-rt-rs = { path = "third-party/oai-rt-rs" }' Cargo.toml &&
+  grep -Fq '//third-party/oai-rt-rs:package_runfiles' BUILD.bazel &&
+  grep -Fq 'name = "package_runfiles"' third-party/oai-rt-rs/BUILD.bazel &&
+  grep -Fq 'crate = "oai-rt-rs"' MODULE.bazel &&
+  grep -Fq 'additive_build_file_content' MODULE.bazel &&
   grep -Fq "crates__oai-rt-rs-${oai_rt_rs_version}" MODULE.bazel.lock; then
-  pass "oai-rt-rs resolves from crates.io without vendored runfiles plumbing"
+  pass "oai-rt-rs path patch is portable and exported to remote runfiles"
 else
-  bad "oai-rt-rs still appears to use vendored runfiles plumbing"
+  bad "oai-rt-rs path patch is missing portable remote-runfiles plumbing"
 fi
 
 if grep -Fq -- '--retry 5' scripts/install-buildbuddy-cli &&

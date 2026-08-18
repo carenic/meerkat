@@ -2,11 +2,11 @@
 
 use meerkat_contracts::{
     CallbackToolDefinition, CallbackToolExecution, JobAttemptAuthority, JobDeliveryKind,
-    JobExecutionActivity, JobExecutionActivityKind, JobHealthStatus, JobHealthSummary,
-    JobIdempotencyScope, JobPhase, JobProgress, JobRestartClass, JobRunner, JobSummary,
-    JobTerminalResult, JobsArtifactsResult, JobsGetResult, JobsHealthResult, JobsProgressResult,
-    JobsResultResult, JobsRetryParams, MobkitJobProgressParams, MonitorOutputProtocol,
-    MonitorsStartParams,
+    JobExecutionActivity, JobExecutionActivityKind, JobHealthCoverage, JobHealthStatus,
+    JobHealthSummary, JobIdempotencyScope, JobPhase, JobProgress, JobRestartClass, JobRunner,
+    JobSummary, JobTerminalResult, JobsArtifactsResult, JobsGetResult, JobsHealthResult,
+    JobsProgressResult, JobsResultResult, JobsRetryParams, MobkitJobProgressParams,
+    MonitorOutputProtocol, MonitorsStartParams,
 };
 
 #[test]
@@ -124,7 +124,9 @@ fn health_and_activity_distinguish_healthy_awaiting_from_faults() {
         awaiting_members: 1,
         stale_leases: 0,
         needs_attention: 0,
-        delivery_backlog: 0,
+        pending_outbox_jobs: 0,
+        runtime_inbox_backlog: 0,
+        coverage: JobHealthCoverage::Complete,
     };
     let activity = JobExecutionActivity {
         kind: JobExecutionActivityKind::AwaitingDetached,
@@ -201,7 +203,9 @@ fn public_control_projections_do_not_leak_attempt_authority() {
             awaiting_members: 0,
             stale_leases: 0,
             needs_attention: 0,
-            delivery_backlog: 0,
+            pending_outbox_jobs: 0,
+            runtime_inbox_backlog: 0,
+            coverage: JobHealthCoverage::Complete,
         },
     };
 

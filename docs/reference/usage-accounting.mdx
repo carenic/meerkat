@@ -92,6 +92,27 @@ and earlier carry a bare `usage` object with no attribution; recover the model
 for those from session metadata.
 </Note>
 
+## When a turn has no accounting at all
+
+A provider stream can end without ever sending a usage event. From 0.8.24 that
+is a degradation, not a failure: the turn completes, its assistant message is
+committed, and `turn_completed` is published with `usage` **absent** rather than
+with fabricated counters. A companion `turn_usage_accounting_unmeasured` event
+names the provider and model that went unaccounted, carrying the operator marker
+`unmeasured:turn_usage_accounting` from the same vocabulary `runtime/health`
+uses.
+
+An unaccounted turn moves nothing: it is not added to `run_completed.usage`, not
+charged against the token budget, and does not reset the last-input-token figure
+compaction reads. Consumers must skip an absent row. Treating it as zero
+understates the session and, worse, publishes a measurement nobody made.
+
+A related but distinct event, `turn_usage_accounting_identity_disputed`, means
+the counters DID arrive but named a different provider/model than the request
+they answered. Those counters are internally consistent, so they are recorded
+exactly as reported and the axis advances normally; only the attribution is
+contested, and it is never rewritten to the active identity.
+
 ## Worked example
 
 One session, two runs. The first run makes three Anthropic calls (the first two

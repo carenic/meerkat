@@ -2869,6 +2869,28 @@ impl RuntimeLoopTeardownSlot {
         }
     }
 
+    /// True only when the runtime loop has already released its executor, so
+    /// the disposal protocol can be entered without parking.
+    ///
+    /// This exists for callers that must decline rather than wait. Of the four
+    /// slot states, exactly two park:  `Pending` means the loop body is still
+    /// running and may take arbitrarily long to publish, and `Cleaning` means
+    /// another owner holds the handoff mid-claim. Both make
+    /// [`Self::wait_until_published`] and
+    /// [`Self::discard_after_reload_required`] blocking operations.  `Ready`
+    /// and `Cleaned` both answer immediately - the handoff is there to claim,
+    /// or it was already discharged - and neither can return to a parking
+    /// state without a new attachment, which would install a new slot.
+    pub(crate) fn exit_handoff_is_settled(&self) -> bool {
+        matches!(
+            &*self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            RuntimeLoopTeardownState::Ready(_) | RuntimeLoopTeardownState::Cleaned(_)
+        )
+    }
+
     /// Consume the exact executor handoff after its registration loses durable
     /// authority, without publishing an ordinary stop or unregister terminal.
     ///
@@ -5938,13 +5960,16 @@ async fn process_queue(
                 // clock and its watchdog start here rather than at `apply`.
                 let staged_at = crate::run_progress::Instant::now();
                 let turn_start_signal = crate::run_progress::TurnStartSignalCell::default();
-                let (staged_directed_interaction_ids, shared_dsl_authority) = {
+                let (staged_directed_interaction_ids, shared_dsl_authority, run_start_window) = {
                     let driver_guard = driver.lock().await;
                     let shared_dsl_authority = driver_guard.shared_dsl_authority();
+                    let run_start_window = driver_guard.run_start_window_handle();
                     match crate::meerkat_machine::driver::machine_staged_directed_interaction_ids(
                         &driver_guard,
                     ) {
-                        Ok(interaction_ids) => (interaction_ids, shared_dsl_authority),
+                        Ok(interaction_ids) => {
+                            (interaction_ids, shared_dsl_authority, run_start_window)
+                        }
                         Err(error) => {
                             drop(driver_guard);
                             drop(queue_authority_guard);
@@ -5962,6 +5987,14 @@ async fn process_queue(
                         }
                     }
                 };
+                // Session-scoped mechanical record of this window for the
+                // runtime host health census. The census recomputes the
+                // verdict from machine truth on every read, so this cell is
+                // never cleared: a stale window degrades to Clear through
+                // `run_is_current` / `applying_primitive`, never to a false
+                // Overdue. See the void condition on
+                // `SharedRunStartWindowCell` before adding any other reader.
+                run_start_window.arm(run_id.clone(), staged_at, turn_start_signal.clone());
                 // Read seam for the machine-owned "this run began executing"
                 // fact. Captured without the async driver lock - which the
                 // wedged party may itself be holding - so both supervisors can

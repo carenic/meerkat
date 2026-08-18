@@ -17,6 +17,8 @@ mod state;
 pub(crate) mod test_turn_state_handle;
 #[cfg(test)]
 mod usage_accounting_tests;
+#[cfg(test)]
+mod usage_degradation_tests;
 use crate::budget::Budget;
 use crate::comms::{
     CommsCommand, CommsTrustMutation, CommsTrustMutationResult, EventStream, PeerDirectoryEntry,
@@ -33,6 +35,7 @@ use crate::lifecycle::RunId;
 use crate::lifecycle::run_primitive::ProviderParamsOverride;
 use crate::ops::OperationId;
 use crate::ops_lifecycle::{OperationKind, OperationStatus, OperationTerminalOutcome};
+use crate::provider_evidence::DisputedTurnUsageAccountingIdentity;
 use crate::retry::RetryPolicy;
 use crate::schema::{CompiledSchema, SchemaError};
 use crate::session::Session;
@@ -59,32 +62,62 @@ use std::sync::Arc;
 pub use builder::{AgentBuildPolicyError, AgentBuilder, DefaultSystemPromptPolicy};
 pub use runner::{AgentControlStateError, AgentRunner, SnapshotProjectionError};
 
-fn validate_provider_turn_usage_identity(
+/// Whether one turn's accounting agrees with the request identity it answered.
+///
+/// This is a classification, not a gate. See
+/// [`classify_provider_turn_usage_identity`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TurnUsageIdentityVerdict {
+    /// The accounting names the provider and model that were requested.
+    Agreed,
+    /// The accounting names some other provider/model. The counters are still
+    /// the ones the adapter minted and are carried unchanged.
+    Disputed(DisputedTurnUsageAccountingIdentity),
+}
+
+/// Classify one turn's accounting identity against the active request
+/// identity.
+///
+/// # Why this reports rather than refuses
+///
+/// The fact in question is attribution: WHOSE model these counters describe.
+/// It is not a statement about the counters themselves, which arrive with
+/// their [`crate::PresentedTokenConvention`] attached and therefore mean what
+/// they say under either name. So a mismatch degrades - the number is
+/// recorded, the dispute is published - instead of failing a turn the model
+/// already answered.
+///
+/// # Why the disputed identity is never repaired
+///
+/// The obvious "fix" is to stamp the active identity over the reported one.
+/// That publishes an agreement nobody observed and destroys the only evidence
+/// that anything disagreed, which is strictly worse than saying so.
+///
+/// # What this cannot see
+///
+/// Every in-tree adapter mints its accounting from the model it lowered into
+/// the request (`meerkat-anthropic/src/client.rs`, `meerkat-gemini`,
+/// `meerkat-openai` both surfaces), so both sides of this comparison echo the
+/// same identity and no in-tree stream reaches `Disputed`. The check exists
+/// for host-implemented `AgentLlmClient`s and for adapters that later account
+/// under a provider-resolved model; it must not be read as coverage of
+/// provider-side model substitution, which no adapter currently reports.
+pub(crate) fn classify_provider_turn_usage_identity(
     turn_usage: &TurnUsage,
     active_provider: crate::Provider,
     active_model: &str,
-) -> Result<(), AgentError> {
+) -> TurnUsageIdentityVerdict {
     let accounting = turn_usage.accounting();
     if accounting.provider == active_provider && accounting.model == active_model {
-        return Ok(());
+        return TurnUsageIdentityVerdict::Agreed;
     }
 
-    Err(AgentError::llm(
-        active_provider.as_str(),
-        crate::error::LlmFailureReason::ProviderError(
-            crate::error::LlmProviderError::non_retryable(
-                crate::error::LlmProviderErrorKind::IncompleteResponse,
-                serde_json::json!({
-                    "reason": "normalized_provider_accounting_identity_mismatch",
-                    "expected_provider": active_provider,
-                    "expected_model": active_model,
-                    "reported_provider": accounting.provider,
-                    "reported_model": accounting.model,
-                }),
-            ),
-        ),
-        "provider turn usage accounting did not match the active provider/model identity",
-    ))
+    TurnUsageIdentityVerdict::Disputed(DisputedTurnUsageAccountingIdentity {
+        active_provider,
+        active_model: active_model.to_string(),
+        reported_provider: accounting.provider,
+        reported_model: accounting.model.clone(),
+    })
 }
 
 /// Trait for LLM clients that can be used with the agent

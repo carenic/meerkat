@@ -918,6 +918,16 @@ fn format_router_send_error(peer_name: &str, error: crate::router::SendError) ->
         crate::router::SendError::DurableAdmissionRejected { envelope_id } => format!(
             "peer_input_rejected: peer '{peer_name}' durably rejected envelope {envelope_id}"
         ),
+        // Neither `peer_unreachable` (the peer was present and took the item)
+        // nor `peer_admission_dropped` (admission refused it): the envelope is
+        // on the peer's queue and no drain confirmed it inside the bound.
+        crate::router::SendError::InprocDeliveryUnconfirmed {
+            envelope_id,
+            park_bound,
+        } => format!(
+            "peer_delivery_unconfirmed: peer '{peer_name}' admitted envelope {envelope_id} but did not confirm it within {}s",
+            park_bound.as_secs_f64()
+        ),
         crate::router::SendError::Transport(inner) => {
             format!(
                 "peer_unreachable: peer '{peer_name}' is unreachable: transport_error ({inner})"

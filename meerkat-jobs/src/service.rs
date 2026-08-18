@@ -5,12 +5,12 @@ use crate::store::{InsertJobOutcome, PredicateDeliveryCommitOutcome, StoredJob};
 use crate::{
     AttemptClaim, AttemptClaimReceipt, AttemptId, AttemptWriteAuthority, CheckpointRef,
     DetachedJobError, DetachedJobStore, FenceToken, JobDescription, JobFailureCode,
-    JobHealthCondition, JobHealthSnapshot, JobId, JobNotification, JobNotificationReceipt,
-    JobOutboxEntry, JobOutboxPayload, JobProgress, JobReceipt, JobReference, JobResultRef,
-    JobSnapshot, JobSubscription, JobSubscriptionId, JobTerminalResult, NotificationId,
-    PredicateDeliveryCommit, PredicateDeliveryIdentity, PredicateDeliveryNotificationReceipt,
-    PredicateDeliveryOutcome, PredicateEvaluation, PredicateEvaluationReceipt,
-    PredicateObservation, PredicateWatch,
+    JobHealthCondition, JobHealthCoverage, JobHealthSnapshot, JobId, JobNotification,
+    JobNotificationReceipt, JobOutboxEntry, JobOutboxPayload, JobProgress, JobReceipt,
+    JobReference, JobResultRef, JobSnapshot, JobSubscription, JobSubscriptionId, JobTerminalResult,
+    NotificationId, PredicateDeliveryCommit, PredicateDeliveryIdentity,
+    PredicateDeliveryNotificationReceipt, PredicateDeliveryOutcome, PredicateEvaluation,
+    PredicateEvaluationReceipt, PredicateObservation, PredicateWatch,
 };
 
 const REQUEST_CANCEL_CONFLICT_BUDGET: usize = 8;
@@ -190,12 +190,32 @@ impl DetachedJobService {
         observed_at_ms: u64,
         limit: usize,
     ) -> Result<JobHealthSnapshot, DetachedJobError> {
-        let jobs = self.store.list_all(limit).await?;
-        let mut health = JobHealthSnapshot::default();
-        for job in jobs
-            .into_iter()
-            .filter(|job| realm_id.is_none_or(|realm_id| job.spec.realm_id == realm_id))
-        {
+        // The outbox half is an exact indexed count, deliberately taken
+        // outside the bounded scan: delivery backlog survives on rows the
+        // window never reaches, and it is the one term here that a terminal
+        // job still contributes to.
+        let pending_outbox_jobs = self.store.count_pending_outbox_jobs(realm_id).await?;
+        // Realm-filtered and phase-filtered IN THE STORE, so the window is a
+        // bound on live work in this realm rather than on rows-by-primary-key.
+        let jobs = self.store.list_census_candidates(realm_id, limit).await?;
+        // A scan that came back full stopped at the window, not at the end of
+        // the population. Record that as a fact rather than letting the counts
+        // below stand in for a census.
+        let scanned = u64::try_from(jobs.len()).unwrap_or(u64::MAX);
+        let coverage = if jobs.len() >= limit {
+            JobHealthCoverage::Truncated {
+                scanned,
+                limit: u64::try_from(limit).unwrap_or(u64::MAX),
+            }
+        } else {
+            JobHealthCoverage::Complete
+        };
+        let mut health = JobHealthSnapshot {
+            pending_outbox_jobs,
+            coverage,
+            ..JobHealthSnapshot::default()
+        };
+        for job in jobs {
             let state = &job.machine_state;
             match state.lifecycle_phase {
                 dsl::DetachedJobPhase::Queued | dsl::DetachedJobPhase::RetryScheduled => {
@@ -221,10 +241,6 @@ impl DetachedJobService {
                 | dsl::DetachedJobPhase::Cancelled
                 | dsl::DetachedJobPhase::WorkerLost => {}
             }
-            health.delivery_backlog = health.delivery_backlog.saturating_add(
-                u64::try_from(job.outbox.iter().filter(|entry| !entry.applied).count())
-                    .unwrap_or(u64::MAX),
-            );
         }
         Ok(health)
     }

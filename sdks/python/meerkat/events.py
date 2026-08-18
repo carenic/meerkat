@@ -19,7 +19,9 @@ Example::
             case ToolCallRequested(name=name):
                 print(f"\\nCalling tool: {name}")
             case TurnCompleted(usage=u):
-                print(f"\\nTokens: {u.input_tokens} in / {u.output_tokens} out")
+                # `u` is None when the provider sent no accounting for the turn.
+                print(f"\\nTokens: {u.input_tokens} in / {u.output_tokens} out" if u
+                      else "\\nTokens: unmeasured")
             case _:
                 pass
 """
@@ -298,10 +300,18 @@ class ToolResultReceived(Event):
 
 @dataclass(frozen=True, slots=True)
 class TurnCompleted(Event):
-    """An LLM turn finished."""
+    """An LLM turn finished.
+
+    ``usage`` is ``None`` when the provider stream carried no normalized token
+    accounting for the turn. That is an honest absence, not a zero: the turn
+    completed and its assistant message was committed, and no token counter
+    advanced for it. The paired ``turn_usage_accounting_unmeasured`` event
+    names which provider and model went unaccounted. Skip an absent row when
+    aggregating; never fold it in as zero.
+    """
 
     stop_reason: str | None = None
-    usage: Usage = field(default_factory=Usage)
+    usage: Usage | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1180,7 +1190,9 @@ def _validate_known_event(event_type: str, raw: dict[str, Any]) -> None:
         "text_complete": ("content",),
         "tool_call_requested": ("id", "name"),
         "tool_result_received": ("id", "name", "is_error"),
-        "turn_completed": ("stop_reason", "usage"),
+        # `usage` is deliberately not required: a completed turn with no
+        # provider accounting is a valid, typed outcome.
+        "turn_completed": ("stop_reason",),
         "tool_execution_started": ("id", "name"),
         "tool_execution_completed": ("id", "name", "content"),
         "tool_execution_timed_out": ("id", "name", "timeout_ms"),
@@ -1331,7 +1343,10 @@ def parse_event(raw: dict[str, Any]) -> Event:
         kwargs: dict[str, Any] = {}
         for f in cls.__dataclass_fields__:
             if f == "usage":
-                kwargs["usage"] = _parse_usage(raw.get("usage"))
+                if cls is TurnCompleted and raw.get("usage") is None:
+                    kwargs["usage"] = None
+                else:
+                    kwargs["usage"] = _parse_usage(raw.get("usage"))
             elif f == "content" and cls in {ToolResultReceived, ToolExecutionCompleted}:
                 kwargs["content"] = _parse_content_blocks(
                     raw.get("content"),

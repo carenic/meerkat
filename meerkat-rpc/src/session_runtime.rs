@@ -3020,6 +3020,26 @@ impl SessionRuntime {
         self.runtime_adapter.dead_runtime_loop_session_count()
     }
 
+    /// Sessions holding a staged run overdue to begin executing.
+    ///
+    /// Pass-through to the runtime adapter, which is private to this type.
+    /// `None` carries the same report-it-as-unreadable obligation as its
+    /// siblings, and additionally covers a past-bound window whose machine
+    /// authority could not be read without blocking.
+    pub(crate) fn overdue_run_start_session_count(&self) -> Option<usize> {
+        self.runtime_adapter.overdue_run_start_session_count()
+    }
+
+    /// Sessions parked on queued work: input in the machine's queued phase
+    /// past the notice bound, registration `Active`, no run in flight.
+    ///
+    /// Pass-through to the runtime adapter, which is private to this type.
+    /// `None` carries the same report-it-as-unreadable obligation as its
+    /// siblings.
+    pub(crate) fn parked_queued_input_session_count(&self) -> Option<usize> {
+        self.runtime_adapter.parked_queued_input_session_count()
+    }
+
     /// Active instance id for this runtime, if configured.
     pub fn instance_id(&self) -> Option<String> {
         self.inner.instance_id()
@@ -4952,38 +4972,22 @@ impl SessionRuntime {
         Ok(summary)
     }
 
+    /// Committed-but-undrained runtime deliveries across this host's store.
+    ///
+    /// Asked of the delivery authority directly rather than of a session set
+    /// derived from job rows. The derived set MISSES: job rows are read
+    /// through a bounded window ordered by job id, so a session whose jobs
+    /// aged out of that window still holds its undrained inbox rows and used
+    /// to contribute nothing - accepted-and-undrained being the field symptom
+    /// this probe exists to catch.
+    ///
+    /// The answer is host-store scoped rather than realm scoped; see
+    /// [`meerkat_runtime::RuntimeDeliveryInbox::pending_delivery_total`].
     pub async fn runtime_job_delivery_backlog(&self) -> Result<u64, String> {
-        let realm_id = self.realm_id().map(|realm_id| realm_id.to_string());
-        let jobs = self
-            .job_store
-            .list_all(10_000)
+        self.runtime_delivery_inbox
+            .pending_delivery_total()
             .await
-            .map_err(|error| error.to_string())?;
-        let sessions = jobs
-            .into_iter()
-            .filter(|job| {
-                realm_id
-                    .as_deref()
-                    .is_none_or(|realm_id| job.spec.realm_id == realm_id)
-            })
-            .map(|job| {
-                let session_id = job.spec.origin_session_id;
-                (session_id.to_string(), session_id)
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut total = 0_u64;
-        for session_id in sessions.into_values() {
-            let pending = self
-                .runtime_delivery_inbox
-                .list_pending(
-                    &meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
-                    10_000,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            total = total.saturating_add(u64::try_from(pending.len()).unwrap_or(u64::MAX));
-        }
-        Ok(total)
+            .map_err(|error| error.to_string())
     }
 
     /// Build the realm-scoped WorkGraph service.
@@ -6213,24 +6217,25 @@ impl SessionRuntime {
                     });
                 }
 
-                let (publication_handle, publication_owner) = {
+                #[cfg(feature = "mob")]
+                let publication_owner;
+                let publication_handle = {
                     let attachments = runtime_publication_handles
                         .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    attachments
+                    let attachment = attachments
                         .get(&expected_session_id)
                         .filter(|attachment| attachment.witness == *attachment_witness)
-                        .map(|attachment| {
-                            (
-                                attachment.publication_handle.clone(),
-                                attachment.owner.clone(),
-                            )
-                        })
                         .ok_or_else(|| RuntimeDriverError::StaleAuthority {
                             reason: format!(
                                 "RPC actor publication refresh for session {expected_session_id} does not own the prepared executor attachment and publication owner"
                             ),
-                        })?
+                        })?;
+                    #[cfg(feature = "mob")]
+                    {
+                        publication_owner = attachment.owner.clone();
+                    }
+                    attachment.publication_handle.clone()
                 };
 
                 #[cfg(feature = "mob")]
@@ -6252,7 +6257,7 @@ impl SessionRuntime {
                 let immutable_actor_handle =
                     meerkat::surface::persistent_runtime_publication_handle(
                         Arc::clone(&persistent_service),
-                        actor_witness.clone(),
+                        actor_witness,
                     );
 
                 // This callback runs while PreparedAttachedSessionActorRecovery
@@ -13256,6 +13261,7 @@ mod tests {
                     .into(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         section.auth.insert(

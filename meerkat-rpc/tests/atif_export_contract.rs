@@ -122,11 +122,11 @@ async fn seed_committed_turn(event_store: &Arc<dyn EventStore>, session_id: &Ses
                 },
                 AgentEvent::TurnCompleted {
                     stop_reason: StopReason::EndTurn,
-                    usage: meerkat_core::TurnUsage::host_declared(
+                    usage: Some(meerkat_core::TurnUsage::host_declared(
                         meerkat_core::Provider::Anthropic,
                         "claude-sonnet-4-5",
                         meerkat_core::Usage::default(),
-                    ),
+                    )),
                 },
             ],
         )

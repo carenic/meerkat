@@ -403,10 +403,10 @@ fn sqlite_open_refuses_a_jobs_schema_below_the_0_8_10_floor() {
             meerkat_sqlite::SqliteStoreError::UnsupportedSchemaPredecessor {
                 ref domain,
                 found: 1,
-                supported: 3,
+                supported: 4,
                 ref allowed,
             }
-        ) if domain == "jobs" && allowed == &[2, 3]
+        ) if domain == "jobs" && allowed == &[2, 3, 4]
     ));
     let version = meerkat_sqlite::domain_version(
         &meerkat_sqlite::open(&path, meerkat_sqlite::ConnectionProfile::ReadOnly)
@@ -455,7 +455,7 @@ fn sqlite_open_migrates_the_released_v2_jobs_schema_to_the_predicate_ledger() {
     assert_eq!(ledger_table, "detached_job_predicate_deliveries");
     let version = meerkat_sqlite::domain_version(&conn, meerkat_jobs::JOBS_DOMAIN.name)
         .expect("domain version");
-    assert_eq!(version, Some(3));
+    assert_eq!(version, Some(4));
 }
 
 #[test]
@@ -481,7 +481,7 @@ fn sqlite_open_refuses_a_future_jobs_schema() {
             meerkat_sqlite::SqliteStoreError::SchemaFromTheFuture {
                 ref domain,
                 found: 999,
-                supported: 3
+                supported: 4
             }
         ) if domain == "jobs"
     ));
@@ -611,4 +611,48 @@ async fn memory_and_sqlite_share_pending_outbox_ack_conformance() {
         "sqlite-pending-conformance",
     )
     .await;
+}
+
+/// A `census_live` column that disagrees with the document fails the read.
+///
+/// The column is a projection of the phase, and a projection with no staleness
+/// policy is a second source of truth. The failure mode it would otherwise
+/// produce is invisible by construction - a live row marked settled simply
+/// stops appearing in the health window - so the guard has to fire on any read
+/// that touches the row rather than waiting for the census to notice an
+/// absence.
+#[tokio::test]
+async fn a_stale_census_live_column_fails_closed_on_read() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("jobs.sqlite3");
+    let store = SqliteDetachedJobStore::open(&path).expect("open");
+    let service = DetachedJobService::new(Arc::new(store.clone()));
+    let receipt = service
+        .submit(spec("census-drift", RestartClass::NonResumable))
+        .await
+        .expect("submit");
+    assert!(
+        DetachedJobStore::get(&store, &receipt.job_id)
+            .await
+            .expect("read before tampering")
+            .is_some()
+    );
+
+    let conn = rusqlite::Connection::open(&path).expect("raw open");
+    let changed = conn
+        .execute(
+            "UPDATE detached_jobs SET census_live = 0 WHERE job_id = ?1",
+            [receipt.job_id.as_str()],
+        )
+        .expect("tamper with the projection");
+    assert_eq!(changed, 1);
+    drop(conn);
+
+    let error = DetachedJobStore::get(&store, &receipt.job_id)
+        .await
+        .expect_err("a queued job marked settled is a projection that lies");
+    assert!(
+        format!("{error}").contains("disagree"),
+        "the refusal must name the disagreement: {error}"
+    );
 }

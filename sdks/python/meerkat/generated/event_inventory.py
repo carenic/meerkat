@@ -28,6 +28,8 @@ KNOWN_AGENT_EVENT_TYPES: frozenset[str] = frozenset({
     "tool_call_requested",
     "tool_result_received",
     "turn_completed",
+    "turn_usage_accounting_unmeasured",
+    "turn_usage_accounting_identity_disputed",
     "tool_execution_started",
     "tool_execution_completed",
     "tool_execution_timed_out",

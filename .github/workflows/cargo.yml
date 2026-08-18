@@ -562,6 +562,13 @@ jobs:
       - name: Docs validation
         run: make docs-check
 
+      # The release-time semver-breaks gate needs cargo-semver-checks; its
+      # analyser does not. Run the analyser's unit tests on every PR so parser
+      # drift is caught here rather than at the tag, where "no breaks found"
+      # and "parser stopped matching the report" look identical.
+      - name: Semver-breaks analyser self-test
+        run: make semver-breaks-selftest
+
       - name: Verify version parity
         run: make verify-version-parity
 
@@ -594,8 +601,17 @@ jobs:
       - name: Verify SDK wrapper freshness
         run: make verify-sdk-wrapper-freshness
 
+      - name: Verify pre-ledger corpus generator exclusions
+        run: make verify-fixture-mint-generator
+
       - name: Verify Rust release configuration
         run: make check-rust-release-config
+
+      # The gate above is only worth its runtime if it still fails on the
+      # defects it was written for. This contract test asserts that on a
+      # scratch workspace and costs no build; pre-push alone is bypassable.
+      - name: Verify release crate enumeration gate still fails closed
+        run: scripts/test-crate-enumeration-gate.sh
 
       - name: Verify generated machine kernels are not stale
         id: machine_drift
@@ -619,6 +635,42 @@ jobs:
             specs/machines
             specs/compositions
             meerkat-machine-kernels/src/generated
+          if-no-files-found: error
+          retention-days: 1
+
+      # protocol-codegen emits a different artifact set than machine-codegen
+      # (handoff protocol helpers, terminal surface mapping, generated
+      # authority contracts) through a different renderer. Before this step
+      # nothing in a blocking lane re-rendered that set as a whole, so a stale
+      # committed artifact could ship. Both this check and the writer read the
+      # same emission set, so a newly added artifact is gated on arrival.
+      - name: Verify generated protocol artifacts are not stale
+        id: protocol_drift
+        shell: bash
+        run: |
+          if make protocol-check-drift; then
+            exit 0
+          fi
+          # Preserve the exact generated side of the failed comparison, same
+          # rationale as the machine-kernel drift step above.
+          make protocol-codegen
+          exit 1
+
+      - name: Upload fresh protocol artifacts after drift failure
+        if: ${{ failure() && steps.protocol_drift.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fresh-protocol-artifacts
+          # The six crates protocol-codegen emits into. Kept in sync with the
+          # emission set in xtask/src/protocol_codegen.rs; a missing directory
+          # fails the upload rather than silently shipping partial evidence.
+          path: |
+            meerkat-core/src/generated
+            meerkat-session/src/generated
+            meerkat-mob/src/generated
+            meerkat-mcp/src/generated
+            meerkat-runtime/src/generated
+            meerkat-workgraph/src/generated
           if-no-files-found: error
           retention-days: 1
       # check-rust-release-packaging dry-run-packages every release crate

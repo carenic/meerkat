@@ -2148,16 +2148,46 @@ mod tests {
         let report = bridge_pre_0_8_10_realm_storage_in(temp.path(), realm_id, &fence)?;
         drop(fence);
 
+        // `to_version` is DERIVED from each domain's own migration list rather
+        // than written here. The contract this test exists to pin is that the
+        // bridge orchestrates the existing realm databases IN ORDER and
+        // converges each one to its current head - not what that head happens
+        // to be this month. Hardcoding the numbers made a true statement about
+        // the bridge read as a broken bridge: `jobs` gained a fourth migration
+        // (`census-live-projection`) in an unrelated fix, and this assertion
+        // failed while the bridge was doing exactly the right thing. The ORDER
+        // stays literal, because the order IS the contract.
+        fn head(domain: &meerkat_sqlite::SchemaDomain) -> i64 {
+            domain
+                .migrations
+                .iter()
+                .map(|migration| migration.version)
+                .max()
+                .unwrap_or_default()
+        }
+
         let mut expected = vec![
-            ("session-store", 1, 4),
-            ("runtime-store", 1, 3),
-            ("schedule-store", 1, 3),
-            ("workgraph", 1, 3),
-            ("jobs", 1, 3),
+            (
+                "session-store",
+                1,
+                head(&meerkat_store::sqlite_store::SESSION_STORE_DOMAIN),
+            ),
+            (
+                "runtime-store",
+                1,
+                head(&meerkat_runtime::store::sqlite::RUNTIME_STORE_DOMAIN),
+            ),
+            (
+                "schedule-store",
+                1,
+                head(&meerkat_store::schedule_sqlite_store::SCHEDULE_STORE_DOMAIN),
+            ),
+            ("workgraph", 1, head(&meerkat_workgraph::WORKGRAPH_DOMAIN)),
+            ("jobs", 1, head(&meerkat_jobs::JOBS_DOMAIN)),
         ];
         #[cfg(feature = "memory-store-session")]
-        expected.push(("memory", 1, 2));
-        expected.push(("tools-tasks", 1, 1));
+        expected.push(("memory", 1, head(&meerkat_memory::MEMORY_DOMAIN)));
+        expected.push(("tools-tasks", 1, head(&meerkat_tools::TOOLS_TASKS_DOMAIN)));
 
         let actual = report
             .domains

@@ -212,6 +212,31 @@ impl IngressDeliveryReceipt {
     }
 }
 
+/// Result of a BOUNDED wait for authoritative in-process delivery.
+///
+/// [`InboxSender::send_wait_for_delivery`] parks the sender twice: once for
+/// queue capacity and once for the receiver's ingress authority to commit the
+/// exact claim. Both parks are resolved only by the RECEIVER's drain, so both
+/// are bounded by a caller-supplied deadline. The three variants keep the
+/// three facts apart, because they are not interchangeable:
+///
+/// * `Resolved` — the receiver's authority produced a terminal fact.
+/// * `AdmittedUnconfirmed` — the item IS on the receiver queue, but no drain
+///   committed its claim inside the bound. Delivery is AMBIGUOUS: it is not a
+///   drop and it is emphatically not a success.
+/// * `AdmissionParkTimedOut` — the receiver queue stayed at capacity for the
+///   whole bound, so the item was never admitted. Nothing was delivered.
+///
+/// A separate type (rather than extra [`IngressDeliveryOutcome`] variants)
+/// keeps the unbounded connection-ingress path's exhaustive match honest: the
+/// deadline is a property of THIS call, not of the ingress queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundedIngressDelivery {
+    Resolved(IngressDeliveryOutcome),
+    AdmittedUnconfirmed { park_bound: std::time::Duration },
+    AdmissionParkTimedOut { park_bound: std::time::Duration },
+}
+
 #[derive(Debug, Clone, Copy)]
 struct OutstandingClaim {
     claim_id: meerkat_core::interaction::PeerIngressClaimId,
@@ -1178,22 +1203,44 @@ impl InboxSender {
         self.record_drop(DropReason::ClassificationRejected)
     }
 
-    /// Wait for queue capacity and then for authoritative durable admission.
+    /// Wait for queue capacity and then for authoritative durable admission,
+    /// under a single caller-supplied deadline.
+    ///
     /// Used by in-process delivery, whose successful return has the same
-    /// meaning as a signed transport ack.
-    pub(crate) async fn send_wait_for_delivery(&self, item: InboxItem) -> IngressDeliveryOutcome {
+    /// meaning as a signed transport ack. BOTH parks in this call are resolved
+    /// only by the receiver's drain (capacity opens on dequeue, the receipt
+    /// resolves on claim commit), so an undrained receiver would otherwise make
+    /// sender liveness a function of receiver-drain liveness with no bound.
+    /// `park_bound` is that bound; it covers the whole call, not each park
+    /// separately, so the caller's deadline means one thing.
+    ///
+    /// Expiry is classified by WHERE it fired: before admission nothing was
+    /// delivered; after admission delivery is ambiguous. See
+    /// [`BoundedIngressDelivery`].
+    pub(crate) async fn send_wait_for_delivery(
+        &self,
+        item: InboxItem,
+        park_bound: std::time::Duration,
+    ) -> BoundedIngressDelivery {
         let (Some(ctx), Some(classified_queue)) =
             (&self.classification_context, &self.classified_queue)
         else {
-            return IngressDeliveryOutcome::Dropped {
+            return BoundedIngressDelivery::Resolved(IngressDeliveryOutcome::Dropped {
                 reason: DropReason::ClassificationRejected,
-            };
+            });
         };
         let Some(prepared) = ctx.prepare(item) else {
-            return IngressDeliveryOutcome::Dropped {
+            return BoundedIngressDelivery::Resolved(IngressDeliveryOutcome::Dropped {
                 reason: DropReason::ClassificationRejected,
-            };
+            });
         };
+        // ONE budget across both parks, tracked as remaining time rather than
+        // as a `tokio::time::Instant` deadline: the wasm glue behind
+        // `crate::tokio` exposes neither `Instant` nor `timeout_at`, and this
+        // path is compiled for wasm32. `time_compat::Instant` is the
+        // browser-safe monotonic clock.
+        let park_started = meerkat_core::time_compat::Instant::now();
+        let remaining_budget = || park_bound.saturating_sub(park_started.elapsed());
         let kind = prepared.kind;
         let mut prepared = Some(prepared);
         let capacity_notify = classified_queue.lock().capacity_notifier();
@@ -1207,16 +1254,16 @@ impl InboxSender {
             let admitted = {
                 let mut queue = classified_queue.lock();
                 if queue.closed {
-                    return IngressDeliveryOutcome::Dropped {
+                    return BoundedIngressDelivery::Resolved(IngressDeliveryOutcome::Dropped {
                         reason: DropReason::SessionClosed,
-                    };
+                    });
                 }
                 if queue.entries.len() < queue.capacity {
                     let Some(prepared) = prepared.take() else {
                         tracing::error!(kind = ?kind, "durable send lost prepared ingress item");
-                        return IngressDeliveryOutcome::Dropped {
+                        return BoundedIngressDelivery::Resolved(IngressDeliveryOutcome::Dropped {
                             reason: DropReason::SessionClosed,
-                        };
+                        });
                     };
                     Some(queue.admit_and_push(prepared, completion.take()))
                 } else {
@@ -1226,7 +1273,9 @@ impl InboxSender {
             if let Some(decision) = admitted {
                 match decision.outcome {
                     AdmissionOutcome::Dropped { reason } => {
-                        return IngressDeliveryOutcome::Dropped { reason };
+                        return BoundedIngressDelivery::Resolved(IngressDeliveryOutcome::Dropped {
+                            reason,
+                        });
                     }
                     AdmissionOutcome::Admitted => {
                         if decision.is_actionable
@@ -1235,12 +1284,25 @@ impl InboxSender {
                             actionable.notify_waiters();
                         }
                         self.notify.notify_waiters();
-                        return receipt.wait().await;
+                        return match tokio::time::timeout(remaining_budget(), receipt.wait()).await
+                        {
+                            Ok(outcome) => BoundedIngressDelivery::Resolved(outcome),
+                            Err(_) => BoundedIngressDelivery::AdmittedUnconfirmed { park_bound },
+                        };
                     }
                 }
             }
             run_classified_send_wait_before_await_hook();
-            notified.await;
+            // The capacity park is bounded by the SAME deadline as the receipt
+            // park: a receiver whose drain is dead never dequeues, so
+            // `capacity_notify` never fires and this await would otherwise be
+            // the second unbounded park in this call.
+            if tokio::time::timeout(remaining_budget(), notified.as_mut())
+                .await
+                .is_err()
+            {
+                return BoundedIngressDelivery::AdmissionParkTimedOut { park_bound };
+            }
         }
     }
 

@@ -342,12 +342,104 @@ pub fn render_composition_mapping_coverage(
 }
 
 #[cfg(not(test))]
-pub fn render_machine_kernel_module(schema: &MachineSchema) -> String {
+pub fn render_machine_kernel_module(
+    schema: &MachineSchema,
+) -> Result<String, MachineKernelRenderError> {
     render_canonical_stub_modeled_module(schema)
 }
 
 #[cfg(not(test))]
-fn render_canonical_stub_modeled_module(schema: &MachineSchema) -> String {
+#[derive(Debug, thiserror::Error)]
+pub enum MachineKernelRenderError {
+    #[error(
+        "MeerkatMachine public TransitionId tail names missing schema transition `{transition}`"
+    )]
+    MissingPublicTransitionTail { transition: String },
+    #[error(
+        "MeerkatMachine public TransitionId tail must name unique schema transitions: rendered {rendered}, schema has {schema}"
+    )]
+    NonUniquePublicTransitionTail { rendered: usize, schema: usize },
+}
+
+// Rust enum order is a public compatibility surface, while transition schema
+// order is a runtime semantic surface: the production proc-macro dispatcher
+// preserves declaration order when it builds same-trigger first-match chains.
+// Keep additions that landed inside the MeerkatMachine transition catalog in
+// this append-only emission tail instead of moving their transition bodies.
+#[cfg(not(test))]
+const MEERKAT_TRANSITION_ENUM_TAIL: &[&str] = &[
+    "RegisterSessionRefusedUnregisterDrainingIdle",
+    "RegisterSessionRefusedUnregisterDrainingAttached",
+    "RegisterSessionRefusedUnregisterDrainingRunning",
+    "RegisterSessionRefusedUnregisterDrainingRetired",
+    "RegisterSessionRefusedUnregisterDrainingStopped",
+    "ClassifyRecoveredTerminalCompletionBatchRecoverInitializing",
+    "ClassifyRecoveredTerminalCompletionBatchRecoverIdle",
+    "ClassifyRecoveredTerminalCompletionBatchRecoverAttached",
+    "ClassifyRecoveredTerminalCompletionBatchRecoverRunning",
+    "ClassifyRecoveredTerminalCompletionBatchRecoverRetired",
+    "ClassifyRecoveredTerminalCompletionBatchRecoverStopped",
+    "ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableInitializing",
+    "ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableIdle",
+    "ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableAttached",
+    "ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRunning",
+    "ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRetired",
+    "ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableStopped",
+    "ClassifyRecoveredTerminalCompletionBatchBlockedInitializing",
+    "ClassifyRecoveredTerminalCompletionBatchBlockedIdle",
+    "ClassifyRecoveredTerminalCompletionBatchBlockedAttached",
+    "ClassifyRecoveredTerminalCompletionBatchBlockedRunning",
+    "ClassifyRecoveredTerminalCompletionBatchBlockedRetired",
+    "ClassifyRecoveredTerminalCompletionBatchBlockedStopped",
+    "DeclareRecoveredTerminalCompletionUnrecoverableInitializing",
+    "DeclareRecoveredTerminalCompletionUnrecoverableIdle",
+    "DeclareRecoveredTerminalCompletionUnrecoverableAttached",
+    "DeclareRecoveredTerminalCompletionUnrecoverableRunning",
+    "DeclareRecoveredTerminalCompletionUnrecoverableRetired",
+    "DeclareRecoveredTerminalCompletionUnrecoverableStopped",
+    "PrepareIdleRetainingUnsettledCompletion",
+    "PrepareAttachedRetainingUnsettledCompletion",
+    "DrainQueuedRunRetiredRetainingUnsettledCompletion",
+];
+
+#[cfg(not(test))]
+fn transitions_in_public_enum_order(
+    schema: &MachineSchema,
+) -> Result<Vec<&TransitionSchema>, MachineKernelRenderError> {
+    if schema.machine.as_ref() != "MeerkatMachine" {
+        return Ok(schema.transitions.iter().collect());
+    }
+
+    let mut ordered = Vec::with_capacity(schema.transitions.len());
+    ordered.extend(
+        schema
+            .transitions
+            .iter()
+            .filter(|transition| !MEERKAT_TRANSITION_ENUM_TAIL.contains(&transition.name.as_ref())),
+    );
+    for expected_name in MEERKAT_TRANSITION_ENUM_TAIL {
+        let transition = schema
+            .transitions
+            .iter()
+            .find(|transition| transition.name.as_ref() == *expected_name)
+            .ok_or_else(|| MachineKernelRenderError::MissingPublicTransitionTail {
+                transition: (*expected_name).to_owned(),
+            })?;
+        ordered.push(transition);
+    }
+    if ordered.len() != schema.transitions.len() {
+        return Err(MachineKernelRenderError::NonUniquePublicTransitionTail {
+            rendered: ordered.len(),
+            schema: schema.transitions.len(),
+        });
+    }
+    Ok(ordered)
+}
+
+#[cfg(not(test))]
+fn render_canonical_stub_modeled_module(
+    schema: &MachineSchema,
+) -> Result<String, MachineKernelRenderError> {
     let mut out = String::new();
     let module_name = machine_slug(&schema.machine);
     let catalog_fn = format!("catalog::dsl::dsl_{module_name}_machine");
@@ -595,7 +687,7 @@ fn render_canonical_stub_modeled_module(schema: &MachineSchema) -> String {
         "#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]"
     );
     pushln!(&mut out, "pub enum TransitionId {{");
-    for transition in &schema.transitions {
+    for transition in transitions_in_public_enum_order(schema)? {
         pushln!(&mut out, "    {},", rust_ident(&transition.name));
     }
     pushln!(&mut out, "}}");
@@ -720,7 +812,7 @@ fn render_canonical_stub_modeled_module(schema: &MachineSchema) -> String {
     }
     pushln!(&mut out, "    }}");
     pushln!(&mut out, "}}");
-    out
+    Ok(out)
 }
 
 #[cfg(not(test))]

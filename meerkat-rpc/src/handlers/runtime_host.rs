@@ -129,9 +129,17 @@ pub async fn handle_health(id: Option<RpcId>, runtime: &Arc<SessionRuntime>) -> 
 /// ## Covered
 ///
 /// - `jobs` - detached-job service health for the active realm (or process-wide
-///   when no realm is bound) plus the in-process delivery backlog. `Degraded`
-///   when a snapshot that was read says the service is degraded, or a backlog
-///   that was read is non-empty.
+///   when no realm is bound) plus the durable runtime delivery backlog.
+///   `Degraded` when a snapshot that was read says the service is degraded, or
+///   a backlog that was read is non-empty. The two sub-reads stay separate all
+///   the way to the wire (`pending_outbox_jobs` is work whose delivery was
+///   never handed to a runtime; `runtime_inbox_backlog` is a delivery a runtime
+///   accepted and never drained) because a single merged number would say a
+///   delivery is stuck without saying which side is holding it. Only the RUNG
+///   folds. `unreadable:jobs` when either read failed, and also when the job
+///   census came back TRUNCATED: a scan that stopped at its window did not
+///   establish that the rows behind it are healthy, and its zero counts are a
+///   lower bound rather than a census.
 /// - `session_durability` - registered sessions whose shared durability gate
 ///   demands a cold reload before they may execute or mutate durable state.
 ///   `Degraded` when any session is in that state. A storeless session has no
@@ -139,12 +147,36 @@ pub async fn handle_health(id: Option<RpcId>, runtime: &Arc<SessionRuntime>) -> 
 /// - `session_runtime_loop` - registered sessions still claiming a runtime loop
 ///   whose task is gone or whose channels are closed. `Degraded` when any
 ///   session is in that state.
+/// - `session_run_start` - registered sessions holding a staged run that is
+///   overdue to begin executing: staged past the watchdog's notice bound while
+///   machine authority still shows the run current with its primitive
+///   un-applied. `Degraded` when any session is in that state. The verdict is
+///   recomputed from machine truth per scrape - the same facts the staged-run
+///   watchdog classifies - so this key and that log line cannot disagree. A
+///   window whose run moved on is resolved and never counted; a window whose
+///   run is STILL CURRENT but cannot be interpreted (unbound runtime,
+///   unsignalled turn start) publishes `unreadable:session_run_start`, never
+///   a rung - an absence of observation is not health.
+/// - `session_liveness` - registered sessions parked on queued work, on
+///   either of two axes: an input in the machine's queued phase for longer
+///   than the notice bound (aged), or an input staged and rolled back at
+///   least twice that is queued again (stage churn - its age clock resets on
+///   every rollback, so age alone would read the flapping member as
+///   forever-fresh). Both require the executor registration `Active` and no
+///   run in flight. This is the pre-staging class - a session that resumed
+///   cleanly, keeps its loop alive, and never starts the work it was handed,
+///   which under `queue_mode: fifo` is a total outage for that session.
+///   `Degraded` when any session is in that state. Queued work waiting behind
+///   a live turn is a backlog, not a wedge, and is never counted.
 ///
-/// **Every one of the three may instead answer "I could not look", and every
-/// one of the three reports that as `unreadable:<dimension>` rather than as a
+/// **Every one of the five may instead answer "I could not look", and every
+/// one of the five reports that as `unreadable:<dimension>` rather than as a
 /// `Measured` rung.** For the session probes the failed read is an unreadable
-/// session registry; for `jobs` it is a job-service snapshot or a delivery
-/// backlog that returned an error. This is the same rule the paragraph above
+/// session registry - and for `session_run_start` and `session_liveness` also
+/// a per-session authority or driver ledger that could not be read without
+/// blocking, the holder of which is the prime suspect for the wedge itself;
+/// for `jobs` it is a job-service snapshot or a delivery backlog that
+/// returned an error, or a census that filled its window. This is the same rule the paragraph above
 /// states, applied to this function's own checks: a `jobs: degraded` published
 /// off a failed snapshot read would be asserting a specific and actionable
 /// fault - the job service is in trouble - that nobody observed, and it is a
@@ -161,14 +193,18 @@ pub async fn handle_health(id: Option<RpcId>, runtime: &Arc<SessionRuntime>) -> 
 /// the difference between telling an operator where to look and sending them
 /// after a fault that does not exist.
 ///
-/// ## Not covered (published as `unmeasured:*`, never as healthy)
+/// ## Coverage boundary (not a declared dimension, stated so nobody infers it)
 ///
-/// - `session_liveness` - nothing here observes whether live sessions are
-///   *progressing*. A session whose loop task is alive and whose channels are
-///   open, but which is parked while machine-owned lane truth still holds
-///   selectable queued work, moves no value this handler reads. That signal
-///   needs a watchdog bridge, which is 0.8.24 work. No probe exists, so this
-///   one stays out of the rollup: a permanent amber light is a muted alarm.
+/// Every declared dimension is measured on this surface, so no `unmeasured:*`
+/// key remains here. That is a claim about the DECLARED dimensions, not about
+/// everything that can go wrong. In particular, a turn that BEGINS and then
+/// produces nothing - `PrimitiveApplied` has moved the phase on, so
+/// `session_run_start` stands down, and the run is in flight, so
+/// `session_liveness` stands down - is mid-turn progress, a distinct
+/// dimension with no probe and no declared name yet. The household fleet's
+/// own fuse has already observed that class in the field (a member mute on an
+/// established run for 54 minutes). Naming it here is what keeps this
+/// handler's green honest about its edges.
 async fn runtime_health(runtime: &SessionRuntime) -> meerkat_contracts::RuntimeHostHealth {
     let observed_at_ms = meerkat_core::time_compat::SystemTime::now()
         .duration_since(meerkat_core::time_compat::UNIX_EPOCH)
@@ -187,21 +223,37 @@ async fn runtime_health(runtime: &SessionRuntime) -> meerkat_contracts::RuntimeH
     // A snapshot this probe could not read is not a degraded job service. The
     // two sub-reads are folded worst-wins, but a failure of EITHER read makes
     // the dimension unreadable rather than degraded: only a reading that came
-    // back may publish a rung under the plain `jobs` key.
+    // back may publish a rung under the plain `jobs` key. A census that came
+    // back TRUNCATED is the same class of non-answer - it stopped at its
+    // window, not at the end of the population - and the shared fold in
+    // `handlers::jobs` is what says so, so this surface and `jobs/health`
+    // cannot drift on what the same store state means.
     let jobs = match job_snapshot {
         Err(_) => meerkat::surface::RuntimeHealthObservation::Unreadable,
         Ok(snapshot) => match runtime.runtime_job_delivery_backlog().await {
             Err(_) => meerkat::surface::RuntimeHealthObservation::Unreadable,
-            Ok(backlog) => meerkat::surface::RuntimeHealthObservation::Measured(
-                if snapshot.is_degraded() || backlog != 0 {
-                    meerkat_contracts::RuntimeHostHealthStatus::Degraded
-                } else {
-                    meerkat_contracts::RuntimeHostHealthStatus::Ok
-                },
-            ),
+            // `awaiting_members` is not a rung term and costs a per-session
+            // scan, so this probe does not pay for it.
+            Ok(backlog) => {
+                match crate::handlers::jobs::job_health_summary(&snapshot, backlog, 0).status {
+                    meerkat_contracts::JobHealthStatus::Ok => {
+                        meerkat::surface::RuntimeHealthObservation::Measured(
+                            meerkat_contracts::RuntimeHostHealthStatus::Ok,
+                        )
+                    }
+                    meerkat_contracts::JobHealthStatus::Degraded => {
+                        meerkat::surface::RuntimeHealthObservation::Measured(
+                            meerkat_contracts::RuntimeHostHealthStatus::Degraded,
+                        )
+                    }
+                    meerkat_contracts::JobHealthStatus::Unreadable => {
+                        meerkat::surface::RuntimeHealthObservation::Unreadable
+                    }
+                }
+            }
         },
     };
-    // All three probes are attempted unconditionally, so every dimension this
+    // All five probes are attempted unconditionally, so every dimension this
     // handler owns is in the attempted set on every scrape. The only thing that
     // varies is whether the probe came back with a reading.
     let observations = vec![
@@ -213,6 +265,14 @@ async fn runtime_health(runtime: &SessionRuntime) -> meerkat_contracts::RuntimeH
         (
             "session_runtime_loop".to_string(),
             observed_session_population(runtime.dead_runtime_loop_session_count()),
+        ),
+        (
+            "session_run_start".to_string(),
+            observed_session_population(runtime.overdue_run_start_session_count()),
+        ),
+        (
+            "session_liveness".to_string(),
+            observed_session_population(runtime.parked_queued_input_session_count()),
         ),
     ];
     meerkat::surface::build_runtime_host_health_from_observations(observations)

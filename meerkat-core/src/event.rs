@@ -1029,6 +1029,10 @@ pub fn agent_event_type(event: &AgentEvent) -> &'static str {
         AgentEvent::ProviderCacheBreakpointsDiscarded { .. } => {
             "provider_cache_breakpoints_discarded"
         }
+        AgentEvent::TurnUsageAccountingUnmeasured { .. } => "turn_usage_accounting_unmeasured",
+        AgentEvent::TurnUsageAccountingIdentityDisputed { .. } => {
+            "turn_usage_accounting_identity_disputed"
+        }
     }
 }
 
@@ -2144,7 +2148,13 @@ pub enum AgentEvent {
         args: ToolCallArguments,
     },
 
-    /// Tool result received (injected into conversation)
+    /// Tool result received (injected into conversation).
+    ///
+    /// The conversation-level fact for a tool call: this result entered the
+    /// transcript. [`AgentEvent::ToolExecutionCompleted`] is the paired
+    /// execution-level fact for the same `id` and currently carries a full
+    /// copy of these same blocks - see that variant before persisting both, or
+    /// a durable consumer stores every result body twice.
     ToolResultReceived {
         id: String,
         name: String,
@@ -2152,22 +2162,71 @@ pub enum AgentEvent {
         is_error: bool,
     },
 
-    /// Turn completed
+    /// Turn completed.
+    ///
+    /// # Why `usage` is optional
+    ///
+    /// This event states one semantic fact - a model turn reached its terminal
+    /// and its assistant message is committed - and carries one accounting
+    /// fact beside it. The two have different owners and different failure
+    /// modes: a provider stream that ends without ever sending a usage event
+    /// has said nothing about tokens while having said everything about the
+    /// answer. Absence is therefore representable here, because the only
+    /// alternatives are to fabricate counters no provider issued or to
+    /// suppress the completion of a turn the caller has already read.
+    ///
+    /// `usage: None` means exactly "no accounting exists for this turn": no
+    /// counter advanced, and no per-call row should be reconciled for it. The
+    /// paired [`AgentEvent::TurnUsageAccountingUnmeasured`] carries the
+    /// explanation (which provider and model went unaccounted); this field
+    /// owns only the number's presence or absence. Consumers must skip an
+    /// absent row, never treat it as zero.
     TurnCompleted {
         stop_reason: StopReason,
-        usage: crate::types::TurnUsage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<crate::types::TurnUsage>,
     },
 
     // === Tool Execution ===
     /// Starting tool execution
     ToolExecutionStarted { id: String, name: String },
 
-    /// Tool execution completed
+    /// Tool execution completed.
+    ///
+    /// # This carries a SECOND COPY of the result body
+    ///
+    /// This event and [`AgentEvent::ToolResultReceived`] are both emitted for
+    /// every tool call, and they differ by exactly one field: `duration_ms`.
+    /// Both carry the full `content` blocks. The two facts are genuinely
+    /// distinct and both deserve to exist - `ToolResultReceived` is the
+    /// CONVERSATION fact (this result was injected into the transcript),
+    /// this is the EXECUTION fact (the call finished, and here is how long it
+    /// took) - but the cost of the execution fact currently scales with the
+    /// size of the result rather than with the fact itself.
+    ///
+    /// A consumer that durably persists BOTH events therefore stores every
+    /// tool result body twice. This is not hypothetical: it was measured
+    /// independently on two adopter fleets with different storage engines and
+    /// different payload shapes - a console frame store (~348 MB against
+    /// ~348 MB, pairwise-identical maxima, from 153 camera-tool calls) and a
+    /// warehouse events table (89,033 rows / 3.35 GB against 88,934 rows /
+    /// 1.69 GB). Neither had configured it; both inherited it from this
+    /// vocabulary. Note it is a PER-CALL cost, not a scale problem: one tool
+    /// returning a large blob is enough.
+    ///
+    /// `id` is present on both events and is already the join key. A consumer
+    /// persisting both should store the body once against `id` and join for
+    /// the execution fact, rather than capping bytes at its own writer - a cap
+    /// applied downstream still writes the body twice, only smaller, and every
+    /// consumer would have to reimplement it.
     ToolExecutionCompleted {
         id: String,
         name: String,
         /// Canonical typed tool-result content. Display text is derived from
         /// these blocks at the consumer edge, never carried beside them.
+        ///
+        /// Duplicates the blocks [`AgentEvent::ToolResultReceived`] carries
+        /// for the same `id`; see this variant's docs before persisting both.
         content: Vec<ContentBlock>,
         is_error: bool,
         duration_ms: u64,
@@ -2358,6 +2417,43 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sender_taint: Option<crate::comms::SenderContentTaint>,
     },
+
+    /// One model turn's provider token accounting was absent.
+    ///
+    /// The routed form of the `unmeasured:turn_usage_accounting` marker. It
+    /// states exactly one thing: the provider stream for this turn carried no
+    /// normalized accounting, so no accounting axis advanced for it - no
+    /// budget charge, no session usage, no presented-token update.
+    ///
+    /// It deliberately does NOT claim the turn completed. This is published at
+    /// the model boundary, before the boundary effects and terminal hooks that
+    /// can still fail the turn on their own (unrelated) grounds, and the
+    /// absence of accounting is true either way. Whether the turn completed is
+    /// owned by [`AgentEvent::TurnCompleted`] - whose `usage` is `None` on the
+    /// turns this marker names - and a turn that fails afterwards publishes
+    /// its own terminal fact.
+    ///
+    /// What this is not is a cause of failure. A number nobody has cannot
+    /// invalidate an answer the user has already read; see
+    /// [`crate::UnmeasuredTurnUsageAccounting`].
+    TurnUsageAccountingUnmeasured {
+        session_id: SessionId,
+        unmeasured: crate::provider_evidence::UnmeasuredTurnUsageAccounting,
+    },
+
+    /// One model turn's accounting named a provider/model other than the
+    /// request it answered.
+    ///
+    /// The routed form of the `disputed:turn_usage_accounting_identity`
+    /// marker. Unlike [`AgentEvent::TurnUsageAccountingUnmeasured`] the
+    /// counters exist and are internally consistent, so the token axis still
+    /// advances on them; what is in dispute is attribution. The reported
+    /// identity is published exactly as the adapter minted it and is never
+    /// rewritten to the active identity.
+    TurnUsageAccountingIdentityDisputed {
+        session_id: SessionId,
+        dispute: crate::provider_evidence::DisputedTurnUsageAccountingIdentity,
+    },
 }
 
 impl AgentEvent {
@@ -2520,10 +2616,15 @@ pub fn format_verbose_event_with_config(
                 "  {status} {name} ({duration_ms}ms): {result_preview}"
             ))
         }
-        AgentEvent::TurnCompleted { stop_reason, usage } => Some(format!(
-            "  ── Turn complete: {:?} ({} in / {} out tokens)",
-            stop_reason, usage.input_tokens, usage.output_tokens
-        )),
+        AgentEvent::TurnCompleted { stop_reason, usage } => Some(match usage {
+            Some(usage) => format!(
+                "  ── Turn complete: {:?} ({} in / {} out tokens)",
+                stop_reason, usage.input_tokens, usage.output_tokens
+            ),
+            // Absent accounting must read as absent. Rendering `0 in / 0 out`
+            // would turn "no answer" into a wrong answer that looks right.
+            None => format!("  ── Turn complete: {stop_reason:?} (tokens unmeasured)"),
+        }),
         AgentEvent::TextComplete { content } => {
             if content.is_empty() {
                 None
@@ -2613,6 +2714,12 @@ pub fn format_verbose_event_with_config(
         } => Some(format!(
             "  ⚠ Cache breakpoints discarded (continuing): {} dropped, {retained} still binding",
             discarded.len()
+        )),
+        AgentEvent::TurnUsageAccountingUnmeasured { unmeasured, .. } => Some(format!(
+            "  ⚠ Turn usage accounting unmeasured (turn committed): {unmeasured}"
+        )),
+        AgentEvent::TurnUsageAccountingIdentityDisputed { dispute, .. } => Some(format!(
+            "  ⚠ Turn usage accounting identity disputed (counters kept as reported): {dispute}"
         )),
         _ => None,
     }
@@ -3341,11 +3448,11 @@ mod tests {
             AgentEvent::TurnStarted { turn_number: 1 },
             AgentEvent::TurnCompleted {
                 stop_reason: StopReason::EndTurn,
-                usage: crate::types::TurnUsage::host_declared(
+                usage: Some(crate::types::TurnUsage::host_declared(
                     crate::Provider::Other,
                     "event-test",
                     Usage::default(),
-                ),
+                )),
             },
             AgentEvent::ToolCallRequested {
                 id: "tc_1".to_string(),
@@ -3973,11 +4080,11 @@ mod tests {
             },
             AgentEvent::TurnCompleted {
                 stop_reason: StopReason::EndTurn,
-                usage: crate::types::TurnUsage::host_declared(
+                usage: Some(crate::types::TurnUsage::host_declared(
                     crate::Provider::Other,
                     "event-test",
                     Usage::default(),
-                ),
+                )),
             },
             AgentEvent::ToolExecutionStarted {
                 id: "tool-1".to_string(),

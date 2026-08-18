@@ -51,6 +51,12 @@ enum Commands {
     SeamInventory(SeamInventoryArgs),
     #[command(name = "protocol-codegen")]
     ProtocolCodegen,
+    /// Drift gate for `protocol-codegen`: re-render the canonical emission set
+    /// and fail if any committed artifact differs. Non-mutating, so it is safe
+    /// in `make ci` on a dirty tree (the `machine-check-drift` counterpart for
+    /// protocol codegen).
+    #[command(name = "protocol-check-drift")]
+    ProtocolCheckDrift,
     #[command(name = "rmat-audit")]
     RmatAudit(RmatAuditArgs),
     /// Structural effect-authority audit: runtime interrupt / runtime-effect
@@ -103,6 +109,9 @@ pub fn run() -> Result<()> {
         Commands::SeamInventory(args) => seam_inventory::run_seam_inventory(args),
         Commands::ProtocolCodegen => {
             run_machine_authority_task(protocol_codegen::run_protocol_codegen)
+        }
+        Commands::ProtocolCheckDrift => {
+            run_machine_authority_task(protocol_codegen::check_protocol_codegen_drift)
         }
         // rmat-audit, effect-authority, and bridge-classifier all walk the
         // whole workspace's syn ASTs — including the large generated machine

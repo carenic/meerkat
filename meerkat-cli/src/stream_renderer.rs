@@ -186,10 +186,8 @@ fn render_event(
         AgentEvent::TurnCompleted { stop_reason, usage } => {
             end_text_block(state);
             end_thinking_block(mux, scope_id, state);
-            chrome_line(
-                mux,
-                scope_id,
-                &format!(
+            let line = match usage {
+                Some(usage) => format!(
                     "{}  {} tokens ({} in / {} out){}",
                     style(ansi, DIM),
                     usage.input_tokens + usage.output_tokens,
@@ -197,8 +195,43 @@ fn render_event(
                     usage.output_tokens,
                     reset(ansi)
                 ),
-            );
+                // The provider accounted for nothing on this turn. Printing
+                // `0 tokens` would be a wrong number that reads as a real one.
+                None => format!("{}  tokens unmeasured{}", style(ansi, DIM), reset(ansi)),
+            };
+            chrome_line(mux, scope_id, &line);
             let _ = stop_reason;
+        }
+
+        // The degradation markers are operator-facing: they name the exact
+        // dimension that went unmeasured or contested while the turn itself
+        // completed normally.
+        AgentEvent::TurnUsageAccountingUnmeasured { unmeasured, .. } => {
+            end_text_block(state);
+            chrome_line(
+                mux,
+                scope_id,
+                &format!(
+                    "{}  ⚠ {} (turn committed){}",
+                    style(ansi, DIM),
+                    unmeasured,
+                    reset(ansi)
+                ),
+            );
+        }
+
+        AgentEvent::TurnUsageAccountingIdentityDisputed { dispute, .. } => {
+            end_text_block(state);
+            chrome_line(
+                mux,
+                scope_id,
+                &format!(
+                    "{}  ⚠ {} (counters kept as reported){}",
+                    style(ansi, DIM),
+                    dispute,
+                    reset(ansi)
+                ),
+            );
         }
 
         // ── Reasoning / thinking ───────────────────────────────────

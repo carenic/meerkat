@@ -36,6 +36,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `last_runtime_apply_failure_cause`: `Option<RuntimeApplyFailureCause>`
 - `last_runtime_apply_failure_message`: `Option<String>`
 - `runtime_completion_result_run_id`: `Option<RunId>`
+- `runtime_completion_result_resolved`: `Bool`
 - `extraction_attempts`: `u64`
 - `max_extraction_retries`: `u64`
 - `extraction_active`: `Bool`
@@ -627,6 +628,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `AuthorizeSupervisorMobPeerOverlay`(supervisor_peer_id: String, supervisor_epoch: u64, recipient_peer_id: String, overlay_epoch: u64, endpoints: Set<PeerEndpoint>, endpoint_count: u64, command_peer_id: String, command_endpoint: PeerEndpoint, command_kind: MobPeerOverlayCommandKind)
 - `ApplyMobPeerOverlay`(epoch: u64, endpoints: Set<PeerEndpoint>)
 - `AuthorizeInteractionTerminalOutboxAdoption`(batch_key: String, candidate_digest: String, session_id: SessionId, previous_agent_runtime_id: AgentRuntimeId, previous_fence_token: FenceToken, previous_runtime_generation: Generation, previous_runtime_epoch_id: Option<RuntimeEpochId>)
+- `ClassifyRecoveredTerminalCompletionBatch`(batch_key: String, correlatable: Bool, owner_candidate_present: Bool, directed_publication_pending: Bool)
+- `DeclareRecoveredTerminalCompletionUnrecoverable`(batch_key: String, reason: RecoveredTerminalCompletionUnrecoverableReasonKind)
 
 ## Signals
 - `Initialize`
@@ -730,7 +733,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RuntimeObservedCompletionCursorAdvanced`(cursor: u64)
 - `RuntimeInjectedCompletionCursorAdvanced`(cursor: u64)
 - `OpRegistrationAdmissionResolved`(operation_id: String, result: OpRegistrationAdmissionResultKind, reject_reason: Option<OpRegistrationRejectReasonKind>, max_concurrent_limit: Option<u64>, active_op_count: u64)
-- `SessionRegistrationRejected`(session_id: SessionId, reason: SessionRegistrationRejectReasonKind, registered_runtime_epoch_id: Option<RuntimeEpochId>, attempted_runtime_epoch_id: Option<RuntimeEpochId>)
+- `SessionRegistrationRejected`(session_id: SessionId, reason: SessionRegistrationRejectReasonKind, registered_runtime_epoch_id: Option<RuntimeEpochId>, attempted_runtime_epoch_id: Option<RuntimeEpochId>, unregister_runtime_loop_drain_pending: Bool, unregister_comms_drain_exit_pending: Bool, unregister_completion_waiter_drain_pending: Bool)
 - `OpLifecycleTransitionRejected`(operation_id: String, action: OpLifecycleActionKind, reason: OpLifecycleRejectReasonKind, status: Option<OperationStatus>)
 - `WaitAllAdmissionResolved`(wait_request_id: WaitRequestId, result: WaitAllAdmissionResultKind, reject_reason: Option<WaitAllRejectReasonKind>, rejected_operation_id: Option<String>)
 - `WaitAllSatisfied`(wait_request_id: WaitRequestId, run_id: RunId, operation_ids: Set<OperationId>)
@@ -804,6 +807,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RequestCommsDrainExitForUnregister`(session_id: SessionId)
 - `RequestCompletionWaiterResolutionForUnregister`(session_id: SessionId)
 - `InteractionTerminalOutboxAdoptionAuthorized`(batch_key: String, candidate_digest: String, session_id: SessionId, previous_agent_runtime_id: AgentRuntimeId, previous_fence_token: FenceToken, previous_runtime_generation: Generation, previous_runtime_epoch_id: Option<RuntimeEpochId>, next_agent_runtime_id: AgentRuntimeId, next_fence_token: FenceToken, next_runtime_generation: Generation, next_runtime_epoch_id: Option<RuntimeEpochId>)
+- `RecoveredTerminalCompletionBatchClassified`(batch_key: String, disposition: RecoveredTerminalCompletionDisposition)
+- `RecoveredTerminalCompletionDeclaredUnrecoverable`(batch_key: String, reason: RecoveredTerminalCompletionUnrecoverableReasonKind)
 
 ## Helpers
 - `runtime_authority_reconcile_decision`(observation_kind: RuntimeAuthorityObservationKind, state: Option<RuntimeLifecycleObservedState>, agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>, current_run_id: Option<RunId>, pre_run_phase: Option<PreRunPhase>, malformed_reclaim_safe: Bool) -> `RuntimeAuthorityReconcileDecision`
@@ -1404,6 +1409,46 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `registered_epoch_differs`
 - Emits: `SessionRegistrationRejected`
 - To: `Retired`
+
+### `RegisterSessionRefusedUnregisterDrainingIdle`
+- From: `Idle`
+- On: `RegisterSession`(session_id, runtime_epoch_id)
+- Guards:
+  - `unregister_draining`
+- Emits: `SessionRegistrationRejected`
+- To: `Idle`
+
+### `RegisterSessionRefusedUnregisterDrainingAttached`
+- From: `Attached`
+- On: `RegisterSession`(session_id, runtime_epoch_id)
+- Guards:
+  - `unregister_draining`
+- Emits: `SessionRegistrationRejected`
+- To: `Attached`
+
+### `RegisterSessionRefusedUnregisterDrainingRunning`
+- From: `Running`
+- On: `RegisterSession`(session_id, runtime_epoch_id)
+- Guards:
+  - `unregister_draining`
+- Emits: `SessionRegistrationRejected`
+- To: `Running`
+
+### `RegisterSessionRefusedUnregisterDrainingRetired`
+- From: `Retired`
+- On: `RegisterSession`(session_id, runtime_epoch_id)
+- Guards:
+  - `unregister_draining`
+- Emits: `SessionRegistrationRejected`
+- To: `Retired`
+
+### `RegisterSessionRefusedUnregisterDrainingStopped`
+- From: `Stopped`
+- On: `RegisterSession`(session_id, runtime_epoch_id)
+- Guards:
+  - `unregister_draining`
+- Emits: `SessionRegistrationRejected`
+- To: `Stopped`
 
 ### `RegisterSessionResumesStopped`
 - From: `Stopped`
@@ -7397,6 +7442,228 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `RecoveredInputDurabilityClassified`
 - To: `Stopped`
 
+### `ClassifyRecoveredTerminalCompletionBatchRecoverInitializing`
+- From: `Initializing`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `recoverable`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Initializing`
+
+### `ClassifyRecoveredTerminalCompletionBatchRecoverIdle`
+- From: `Idle`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `recoverable`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Idle`
+
+### `ClassifyRecoveredTerminalCompletionBatchRecoverAttached`
+- From: `Attached`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `recoverable`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Attached`
+
+### `ClassifyRecoveredTerminalCompletionBatchRecoverRunning`
+- From: `Running`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `recoverable`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Running`
+
+### `ClassifyRecoveredTerminalCompletionBatchRecoverRetired`
+- From: `Retired`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `recoverable`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Retired`
+
+### `ClassifyRecoveredTerminalCompletionBatchRecoverStopped`
+- From: `Stopped`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `recoverable`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Stopped`
+
+### `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableInitializing`
+- From: `Initializing`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `not_recoverable`
+  - `no_directed_publication_at_risk`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Initializing`
+
+### `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableIdle`
+- From: `Idle`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `not_recoverable`
+  - `no_directed_publication_at_risk`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Idle`
+
+### `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableAttached`
+- From: `Attached`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `not_recoverable`
+  - `no_directed_publication_at_risk`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Attached`
+
+### `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRunning`
+- From: `Running`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `not_recoverable`
+  - `no_directed_publication_at_risk`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Running`
+
+### `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRetired`
+- From: `Retired`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `not_recoverable`
+  - `no_directed_publication_at_risk`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Retired`
+
+### `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableStopped`
+- From: `Stopped`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `not_recoverable`
+  - `no_directed_publication_at_risk`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Stopped`
+
+### `ClassifyRecoveredTerminalCompletionBatchBlockedInitializing`
+- From: `Initializing`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `not_recoverable`
+  - `directed_publication_at_risk`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Initializing`
+
+### `ClassifyRecoveredTerminalCompletionBatchBlockedIdle`
+- From: `Idle`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `not_recoverable`
+  - `directed_publication_at_risk`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Idle`
+
+### `ClassifyRecoveredTerminalCompletionBatchBlockedAttached`
+- From: `Attached`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `not_recoverable`
+  - `directed_publication_at_risk`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Attached`
+
+### `ClassifyRecoveredTerminalCompletionBatchBlockedRunning`
+- From: `Running`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `not_recoverable`
+  - `directed_publication_at_risk`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Running`
+
+### `ClassifyRecoveredTerminalCompletionBatchBlockedRetired`
+- From: `Retired`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `not_recoverable`
+  - `directed_publication_at_risk`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Retired`
+
+### `ClassifyRecoveredTerminalCompletionBatchBlockedStopped`
+- From: `Stopped`
+- On: `ClassifyRecoveredTerminalCompletionBatch`(batch_key, correlatable, owner_candidate_present, directed_publication_pending)
+- Guards:
+  - `batch_key_present`
+  - `not_recoverable`
+  - `directed_publication_at_risk`
+- Emits: `RecoveredTerminalCompletionBatchClassified`
+- To: `Stopped`
+
+### `DeclareRecoveredTerminalCompletionUnrecoverableInitializing`
+- From: `Initializing`
+- On: `DeclareRecoveredTerminalCompletionUnrecoverable`(batch_key, reason)
+- Guards:
+  - `batch_key_present`
+- Emits: `RecoveredTerminalCompletionDeclaredUnrecoverable`
+- To: `Initializing`
+
+### `DeclareRecoveredTerminalCompletionUnrecoverableIdle`
+- From: `Idle`
+- On: `DeclareRecoveredTerminalCompletionUnrecoverable`(batch_key, reason)
+- Guards:
+  - `batch_key_present`
+- Emits: `RecoveredTerminalCompletionDeclaredUnrecoverable`
+- To: `Idle`
+
+### `DeclareRecoveredTerminalCompletionUnrecoverableAttached`
+- From: `Attached`
+- On: `DeclareRecoveredTerminalCompletionUnrecoverable`(batch_key, reason)
+- Guards:
+  - `batch_key_present`
+- Emits: `RecoveredTerminalCompletionDeclaredUnrecoverable`
+- To: `Attached`
+
+### `DeclareRecoveredTerminalCompletionUnrecoverableRunning`
+- From: `Running`
+- On: `DeclareRecoveredTerminalCompletionUnrecoverable`(batch_key, reason)
+- Guards:
+  - `batch_key_present`
+- Emits: `RecoveredTerminalCompletionDeclaredUnrecoverable`
+- To: `Running`
+
+### `DeclareRecoveredTerminalCompletionUnrecoverableRetired`
+- From: `Retired`
+- On: `DeclareRecoveredTerminalCompletionUnrecoverable`(batch_key, reason)
+- Guards:
+  - `batch_key_present`
+- Emits: `RecoveredTerminalCompletionDeclaredUnrecoverable`
+- To: `Retired`
+
+### `DeclareRecoveredTerminalCompletionUnrecoverableStopped`
+- From: `Stopped`
+- On: `DeclareRecoveredTerminalCompletionUnrecoverable`(batch_key, reason)
+- Guards:
+  - `batch_key_present`
+- Emits: `RecoveredTerminalCompletionDeclaredUnrecoverable`
+- To: `Stopped`
+
 ### `ResolveInputPublicLifecycleAcceptedIdle`
 - From: `Idle`
 - On: `ResolveInputPublicLifecycle`(input_id, phase)
@@ -8896,6 +9163,16 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `Prepare`(session_id, run_id)
 - Guards:
   - `session_registered`
+  - `completion_correlation_settled`
+- Emits: `SubmitRunPrimitive`
+- To: `Running`
+
+### `PrepareIdleRetainingUnsettledCompletion`
+- From: `Idle`
+- On: `Prepare`(session_id, run_id)
+- Guards:
+  - `session_registered`
+  - `completion_correlation_unsettled`
 - Emits: `SubmitRunPrimitive`
 - To: `Running`
 
@@ -8904,12 +9181,32 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `Prepare`(session_id, run_id)
 - Guards:
   - `session_registered`
+  - `completion_correlation_settled`
+- Emits: `SubmitRunPrimitive`
+- To: `Running`
+
+### `PrepareAttachedRetainingUnsettledCompletion`
+- From: `Attached`
+- On: `Prepare`(session_id, run_id)
+- Guards:
+  - `session_registered`
+  - `completion_correlation_unsettled`
 - Emits: `SubmitRunPrimitive`
 - To: `Running`
 
 ### `DrainQueuedRunRetired`
 - From: `Retired`
 - On: `DrainQueuedRun`(run_id)
+- Guards:
+  - `completion_correlation_settled`
+- Emits: `SubmitRunPrimitive`
+- To: `Running`
+
+### `DrainQueuedRunRetiredRetainingUnsettledCompletion`
+- From: `Retired`
+- On: `DrainQueuedRun`(run_id)
+- Guards:
+  - `completion_correlation_unsettled`
 - Emits: `SubmitRunPrimitive`
 - To: `Running`
 

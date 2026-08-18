@@ -1345,6 +1345,13 @@ async fn run_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if Path::new(&argv[0]) == repo_cargo() {
+        for (key, _) in std::env::vars_os() {
+            if inherited_cargo_build_context(&key) {
+                child.env_remove(key);
+            }
+        }
+    }
     for (key, value) in env_overrides {
         child.env(key, value);
     }
@@ -1376,6 +1383,14 @@ async fn run_command(
     );
 
     Ok(CompletedCommand { output: combined })
+}
+
+fn inherited_cargo_build_context(key: &std::ffi::OsStr) -> bool {
+    let key = key.to_string_lossy();
+    key == "CARGO"
+        || key == "CARGO_MANIFEST_DIR"
+        || key.starts_with("CARGO_PKG_")
+        || key.starts_with("CARGO_BIN_EXE_")
 }
 
 fn build_commands_for_mode(
@@ -1752,10 +1767,12 @@ fn scenario_env(
         "CARGO_TARGET_DIR".to_string(),
         cargo_target_dir.display().to_string(),
     );
-    env.insert(
-        "RUST_LANE_ID".to_string(),
-        format!("e2e-{}", scenario_artifact_key(spec)),
-    );
+    if !matches!(spec.lane, Lane::System) {
+        env.insert(
+            "RUST_LANE_ID".to_string(),
+            format!("e2e-{}", scenario_artifact_key(spec)),
+        );
+    }
     // macOS 26.3.1+ `codeSigningMonitor=2` can SIGKILL adhoc/linker-signed
     // binaries whose signature is invalidated while dyld is loading them,
     // which happens when the outer `cargo test` or sibling scenarios
@@ -4717,9 +4734,33 @@ fn suite_spec(name: &str) -> Option<&'static Spec> {
             required_env: &[],
             required_bins: &["cargo"],
             cwd: ".",
-            env: &[],
+            env: &[(
+                "RKAT_TEST_BIN_RKAT",
+                "{cargo_target_dir}/e2e-bins/system-mob-run-custody/rkat",
+            )],
             cargo_bin_env: &[],
-            pre_commands: &[],
+            pre_commands: &[
+                &[
+                    "cargo",
+                    "build",
+                    "-p",
+                    "rkat",
+                    "--bin",
+                    "rkat",
+                    "--features",
+                    "integration-real-tests,mob",
+                ],
+                &[
+                    "mkdir",
+                    "-p",
+                    "{cargo_target_dir}/e2e-bins/system-mob-run-custody",
+                ],
+                &[
+                    "cp",
+                    "{cargo_target_dir}/debug/rkat",
+                    "{cargo_target_dir}/e2e-bins/system-mob-run-custody/rkat",
+                ],
+            ],
             command: CommandSpec::CargoTest {
                 package: "rkat",
                 test_target: "system_mob_run_custody",
@@ -5732,9 +5773,9 @@ mod tests {
     use super::{
         ArtifactManifest, ArtifactRequirement, CommandLockMode, E2eSelection, ExecutionMode, Lane,
         SMOKE_ENTRIES, SmokeRuntimeClass, SmokeScheduler, bazel_build_event_provenance,
-        build_commands_for_mode, normalize_command_with_env, order_smoke_specs_for_runtime,
-        plan_for_selection, pre_command_lock_mode, repo_cargo,
-        require_built_by_recorded_invocation, sanitize_artifact_key, scenario_spec,
+        build_commands_for_mode, inherited_cargo_build_context, normalize_command_with_env,
+        order_smoke_specs_for_runtime, plan_for_selection, pre_command_lock_mode, repo_cargo,
+        require_built_by_recorded_invocation, sanitize_artifact_key, scenario_env, scenario_spec,
         smoke_runtime_class, smoke_test_filter_for_selection, source_revision_key, suite_spec,
     };
     use std::collections::BTreeSet;
@@ -5933,6 +5974,47 @@ mod tests {
             normalize_command_with_env(&["cargo", "run", "{cargo_target_dir}/debug/rkat"], &env);
         assert_eq!(argv[0], repo_cargo().display().to_string());
         assert_eq!(argv[2], "/tmp/meerkat-e2e-scenario-target/debug/rkat");
+    }
+
+    #[test]
+    fn system_scenarios_retain_the_shared_parent_rust_lane() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let system = suite_spec("cli-capabilities-and-config").expect("system spec");
+        let system_env = scenario_env(system, temp.path(), ExecutionMode::Cargo, None)
+            .expect("system scenario env");
+        assert!(system_env.iter().all(|(key, _)| key != "RUST_LANE_ID"));
+
+        let smoke = scenario_spec(15).expect("smoke spec");
+        let smoke_env = scenario_env(smoke, temp.path(), ExecutionMode::Cargo, None)
+            .expect("smoke scenario env");
+        assert!(smoke_env.iter().any(|(key, _)| key == "RUST_LANE_ID"));
+    }
+
+    #[test]
+    fn nested_cargo_drops_only_outer_build_context() {
+        for key in [
+            "CARGO",
+            "CARGO_MANIFEST_DIR",
+            "CARGO_PKG_NAME",
+            "CARGO_BIN_EXE_e2e_artifacts",
+        ] {
+            assert!(
+                inherited_cargo_build_context(std::ffi::OsStr::new(key)),
+                "{key}"
+            );
+        }
+        for key in [
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "CARGO_INCREMENTAL",
+            "CARGO_REGISTRY_TOKEN",
+            "RUSTC",
+        ] {
+            assert!(
+                !inherited_cargo_build_context(std::ffi::OsStr::new(key)),
+                "{key}"
+            );
+        }
     }
 
     #[test]

@@ -583,7 +583,6 @@ async fn workgraph_sqlite_shared_realm_observability_roundtrip()
         realm_id,
         "workgraph",
         "snapshot",
-        "--all-namespaces",
         "--include-terminal",
         "--json",
     ];
@@ -624,7 +623,6 @@ async fn workgraph_sqlite_shared_realm_observability_roundtrip()
         2,
         "workgraph/snapshot",
         json!({
-            "all_namespaces": true,
             "include_terminal": true,
         }),
         20,
@@ -653,7 +651,7 @@ async fn workgraph_sqlite_shared_realm_observability_roundtrip()
     let client = reqwest::Client::new();
     let rest_response = client
         .get(format!(
-            "http://127.0.0.1:{port}/workgraph/snapshot?all_namespaces=true&include_terminal=true"
+            "http://127.0.0.1:{port}/workgraph/snapshot?include_terminal=true"
         ))
         .send()
         .await?;

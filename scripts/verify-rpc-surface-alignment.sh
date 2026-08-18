@@ -10,6 +10,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 green() { printf '\033[0;32m%s\033[0m\n' "$*"; }
 
 python3 "$ROOT/scripts/verify_rpc_surface_alignment.py" "$ROOT"
+python3 "$ROOT/scripts/test_verify_rpc_signature_parity.py"
 python3 "$ROOT/scripts/verify_rpc_signature_parity.py" "$ROOT"
 
 green "RPC surface alignment check passed"

@@ -131,6 +131,21 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RegisterSessionEpochConflictRejectedRetired`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `RegisterSessionRefusedUnregisterDrainingIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RegisterSessionRefusedUnregisterDrainingAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RegisterSessionRefusedUnregisterDrainingRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RegisterSessionRefusedUnregisterDrainingRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RegisterSessionRefusedUnregisterDrainingStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `RegisterSessionResumesStopped`
   - anchors: `meerkat_machine`
   - scenarios: (unclaimed)
@@ -1964,6 +1979,78 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ClassifyRecoveredInputDurabilityRetainDurableDerivedOrMissingStopped`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchRecoverInitializing`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchRecoverIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchRecoverAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchRecoverRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchRecoverRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchRecoverStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableInitializing`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchDiscardUnrecoverableStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchBlockedInitializing`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchBlockedIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchBlockedAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchBlockedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchBlockedRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRecoveredTerminalCompletionBatchBlockedStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DeclareRecoveredTerminalCompletionUnrecoverableInitializing`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DeclareRecoveredTerminalCompletionUnrecoverableIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DeclareRecoveredTerminalCompletionUnrecoverableAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DeclareRecoveredTerminalCompletionUnrecoverableRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DeclareRecoveredTerminalCompletionUnrecoverableRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DeclareRecoveredTerminalCompletionUnrecoverableStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `ResolveInputPublicLifecycleAcceptedIdle`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -2468,10 +2555,19 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `PrepareIdle`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `PrepareIdleRetainingUnsettledCompletion`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `PrepareAttached`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `PrepareAttachedRetainingUnsettledCompletion`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `DrainQueuedRunRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DrainQueuedRunRetiredRetainingUnsettledCompletion`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `StartConversationRunIdleWithBinding`
@@ -6509,6 +6605,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `InteractionTerminalOutboxAdoptionAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoveredTerminalCompletionBatchClassified`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoveredTerminalCompletionDeclaredUnrecoverable`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 

@@ -3,24 +3,27 @@
 # module lockfile are stale, so CI doesn't reject the push for the same
 # reason after a long round-trip.
 #
-# Three gates:
+# Four gates:
 #   1. node scripts/generate-bazel-rust-builds.mjs --check
 #      Verifies the generated Bazel BUILD files match the workspace's
 #      Cargo metadata. Always runs (no `bb` CLI dependency).
-#   2. scripts/check_bazel_module_lock_inputs.py
+#   2. scripts/check-bazel-path-patch-runfiles.py
+#      Verifies every in-tree [patch] path dependency crosses its Bazel package
+#      boundary into workspace_runfiles for nested Cargo builds.
+#   3. scripts/check_bazel_module_lock_inputs.py
 #      Verifies MODULE.bazel.lock still matches the workspace files it
 #      recorded as crate_universe extension inputs (Cargo.lock and every
 #      member manifest). Offline and always runs: this is the class that
 #      broke every BuildBuddy release-binary lane in 0.8.22, when a
 #      one-line Cargo.lock heal landed without a module-lock refresh.
-#   3. bb mod deps --lockfile_mode=error
+#   4. bb mod deps --lockfile_mode=error
 #      Full authority over MODULE.bazel.lock vs MODULE.bazel, including
-#      registry inputs gate 2 cannot see. Requires the pinned `bb` CLI.
+#      registry inputs gate 3 cannot see. Requires the pinned `bb` CLI.
 #      Skipped (with a clear note) when `bb` is not available, unless
 #      --require-bb is passed (the release preflight does).
 #
 # Usage: pre-push-bazel-locks.sh [--require-bb]
-# Exit 0 = locks fresh (or gate 3 skipped honestly), exit 1 = stale locks.
+# Exit 0 = locks fresh (or gate 4 skipped honestly), exit 1 = stale locks.
 
 set -euo pipefail
 
@@ -62,9 +65,19 @@ else
   failed=1
 fi
 
-# ---- Gate 2: recorded workspace inputs vs on-disk content -------------------
+# ---- Gate 2: Cargo path patches included in Bazel runfiles ------------------
 
 PYTHON="${PYTHON:-$(command -v python3.11 2>/dev/null || command -v python3)}"
+
+if "${PYTHON}" scripts/check-bazel-path-patch-runfiles.py "${ROOT}"; then
+  printf '%bCargo path patches are present in Bazel workspace runfiles%b\n' "${GREEN}" "${NC}"
+else
+  printf '%bCargo path patches are missing from Bazel workspace runfiles.%b\n\n' \
+    "${RED}" "${NC}"
+  failed=1
+fi
+
+# ---- Gate 3: recorded workspace inputs vs on-disk content -------------------
 
 if "${PYTHON}" scripts/check_bazel_module_lock_inputs.py "${ROOT}"; then
   printf '%bMODULE.bazel.lock matches its recorded workspace inputs%b\n' "${GREEN}" "${NC}"
@@ -76,7 +89,7 @@ else
   failed=1
 fi
 
-# ---- Gate 3: MODULE.bazel.lock freshness ------------------------------------
+# ---- Gate 4: MODULE.bazel.lock freshness ------------------------------------
 
 # Locate the pinned `bb` CLI the same way scripts/buildbuddy-doctor does.
 bb_bin=""
@@ -102,7 +115,7 @@ if [[ -z "${bb_bin}" && "${require_bb}" -eq 1 ]]; then
 elif [[ -z "${bb_bin}" ]]; then
   printf '%bbb CLI not installed locally; skipping full lockfile_mode=error check%b\n' \
     "${YELLOW}" "${NC}"
-  printf '%b(Gate 2 above still covers the workspace-input class offline. Install%b\n' \
+  printf '%b(Gate 3 above still covers the workspace-input class offline. Install%b\n' \
     "${YELLOW}" "${NC}"
   printf '%bwith `make buildbuddy-install`, or run `make verify-bazel-locks-strict`.)%b\n' \
     "${YELLOW}" "${NC}"

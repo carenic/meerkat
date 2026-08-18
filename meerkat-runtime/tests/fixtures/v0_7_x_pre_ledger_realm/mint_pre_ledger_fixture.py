@@ -66,6 +66,16 @@ REALM_ID = "legacy-realm"
 TARGET = "aarch64-apple-darwin"
 SOURCE_REPO = "https://github.com/lukacf/meerkat"
 CANONICAL_REALM_FILES = ("realm_manifest.json", "sessions.sqlite3", "workgraph.sqlite3")
+
+# Suffixes of files the capturing process leaves behind that are not state of
+# the realm being captured. A sequence lock is held by the writer while it is
+# running and means nothing once it has stopped, so binding one to a content
+# manifest makes the corpus unverifiable the moment the capture ends. The repo
+# `.gitignore` drops the same suffix from the committed corpus tree, so a
+# capture that carried one into the manifest would describe a file no clean
+# checkout can have. `scripts/test_mint_pre_ledger_fixture.py` holds this
+# tuple and that `.gitignore` rule to the same answer.
+TRANSIENT_CAPTURE_SUFFIXES = (".lock",)
 MANIFEST_SCHEMA_VERSION = 2
 FIXTURE_ID = "meerkat-0.7.x-pre-ledger-realms"
 BOOTSTRAP_ONLY = "bootstrap-only"
@@ -268,9 +278,30 @@ def run_capture(
     return realm, receipt
 
 
+def is_transient_capture_artifact(relative_path: str) -> bool:
+    """True for a path the capturing process wrote that is not realm state.
+
+    This is the single place that decides it. Both the copy into the corpus and
+    the manifest payload list are derived from `realm_relative_files`, so a
+    suffix named here can neither reach the committed tree nor the manifest.
+    """
+    return relative_path.endswith(TRANSIENT_CAPTURE_SUFFIXES)
+
+
 def realm_relative_files(realm: pathlib.Path) -> list[str]:
+    """The realm state a capture carries, as `/`-joined paths relative to it.
+
+    Transient capture artifacts are dropped rather than refused: they are
+    expected output of a live writer. WAL/SHM sidecars are refused instead,
+    because they mean the realm was opened *after* the writer stopped, so the
+    bytes are no longer the ones the writer left.
+    """
     files = sorted(
-        entry.relative_to(realm).as_posix() for entry in realm.rglob("*") if entry.is_file()
+        relative
+        for relative in (
+            entry.relative_to(realm).as_posix() for entry in realm.rglob("*") if entry.is_file()
+        )
+        if not is_transient_capture_artifact(relative)
     )
     missing = [name for name in CANONICAL_REALM_FILES if name not in files]
     if missing:

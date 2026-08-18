@@ -12772,6 +12772,48 @@ ORDER BY runtime_id";
             Ok(RuntimeDeliveryAuthorityCasOutcome::Applied(replacement))
         }
 
+        async fn list_runtime_delivery_authorities(
+            &self,
+        ) -> Result<Vec<(LogicalRuntimeId, RuntimeDeliveryAuthorityRecord)>, RuntimeStoreError>
+        {
+            // A file that never used durable delivery has no domain and no
+            // rows; that is a readable zero, not an unreadable dimension.
+            let Some(conn) = open_runtime_delivery_read_connection(&self.path)? else {
+                return Ok(Vec::new());
+            };
+            let mut statement = conn
+                .prepare(
+                    r"
+                    SELECT runtime_id, revision, state_json
+                      FROM runtime_delivery_authority
+                     ORDER BY runtime_id ASC
+                    ",
+                )
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            let mut records = Vec::new();
+            for row in rows {
+                let (runtime_id, revision, state_json) =
+                    row.map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+                records.push((
+                    LogicalRuntimeId::new(runtime_id),
+                    RuntimeDeliveryAuthorityRecord::from_parts(
+                        decode_u64(revision, "runtime delivery authority revision")?,
+                        state_json,
+                    ),
+                ));
+            }
+            Ok(records)
+        }
+
         async fn list_runtime_delivery_records(
             &self,
             runtime_id: &LogicalRuntimeId,

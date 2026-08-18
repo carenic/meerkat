@@ -3240,6 +3240,36 @@ fn normalize_rest_comms_send_error(
                 }
             }
         }
+        // An ambiguous delivery is NOT a failed send, and it must not arrive at
+        // a caller under a code that says it was. The envelope may already be on
+        // the receiver's queue and a later drain may still commit it, so the
+        // caller's next safe move is to RECONCILE against durable work truth -
+        // never to retry, which would duplicate. Folding this into
+        // `send_failed` would tell every caller the opposite, and a
+        // model-mediated caller reading the code or the prose will retry on the
+        // word "failed". Carries the envelope id as the correlation evidence
+        // reconciliation needs.
+        meerkat_core::comms::SendError::AmbiguousDelivery {
+            envelope_id,
+            detail,
+        } => {
+            let message = format!(
+                "delivery outcome for envelope {envelope_id} is unknown; it may already be \
+                 delivered. Reconcile against durable work truth before any new attempt - a \
+                 retry can duplicate. ({detail})"
+            );
+            ApiError::InternalWithData {
+                message: format!("send_ambiguous: {message}"),
+                code: "send_ambiguous".to_string(),
+                details: json!({
+                    "code": "send_ambiguous",
+                    "message": message,
+                    "envelope_id": envelope_id.to_string(),
+                    "retry_safe": false,
+                    "required_action": "reconcile",
+                }),
+            }
+        }
         other => ApiError::InternalWithData {
             message: format!("send_failed: {other}"),
             code: "send_failed".to_string(),
@@ -3855,9 +3885,9 @@ fn rest_observed_session_population(
 
 /// What THIS surface's probes established about runtime host health.
 ///
-/// REST reads the two session dimensions straight off the `MeerkatMachine` it
-/// already holds; both accessors are synchronous non-blocking reads, so a
-/// health scrape cannot park behind the wedge it is trying to report.
+/// REST reads the four session dimensions straight off the `MeerkatMachine`
+/// it already holds; all four accessors are synchronous non-blocking reads,
+/// so a health scrape cannot park behind the wedge it is trying to report.
 ///
 /// `jobs` is not probed here. REST holds no `DetachedJobService`, so it is
 /// published as `unmeasured:jobs`: a coverage statement in the payload rather
@@ -3874,6 +3904,18 @@ fn rest_runtime_health(state: &AppState) -> meerkat_contracts::RuntimeHostHealth
             "session_runtime_loop".to_string(),
             rest_observed_session_population(
                 state.runtime_adapter.dead_runtime_loop_session_count(),
+            ),
+        ),
+        (
+            "session_run_start".to_string(),
+            rest_observed_session_population(
+                state.runtime_adapter.overdue_run_start_session_count(),
+            ),
+        ),
+        (
+            "session_liveness".to_string(),
+            rest_observed_session_population(
+                state.runtime_adapter.parked_queued_input_session_count(),
             ),
         ),
     ])
@@ -10904,6 +10946,7 @@ mod tests {
                 backend_kind: "google_code_assist".to_string(),
                 base_url: None,
                 options: serde_json::Value::Null,
+                server: None,
             },
         );
         global.auth.insert(
@@ -12654,11 +12697,16 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let health: Value = serde_json::from_slice(&body).unwrap();
-        // Measured. REST reads both session dimensions off the runtime machine
-        // it already holds, so their presence here is the wiring pin: a route
-        // that forgot to probe would publish `unmeasured:*` instead and fail
-        // the next block.
-        for measured in ["session_durability", "session_runtime_loop"] {
+        // Measured. REST reads the three session dimensions off the runtime
+        // machine it already holds, so their presence here is the wiring pin:
+        // a route that forgot to probe would publish `unmeasured:*` instead
+        // and fail the next block.
+        for measured in [
+            "session_durability",
+            "session_runtime_loop",
+            "session_run_start",
+            "session_liveness",
+        ] {
             assert_eq!(
                 health["checks"][measured], "ok",
                 "GET /runtime/health must publish `{measured}` as measured: {health}"
@@ -12671,16 +12719,21 @@ mod tests {
             );
         }
         // Unmeasured, and named rather than omitted. REST holds no
-        // `DetachedJobService`, and nothing anywhere observes whether a live
-        // session is progressing.
-        for unmeasured in ["unmeasured:jobs", "unmeasured:session_liveness"] {
-            assert_eq!(
-                health["checks"][unmeasured], "degraded",
-                "GET /runtime/health must name `{unmeasured}` as unmeasured coverage: {health}"
-            );
-        }
+        // `DetachedJobService`, so `jobs` is the one dimension this surface
+        // still cannot probe.
+        assert_eq!(
+            health["checks"]["unmeasured:jobs"], "degraded",
+            "GET /runtime/health must name `unmeasured:jobs` as unmeasured coverage: {health}"
+        );
+        assert!(
+            health["checks"]
+                .get("unmeasured:session_liveness")
+                .is_none(),
+            "session_liveness is measured here now; a leftover unmeasured key \
+             would double-publish the dimension: {health}"
+        );
         // The third coverage vocabulary means a probe ran and could not read.
-        // Both probes answered on this host, so neither may claim it failed.
+        // The probes answered on this host, so none may claim it failed.
         assert!(
             !health["checks"]
                 .as_object()

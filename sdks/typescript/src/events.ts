@@ -19,7 +19,10 @@
  *       console.log(`Calling ${event.name}`);
  *       break;
  *     case "turn_completed":
- *       console.log(`Tokens: ${event.usage.inputTokens} in / ${event.usage.outputTokens} out`);
+ *       // `usage` is absent when the provider sent no accounting for the turn.
+ *       console.log(event.usage
+ *         ? `Tokens: ${event.usage.inputTokens} in / ${event.usage.outputTokens} out`
+ *         : "Tokens: unmeasured");
  *       break;
  *   }
  * }
@@ -272,10 +275,20 @@ export interface ToolResultReceivedEvent {
   readonly isError?: boolean;
 }
 
+/**
+ * One model turn reached its terminal and its assistant message was committed.
+ *
+ * `usage` is ABSENT when the provider stream carried no normalized token
+ * accounting for the turn. That is an honest absence rather than a zero: the
+ * turn completed, and no token counter advanced for it. The paired
+ * `turn_usage_accounting_unmeasured` event names which provider and model went
+ * unaccounted. Skip an absent row when aggregating; folding it in as zero
+ * silently understates every total built on top of it.
+ */
 export interface TurnCompletedEvent {
   readonly type: "turn_completed";
   readonly stopReason?: StopReason;
-  readonly usage: Usage;
+  readonly usage?: Usage;
 }
 
 // ---------------------------------------------------------------------------
@@ -1358,7 +1371,11 @@ export function parseCoreEvent(raw: Record<string, unknown>): AgentEvent {
           "stop_reason",
           ["end_turn", "tool_use", "max_tokens", "stop_sequence", "content_filter", "cancelled"] as const,
         ),
-        usage: parseUsage(raw.usage),
+        // An unaccounted turn omits `usage` entirely. Parsing it as a zero row
+        // would turn "no measurement" into a wrong measurement that looks
+        // right, and rejecting the event would let an accounting gap erase a
+        // completed turn.
+        ...(raw.usage !== undefined && raw.usage !== null ? { usage: parseUsage(raw.usage) } : {}),
       };
 
     // Tool execution

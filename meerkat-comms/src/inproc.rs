@@ -26,15 +26,47 @@ use parking_lot::RwLock;
 use uuid::Uuid;
 
 use crate::identity::{Keypair, PubKey, Signature};
-use crate::inbox::{AdmissionOutcome, DropReason, InboxSender, IngressDeliveryOutcome};
+use crate::inbox::{
+    AdmissionOutcome, BoundedIngressDelivery, DropReason, InboxSender, IngressDeliveryOutcome,
+};
 use crate::peer_meta::PeerMeta;
 use crate::types::{Envelope, InboxItem, MessageKind};
 
 const DEFAULT_NAMESPACE: &str = "";
 
+#[derive(Debug)]
 pub(crate) struct InprocDelivery {
     pub(crate) envelope_id: Uuid,
-    pub(crate) outcome: IngressDeliveryOutcome,
+    pub(crate) outcome: InprocDeliveryOutcome,
+}
+
+/// What the in-process lane can truthfully say about one delivery attempt.
+///
+/// `Resolved` carries the receiver's own terminal ingress fact. `Unconfirmed`
+/// says only that the envelope IS sitting on the receiver's queue and no drain
+/// committed it inside the sender's bound: not a drop, not a success. Callers
+/// must not launder it into either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InprocDeliveryOutcome {
+    Resolved(IngressDeliveryOutcome),
+    Unconfirmed { park_bound: std::time::Duration },
+}
+
+#[cfg(test)]
+impl InprocDelivery {
+    /// Test-only accessor asserting the receiver produced a terminal fact.
+    ///
+    /// Deliberately panics on `Unconfirmed` so a delivery test that silently
+    /// starts timing out is a failure, not a pass on a different fact.
+    #[allow(clippy::panic)]
+    fn resolved_outcome(&self) -> IngressDeliveryOutcome {
+        match self.outcome {
+            InprocDeliveryOutcome::Resolved(outcome) => outcome,
+            InprocDeliveryOutcome::Unconfirmed { park_bound } => panic!(
+                "expected a receiver-resolved inproc delivery, got unconfirmed after {park_bound:?}"
+            ),
+        }
+    }
 }
 
 /// Snapshot of an inproc peer returned by [`InprocRegistry::peers()`].
@@ -52,17 +84,23 @@ pub enum RegistrationRejection {
     /// The supplied pubkey was the all-zero key, which can never identify a
     /// distinct peer and is refused fail-closed.
     ZeroPubkey,
-    /// This participant name already has a live route under a *different*
-    /// public key, so the registrant is a different peer claiming an occupied
-    /// name.
+    /// This participant name already has a live route, so it is not the
+    /// registrant's to claim.
     ///
-    /// Delivery is keyed by public key, so honouring the newcomer would make
-    /// `holder_pubkey` - a key that peers still hold, trust and address -
-    /// unreachable, with the incumbent finding out only by no longer receiving.
-    /// The registration is refused instead, without mutation, and the incumbent
-    /// keeps routing. A caller that legitimately succeeds a *known* predecessor
-    /// proves it through [`InprocRegistry::replace_sender_in_namespace`] rather
-    /// than by claiming the name.
+    /// `holder_pubkey` is the incumbent's key, and it is *evidence*, not a
+    /// verdict about the registrant's identity. Whether it equals the
+    /// registrant's own key changes nothing about the refusal: a live route
+    /// under this name means the incumbent generation is still receiving, and
+    /// registration cannot tell one host rebuilding itself apart from a second
+    /// live host of the same identity. Both are refused, without mutation, and
+    /// the incumbent keeps routing.
+    ///
+    /// Succession is proved, never asserted. Either the incumbent releases the
+    /// name first (`CommsRuntime::retire_inproc_route`, or its `Drop`), leaving
+    /// it unbound for the next claimant, or the successor hands in the exact
+    /// predecessor generation it is replacing through
+    /// [`InprocRegistry::replace_sender_in_namespace`]. A registrant that can do
+    /// neither has not proved the incumbent is gone.
     NameOccupied { holder_pubkey: PubKey },
 }
 
@@ -72,9 +110,18 @@ impl std::fmt::Display for RegistrationRejection {
             Self::ZeroPubkey => {
                 f.write_str("the all-zero public key can never identify a distinct peer")
             }
+            // Remedy first. The holder key is named last and explicitly framed
+            // as evidence: in 0.8.23 a refusal that led with a public key read
+            // as a crypto/trust failure when the real cause was an unreleased
+            // predecessor, and the misreading cost an adopter fleet an hour.
             Self::NameOccupied { holder_pubkey } => write!(
                 f,
-                "the participant name already has a live route under a different public key {}",
+                "the incumbent has not released this participant name; retire it first \
+                 (release the live route via CommsRuntime::retire_inproc_route, or drop the \
+                 runtime holding it) or publish through the replacing seam with the predecessor \
+                 generation in hand. The live route is held by public key {} - that is evidence \
+                 of who holds the name, not a key or trust failure; it may well be this \
+                 registrant's own earlier generation",
                 holder_pubkey.to_pubkey_string()
             ),
         }
@@ -83,31 +130,28 @@ impl std::fmt::Display for RegistrationRejection {
 
 /// Typed result of registering an inproc peer.
 ///
-/// Registration is not always a clean insert, and every non-clean shape is
-/// named rather than silently applied. A registrant may move its own key to a
-/// free name ([`RegistrationOutcome::ReplacedPubkey`]) or rebind its own name to
-/// a newer inbox generation ([`RegistrationOutcome::ReboundOwnName`]); no
-/// registration path can unbind a route belonging to a *different* key
+/// Registration claims a participant name, and there is exactly one rule for
+/// that claim: the name must be unbound. A registrant may move its own key onto
+/// a free name ([`RegistrationOutcome::ReplacedPubkey`]); no registration path
+/// unbinds a live route under the name being claimed, whichever key holds it
 /// ([`RegistrationRejection::NameOccupied`]). Callers (runtime constructors,
 /// metadata refresh) must observe these facts rather than assume a clean
 /// success.
+///
+/// There is deliberately no "rebound my own name" outcome. Succeeding a live
+/// generation is proved by evidence, not by identity: the incumbent releases the
+/// name, or the successor hands its exact generation in through
+/// [`InprocRegistry::replace_sender_in_namespace`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistrationOutcome {
     /// The peer was inserted without touching any existing route.
     Registered,
     /// This pubkey was already registered under a different name; the old name
     /// mapping was removed and replaced with the new name.
-    ReplacedPubkey { evicted_name: String },
-    /// This exact public key already held this exact name, and its route was
-    /// rebound to the registrant's newer inbox generation.
     ///
-    /// This is one identity reconstructing itself, not a displacement: the key
-    /// peers address stays reachable throughout and now resolves to the newest
-    /// generation, and the predecessor's generation-checked unregistration
-    /// cannot unbind the successor. What does change is that the predecessor
-    /// generation stops receiving, so the outcome is reported rather than
-    /// folded into [`RegistrationOutcome::Registered`].
-    ReboundOwnName,
+    /// The *claimed* name was still unbound, so this is a rename inside one
+    /// identity, not a claim over a live route.
+    ReplacedPubkey { evicted_name: String },
     /// The registration was refused without mutating the registry.
     Rejected { reason: RegistrationRejection },
 }
@@ -231,27 +275,28 @@ impl InprocRegistry {
 
     /// Register an agent's inbox within an explicit namespace.
     ///
-    /// One rule, for every registrant with no exceptions: the public key is the
-    /// participant identity, so a name may only ever be bound or rebound by the
-    /// key that holds it.
+    /// ONE claim rule, for every registrant with no exceptions: a name may be
+    /// published only while it is UNBOUND. Key identity does not fork it.
     ///
-    /// - a name held by a *different* live key belongs to another peer.
-    ///   Delivery is key-addressed, so honouring the newcomer would make that
-    ///   key unreachable; the registration is refused before any mutation
+    /// - a name that already has a live route is refused before any mutation
     ///   ([`RegistrationRejection::NameOccupied`]) and the incumbent keeps
-    ///   routing. A caller that legitimately succeeds a known predecessor
-    ///   proves it through
+    ///   routing, *whichever key holds it*. Delivery is key-addressed and this
+    ///   registry cannot see hosts, so a peer rebuilding itself and a second
+    ///   live host of that same identity arrive here as the same event. Only
+    ///   one of them is safe to admit, so neither is: honouring the newcomer
+    ///   would silently orphan a route that is more likely to be live, not
+    ///   less, precisely when the two keys match.
+    /// - succession is admitted on EVIDENCE, in one of two forms. Either the
+    ///   incumbent released the name first - `CommsRuntime::retire_inproc_route`
+    ///   at a chosen point, or its `Drop` - which leaves the name unbound for
+    ///   an ordinary claim; or the successor hands in the exact predecessor
+    ///   generation through
     ///   [`replace_sender_in_namespace`](Self::replace_sender_in_namespace),
-    ///   which authorizes replacement by the exact generation being replaced.
-    /// - a name held by the *same* key is that identity reconstructing itself.
-    ///   The route is rebound to the newer generation and reported as
-    ///   [`RegistrationOutcome::ReboundOwnName`]: the addressable identity never
-    ///   stops being reachable, and the predecessor's generation-checked
-    ///   unregistration cannot unbind the successor. Whether two live hosts of
-    ///   one identity may exist at all is not visible here and is not decided
-    ///   here (see `SessionClaimHandle` for session identities).
+    ///   which authorizes replacement by naming what it replaces. Holding the
+    ///   same private key is not evidence of either.
     /// - re-registering an existing key under a *free* name is that
-    ///   registrant's own rename ([`RegistrationOutcome::ReplacedPubkey`]).
+    ///   registrant's own rename ([`RegistrationOutcome::ReplacedPubkey`]). The
+    ///   claimed name was unbound, so the one rule is satisfied.
     /// - a zero pubkey is refused ([`RegistrationRejection::ZeroPubkey`]).
     ///
     /// Callers must observe the outcome rather than assume a clean success.
@@ -284,34 +329,35 @@ impl InprocRegistry {
         let mut state = self.state.write();
         let namespace_state = state.namespace_mut(namespace);
 
-        // Fail closed before any mutation. A live route under this name is a
-        // serving peer's only inbox, and from here one participant rebuilding
-        // itself is indistinguishable from a second live instance of it, so
-        // neither is allowed to claim the name. Exact-generation replacement is
-        // the seam that can tell them apart, because the caller has to name the
-        // predecessor it is replacing.
-        let held_by = namespace_state.names.get(&name).copied();
-        if let Some(holder_pubkey) = held_by.filter(|&held_by| held_by != pubkey) {
+        // Fail closed before any mutation, on occupancy alone. A live route
+        // under this name is a serving peer's only inbox, and from here one
+        // participant rebuilding itself is indistinguishable from a second live
+        // instance of it. There is deliberately no key-identity exemption: the
+        // same-key case is the one where the displaced route is MOST likely to
+        // still be live, so admitting it is silent displacement wearing an
+        // identity argument. Succession is proved instead - the incumbent
+        // releases the name, or the successor names the exact generation it
+        // replaces via `replace_sender_in_namespace`.
+        if let Some(holder_pubkey) = namespace_state.names.get(&name).copied() {
             tracing::warn!(
                 inproc_namespace = %namespace,
                 peer_name = %name,
                 holder_pubkey = %holder_pubkey.to_pubkey_string(),
                 registrant_pubkey = %pubkey.to_pubkey_string(),
+                holder_is_registrant = holder_pubkey == pubkey,
                 "refusing inproc registration that would unbind a live route under this name"
             );
             return RegistrationOutcome::Rejected {
                 reason: RegistrationRejection::NameOccupied { holder_pubkey },
             };
         }
-        let rebound_own_name = held_by.is_some();
 
-        // This pubkey may hold a different name already. That route belongs to
-        // this same registrant, so the stale mapping is its own rename rather
-        // than a displacement of somebody else.
+        // The claimed name is unbound. This pubkey may still hold a *different*
+        // name, and that route belongs to this same registrant, so releasing the
+        // stale mapping is its own rename rather than a displacement of anyone.
         let evicted_name = namespace_state
             .peers
             .get(&pubkey)
-            .filter(|old_peer| old_peer.name != name)
             .map(|old_peer| old_peer.name.clone());
         if let Some(old_name) = &evicted_name {
             namespace_state.names.remove(old_name);
@@ -320,10 +366,9 @@ impl InprocRegistry {
         namespace_state.peers.insert(pubkey, peer);
         namespace_state.names.insert(name, pubkey);
 
-        match (evicted_name, rebound_own_name) {
-            (Some(evicted_name), _) => RegistrationOutcome::ReplacedPubkey { evicted_name },
-            (None, true) => RegistrationOutcome::ReboundOwnName,
-            (None, false) => RegistrationOutcome::Registered,
+        match evicted_name {
+            Some(evicted_name) => RegistrationOutcome::ReplacedPubkey { evicted_name },
+            None => RegistrationOutcome::Registered,
         }
     }
 
@@ -553,7 +598,9 @@ impl InprocRegistry {
     /// Backpressured pubkey-keyed delivery across all namespaces.
     ///
     /// Runtime-originated peer sends should await receiver capacity instead of
-    /// turning a transient full inbox into semantic message loss.
+    /// turning a transient full inbox into semantic message loss. `park_bound`
+    /// caps how long the sender's own liveness is allowed to depend on the
+    /// receiver's drain; see [`Self::deliver_to_sender_wait`].
     pub(crate) async fn send_to_pubkey_any_namespace_with_id_wait(
         &self,
         from_keypair: &Keypair,
@@ -561,6 +608,7 @@ impl InprocRegistry {
         envelope_id: Uuid,
         kind: MessageKind,
         sign_envelope: bool,
+        park_bound: std::time::Duration,
     ) -> Result<InprocDelivery, InprocSendError> {
         let sender = self
             .get_by_pubkey_any_namespace(to_pubkey)
@@ -573,6 +621,7 @@ impl InprocRegistry {
             envelope_id,
             kind,
             sign_envelope,
+            park_bound,
         )
         .await
     }
@@ -588,6 +637,12 @@ impl InprocRegistry {
     /// inbox handoff — a second any-namespace lookup would open a window where
     /// the peer re-registers elsewhere and delivery crosses the namespace
     /// boundary.
+    // One argument over the lint's threshold, and the extra one is the
+    // `namespace` delivery authority that distinguishes this send from its
+    // any-namespace sibling. Bundling the envelope arguments into a params
+    // struct would only move the same values behind a name that adds no
+    // meaning, so the sibling signatures are kept identical instead.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_to_pubkey_in_namespace_with_id_wait(
         &self,
         namespace: &str,
@@ -596,6 +651,7 @@ impl InprocRegistry {
         envelope_id: Uuid,
         kind: MessageKind,
         sign_envelope: bool,
+        park_bound: std::time::Duration,
     ) -> Result<InprocDelivery, InprocSendError> {
         let sender = self
             .get_by_pubkey_in_namespace(namespace, to_pubkey)
@@ -608,10 +664,22 @@ impl InprocRegistry {
             envelope_id,
             kind,
             sign_envelope,
+            park_bound,
         )
         .await
     }
 
+    /// Hand one envelope to a resolved in-process receiver.
+    ///
+    /// Non-`Response` kinds wait for the receiver's ingress authority to commit
+    /// the exact claim, which makes the caller's liveness depend on the
+    /// RECEIVER's drain being alive. `park_bound` caps that dependency: on
+    /// expiry the caller is told delivery is unconfirmed rather than being
+    /// parked forever behind a dead or stalled drain.
+    ///
+    /// `MessageKind::Response` deliberately keeps capacity-only semantics: it
+    /// returns as soon as the item is admitted to the queue and never waits on
+    /// the drain, so it has no receipt park to bound.
     async fn deliver_to_sender_wait(
         from_keypair: &Keypair,
         to_pubkey: PubKey,
@@ -619,6 +687,7 @@ impl InprocRegistry {
         envelope_id: Uuid,
         kind: MessageKind,
         sign_envelope: bool,
+        park_bound: std::time::Duration,
     ) -> Result<InprocDelivery, InprocSendError> {
         let response_uses_legacy_queue_semantics = matches!(&kind, MessageKind::Response { .. });
         let mut envelope = Envelope {
@@ -637,7 +706,7 @@ impl InprocRegistry {
             return match sender.send_wait(InboxItem::External { envelope }).await {
                 AdmissionOutcome::Admitted => Ok(InprocDelivery {
                     envelope_id,
-                    outcome: IngressDeliveryOutcome::Queued,
+                    outcome: InprocDeliveryOutcome::Resolved(IngressDeliveryOutcome::Queued),
                 }),
                 AdmissionOutcome::Dropped {
                     reason: DropReason::SessionClosed,
@@ -651,26 +720,48 @@ impl InprocRegistry {
             };
         }
         match sender
-            .send_wait_for_delivery(InboxItem::External { envelope })
+            .send_wait_for_delivery(InboxItem::External { envelope }, park_bound)
             .await
         {
-            IngressDeliveryOutcome::Queued => unreachable!(
+            BoundedIngressDelivery::Resolved(IngressDeliveryOutcome::Queued) => unreachable!(
                 "only the immediate legacy Response path produces queued inproc delivery"
             ),
-            outcome @ (IngressDeliveryOutcome::DurablyResolved(_)
-            | IngressDeliveryOutcome::VolatileHandedOff) => Ok(InprocDelivery {
+            BoundedIngressDelivery::Resolved(
+                outcome @ (IngressDeliveryOutcome::DurablyResolved(_)
+                | IngressDeliveryOutcome::VolatileHandedOff),
+            ) => Ok(InprocDelivery {
                 envelope_id,
-                outcome,
+                outcome: InprocDeliveryOutcome::Resolved(outcome),
             }),
-            IngressDeliveryOutcome::Dropped {
+            BoundedIngressDelivery::Resolved(IngressDeliveryOutcome::Dropped {
                 reason: DropReason::SessionClosed,
-            } => Err(InprocSendError::InboxClosed),
-            IngressDeliveryOutcome::Dropped {
+            }) => Err(InprocSendError::InboxClosed),
+            BoundedIngressDelivery::Resolved(IngressDeliveryOutcome::Dropped {
                 reason: DropReason::InboxFull,
-            } => Err(InprocSendError::InboxFull),
-            IngressDeliveryOutcome::Dropped { reason } => {
+            }) => Err(InprocSendError::InboxFull),
+            BoundedIngressDelivery::Resolved(IngressDeliveryOutcome::Dropped { reason }) => {
                 Err(InprocSendError::IngressDropped(reason))
             }
+            // The receiver's queue never opened inside the bound: nothing was
+            // admitted, so this is an admission refusal for a typed capacity
+            // reason - NOT an ambiguous delivery, and not "peer unreachable".
+            // The peer was present and its queue answered; it was full.
+            // `IngressDropped` is the arm that carries that typed reason
+            // through to `peer_admission_dropped: inbox_full`; the bare
+            // `InboxFull` arm above collapses into `PeerOffline` on the way
+            // out, which would report an unreachable peer for a reachable one.
+            BoundedIngressDelivery::AdmissionParkTimedOut { park_bound } => {
+                tracing::warn!(
+                    %envelope_id,
+                    park_bound_secs = park_bound.as_secs_f64(),
+                    "inproc send gave up waiting for receiver inbox capacity"
+                );
+                Err(InprocSendError::IngressDropped(DropReason::InboxFull))
+            }
+            BoundedIngressDelivery::AdmittedUnconfirmed { park_bound } => Ok(InprocDelivery {
+                envelope_id,
+                outcome: InprocDeliveryOutcome::Unconfirmed { park_bound },
+            }),
         }
     }
 
@@ -733,6 +824,12 @@ mod tests {
     use crate::trust::TrustStore;
     use parking_lot::RwLock;
     use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Park bound for tests whose receiver DOES drain: generous enough that a
+    /// healthy drain always wins the race, so these tests keep asserting
+    /// delivery semantics rather than accidentally asserting the deadline.
+    const TEST_PARK_BOUND: Duration = Duration::from_secs(30);
 
     fn classified_inbox() -> (Inbox, crate::InboxSender) {
         classified_inbox_with_auth(false)
@@ -1033,11 +1130,12 @@ mod tests {
                     Uuid::new_v4(),
                     probe_message(body),
                     true,
+                    TEST_PARK_BOUND,
                 )
                 .await
                 .expect("both same-name peers must remain routable");
             assert!(matches!(
-                delivery.outcome,
+                delivery.resolved_outcome(),
                 IngressDeliveryOutcome::DurablyResolved(
                     meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
                 )
@@ -1127,11 +1225,12 @@ mod tests {
                 Uuid::new_v4(),
                 probe_message("incumbent keeps routing"),
                 true,
+                TEST_PARK_BOUND,
             )
             .await
             .expect("the refused registration must not have unbound the incumbent");
         assert!(matches!(
-            delivery.outcome,
+            delivery.resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
             )
@@ -1144,10 +1243,10 @@ mod tests {
             other => panic!("expected Message interaction, got {other:?}"),
         }
 
-        // The refusal is keyed on IDENTITY, not on the name being busy: the
-        // incumbent's own key may still rebind its own name, because that keeps
-        // the addressable identity reachable (see
-        // `same_identity_rebind_keeps_the_identity_addressable_and_survives_stale_drop`).
+        // The refusal is keyed on the NAME being live, not on identity. The
+        // incumbent's own key gets the identical refusal, carrying its own key
+        // back as the holder (see
+        // `same_key_registration_over_a_live_route_is_refused_like_any_other`).
         let (_rebuild_inbox, rebuild_sender) = classified_inbox();
         assert_eq!(
             registry.register_with_meta_in_namespace(
@@ -1157,33 +1256,37 @@ mod tests {
                 rebuild_sender,
                 PeerMeta::default(),
             ),
-            RegistrationOutcome::ReboundOwnName,
-            "the holder of a name may rebuild its own route"
+            RegistrationOutcome::Rejected {
+                reason: RegistrationRejection::NameOccupied {
+                    holder_pubkey: incumbent_pubkey
+                }
+            },
+            "the holder of a live name does not get a second claim rule for rebuilding itself"
         );
     }
 
-    /// The residual boundary of this design, stated as behaviour rather than as
-    /// a comment: a same-key rebind is admitted, so delivery to the identity
-    /// lands in the NEWEST generation's inbox and the still-live predecessor
-    /// generation is silently orphaned. Nothing at this layer prevents that,
-    /// because two live hosts of one identity are cryptographically the same
-    /// peer and the registry cannot see the difference. Excluding them belongs
-    /// to whoever owns the identity: `SessionClaimHandle` for session
-    /// identities (typed `SessionIdentityInUse`), the mob host binding and
-    /// supervisor authority records for mobs.
+    /// The behaviour the one-claim rule buys, and the exact inversion of what
+    /// this test asserted through 0.8.23. A same-key second registration used to
+    /// be admitted, which moved delivery to the NEWEST generation's inbox and
+    /// silently orphaned the still-live predecessor. That was the worst case,
+    /// not the safe one: two live hosts of one identity are cryptographically
+    /// the same peer, so the registry cannot tell a rebuild from a displacement,
+    /// and in-proc occupancy was in practice the only thing excluding two live
+    /// hosts of one mob at all.
     ///
-    /// The rebind is reported as [`RegistrationOutcome::ReboundOwnName`] so the
-    /// orphaning is at least never silent to the registrant.
+    /// Now the second claim is refused and the PREDECESSOR keeps receiving. The
+    /// delivery leg is the point: this asserts a live route, not a surviving map
+    /// entry.
     #[tokio::test]
-    async fn same_identity_rebind_delivers_to_the_newest_generation_only() {
+    async fn same_key_registration_over_a_live_route_leaves_the_predecessor_receiving() {
         let registry = InprocRegistry::new();
         let namespace = "realm-rebind-delivery";
         let name = "mob.rebind/lead/lead-1";
         let keypair = make_keypair();
         let pubkey = keypair.public_key();
-        let (predecessor_inbox, predecessor_sender, _predecessor_finalizer) =
+        let (predecessor_inbox, predecessor_sender, predecessor_finalizer) =
             classified_inbox_with_runtime();
-        let (successor_inbox, successor_sender, successor_finalizer) =
+        let (successor_inbox, successor_sender, _successor_finalizer) =
             classified_inbox_with_runtime();
 
         assert_eq!(
@@ -1204,13 +1307,18 @@ mod tests {
                 successor_sender,
                 PeerMeta::default(),
             ),
-            RegistrationOutcome::ReboundOwnName,
-            "one identity rebuilding its own route is admitted, and reported"
+            RegistrationOutcome::Rejected {
+                reason: RegistrationRejection::NameOccupied {
+                    holder_pubkey: pubkey
+                }
+            },
+            "one identity rebuilding itself over its own live route gets the same refusal as \
+             any other claimant, with its own key carried back as the holder"
         );
 
-        let predecessor_inbox = Arc::new(predecessor_inbox);
-        let successor_finalize =
-            spawn_runtime_finalization(Arc::new(successor_inbox), successor_finalizer);
+        let successor_inbox = Arc::new(successor_inbox);
+        let predecessor_finalize =
+            spawn_runtime_finalization(Arc::new(predecessor_inbox), predecessor_finalizer);
         let peer_keypair = make_keypair();
         let delivery = registry
             .send_to_pubkey_in_namespace_with_id_wait(
@@ -1218,49 +1326,48 @@ mod tests {
                 &peer_keypair,
                 &pubkey,
                 Uuid::new_v4(),
-                probe_message("after the rebind"),
+                probe_message("after the refused claim"),
                 true,
+                TEST_PARK_BOUND,
             )
             .await
-            .expect("the identity must stay addressable across the rebind");
+            .expect("the refused claim must not have unbound the incumbent generation");
         assert!(matches!(
-            delivery.outcome,
+            delivery.resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
             )
         ));
 
-        let candidate = successor_finalize
+        let candidate = predecessor_finalize
             .await
-            .expect("successor finalizer completes");
+            .expect("predecessor finalizer completes");
         match candidate.interaction.content {
             meerkat_core::InteractionContent::Message { body, blocks: None } => {
-                assert_eq!(body, "after the rebind");
+                assert_eq!(body, "after the refused claim");
             }
             other => panic!("expected Message interaction, got {other:?}"),
         }
         assert!(
-            predecessor_inbox.try_claim_one_classified().is_none(),
-            "the superseded generation is orphaned by the rebind: this layer routes one \
-             identity to exactly one inbox and cannot tell a rebuild from a second live host"
+            successor_inbox.try_claim_one_classified().is_none(),
+            "a refused claim must not receive: the route was never handed to it"
         );
     }
 
-    /// Same namespace, same name, same signing key, new inbox generation: one
-    /// identity reconstructing itself. This is permitted, and the two safety
-    /// properties that make it *not* a route displacement are what this test
-    /// pins:
+    /// Same namespace, same name, same signing key, new inbox generation. There
+    /// is exactly ONE door to that, and it is the replacing seam: the successor
+    /// hands in the exact predecessor generation it replaces. Registration is
+    /// not a second door, and this pins both halves in one test so neither can
+    /// drift from the other:
     ///
-    /// 1. the key peers address never stops resolving, and after the rebind it
-    ///    resolves to the newest generation;
-    /// 2. the predecessor generation's later unregistration (its `Drop`) is
-    ///    generation-checked, so it cannot unbind the successor.
-    ///
-    /// The outcome is reported as [`RegistrationOutcome::ReboundOwnName`] rather
-    /// than a clean `Registered`, because the predecessor generation does stop
-    /// receiving and that fact must not be silent.
+    /// 1. registration is REFUSED and the refusal carries the holder key, which
+    ///    here is the claimant's own;
+    /// 2. `replace_sender_in_namespace` is admitted, the key never stops
+    ///    resolving and now resolves to the newest generation, and the
+    ///    superseded predecessor's later generation-checked unregistration (its
+    ///    `Drop`) cannot unbind the successor.
     #[test]
-    fn same_identity_rebind_keeps_the_identity_addressable_and_survives_stale_drop() {
+    fn same_identity_generational_move_goes_through_the_replacing_seam_only() {
         let registry = InprocRegistry::new();
         let namespace = "realm-rebind";
         let keypair = make_keypair();
@@ -1286,15 +1393,38 @@ mod tests {
                 second_sender.clone(),
                 PeerMeta::default(),
             ),
-            RegistrationOutcome::ReboundOwnName,
-            "re-registering the same identity is a rebind, and it is reported as one"
+            RegistrationOutcome::Rejected {
+                reason: RegistrationRejection::NameOccupied {
+                    holder_pubkey: pubkey
+                }
+            },
+            "registration is not a door to a generational move, not even for the key that \
+             already holds the name"
         );
+        let live = registry
+            .get_by_pubkey_in_namespace(namespace, &pubkey)
+            .expect("the refused claim must leave the incumbent generation live");
+        assert!(
+            live.same_inbox(&first_sender),
+            "a refused claim must not move the route onto the newcomer's inbox"
+        );
+
+        // The one legal door: name the predecessor generation being replaced.
+        registry
+            .replace_sender_in_namespace(
+                namespace,
+                "agent",
+                (&pubkey, &first_sender),
+                pubkey,
+                second_sender.clone(),
+            )
+            .expect("naming the exact predecessor generation must be admitted");
         let live = registry
             .get_by_pubkey_in_namespace(namespace, &pubkey)
             .expect("the identity must never stop being addressable");
         assert!(
             live.same_inbox(&second_sender),
-            "the rebind must resolve to the newest inbox generation"
+            "the replacement must resolve to the newest inbox generation"
         );
         assert_eq!(registry.peers_in_namespace(namespace).len(), 1);
 
@@ -1640,11 +1770,12 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
         let delivery = result.expect("runtime-bound Message must be durably admitted");
         assert!(matches!(
-            delivery.outcome,
+            delivery.resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
             )
@@ -1689,6 +1820,7 @@ mod tests {
                 envelope_id,
                 message(),
                 true,
+                TEST_PARK_BOUND,
             )
             .await
             .expect("first stable envelope delivery should resolve");
@@ -1696,7 +1828,7 @@ mod tests {
             .await
             .expect("first actual-machine admission should complete");
         assert!(matches!(
-            first.outcome,
+            first.resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
             )
@@ -1711,6 +1843,7 @@ mod tests {
                 envelope_id,
                 message(),
                 true,
+                TEST_PARK_BOUND,
             )
             .await
             .expect("same-envelope retry should resolve by durable deduplication");
@@ -1718,7 +1851,7 @@ mod tests {
             .await
             .expect("retry actual-machine admission should complete");
         assert!(matches!(
-            retry.outcome,
+            retry.resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Deduplicated
             )
@@ -1771,12 +1904,16 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await
             .expect("Response must complete after queue admission");
 
         assert_eq!(delivery.envelope_id, response_id);
-        assert!(matches!(delivery.outcome, IngressDeliveryOutcome::Queued));
+        assert!(matches!(
+            delivery.resolved_outcome(),
+            IngressDeliveryOutcome::Queued
+        ));
         let mut entries = inbox.try_drain_classified();
         assert_eq!(entries.len(), 1);
         let entry = entries.pop().expect("queued Response entry");
@@ -1784,6 +1921,249 @@ mod tests {
             panic!("expected external Response envelope");
         };
         assert_eq!(envelope.id, response_id);
+    }
+
+    /// Bound used by the park tests. Short enough to keep the lane fast, and
+    /// always paired with a much longer OUTER timeout so a regression to the
+    /// unbounded park fails the assertion instead of hanging the lane.
+    const SHORT_PARK_BOUND: Duration = Duration::from_millis(200);
+    const OUTER_DEADLINE: Duration = Duration::from_secs(5);
+
+    fn message_kind(body: &str) -> MessageKind {
+        MessageKind::Message {
+            objective_id: None,
+            content_taint: None,
+            blocks: None,
+            body: body.to_string(),
+            handling_mode: None,
+        }
+    }
+
+    /// The exact field defect: an in-process peer send waits for the RECEIVER's
+    /// drain to commit its claim, so a drain that dies mid-claim used to park
+    /// the sender forever. The claim drop releases the entry back to the queue
+    /// head, nothing commits it, and nothing polls.
+    ///
+    /// The bounded park must return a fact that is neither a drop nor a
+    /// success: the envelope IS queued and may still be drained later.
+    #[tokio::test]
+    async fn parked_inproc_sender_resolves_when_receiver_drain_dies() {
+        let registry = InprocRegistry::new();
+        let receiver_keypair = make_keypair();
+        let (inbox, sender, _finalizer) = classified_inbox_with_runtime();
+        registry.register("receiver", receiver_keypair.public_key(), sender);
+        let inbox = Arc::new(inbox);
+
+        // A drain that dies while holding the exact claim: it takes the claim
+        // and drops it without committing. `PeerIngressQueueClaim::drop`
+        // releases the lease, which leaves the entry queued and the sender's
+        // receipt unresolved forever.
+        let dying_drain = {
+            let inbox = Arc::clone(&inbox);
+            tokio::spawn(async move {
+                loop {
+                    if let Some(claimed) = inbox.try_claim_one_classified() {
+                        drop(crate::runtime::comms_runtime::test_peer_ingress_queue_claim(claimed));
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        let sender_keypair = make_keypair();
+        let envelope_id = Uuid::new_v4();
+        let delivery = tokio::time::timeout(
+            OUTER_DEADLINE,
+            registry.send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                envelope_id,
+                message_kind("drain dies mid-claim"),
+                true,
+                SHORT_PARK_BOUND,
+            ),
+        )
+        .await
+        .expect("a dead receiver drain must not park the sender forever")
+        .expect("the envelope was admitted, so this is not a typed send failure");
+
+        assert_eq!(delivery.envelope_id, envelope_id);
+        assert!(
+            matches!(
+                delivery.outcome,
+                InprocDeliveryOutcome::Unconfirmed { park_bound } if park_bound == SHORT_PARK_BOUND
+            ),
+            "a dropped receiver claim is ambiguous delivery, not success: got {:?}",
+            delivery.outcome
+        );
+        dying_drain.await.expect("dying drain task joins");
+
+        let (_, queued) = inbox
+            .peer_authority_test_snapshot()
+            .expect("classified inbox exposes its queue depth");
+        assert_eq!(
+            queued, 1,
+            "the envelope must still be queued: `Unconfirmed` claims admission, not loss"
+        );
+    }
+
+    /// Companion: a drain that is alive but never claims (stalled, not dead)
+    /// parks the sender at exactly the same await. Same bound, same fact.
+    #[tokio::test]
+    async fn inproc_sender_park_is_bounded_when_drain_never_claims() {
+        let registry = InprocRegistry::new();
+        let receiver_keypair = make_keypair();
+        let (inbox, sender, _finalizer) = classified_inbox_with_runtime();
+        registry.register("receiver", receiver_keypair.public_key(), sender);
+
+        let sender_keypair = make_keypair();
+        let delivery = tokio::time::timeout(
+            OUTER_DEADLINE,
+            registry.send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                Uuid::new_v4(),
+                message_kind("nobody is draining"),
+                true,
+                SHORT_PARK_BOUND,
+            ),
+        )
+        .await
+        .expect("a stalled receiver drain must not park the sender forever")
+        .expect("the envelope was admitted, so this is not a typed send failure");
+
+        assert!(
+            matches!(
+                delivery.outcome,
+                InprocDeliveryOutcome::Unconfirmed { park_bound } if park_bound == SHORT_PARK_BOUND
+            ),
+            "expected the bounded ambiguous fact, got {:?}",
+            delivery.outcome
+        );
+        drop(inbox);
+    }
+
+    /// The second park in the same call: once timed-out senders have filled the
+    /// receiver queue, capacity never opens again (only a dequeue fires the
+    /// capacity notifier), so the capacity wait must share the same deadline.
+    ///
+    /// Expiry BEFORE admission is not ambiguous - nothing was delivered - so it
+    /// keeps the existing typed `InboxFull` fact rather than claiming the
+    /// envelope reached the peer.
+    #[tokio::test]
+    async fn inproc_sender_capacity_park_is_bounded_when_receiver_never_drains() {
+        let registry = InprocRegistry::new();
+        let receiver_keypair = make_keypair();
+        let (peer_comms_handle, _finalizer) =
+            meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+        let context = Arc::new(crate::classify::IngressClassificationContext {
+            require_peer_auth: false,
+            trusted_peers: Arc::new(RwLock::new(TrustStore::new())),
+            peer_comms_handle: Arc::new(RwLock::new(Some(peer_comms_handle))),
+            inproc_namespace: None,
+            durable_runtime_consumer: true,
+        });
+        let (inbox, sender) = Inbox::new_classified_with_capacity_for_test(context, 1);
+        registry.register("receiver", receiver_keypair.public_key(), sender);
+
+        let sender_keypair = make_keypair();
+        let first = tokio::time::timeout(
+            OUTER_DEADLINE,
+            registry.send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                Uuid::new_v4(),
+                message_kind("fills the only slot"),
+                true,
+                SHORT_PARK_BOUND,
+            ),
+        )
+        .await
+        .expect("first send must return at the bound")
+        .expect("first send was admitted");
+        assert!(matches!(
+            first.outcome,
+            InprocDeliveryOutcome::Unconfirmed { .. }
+        ));
+
+        let second = tokio::time::timeout(
+            OUTER_DEADLINE,
+            registry.send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                Uuid::new_v4(),
+                message_kind("waits on capacity that never opens"),
+                true,
+                SHORT_PARK_BOUND,
+            ),
+        )
+        .await
+        .expect("the capacity park must be bounded by the same deadline as the receipt park");
+
+        assert!(
+            matches!(
+                second,
+                Err(InprocSendError::IngressDropped(DropReason::InboxFull))
+            ),
+            "a send that never got admitted must carry the typed capacity refusal, \
+             not an ambiguous delivery and not an unreachable peer: got {second:?}"
+        );
+        let (_, queued) = inbox
+            .peer_authority_test_snapshot()
+            .expect("classified inbox exposes its queue depth");
+        assert_eq!(queued, 1, "the refused send must not have been queued");
+    }
+
+    /// The `Response` lane deliberately keeps capacity-only semantics: it
+    /// returns on queue admission and never waits for the receiver's drain.
+    ///
+    /// The park bound here is deliberately huge, so the only way this test can
+    /// finish inside its outer deadline is if `Response` never waits on a
+    /// drain that does not exist.
+    #[tokio::test]
+    async fn response_inproc_send_never_waits_for_a_receiver_drain() {
+        let registry = InprocRegistry::new();
+        let receiver_keypair = make_keypair();
+        let (inbox, sender, _finalizer) = classified_inbox_with_runtime();
+        registry.register("receiver", receiver_keypair.public_key(), sender);
+
+        let sender_keypair = make_keypair();
+        let response_id = Uuid::new_v4();
+        let delivery = tokio::time::timeout(
+            OUTER_DEADLINE,
+            registry.send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                response_id,
+                MessageKind::Response {
+                    objective_id: None,
+                    content_taint: None,
+                    in_reply_to: Uuid::new_v4(),
+                    status: crate::types::Status::Completed,
+                    result: serde_json::json!({}),
+                    blocks: None,
+                    handling_mode: None,
+                },
+                true,
+                Duration::from_secs(3600),
+            ),
+        )
+        .await
+        .expect("Response must return on admission, never on drain commit")
+        .expect("Response admission succeeded");
+
+        assert_eq!(delivery.envelope_id, response_id);
+        assert!(matches!(
+            delivery.resolved_outcome(),
+            IngressDeliveryOutcome::Queued
+        ));
+        drop(inbox);
     }
 
     #[tokio::test]
@@ -1823,13 +2203,14 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await
             .expect("auth-exempt supervisor bridge request must hand off as volatile control");
 
         assert_eq!(delivery.envelope_id, request_id);
         assert!(matches!(
-            delivery.outcome,
+            delivery.resolved_outcome(),
             IngressDeliveryOutcome::VolatileHandedOff
         ));
         let entry = handoff.await.expect("volatile handoff task completes");
@@ -1866,6 +2247,7 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
 
@@ -1898,6 +2280,7 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
 
@@ -1947,10 +2330,12 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
         assert!(matches!(
-            ok.expect("matching namespace must deliver").outcome,
+            ok.expect("matching namespace must deliver")
+                .resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
             )
@@ -1971,6 +2356,7 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
         assert!(matches!(wrong_ns, Err(InprocSendError::PeerNotFound(_))));
@@ -2019,11 +2405,12 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
         let delivery = result.expect("canonical target must receive");
         assert!(matches!(
-            delivery.outcome,
+            delivery.resolved_outcome(),
             IngressDeliveryOutcome::DurablyResolved(
                 meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
             )
@@ -2073,6 +2460,7 @@ mod tests {
                     handling_mode: None,
                 },
                 true,
+                TEST_PARK_BOUND,
             )
             .await;
 

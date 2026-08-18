@@ -1222,8 +1222,31 @@ class JobDeliveryKindEvent(TypedDict, total=False):
 
 JobDeliveryKind = JobDeliveryKindRecord | JobDeliveryKindNotification | JobDeliveryKindEvent
 
-# Durable job wire type for JobHealthStatus.
-JobHealthStatus = Literal['ok', 'degraded']
+# Whether the census behind a [`JobHealthSummary`] read every row it needed.
+#
+# `complete` means every candidate row was read and the phase counts are
+# exact. `truncated` means the scan window filled at `scanned` rows out of an
+# unknown larger population: the phase counts are a lower bound over the rows
+# that were read, and `status` is `unreadable`.
+class JobHealthCoverageComplete(TypedDict, total=False):
+    kind: Required[Literal['complete']]
+
+class JobHealthCoverageTruncated(TypedDict, total=False):
+    kind: Required[Literal['truncated']]
+    limit: Required[int]
+    scanned: Required[int]
+
+JobHealthCoverage = JobHealthCoverageComplete | JobHealthCoverageTruncated
+
+# Rung of a job-health census.
+#
+# `unreadable` is not a rung between `ok` and `degraded`: it says the census
+# did not establish anything, because a read failed or the scan stopped at
+# its window. It is distinct from `degraded` on purpose - `degraded` asserts
+# that some job is wedged, and a scan that never reached the rows observed no
+# such thing, so an operator paging on `degraded` can trust that something
+# was actually seen.
+JobHealthStatus = Literal['ok', 'degraded', 'unreadable']
 
 # Durable job wire type for JobIdempotencyScope.
 JobIdempotencyScope = Literal['tool_call', 'interaction_and_arguments', 'host_semantic_key']
@@ -1281,10 +1304,12 @@ summaries or ordinary status responses."""
 class JobHealthSummary:
     """Wire payload for JobHealthSummary."""
     awaiting_members: int
-    delivery_backlog: int
+    coverage: JobHealthCoverage
     needs_attention: int
+    pending_outbox_jobs: int
     queued: int
     running: int
+    runtime_inbox_backlog: int
     stale_leases: int
     status: JobHealthStatus
 

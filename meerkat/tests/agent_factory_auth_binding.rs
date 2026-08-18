@@ -49,6 +49,7 @@ fn config_with_realm() -> Config {
             backend_kind: "openai_api".into(),
             base_url: None,
             options: serde_json::Value::Null,
+            server: None,
         },
     );
     backend.insert(
@@ -58,6 +59,7 @@ fn config_with_realm() -> Config {
             backend_kind: "anthropic_api".into(),
             base_url: None,
             options: serde_json::Value::Null,
+            server: None,
         },
     );
     backend.insert(
@@ -67,6 +69,7 @@ fn config_with_realm() -> Config {
             backend_kind: "google_genai".into(),
             base_url: None,
             options: serde_json::Value::Null,
+            server: None,
         },
     );
 

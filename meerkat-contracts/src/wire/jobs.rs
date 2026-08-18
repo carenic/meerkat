@@ -273,12 +273,35 @@ pub struct JobsUnsubscribeParams {
 
 pub type JobsUnsubscribeResult = JobsGetResult;
 
+/// Rung of a job-health census.
+///
+/// `unreadable` is not a rung between `ok` and `degraded`: it says the census
+/// did not establish anything, because a read failed or the scan stopped at
+/// its window. It is distinct from `degraded` on purpose - `degraded` asserts
+/// that some job is wedged, and a scan that never reached the rows observed no
+/// such thing, so an operator paging on `degraded` can trust that something
+/// was actually seen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum JobHealthStatus {
     Ok,
     Degraded,
+    Unreadable,
+}
+
+/// Whether the census behind a [`JobHealthSummary`] read every row it needed.
+///
+/// `complete` means every candidate row was read and the phase counts are
+/// exact. `truncated` means the scan window filled at `scanned` rows out of an
+/// unknown larger population: the phase counts are a lower bound over the rows
+/// that were read, and `status` is `unreadable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JobHealthCoverage {
+    Complete,
+    Truncated { scanned: u64, limit: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,7 +313,20 @@ pub struct JobHealthSummary {
     pub awaiting_members: u64,
     pub stale_leases: u64,
     pub needs_attention: u64,
-    pub delivery_backlog: u64,
+    /// Jobs holding at least one unapplied outbox entry, in this realm.
+    ///
+    /// Exact and uncapped, and counted in JOBS rather than entries. Kept
+    /// separate from `runtime_inbox_backlog` because the two name different
+    /// wedges: this one is a job whose delivery was never handed to a runtime,
+    /// that one is a delivery a runtime accepted and never drained.
+    pub pending_outbox_jobs: u64,
+    /// Committed-but-undrained runtime deliveries in this host's store.
+    ///
+    /// Host-store scoped, not realm scoped: one durable runtime store serves
+    /// every session the host built, including sessions under other logical
+    /// realm ids, and a runtime id carries no realm.
+    pub runtime_inbox_backlog: u64,
+    pub coverage: JobHealthCoverage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

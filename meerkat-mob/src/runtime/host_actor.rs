@@ -205,6 +205,21 @@ pub enum MobHostActorError {
     /// Internal invariant violation.
     #[error("mob host actor internal fault: {detail}")]
     Internal { detail: String },
+    /// The host participant name could not be published because a *different*
+    /// live public key already holds that route.
+    ///
+    /// Re-carries [`meerkat_comms::RegistrationRejection::NameOccupied`]'s
+    /// `holder_pubkey` verbatim rather than flattening it into
+    /// [`Self::Comms`]'s prose. Construct only from
+    /// `crate::error::comms_name_occupancy_holder`.
+    #[error(
+        "{}",
+        crate::error::participant_name_occupied_message(participant_name, holder_pubkey)
+    )]
+    ParticipantNameOccupied {
+        participant_name: String,
+        holder_pubkey: meerkat_comms::PubKey,
+    },
 }
 
 impl MobHostActorError {
@@ -4845,9 +4860,19 @@ pub fn build_host_comms_runtime(
         keypair,
         Arc::new(std::collections::HashSet::new()),
     )
-    .map_err(|err| MobHostActorError::Comms {
-        detail: format!("failed to construct host comms runtime '{participant_name}': {err}"),
-    })?;
+    .map_err(
+        |err| match crate::error::comms_name_occupancy_holder(&err) {
+            Some(holder_pubkey) => MobHostActorError::ParticipantNameOccupied {
+                participant_name: participant_name.to_string(),
+                holder_pubkey,
+            },
+            None => MobHostActorError::Comms {
+                detail: format!(
+                    "failed to construct host comms runtime '{participant_name}': {err}"
+                ),
+            },
+        },
+    )?;
     let runtime = Arc::new(runtime);
 
     let dsl = Arc::new(meerkat_runtime::HandleDslAuthority::ephemeral());
@@ -5394,6 +5419,18 @@ async fn run_host_responder(
             Ok(()) | Err(oneshot::error::TryRecvError::Closed) => break,
             Err(oneshot::error::TryRecvError::Empty) => {}
         }
+    }
+
+    // HOST LOSS RELEASES ITS MEMBERS' PARTICIPANT ROUTES. Dropping the actor is
+    // not enough: each member route is held by its comms drain in a detached
+    // task, so the refcount never reaches zero and `Drop` never runs. Under the
+    // 0.8.24 one claim rule a successor may no longer rebind over a
+    // still-published name even holding the same durable identity, so without
+    // this an orphaned route refuses the very host that replaces it - and the
+    // successor has no handle to clear it. The supervisor axis already releases
+    // on shutdown; this is the member axis doing the same.
+    if let Some(materializer) = actor.materializer.as_mut() {
+        materializer.release_live_member_routes();
     }
 }
 

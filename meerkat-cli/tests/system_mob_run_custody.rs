@@ -35,6 +35,12 @@ const DISPATCH_TIMEOUT: Duration = Duration::from_secs(120);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn rkat_binary_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("RKAT_TEST_BIN_RKAT") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path.canonicalize().unwrap_or(path));
+        }
+    }
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rkat") {
         let path = PathBuf::from(path);
         if path.exists() {
@@ -318,6 +324,18 @@ auth_profile = "stall_auth"
         .spawn()
         .expect("spawn rkat mob run");
     let run_pid = run_child.id().expect("run child pid");
+    let mut run_stdout_pipe = run_child.stdout.take().expect("run child stdout");
+    let run_stdout_task = tokio::spawn(async move {
+        let mut output = String::new();
+        let _ = run_stdout_pipe.read_to_string(&mut output).await;
+        output
+    });
+    let mut run_stderr_pipe = run_child.stderr.take().expect("run child stderr");
+    let run_stderr_task = tokio::spawn(async move {
+        let mut output = String::new();
+        let _ = run_stderr_pipe.read_to_string(&mut output).await;
+        output
+    });
 
     // The stalled member turn's HTTP request proves the flow is mid-step. A
     // premature CLI exit is surfaced with its output instead of a bare
@@ -330,14 +348,8 @@ auth_profile = "stall_auth"
         }
         early_exit = run_child.wait() => {
             let status = early_exit.expect("await early rkat mob run exit");
-            let mut child_stdout = String::new();
-            if let Some(mut pipe) = run_child.stdout.take() {
-                let _ = pipe.read_to_string(&mut child_stdout).await;
-            }
-            let mut child_stderr = String::new();
-            if let Some(mut pipe) = run_child.stderr.take() {
-                let _ = pipe.read_to_string(&mut child_stderr).await;
-            }
+            let child_stdout = run_stdout_task.await.expect("join stdout reader");
+            let child_stderr = run_stderr_task.await.expect("join stderr reader");
             panic!(
                 "rkat mob run exited before dispatching a member turn: {status}\nstdout: {child_stdout}\nstderr: {child_stderr}"
             );
@@ -346,14 +358,26 @@ auth_profile = "stall_auth"
 
     send_signal(run_pid, "-TERM");
 
-    let output = tokio::time::timeout(SHUTDOWN_TIMEOUT, run_child.wait_with_output())
-        .await
-        .expect("rkat mob run did not exit after SIGTERM within the grace budget")
-        .expect("collect rkat mob run output");
-    let run_stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let run_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let status = match tokio::time::timeout(SHUTDOWN_TIMEOUT, run_child.wait()).await {
+        Ok(status) => status.expect("wait for rkat mob run after SIGTERM"),
+        Err(_) => {
+            let _ = run_child.start_kill();
+            let _ = run_child.wait().await;
+            let run_stdout = run_stdout_task
+                .await
+                .expect("join stdout reader after timeout");
+            let run_stderr = run_stderr_task
+                .await
+                .expect("join stderr reader after timeout");
+            panic!(
+                "rkat mob run did not exit after SIGTERM within the grace budget\nstdout: {run_stdout}\nstderr: {run_stderr}"
+            );
+        }
+    };
+    let run_stdout = run_stdout_task.await.expect("join stdout reader");
+    let run_stderr = run_stderr_task.await.expect("join stderr reader");
     assert!(
-        !output.status.success(),
+        !status.success(),
         "a signal-interrupted run must exit nonzero\nstdout: {run_stdout}\nstderr: {run_stderr}"
     );
     assert!(
@@ -450,12 +474,13 @@ async fn integration_real_mob_run_detach_converges_execution_custody_lost() {
         .await;
     assert_success(&ran, "rkat mob run --detach");
     let run_stdout = stdout_str(&ran);
+    let run_stderr = stderr_str(&ran);
     let run_doc = first_json_document(&run_stdout);
     assert_eq!(run_doc["mob_id"], MOB_ID);
     let run_id = run_doc["run_id"].as_str().expect("run_id").to_string();
     assert!(
-        run_stdout.contains("execution custody lost"),
-        "detach must warn about the execution-custody boundary: {run_stdout}"
+        run_stderr.contains("execution custody lost"),
+        "detach must warn about the execution-custody boundary on stderr: {run_stderr}"
     );
 
     // The detached CLI process has exited; the next hydration must converge

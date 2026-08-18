@@ -55,13 +55,23 @@ Init ==
     /\ session_pending_tool_results_count = [x \in {} |-> None]
     /\ session_lifecycle_terminal = [x \in {} |-> None]
 
+\* Named UNCHANGED frames. One definition per distinct frame; every action
+\* that leaves those variables unchanged references the definition by name.
+UnchangedFrame_22aad6af14391dc5 == UNCHANGED << session_first_turn_phase, session_lifecycle_terminal >>
+UnchangedFrame_376ac12ab7b0e6aa == UNCHANGED << session_lifecycle_terminal >>
+UnchangedFrame_8caec532b977f983 == UNCHANGED << session_first_turn_phase, session_pending_tool_results_count, session_lifecycle_terminal >>
+UnchangedFrame_96a866aa379bd0e2 == UNCHANGED << session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+UnchangedFrame_9a1f5972dcdb13ef == UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_lifecycle_terminal >>
+UnchangedFrame_a410bb8a878b88b9 == UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count >>
+UnchangedFrame_b4248dd3143f6dbd == UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+
 MarkSessionInitialTurnPendingInactiveOrPending(session_id) ==
     /\ phase = "Ready"
     /\ (IF ((IF "value" \in DOMAIN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None) THEN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Inactive") THEN TRUE ELSE ((IF "value" \in DOMAIN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None) THEN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Pending"))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ session_first_turn_phase' = MapSet(session_first_turn_phase, session_id, "Pending")
-    /\ UNCHANGED << session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_96a866aa379bd0e2
 
 
 MarkSessionInitialTurnPendingConsumed(session_id) ==
@@ -69,7 +79,7 @@ MarkSessionInitialTurnPendingConsumed(session_id) ==
     /\ ((IF "value" \in DOMAIN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None) THEN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Consumed")
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 StartSessionInitialTurnPending(session_id) ==
@@ -78,7 +88,7 @@ StartSessionInitialTurnPending(session_id) ==
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ session_first_turn_phase' = MapSet(session_first_turn_phase, session_id, "Consumed")
-    /\ UNCHANGED << session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_96a866aa379bd0e2
 
 
 StartSessionInitialTurnInactive(session_id) ==
@@ -86,7 +96,7 @@ StartSessionInitialTurnInactive(session_id) ==
     /\ ((IF "value" \in DOMAIN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None) THEN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Inactive")
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 StartSessionInitialTurnConsumed(session_id) ==
@@ -94,7 +104,7 @@ StartSessionInitialTurnConsumed(session_id) ==
     /\ ((IF "value" \in DOMAIN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None) THEN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Consumed")
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveSessionFirstTurnOverridesAllowed(session_id) ==
@@ -102,7 +112,7 @@ ResolveSessionFirstTurnOverridesAllowed(session_id) ==
     /\ phase_allows_initial_turn_overrides((IF "value" \in DOMAIN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None) THEN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None)["value"] ELSE None))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveSessionFirstTurnOverridesDenied(session_id) ==
@@ -110,7 +120,7 @@ ResolveSessionFirstTurnOverridesDenied(session_id) ==
     /\ (phase_allows_initial_turn_overrides((IF "value" \in DOMAIN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None) THEN (IF (session_id \in DOMAIN session_first_turn_phase) THEN Some((IF session_id \in DOMAIN session_first_turn_phase THEN session_first_turn_phase[session_id] ELSE "None")) ELSE None)["value"] ELSE None)) = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 StageSessionInitialPromptStore(session_id, prompt_has_content) ==
@@ -119,7 +129,7 @@ StageSessionInitialPromptStore(session_id, prompt_has_content) ==
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ session_pending_initial_prompt_present' = MapSet(session_pending_initial_prompt_present, session_id, TRUE)
-    /\ UNCHANGED << session_first_turn_phase, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_8caec532b977f983
 
 
 StageSessionInitialPromptClear(session_id, prompt_has_content) ==
@@ -128,7 +138,7 @@ StageSessionInitialPromptClear(session_id, prompt_has_content) ==
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ session_pending_initial_prompt_present' = MapSet(session_pending_initial_prompt_present, session_id, FALSE)
-    /\ UNCHANGED << session_first_turn_phase, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_8caec532b977f983
 
 
 StageSessionToolResults(session_id, result_count) ==
@@ -137,7 +147,7 @@ StageSessionToolResults(session_id, result_count) ==
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ session_pending_tool_results_count' = MapSet(session_pending_tool_results_count, session_id, result_count)
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_lifecycle_terminal >>
+    /\ UnchangedFrame_9a1f5972dcdb13ef
 
 
 ConsumeSessionDeferredInputsPending(session_id) ==
@@ -148,7 +158,7 @@ ConsumeSessionDeferredInputsPending(session_id) ==
     /\ session_first_turn_phase' = MapSet(session_first_turn_phase, session_id, "Consumed")
     /\ session_pending_initial_prompt_present' = MapSet(session_pending_initial_prompt_present, session_id, FALSE)
     /\ session_pending_tool_results_count' = MapSet(session_pending_tool_results_count, session_id, 0)
-    /\ UNCHANGED << session_lifecycle_terminal >>
+    /\ UnchangedFrame_376ac12ab7b0e6aa
 
 
 ConsumeSessionDeferredInputsInactive(session_id) ==
@@ -158,7 +168,7 @@ ConsumeSessionDeferredInputsInactive(session_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ session_pending_initial_prompt_present' = MapSet(session_pending_initial_prompt_present, session_id, FALSE)
     /\ session_pending_tool_results_count' = MapSet(session_pending_tool_results_count, session_id, 0)
-    /\ UNCHANGED << session_first_turn_phase, session_lifecycle_terminal >>
+    /\ UnchangedFrame_22aad6af14391dc5
 
 
 ConsumeSessionDeferredInputsConsumed(session_id) ==
@@ -168,7 +178,7 @@ ConsumeSessionDeferredInputsConsumed(session_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ session_pending_initial_prompt_present' = MapSet(session_pending_initial_prompt_present, session_id, FALSE)
     /\ session_pending_tool_results_count' = MapSet(session_pending_tool_results_count, session_id, 0)
-    /\ UNCHANGED << session_first_turn_phase, session_lifecycle_terminal >>
+    /\ UnchangedFrame_22aad6af14391dc5
 
 
 RestoreSessionConsumedInputs(session_id, restore_first_turn_pending, pending_initial_prompt_present, pending_tool_result_message_count) ==
@@ -179,7 +189,7 @@ RestoreSessionConsumedInputs(session_id, restore_first_turn_pending, pending_ini
     /\ session_first_turn_phase' = MapSet(session_first_turn_phase, session_id, "Pending")
     /\ session_pending_initial_prompt_present' = MapSet(session_pending_initial_prompt_present, session_id, pending_initial_prompt_present)
     /\ session_pending_tool_results_count' = MapSet(session_pending_tool_results_count, session_id, pending_tool_result_message_count)
-    /\ UNCHANGED << session_lifecycle_terminal >>
+    /\ UnchangedFrame_376ac12ab7b0e6aa
 
 
 RestoreSessionConsumedInputsNoPhaseRollback(session_id, restore_first_turn_pending, pending_initial_prompt_present, pending_tool_result_message_count) ==
@@ -189,7 +199,7 @@ RestoreSessionConsumedInputsNoPhaseRollback(session_id, restore_first_turn_pendi
     /\ model_step_count' = model_step_count + 1
     /\ session_pending_initial_prompt_present' = MapSet(session_pending_initial_prompt_present, session_id, pending_initial_prompt_present)
     /\ session_pending_tool_results_count' = MapSet(session_pending_tool_results_count, session_id, pending_tool_result_message_count)
-    /\ UNCHANGED << session_first_turn_phase, session_lifecycle_terminal >>
+    /\ UnchangedFrame_22aad6af14391dc5
 
 
 RecoverSessionFirstTurnPhase(session_id, arg_phase, pending_initial_prompt_present, pending_tool_result_message_count) ==
@@ -200,7 +210,7 @@ RecoverSessionFirstTurnPhase(session_id, arg_phase, pending_initial_prompt_prese
     /\ session_first_turn_phase' = MapSet(session_first_turn_phase, session_id, arg_phase)
     /\ session_pending_initial_prompt_present' = MapSet(session_pending_initial_prompt_present, session_id, pending_initial_prompt_present)
     /\ session_pending_tool_results_count' = MapSet(session_pending_tool_results_count, session_id, pending_tool_result_message_count)
-    /\ UNCHANGED << session_lifecycle_terminal >>
+    /\ UnchangedFrame_376ac12ab7b0e6aa
 
 
 ResolveRealtimeItemObservedDiscardedAssistant(role, response_discarded) ==
@@ -208,7 +218,7 @@ ResolveRealtimeItemObservedDiscardedAssistant(role, response_discarded) ==
     /\ ((role = "Assistant") /\ response_discarded)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeItemObservedPresent(role, response_discarded) ==
@@ -216,14 +226,14 @@ ResolveRealtimeItemObservedPresent(role, response_discarded) ==
     /\ (IF (role # "Assistant") THEN TRUE ELSE (response_discarded = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeItemSkipped ==
     /\ phase = "Ready"
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserTranscriptFinalEmpty(text_present, segment_empty, segment_matches) ==
@@ -231,7 +241,7 @@ ResolveRealtimeUserTranscriptFinalEmpty(text_present, segment_empty, segment_mat
     /\ (text_present = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserTranscriptFinalStore(text_present, segment_empty, segment_matches) ==
@@ -239,7 +249,7 @@ ResolveRealtimeUserTranscriptFinalStore(text_present, segment_empty, segment_mat
     /\ (text_present /\ segment_empty)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserTranscriptFinalReplayOrConflict(text_present, segment_empty, segment_matches) ==
@@ -247,7 +257,7 @@ ResolveRealtimeUserTranscriptFinalReplayOrConflict(text_present, segment_empty, 
     /\ (text_present /\ (segment_empty = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentIdentityInvalid(identity_fields_valid, key_tombstoned, predecessor_materialized, existing_identity_present, existing_payload_matches, target_item_id_available, reducer_commit_proof_required, reducer_commit_proof_present) ==
@@ -255,7 +265,7 @@ ResolveRealtimeUserContentIdentityInvalid(identity_fields_valid, key_tombstoned,
     /\ (IF (identity_fields_valid = FALSE) THEN TRUE ELSE ((key_tombstoned = FALSE) /\ predecessor_materialized /\ (existing_identity_present = FALSE) /\ target_item_id_available /\ reducer_commit_proof_required /\ (reducer_commit_proof_present = FALSE)))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentIdentityUnmaterializedPredecessor(identity_fields_valid, key_tombstoned, predecessor_materialized, existing_identity_present, existing_payload_matches, target_item_id_available, reducer_commit_proof_required, reducer_commit_proof_present) ==
@@ -263,7 +273,7 @@ ResolveRealtimeUserContentIdentityUnmaterializedPredecessor(identity_fields_vali
     /\ (identity_fields_valid /\ (key_tombstoned = FALSE) /\ (predecessor_materialized = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentIdentityConflict(identity_fields_valid, key_tombstoned, predecessor_materialized, existing_identity_present, existing_payload_matches, target_item_id_available, reducer_commit_proof_required, reducer_commit_proof_present) ==
@@ -271,7 +281,7 @@ ResolveRealtimeUserContentIdentityConflict(identity_fields_valid, key_tombstoned
     /\ (identity_fields_valid /\ (IF key_tombstoned THEN TRUE ELSE (predecessor_materialized /\ (IF (existing_identity_present /\ (existing_payload_matches = FALSE)) THEN TRUE ELSE ((existing_identity_present = FALSE) /\ (target_item_id_available = FALSE))))))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentIdentityReplay(identity_fields_valid, key_tombstoned, predecessor_materialized, existing_identity_present, existing_payload_matches, target_item_id_available, reducer_commit_proof_required, reducer_commit_proof_present) ==
@@ -279,7 +289,7 @@ ResolveRealtimeUserContentIdentityReplay(identity_fields_valid, key_tombstoned, 
     /\ (identity_fields_valid /\ (key_tombstoned = FALSE) /\ predecessor_materialized /\ existing_identity_present /\ existing_payload_matches)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentIdentityCommitNew(identity_fields_valid, key_tombstoned, predecessor_materialized, existing_identity_present, existing_payload_matches, target_item_id_available, reducer_commit_proof_required, reducer_commit_proof_present) ==
@@ -287,7 +297,7 @@ ResolveRealtimeUserContentIdentityCommitNew(identity_fields_valid, key_tombstone
     /\ (identity_fields_valid /\ (key_tombstoned = FALSE) /\ predecessor_materialized /\ (existing_identity_present = FALSE) /\ target_item_id_available /\ (IF (reducer_commit_proof_required = FALSE) THEN TRUE ELSE reducer_commit_proof_present))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentBlobStageNew(pending_present, pending_matches_request) ==
@@ -295,7 +305,7 @@ ResolveRealtimeUserContentBlobStageNew(pending_present, pending_matches_request)
     /\ (pending_present = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentBlobStageReuseExact(pending_present, pending_matches_request) ==
@@ -303,7 +313,7 @@ ResolveRealtimeUserContentBlobStageReuseExact(pending_present, pending_matches_r
     /\ (pending_present /\ pending_matches_request)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentBlobStageRejectOccupied(pending_present, pending_matches_request) ==
@@ -311,7 +321,7 @@ ResolveRealtimeUserContentBlobStageRejectOccupied(pending_present, pending_match
     /\ (pending_present /\ (pending_matches_request = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentBlobRecoveryNone(pending_present, request_matches_pending, pending_blob_valid) ==
@@ -319,7 +329,7 @@ ResolveRealtimeUserContentBlobRecoveryNone(pending_present, request_matches_pend
     /\ (pending_present = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentBlobRecoveryExact(pending_present, request_matches_pending, pending_blob_valid) ==
@@ -327,7 +337,7 @@ ResolveRealtimeUserContentBlobRecoveryExact(pending_present, request_matches_pen
     /\ (pending_present /\ request_matches_pending)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentBlobRecoveryCommitVerified(pending_present, request_matches_pending, pending_blob_valid) ==
@@ -335,7 +345,7 @@ ResolveRealtimeUserContentBlobRecoveryCommitVerified(pending_present, request_ma
     /\ (pending_present /\ (request_matches_pending = FALSE) /\ pending_blob_valid)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentBlobRecoveryClearInvalid(pending_present, request_matches_pending, pending_blob_valid) ==
@@ -343,7 +353,7 @@ ResolveRealtimeUserContentBlobRecoveryClearInvalid(pending_present, request_matc
     /\ (pending_present /\ (request_matches_pending = FALSE) /\ (pending_blob_valid = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentBlobFinalizeNone(pending_present, pending_matches_committed) ==
@@ -351,7 +361,7 @@ ResolveRealtimeUserContentBlobFinalizeNone(pending_present, pending_matches_comm
     /\ (pending_present = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentBlobFinalizeClearCommitted(pending_present, pending_matches_committed) ==
@@ -359,7 +369,7 @@ ResolveRealtimeUserContentBlobFinalizeClearCommitted(pending_present, pending_ma
     /\ (pending_present /\ pending_matches_committed)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentBlobFinalizeRejectMismatch(pending_present, pending_matches_committed) ==
@@ -367,7 +377,7 @@ ResolveRealtimeUserContentBlobFinalizeRejectMismatch(pending_present, pending_ma
     /\ (pending_present /\ (pending_matches_committed = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentFinalEmpty(content_present, segment_empty, segment_matches) ==
@@ -375,7 +385,7 @@ ResolveRealtimeUserContentFinalEmpty(content_present, segment_empty, segment_mat
     /\ (content_present = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentFinalStore(content_present, segment_empty, segment_matches) ==
@@ -383,7 +393,7 @@ ResolveRealtimeUserContentFinalStore(content_present, segment_empty, segment_mat
     /\ (content_present /\ segment_empty)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeUserContentFinalReplayOrConflict(content_present, segment_empty, segment_matches) ==
@@ -391,7 +401,7 @@ ResolveRealtimeUserContentFinalReplayOrConflict(content_present, segment_empty, 
     /\ (content_present /\ (segment_empty = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantDeltaInvalidOrDuplicate(response_id_valid, response_discarded, delta_id_present, delta_id_seen, item_has_text, current_lane, requested_lane, response_completed, text_after_write_present) ==
@@ -399,7 +409,7 @@ ResolveRealtimeAssistantDeltaInvalidOrDuplicate(response_id_valid, response_disc
     /\ (IF (response_id_valid = FALSE) THEN TRUE ELSE realtime_delta_is_duplicate(delta_id_present, delta_id_seen))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantDeltaDiscarded(response_id_valid, response_discarded, delta_id_present, delta_id_seen, item_has_text, current_lane, requested_lane, response_completed, text_after_write_present) ==
@@ -407,7 +417,7 @@ ResolveRealtimeAssistantDeltaDiscarded(response_id_valid, response_discarded, de
     /\ (response_id_valid /\ response_discarded)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantDeltaLaneConflict(response_id_valid, response_discarded, delta_id_present, delta_id_seen, item_has_text, current_lane, requested_lane, response_completed, text_after_write_present) ==
@@ -415,7 +425,7 @@ ResolveRealtimeAssistantDeltaLaneConflict(response_id_valid, response_discarded,
     /\ (response_id_valid /\ (response_discarded = FALSE) /\ (realtime_delta_is_duplicate(delta_id_present, delta_id_seen) = FALSE) /\ (realtime_lane_accepts(item_has_text, current_lane, requested_lane) = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantDeltaAccepted(response_id_valid, response_discarded, delta_id_present, delta_id_seen, item_has_text, current_lane, requested_lane, response_completed, text_after_write_present) ==
@@ -423,7 +433,7 @@ ResolveRealtimeAssistantDeltaAccepted(response_id_valid, response_discarded, del
     /\ (response_id_valid /\ (response_discarded = FALSE) /\ (realtime_delta_is_duplicate(delta_id_present, delta_id_seen) = FALSE) /\ realtime_lane_accepts(item_has_text, current_lane, requested_lane))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantReplacementInvalid(response_id_valid, response_discarded, item_materialized, item_has_text, current_lane, requested_lane, response_completed, text_after_replace_present) ==
@@ -431,7 +441,7 @@ ResolveRealtimeAssistantReplacementInvalid(response_id_valid, response_discarded
     /\ (response_id_valid = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantReplacementDiscarded(response_id_valid, response_discarded, item_materialized, item_has_text, current_lane, requested_lane, response_completed, text_after_replace_present) ==
@@ -439,7 +449,7 @@ ResolveRealtimeAssistantReplacementDiscarded(response_id_valid, response_discard
     /\ (response_id_valid /\ response_discarded)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantReplacementLocked(response_id_valid, response_discarded, item_materialized, item_has_text, current_lane, requested_lane, response_completed, text_after_replace_present) ==
@@ -447,7 +457,7 @@ ResolveRealtimeAssistantReplacementLocked(response_id_valid, response_discarded,
     /\ (response_id_valid /\ (response_discarded = FALSE) /\ item_materialized)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantReplacementLaneConflict(response_id_valid, response_discarded, item_materialized, item_has_text, current_lane, requested_lane, response_completed, text_after_replace_present) ==
@@ -455,7 +465,7 @@ ResolveRealtimeAssistantReplacementLaneConflict(response_id_valid, response_disc
     /\ (response_id_valid /\ (response_discarded = FALSE) /\ (item_materialized = FALSE) /\ (realtime_lane_accepts(item_has_text, current_lane, requested_lane) = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantReplacementAccepted(response_id_valid, response_discarded, item_materialized, item_has_text, current_lane, requested_lane, response_completed, text_after_replace_present) ==
@@ -463,7 +473,7 @@ ResolveRealtimeAssistantReplacementAccepted(response_id_valid, response_discarde
     /\ (response_id_valid /\ (response_discarded = FALSE) /\ (item_materialized = FALSE) /\ realtime_lane_accepts(item_has_text, current_lane, requested_lane))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantTurnCompletedInvalid(response_id_valid, response_discarded, stop_reason) ==
@@ -471,7 +481,7 @@ ResolveRealtimeAssistantTurnCompletedInvalid(response_id_valid, response_discard
     /\ (response_id_valid = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantTurnCompletedDiscard(response_id_valid, response_discarded, stop_reason) ==
@@ -479,7 +489,7 @@ ResolveRealtimeAssistantTurnCompletedDiscard(response_id_valid, response_discard
     /\ (response_id_valid /\ (IF response_discarded THEN TRUE ELSE realtime_stop_reason_discards(stop_reason)))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantTurnCompletedToolUse(response_id_valid, response_discarded, stop_reason) ==
@@ -487,7 +497,7 @@ ResolveRealtimeAssistantTurnCompletedToolUse(response_id_valid, response_discard
     /\ (response_id_valid /\ (response_discarded = FALSE) /\ realtime_stop_reason_removes_completion(stop_reason))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantTurnCompletedRecord(response_id_valid, response_discarded, stop_reason) ==
@@ -495,7 +505,7 @@ ResolveRealtimeAssistantTurnCompletedRecord(response_id_valid, response_discarde
     /\ (response_id_valid /\ (response_discarded = FALSE) /\ realtime_stop_reason_records_completion(stop_reason))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantTurnInterruptedInvalid(response_id_valid) ==
@@ -503,7 +513,7 @@ ResolveRealtimeAssistantTurnInterruptedInvalid(response_id_valid) ==
     /\ (response_id_valid = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeAssistantTurnInterruptedValid(response_id_valid) ==
@@ -511,7 +521,7 @@ ResolveRealtimeAssistantTurnInterruptedValid(response_id_valid) ==
     /\ response_id_valid
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeMaterializeAlreadyDone(item_materialized, predecessor_materialized, item_skipped, item_ready, item_text_present, role, response_id_present, completion_present, completion_usage_consumed) ==
@@ -519,7 +529,7 @@ ResolveRealtimeMaterializeAlreadyDone(item_materialized, predecessor_materialize
     /\ item_materialized
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeMaterializeWaitForPredecessor(item_materialized, predecessor_materialized, item_skipped, item_ready, item_text_present, role, response_id_present, completion_present, completion_usage_consumed) ==
@@ -527,7 +537,7 @@ ResolveRealtimeMaterializeWaitForPredecessor(item_materialized, predecessor_mate
     /\ ((item_materialized = FALSE) /\ (predecessor_materialized = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeMaterializeSkipped(item_materialized, predecessor_materialized, item_skipped, item_ready, item_text_present, role, response_id_present, completion_present, completion_usage_consumed) ==
@@ -535,7 +545,7 @@ ResolveRealtimeMaterializeSkipped(item_materialized, predecessor_materialized, i
     /\ ((item_materialized = FALSE) /\ predecessor_materialized /\ item_skipped)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeMaterializeWaitForReadyText(item_materialized, predecessor_materialized, item_skipped, item_ready, item_text_present, role, response_id_present, completion_present, completion_usage_consumed) ==
@@ -543,7 +553,7 @@ ResolveRealtimeMaterializeWaitForReadyText(item_materialized, predecessor_materi
     /\ ((item_materialized = FALSE) /\ predecessor_materialized /\ (item_skipped = FALSE) /\ (IF (item_ready = FALSE) THEN TRUE ELSE (item_text_present = FALSE)))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeMaterializeUser(item_materialized, predecessor_materialized, item_skipped, item_ready, item_text_present, role, response_id_present, completion_present, completion_usage_consumed) ==
@@ -551,7 +561,7 @@ ResolveRealtimeMaterializeUser(item_materialized, predecessor_materialized, item
     /\ ((item_materialized = FALSE) /\ predecessor_materialized /\ (item_skipped = FALSE) /\ item_ready /\ item_text_present /\ (role = "User"))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeMaterializeAssistant(item_materialized, predecessor_materialized, item_skipped, item_ready, item_text_present, role, response_id_present, completion_present, completion_usage_consumed) ==
@@ -559,7 +569,7 @@ ResolveRealtimeMaterializeAssistant(item_materialized, predecessor_materialized,
     /\ ((item_materialized = FALSE) /\ predecessor_materialized /\ (item_skipped = FALSE) /\ item_ready /\ item_text_present /\ (role = "Assistant") /\ response_id_present /\ completion_present)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRealtimeMaterializeAssistantMissingCompletion(item_materialized, predecessor_materialized, item_skipped, item_ready, item_text_present, role, response_id_present, completion_present, completion_usage_consumed) ==
@@ -567,7 +577,7 @@ ResolveRealtimeMaterializeAssistantMissingCompletion(item_materialized, predeces
     /\ ((item_materialized = FALSE) /\ predecessor_materialized /\ (item_skipped = FALSE) /\ item_ready /\ item_text_present /\ (role = "Assistant") /\ (IF (response_id_present = FALSE) THEN TRUE ELSE (completion_present = FALSE)))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 AuthorizeRestoreRealtimeTranscriptState(item_count, first_seen_count, first_seen_unique_count, every_item_has_order_entry, every_order_entry_has_item, all_materialized_predecessor_references_exist, no_self_predecessor_references, causal_graph_acyclic, all_materialized_items_have_materialized_ancestry, all_identity_fields_valid, all_user_content_identity_keys_match, all_user_content_identity_fields_valid, all_user_content_identity_item_ids_unique, all_user_content_identities_reference_materialized_user_items, all_user_content_tombstones_valid, user_content_identities_and_tombstones_disjoint, pending_user_content_blob_fields_valid, pending_user_content_blob_uncommitted, all_delta_ids_valid, all_completion_response_ids_valid, all_discarded_response_ids_valid, all_materialized_items_were_ready_or_skipped, all_assistant_items_have_response_unless_skipped, all_ready_assistant_items_have_completion_or_are_skipped, all_materialized_assistant_completions_consumed, all_completed_assistant_text_items_are_ready_or_materialized_or_skipped, all_discarded_assistant_items_are_skipped_or_materialized) ==
@@ -575,7 +585,7 @@ AuthorizeRestoreRealtimeTranscriptState(item_count, first_seen_count, first_seen
     /\ ((item_count = first_seen_count) /\ (first_seen_count = first_seen_unique_count) /\ every_item_has_order_entry /\ every_order_entry_has_item /\ all_materialized_predecessor_references_exist /\ no_self_predecessor_references /\ causal_graph_acyclic /\ all_materialized_items_have_materialized_ancestry /\ all_identity_fields_valid /\ all_user_content_identity_keys_match /\ all_user_content_identity_fields_valid /\ all_user_content_identity_item_ids_unique /\ all_user_content_identities_reference_materialized_user_items /\ all_user_content_tombstones_valid /\ user_content_identities_and_tombstones_disjoint /\ pending_user_content_blob_fields_valid /\ pending_user_content_blob_uncommitted /\ all_delta_ids_valid /\ all_completion_response_ids_valid /\ all_discarded_response_ids_valid /\ all_materialized_items_were_ready_or_skipped /\ all_assistant_items_have_response_unless_skipped /\ all_ready_assistant_items_have_completion_or_are_skipped /\ all_materialized_assistant_completions_consumed /\ all_completed_assistant_text_items_are_ready_or_materialized_or_skipped /\ all_discarded_assistant_items_are_skipped_or_materialized)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 AuthorizeSessionMetadataPersist(schema_version, model_present) ==
@@ -583,7 +593,7 @@ AuthorizeSessionMetadataPersist(schema_version, model_present) ==
     /\ ((schema_version > 0) /\ (model_present = TRUE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 AuthorizeSessionBuildStatePersist(mob_tool_authority_context_present, mob_tool_authority_context_generated) ==
@@ -591,14 +601,14 @@ AuthorizeSessionBuildStatePersist(mob_tool_authority_context_present, mob_tool_a
     /\ (IF (mob_tool_authority_context_present = FALSE) THEN TRUE ELSE (mob_tool_authority_context_generated = TRUE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 RestoreSessionBuildState ==
     /\ phase = "Ready"
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolvePendingContinuationWithBoundary(session_tail, staged_tool_result_count) ==
@@ -606,7 +616,7 @@ ResolvePendingContinuationWithBoundary(session_tail, staged_tool_result_count) =
     /\ has_effective_pending_boundary(session_tail, staged_tool_result_count)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolvePendingContinuationWithoutBoundary(session_tail, staged_tool_result_count) ==
@@ -614,7 +624,7 @@ ResolvePendingContinuationWithoutBoundary(session_tail, staged_tool_result_count
     /\ (has_effective_pending_boundary(session_tail, staged_tool_result_count) = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 AuthorizeSessionResumeOverridesRejectProviderRequiresModel(provider_override_present, model_override_present, self_hosted_server_override_present, has_build_only_overrides, first_turn_phase) ==
@@ -622,7 +632,7 @@ AuthorizeSessionResumeOverridesRejectProviderRequiresModel(provider_override_pre
     /\ resume_reject_provider_requires_model(provider_override_present, model_override_present)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 AuthorizeSessionResumeOverridesRejectBuildOnlyAfterFirstTurn(provider_override_present, model_override_present, self_hosted_server_override_present, has_build_only_overrides, first_turn_phase) ==
@@ -630,7 +640,7 @@ AuthorizeSessionResumeOverridesRejectBuildOnlyAfterFirstTurn(provider_override_p
     /\ ((resume_reject_provider_requires_model(provider_override_present, model_override_present) = FALSE) /\ resume_reject_build_only_after_first_turn(has_build_only_overrides, first_turn_phase))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 AuthorizeSessionResumeOverridesAcceptRecomputeProvider(provider_override_present, model_override_present, self_hosted_server_override_present, has_build_only_overrides, first_turn_phase) ==
@@ -638,7 +648,7 @@ AuthorizeSessionResumeOverridesAcceptRecomputeProvider(provider_override_present
     /\ (resume_overrides_admissible(provider_override_present, model_override_present, has_build_only_overrides, first_turn_phase) /\ resume_provider_recompute_from_model(model_override_present, provider_override_present) /\ (self_hosted_server_override_present = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 AuthorizeSessionResumeOverridesAcceptRecomputeProviderWithSelfHostedOverride(provider_override_present, model_override_present, self_hosted_server_override_present, has_build_only_overrides, first_turn_phase) ==
@@ -646,7 +656,7 @@ AuthorizeSessionResumeOverridesAcceptRecomputeProviderWithSelfHostedOverride(pro
     /\ (resume_overrides_admissible(provider_override_present, model_override_present, has_build_only_overrides, first_turn_phase) /\ resume_provider_recompute_from_model(model_override_present, provider_override_present) /\ self_hosted_server_override_present)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 AuthorizeSessionResumeOverridesAcceptUseOverride(provider_override_present, model_override_present, self_hosted_server_override_present, has_build_only_overrides, first_turn_phase) ==
@@ -654,7 +664,7 @@ AuthorizeSessionResumeOverridesAcceptUseOverride(provider_override_present, mode
     /\ (resume_overrides_admissible(provider_override_present, model_override_present, has_build_only_overrides, first_turn_phase) /\ (resume_provider_recompute_from_model(model_override_present, provider_override_present) = FALSE) /\ provider_override_present /\ (self_hosted_server_override_present = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 AuthorizeSessionResumeOverridesAcceptUseOverrideWithSelfHostedOverride(provider_override_present, model_override_present, self_hosted_server_override_present, has_build_only_overrides, first_turn_phase) ==
@@ -662,7 +672,7 @@ AuthorizeSessionResumeOverridesAcceptUseOverrideWithSelfHostedOverride(provider_
     /\ (resume_overrides_admissible(provider_override_present, model_override_present, has_build_only_overrides, first_turn_phase) /\ (resume_provider_recompute_from_model(model_override_present, provider_override_present) = FALSE) /\ provider_override_present /\ self_hosted_server_override_present)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 AuthorizeSessionResumeOverridesAcceptRetainStored(provider_override_present, model_override_present, self_hosted_server_override_present, has_build_only_overrides, first_turn_phase) ==
@@ -670,7 +680,7 @@ AuthorizeSessionResumeOverridesAcceptRetainStored(provider_override_present, mod
     /\ (resume_overrides_admissible(provider_override_present, model_override_present, has_build_only_overrides, first_turn_phase) /\ (resume_provider_recompute_from_model(model_override_present, provider_override_present) = FALSE) /\ (provider_override_present = FALSE) /\ (self_hosted_server_override_present = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 AuthorizeSessionResumeOverridesAcceptRetainStoredWithSelfHostedOverride(provider_override_present, model_override_present, self_hosted_server_override_present, has_build_only_overrides, first_turn_phase) ==
@@ -678,7 +688,7 @@ AuthorizeSessionResumeOverridesAcceptRetainStoredWithSelfHostedOverride(provider
     /\ (resume_overrides_admissible(provider_override_present, model_override_present, has_build_only_overrides, first_turn_phase) /\ (resume_provider_recompute_from_model(model_override_present, provider_override_present) = FALSE) /\ (provider_override_present = FALSE) /\ self_hosted_server_override_present)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ClassifyLiveSessionAuthorityLive(stored_transcript_diverged, live_has_uncommitted_transcript, stored_is_archived) ==
@@ -686,7 +696,7 @@ ClassifyLiveSessionAuthorityLive(stored_transcript_diverged, live_has_uncommitte
     /\ ((stored_transcript_diverged = FALSE) /\ (live_has_uncommitted_transcript = FALSE) /\ (stored_is_archived = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ClassifyLiveSessionAuthorityDurableArchived(stored_transcript_diverged, live_has_uncommitted_transcript, stored_is_archived) ==
@@ -694,7 +704,7 @@ ClassifyLiveSessionAuthorityDurableArchived(stored_transcript_diverged, live_has
     /\ (stored_is_archived = TRUE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ClassifyLiveSessionAuthorityDurableUncommitted(stored_transcript_diverged, live_has_uncommitted_transcript, stored_is_archived) ==
@@ -702,7 +712,7 @@ ClassifyLiveSessionAuthorityDurableUncommitted(stored_transcript_diverged, live_
     /\ ((stored_is_archived = FALSE) /\ (live_has_uncommitted_transcript = TRUE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ClassifyLiveSessionAuthorityDurableRevision(stored_transcript_diverged, live_has_uncommitted_transcript, stored_is_archived) ==
@@ -710,7 +720,7 @@ ClassifyLiveSessionAuthorityDurableRevision(stored_transcript_diverged, live_has
     /\ ((stored_is_archived = FALSE) /\ (live_has_uncommitted_transcript = FALSE) /\ (stored_transcript_diverged = TRUE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 RecoverSessionFromStoreAuthorized(session_id, has_metadata, has_build_state, runtime_projection_quarantined) ==
@@ -718,7 +728,7 @@ RecoverSessionFromStoreAuthorized(session_id, has_metadata, has_build_state, run
     /\ store_projection_can_recover_authority(has_metadata, has_build_state, runtime_projection_quarantined)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 RecoverSessionFromStoreUnrecoverable(session_id, has_metadata, has_build_state, runtime_projection_quarantined) ==
@@ -726,7 +736,7 @@ RecoverSessionFromStoreUnrecoverable(session_id, has_metadata, has_build_state, 
     /\ (store_projection_can_recover_authority(has_metadata, has_build_state, runtime_projection_quarantined) = FALSE)
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ClassifyDurableTailCompleted(session_id, candidate_id, relation, run_id_cardinality, terminal_stop_reason, dangling_tool_use_count, orphan_tool_result_count, messages_after_terminal) ==
@@ -734,7 +744,7 @@ ClassifyDurableTailCompleted(session_id, candidate_id, relation, run_id_cardinal
     /\ ((relation = "VerifiedStrictDescendant") /\ (run_id_cardinality = "SingleRunId") /\ (terminal_stop_reason = "EndTurn") /\ (dangling_tool_use_count = 0) /\ (orphan_tool_result_count = 0) /\ (messages_after_terminal = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ClassifyDurableTailRepairable(session_id, candidate_id, relation, run_id_cardinality, terminal_stop_reason, dangling_tool_use_count, orphan_tool_result_count, messages_after_terminal) ==
@@ -742,7 +752,7 @@ ClassifyDurableTailRepairable(session_id, candidate_id, relation, run_id_cardina
     /\ ((relation = "VerifiedStrictDescendant") /\ (run_id_cardinality = "SingleRunId") /\ (dangling_tool_use_count = 0) /\ (orphan_tool_result_count = 0) /\ (messages_after_terminal = FALSE) /\ (IF (terminal_stop_reason = "ToolUse") THEN TRUE ELSE (terminal_stop_reason = "Absent")))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ClassifyDurableTailAmbiguous(session_id, candidate_id, relation, run_id_cardinality, terminal_stop_reason, dangling_tool_use_count, orphan_tool_result_count, messages_after_terminal) ==
@@ -750,7 +760,7 @@ ClassifyDurableTailAmbiguous(session_id, candidate_id, relation, run_id_cardinal
     /\ (IF (relation # "VerifiedStrictDescendant") THEN TRUE ELSE (IF (run_id_cardinality # "SingleRunId") THEN TRUE ELSE (IF (orphan_tool_result_count # 0) THEN TRUE ELSE (IF (messages_after_terminal = TRUE) THEN TRUE ELSE (IF (terminal_stop_reason = "Other") THEN TRUE ELSE (dangling_tool_use_count # 0))))))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRuntimeCheckpointProjectionActive(session_id) ==
@@ -758,7 +768,7 @@ ResolveRuntimeCheckpointProjectionActive(session_id) ==
     /\ ((IF "value" \in DOMAIN (IF (session_id \in DOMAIN session_lifecycle_terminal) THEN Some((IF session_id \in DOMAIN session_lifecycle_terminal THEN session_lifecycle_terminal[session_id] ELSE "None")) ELSE None) THEN (IF (session_id \in DOMAIN session_lifecycle_terminal) THEN Some((IF session_id \in DOMAIN session_lifecycle_terminal THEN session_lifecycle_terminal[session_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Active")
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveRuntimeCheckpointProjectionArchived(session_id) ==
@@ -766,7 +776,7 @@ ResolveRuntimeCheckpointProjectionArchived(session_id) ==
     /\ ((IF "value" \in DOMAIN (IF (session_id \in DOMAIN session_lifecycle_terminal) THEN Some((IF session_id \in DOMAIN session_lifecycle_terminal THEN session_lifecycle_terminal[session_id] ELSE "None")) ELSE None) THEN (IF (session_id \in DOMAIN session_lifecycle_terminal) THEN Some((IF session_id \in DOMAIN session_lifecycle_terminal THEN session_lifecycle_terminal[session_id] ELSE "None")) ELSE None)["value"] ELSE None) = "Archived")
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveSessionDocumentLifecycleMergeArchivedAbsorbing(session_id, authority_archived, candidate_archived) ==
@@ -774,7 +784,7 @@ ResolveSessionDocumentLifecycleMergeArchivedAbsorbing(session_id, authority_arch
     /\ (IF (authority_archived = TRUE) THEN TRUE ELSE (candidate_archived = TRUE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ResolveSessionDocumentLifecycleMergeAuthority(session_id, authority_archived, candidate_archived) ==
@@ -782,14 +792,14 @@ ResolveSessionDocumentLifecycleMergeAuthority(session_id, authority_archived, ca
     /\ ((authority_archived = FALSE) /\ (candidate_archived = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ApplyPendingToolResults(session_id, result_count) ==
     /\ phase = "Ready"
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 TranscriptEditFork(session_id, fork_or_rewrite_directive) ==
@@ -797,7 +807,7 @@ TranscriptEditFork(session_id, fork_or_rewrite_directive) ==
     /\ (fork_or_rewrite_directive = "Fork")
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 TranscriptEditRewrite(session_id, fork_or_rewrite_directive) ==
@@ -805,7 +815,7 @@ TranscriptEditRewrite(session_id, fork_or_rewrite_directive) ==
     /\ (fork_or_rewrite_directive = "Rewrite")
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 RecoverSessionLifecycleTerminal(session_id, terminal) ==
@@ -814,7 +824,7 @@ RecoverSessionLifecycleTerminal(session_id, terminal) ==
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ session_lifecycle_terminal' = MapSet(session_lifecycle_terminal, session_id, terminal)
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count >>
+    /\ UnchangedFrame_a410bb8a878b88b9
 
 
 ReviveArchivedSessionDocument(session_id) ==
@@ -823,7 +833,7 @@ ReviveArchivedSessionDocument(session_id) ==
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ session_lifecycle_terminal' = MapSet(session_lifecycle_terminal, session_id, "Active")
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count >>
+    /\ UnchangedFrame_a410bb8a878b88b9
 
 
 ArchiveSessionDocumentActive(session_id, runtime_backed, durable_document_present, runtime_observation) ==
@@ -832,7 +842,7 @@ ArchiveSessionDocumentActive(session_id, runtime_backed, durable_document_presen
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ session_lifecycle_terminal' = MapSet(session_lifecycle_terminal, session_id, "Archived")
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count >>
+    /\ UnchangedFrame_a410bb8a878b88b9
 
 
 ArchiveSessionDocumentAlreadyArchived(session_id, runtime_backed, durable_document_present, runtime_observation) ==
@@ -841,7 +851,7 @@ ArchiveSessionDocumentAlreadyArchived(session_id, runtime_backed, durable_docume
     /\ (runtime_observation # "RetirementRequired")
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 ArchiveSessionDocumentCompleteRetire(session_id, runtime_backed, durable_document_present, runtime_observation) ==
@@ -850,7 +860,7 @@ ArchiveSessionDocumentCompleteRetire(session_id, runtime_backed, durable_documen
     /\ (runtime_observation = "RetirementRequired")
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_first_turn_phase, session_pending_initial_prompt_present, session_pending_tool_results_count, session_lifecycle_terminal >>
+    /\ UnchangedFrame_b4248dd3143f6dbd
 
 
 Next ==

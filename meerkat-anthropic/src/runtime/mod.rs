@@ -791,6 +791,7 @@ mod tests {
             backend_kind: AnthropicBackendKind::Bedrock.as_str().into(),
             base_url: base_url.map(str::to_string),
             options,
+            server: None,
         };
         let auth = AuthProfile {
             id: "bedrock-auth".into(),

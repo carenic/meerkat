@@ -685,6 +685,21 @@ async fn rebind_same_supervisor_identity_replaces_stale_address() {
         panic!("expected materialized member")
     };
 
+    // The predecessor is finished as a controller, so it RELEASES the
+    // participant name it published. A live route is never taken over - not
+    // even by this same authority key - and succession is admitted only on
+    // evidence, so the release is the evidence. In deployment the successor is
+    // a fresh process with an empty registry and nothing to release; this is
+    // the in-process stand-in for that process exiting.
+    //
+    // ONLY the inproc route goes. The TCP listener below stays bound, so port 0
+    // cannot be recycled and the stale address stays reachable - which is what
+    // gives the new-address assertions their teeth.
+    assert!(
+        original.runtime.retire_inproc_route(),
+        "the predecessor must still own the live generation it is releasing"
+    );
+
     // Keep the old listener alive so port-0 cannot be recycled: the second
     // endpoint has the same signing identity/PeerId and a provably new route.
     let restarted =
