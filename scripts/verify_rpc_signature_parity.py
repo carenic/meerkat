@@ -37,7 +37,6 @@ import json
 import pathlib
 import re
 import sys
-from datetime import date
 from dataclasses import dataclass, field
 
 # JSON pass-through markers that are intentionally untyped on the wire.
@@ -304,13 +303,14 @@ BASELINE_HAND_ROLLED: set[tuple[str, str, str]] = {
 # hatch. New generated wrappers must remove entries; the whole baseline expires
 # unless renewed with an explicit owner decision.
 #
-# 2026-08-10 sdk-contracts owner review: all 239 entries remain active
+# 2026-08-18 sdk-contracts owner review: all 239 entries remain active
 # generated-type mismatches (ts=110, py=129), and the gate reports no stale
-# entries that can be deleted without migrating their wrappers. Renew only for
-# one week of 0.8.22 release closeout, and ratchet the cap to the exact reviewed
-# count so this decision cannot admit new hand-rolled debt.
+# entries that can be deleted without migrating their wrappers. Keep the exact
+# reviewed cap through 0.8.24 only. Opening the 0.8.25 train must migrate all
+# 239 wrappers; see docs/plans/0.8.25-sdk-wrapper-migration.md.
 BASELINE_HAND_ROLLED_OWNER = "sdk-contracts"
-BASELINE_HAND_ROLLED_EXPIRES = "2026-08-17"
+BASELINE_HAND_ROLLED_CURRENT_TRAIN = "0.8.24"
+BASELINE_HAND_ROLLED_EXPIRES_AT_TRAIN = "0.8.25"
 BASELINE_HAND_ROLLED_MAX_ENTRIES = 239
 
 
@@ -318,6 +318,31 @@ def split_type_refs(type_ref: str | None) -> list[str]:
     if not type_ref:
         return []
     return [part.strip() for part in type_ref.split("|") if part.strip()]
+
+
+def release_version_tuple(version: str) -> tuple[int, int, int]:
+    """Return the release-ordering portion of a Cargo semantic version."""
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", version)
+    if not match:
+        raise ValueError(f"invalid semantic version: {version}")
+    return tuple(int(part) for part in match.groups())
+
+
+def baseline_train_expiry_failure(
+    current_train: str,
+    expiry_train: str,
+    baseline_size: int,
+) -> str | None:
+    """Fail the grandfathered baseline when the named release train opens."""
+    current = release_version_tuple(current_train)
+    expiry = release_version_tuple(expiry_train)
+    if baseline_size and current >= expiry:
+        return (
+            "baseline policy: BASELINE_HAND_ROLLED expired at the "
+            f"{expiry_train} train opening (current train {current_train}); "
+            f"migrate all {baseline_size} grandfathered wrappers before continuing"
+        )
+    return None
 
 
 def load_catalog(root: pathlib.Path) -> dict[str, dict[str, str | None]]:
@@ -1102,18 +1127,16 @@ def main() -> int:
     if not BASELINE_HAND_ROLLED_OWNER:
         failures.append("baseline policy: BASELINE_HAND_ROLLED_OWNER must be set")
     try:
-        expiry = date.fromisoformat(BASELINE_HAND_ROLLED_EXPIRES)
-    except ValueError:
-        failures.append(
-            "baseline policy: BASELINE_HAND_ROLLED_EXPIRES must be an ISO date"
+        train_failure = baseline_train_expiry_failure(
+            BASELINE_HAND_ROLLED_CURRENT_TRAIN,
+            BASELINE_HAND_ROLLED_EXPIRES_AT_TRAIN,
+            len(BASELINE_HAND_ROLLED),
         )
+    except ValueError as error:
+        failures.append(f"baseline policy: {error}")
     else:
-        if date.today() > expiry:
-            failures.append(
-                "baseline policy: BASELINE_HAND_ROLLED expired on "
-                f"{BASELINE_HAND_ROLLED_EXPIRES}; remove entries or renew with "
-                "an explicit owner decision"
-            )
+        if train_failure:
+            failures.append(train_failure)
     if len(BASELINE_HAND_ROLLED) > BASELINE_HAND_ROLLED_MAX_ENTRIES:
         failures.append(
             "baseline policy: BASELINE_HAND_ROLLED grew to "
@@ -1134,7 +1157,9 @@ def main() -> int:
         f"ts={ts_enforced} py={py_enforced} web-auth={web_enforced} "
         "generated-typed sides enforced "
         f"({baseline_count} grandfathered hand-rolled, "
-        f"owner={BASELINE_HAND_ROLLED_OWNER} expires={BASELINE_HAND_ROLLED_EXPIRES}, "
+        f"owner={BASELINE_HAND_ROLLED_OWNER} "
+        f"train={BASELINE_HAND_ROLLED_CURRENT_TRAIN} "
+        f"expires-at-train={BASELINE_HAND_ROLLED_EXPIRES_AT_TRAIN}, "
         f"ts={ts_untracked} py={py_untracked} web-auth={web_untracked} "
         "sides untracked because the "
         "generated SDK type does not exist yet)."
