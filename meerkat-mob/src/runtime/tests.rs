@@ -7820,6 +7820,24 @@ async fn spawn_live_external_peer_with_transport(
                                         "correlated rotation response send was not confirmed"
                                     );
                                 }
+                                Err(SendError::AmbiguousDelivery {
+                                    envelope_id,
+                                    detail,
+                                }) if detail.contains("Connection refused") => {
+                                    // The one-shot probe has already retired, so
+                                    // ECONNREFUSED proves this response was not
+                                    // delivered. Comms currently folds pre-write IO
+                                    // failures into AmbiguousDelivery. The 0.8.25
+                                    // transport-classification work must give this
+                                    // fact a typed non-delivery outcome and remove
+                                    // this harness-only exception.
+                                    tracing::warn!(
+                                        %interaction_id,
+                                        %envelope_id,
+                                        %detail,
+                                        "correlated rotation response reached a retired probe"
+                                    );
+                                }
                                 Err(error) => {
                                     panic!(
                                         "send correlated rotation observation response failed: {error}"
