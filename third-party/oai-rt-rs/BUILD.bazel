@@ -80,3 +80,13 @@ rust_library(
     }),
     version = "0.4.0",
 )
+
+# Additive BUILD file content
+
+# Export the complete in-tree path dependency so nested Cargo builds running
+# from Bazel runfiles can resolve the workspace [patch.crates-io] entry.
+filegroup(
+    name = "package_runfiles",
+    srcs = glob(["**/*"], exclude = ["BUILD", "BUILD.bazel"], allow_empty = True),
+    visibility = ["//visibility:public"],
+)
