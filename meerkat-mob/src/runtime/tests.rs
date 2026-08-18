@@ -11847,6 +11847,7 @@ async fn test_mob_shutdown() {
 async fn test_mob_shutdown_interrupts_active_autonomous_member() {
     let (handle, service) = create_test_mob(sample_definition()).await;
     let adapter = service.enable_runtime_adapter();
+    service.set_start_turn_delay_ms(600_000);
     let identity = AgentIdentity::from("w-active-autonomous-shutdown");
     let mut spec = SpawnMemberSpec::new("worker", identity.as_str());
     spec.runtime_mode = Some(crate::MobRuntimeMode::AutonomousHost);
@@ -11858,6 +11859,12 @@ async fn test_mob_shutdown_interrupts_active_autonomous_member() {
         .resolve_bridge_session_id(&identity)
         .await
         .expect("session-backed autonomous member");
+    wait_for_start_turn_call_count(
+        service.as_ref(),
+        1,
+        "autonomous shutdown target should reach the active provider call",
+    )
+    .await;
     let baseline_target_interrupts = service.interrupt_call_count_for(&session_id);
 
     handle
@@ -11868,8 +11875,8 @@ async fn test_mob_shutdown_interrupts_active_autonomous_member() {
     assert_eq!(handle.status().await.unwrap(), MobState::Stopped);
     assert_eq!(
         service.interrupt_call_count_for(&session_id),
-        baseline_target_interrupts,
-        "durable Retiring must not route the target teardown through ambient interruption"
+        baseline_target_interrupts + 1,
+        "active autonomous shutdown must realize exactly one machine-authorized target interrupt"
     );
     assert!(
         !adapter.contains_session(&session_id).await,
