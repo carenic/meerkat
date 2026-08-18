@@ -307,7 +307,7 @@ BASELINE_HAND_ROLLED: set[tuple[str, str, str]] = {
 # generated-type mismatches (ts=110, py=129), and the gate reports no stale
 # entries that can be deleted without migrating their wrappers. Keep the exact
 # reviewed cap through 0.8.24 only. Opening the 0.8.25 train must migrate all
-# 239 wrappers; see docs/plans/0.8.25-sdk-wrapper-migration.md.
+# 239 wrappers; see RELEASE-0.8.25.md.
 BASELINE_HAND_ROLLED_OWNER = "sdk-contracts"
 BASELINE_HAND_ROLLED_CURRENT_TRAIN = "0.8.24"
 BASELINE_HAND_ROLLED_EXPIRES_AT_TRAIN = "0.8.25"
