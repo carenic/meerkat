@@ -15600,21 +15600,18 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
     } = &command
         && std::path::Path::new(target).exists()
     {
+        let invocation = OwnedMobRunPackInvocation {
+            pack: PathBuf::from(target),
+            flow: flow.clone(),
+            prompt: prompt.clone(),
+            raw_params: params.clone(),
+            detach: *detach,
+            json: *json,
+            cli_trust_policy: *trust_policy,
+        };
         println!(
             "{}",
-            Box::pin(execute_mob_run_pack(
-                scope,
-                MobRunPackInvocation {
-                    pack: std::path::Path::new(target),
-                    flow: flow.as_deref(),
-                    prompt: prompt.as_deref(),
-                    raw_params: params,
-                    detach: *detach,
-                    json: *json,
-                    cli_trust_policy: *trust_policy,
-                },
-            ))
-            .await?
+            execute_mob_run_pack_with_stack_relief(scope.clone(), invocation).await?
         );
         return Ok(());
     }
@@ -16682,6 +16679,49 @@ struct MobRunPackInvocation<'a> {
     detach: bool,
     json: bool,
     cli_trust_policy: Option<TrustPolicyArg>,
+}
+
+#[cfg(feature = "mob")]
+struct OwnedMobRunPackInvocation {
+    pack: PathBuf,
+    flow: Option<String>,
+    prompt: Option<String>,
+    raw_params: Vec<String>,
+    detach: bool,
+    json: bool,
+    cli_trust_policy: Option<TrustPolicyArg>,
+}
+
+/// Materialize the large mobpack run future at the top of a fresh Tokio task
+/// instead of below the CLI main command-dispatch poll chain. In debug builds,
+/// the inline chain exceeds the process main-thread stack even though the
+/// command itself fits the runtime's 2 MiB worker-stack contract.
+///
+/// The fresh task weakens synchronous drop cancellation, but this command's
+/// effects are durable, machine-fenced, and idempotent. Its foreground flow
+/// path also owns the SIGINT/SIGTERM race and durable cancellation convergence,
+/// so process shutdown still reaches the same typed terminalization path.
+#[cfg(feature = "mob")]
+async fn execute_mob_run_pack_with_stack_relief(
+    scope: RuntimeScope,
+    invocation: OwnedMobRunPackInvocation,
+) -> anyhow::Result<String> {
+    meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
+        execute_mob_run_pack(
+            &scope,
+            MobRunPackInvocation {
+                pack: &invocation.pack,
+                flow: invocation.flow.as_deref(),
+                prompt: invocation.prompt.as_deref(),
+                raw_params: &invocation.raw_params,
+                detach: invocation.detach,
+                json: invocation.json,
+                cli_trust_policy: invocation.cli_trust_policy,
+            },
+        )
+        .await
+    })
+    .await
 }
 
 #[cfg(feature = "mob")]
@@ -17998,6 +18038,48 @@ mod tests {
             #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
             provider_auth_authority,
         }
+    }
+
+    #[cfg(feature = "mob")]
+    #[test]
+    fn mobpack_run_stack_relief_moves_work_off_compact_caller_within_worker_contract() {
+        const CALLER_STACK_BUDGET: usize = 1024 * 1024;
+        const WORKER_STACK_BUDGET: usize = 2 * 1024 * 1024;
+
+        let caller = std::thread::Builder::new()
+            .name("mobpack-run-compact-caller".to_string())
+            .stack_size(CALLER_STACK_BUDGET)
+            .spawn(|| {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let scope = test_scope(temp.path().to_path_buf(), "mobpack-stack-budget");
+                let invocation = OwnedMobRunPackInvocation {
+                    pack: temp.path().join("missing.mobpack"),
+                    flow: Some("main".to_string()),
+                    prompt: Some("stack budget probe".to_string()),
+                    raw_params: Vec::new(),
+                    detach: false,
+                    json: true,
+                    cli_trust_policy: Some(TrustPolicyArg::Permissive),
+                };
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_stack_size(WORKER_STACK_BUDGET)
+                    .enable_all()
+                    .build()
+                    .expect("compact-stack test runtime");
+                let error = runtime
+                    .block_on(execute_mob_run_pack_with_stack_relief(scope, invocation))
+                    .expect_err("missing mobpack must fail");
+                assert!(
+                    error.to_string().contains("failed reading pack"),
+                    "typed missing-pack error should escape the relieved future: {error}"
+                );
+            })
+            .expect("compact-stack caller should start");
+
+        caller
+            .join()
+            .expect("mobpack run future must move off the compact caller and fit the two MiB worker contract");
     }
 
     #[test]
