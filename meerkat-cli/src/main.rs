@@ -14975,6 +14975,11 @@ mod mob_typed_exit_tests {
 #[cfg(feature = "mob")]
 const PACK_RUN_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Optional usage enrichment must not hold a reached Flow terminal or process
+/// shutdown hostage to a member whose status projection is still blocked.
+#[cfg(feature = "mob")]
+const MOB_RUN_ACCOUNTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Which future finished first while a foreground pack flow run waited for
 /// its terminal state.
 #[cfg(feature = "mob")]
@@ -15109,6 +15114,18 @@ mod pack_run_shutdown_seam_tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn reached_terminal_is_not_held_by_stalled_optional_accounting() {
+        let accounting = collect_mob_run_accounting_with_timeout(
+            std::time::Duration::from_millis(1),
+            std::future::pending::<
+                Result<meerkat_contracts::WireMobRunAccounting, meerkat_mob::MobError>,
+            >(),
+        )
+        .await;
+        assert!(accounting.is_none());
+    }
 }
 
 #[cfg(feature = "mob")]
@@ -15235,13 +15252,34 @@ async fn collect_mob_run_accounting(
     state: &meerkat_mob_mcp::MobMcpState,
     mob_id: &str,
 ) -> Option<meerkat_contracts::WireMobRunAccounting> {
-    match state
-        .mob_run_accounting(&meerkat_mob::MobId::from(mob_id.to_string()))
-        .await
-    {
-        Ok(accounting) => Some(accounting),
-        Err(error) => {
+    collect_mob_run_accounting_with_timeout(
+        MOB_RUN_ACCOUNTING_TIMEOUT,
+        state.mob_run_accounting(&meerkat_mob::MobId::from(mob_id.to_string())),
+    )
+    .await
+}
+
+#[cfg(feature = "mob")]
+async fn collect_mob_run_accounting_with_timeout<F>(
+    timeout: std::time::Duration,
+    accounting: F,
+) -> Option<meerkat_contracts::WireMobRunAccounting>
+where
+    F: std::future::Future<
+            Output = Result<meerkat_contracts::WireMobRunAccounting, meerkat_mob::MobError>,
+        >,
+{
+    match tokio::time::timeout(timeout, accounting).await {
+        Ok(Ok(accounting)) => Some(accounting),
+        Ok(Err(error)) => {
             eprintln!("warning\tmob run accounting unavailable: {error}");
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "warning\tmob run accounting unavailable: projection exceeded {}s",
+                timeout.as_secs_f64()
+            );
             None
         }
     }
