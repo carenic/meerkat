@@ -28,6 +28,8 @@ them.
 
 ## [Unreleased]
 
+## [0.8.24] - 2026-08-18
+
 ### Breaking
 
 - **`meerkat_core::BackendProfile` gains a `server: Option<String>` field** and
