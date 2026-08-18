@@ -17,6 +17,7 @@ mod mcp;
     feature = "rpc-surface"
 ))]
 mod mob_host;
+mod shutdown_signal;
 #[cfg(feature = "comms")]
 mod stdin_events;
 mod storage_migrate;
@@ -11231,7 +11232,7 @@ async fn run_agent(
             );
             // Block until SIGINT/SIGTERM. The runtime loop, comms drain, and
             // detached wake tasks continue running in background tokio tasks.
-            mob_host::wait_for_shutdown_signal().await?;
+            shutdown_signal::wait_for_shutdown_signal().await?;
             eprintln!("\nShutting down...");
         }
 
@@ -11923,7 +11924,7 @@ async fn resume_session_with_llm_override(
             eprintln!(
                 "Keep-alive: resume turn complete, waiting for events (Ctrl+C or SIGTERM to exit)..."
             );
-            mob_host::wait_for_shutdown_signal().await?;
+            shutdown_signal::wait_for_shutdown_signal().await?;
             eprintln!("\nShutting down...");
         }
 
@@ -15022,7 +15023,7 @@ async fn run_pack_flow_foreground(
         .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
     match select_pack_flow_terminal_or_shutdown(
         wait_for_terminal_flow_run(state, mob_id.as_str(), &run_id),
-        mob_host::wait_for_shutdown_signal(),
+        shutdown_signal::wait_for_shutdown_signal(),
     )
     .await
     {
