@@ -6217,24 +6217,25 @@ impl SessionRuntime {
                     });
                 }
 
-                let (publication_handle, publication_owner) = {
+                #[cfg(feature = "mob")]
+                let publication_owner;
+                let publication_handle = {
                     let attachments = runtime_publication_handles
                         .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    attachments
+                    let attachment = attachments
                         .get(&expected_session_id)
                         .filter(|attachment| attachment.witness == *attachment_witness)
-                        .map(|attachment| {
-                            (
-                                attachment.publication_handle.clone(),
-                                attachment.owner.clone(),
-                            )
-                        })
                         .ok_or_else(|| RuntimeDriverError::StaleAuthority {
                             reason: format!(
                                 "RPC actor publication refresh for session {expected_session_id} does not own the prepared executor attachment and publication owner"
                             ),
-                        })?
+                        })?;
+                    #[cfg(feature = "mob")]
+                    {
+                        publication_owner = attachment.owner.clone();
+                    }
+                    attachment.publication_handle.clone()
                 };
 
                 #[cfg(feature = "mob")]
@@ -6256,7 +6257,7 @@ impl SessionRuntime {
                 let immutable_actor_handle =
                     meerkat::surface::persistent_runtime_publication_handle(
                         Arc::clone(&persistent_service),
-                        actor_witness.clone(),
+                        actor_witness,
                     );
 
                 // This callback runs while PreparedAttachedSessionActorRecovery
