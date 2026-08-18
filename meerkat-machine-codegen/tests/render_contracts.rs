@@ -3,12 +3,13 @@
 use std::collections::BTreeSet;
 
 use meerkat_machine_codegen::{
-    GENERATED_COVERAGE_END, GENERATED_COVERAGE_START, merge_mapping_document,
-    render_composition_ci_cfg, render_composition_driver, render_composition_mapping_coverage,
-    render_composition_module, render_composition_semantic_model, render_composition_witness_cfg,
-    render_generated_kernel_mod, render_machine_ci_cfg, render_machine_contract_markdown,
-    render_machine_kernel_module, render_machine_mapping_coverage, render_machine_module,
-    render_machine_semantic_model,
+    GENERATED_COVERAGE_END, GENERATED_COVERAGE_START, MachineKernelRenderError,
+    merge_mapping_document, render_composition_ci_cfg, render_composition_driver,
+    render_composition_mapping_coverage, render_composition_module,
+    render_composition_semantic_model, render_composition_witness_cfg, render_generated_kernel_mod,
+    render_machine_ci_cfg, render_machine_contract_markdown,
+    render_machine_kernel_module as try_render_machine_kernel_module,
+    render_machine_mapping_coverage, render_machine_module, render_machine_semantic_model,
 };
 use meerkat_machine_schema::catalog::dsl::{
     dsl_auth_machine as auth_machine, dsl_meerkat_machine as meerkat_machine,
@@ -23,9 +24,13 @@ use meerkat_machine_schema::catalog::{
 };
 use meerkat_machine_schema::identity::{EnumVariantId, RustTypeAtom};
 use meerkat_machine_schema::{
-    CompositionDriver, CompositionDriverRustBinding, DriverDispatchRoute, Expr, RouteTargetKind,
-    TriggerMatch, Update, WatchedEffect, canonical_machine_schemas,
+    CompositionDriver, CompositionDriverRustBinding, DriverDispatchRoute, Expr, MachineSchema,
+    RouteTargetKind, TriggerMatch, Update, WatchedEffect, canonical_machine_schemas,
 };
+
+fn render_machine_kernel_module(schema: &MachineSchema) -> String {
+    try_render_machine_kernel_module(schema).expect("machine kernel rendering must succeed")
+}
 
 #[test]
 fn renders_canonical_meerkat_machine_fixture_with_stable_sections() {
@@ -597,6 +602,22 @@ fn generated_meerkat_transition_enum_order_is_decoupled_from_dispatch_order() {
         old_final < appended,
         "new TransitionId variants must be emitted after every pre-0.8.24 variant"
     );
+}
+
+#[test]
+fn generated_meerkat_transition_tail_missing_name_is_a_structured_error() {
+    let mut schema = meerkat_machine();
+    schema.transitions.retain(|transition| {
+        transition.name.as_ref() != "RegisterSessionRefusedUnregisterDrainingIdle"
+    });
+
+    let error = try_render_machine_kernel_module(&schema)
+        .expect_err("missing public transition tail name must fail rendering");
+    assert!(matches!(
+        error,
+        MachineKernelRenderError::MissingPublicTransitionTail { transition }
+            if transition == "RegisterSessionRefusedUnregisterDrainingIdle"
+    ));
 }
 
 #[test]

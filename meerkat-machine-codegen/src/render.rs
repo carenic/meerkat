@@ -342,8 +342,23 @@ pub fn render_composition_mapping_coverage(
 }
 
 #[cfg(not(test))]
-pub fn render_machine_kernel_module(schema: &MachineSchema) -> String {
+pub fn render_machine_kernel_module(
+    schema: &MachineSchema,
+) -> Result<String, MachineKernelRenderError> {
     render_canonical_stub_modeled_module(schema)
+}
+
+#[cfg(not(test))]
+#[derive(Debug, thiserror::Error)]
+pub enum MachineKernelRenderError {
+    #[error(
+        "MeerkatMachine public TransitionId tail names missing schema transition `{transition}`"
+    )]
+    MissingPublicTransitionTail { transition: String },
+    #[error(
+        "MeerkatMachine public TransitionId tail must name unique schema transitions: rendered {rendered}, schema has {schema}"
+    )]
+    NonUniquePublicTransitionTail { rendered: usize, schema: usize },
 }
 
 // Rust enum order is a public compatibility surface, while transition schema
@@ -388,9 +403,11 @@ const MEERKAT_TRANSITION_ENUM_TAIL: &[&str] = &[
 ];
 
 #[cfg(not(test))]
-fn transitions_in_public_enum_order(schema: &MachineSchema) -> Vec<&TransitionSchema> {
+fn transitions_in_public_enum_order(
+    schema: &MachineSchema,
+) -> Result<Vec<&TransitionSchema>, MachineKernelRenderError> {
     if schema.machine.as_ref() != "MeerkatMachine" {
-        return schema.transitions.iter().collect();
+        return Ok(schema.transitions.iter().collect());
     }
 
     let mut ordered = Vec::with_capacity(schema.transitions.len());
@@ -405,23 +422,24 @@ fn transitions_in_public_enum_order(schema: &MachineSchema) -> Vec<&TransitionSc
             .transitions
             .iter()
             .find(|transition| transition.name.as_ref() == *expected_name)
-            .unwrap_or_else(|| {
-                panic!(
-                    "MeerkatMachine public TransitionId tail names missing schema transition `{expected_name}`"
-                )
-            });
+            .ok_or_else(|| MachineKernelRenderError::MissingPublicTransitionTail {
+                transition: (*expected_name).to_owned(),
+            })?;
         ordered.push(transition);
     }
-    assert_eq!(
-        ordered.len(),
-        schema.transitions.len(),
-        "MeerkatMachine public TransitionId tail must name unique schema transitions"
-    );
-    ordered
+    if ordered.len() != schema.transitions.len() {
+        return Err(MachineKernelRenderError::NonUniquePublicTransitionTail {
+            rendered: ordered.len(),
+            schema: schema.transitions.len(),
+        });
+    }
+    Ok(ordered)
 }
 
 #[cfg(not(test))]
-fn render_canonical_stub_modeled_module(schema: &MachineSchema) -> String {
+fn render_canonical_stub_modeled_module(
+    schema: &MachineSchema,
+) -> Result<String, MachineKernelRenderError> {
     let mut out = String::new();
     let module_name = machine_slug(&schema.machine);
     let catalog_fn = format!("catalog::dsl::dsl_{module_name}_machine");
@@ -669,7 +687,7 @@ fn render_canonical_stub_modeled_module(schema: &MachineSchema) -> String {
         "#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]"
     );
     pushln!(&mut out, "pub enum TransitionId {{");
-    for transition in transitions_in_public_enum_order(schema) {
+    for transition in transitions_in_public_enum_order(schema)? {
         pushln!(&mut out, "    {},", rust_ident(&transition.name));
     }
     pushln!(&mut out, "}}");
@@ -794,7 +812,7 @@ fn render_canonical_stub_modeled_module(schema: &MachineSchema) -> String {
     }
     pushln!(&mut out, "    }}");
     pushln!(&mut out, "}}");
-    out
+    Ok(out)
 }
 
 #[cfg(not(test))]

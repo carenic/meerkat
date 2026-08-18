@@ -328,7 +328,7 @@ pub fn machine_codegen_at_root(root: &Path, selection: &Selection) -> Result<()>
         let generated_slug = generated_kernel_module_slug(&machine.schema.machine);
         write_generated(
             &generated_kernel_module_path(root, &generated_slug),
-            &render_machine_kernel_module(&machine.schema),
+            &render_machine_kernel_module(&machine.schema)?,
         )?;
         println!(
             "generated {}",
@@ -340,7 +340,7 @@ pub fn machine_codegen_at_root(root: &Path, selection: &Selection) -> Result<()>
         let generated_slug = generated_kernel_module_slug(&compat.machine);
         write_generated(
             &mob_generated_machine_module_path(root, &generated_slug),
-            &render_machine_kernel_module(&compat),
+            &render_machine_kernel_module(&compat)?,
         )?;
         println!(
             "generated {}",
@@ -622,7 +622,7 @@ pub fn collect_drift_mismatches(root: &Path, selection: &Selection) -> Result<Ve
         let generated_slug = generated_kernel_module_slug(&machine.schema.machine);
         compare_generated(
             &generated_kernel_module_path(root, &generated_slug),
-            &render_machine_kernel_module(&machine.schema),
+            &render_machine_kernel_module(&machine.schema)?,
             &mut mismatches,
         )?;
     }
@@ -636,7 +636,7 @@ pub fn collect_drift_mismatches(root: &Path, selection: &Selection) -> Result<Ve
         let generated_slug = generated_kernel_module_slug(&compat.machine);
         compare_generated(
             &mob_generated_machine_module_path(root, &generated_slug),
-            &render_machine_kernel_module(&compat),
+            &render_machine_kernel_module(&compat)?,
             &mut mismatches,
         )?;
     }
