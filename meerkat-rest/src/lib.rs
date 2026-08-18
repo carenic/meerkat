@@ -9593,6 +9593,25 @@ mod tests {
         completed.session_id
     }
 
+    async fn unregister_rest_runtime_session_until_terminal_for_test(
+        state: &AppState,
+        session_id: &SessionId,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                match state.runtime_adapter.unregister_session(session_id).await {
+                    Ok(()) => return,
+                    Err(meerkat_runtime::RuntimeDriverError::UnregisterInProgress { .. }) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("runtime session unregister failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("runtime session unregister must reach a terminal result");
+    }
+
     #[cfg(feature = "comms")]
     async fn create_completed_rest_runtime_comms_session(state: &AppState) -> SessionId {
         let pre_session = Session::new();
@@ -10106,11 +10125,7 @@ mod tests {
             .discard_live_session(&target_session_id)
             .await
             .expect("discard live target session");
-        state
-            .runtime_adapter
-            .unregister_session(&target_session_id)
-            .await
-            .expect("target runtime session should unregister cleanly");
+        unregister_rest_runtime_session_until_terminal_for_test(&state, &target_session_id).await;
 
         let runtime_store = state.session_service.runtime_store();
         let persisted_input = meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
@@ -10252,11 +10267,7 @@ mod tests {
             .discard_live_session(&target_session_id)
             .await
             .expect("discard live target session");
-        state
-            .runtime_adapter
-            .unregister_session(&target_session_id)
-            .await
-            .expect("target runtime session should unregister cleanly");
+        unregister_rest_runtime_session_until_terminal_for_test(&state, &target_session_id).await;
         assert!(
             !state
                 .runtime_adapter
@@ -10561,11 +10572,7 @@ mod tests {
             .discard_live_session(&target_session_id)
             .await
             .expect("discard live target session");
-        state
-            .runtime_adapter
-            .unregister_session(&target_session_id)
-            .await
-            .expect("target runtime session should unregister cleanly");
+        unregister_rest_runtime_session_until_terminal_for_test(&state, &target_session_id).await;
         assert!(
             !state
                 .session_service

@@ -10091,6 +10091,14 @@ impl MobHandle {
         .await?
     }
 
+    /// Test witness that crash-stop acknowledgement followed actor teardown.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn actor_command_channel_closed_for_test(&self) -> bool {
+        self.command_tx.is_closed()
+    }
+
     /// Force-cancel a member's in-flight turn via the user interrupt path.
     ///
     /// Unlike [`retire`](Self::retire), this does not archive the session or

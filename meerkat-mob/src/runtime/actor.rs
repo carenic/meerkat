@@ -5265,6 +5265,12 @@ pub(super) struct MobActor {
     /// exactly.  The loop quiesces and terminates before accepting another
     /// command; cold recovery is the only authority that may continue.
     pub(super) durable_uncertainty_fail_stop: bool,
+    /// Test-only process-death acknowledgement retained until the actor object
+    /// itself has been dropped. Sending this from the command arm races a cold
+    /// same-process replacement with the actor-owned runtime adapter and its
+    /// member comms routes, which a real process death destroys atomically.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) crash_stop_reply_tx: Option<oneshot::Sender<Result<(), MobError>>>,
     /// Same-process retry hint for the post-commit V5 adoption tail. Durable
     /// recovery does not depend on this flag: every V5 cold materialization
     /// reissues exact semantic Bind for all peer-only members. It only keeps a
@@ -22127,7 +22133,10 @@ impl MobActor {
                     // canceling flow state, or deleting private custody.
                     // The exact stores remain the only restart authority.
                     self.quiesce_volatile_producers_after_fail_stop().await;
-                    let _ = reply_tx.send(Ok(()));
+                    // Do not acknowledge here. The actor still owns its runtime
+                    // adapter until `run` drops `self`; replying now lets a
+                    // same-process cold replacement race those member routes.
+                    self.crash_stop_reply_tx = Some(reply_tx);
                     ActorLoopControl::BreakActor
                 }
                 MobCommand::Shutdown { reply_tx } => {
@@ -22621,6 +22630,16 @@ impl MobActor {
         // abort run, pending-spawn, and autonomous-turn producers before the
         // actor object (and its command receiver) is dropped.
         self.quiesce_volatile_producers_after_fail_stop().await;
+        #[cfg(any(test, feature = "test-support"))]
+        let crash_stop_reply_tx = self.crash_stop_reply_tx.take();
+        // Process death releases actor-owned runtime adapters and their inproc
+        // routes. Make that destruction happen before a crash-stop caller can
+        // construct a same-process cold replacement.
+        drop(self);
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(reply_tx) = crash_stop_reply_tx {
+            let _ = reply_tx.send(Ok(()));
+        }
     }
 
     fn pending_spawn_cleanup_anchor_for_slot(

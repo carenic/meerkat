@@ -112,9 +112,10 @@ impl meerkat_core::CompactionCurator for TestCompactionCurator {
 /// fact, so durable active-run and remote-turn custody survive exactly as they
 /// would across a crash. It is also the more conservative substitute for the
 /// pre-0.8.24 behaviour, under which the predecessor kept running and merely
-/// lost its route. It replies only after teardown, which is what makes it
-/// awaitable; the [`await_supervisor_route_release`] call below is the assertion
-/// that it did what this helper claims.
+/// lost its route. Its reply is retained until the actor loop has quiesced and
+/// dropped the actor-owned runtime adapter, which makes the simulated process
+/// death awaitable; the [`await_supervisor_route_release`] call below
+/// independently asserts that the supervisor route is gone.
 ///
 /// Use `handle.shutdown()` instead where the test's subject is a graceful stop.
 async fn crash_stop_and_release_routes(handle: MobHandle) {
@@ -1689,7 +1690,7 @@ struct MockSessionService {
     injected_interaction_ids: Arc<std::sync::Mutex<Vec<InteractionId>>>,
     keep_alive_prompts: RwLock<Vec<(SessionId, String)>>,
     interrupt_calls: AtomicU64,
-    interrupted_session_ids: RwLock<Vec<SessionId>>,
+    interrupted_session_ids: std::sync::Mutex<Vec<SessionId>>,
     runtime_control_barrier: RwLock<Option<Arc<TestRuntimeControlBarrier>>>,
     turn_finalization_gate: std::sync::RwLock<Option<Arc<tokio::sync::Mutex<()>>>>,
     turn_finalization_acquire_started: AtomicU64,
@@ -1805,7 +1806,7 @@ impl MockSessionService {
             injected_interaction_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             keep_alive_prompts: RwLock::new(Vec::new()),
             interrupt_calls: AtomicU64::new(0),
-            interrupted_session_ids: RwLock::new(Vec::new()),
+            interrupted_session_ids: std::sync::Mutex::new(Vec::new()),
             runtime_control_barrier: RwLock::new(None),
             turn_finalization_gate: std::sync::RwLock::new(None),
             turn_finalization_acquire_started: AtomicU64::new(0),
@@ -2313,10 +2314,10 @@ impl MockSessionService {
         self.interrupt_calls.load(Ordering::Relaxed)
     }
 
-    async fn interrupt_call_count_for(&self, session_id: &SessionId) -> usize {
+    fn interrupt_call_count_for(&self, session_id: &SessionId) -> usize {
         self.interrupted_session_ids
-            .read()
-            .await
+            .lock()
+            .expect("interrupted session ids mutex")
             .iter()
             .filter(|interrupted| *interrupted == session_id)
             .count()
@@ -3191,7 +3192,10 @@ impl SessionService for MockSessionService {
 
     async fn interrupt(&self, id: &SessionId) -> Result<(), SessionError> {
         self.interrupt_calls.fetch_add(1, Ordering::Relaxed);
-        self.interrupted_session_ids.write().await.push(id.clone());
+        self.interrupted_session_ids
+            .lock()
+            .expect("interrupted session ids mutex")
+            .push(id.clone());
         let sessions = self.sessions.read().await;
         if !sessions.contains_key(id) {
             return Err(SessionError::NotFound { id: id.clone() });
@@ -11854,7 +11858,7 @@ async fn test_mob_shutdown_interrupts_active_autonomous_member() {
         .resolve_bridge_session_id(&identity)
         .await
         .expect("session-backed autonomous member");
-    let baseline_target_interrupts = service.interrupt_call_count_for(&session_id).await;
+    let baseline_target_interrupts = service.interrupt_call_count_for(&session_id);
 
     handle
         .shutdown()
@@ -11863,7 +11867,7 @@ async fn test_mob_shutdown_interrupts_active_autonomous_member() {
 
     assert_eq!(handle.status().await.unwrap(), MobState::Stopped);
     assert_eq!(
-        service.interrupt_call_count_for(&session_id).await,
+        service.interrupt_call_count_for(&session_id),
         baseline_target_interrupts,
         "durable Retiring must not route the target teardown through ambient interruption"
     );

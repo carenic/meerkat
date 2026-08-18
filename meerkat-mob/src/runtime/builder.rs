@@ -10098,6 +10098,8 @@ impl MobBuilder {
                 pending_routed_effects: Vec::new(),
                 destroy_cleanup_active: false,
                 durable_uncertainty_fail_stop: false,
+                #[cfg(any(test, feature = "test-support"))]
+                crash_stop_reply_tx: None,
                 direct_member_adoption_pending: recovered_direct_member_adoption_pending,
                 respawn_topology_reply_withheld: false,
                 #[cfg(not(target_arch = "wasm32"))]
