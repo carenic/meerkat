@@ -109,7 +109,10 @@ fn cargo_workflow_covers_the_full_per_push_gate_set() {
             "e2e-fast",
             "fmt-governance",
             "gate",
+            "int-archives",
+            "int-else",
             "int-heavy",
+            "int-mob",
             "int-rest",
             "locks",
             "machine-verify",
@@ -117,6 +120,7 @@ fn cargo_workflow_covers_the_full_per_push_gate_set() {
             "sdk-host",
             "sdk-web",
             "unit",
+            "unit-archive",
             "wasm-check",
             "wasm-contract",
         ],
@@ -189,14 +193,19 @@ fn cargo_workflow_covers_the_full_per_push_gate_set() {
 
     // Full-workspace verification (the changed-crates-only gate missed
     // dependent-crate breakage; do not reintroduce it as the only test gate).
-    // Unit/int run as sharded nextest partitions of the same workspace-wide
-    // lanes the `unit`/`int` cargo aliases define; clippy covers the whole
-    // workspace with all features (test-target lints run nightly).
+    // Unit and integration execution jobs consume portable Nextest archives
+    // built once per compatible Cargo profile. The archive contract self-test
+    // pins the complete build scopes and fail-closed partitions; clippy covers
+    // the whole workspace with all features (test-target lints run nightly).
     for lane in [
         "clippy --workspace --all-features",
-        "repo-cargo unit --partition",
-        "-p meerkat-integration-tests --tests",
-        "--workspace --exclude meerkat-integration-tests",
+        "uses: ./.github/actions/build-nextest-archive",
+        "uses: ./.github/actions/run-nextest-archive",
+        "family: unit",
+        "family: int-heavy",
+        "family: int-mob",
+        "family: int-everything-else",
+        "scripts/test-ci-nextest-archive.sh",
         "make e2e-fast",
         "make verify-schema-freshness",
         "make verify-sdk-codegen-freshness",
