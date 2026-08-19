@@ -1,6 +1,12 @@
 name: Setup Rust CI
 description: Install Meerkat's pinned Rust toolchain and force its binaries ahead of runner defaults.
 
+inputs:
+  components:
+    description: Comma-separated Rust components required by this job.
+    required: false
+    default: rustfmt, clippy
+
 runs:
   using: composite
   steps:
@@ -9,7 +15,7 @@ runs:
       with:
         # The CI lanes run fmt/clippy directly; the dtolnay action installs a
         # minimal profile, so name the components explicitly.
-        components: rustfmt, clippy
+        components: ${{ inputs.components }}
 
     - name: Pin Rust toolchain binaries
       shell: bash

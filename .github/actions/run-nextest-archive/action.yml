@@ -12,6 +12,11 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Setup pinned Rust test tools
+      uses: ./.github/actions/setup-rust-ci
+      with:
+        components: rustfmt
+
     - name: Download portable test archive
       uses: actions/download-artifact@v7
       with:

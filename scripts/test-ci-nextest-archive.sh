@@ -124,6 +124,8 @@ stable_artifact_name="nextest-\${{ inputs.family }}-\${{ github.sha }}"
 assert_file_contains "$BUILD_ACTION" "name: ${stable_artifact_name}"
 assert_file_contains "$BUILD_ACTION" 'overwrite: true'
 assert_file_contains "$RUN_ACTION" "name: ${stable_artifact_name}"
+assert_file_contains "$RUN_ACTION" 'uses: ./.github/actions/setup-rust-ci'
+assert_file_contains "$RUN_ACTION" 'components: rustfmt'
 assert_file_contains "$RUN_ACTION" 'scripts/ci-nextest-archive.sh run'
 
 for dependency in unit-archive int-archives; do
