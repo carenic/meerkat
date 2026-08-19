@@ -28,6 +28,24 @@ them.
 
 ## [Unreleased]
 
+### Corrected
+
+- Provider failures whose class is genuinely unknown now enter the existing
+  machine-authorized, bounded retry path instead of terminalizing the agent on
+  the first attempt. The retry budget and exponential backoff are unchanged;
+  explicit terminal classes such as invalid request, authentication failure,
+  missing model, content filtering, context overflow, and oversized requests
+  remain non-retryable. OpenAI Responses streaming now also recognizes the
+  observed `server_is_overloaded` code as the typed retryable overload class.
+  With the default policy, a persistently unknown failure can now add three
+  backoff waits totaling about 3.5 seconds plus up to four provider round trips
+  before terminalizing. These attempts consume the aggregate turn budget, so
+  operators should check turn deadlines, stall alerts, and console read
+  timeouts against their provider latency. As an intentional REST wire-contract
+  consequence, such exhausted unknown failures now report error kind
+  `retry_exhausted` rather than `llm_failure`; clients branching on that code
+  must handle the new value.
+
 ## [0.8.24] - 2026-08-18
 
 ### Breaking
