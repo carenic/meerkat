@@ -10,7 +10,7 @@ ROOT="${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 CARGO="${CARGO:-$ROOT/scripts/repo-cargo}"
 GIT_BIN="${GIT_BIN:-git}"
 
-CACHE_VERSION="v9"
+CACHE_VERSION="v10"
 NEXTEST_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS:-300}"
 BUILD_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_BUILD_TIMEOUT_SECS:-${MEERKAT_PRE_PUSH_NARROW_BUILD_TIMEOUT_SECS:-900}}"
 # The unit lane includes a dense-topology stress test with its own 300-second
@@ -190,7 +190,17 @@ retry_lane() {
 }
 
 acquire_lock
-trap release_lock EXIT
+NEXTEST_REUSE_DIR=""
+
+release_resources() {
+  if [[ -n "$NEXTEST_REUSE_DIR" && -d "$NEXTEST_REUSE_DIR" ]]; then
+    rm -rf -- "$NEXTEST_REUSE_DIR"
+  fi
+  release_lock
+}
+
+trap release_resources EXIT
+NEXTEST_REUSE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-pre-push-nextest.XXXXXX")"
 
 require_exact_clean_head
 tree="$(tree_key)"
@@ -204,47 +214,68 @@ if [[ "${MEERKAT_SKIP_PRE_PUSH_UNIT_CACHE:-0}" != "1" && -f "$stamp_path" ]]; th
   exit 0
 fi
 
+workspace_cargo_metadata="${NEXTEST_REUSE_DIR}/workspace-cargo-metadata.json"
+workspace_binaries_metadata="${NEXTEST_REUSE_DIR}/workspace-binaries-metadata.json"
+headcanonical_binaries_metadata="${NEXTEST_REUSE_DIR}/headcanonical-binaries-metadata.json"
+
+write_cargo_metadata() {
+  "$CARGO" metadata --format-version 1 >"$workspace_cargo_metadata"
+}
+
+build_workspace_inventory() {
+  "$CARGO" nextest list --workspace \
+    --list-type binaries-only --message-format json \
+    -E 'kind(lib) or kind(test)' >"$workspace_binaries_metadata"
+}
+
+build_headcanonical_inventory() {
+  "$CARGO" nextest list -p meerkat-mob --test cold_restart_mob_resume \
+    --features test-support --profile fast \
+    --list-type binaries-only --message-format json \
+    >"$headcanonical_binaries_metadata"
+}
+
+write_cargo_metadata
 retry_lane \
-  "workspace unit build" \
+  "workspace default-feature test build" \
   "$BUILD_TIMEOUT_SECS" \
-  "$CARGO" nextest run --workspace --lib --no-run
+  build_workspace_inventory
 retry_lane \
   "workspace unit lane" \
   "$UNIT_NEXTEST_TIMEOUT_SECS" \
-  "$CARGO" nextest run --workspace --lib --no-fail-fast \
+  "$CARGO" nextest run \
+    --cargo-metadata "$workspace_cargo_metadata" \
+    --binaries-metadata "$workspace_binaries_metadata" \
+    -E 'kind(lib)' --no-tests=fail --no-fail-fast \
     --show-progress none --status-level none --final-status-level fail
-retry_lane \
-  "workspace integration build" \
-  "$BUILD_TIMEOUT_SECS" \
-  "$CARGO" nextest run --workspace --tests --profile fast \
-    --no-run -E 'kind(test)'
 retry_lane \
   "workspace integration lane" \
   "$INTEGRATION_NEXTEST_TIMEOUT_SECS" \
-  "$CARGO" nextest run --workspace --tests --profile fast --no-fail-fast \
-    -E 'kind(test)' \
+  "$CARGO" nextest run \
+    --cargo-metadata "$workspace_cargo_metadata" \
+    --binaries-metadata "$workspace_binaries_metadata" \
+    --profile fast -E 'kind(test)' --no-tests=fail --no-fail-fast \
     --show-progress none --status-level none --final-status-level fail
 retry_lane \
   "HeadCanonical cold-restart build" \
   "$BUILD_TIMEOUT_SECS" \
-  "$CARGO" nextest run -p meerkat-mob --test cold_restart_mob_resume \
-    --features test-support --profile fast --no-tests=fail --no-run
+  build_headcanonical_inventory
 retry_lane \
   "HeadCanonical cold-restart lane" \
   "$NEXTEST_TIMEOUT_SECS" \
-  "$CARGO" nextest run -p meerkat-mob --test cold_restart_mob_resume \
-    --features test-support --profile fast --no-tests=fail \
+  "$CARGO" nextest run \
+    --cargo-metadata "$workspace_cargo_metadata" \
+    --binaries-metadata "$headcanonical_binaries_metadata" \
+    --profile fast -E 'binary(cold_restart_mob_resume)' --no-tests=fail \
     --show-progress none --status-level none --final-status-level fail
-retry_lane \
-  "e2e-fast build" \
-  "$BUILD_TIMEOUT_SECS" \
-  "$CARGO" nextest run -p meerkat-integration-tests --test e2e_fast_lane \
-    --no-run
 retry_lane \
   "e2e-fast lane" \
   "$NEXTEST_TIMEOUT_SECS" \
-  "$CARGO" nextest run -p meerkat-integration-tests --test e2e_fast_lane \
-    --no-fail-fast --show-progress none --status-level none --final-status-level fail
+  "$CARGO" nextest run \
+    --cargo-metadata "$workspace_cargo_metadata" \
+    --binaries-metadata "$workspace_binaries_metadata" \
+    -E 'binary(e2e_fast_lane)' --no-tests=fail --no-fail-fast \
+    --show-progress none --status-level none --final-status-level fail
 
 require_exact_clean_head
 final_tree="$(tree_key)"

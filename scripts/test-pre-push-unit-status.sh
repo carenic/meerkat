@@ -22,33 +22,28 @@ cat > "$FAKE_CARGO" <<'EOF'
 set -euo pipefail
 
 args=" $* "
-if [[ "$args" == *" --test cold_restart_mob_resume "* ]]; then
-  if [[ "$args" == *" --no-run "* ]]; then
-    lane="headcanonical-build"
-  else
-    lane="headcanonical-process-death"
-  fi
-elif [[ "$args" == *" --lib "* ]]; then
-  if [[ "$args" == *" --no-run "* ]]; then
-    lane="unit-build"
-  else
-    lane="unit"
-  fi
-elif [[ "$args" == *" --tests "* ]]; then
-  [[ "$args" == *" -E kind(test) "* ]] || exit 98
-  if [[ "$args" == *" --no-run "* ]]; then
-    lane="integration-build"
-  else
-    lane="integration"
-  fi
-elif [[ "$args" == *" --test e2e_fast_lane "* ]]; then
-  if [[ "$args" == *" --no-run "* ]]; then
-    lane="e2e-fast-build"
-  else
-    lane="e2e-fast"
-  fi
+if [[ "${1:-}" == "metadata" ]]; then
+  printf '{}\n'
+  exit 0
+elif [[ "$args" == *" nextest list "* && "$args" == *" --test cold_restart_mob_resume "* ]]; then
+  lane="headcanonical-build"
+elif [[ "$args" == *" nextest list "* && "$args" == *" --workspace "* ]]; then
+  [[ "$args" == *" -E kind(lib) or kind(test) "* ]] || exit 98
+  lane="workspace-build"
+elif [[ "$args" == *" --binaries-metadata "* && "$args" == *" -E kind(lib) "* ]]; then
+  lane="unit"
+elif [[ "$args" == *" --binaries-metadata "* && "$args" == *" -E kind(test) "* ]]; then
+  lane="integration"
+elif [[ "$args" == *" --binaries-metadata "* && "$args" == *" -E binary(cold_restart_mob_resume) "* ]]; then
+  lane="headcanonical-process-death"
+elif [[ "$args" == *" --binaries-metadata "* && "$args" == *" -E binary(e2e_fast_lane) "* ]]; then
+  lane="e2e-fast"
 else
   exit 99
+fi
+
+if [[ "$args" == *" --binaries-metadata "* && "$args" != *" --no-tests=fail "* ]]; then
+  exit 97
 fi
 printf '%s\n' "$lane" >> "$MEERKAT_PRE_PUSH_TEST_LANE_LOG"
 timeout_lane="${MEERKAT_PRE_PUSH_TEST_TIMEOUT_LANE:-}"
@@ -64,6 +59,9 @@ if [[ "$lane" == "$timeout_lane" && "$timeout_attempts" -gt 0 ]]; then
 fi
 if [[ "$lane" == "$MEERKAT_PRE_PUSH_TEST_FAIL_LANE" ]]; then
   exit "$MEERKAT_PRE_PUSH_TEST_FAIL_STATUS"
+fi
+if [[ "$lane" == "workspace-build" || "$lane" == "headcanonical-build" ]]; then
+  printf '{}\n'
 fi
 EOF
 chmod +x "$FAKE_CARGO"
@@ -117,12 +115,12 @@ assert_failure_case() {
   fi
 }
 
-assert_failure_case unit 37 "unit-build unit"
-assert_failure_case integration 38 "unit-build unit integration-build integration"
+assert_failure_case unit 37 "workspace-build unit"
+assert_failure_case integration 38 "workspace-build unit integration"
 assert_failure_case headcanonical-process-death 39 \
-  "unit-build unit integration-build integration headcanonical-build headcanonical-process-death"
+  "workspace-build unit integration headcanonical-build headcanonical-process-death"
 assert_failure_case e2e-fast 40 \
-  "unit-build unit integration-build integration headcanonical-build headcanonical-process-death e2e-fast-build e2e-fast"
+  "workspace-build unit integration headcanonical-build headcanonical-process-death e2e-fast"
 
 assert_timeout_case() {
   local timeout_lane="$1"
@@ -180,23 +178,19 @@ assert_timeout_case() {
 }
 
 assert_timeout_case unit 1 0 \
-  "unit-build unit unit integration-build integration headcanonical-build headcanonical-process-death e2e-fast-build e2e-fast" 1
-assert_timeout_case unit 2 124 "unit-build unit unit" 0
-assert_timeout_case unit-build 1 0 \
-  "unit-build unit-build unit integration-build integration headcanonical-build headcanonical-process-death e2e-fast-build e2e-fast" 1
-assert_timeout_case unit-build 2 124 "unit-build unit-build" 0
-assert_timeout_case integration-build 1 0 \
-  "unit-build unit integration-build integration-build integration headcanonical-build headcanonical-process-death e2e-fast-build e2e-fast" 1
-assert_timeout_case integration-build 2 124 \
-  "unit-build unit integration-build integration-build" 0
+  "workspace-build unit unit integration headcanonical-build headcanonical-process-death e2e-fast" 1
+assert_timeout_case unit 2 124 "workspace-build unit unit" 0
+assert_timeout_case workspace-build 1 0 \
+  "workspace-build workspace-build unit integration headcanonical-build headcanonical-process-death e2e-fast" 1
+assert_timeout_case workspace-build 2 124 "workspace-build workspace-build" 0
 assert_timeout_case headcanonical-process-death 1 0 \
-  "unit-build unit integration-build integration headcanonical-build headcanonical-process-death headcanonical-process-death e2e-fast-build e2e-fast" 1
+  "workspace-build unit integration headcanonical-build headcanonical-process-death headcanonical-process-death e2e-fast" 1
 assert_timeout_case headcanonical-process-death 2 124 \
-  "unit-build unit integration-build integration headcanonical-build headcanonical-process-death headcanonical-process-death" 0
+  "workspace-build unit integration headcanonical-build headcanonical-process-death headcanonical-process-death" 0
 assert_timeout_case headcanonical-build 1 0 \
-  "unit-build unit integration-build integration headcanonical-build headcanonical-build headcanonical-process-death e2e-fast-build e2e-fast" 1
+  "workspace-build unit integration headcanonical-build headcanonical-build headcanonical-process-death e2e-fast" 1
 assert_timeout_case headcanonical-build 2 124 \
-  "unit-build unit integration-build integration headcanonical-build headcanonical-build" 0
+  "workspace-build unit integration headcanonical-build headcanonical-build" 0
 
 assert_preflight_rejection() {
   local label="$1"
@@ -257,7 +251,7 @@ rm -rf "$TEST_ROOT/.git/meerkat-hook-cache"
     "$REPO_ROOT/scripts/pre-push-unit.sh"
 )
 if [[ "$(paste -sd ' ' "$LANE_LOG")" != \
-  "unit-build unit integration-build integration headcanonical-build headcanonical-process-death e2e-fast-build e2e-fast" ]]; then
+  "workspace-build unit integration headcanonical-build headcanonical-process-death e2e-fast" ]]; then
   echo "successful pre-push lane order was '$(paste -sd ' ' "$LANE_LOG")'" >&2
   exit 1
 fi
@@ -314,7 +308,7 @@ test_head="$(git -C "$TEST_ROOT" rev-parse HEAD)"
     PRE_COMMIT_TO_REF="$test_head" \
     "$REPO_ROOT/scripts/pre-push-unit.sh"
 )
-expected_source_lanes="unit-build unit integration-build integration headcanonical-build headcanonical-process-death e2e-fast-build e2e-fast"
+expected_source_lanes="workspace-build unit integration headcanonical-build headcanonical-process-death e2e-fast"
 if [[ "$(paste -sd ' ' "$LANE_LOG")" != "$expected_source_lanes" ]]; then
   echo "source change lane order was '$(paste -sd ' ' "$LANE_LOG")'; expected '${expected_source_lanes}'" >&2
   exit 1
