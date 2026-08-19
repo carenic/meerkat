@@ -30,6 +30,10 @@ EOF
 cat >"$FAKE_NEXTEST" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+[[ "${MEERKAT_WORKSPACE_ROOT:-}" == "${EXPECTED_WORKSPACE_ROOT:?}" ]] || {
+  echo "archived run omitted MEERKAT_WORKSPACE_ROOT" >&2
+  exit 92
+}
 printf 'nextest' >>"$COMMAND_LOG"
 printf ' <%s>' "$@" >>"$COMMAND_LOG"
 printf '\n' >>"$COMMAND_LOG"
@@ -37,6 +41,7 @@ EOF
 
 chmod +x "$FAKE_CARGO" "$FAKE_NEXTEST"
 export COMMAND_LOG="$LOG"
+export EXPECTED_WORKSPACE_ROOT="$ROOT"
 export ROOT
 export CARGO="$FAKE_CARGO"
 export NEXTEST_BIN="$FAKE_NEXTEST"

@@ -119,7 +119,7 @@ case "${1:-}" in
     if [[ "$profile" == fast ]]; then
       run_args+=(--profile fast)
     fi
-    "$NEXTEST_BIN" "${run_args[@]}"
+    MEERKAT_WORKSPACE_ROOT="$ROOT" "$NEXTEST_BIN" "${run_args[@]}"
     ;;
   *)
     usage
