@@ -1,0 +1,32 @@
+name: Build Nextest archive
+description: Build one canonical Meerkat test family and publish its portable Nextest archive.
+
+inputs:
+  family:
+    description: Canonical archive family.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Build portable test archive
+      id: archive
+      shell: bash
+      env:
+        ARCHIVE_FAMILY: ${{ inputs.family }}
+      run: |
+        set -euo pipefail
+        archive_path="${RUNNER_TEMP}/nextest-${ARCHIVE_FAMILY}.tar.zst"
+        scripts/ci-nextest-archive.sh build "${ARCHIVE_FAMILY}" "${archive_path}"
+        ls -lh "${archive_path}"
+        echo "path=${archive_path}" >>"${GITHUB_OUTPUT}"
+
+    - name: Upload portable test archive
+      uses: actions/upload-artifact@v7
+      with:
+        name: nextest-${{ inputs.family }}-${{ github.sha }}
+        path: ${{ steps.archive.outputs.path }}
+        if-no-files-found: error
+        compression-level: 0
+        overwrite: true
+        retention-days: 3
