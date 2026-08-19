@@ -78,7 +78,9 @@ fn insert_session(conn: &Connection, session: &Session) {
 }
 
 fn run_doctor(temp: &TempDir, args: &[&str]) -> Output {
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rkat"));
+    let binary = std::env::var_os("CARGO_BIN_EXE_rkat")
+        .map(PathBuf::from)
+        .expect("Cargo or Nextest must provide the runtime rkat binary path");
     let project = temp.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
     let mut command = Command::new(binary);

@@ -177,7 +177,8 @@ fn embedded_help_mobpack_examples_match_typed_authoring_contracts()
         "0707070707070707070707070707070707070707070707070707070707070707\n",
     )?;
     let pack = dist.join("release-triage.mobpack");
-    let rkat = env!("CARGO_BIN_EXE_rkat");
+    let rkat = std::env::var_os("CARGO_BIN_EXE_rkat")
+        .expect("Cargo or Nextest must provide the runtime rkat binary path");
 
     let empty_path = temp.path().join("empty-path");
     std::fs::create_dir_all(&empty_path)?;

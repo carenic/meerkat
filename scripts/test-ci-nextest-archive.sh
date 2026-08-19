@@ -77,6 +77,10 @@ while IFS= read -r command; do
     echo "archived run omitted --no-tests=fail: ${command}" >&2
     exit 1
   }
+  # This proves that every archived execution passes Nextest's relocation
+  # flag. Compile-time CARGO_MANIFEST_DIR reads can still embed the builder
+  # checkout, so the count ratchet below prevents that known gap from growing
+  # until the dedicated portability cleanup removes it.
   [[ "$command" == *' <--workspace-remap> '* ]] || {
     echo "archived run omitted --workspace-remap: ${command}" >&2
     exit 1
@@ -165,5 +169,22 @@ else_job="$(sed -n '/^  int-else:$/,/^  int-rest:$/p' "$WORKFLOW")"
   echo "int-else execution does not depend on int-archives" >&2
   exit 1
 }
+
+if rg -n 'env!\("CARGO_BIN_EXE_' "$ROOT" --glob '*.rs'; then
+  echo "archived tests must resolve Cargo binary paths from the runtime environment" >&2
+  exit 1
+fi
+
+manifest_dir_env_matches="$(
+  rg -n 'env!\("CARGO_MANIFEST_DIR"\)' "$ROOT" --glob '*.rs' || true
+)"
+manifest_dir_env_count="$(
+  printf '%s\n' "$manifest_dir_env_matches" | sed '/^$/d' | wc -l | tr -d '[:space:]'
+)"
+if ((manifest_dir_env_count > 71)); then
+  printf '%s\n' "$manifest_dir_env_matches" >&2
+  echo "compile-time CARGO_MANIFEST_DIR archive paths grew from the pinned budget of 71" >&2
+  exit 1
+fi
 
 echo "CI nextest archive family and fail-closed contracts hold"
