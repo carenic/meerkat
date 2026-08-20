@@ -454,6 +454,22 @@ fn apply_resumed_session_metadata_with_role_migration(
         resume_from_role,
     )?;
     if role_migrated {
+        if let (Some(declared_predecessor_role), Some((_, requested_role, current_member))) = (
+            resume_from_role,
+            split_member_comms_name(&current_comms_name),
+        ) {
+            let member = config
+                .mob_member_binding
+                .as_ref()
+                .map(|binding| binding.member.as_str())
+                .unwrap_or(current_member);
+            tracing::info!(
+                member,
+                from_role = declared_predecessor_role.as_str(),
+                to_role = requested_role,
+                "applied declared member role migration"
+            );
+        }
         // AgentFactory performs its own generic resume projection after this
         // mob-specific admission. Fence the two identity projections that
         // must stay current so durable metadata cannot overwrite the admitted
@@ -3718,6 +3734,27 @@ mod tests {
                 .map(String::as_str),
             Some("home-automation"),
             "peer metadata must be restamped to the current durable role"
+        );
+    }
+
+    #[test]
+    fn consumed_role_migration_declaration_is_inert_after_the_restamp() {
+        let (mut config, mut metadata) = role_migration_fixture();
+        metadata.comms_name = config.comms_name.clone();
+        metadata.mob_member_binding = config.mob_member_binding.clone();
+        metadata.peer_meta = Some(PeerMeta::default().with_label("role", "home-automation"));
+
+        let expected_comms_name = config.comms_name.clone();
+        let expected_binding = config.mob_member_binding.clone();
+        let declared = ProfileName::from("domain");
+        apply_resumed_session_metadata_with_role_migration(&mut config, &metadata, Some(&declared))
+            .expect("an already-consumed predecessor declaration must be inert");
+
+        assert_eq!(config.comms_name, expected_comms_name);
+        assert_eq!(config.mob_member_binding, expected_binding);
+        assert!(
+            !config.resume_override_mask.comms_name && !config.resume_override_mask.peer_meta,
+            "a declaration must not authorize another restamp once durable and current roles match"
         );
     }
 
