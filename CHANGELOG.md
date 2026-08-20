@@ -53,6 +53,15 @@ them.
   forward-only against a shared durable store: rollback requires another
   declared forward migration (or separately versioned durable state), not an
   old binary silently reclaiming the predecessor role.
+- Persistent session event logs no longer consume the bounded, best-effort UI
+  broadcast stream. A long or bursty turn could previously outrun that ring
+  while the durable projector appended events, permanently halting the session
+  with `SessionEventProjectionLagged`. The singular durable projector now uses
+  its own dedicated queue, while UI subscribers retain typed
+  `StreamLagged` markers when they fall behind. A rate-limited warning reports
+  projector queue depth and high-water once the backlog reaches 1,024 events,
+  and shared event envelopes avoid duplicating large payloads between the
+  durable queue and ordinary broadcast stream.
 - Provider failures whose class is genuinely unknown now enter the existing
   machine-authorized, bounded retry path instead of terminalizing the agent on
   the first attempt. The retry budget and exponential backoff are unchanged;
