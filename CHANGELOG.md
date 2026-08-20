@@ -28,6 +28,8 @@ them.
 
 ## [Unreleased]
 
+## [0.8.25] - 2026-08-20
+
 ### Breaking
 
 - **`meerkat_mob::MemberLaunchMode::Resume` gains
@@ -38,6 +40,10 @@ them.
   strict same-role resume. `meerkat_mob::MobError` gains
   `MemberRoleMigrationRequired` and `MemberRoleMigrationRejected`; exhaustive
   matches must add both arms.
+- **`meerkat_rpc::handlers::event::ExternalEventParams` is removed.** The
+  `session/external_event` handler now consumes the catalog-generated
+  `meerkat_contracts::SessionExternalEventParams`; downstream imports of the
+  handler-local struct must move to that canonical contract type.
 
 ### Corrected
 
