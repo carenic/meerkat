@@ -28,6 +28,8 @@ them.
 
 ## [Unreleased]
 
+## [0.8.25] - 2026-08-20
+
 ### Breaking
 
 - **`meerkat_mob::MemberLaunchMode::Resume` gains
@@ -38,9 +40,21 @@ them.
   strict same-role resume. `meerkat_mob::MobError` gains
   `MemberRoleMigrationRequired` and `MemberRoleMigrationRejected`; exhaustive
   matches must add both arms.
+- **`meerkat_rpc::handlers::event::ExternalEventParams` is removed.** The
+  `session/external_event` handler now consumes the catalog-generated
+  `meerkat_contracts::SessionExternalEventParams`; downstream imports of the
+  handler-local struct must move to that canonical contract type.
 
 ### Corrected
 
+- Python and TypeScript RPC clients now bind all 164 catalog methods to
+  generated request and result contracts instead of maintaining a parallel
+  hand-written wire surface. Python auth login-start requests now include the
+  required realm and binding selectors, and the generated
+  `session/external_event` request contract includes its required `session_id`.
+  Python codegen also preserves outer object properties around root `oneOf`
+  variants, while TypeScript content normalization leaves opaque bridge JSON
+  unchanged.
 - Durable mob members can now perform an explicitly declared, one-shot role
   migration on an exact Resume request. The declaration must name the one
   durable predecessor role; mob id and member identity never migrate, wrong or
