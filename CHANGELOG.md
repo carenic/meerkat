@@ -41,6 +41,14 @@ them.
 
 ### Corrected
 
+- Python and TypeScript RPC clients now bind all 164 catalog methods to
+  generated request and result contracts instead of maintaining a parallel
+  hand-written wire surface. Python auth login-start requests now include the
+  required realm and binding selectors, and the generated
+  `session/external_event` request contract includes its required `session_id`.
+  Python codegen also preserves outer object properties around root `oneOf`
+  variants, while TypeScript content normalization leaves opaque bridge JSON
+  unchanged.
 - Durable mob members can now perform an explicitly declared, one-shot role
   migration on an exact Resume request. The declaration must name the one
   durable predecessor role; mob id and member identity never migrate, wrong or
