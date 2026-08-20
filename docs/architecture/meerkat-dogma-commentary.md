@@ -6,7 +6,7 @@ icon: "book-open"
 
 # Meerkat Dogma Commentary
 
-Status: Draft companion commentary
+Status: Accepted companion commentary
 Primary doctrine: `docs/architecture/meerkat-dogma.md`
 
 ## Purpose
@@ -1672,7 +1672,17 @@ A REST or RPC event channel lags, drops events, logs the lag, and continues. If
 observers rely on those events to reconstruct lifecycle or terminal outcome,
 the drop is semantic.
 
-Correct shape: dropped observations have declared consequence: reject, replay,
+Current Meerkat makes this split explicit. A configured persistent event audit
+projector receives envelopes through a dedicated unbounded queue independent
+of the bounded UI broadcast. A lagging UI subscriber receives a typed
+`StreamTruncated` marker with the dropped count and must resynchronize; that UI
+lag cannot drop projector input. The audit append is still asynchronous derived
+state. A failure latches projection halt and refuses later replay entries past
+the gap without undoing the committed session turn.
+
+Correct shape: decide whether the channel is an authority path or an
+observability projection. An authority path must be lossless or fail closed.
+Dropped projection observations have a declared consequence: reject, replay,
 resync, degrade, or mark the observer stale.
 
 #### Schema Default As Recovery

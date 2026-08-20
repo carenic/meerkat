@@ -1,7 +1,7 @@
 /**
- * 027 — Skills V2.1 Invocation (TypeScript SDK)
+ * 027 - Canonical Skill Invocation (TypeScript SDK)
  *
- * Invoke a specific skill using canonical refs (`SkillKey`) from the rebuilt
+ * Invoke a specific skill using canonical refs (`SkillKey`) from the current
  * skill system.
  *
  * Run:

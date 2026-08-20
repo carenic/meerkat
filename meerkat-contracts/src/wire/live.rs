@@ -1753,7 +1753,7 @@ impl TryFrom<RealtimeTranscriptEvent> for WireRealtimeTranscriptEvent {
 ///
 /// FIX-SDK-OBS: closes the R5-4 verifier gap. The core enum is the canonical
 /// shape adapters emit, but it is not registered for schema emission and is
-/// therefore invisible at the SDK boundary — browser/Python clients receive
+/// therefore invisible at the SDK boundary - browser/Python clients receive
 /// observations as untyped JSON and cannot type-narrow on
 /// `assistant_audio_chunk` (to read the new `item_id` / `response_id` /
 /// `content_index` fields driving `live/truncate`) or on `command_rejected`
@@ -1766,7 +1766,7 @@ impl TryFrom<RealtimeTranscriptEvent> for WireRealtimeTranscriptEvent {
 /// byte-identical (see `wire_live_adapter_observation_byte_compatible_with_core`).
 ///
 /// Field types reference other wire mirrors where they exist
-/// ([`WireStopReason`], [`WireUsage`], [`WireLiveAdapterStatus`],
+/// ([`WireStopReason`], [`crate::wire::WireUsage`], [`WireLiveAdapterStatus`],
 /// [`WireLiveAdapterErrorCode`]) and the public-safe
 /// [`WireRealtimeTranscriptEvent`].
 ///

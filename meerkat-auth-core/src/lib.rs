@@ -6,10 +6,10 @@
 //! (PKCE/callback/device-code/token-exchange), and generic cloud-IAM
 //! authorizers (AWS SigV4, Google ADC, Azure AD).
 //!
-//! Non-wasm32 by construction: the filesystem, keyring, and OS lockfile
-//! primitives this crate wraps are not available in the browser. Provider
-//! crates (`meerkat-anthropic`, `meerkat-openai`, `meerkat-gemini`) depend
-//! on this crate for their cloud-IAM backends via feature flags.
+//! Filesystem stores, keyring access, OS lockfiles, interactive OAuth, and
+//! cloud-IAM authorizers are native-only. The resolver and self-hosted runtime
+//! modules also compile on wasm32 so browser hosts can resolve inline or
+//! externally supplied credentials and register provider runtimes.
 //!
 //! Deferral §3 B2 split (2026-04-18): extracted from `meerkat-providers`.
 

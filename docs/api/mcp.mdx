@@ -131,6 +131,36 @@ privilege-escalation vector. Host/grant/live admin lives on JSON-RPC/SDK plus
 CLI; hard cancel is JSON-RPC/SDK-only. Unknown tool names fail closed.
 </Note>
 
+<Warning>
+`resume_from_role` is not accepted by `meerkat_mob_spawn`, spawn-many, helper,
+or profile tools. Durable member role migration is a one-request trusted-host
+operation available only to in-process `SpawnMemberSpec` and the private
+member-host materialization protocol. It is not an MCP permission or a standing
+profile setting.
+</Warning>
+
+### Surface boundaries
+
+The MCP server deliberately does not mirror every operator API:
+
+| Domain | MCP exposure |
+|--------|--------------|
+| Approvals | None; use JSON-RPC/SDK `approval/*` |
+| Durable jobs and monitors | None; use JSON-RPC/SDK `jobs/*` and `monitors/start` |
+| Blobs | `meerkat_blob_get` fetches a known blob ID |
+| Stable artifact records/downloads | None; use JSON-RPC/SDK `artifact/*` |
+| Live audio/WebRTC channels | None; use JSON-RPC/SDK `live/*` |
+| Multi-host mobs | Placement plus observation only; admin remains RPC/SDK/CLI |
+
+Session event streams are bounded live subscriptions. If a consumer falls
+behind, the stream yields the typed `stream_truncated` event with a
+`StreamLagged` dropped count and then continues with retained events. That is a
+live-delivery gap, not an EventStore projection result. Built-in realm-backed
+persistent sessions can feed a separate durable audit projector whose unbounded
+queue is independent of the UI ring. That projection is asynchronous derived
+state, so reconcile available replay/snapshot evidence with current session
+state when completeness matters.
+
 ## Use MCP servers as tools (client)
 
 ### CLI configuration (recommended)
@@ -145,10 +175,10 @@ rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp
 rkat mcp add api --url https://mcp.example.com/api
 
 # Add a streamable HTTP server with Claude-compatible positional URL syntax
-rkat mcp add --transport http glean https://king-be.glean.com/mcp/default
+rkat mcp add --transport http remote https://mcp.example.com/api
 
 # Log in when the HTTP server requires OAuth
-rkat mcp login glean
+rkat mcp login remote
 
 # List servers
 rkat mcp list
@@ -190,8 +220,8 @@ Project config wins on name collisions.
   # OAuth-protected HTTP server. No OAuth schema is persisted here;
   # discovery and token storage happen when connecting or running `mcp login`.
   [[servers]]
-  name = "glean"
-  url = "https://king-be.glean.com/mcp/default"
+  name = "remote-oauth"
+  url = "https://mcp.example.com/api"
 
   # Legacy SSE server
   [[servers]]
@@ -272,14 +302,20 @@ need a mob-only MCP host, `meerkat-mob-mcp` exposes `public_tools_list()` and
 `meerkat-mob-mcp::tools_list()` and `handle_tools_call()` remain the internal
 agent-side `mob_*` dispatcher helpers; they are not the public host contract.
 
-The bundled `rkat-mcp` binary supports realm scope flags:
+The bundled `rkat-mcp` binary supports the complete runtime scope flags:
 
 ```bash
-rkat-mcp --realm team-alpha --instance worker-1 --realm-backend sqlite
+rkat-mcp [--realm <id>] [--isolated] [--instance <id>] \
+  [--realm-backend <sqlite|jsonl|memory>] [--state-root <path>] \
+  [--context-root <path>] [--user-config-root <path>] [--expose-paths]
 ```
 
 If `--realm` is omitted, the server creates a new isolated realm by default.
 `--realm-backend` is a creation hint only; after the first open, the manifest-pinned backend is authoritative.
+The bundled binary is stdio-only. If an embedding host publishes these tools
+over HTTP, that host owns transport authentication, authorization, and
+encryption; provider auth bindings configure outbound model credentials and do
+not authenticate inbound MCP callers.
 
 ## Tool reference
 

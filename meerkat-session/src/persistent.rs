@@ -347,7 +347,7 @@ pub struct DurableEventProjectionHaltMarker {
 /// before the marker or any later event is appended.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "session event projection lagged for session {session_id}: {dropped} canonical events were dropped"
+    "session event projection lagged for session {session_id}: {dropped} projector input events were dropped"
 )]
 pub struct SessionEventProjectionLagged {
     session_id: SessionId,
@@ -511,7 +511,7 @@ async fn append_and_project_event(
             session_id = %session_id,
             degraded_projection = true,
             error = %error,
-            "derived .rkat/ projection degraded; canonical event log is intact and replay will regenerate it"
+            "derived .rkat/ view degraded; projected event rows remain available for replay"
         );
     }
 
@@ -585,7 +585,7 @@ async fn project_session_event_stream(
         )
         .await
         {
-            // Terminal durability fault: the canonical event log append
+            // Terminal projection fault: the derived event-log append
             // failed, leaving a sequence hole. Stop draining the stream
             // rather than appending past the hole and compounding it, and
             // record the typed fault so replay reads fail closed.
@@ -710,7 +710,7 @@ async fn project_create_time_events(
                     )
                     .await
                     {
-                        // Terminal durability fault: the canonical event log
+                        // Terminal projection fault: the derived event log
                         // append failed, leaving a sequence hole. Stop the
                         // projection loop rather than continuing to append past
                         // the hole and compounding it, and record the typed
@@ -12252,7 +12252,11 @@ mod tests {
             .projection_halt(&session_id)
             .await?
             .expect("lag must persist a durable projection halt");
-        assert!(marker.reason.contains("17 canonical events were dropped"));
+        assert!(
+            marker
+                .reason
+                .contains("17 projector input events were dropped")
+        );
         assert!(
             concrete_store.read_from(&session_id, 0).await?.is_empty(),
             "neither the synthetic marker nor later events may be renumbered into the durable log"

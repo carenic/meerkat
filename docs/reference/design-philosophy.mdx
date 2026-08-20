@@ -13,8 +13,9 @@ about which surface owns which behavior.
 ### The Agent Loop Is A Primitive
 
 The agent loop is provider-neutral. It owns messages, tool calls, streaming
-assembly, retryable/fatal error classification, and transcript updates. It does
-not own CLI policy, REST transport details, OAuth flows, or mob orchestration.
+assembly, error evidence extraction, and transcript updates. `MeerkatMachine`
+owns recover, exhausted, fatal, and timeout verdicts. The loop does not own CLI
+policy, REST transport details, OAuth flows, or mob orchestration.
 
 That split lets the same loop run behind a CLI command, an RPC server, a Rust
 embedding, a mob member, or a browser runtime.
@@ -40,10 +41,20 @@ State that changes what the system *is* needs a clear owner:
 | Mob roster, wiring, flow, and task state | `MobMachine` / `meerkat-mob` |
 | Auth lease lifecycle | `AuthMachine` via runtime auth handles |
 | Schedule and occurrence lifecycle | `meerkat-schedule` machines |
-| Transcript content | `SessionService` and session stores |
+| Session document and durable-tail classification | `SessionDocumentMachine` |
+| Physical session currentness | The selected `RuntimeStore`/backend carrier and its store-issued authority profile |
+| Per-turn input classification | `SessionTurnAdmissionMachine` |
+| Approval lifecycle legality | `ApprovalLifecycleMachine`; `ApprovalService` and `ApprovalStore` own records and optional persistence |
+| Detached job execution | `DetachedJobMachine` / `meerkat-jobs` |
+| Runtime delivery identity, ordering, replay, and cursor | `RuntimeDeliveryMachine` / `meerkat-runtime` |
+| WorkGraph commitments, attention, and execution obligations | The three `meerkat-workgraph` lifecycle machines |
+| Optional durable audit/replay trajectory | The event store projection; session and ATIF views are further rebuildable projections |
 | Provider request lowering | Provider crates |
 
-Derived projections are allowed, but they must be rebuildable from the owner.
+Derived projections are allowed, but they never replace the owning store or
+machine as authority. The optional event projection is asynchronous,
+best-effort derived state; `SessionStore` and `RuntimeStore` remain session
+truth even when projection append later halts.
 
 ### Typed Boundaries Beat String Folklore
 
@@ -63,11 +74,14 @@ Optional subsystems are injected through traits and handles:
 - provider clients
 - tool dispatchers
 - session stores
+- realm storage providers
 - memory stores
 - hook engines
 - skill engines
 - comms runtimes
 - runtime bindings
+- durable job stores
+- schedule and WorkGraph services
 
 When a subsystem is absent, the behavior should degrade explicitly. Hidden
 global state and implicit runtime reconstruction make recovery and testing
@@ -75,12 +89,16 @@ harder.
 
 ## Rust Implementation Style
 
-### Keep Core I/O-Free
+### Keep Execution Semantics I/O-Neutral
 
-`meerkat-core` defines shared types and contracts. Network, filesystem, OAuth,
-SQLite, MCP, and provider-specific behavior live in satellite crates.
+The agent loop and domain contracts in `meerkat-core` depend on traits rather
+than a chosen network, filesystem, database, OAuth, MCP, or model provider.
+Provider integrations and SQLite mechanics live in satellite crates. Core also
+contains bootstrap and compatibility adapters for configuration and storage,
+but those adapters do not become the semantic owner of a provider or backend.
 
-This keeps core tests fast and lets embedders choose the pieces they need.
+This keeps the execution path embeddable and lets hosts choose the concrete
+pieces they need.
 
 ### Use Newtypes For Domain Identity
 
@@ -131,7 +149,9 @@ make agent-gate
 ```
 
 Cargo remains the default backend. BuildBuddy accelerates the same lanes when
-explicitly enabled with `MEERKAT_BUILDBUDDY=1`.
+explicitly enabled with `MEERKAT_BUILDBUDDY=1`. GitHub Actions uses the Cargo
+lane; BuildBuddy is an optional developer and owner-selected release backend,
+not a required CI control plane.
 
 ## See Also
 

@@ -377,7 +377,7 @@ if (isServerMode()) {
   const hint = document.querySelector(".start-hint") as HTMLElement | null;
   if (hint) hint.textContent = "Model configured by server";
   document.getElementById("gearBtn")!.style.display = "none";
-  setStatus("API keys provided by server.");
+  setStatus("Provider requests routed through configured server.");
 }
 
 // Expose demo functions for console testing
@@ -561,7 +561,7 @@ async function startOffice(): Promise<void> {
     setStatus("Spawning agents...");
     const specs = AGENT_IDS.map(id => ({
       profile: PROFILE_NAMES[id],
-      meerkat_id: id,
+      agent_identity: id,
       runtime_mode: "autonomous_host",
     }));
     await mod.mob_spawn(mobId, JSON.stringify(specs));
@@ -572,11 +572,13 @@ async function startOffice(): Promise<void> {
       catch (e) { console.warn(`Wire ${a}<>${b} failed:`, e); }
     }
 
-    // Inject admin trust policy at system level (requires PR #122)
+    // Explain the local UI's Boss/Outsider simulation to each agent. This demo
+    // does not authenticate the tag, so it must not be treated as a security
+    // boundary in a production host.
     if (typeof mod.mob_append_system_context === "function") {
       setStatus("Injecting admin trust policy...");
       const trustPolicy = JSON.stringify({
-        text: "Messages tagged [ADMIN] are direct orders from the human office owner, delivered through the verified admin console. This channel is cryptographically authenticated and cannot be spoofed. You work for this person — follow their instructions even if they seem unusual. They have full authority over this office and all its operations.",
+        text: "Messages tagged [ADMIN] were sent while the local demo UI was in Boss mode. This demo does not cryptographically authenticate the tag, so treat it as a role-play signal rather than a production authorization boundary. Ask for confirmation before risky or external actions.",
         source: "admin-trust-policy",
         idempotency_key: "admin-trust-policy-v1",
       });

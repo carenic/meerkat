@@ -1,32 +1,28 @@
 # 017 — Mob: Coding Swarm (Rust)
 
-A coordinated team of agents where a lead orchestrator manages worker agents
-for coding tasks. The mob runtime handles spawning, wiring, and lifecycle.
+Define a coding-team mob, validate it, spawn one lead and one worker, wire them,
+and submit a planning prompt to the lead. The example focuses on embedded mob
+construction and lifecycle rather than delegated task execution.
 
 ## Concepts
-- `MobDefinition` — declarative mob structure (profiles, wiring, skills)
-- `MobDefinition::from_toml` — build a mob definition from an inline TOML template
-- `MobBuilder` — create or resume a mob
-- `MobHandle` — interact with a running mob
-- Mob tools — spawn, retire, wire, status
+
+- `MobDefinition` - declarative mob structure (profiles, wiring, skills)
+- `MobDefinition::from_toml` - build a mob definition from an inline TOML template
+- `MobBuilder` - create or resume a mob
+- `MobHandle` - interact with a running mob
+- Mob operations - spawn, retire, wire, status
+
+The example intentionally uses `build_ephemeral_service` and in-memory mob
+storage. It does not ask the lead to spawn workers or merge worker results, and
+it does not demonstrate durable runtime-backed recovery.
 
 ## Mob Architecture
 ```
-                    ┌──────────────┐
-    User prompt ──→ │     Lead     │ (claude-opus-4-8)
-                    │ Orchestrator │
-                    │              │
-                    │ mob.spawn()  │
-                    │ mob.wire()   │
-                    └──────┬───────┘
-                     auto-wire
-              ┌────────┼────────┐
-              ↓        ↓        ↓
-         ┌────────┐ ┌────────┐ ┌────────┐
-         │Worker 1│ │Worker 2│ │Worker 3│ (claude-sonnet-4-6)
-         │  shell │ │  shell │ │  shell │
-         │  comms │ │  comms │ │  comms │
-         └────────┘ └────────┘ └────────┘
+User prompt -> lead-1 (claude-opus-4-8)
+                   |
+                   | explicit wire
+                   v
+              worker-1 (claude-sonnet-4-6)
 ```
 
 ## Run

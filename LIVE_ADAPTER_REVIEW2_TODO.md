@@ -1,5 +1,10 @@
 # Live-Adapter Review-2 — Outstanding Issues
 
+> Historical PR #650 review ledger. Checkbox state below describes that
+> implementation cycle, not current Meerkat. Use `docs/guides/realtime.mdx`
+> and `docs/reference/runtime-architecture.mdx` for current live-channel
+> contracts.
+
 Tracking document for the second-round external review on the
 `live-adapter-mvp` branch (PR #650). Eight original findings: 3
 architectural P1s (refresh/open semantics + projection snapshot

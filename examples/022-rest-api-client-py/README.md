@@ -31,5 +31,5 @@ export RKAT_REST="$(./scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_D
 ANTHROPIC_API_KEY=sk-... "$RKAT_REST"
 
 # Terminal 2: Run the example
-python3 main.py
+python3 examples/022-rest-api-client-py/main.py
 ```

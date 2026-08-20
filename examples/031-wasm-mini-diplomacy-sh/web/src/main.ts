@@ -369,7 +369,7 @@ async function startMatch(): Promise<void> {
       await mod.mob_wire(mobId, `${team}-planner`, `${team}-ambassador`);
 
       for (const role of ["planner", "operator", "ambassador"] as const) {
-        try { subs.push({ meerkatId: `${team}-${role}`, handle: await mod.mob_member_subscribe(mobId, `${team}-${role}`), role, team }); }
+        try { subs.push({ agentIdentity: `${team}-${role}`, handle: await mod.mob_member_subscribe(mobId, `${team}-${role}`), role, team }); }
         catch (e) { console.warn(`Failed to subscribe to ${team}-${role}:`, e); }
       }
       factions.push({ team, mobId });
@@ -442,7 +442,7 @@ if (isServerMode()) {
   if (hint) hint.textContent = "Models configured by server";
   // Update status line
   const statusLine = document.getElementById("statusLine");
-  if (statusLine) statusLine.textContent = "API keys provided by server. Starting...";
+  if (statusLine) statusLine.textContent = "Provider requests routed through configured server. Starting...";
   // Hide start button (auto-start instead)
   const startBtn = document.getElementById("startBtn");
   if (startBtn) startBtn.style.display = "none";

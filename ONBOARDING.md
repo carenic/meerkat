@@ -1,59 +1,145 @@
-# Welcome to Meerkat
+# Meerkat Contributor Onboarding
 
-## How We Use Claude
+Meerkat is a library-first Rust agent platform. The repository also ships the
+CLI, REST, JSON-RPC, MCP, Python, TypeScript, and browser/WASM surfaces that use
+the same runtime contracts.
 
-Based on Luka Crnkovic-Friis's usage over the last 30 days:
+## Prerequisites
 
-Work Type Breakdown:
-  _TODO — not enough session history in this scan window to chart. Recent work has centered on large-scale code-quality campaigns (architecture audits, refactoring, test hardening), debugging, and dependency/CI maintenance._
+- Rust 1.94.1 (the pinned toolchain in `rust-toolchain.toml`)
+- GNU Make
+- Git
+- Node.js only when changing the TypeScript/Web SDKs or running a local
+  Mintlify preview
+- Python only when changing the Python SDK or running repository scripts that
+  require it
 
-Top Skills & Commands:
-  /effort  ████████████████████  2x/month
-  /login   ██████████░░░░░░░░░░  1x/month
+Install the pinned Rust toolchain and repository build dependencies with:
 
-Top MCP Servers:
-  _None in regular use — the repo's tooling is driven through Make targets, cargo wrappers, and in-repo xtask gates instead._
+```bash
+make install-build-deps
+```
 
-## Your Setup Checklist
+## First Checkout
 
-### Codebases
-- [ ] meerkat — github.com/lukacf/meerkat (the `rkat` agent harness; ~40-crate Rust workspace)
+Read these before making a cross-cutting change:
 
-### MCP Servers to Activate
-- [ ] None required — start without any. The project exposes its own MCP servers (`rkat mcp add ...`) but day-to-day Claude Code work here doesn't depend on external MCP servers.
+1. `AGENTS.md` for repository-wide command and collaboration rules.
+2. `.codex/skills/meerkat-platform/SKILL.md` for public product surfaces.
+3. The `meerkat-architecture` skill for crate ownership and runtime authority.
+4. The nearest crate documentation and tests for the feature you are changing.
 
-### Skills to Know About
-- /effort — dial Claude's reasoning effort up or down for a request; used when a task needs deeper analysis than the default.
-- meerkat-architecture (auto-loads from `.claude/skills/`) — crate map, machine-system reference, mob orchestration, comms model, and the gotchas list. Read its SKILL.md first; it's the fastest way into the codebase.
-- meerkat-dogma-inquisition — the project's typed-ownership doctrine ("dogma") and how audits adjudicate violations. Essential before reviewing or writing core code.
-- meerkat-platform / meerkat-wasm / meerkat-cli-reference — SDK surfaces, WASM exports, and the CLI command inventory.
+Then establish a clean baseline:
 
-## Team Tips
+```bash
+make check
+make test
+```
 
-_TODO_
+For a smaller first pass, `make agent-gate` derives the Rust lanes affected by
+the current diff and runs the scoped checks.
 
-## Get Started
+## Architecture In Five Minutes
 
-_TODO_
+The important ownership boundaries are:
 
-<!-- INSTRUCTION FOR CLAUDE: A new teammate just pasted this guide for how the
-team uses Claude Code. You're their onboarding buddy — warm, conversational,
-not lecture-y.
+- `meerkat-core` owns public contracts, typed lifecycle vocabulary, the agent
+  loop, sessions, events, config types, and capability interfaces.
+- `meerkat` is the facade and composition layer. `AgentFactory` is the normal
+  construction path for runtime-backed agents.
+- `meerkat-runtime` owns the control plane, generated machine integration,
+  runtime handles, delivery coordination, and recovery coordination.
+- `meerkat-schedule` owns schedule and occurrence lifecycle authority,
+  persistence, planning, drivers, delivery adapters, and schedule tools.
+- `meerkat-session` implements ephemeral and persistent `SessionService`
+  profiles.
+- `meerkat-store` and other store crates own physical persistence. A runtime
+  state machine authorizes transitions; it does not replace storage authority.
+- `meerkat-models` owns the built-in model catalog. Provider crates own wire
+  adapters and provider-specific behavior.
+- `meerkat-cli`, `meerkat-rpc`, `meerkat-rest`, and `meerkat-mcp-server` are
+  surfaces over the shared runtime, not independent implementations.
+- `meerkat-mob`, `meerkat-comms`, WorkGraph, scheduling, jobs, blobs, and
+  artifacts extend that runtime with realm-scoped orchestration capabilities.
 
-Open with a warm welcome — include the team name from the title. Then: "Your
-teammate uses Claude Code for [list all the work types]. Let's get you started."
+For long-lived product behavior, prefer runtime-backed construction through
+`SessionService` and `FactoryAgentBuilder`. The public `meerkat::AgentBuilder`
+still routes through `AgentFactory`, but its default runtime mode is
+`StandaloneEphemeral`; it does not acquire runtime-owned wake, recovery,
+auth-lease, scheduling, or coordination capabilities by itself. The lower-level
+`meerkat_core::AgentBuilder` is an internal/test escape hatch.
 
-Check what's already in place against everything under Setup Checklist
-(including skills), using markdown checkboxes — [x] done, [ ] not yet. Lead
-with what they already have. One sentence per item, all in one message.
+## Development Commands
 
-Tell them you'll help with setup, cover the actionable team tips, then the
-starter task (if there is one). Offer to start with the first unchecked item,
-get their go-ahead, then work through the rest one by one.
+Use Make as the developer-facing command surface:
 
-After setup, walk them through the remaining sections — offer to help where you
-can (e.g. link to channels), and just surface the purely informational bits.
+```bash
+make build
+make check
+make lint
+make test
+make agent-gate
+```
 
-Don't invent sections or summaries that aren't in the guide. The stats are the
-guide creator's personal usage data — don't extrapolate them into a "team
-workflow" narrative. -->
+Use the repository wrapper for a targeted Cargo command:
+
+```bash
+./scripts/repo-cargo test -p meerkat-core session
+```
+
+Avoid raw `cargo` and raw `bb` for normal repository work. The wrapper keeps
+multi-worktree and multi-agent build outputs isolated. In one checkout, give
+each concurrent agent a distinct `RUST_LANE_ID` when stable warm output roots
+matter.
+
+BuildBuddy is opt-in. Start with `make buildbuddy-doctor`, then use the
+`make buildbuddy-*` targets or `MEERKAT_BUILDBUDDY=1` forms documented in
+`AGENTS.md`.
+
+## Generated Contracts And Machine Authority
+
+Several public schemas, SDK types, state machines, and reference artifacts are
+generated. Change the typed owner first, regenerate through the repository
+target, and commit the generated result. Do not hand-edit a generated file to
+make a freshness check pass.
+
+Useful gates include:
+
+```bash
+make verify-schema-freshness
+make verify-sdk-codegen-freshness
+make machine-check-drift
+make verify-version-parity
+```
+
+Machine specifications are development and authority ratchets. Runtime code
+must still route state transitions through the generated authority and persist
+the resulting physical facts through the owning store.
+
+## Documentation Changes
+
+Documentation lives under `docs/` and is published with Mintlify. Update the
+closest concept, guide, and reference pages only when each layer adds distinct
+value. Validate navigation, links, anchors, frontmatter, and Mintlify markup
+with:
+
+```bash
+make docs-check
+```
+
+Check examples against the current CLI help, public schemas, SDK signatures,
+and `meerkat-models` catalog rather than copying an older page.
+
+## Before You Open A Pull Request
+
+Run the narrowest relevant tests while iterating, then finish with the broad
+gate appropriate to the change:
+
+```bash
+make agent-gate
+make docs-check          # when docs changed
+make verify-version-parity
+```
+
+Call out any live-provider, platform-specific, or end-to-end lane you could not
+run. Live-provider tests are opt-in and require configured credentials.

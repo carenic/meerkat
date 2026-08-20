@@ -2197,7 +2197,7 @@
             "type": "boolean"
           },
           "durable_sessions": {
-            "description": "Host persists sessions durably (event-sourced); `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
+            "description": "Host persists session state durably; `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
             "type": "boolean"
           },
           "engine_version": {
@@ -5284,7 +5284,7 @@
           },
           {
             "additionalProperties": false,
-            "description": "Transcript snapshot page for a remote member. Row type is the canonical\nwire transcript row (`WireSessionMessage`) — the same rows the local\n`SessionHistoryPage` projection produces — via the [`WireHistoryRow`]\nequality adapter.",
+            "description": "Transcript snapshot page for a remote member. Row type is the canonical\nwire transcript row (`WireSessionMessage`) - the same rows the local\n`SessionHistoryPage` projection produces via the\n[`WireHistoryRow`](crate::wire::WireHistoryRow)\nequality adapter.",
             "properties": {
               "generation": {
                 "description": "Member generation the page was read at; a bump means the visible\ngeneration window changed (the underlying session may be reused).",
@@ -7088,7 +7088,7 @@
             "type": "object"
           },
           {
-            "description": "A `pre_*` background hook attempted a non-observe action (patch or deny),\nwhich is not permitted for observe-only background hooks.",
+            "description": "A background hook attempted a non-observe action, which is not\npermitted for observe-only background hooks at any hook point.",
             "properties": {
               "reason_code": {
                 "const": "observe_only_violation",
@@ -18210,7 +18210,7 @@
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "Request payload for `session/fork_replace`.\n\n`replacement` rides as the typed [`WireTranscriptReplacement`] mirror so\nthe emitted JSON schema is the closed replacement enum rather than a bare\n`serde_json::Value`. The consuming surface lowers it into the core\n[`TranscriptReplacement`] via [`WireTranscriptReplacement::into_core`].",
+    "description": "Request payload for `session/fork_replace`.\n\n`replacement` rides as the typed `WireTranscriptReplacement` mirror so\nthe emitted JSON schema is the closed replacement enum rather than a bare\n`serde_json::Value`. The consuming surface lowers it into the core\n[`TranscriptReplacement`] via `WireTranscriptReplacement::into_core`.",
     "properties": {
       "message_index": {
         "format": "uint",
@@ -19201,7 +19201,7 @@
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Parameters for `session/inject_context`, which appends one ordinary durable\nordered System message at the admitted transcript boundary.\n\nThe injected body is the typed [`CoreRenderable`] owner rather than a bare\n`text` string: surfaces parse their inbound payload into the renderable at\nthe ingress boundary and the handler threads it straight through to\n`AppendSystemContextRequest.content`. A plain-text client payload still\ndeserializes via `CoreRenderable`'s tagged `text` variant. The rendered\nstring is preserved exactly, including empty and whitespace-only content.",
+    "description": "Parameters for `session/inject_context`, which appends one ordinary durable\nordered System message at the admitted transcript boundary.\n\nThe injected body is the typed\n[`CoreRenderable`](meerkat_core::lifecycle::run_primitive::CoreRenderable)\nowner rather than a bare\n`text` string: surfaces parse their inbound payload into the renderable at\nthe ingress boundary and the handler threads it straight through to\n`AppendSystemContextRequest.content`. A plain-text client payload still\ndeserializes via `CoreRenderable`'s tagged `text` variant. The rendered\nstring is preserved exactly, including empty and whitespace-only content.",
     "properties": {
       "content": {
         "$ref": "#/$defs/CoreRenderable"
@@ -21922,7 +21922,7 @@
         "type": "string"
       },
       "MobMemberSpecWire": {
-        "description": "Per-member spec for `mob/ensure_member` and the `desired` entries of\n`mob/reconcile`.\n\nMirrors the essential, codegen-friendly fields of\n[`meerkat_mob::SpawnMemberSpec`]. Complex sub-types (tool access policy,\nbudget split, inherited tool filter, override profile) are not on this\nwire surface — callers that need that parity should use the non-declarative\n`mob/spawn` method.",
+        "description": "Per-member spec for `mob/ensure_member` and the `desired` entries of\n`mob/reconcile`.\n\nMirrors the essential, codegen-friendly fields of\n`meerkat_mob::SpawnMemberSpec`. Complex sub-types (tool access policy,\nbudget split, inherited tool filter, override profile) are not on this\nwire surface - callers that need that parity should use the non-declarative\n`mob/spawn` method.",
         "properties": {
           "additional_instructions": {
             "items": {
@@ -22618,7 +22618,7 @@
         "type": "string"
       },
       "MobMemberSpecWire": {
-        "description": "Per-member spec for `mob/ensure_member` and the `desired` entries of\n`mob/reconcile`.\n\nMirrors the essential, codegen-friendly fields of\n[`meerkat_mob::SpawnMemberSpec`]. Complex sub-types (tool access policy,\nbudget split, inherited tool filter, override profile) are not on this\nwire surface — callers that need that parity should use the non-declarative\n`mob/spawn` method.",
+        "description": "Per-member spec for `mob/ensure_member` and the `desired` entries of\n`mob/reconcile`.\n\nMirrors the essential, codegen-friendly fields of\n`meerkat_mob::SpawnMemberSpec`. Complex sub-types (tool access policy,\nbudget split, inherited tool filter, override profile) are not on this\nwire surface - callers that need that parity should use the non-declarative\n`mob/spawn` method.",
         "properties": {
           "additional_instructions": {
             "items": {
@@ -25702,7 +25702,7 @@
         "type": "string"
       },
       "MobMemberSpecWire": {
-        "description": "Per-member spec for `mob/ensure_member` and the `desired` entries of\n`mob/reconcile`.\n\nMirrors the essential, codegen-friendly fields of\n[`meerkat_mob::SpawnMemberSpec`]. Complex sub-types (tool access policy,\nbudget split, inherited tool filter, override profile) are not on this\nwire surface — callers that need that parity should use the non-declarative\n`mob/spawn` method.",
+        "description": "Per-member spec for `mob/ensure_member` and the `desired` entries of\n`mob/reconcile`.\n\nMirrors the essential, codegen-friendly fields of\n`meerkat_mob::SpawnMemberSpec`. Complex sub-types (tool access policy,\nbudget split, inherited tool filter, override profile) are not on this\nwire surface - callers that need that parity should use the non-declarative\n`mob/spawn` method.",
         "properties": {
           "additional_instructions": {
             "items": {

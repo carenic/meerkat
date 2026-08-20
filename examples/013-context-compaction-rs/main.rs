@@ -2,7 +2,7 @@
 //!
 //! Long conversations eventually exceed the LLM's context window. Meerkat's
 //! compaction system automatically summarizes old messages to keep the agent
-//! running indefinitely without losing important context.
+//! supporting longer conversations without retaining every prior message.
 //!
 //! ## What you'll learn
 //! - How the `DefaultCompactor` works
@@ -179,8 +179,8 @@ min_turns_between_compactions = 3
 # 4. Old messages are replaced with the summary
 # 5. Agent continues with reduced context but preserved knowledge
 #
-# The result: agents that can run indefinitely without losing important
-# context or exceeding the LLM's context window.
+# The result: agents can sustain longer conversations by retaining recent and
+# summarized context while keeping request size bounded.
 "
     );
 

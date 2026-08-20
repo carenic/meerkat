@@ -12,7 +12,16 @@ All semantic state mutations route through the DSL authority via `dsl_apply(inpu
 
 Runtime-backed surfaces (CLI, REST, RPC, MCP) obtain `SessionRuntimeBindings` from `MeerkatMachine::prepare_bindings(session_id)` and pass them through `SessionBuildOptions.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings)`. Standalone paths (WASM, tests, embedded) use `RuntimeBuildMode::StandaloneEphemeral`.
 
-`SessionRuntimeBindings` (in `meerkat-core/src/runtime_epoch.rs`) is the epoch-local bundle. It carries identity, ops/completion state, the machine-owned tool visibility projection, and all session-owned DSL handles that share the session's real `MeerkatMachineAuthority` via `HandleDslAuthority::from_shared(...)` — handle method calls and dispatch-driven transitions land on the same underlying state.
+`SessionRuntimeBindings` (in `meerkat-core/src/runtime_epoch.rs`) is the
+epoch-local bundle. It carries identity, ops/completion state, the
+MeerkatMachine-owned tool visibility projection and handles, independently
+owned auth lease authority, and cross-owner coordinators. The
+MeerkatMachine-backed handles share the session's real
+`MeerkatMachineAuthority` via `HandleDslAuthority::from_shared(...)`, so their
+method calls and dispatch-driven transitions land on the same underlying state.
+`AuthLeaseHandle` is the exception: `RuntimeAuthLeaseHandle` owns a
+mutex-guarded registry of per-binding `AuthMachineAuthority` instances rather
+than borrowing the session's MeerkatMachine authority.
 
 Identity:
 
@@ -39,16 +48,28 @@ Tool surface:
 
 Peer comms:
 
-- `peer_comms: Arc<dyn PeerCommsHandle>` — peer envelope classification
+- `peer_comms_install: GeneratedPeerCommsInstallFactory` - peer envelope
+  classification plus the machine-minted install authority for trust
+  projection mutations; consumers read the handle through `peer_comms()`
 - `peer_interaction: Arc<dyn PeerInteractionHandle>` — peer-driven interaction transitions
 - `interaction_stream: Arc<dyn InteractionStreamHandle>` — interaction stream lifecycle
 
 Model + auth:
 
 - `model_routing: Arc<dyn ModelRoutingHandle>` — provider/model baseline resolution
-- `auth_lease: Arc<dyn AuthLeaseHandle>` — published `AuthMachine` lease handle for the session
+- `sticky_model_fallback_commit_coordinator` - cancellation-safe durable
+  fallback identity commit
+- `auth_lease: GeneratedAuthLeaseHandle` - certified handle backed by the
+  runtime's per-binding `AuthMachine` registry
 
-When you add a new handle field, `prepare_bindings()` and the factory's `SessionOwned` validation must be updated so the surface gets the same authority view as dispatch.
+Compaction:
+
+- `compaction_commit_coordinator` - exact transcript-plus-memory handoff for
+  the session/runtime epoch
+
+When you add a new handle field, `prepare_bindings()` and the factory's
+`SessionOwned` validation must be updated so the surface receives the correct
+owner's certified authority view rather than a convenient session-local copy.
 
 ## Ownership split
 
@@ -59,24 +80,27 @@ When you add a new handle field, `prepare_bindings()` and the factory's `Session
 
 ## Durable-tail recovery
 
-The intra-turn checkpointer writes the canonical session store outside the
-boundary transaction, so a crash can leave a durable tail — up to a fully
-completed turn — whose boundary commit never landed. Ownership splits three
-ways (never-discard; full contract in `docs/reference/machine-authority.mdx`):
+The intra-turn persistence hook writes a provisional physical successor
+outside the boundary transaction and returns an exact `RunCheckpointReceipt`.
+The compatibility type name does not mean checkpoint authority is embedded in
+`Session`. A crash can leave a durable tail - up to a fully completed turn -
+whose boundary commit never landed. Ownership splits three ways (never-discard;
+full contract in `docs/reference/machine-authority.mdx`):
 
-- `SessionDocumentMachine` classifies: typed cold-read source disposition
-  (`UseRuntimeSnapshot` / `UseCommittedStoreHead` / `RecoveryRequired` /
-  `Quarantine`) and `DurableTailRecoveryClass` (`CompletedCandidate` /
+- The store retains the committed physical authority and any exact
+  provisional-tail authority; a recovery candidate is never returned as an
+  ordinary session. `SessionDocumentMachine` classifies the observed tail as
+  `DurableTailRecoveryClass` (`CompletedCandidate` /
   `InterruptedRepairableCandidate` / `Ambiguous`; any dangling `tool_use` is
-  Ambiguous — held, never closed with synthetic results).
+  Ambiguous - held, never closed with synthetic results).
 - `MeerkatMachine` authorizes: `AuthorizeDurableTailRecovery` judges the
   persisted lifecycle row, the prior-commit receipt comparison, and input
   attributability; both hold paths are machine-minted; commit verdicts emit
   `DurableTailRecoveryCommitAuthorized` with the machine-minted boundary
   sequence (one past the last committed receipt).
-- `RuntimeStore` realizes: one `atomic_apply` boundary (recovered snapshot +
-  receipt + input terminalization), fenced on the observed lifecycle-row
-  version and per-input-row digests (`expected_row_digest` MUST be enforced
+- `RuntimeStore` realizes: one `atomic_apply` boundary (recovered committed
+  session body + receipt + input terminalization), fenced on the observed
+  lifecycle-row version and per-input-row digests (`expected_row_digest` MUST be enforced
   inside the writing transaction; typed `InputRowVersionConflict` /
   `MachineLifecycleVersionConflict`).
 
@@ -90,13 +114,15 @@ per-session fence and converges idempotently when a competing process wins.
 
 ## Key operations
 
-- `ingest(session_id, input)` — admit an input through policy resolution
-- `retire(session_id)` — graceful drain (process queue, reject new input)
-- `respawn(...)` — retire old runtime binding, spawn fresh with same identity/spec/wiring, advance runtime incarnation + fence token (sequencing is shell convenience; restore/revival lifecycle facts are machine-owned — see Respawn semantics below)
-- `reset(session_id)` — abandon pending, return to Idle
-- `recover(session_id)` — replay from store for crash recovery
-- `destroy(session_id)` — terminal state, no recovery
-- `runtime_state(session_id)` — query current state (Initializing/Idle/Running/Recovering/Retired/Stopped/Destroyed)
+- `ingest(runtime_id, input)` - admit an input through policy resolution
+- `publish_event(event)` - publish an event to the logical runtime's current incarnation
+- `retire(runtime_id)` - graceful drain (process the queue and reject new input)
+- `recycle(runtime_id)` - rebuild the driver shell while preserving canonical non-terminal pending work
+- `reset(runtime_id)` - abandon pending work and return to `Idle`
+- `recover(runtime_id)` - replay durable runtime state after a crash or restart
+- `runtime_state(runtime_id)` - query `Initializing`, `Idle`, `Attached`, `Running`, `Retired`, `Stopped`, or terminal `Destroyed`
+- `destroy(runtime_id)` - enter terminal `Destroyed` state with no recovery
+- `load_boundary_receipt(runtime_id, run_id, sequence)` - read an exact committed boundary receipt for verification
 
 ## Policy engine
 
@@ -121,21 +147,47 @@ The runtime owns the comms drain lifecycle via MeerkatMachine's `drain_phase` / 
 
 ## Delegate semantics
 
-`delegate()` is communication-first. It spawns and auto-wires a helper, delivers the opening prompt via the existing initial-message path, and then parent/helper communicate via ordinary comms. There is no hidden task contract or peer reservation stream. If the helper fails during bootstrap before it can reliably report for itself, the bridge emits a typed lifecycle notice and durable kickoff state records the failure.
+`delegate()` is an exact bounded one-turn task/result contract. It provisions a
+turn-driven helper with `initial_message` cleared, admits the task through
+`start_work_for_identity_bounded`, waits for that exact admitted turn to reach
+its committed terminal boundary, and returns the labeled bounded result with
+explicit truncation, session attribution, usage, turn/tool counts, and any
+retirement cleanup error. Bidirectional comms wiring is attempted separately
+and reported by `wired`; it is useful for helper-to-parent messaging but is not
+the result carrier. Use explicit mob members for long-lived collaborators.
 
 ## Completion-feed wake
 
 Idle keep-alive wake from background shell completions is runtime-owned. Terminal `BackgroundToolOp` entries land in `RuntimeCompletionFeed`; the runtime loop tracks `EpochCursorState.runtime_observed_seq` and `runtime_last_injected_seq`, checks `is_quiescent_for_detached_wake()`, and injects `ContinuationInput::detached_background_op_completed()` from `runtime_loop.rs`. Do not spawn surface-local waker tasks or side channels.
 
-## Respawn semantics
+## Recycle versus mob respawn
 
-Runtime-level respawn orchestration is shell convenience: same `AgentIdentity`, spec, and peer wiring; new runtime incarnation and fence token; old bridge binding is archived. Used for "agent is confused, restart it" recovery. The mob-side lifecycle facts behind it are machine-owned: restore failures (`member_restore_failures`) and post-discard revival (`member_revival_pending`, observe → classify → realize with `Broken` terminal) live in MobMachine DSL — see the mob-orchestration reference.
+`RuntimeControlPlane::recycle` rebuilds the driver shell for the same logical
+runtime while preserving its canonical non-terminal pending work. It is not a
+member respawn and does not mint a new mob runtime binding.
 
-## Agent loop state machine
+`MobHandle::respawn` is the separate member-level operation: it preserves the
+member's `AgentIdentity`, spec, and intended peer wiring while replacing the
+runtime incarnation and fence token and archiving the old bridge binding. The
+mob-side lifecycle facts behind that operation are machine-owned: restore
+failures (`member_restore_failures`) and post-discard revival
+(`member_revival_pending`, observe, classify, realize, with `Broken` terminal)
+live in MobMachine DSL. See the mob-orchestration reference.
 
-`CallingLlm` → `WaitingForOps` → `DrainingEvents` → `Completed`, with `ErrorRecovery` and `Cancelling` branches.
+## Agent loop and turn phases
 
-Turn-level state lives in MeerkatMachine DSL (`turn_phase`, `pending_op_refs`, `barrier_operation_ids`, `boundary_count`, `extraction_attempts`, `terminal_outcome`, etc.). The Agent reads it via `TurnStateHandle`. Barrier membership is DSL-authoritative; shell code does not decide what's a barrier or when the barrier is satisfied.
+`LoopState` is the persisted and user-facing coarse projection. Its closed
+roster is `CallingLlm`, `WaitingForOps`, `DrainingEvents`, `ErrorRecovery`,
+`Cancelling`, and terminal `Completed`.
+
+Canonical turn state is the finer `TurnPhase` owned by MeerkatMachine DSL. Its
+closed roster is `Ready`, `ApplyingPrimitive`, `CallingLlm`, `WaitingForOps`,
+`DrainingBoundary`, `Extracting`, `ErrorRecovery`, `Cancelling`, `Completed`,
+`Failed`, and `Cancelled`. The state also carries `pending_op_refs`,
+`barrier_operation_ids`, `boundary_count`, `extraction_attempts`,
+`terminal_outcome`, and related facts. The Agent reads it via
+`TurnStateHandle`. Barrier membership is DSL-authoritative; shell code does not
+decide what is a barrier or when the barrier is satisfied.
 
 ## OpsLifecycleRegistry
 
@@ -154,9 +206,33 @@ Persistence channel: when wired via `set_persistence_channel()`, terminal transi
 
 Recovery: `MeerkatMachine::recover_or_create_ops_state()` loads persisted snapshots via `RuntimeOpsLifecycleRegistry::from_recovered()`. Non-terminal operations are stripped. The feed buffer is pre-seeded with persisted completion entries. Consumer cursors are restored.
 
+## Durable event projection
+
+When a persistent host installs event projection, session event envelopes feed
+two different consumers. The UI broadcast is bounded at 256 entries and reports a
+`StreamTruncated` event with `StreamLagged { dropped }` when a subscriber falls
+behind. The singular durable audit projector receives the same shared envelope
+over a separate unbounded queue and warns at a backlog of 1,024, so UI-ring lag
+does not drop its input. EventStore append is asynchronous best-effort derived
+state, not session commit authority. An append failure latches projection halt
+and replay fails closed without undoing the committed turn; derived `.rkat`
+views and their cursors remain rebuildable projections.
+
+## Durable jobs and runtime delivery
+
+Reusable detached work is not an ops-lifecycle entry. `DetachedJobMachine` and
+`DetachedJobStore` own job submission deduplication, attempts, fences, leases,
+progress, cancellation, terminal results, subscriptions, and the terminal
+outbox. `RuntimeDeliveryMachine` and its inbox own delivery identity, sequence,
+replay, and the applied cursor; `RuntimeStore` supplies CAS persistence for
+that machine-owned state. The `job_runtime_delivery` composition transfers one
+exact outbox entry into that inbox and acknowledges it back to the job store. A schedule or
+WorkGraph item may reference or await a job, but neither becomes a second job
+lifecycle owner.
+
 ## Session Service
 
-All surfaces route through `SessionService`. Runtime-backed surfaces are the canonical product path:
+Runtime-backed product surfaces route through `SessionService`:
 
 ```
 CreateSessionRequest → SessionService::create_session() → RunResult
@@ -169,6 +245,9 @@ Two implementations:
 - `PersistentSessionService<B>` — durable substrate for runtime-backed product surfaces (CLI, RPC, REST, MCP; typically backed by sqlite or jsonl through `PersistenceBundle`)
 
 `FactoryAgentBuilder` bridges `AgentFactory` into `SessionAgentBuilder`.
+Embedded Rust may instead use the public facade `AgentBuilder` to compose an
+explicit standalone agent directly through `AgentFactory`; it is not a
+`SessionService` path.
 
 Usage rule: for runtime-backed surfaces, look for `prepare_bindings()` and `RuntimeBuildMode::SessionOwned(...)`. If code hand-rolls registration + registry extraction or leans on implicit standalone fallback, treat that as architectural drift.
 

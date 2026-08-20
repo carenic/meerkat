@@ -1,13 +1,24 @@
 ---
 title: "Durable Tool Execution and Background Jobs v1"
-description: "Architecture and delivery plan for durable detached tools, generated job lifecycle authority, recovery, delivery, and host protocols."
+description: "Historical architecture and delivery record for durable detached tools, generated job lifecycle authority, recovery, delivery, and host protocols."
 icon: "clock-rotate-left"
 ---
 
-# Proposal: Durable Tool Execution and Background Jobs v1
+# Historical Proposal: Durable Tool Execution and Background Jobs v1
 
-Status: Proposed
-Baseline: Meerkat `dda5f2b2e`; MobKit PR [#301](https://github.com/lukacf/meerkat-mobkit/pull/301) at `c2920a8a`
+Status: Implemented in Meerkat and shipped starting in v0.8.8 through PRs
+[#913](https://github.com/lukacf/meerkat/pull/913),
+[#914](https://github.com/lukacf/meerkat/pull/914), and
+[#915](https://github.com/lukacf/meerkat/pull/915). This file preserves the
+original cross-repository design and delivery sequence; future-tense wording,
+line links, and phase lists describe the historical baseline rather than an
+open implementation state. Use [Durable Jobs and Monitors](/guides/durable-jobs)
+and the current `meerkat-jobs`, `meerkat-runtime::delivery_inbox`,
+`meerkat::job_delivery`, and `meerkat::job_composition` sources for the shipped
+Meerkat contract. Downstream MobKit and HomeCore status belongs to those
+repositories.
+
+Historical baseline: Meerkat `dda5f2b2e`; MobKit PR [#301](https://github.com/lukacf/meerkat-mobkit/pull/301) at `c2920a8a`
 Scope: Meerkat platform, MobKit gateway/SDKs, and downstream host-callback consumers such as HomeCore
 
 ## Decision
@@ -26,7 +37,7 @@ For HomeCore, the key outcome is:
 
 > A security scan is accepted durably within the MobKit callback deadline, runs outside the callback and agent turn, appears as healthy detached activity, re-resolves credentials at execution time, and becomes `WorkerLost`/`NeedsAttention` rather than being blindly replayed after an unrecoverable restart.
 
-## 1. Current state
+## 1. Historical baseline state
 
 Meerkat already has useful pieces:
 
@@ -732,28 +743,39 @@ Example:
 
 ```json
 {
-  "status": "ok",
   "detached_jobs": {
+    "status": "ok",
     "queued": 1,
     "running": 2,
     "awaiting_members": 1,
     "stale_leases": 0,
     "needs_attention": 0,
-    "delivery_backlog": 0
+    "pending_outbox_jobs": 0,
+    "runtime_inbox_backlog": 0,
+    "coverage": { "kind": "complete" }
   }
 }
 ```
 
-Health becomes degraded only for conditions such as:
+The shipping status vocabulary is `ok`, `degraded`, and `unreadable`.
+`unreadable` means the census established nothing because a read failed or its
+scan window truncated; it is not a rung between healthy and degraded.
+Truncated coverage reports `scanned` and `limit`, and the observed phase counts
+are lower bounds. `pending_outbox_jobs` is realm-scoped, while
+`runtime_inbox_backlog` covers this host store and may include deliveries from
+more than one logical realm.
 
-- Job store unavailable.
+Health becomes degraded only when the census actually observes conditions such
+as:
+
 - No eligible worker for a due job.
 - Stale lease or heartbeat.
 - Persistent completion-delivery backlog.
 - Cancellation that cannot be acknowledged.
 - Credentials blocked beyond policy threshold.
 
-Long duration by itself is not unhealthy.
+A failed store read or incomplete scan is `unreadable`, not `degraded`. Long
+duration by itself is not unhealthy.
 
 ## 13. WorkGraph and Schedule composition
 
@@ -784,7 +806,9 @@ The schedule occurrence must not remain open for the job duration. Schedule rede
 
 ## 14. Public job surface
 
-Expose a domain-handle API consistently through CLI, RPC/REST, MCP where appropriate, and MobKit SDKs:
+The shipping public domain-handle API is JSON-RPC plus the generated Python and
+TypeScript SDKs. Meerkat does not expose a general REST, CLI, or public MCP job
+management surface; agent shell tools have their own job commands.
 
 ```text
 jobs/get
@@ -794,6 +818,7 @@ jobs/progress
 jobs/result
 jobs/artifacts
 jobs/retry
+jobs/health
 jobs/subscribe
 jobs/unsubscribe
 monitors/start
@@ -805,8 +830,8 @@ Worker IDs, raw fence tokens, secret references, and sensitive canonical argumen
 
 `monitors/start` is a convenience surface over durable job submission, not a
 second lifecycle authority. It accepts the script/command, output protocol,
-restart declaration, checkpoint policy, notification subscription, resource
-limits, and optional terminal condition. `jobs/cancel`, `jobs/get`, and the
+restart declaration, delivery kind, and resource limits. `jobs/cancel`,
+`jobs/get`, and the
 ordinary job health/status surfaces remain authoritative.
 
 Likewise, a “watch registry” is a query/projection over durable jobs and their
@@ -814,7 +839,7 @@ subscriptions, not another mutable authority. Console/RPC views may expose
 active watches, last committed observation, last notification, next scheduled
 evaluation, source health, and delivery backlog without owning lifecycle state.
 
-## 15. Immediate containment before the full system lands
+## 15. Historical immediate containment
 
 Before durable execution ships:
 
@@ -824,7 +849,7 @@ Before durable execution ships:
 4. Add diagnostics that report the effective deadline and its winning owner.
 5. Refuse to describe current `background: true` as restart-surviving.
 
-## 16. Delivery sequence
+## 16. Historical delivery sequence
 
 ### Phase 0 — Truth and containment
 
@@ -903,7 +928,7 @@ Observability ships with detached callbacks, not as later polish.
 - Make scheduled long work enqueue jobs.
 - Add explicit durable `await_job` composition.
 
-## 17. Acceptance gates
+## 17. Acceptance gates used for delivery
 
 The implementation is complete only when all of these hold:
 

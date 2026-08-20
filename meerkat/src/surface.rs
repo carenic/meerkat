@@ -883,7 +883,7 @@ pub fn build_capabilities_response(config: &Config) -> CapabilitiesResponse {
     }
 }
 
-/// Build a [`ModelsCatalogResponse`] from the resolved model registry.
+/// Build a [`meerkat_contracts::ModelsCatalogResponse`] from the resolved model registry.
 ///
 /// This is **not** a pure compiled-in snapshot: it reads the config-backed
 /// `ModelRegistry`, which combines the compiled-in
@@ -1078,7 +1078,7 @@ where
 // Live MCP surface helpers (shared across RPC, REST)
 // ---------------------------------------------------------------------------
 
-/// Build a canonical [`McpLiveOpResponse`] for a staged operation.
+/// Build a canonical [`meerkat_contracts::McpLiveOpResponse`] for a staged operation.
 ///
 /// All surfaces use this to ensure identical response shaping — operation,
 /// server name, persisted handling, and `applied_at_turn` semantics.

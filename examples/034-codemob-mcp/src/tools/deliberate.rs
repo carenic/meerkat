@@ -12,8 +12,8 @@ use std::time::Duration;
 use meerkat_mob::definition::FlowSpec;
 use meerkat_mob::ids::{FlowId, MobId};
 use meerkat_mob::{
-    MobDefinition, MobFlowRunPublicResultClass, MobRun, MobRunStatus, SpawnMemberSpec,
-    StepRunStatus, mob_machine_run_public_result_class, mob_machine_run_status_is_terminal,
+    mob_machine_run_public_result_class, mob_machine_run_status_is_terminal, MobDefinition,
+    MobFlowRunPublicResultClass, MobRun, MobRunStatus, SpawnMemberSpec, StepRunStatus,
 };
 
 use super::{ProgressNotifier, ToolCallError};
@@ -71,12 +71,8 @@ pub async fn handle(
                 input.pack
             )));
         }
-        let definition = pack.definition(
-            &input.task,
-            context,
-            &overrides,
-            provider_params.as_ref(),
-        );
+        let definition =
+            pack.definition(&input.task, context, &overrides, provider_params.as_ref());
         (total_steps, definition)
     };
 
@@ -150,7 +146,7 @@ pub async fn handle(
             .await
             .map_err(|e| ToolCallError::internal(format!("Mob creation failed: {e}")))?;
 
-        // Spawn one agent per profile (meerkat_id = profile name for simplicity)
+        // Spawn one agent per profile (agent_identity = profile name for simplicity)
         let specs: Vec<SpawnMemberSpec> = profile_names
             .iter()
             .map(|name| SpawnMemberSpec::new(name.as_str(), name.as_str()))
@@ -240,14 +236,16 @@ pub async fn handle(
     )
     .await;
 
-    // Only destroy mob if not resuming (caller owns the lifecycle)
+    // A first call is ephemeral. The experimental reuse path retains a mob
+    // after a caller has explicitly supplied its id.
     if !resuming {
         if let Err(e) = state.mob_state.mob_destroy(&mob_id).await {
             tracing::warn!(mob_id = %mob_id, error = %e, "mob cleanup failed");
         }
     }
 
-    // Append session_id to content so the calling agent can continue the session
+    // Preserve the existing wire label for compatibility. This is a mob id,
+    // not a reliable multi-call conversation handle in this example.
     match result {
         Ok(mut val) => {
             if let Some(arr) = val.get_mut("content").and_then(|c| c.as_array_mut()) {
@@ -351,9 +349,8 @@ async fn run_flow(
                                 "waiting".into()
                             };
                             let should_send = {
-                                let mut last = last_progress
-                                    .lock()
-                                    .expect("flow progress lock poisoned");
+                                let mut last =
+                                    last_progress.lock().expect("flow progress lock poisoned");
                                 let current = (completed, label.clone());
                                 if last.as_ref() == Some(&current) {
                                     false

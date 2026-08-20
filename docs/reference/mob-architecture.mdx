@@ -1,6 +1,6 @@
 ---
 title: "Mob Architecture"
-description: "How Meerkat models multi-agent orchestration, member identity, runtime bindings, wiring, flows, and mobpacks."
+description: "Mob authority, stable identity, local and placed execution, durable role migration, observation, flows, and operator surfaces."
 icon: "people-arrows"
 ---
 
@@ -16,9 +16,13 @@ flowchart TD
     HANDLE --> ACTOR["MobActor"]
     ACTOR --> MACHINE["MobMachine"]
     ACTOR --> STORE["MobStorage"]
-    ACTOR --> MEMBERS["Member runtime bindings"]
-    MEMBERS --> SESSION["Member sessions"]
-    SESSION --> RUNTIME["MeerkatMachine"]
+    ACTOR --> LOCAL["Local member binding"]
+    LOCAL --> LOCAL_SESSION["Controller-realm session"]
+    ACTOR --> BRIDGE["MobSupervisorBridge"]
+    BRIDGE --> HOST_AUTH["Bound member host"]
+    HOST_AUTH --> REMOTE_SESSION["Member-host-realm session"]
+    LOCAL_SESSION --> RUNTIME_A["MeerkatMachine"]
+    REMOTE_SESSION --> RUNTIME_B["MeerkatMachine"]
 ```
 
 `MobActor` serializes mob commands, persists mob state, and projects public
@@ -36,35 +40,111 @@ Mob member identity has two layers:
 | `AgentRuntimeId` | Runtime binding identity. It can rotate on respawn or binding replacement. |
 | `FenceToken` | Monotonic binding epoch used to reject stale runtime effects. |
 | `Generation` | Member generation counter, incremented on respawn. |
+| `HostId` | Canonical bound-host identity used for placement. It is not member identity. |
 
 Use `AgentIdentity` for facts that survive respawn. Use `AgentRuntimeId` only
 for per-binding runtime facts.
 
+### One-shot durable role migration
+
+Role is durable context, but it is not member identity. `MemberLaunchMode::Resume`
+can carry `resume_from_role` on one exact trusted-host request. The declaration
+must name the role stored on the exact cold session. The mob id,
+`AgentIdentity`, and session id remain unchanged.
+
+When the stored and requested roles differ, an absent declaration fails with
+`MemberRoleMigrationRequired`; incorrect, inapplicable, and live-session attempts fail with
+`MemberRoleMigrationRejected`. Success retains the transcript and restamps the
+current comms name, typed member binding, role/profile labels, callback
+context, and explicitly configured tooling. The declaration is not persisted,
+so a `SpawnMemberCustomizer` must re-supply it at `SpawnSource::Resume` after
+process restart.
+
+This seam exists on trusted in-process `SpawnMemberSpec` and private
+`MaterializeLaunchMode::Resume` only. Agent tools, standing profiles, CLI,
+public RPC/REST/MCP/SDK spawn contracts, and Web do not expose it.
+
 ## Runtime Bindings
 
-Members can run as local session-backed agents or as external peers.
+Member construction and member placement are separate facts. Members can be
+local session-backed agents, explicitly bound external peers, or session-backed
+agents materialized on a bound member host.
 
-| Binding | Contract |
+| Form | Contract |
 | --- | --- |
 | `RuntimeBinding::Session` | Meerkat provisions and owns a local session for the member. |
 | `RuntimeBinding::External` | The host declares the external runtime address, Ed25519 public identity, and typed bootstrap token. The mob derives the real peer id and routes through that runtime. |
+| `SpawnMemberSpec.placement = Some(HostId)` | The controlling mob compiles a portable member spec and a bound member host materializes a realm-local session. Placement is not a third `RuntimeBinding` variant. |
 
 External members require an explicit runtime binding. A bare `External` backend
 tag is not enough because the runtime needs a concrete process identity before
 it can route work or trust peer messages. For a remote `rkat` member, generate
 the current binding with `rkat run --comms-listen-tcp ... --comms-binding-out <path>`.
 
+### Placed-member portability
+
+The remote spawn lane accepts only a digest-covered `PortableMemberSpec`.
+Machine admission rejects, rather than drops, all controller-local executable
+or secret-bearing fields:
+
+| Typed category | Rejected input |
+| --- | --- |
+| Non-portable executable objects | Rust bundles, per-spawn external tools, mob-default external tools, default LLM client override, in-process compaction curator override |
+| Controller-local policy | Host-surface MCP allow-list, inherited tool filter, WorkGraph tools |
+| Secret-bearing fields | Shell environment, MCP stdio environment, MCP HTTP headers |
+
+Placement also cannot be combined with an explicit backend or
+`RuntimeBinding`; the member must have exactly one execution transport story.
+
+WorkGraph tools are controller-local because the WorkGraph store and execution
+binding remain on the controlling host. Schedule tools are portable. Memory
+and declarative MCP servers require matching member-host capabilities and must
+not carry the rejected secret fields. Host capability admission also checks
+autonomous members, durable sessions, tracked input cancel, bridge protocol
+v4, memory store, and MCP when the resolved member requires them.
+
+## Multi-Host Authority
+
+Realms are not distributed. The controlling host and each member host retain
+one local realm and one set of local session authorities.
+
+| Owner | Durable authority |
+| --- | --- |
+| Controlling `MobActor` / `MobMachine` | Mob identity, roster, topology, placement, route-install obligations, grants, member generation/fence, merged observation, flow/work lifecycle, teardown |
+| Member host | Host binding admission, materialization, realm-local session execution, history/events, provider credentials, compaction, memory, and live media endpoint |
+| `meerkat-comms` | Signed transport, peer trust and routing mechanics, inbox delivery |
+| MobKit or another console | Projection and operator UX only; no shadow roster, host directory, or lifecycle authority |
+
+One host acceptor serves many placed members and demultiplexes signed envelopes
+by recipient public key. The peer envelope stays identity-addressed. The
+private `supervisor.bridge` protocol shares that transport but has separate
+machine admission and is never promoted to ordinary agent authority.
+
+Remote observation is controller-proxied. Member history is read from the
+owning host, and remote event pages feed the controlling mob's merged stream.
+The public identity-routed operations remain placement-transparent. Host
+reachability, route-install convergence, generation, fence, and provenance
+remain visible as typed evidence. Hosts advertise
+`runtime.capabilities.features.multi_host_mobs`; clients must treat `false` as
+an unsupported capability, not infer support from method presence.
+
+The placed session id remains realm-local to its owning member host. A client
+cannot feed it to the controller's generic `session/*` methods. Use mob
+identity operations and `mob/member_history`; remote transcript revision and
+edit methods are not part of the v1 bridge.
+
 ## Public Surfaces
 
 | Surface | Mob role |
 | --- | --- |
-| CLI `rkat mob ...` | Helper, artifact, typed callable run, and run-resource commands: `run`, `runs`, `status`, `logs`, `attach`, flow execution, pack, deploy, web build. |
-| JSON-RPC `mob/*` | Host control plane for mob lifecycle, members, flows, and profiles. |
-| REST | HTTP adapter for selected mob helper workflows. |
-| MCP `meerkat_mob_*` | Public MCP control plane. |
-| Agent tools `mob_*` / `delegate` | Agent-facing delegation and session-owned implicit mobs. |
-| Python / TypeScript SDKs | Typed wrappers over the RPC mob surface. |
-| Web SDK | In-browser mob runtime and mobpack deployment target. |
+| Trusted in-process Rust host | `MobHandle` and typed builders expose the full local authority seam, including principal-scoped `hard_cancel_member`, process-local compaction curator overrides, and one-request role migration on `SpawnMemberSpec`. |
+| CLI `rkat mob ...` | Helper/run resources plus host bind/revoke/list, grants, remote observations, and live control. Cooperative `force-cancel` is not hard cancel. |
+| JSON-RPC `mob/*` | Full host control plane, including placement, host/grant families, remote observation, `mob/hard_cancel_member`, and member live control. |
+| REST | Remote-transparent ordinary routes plus read-only hosts, route installs, and member history. No host/grant/live/hard-cancel administration. |
+| Public MCP `meerkat_mob_*` | Same intentional multi-host operator restriction as REST. |
+| Agent tools `mob_*` / `delegate` | Agent-facing orchestration. Spawn/delegate may name a bound placement, but agents cannot administer hosts, grants, live channels, observations, or hard cancel. |
+| Python / TypeScript SDKs | Typed wrappers over the full RPC mob surface. |
+| Web SDK | In-browser single-host runtime. Non-local placement is rejected by the typed capability boundary. |
 
 ## Flows
 
@@ -102,8 +182,15 @@ Persistent mob state is SQLite/WAL-backed through `SqliteMobStores`.
 In-memory storage is used for tests and WASM. The previous exclusive-handle mob
 store is gone.
 
-Mobpacks are portable mob artifacts. They package definitions and trust policy
-material for deployment through:
+Multi-host persistence is deliberately split. The controlling realm stores
+the mob, host bindings, placement, grants, route obligations, flow/work state,
+and merged event position. The owning member-host realm stores each placed
+session and its history. Restart recovery replays these authorities and
+re-establishes routes; it does not copy member realms into the controller.
+
+Mobpacks are portable mob artifacts. They package definitions, optional runtime
+assets, capability declarations, and optional signature metadata. Verifier
+trust policy and trusted-signer enrollment remain host-owned. Deploy through:
 
 ```bash
 rkat mob pack ./mob -o ./dist/mob.mobpack
@@ -118,8 +205,12 @@ bundle; it does not compile wasm32.
 
 ## Live Channels
 
-Live channels are per session. For a mob member, open `live/open` against that
-member's session using a realtime-capable model such as `gpt-realtime-2`.
+Live channels execute in the owning session. For a mob member, use the
+identity-routed `mob/member_live_open`, close, status, and control family. It
+is placement-transparent and returns the owning host's WebSocket endpoint.
+Explicit WebRTC is rejected with `LiveTransportUnsupported` for local and
+placed members; session-scoped `live/open` remains the WebRTC path for a
+controller-local session.
 
 The old realtime attachment/status plane has been removed. Live channel
 lifecycle is caller-initiated through the `live/*` method family.
@@ -134,6 +225,9 @@ lifecycle is caller-initiated through the `live/*` method family.
 | Storage | `meerkat-mob/src/store/` |
 | Agent-facing tools | `meerkat-mob-mcp/src/agent_tools.rs` |
 | Supervisor bridge | `meerkat-mob/src/runtime/supervisor_bridge.rs` |
+| Member-host materialization | `meerkat-mob/src/runtime/host_materialize.rs` |
+| Host binding authority | `meerkat-mob/src/machines/mob_host_binding_authority.rs` |
+| Shared host acceptor | `meerkat-comms/src/host_acceptor.rs` |
 | Mobpack | `meerkat-mob-pack/` |
 
 ## See Also

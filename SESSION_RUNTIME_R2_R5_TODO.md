@@ -1,5 +1,11 @@
 # Phase 4 R2–R5 — close the SessionRuntime split: surfaces off `meerkat-rpc::session_runtime`
 
+> Historical session-runtime extraction ledger. Checkbox state below belongs
+> to that implementation cycle and is not a current work queue. Use
+> `docs/reference/runtime-architecture.mdx` and
+> `docs/reference/session-contracts.mdx` for current ownership and lifecycle
+> contracts.
+
 ## Hard requirement
 
 **Zero deferrals.** Every finding in this document gets either a fix that

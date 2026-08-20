@@ -237,10 +237,10 @@ Since 0.8.4 (PR #912, the storage unification arc):
   a single existing candidate is used where it lies, both is a typed
   `RealmSplitBrain` refusal, neither goes to the surface default. Probing
   fails closed (typed `RootProbeFailed` / `RealmDirectoryCollision` /
-  `ManifestUnreadable`); `DualRootResolution.candidate_roots` arms the
-  cross-candidate first-start reservation
-  (`ensure_realm_manifest_pin_with_candidates`) so racing first starts
-  cannot mint twins.
+  `ManifestUnreadable`); `DualRootResolution.candidate_roots` arms a
+  first-start reservation across that invocation's resolved candidate set
+  (`ensure_realm_manifest_pin_with_candidates`). Processes using the same set
+  cannot mint twins; different candidate sets do not coordinate.
 - **`meerkat-sqlite`** — new leaf crate owning the shared SQLite mechanics
   (profiles, ledger, fences, `JsonColumnBytes`, error classification; see
   crate table). Opens are DDL-free; every database gains a `meerkat_schema`
@@ -365,6 +365,63 @@ Since 0.8.11 (checkpoint-free session persistence):
   interpret historical proof fields. It strips them before issuing a current
   Session, and no live write path can mint them again.
 
+Since 0.8.22 through current HEAD:
+
+- **Durable event audit projection is separate derived state.**
+  When a host installs it, a dedicated unbounded queue receives event
+  envelopes independently of the bounded UI broadcast, so UI lag cannot drop
+  projector input. The EventStore append remains asynchronous best-effort
+  projection: failure latches replay without failing the already-committed
+  turn. The RuntimeStore/backend carrier remains session authority;
+  SessionStore rows and EventStore remain component/content and projection
+  seams.
+- **Turn completion and token accounting have distinct owners.**
+  `AgentEvent::TurnCompleted.usage` is optional. Missing accounting emits
+  `TurnUsageAccountingUnmeasured` and advances no counter; an identity mismatch
+  emits `TurnUsageAccountingIdentityDisputed`, preserves the adapter's counters
+  and attribution, and does not invalidate an already-produced answer.
+- **Read-only tool intent is a dispatch-time guarantee.**
+  `ToolAccessPolicy::ReadOnly` admits only a positive owner declaration of
+  `ToolMutationClass::ReadOnly`; unknown/MCP/shell/undeclared tools fail closed.
+  The gate leaves the model-visible list unchanged. Provider-native tools do
+  not cross the dispatcher and must be disabled separately by a host claiming
+  a read-only build.
+- **Bounded runtime submission is idempotency-first.**
+  `meerkat_runtime::submit_bounded` requires an `IdempotencyKey`, bounds the
+  caller's observation rather than cancelling work, and returns a total typed
+  fate: admitted, collapsed, refused, or timed out. A timeout reports either
+  a durable admitted row or `Unknown` when no durable witness was observable;
+  an `Unknown` fate is retried only with the same idempotency key. A
+  `TerminalWithoutDelivery` row permanently spends that key, so genuinely new
+  work needs a new key rather than pretending the terminal row was not seen.
+  A durable row is reported as queued only while machine authority still says
+  the work is pending.
+- **Turn time has its own aggregate owner.**
+  `BudgetLimits::max_turn_duration` and `LimitsConfig::max_turn_duration` are
+  optional and re-armed per run. Config rejects zero; the direct Rust
+  `BudgetLimits` builder accepts `Duration::ZERO`, which makes the turn budget
+  immediately exceeded. They bound the sum of individually timed segments
+  without changing the agent-lifetime `max_duration`.
+- **Health distinguishes absence of evidence from health.** Runtime health
+  includes `session_liveness` and `session_run_start`. Job health separates
+  job outbox backlog from runtime inbox backlog, carries complete/truncated
+  coverage, and represents `Unreadable` as a third reading.
+- **Durable member role change is an exact one-shot migration.**
+  `MemberLaunchMode::Resume` and trusted-host
+  `MaterializeLaunchMode::Resume` carry optional `resume_from_role`. Omission
+  preserves strict same-role resume. A declared migration requires the exact
+  cold durable predecessor, preserves mob/member/session identity and the
+  transcript, and restamps forward-only current role metadata. Agent-callable
+  spawn commands and standing profiles cannot declare it.
+- **Live has two explicit transports.** WebSocket uses the `--live-ws`
+  listener. WebRTC is feature-gated and enabled with `--live-webrtc`; clients
+  call `live/open` with `transport: "webrtc"`, then exchange an SDP offer for
+  an answer through `live/webrtc/answer` using the single-use bootstrap token.
+- **SDK RPC request shapes are generated end to end.** The former 239-entry
+  handwritten-wrapper exception is gone. `verify_rpc_signature_parity.py`
+  requires Python and TypeScript request sites, generated method contracts,
+  and the RPC documentation table to use the same catalog type references.
+
 ## Runtime Dogma (first review lens)
 
 Canonical doctrine: `docs/architecture/meerkat-dogma.md` (nine rules; mirrored
@@ -409,9 +466,10 @@ Public vocabulary:
   and `WireLiveContinuityMode`.
 - `live/status`, `live/refresh`, `live/send_input`, `live/commit_input`,
   `live/interrupt`, `live/truncate`, `live/close` — channel lifecycle.
-- The `--live-ws <addr>` flag on `rkat-rpc` enables the WebSocket
-  listener. Without it the `live/*` methods are not registered (router
-  arms gated on `live_ws_state.is_some()`).
+- The `--live-ws <addr>` flag on `rkat-rpc` enables the WebSocket listener;
+  feature-gated `--live-webrtc` independently enables the WebRTC offer/answer
+  transport. The `live/*` methods are absent only when neither transport is
+  configured.
 
 Wire types live in `meerkat-contracts/src/wire/live.rs`. Adapter
 internals live in `meerkat-core::live_adapter` (`LiveAdapterStatus`,
@@ -435,12 +493,12 @@ Do not maintain a copy of the machine list here — read the registry (and
 `canonical_machine_production_owner_relations()` for per-machine production
 owners; the public mirror is `docs/reference/machine-authority.mdx`).
 
-`MeerkatMachine` and `MobMachine` are the two runtime kernels; the remaining
-catalog machines (auth, approval, session document, session turn admission,
-schedule/occurrence, workgraph/attention) are scoped authorities for perimeter
-state. (Per-member realtime intent and the realtime-binding plane were removed —
-live channels are caller-initiated via `live/*`, gated on each member's
-session-level `ModelCapabilities.realtime`.)
+`MeerkatMachine` and `MobMachine` are the two broad runtime kernels; other
+registry entries are scoped authorities for their owned state. Read the live
+catalog rather than copying that roster here. Per-member realtime intent and
+the realtime-binding plane were removed. Live channels are caller-initiated via
+`live/*`, gated on each member's session-level
+`ModelCapabilities.realtime`.
 
 **Primary semantic authority lives in the catalog-generated machines.** Production modules are bridge shells around catalog-owned DSL bodies and crate-local bridging types. Handwritten `*_authority.rs` helpers that still exist are adapter mechanics, projections, planners, or sealed mutators, not competing semantic owners.
 
@@ -477,7 +535,7 @@ A realm is a config + state namespace. Config inherits along a parent chain;
 state never does. The chain authority is `RealmChain` in
 `meerkat-core/src/connection.rs`.
 
-- **`global` is the universal default head.** Reserved slug
+- **`global` is the reserved optional chain root.** Reserved slug
   `GLOBAL_REALM_SLUG = "global"` (`RealmId::global()` / `RealmId::is_global()`,
   mirroring `is_env_default`). Its config doc is the single HOME-rooted
   `~/.rkat/config.toml` (`Config::global_config_path()`), not a per-workspace
@@ -504,12 +562,13 @@ state never does. The chain authority is `RealmChain` in
   real invariant with no relaxation, and `RealmConnectionSet`/`AuthBindingRef`
   gain no field — zero wire/schema churn. Env/InlineSecret/Command material is
   realm-agnostic (provenance only bites for the realm-namespaced TokenKey/LeaseKey).
-- **Reads inherit, writes are strict-owner.** `resolve_write_owner` +
-  `WriteOwnerError` (`connection.rs`) reject writing into an inherited realm's
-  doc from a child: `auth login` / config `set`/`patch` go to the realm that owns
-  the binding. `ConfigStore.get` returns the RAW head doc (read/write split) so an
-  inherited entry is never flattened into a child; only the agent-build path reads
-  the composed `EffectiveConfigReader` view.
+- **Credential reads inherit; credential writes are strict-owner.**
+  `resolve_write_owner` + `WriteOwnerError` (`connection.rs`) reject a
+  child-addressed inherited credential write and name the owner the caller must
+  target. Config `get`/`set`/`patch` are a separate contract: they read or
+  mutate only the selected RAW head doc. They do not retarget to an inherited
+  owner or flatten inherited entries; only the agent-build path reads the
+  composed `EffectiveConfigReader` view.
 - **Config inherits, state never does.** Models, mcp servers, hooks, skills,
   limits, and auth bindings inherit (per the merge table in
   `compose_effective_config`); children may add/override but cannot remove
@@ -543,8 +602,10 @@ DSL/machine domain. Key files: `meerkat-core/src/connection.rs` (`RealmChain`,
 | Crate | Owns | Key Trait |
 |-------|------|-----------|
 | `meerkat-sqlite` | Shared SQLite mechanics: named connection profiles (DDL-free opens), `meerkat_schema` migration ledger (pinned concurrent-open protocol, typed `SchemaFromTheFuture` refusal), `JsonColumnBytes`, per-operation maintenance-fence guards, error classification (rusqlite only, no meerkat deps) | — |
+| `meerkat-agent-build-authority` | Retired compatibility marker; no public minting path | None |
 | `meerkat-models` | Canonical provider model catalog/capabilities data; exposes `canonical()` `ModelCatalog` (core stays provider-free) | meerkat-core |
-| `meerkat-core` | Agent loop, domain-only `Session`, session-store and provisional-receipt contracts, exact released-state importer, ALL trait contracts, DSL handle traits, `StorageLayout` path authority + realm-id-first dual-root resolution, `DurabilityClass` vocabulary, `StorageMigrator` diagnose seam | `AgentLlmClient`, `AgentToolDispatcher`, `AgentSessionStore`, `SessionStore`, `SessionCheckpointer`, `SessionService`, `CommsRuntime`, `HookEngine`, `OpsLifecycleRegistry`, `StorageMigrator`, `TurnStateHandle`, `CommsDrainHandle`, `ExternalToolSurfaceHandle`, `PeerCommsHandle`, `SessionAdmissionHandle`, `ModelRoutingHandle`, `AuthLeaseHandle`, `McpServerLifecycleHandle`, `PeerInteractionHandle`, `SessionContextHandle`, `SessionClaimHandle`, `InteractionStreamHandle` |
+| `meerkat-core` | Agent loop, domain-only `Session`, foundational session/store/tool/runtime contracts, exact released-state importer, DSL handle traits, `StorageLayout` path authority + realm-id-first dual-root resolution, `DurabilityClass` vocabulary, `StorageMigrator` diagnose seam | `AgentLlmClient`, `AgentToolDispatcher`, `AgentSessionStore`, `SessionStore`, `SessionCheckpointer`, `SessionService`, `CommsRuntime`, `HookEngine`, `OpsLifecycleRegistry`, `StorageMigrator`, and runtime handle traits |
+| `meerkat-atif` | ATIF-v1.7 trajectory model and canonical committed-event exporter | None |
 | `meerkat-store-conformance` | Published storage conformance harness: per-trait capability profiles (baseline / incremental / guarded-projection), capability-discovery, append-only media, blob/artifact chapters | Consumes meerkat-core contracts |
 | `meerkat-contracts` | Wire types, catalogs, stable error codes, generated surface schemas, **supervisor bridge protocol (`BridgeCommand`, `BridgeReply`, `BridgePeerSpec`, `BridgeSupervisorPayload`)** | — |
 | `meerkat-client` | Compatibility client shim that re-exports provider surfaces | Compatibility exports only |
@@ -560,19 +621,24 @@ DSL/machine domain. Key files: `meerkat-core/src/connection.rs` (`RealmChain`,
 | `meerkat-hooks` | Hook runtimes (in-process, command, HTTP) | Implements `HookEngine` |
 | `meerkat-skills` | Skill loading (filesystem, git, HTTP, embedded) | Implements `SkillEngine` |
 | `meerkat-memory` | Semantic memory stores and retrieval | Implements `MemoryStore` |
+| `meerkat-jobs` | Durable detached-job machine lifecycle, fenced attempts, atomic outbox, predicate watches, health, and restart-safe store vocabulary | `DetachedJobStore` |
 | `meerkat-workgraph` | Realm-scoped durable WorkGraph store, service, lifecycle policy, tool surface, host observability, and goal attention bindings | `WorkGraphStore` |
 | `meerkat-mob` | Multi-agent orchestration, member provisioning, flow runtime, **identity-first binding model, supervisor bridge** | `MobSessionService`, `MobProvisioner`, `MobMemberRuntimeBridge` |
+| `meerkat-mob-adaptive` | Transitional import path that re-exports the mob-owned adaptive module | None |
 | `meerkat-mob-pack` | Mobpack archive format, signing, trust policies, validation | — |
 | `meerkat-mob-mcp` | MCP/operator mob surface plus agent-facing delegation tool surface | `MobMcpState`, `AgentMobToolSurfaceFactory` |
-| `meerkat-live` | Live channel host and WebSocket transport glue for `live/*` methods | `LiveAdapterHost`, `LiveProjectionSink` |
-| `meerkat-schedule` | Scheduler subsystem; `Schedule::apply` / `Occurrence::apply` on domain types | `ScheduleService`, `ScheduleDriver`, `ScheduleStore` |
+| `meerkat-live` | Live channel host plus WebSocket and optional WebRTC transport glue for `live/*` methods | `LiveAdapterHost`, `LiveProjectionSink` |
+| `meerkat-schedule` | Once/interval/calendar scheduling, occurrence lifecycle, delivery, and host-runnable targets | `ScheduleService`, `ScheduleDriver`, `ScheduleStore` |
 | `meerkat-web-runtime` | WASM browser deployment (wasm_bindgen exports) | — |
 | `meerkat-machine-schema` | Rust-native machine/composition catalog DSL — the formal authority | — |
 | `meerkat-machine-kernels` | Generated kernel interpreter for all machines/compositions | `GeneratedMachineKernel` |
 | `meerkat-machine-codegen` | TLA+ model generation, TLC verification, drift detection | — |
 | `meerkat` (facade) | `AgentFactory`, `FactoryAgentBuilder`, persistence helpers, re-exports, `RealmStorageProvider` seam + `DiskStorageProvider` + fail-closed durability enforcement | Wires everything together |
 
-**Rule: `meerkat-core` has zero I/O dependencies.** All I/O happens in satellite crates.
+**Rule: keep domain authority separate from backend implementations.**
+`meerkat-core` owns foundational contracts and also contains bounded native
+configuration, path, lock, and fence I/O. Feature crates own their domain
+stores and operational backends, including jobs, WorkGraph, and schedules.
 
 For detailed crate-by-crate reference: load `references/crate_map.md`.
 

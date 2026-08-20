@@ -139,7 +139,7 @@ mod context {
             Ok(Some(session))
         }
 
-        /// Reconstruct a [`CreateSessionRequest`] from a persisted
+        /// Reconstruct a [`meerkat_core::service::CreateSessionRequest`] from a persisted
         /// session using authoritative runtime binding (default for
         /// operator-driven resume).
         pub async fn recovered_create_request(
@@ -157,7 +157,7 @@ mod context {
             .await
         }
 
-        /// Reconstruct a [`CreateSessionRequest`] from a persisted
+        /// Reconstruct a [`meerkat_core::service::CreateSessionRequest`] from a persisted
         /// session, selecting the runtime binding mode (authoritative
         /// vs local-resources-only).
         pub async fn recovered_create_request_with_runtime_binding_mode(

@@ -1,10 +1,10 @@
 ---
 title: "Examples gallery"
-description: "Functional apps and production patterns built with Meerkat. From coding swarms to browser war games."
+description: "Runnable applications and focused patterns built with Meerkat, from session basics to browser war games."
 icon: "rocket"
 ---
 
-Production-ready applications in the [repository](https://github.com/lukacf/meerkat/tree/main/examples). For feature-by-feature code snippets, start with [Sessions & streaming](/examples/sessions).
+Runnable applications, focused demonstrations, and production-shaped patterns live in the [repository](https://github.com/lukacf/meerkat/tree/main/examples). For feature-by-feature code snippets, start with [Sessions & streaming](/examples/sessions).
 
 ## Starter examples
 
@@ -26,27 +26,27 @@ If you are new to Meerkat, start with the three hello-world examples above befor
 
 <CardGroup cols={2}>
   <Card title="017 Coding Swarm" icon="users" href="https://github.com/lukacf/meerkat/tree/main/examples/017-mob-coding-swarm-rs">
-    **Rust** -- Orchestrator + worker mob for coding tasks. Leader decomposes work, workers execute in parallel, results merge.
+    **Rust** -- Define, validate, spawn, and wire a lead + worker coding mob, then submit a planning turn to the lead.
   </Card>
   <Card title="018 Research Team" icon="magnifying-glass" href="https://github.com/lukacf/meerkat/tree/main/examples/018-mob-research-team-rs">
-    **Rust** -- Diverge/converge research pattern. Specialized profiles explore independently, then synthesize findings.
+    **Rust** -- Define, validate, spawn, and wire lead/market/technical research profiles, then run a lead turn.
   </Card>
   <Card title="019 CI/CD Pipeline" icon="arrow-right-arrow-left" href="https://github.com/lukacf/meerkat/tree/main/examples/019-mob-pipeline-rs">
-    **Rust** -- Sequential pipeline with stage handoffs. Each stage validates before passing to the next.
+    **Rust** -- Mob definition, validation, topology wiring, and manual lint/test stage dispatch.
   </Card>
 </CardGroup>
 
-## Production patterns
+## Composition and runtime patterns
 
 <CardGroup cols={2}>
   <Card title="021 Multi-Provider Routing" icon="server" href="https://github.com/lukacf/meerkat/tree/main/examples/021-multi-provider-routing-py">
     **Python** -- Same code routes to Anthropic, OpenAI, or Gemini. Provider-specific params, model switching at runtime.
   </Card>
-  <Card title="024 Event Mesh" icon="satellite-dish" href="https://github.com/lukacf/meerkat/tree/main/examples/024-host-mode-event-mesh-rs">
-    **Rust** -- Reactive agents in keep-alive mode. Process external events from webhooks, CI pipelines, monitoring systems.
+  <Card title="024 Multi-Turn Processing" icon="satellite-dish" href="https://github.com/lukacf/meerkat/tree/main/examples/024-host-mode-event-mesh-rs">
+    **Rust** -- Standalone in-process session with directly submitted turns, retained context, and event streaming.
   </Card>
-  <Card title="025 Full-Stack Agent" icon="layer-group" href="https://github.com/lukacf/meerkat/tree/main/examples/025-full-stack-agent-rs">
-    **Rust** -- Reference architecture combining all features: tools, hooks, skills, memory, persistence, streaming, budget.
+  <Card title="025 Composed Agent" icon="layer-group" href="https://github.com/lukacf/meerkat/tree/main/examples/025-full-stack-agent-rs">
+    **Rust** -- Broad standalone composition example combining built-in and domain tools, budget limits, JSONL storage, an inline behavior prompt, and event logging.
   </Card>
   <Card title="036 Realtime Audio" icon="microphone" href="https://github.com/lukacf/meerkat/tree/main/examples/036-realtime-audio-py">
     **Python** -- Command-line realtime OpenAI audio app with live transcript, callback tools, inline mob skills, and helper sub-agents.
@@ -60,10 +60,10 @@ If you are new to Meerkat, start with the three hello-world examples above befor
     **Shell** -- Build, sign, validate, and deploy a believable multi-role release-triage `.mobpack`. Trust policy, inspection, and realistic incident prompts.
   </Card>
   <Card title="034 CodeMob MCP" icon="code" href="https://github.com/lukacf/meerkat/tree/main/examples/034-codemob-mcp">
-    **Rust (MCP)** -- Multi-agent MCP server for Claude Code. Teams deliberate on code reviews, architecture, brainstorming, and RCT pipelines via structured flows or free-form comms.
+    **Rust (MCP)** -- Multi-agent MCP server for Claude Code. Teams deliberate on code reviews, architecture, brainstorming, and RCT pipelines through machine-owned structured flows.
   </Card>
   <Card title="035 MDM TUX" icon="desktop" href="https://github.com/lukacf/meerkat/tree/main/examples/035-mdm-tux-rs">
-    **Rust (TUI)** -- Device management demo with ratatui TUI controller and target agents. Ed25519-signed comms over TCP, auto-registration, direct and hive modes.
+    **Rust (TUI)** -- Device management demo with ratatui TUI controller and target agents. Signed kennel coordination, target registration, and direct or hive RPC modes.
   </Card>
 </CardGroup>
 
@@ -71,16 +71,22 @@ If you are new to Meerkat, start with the three hello-world examples above befor
 
 <CardGroup cols={2}>
   <Card title="029 Web Incident War Room" icon="fire" href="https://github.com/lukacf/meerkat/tree/main/examples/029-web-incident-war-room-sh">
-    **Shell** -- Browser-deployable SEV war room with commander, SRE, comms, and scribe roles. Pack once, then ship a zero-install web bundle.
+    **Shell** -- Package a SEV-team definition, skills, and kickoff prompt, then assemble a browser runtime bootstrap for a custom host integration.
   </Card>
   <Card title="030 Web Dashboard Copilot" icon="chart-line" href="https://github.com/lukacf/meerkat/tree/main/examples/030-web-dashboard-copilot-sh">
-    **Shell** -- Embeddable release command-center copilot with dashboard context, starter prompts, and web build output ready for host integration.
+    **Shell** -- Assemble a browser runtime bootstrap plus dashboard context, starter prompts, and an iframe placement sketch for a custom host.
+  </Card>
+  <Card title="031 Mini Diplomacy Arena" icon="chess" href="https://github.com/lukacf/meerkat/tree/main/examples/031-wasm-mini-diplomacy-sh">
+    **Shell + Web** -- Nine autonomous agents across three factions, plus a turn-driven narrator, exercise browser mobs, cross-mob comms, flows, and event subscriptions.
   </Card>
   <Card title="032 WebCM Agent" icon="terminal" href="https://github.com/lukacf/meerkat/tree/main/examples/032-wasm-webcm-agent">
     **Web (WASM)** -- Multi-provider coding agent mob in the browser. 4 agents (Anthropic + OpenAI + Gemini) collaborate via comms to plan, code, and review in a sandboxed Alpine Linux VM. TUI-style UI with real-time streaming.
   </Card>
   <Card title="033 The Office" icon="building" href="https://github.com/lukacf/meerkat/tree/main/examples/033-the-office-demo-sh">
     **Shell + Web** -- 10 autonomous agents run a pixel-art office. Events arrive at triage, fan out to specialists and PAs, with human-in-the-loop approval and a knowledge graph.
+  </Card>
+  <Card title="037 Live WebRTC Cockpit" icon="video" href="https://github.com/lukacf/meerkat/tree/main/examples/037-live-webrtc-web">
+    **Web + TypeScript** -- Manual browser cockpit for WebRTC signaling, microphone/audio transport, live controls, note and text-pane callbacks, and the real mob tool surface.
   </Card>
 </CardGroup>
 

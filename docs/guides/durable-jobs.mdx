@@ -1,0 +1,267 @@
+---
+title: "Durable Jobs and Monitors"
+description: "Run detached work durably, inspect its lifecycle, subscribe to delivery, and compose jobs with Schedule and WorkGraph."
+icon: "clock-rotate-left"
+---
+
+# Durable Jobs and Monitors
+
+Meerkat's detached job subsystem owns long-running execution outside an agent
+turn. Submission commits a stable job record before returning. The generated
+`DetachedJobMachine` then owns attempts, leases, fencing, progress,
+cancellation, retry, and terminal result.
+
+<Warning>
+Detached means durable. A persistent realm job store, blob store, runtime
+delivery projector, and canonical session/operation binding are required.
+Memory realms, ephemeral services, WASM, and other hosts missing those pieces
+fail closed. There is no volatile background fallback.
+</Warning>
+
+## Background Shell Jobs
+
+The agent-side shell tool submits a durable, non-resumable job when
+`background: true`:
+
+```json
+{
+  "command": "./scripts/run-security-scan",
+  "working_dir": "/srv/homecore",
+  "timeout_secs": 3600,
+  "background": true
+}
+```
+
+The receipt contains a stable `job_id`. Use `shell_job_status`, `shell_jobs`,
+and `shell_job_cancel` from the same shell tool surface.
+
+The job record and its terminal delivery survive restart, but the Unix process
+does not become resumable. If the process is lost, the current attempt becomes
+`worker_lost` after its committed lease expires. Meerkat never silently
+replays a non-resumable shell command.
+
+`command: "some-command &"` is different. It follows the foreground shell
+path, creates no Meerkat job ID, and leaves any surviving child unmanaged.
+
+## Lifecycle And Restart Contract
+
+Safe job projections use these phases:
+
+```text
+unsubmitted -> queued -> claimed -> running
+                         |          |
+                         |          +-> waiting_external
+                         |          +-> loss_observed -> retry_scheduled
+                         |
+                         +-> succeeded | failed | cancelled
+                             worker_lost | needs_attention
+```
+
+Runner restart classes state what recovery may do:
+
+| Restart class | Recovery contract |
+|---------------|-------------------|
+| `adoptable` | Reattach only through a stable live runner handle |
+| `checkpoint_resumable` | Start from the latest committed checkpoint |
+| `replayable` | Re-run only when the runner's declared idempotency contract permits it |
+| `non_resumable` | Declare loss; never replay automatically |
+
+Worker attempt IDs and fence tokens are host-only. App projections expose the
+job ID, runner, phase, restart class, attempt count, progress, cancellation
+request, terminal result, subscription count, and delivery backlog.
+
+## Public JSON-RPC Surface
+
+The public job surface is JSON-RPC plus the generated Python and TypeScript
+SDKs. There is no general REST, CLI, or public MCP job-management surface.
+Agent shell tools provide their own job-oriented commands.
+
+| JSON-RPC method | Purpose |
+|-----------------|---------|
+| `jobs/get` | Read one safe job projection |
+| `jobs/list` | List jobs for a required origin `session_id` (default 100, maximum 1,000) |
+| `jobs/cancel` | Request machine-authorized cancellation |
+| `jobs/progress` | Read the latest durable progress frame |
+| `jobs/result` | Read the typed terminal result, if present |
+| `jobs/artifacts` | List safe result/detail references |
+| `jobs/retry` | Schedule a machine-authorized retry at `retry_due_at_ms` |
+| `jobs/health` | Read operational health and delivery backlogs |
+| `jobs/subscribe` | Add a durable delivery subscription |
+| `jobs/unsubscribe` | Remove one subscription without cancelling the job |
+| `monitors/start` | Start a high-trust durable script monitor |
+
+Read a job:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "jobs/get",
+  "params": { "job_id": "job_019..." }
+}
+```
+
+Cancellation is a request until the current worker proves containment and
+acknowledges the machine transition. Continue observing the job instead of
+assuming the first cancel response is terminal.
+
+`jobs/retry` does not grant callers a second execution authority. The machine
+admits it only from a compatible loss state and keeps the existing job ID and
+attempt history.
+
+### SDK Method Names
+
+| Operation | Python | TypeScript |
+|-----------|--------|------------|
+| Get | `jobs_get` | `jobsGet` |
+| List | `jobs_list` | `jobsList` |
+| Cancel | `jobs_cancel` | `jobsCancel` |
+| Progress | `jobs_progress` | `jobsProgress` |
+| Result | `jobs_result` | `jobsResult` |
+| Artifacts | `jobs_artifacts` | `jobsArtifacts` |
+| Retry | `jobs_retry` | `jobsRetry` |
+| Health | `jobs_health` | `jobsHealth` |
+| Subscribe | `jobs_subscribe` | `jobsSubscribe` |
+| Unsubscribe | `jobs_unsubscribe` | `jobsUnsubscribe` |
+| Start monitor | `monitors_start` | `monitorsStart` |
+
+## Durable Delivery Subscriptions
+
+A subscription has a caller-stable `subscription_id`, target `session_id`,
+and delivery kind:
+
+- `record` stores the observation without notifying the conversation.
+- `notification` produces durable user-visible notification delivery without
+  opening a provider turn.
+- `event` requests ordinary agent work with `handling_mode: "steer"` or
+  `"queue"`.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "jobs/subscribe",
+  "params": {
+    "job_id": "job_019...",
+    "subscription_id": "security-ui-v1",
+    "session_id": "019...",
+    "delivery": { "kind": "notification" }
+  }
+}
+```
+
+Unsubscribe and cancel are deliberately separate. Unsubscribing stops future
+delivery to that subscription but leaves the job running.
+
+The job outbox and runtime inbox form an ordered, replay-safe handoff. A crash
+on either side retries the same durable identity, and the origin session can
+be woken from idle keep-alive without keeping a provider call open.
+
+## Script Monitors
+
+`monitors/start` is a convenience submission surface over the same durable job
+authority. It is high trust because it starts an agent-authored process. The
+host must have a persistent realm, shell capability, and an explicit project
+or working-directory context.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "monitors/start",
+  "params": {
+    "session_id": "019...",
+    "submission_key": "prod-alert-watch-v1",
+    "command": "./scripts/watch-alerts",
+    "working_dir": "/srv/homecore",
+    "timeout_secs": 86400,
+    "protocol": "framed_jsonl",
+    "restart_class": "checkpoint_resumable",
+    "delivery": { "kind": "event", "handling_mode": "queue" },
+    "max_line_bytes": 65536,
+    "max_notifications_per_window": 30,
+    "notification_window_ms": 60000
+  }
+}
+```
+
+Protocols:
+
+- `framed_jsonl` accepts typed notification, progress, checkpoint, and
+  completion frames. A notification never terminalizes the job.
+- `lines` turns stdout lines into notifications. It cannot provide stable
+  per-observation identity and therefore requires `non_resumable`. Prefer
+  framed JSONL for replay-sensitive work.
+
+Script monitors may declare `checkpoint_resumable`, `replayable`, or
+`non_resumable`. They cannot claim `adoptable`, because an ordinary script has
+no stable external runner handle that proves adoption.
+
+Inside an agent session, the shell tool set exposes the related
+`monitor_start` tool. It uses `event_steer` and `event_queue` shorthand for
+event delivery and otherwise shares the durable monitor authority.
+
+## Health
+
+`jobs/health` returns:
+
+```json
+{
+  "detached_jobs": {
+    "status": "ok",
+    "queued": 1,
+    "running": 2,
+    "awaiting_members": 1,
+    "stale_leases": 0,
+    "needs_attention": 0,
+    "pending_outbox_jobs": 0,
+    "runtime_inbox_backlog": 0,
+    "coverage": { "kind": "complete" }
+  }
+}
+```
+
+`status` is `ok`, `degraded`, or `unreadable`. `degraded` means the census
+actually observed a wedged condition. `unreadable` means the census could not
+establish any result. Independently, truncated coverage has the shape
+`{"kind":"truncated","scanned":N,"limit":N}` and makes phase counts lower
+bounds.
+
+`pending_outbox_jobs` and `runtime_inbox_backlog` name different seams. The
+first is realm-scoped and counts jobs whose delivery has not reached a runtime.
+The second is host-store scoped and counts deliveries a host runtime accepted
+but has not drained, including sessions from other logical realms served by
+that store. Legitimately long or awaited work is not degraded by duration
+alone.
+
+## Compose Without Merging Authorities
+
+### Schedule
+
+`ScheduledDurableJobRunnable` derives a stable submission key from the
+occurrence, submits or ensures the job, and lets the occurrence complete after
+durable acceptance. Schedule redelivery then finds the same job instead of
+launching duplicate work. Schedule owns due time; the job machine owns the
+execution.
+
+### WorkGraph
+
+`JobWorkGraphLink` associates a job with a commitment.
+`JobTerminalEvidenceProjector` projects typed terminal evidence and requests
+closure, but WorkGraph still applies its completion policy. Job execution must
+also work when WorkGraph is disabled.
+
+### Waiting Sessions
+
+Embedding hosts use `JobAwaitCoordinator::await_job` to create a durable
+`DetachedJobWait` operation for a session. It records intentional waiting and
+can be reconstructed after restart; it never keeps a provider call open.
+Notification subscriptions are independent from this wait binding.
+
+## See Also
+
+- [Builtin shell tools](/reference/builtin-tools#shell-tools)
+- [JSON-RPC API](/api/rpc)
+- [Scheduling guide](/guides/scheduling)
+- [WorkGraph guide](/guides/workgraph)
+- [Storage operations](/guides/storage-operations)

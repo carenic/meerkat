@@ -1,81 +1,164 @@
 ---
 title: "Sessions"
-description: "Realm-scoped session lifecycle with deterministic concurrency and cross-surface consistency."
+description: "Realm-scoped agent lifecycle, transcript, persistence, events, and recovery."
 icon: "arrows-rotate"
 ---
 
-Sessions are realm-scoped. A session is visible across surfaces only when they use the same `realm_id`.
+A session is Meerkat's durable conversation and execution identity. Session IDs
+are scoped by a realm, so two surfaces see the same session only when they
+resolve the same realm and persistence location.
+
+Runtime-backed sessions use `SessionService`. The public facade
+`meerkat::AgentBuilder` still routes through `AgentFactory`, but defaults to
+`StandaloneEphemeral` and does not acquire service-owned persistence, recovery,
+auth leases, scheduling, or wake coordination automatically.
 
 ## Lifecycle
 
 | Operation | What it does |
-|-----------|-------------|
-| `create_session` | Build an agent, run first turn, persist session metadata |
-| `start_turn` | Continue existing session; returns `SESSION_BUSY` if a turn is already running |
-| `interrupt` | Cancel in-flight turn |
-| `read` | Return session state + usage |
-| `read_history` | Return committed transcript messages with optional pagination |
-| `list` | List sessions in the active realm |
-| `archive` | Commit the durable archived verdict, retire the live runtime handle, and hide the session from normal listing; committed history stays readable on persistent backends |
+|-----------|--------------|
+| Create | Resolve model, provider, binding, config, and tools; optionally run the first turn |
+| Start turn | Continue an existing session with a new user input and optional turn overrides |
+| Interrupt | Cancel the in-flight turn explicitly |
+| Read | Return the current session state, usage, and lightweight metadata |
+| Read history | Return committed transcript messages, oldest first, with pagination |
+| List | List visible sessions in the active realm |
+| Archive | Commit the archived verdict, retire the live handle, and block later mutation |
 
-## Realm visibility rules
+Only one turn can run on a session at a time. A competing start fails with
+`SESSION_BUSY`; Meerkat does not silently queue it. Use runtime ingress,
+scheduling, comms handling modes, or an application queue when queued delivery
+is part of the product contract.
 
-| Scenario | Result |
-|----------|--------|
-| CLI + RPC with same `realm_id` | Shared session visibility |
-| CLI + RPC with different `realm_id` | Strict isolation |
-| 100 RPC servers, no realm provided | Each gets its own isolated realm by default |
-| 100 agents, same explicit `realm_id` | Shared state and consistent visibility |
+## Transcript Contract
 
-See [realms](/concepts/realms) for default surface behavior.
+The durable transcript is typed and ordered:
 
-## Session metadata
+- `System` is an ordinary instruction and may appear at any transcript
+  position.
+- `SystemNotice` is runtime-authored structured metadata for comms, tools,
+  MCP, auth, jobs, and other lifecycle facts.
+- `User` messages carry a typed role: conversational input, a compaction
+  summary, or host-attached injected context.
+- Assistant messages keep ordered content and tool-call blocks.
+- Tool-result rows keep the results of executed tool calls.
 
-Session metadata now carries realm context:
+Provider adapters project this canonical transcript to the selected wire
+format. A provider with a more limited instruction format returns a typed
+projection error when the ordered transcript cannot be represented safely;
+the durable transcript is not reordered or rewritten to make the call fit.
 
-- `realm_id`
-- `instance_id`
-- `backend`
-- `config_generation`
+### Context And System Updates
 
-This allows deterministic resume behavior and cross-surface observability.
+`injected_context` on create and turn requests is host-attached ambient
+context. Each item becomes a typed injected-context user-channel row immediately
+before that turn's conversational user message. These rows are excluded from
+semantic-memory indexing and do not masquerade as ordinary user requests.
 
-## Session history
+`transient_turn_context` is a different, request-only runtime input. Its exact
+bytes stay with the pending input for crash retry, but it is never appended to
+the Session transcript or included in compaction or structured-output
+extraction. During the active turn it is projected as temporary user-channel
+context before the admitted conversational message. A deferred create cannot
+carry it because no runtime input exists yet; attach it to the eventual turn.
 
-Public surfaces now expose full transcript history separately from lightweight metadata reads.
+The JSON-RPC `session/inject_context` method is a separate compatibility
+surface: it appends durable system context with a source and optional
+idempotency key for a later turn.
 
-- REST: `GET /sessions/{id}/history`
-- RPC: `session/history`
-- MCP: `meerkat_history`
-- Python SDK: `read_session_history()`, `Session.history()`, `DeferredSession.history()`
-- TypeScript SDK: `readSessionHistory()`, `Session.history()`, `DeferredSession.history()`
+At create time, `SystemPromptOverride` keeps inherit, set, and disable as three
+different facts. A set value materializes an ordinary ordered `System` row;
+disable suppresses the config, project-instruction, and built-in prompt sources
+for that build rather than encoding an empty instruction.
 
-History responses return committed messages oldest-to-newest and support `offset` / `limit` pagination. They do not expose in-flight partial output.
+System-prompt update APIs use keyed, versioned `System` rows. The newest
+version of a key is active at the model boundary, while prior revisions remain
+in the audited transcript. Unkeyed system messages remain ordinary ordered
+events.
 
-Archive ownership is uniform across profiles: the canonical `SessionDocumentMachine` owns the session's lifecycle-terminal fact, and archiving commits the durable archived verdict first, then retires the live runtime handle, so a half-archived "resurrection window" is unrepresentable. Archived sessions are hidden from listing and blocked from further mutation. On persistent backends the committed transcript stays readable through history reads; the in-memory ephemeral service keeps a final read-only state view but answers archived history reads with `SESSION_PERSISTENCE_DISABLED`. It is a lifecycle visibility change, not a history wipe.
+Persistent JSON-RPC sessions also expose append-audited transcript revision
+methods:
 
-## Persistence and backend pinning
+- `session/rewrite_transcript`
+- `session/transcript_revision`
+- `session/transcript_revisions`
+- `session/restore_transcript_revision`
+
+These operations retain the session ID and revision history. They are not a
+general promise that every session profile or surface supports transcript
+rewrites.
+
+## Session Metadata
+
+Persisted metadata carries the facts needed to resume consistently:
+
+- model, provider, provider parameters, and optional self-hosted server
+- max-token and structured-output policy
+- tool intent, comms identity, and keep-alive intent
+- realm, instance, pinned backend, and config generation
+- structural auth binding, without credential material
+- typed mob-member binding when a mob runtime owns the session
+
+On resume, the factory re-resolves dynamic capabilities and credentials from
+that durable intent and the active effective config. It does not reuse a stale
+access token stored in the session.
+
+## Persistence Profiles
 
 Backends are selected once per realm and pinned in `realm_manifest.json`.
 
-| Backend | Notes |
-|---------|-------|
-| `sqlite` | Durable embedded database; default for new persistent realms when compiled |
-| `jsonl` | File-based, inspectable, useful for debugging |
-| `memory` | In-process session storage for throwaway runs; not durable across process restart |
+| Backend | Behavior |
+|---------|----------|
+| `sqlite` | Durable embedded storage and the normal same-realm multi-process profile |
+| `jsonl` | Inspectable session files plus durable runtime authority in a companion SQLite store |
+| `memory` | Explicit in-process, non-durable state for throwaway runs |
 
-A realm stays pinned to the backend recorded in `realm_manifest.json`.
+Persistent stores own the physical current head. Runtime machines authorize
+lifecycle transitions and recovery commits, but the in-memory `Session`
+object does not independently certify that its bytes are the durable head.
 
-## Concurrency guarantees
+## Events And History
 
-- One turn per session at a time.
-- No implicit queueing for concurrent turns.
-- `interrupt()` is explicit cancellation.
-- Config writes can be synchronized with generation CAS (`expected_generation`) to avoid lost updates during concurrent operations.
-- SQLite-backed realms support the standard same-realm multi-process workflow across CLI, REST, RPC, MCP, and SDK surfaces.
+History reads return committed transcript rows, not partial in-flight output.
+When installed, persistent event audit projection uses a dedicated unbounded
+subscription, so a slow UI subscriber cannot drop its projector input. The
+audit log is asynchronous derived state, not session commit authority. Bounded
+interactive subscribers can receive a typed
+`StreamTruncated(StreamLagged)` marker and should refresh state or history
+instead of assuming they observed every presentation event.
 
-## See also
+Archiving is a lifecycle visibility change, not a transcript deletion.
+Persistent history remains readable after archive. The memory profile retains
+a final read-only state view but cannot provide persistent archived history.
 
+## Recovery Holds
+
+Meerkat never guesses across ambiguous durable evidence. Resume can be refused
+with one of three stable codes while the stored content remains intact:
+
+| Code | Meaning |
+|------|---------|
+| `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` | A verified tail exists beyond the last committed runtime boundary and awaits authorized reconciliation |
+| `SESSION_DURABLE_TAIL_RECOVERY_REFUSED` | Conflicting runtime facts prevented recovery; retry after the other runtime quiesces or investigate contradictory receipts |
+| `SESSION_DURABLE_EVIDENCE_QUARANTINED` | Evidence is forked or unverifiable, so no head can be served as authority |
+
+These are preservation states, not proof that the transcript was erased.
+Inspect the owning realm and runtime before attempting repair.
+
+## Cross-Surface Visibility
+
+| Scenario | Result |
+|----------|--------|
+| CLI and RPC resolve the same realm and root | Shared sessions |
+| Same realm ID under deliberately different explicit roots | Separate physical stores |
+| Different realm IDs in one folder | Strict isolation |
+| Server surfaces with no realm | Fresh isolated realm per process |
+
+See [Realms](/concepts/realms) for identity and root resolution.
+
+## See Also
+
+- [Session contracts](/reference/session-contracts)
 - [Realms](/concepts/realms)
 - [Configuration](/concepts/configuration)
-- [Session contracts](/reference/session-contracts)
+- [Memory and compaction](/concepts/memory-and-compaction)

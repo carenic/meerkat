@@ -1,11 +1,13 @@
 //! meerkat-live — Live multimodal transport for Meerkat.
 //!
-//! Composable WebSocket bridge between browser/test clients and
-//! `LiveAdapterHost`. Any Meerkat surface (CLI, RPC, REST, MCP) can
-//! mount the axum router or start a standalone listener.
+//! Composable live-channel bridge between browser/test clients and
+//! `LiveAdapterHost`. The base transport is WebSocket; the `webrtc` feature
+//! adds WebRTC SDP answer signaling plus media/data-channel termination. A
+//! Meerkat surface can mount the relevant axum router or listener explicitly.
 //!
-//! Frame protocol: client sends `LiveInputChunk` JSON, receives
-//! `LiveAdapterObservation` JSON. Token-based channel auth.
+//! On WebSocket, the client sends `LiveInputChunk` JSON and receives
+//! `LiveAdapterObservation` JSON. Both transports use token-bound channel
+//! admission.
 
 pub mod host;
 pub mod transport;

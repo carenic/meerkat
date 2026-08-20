@@ -607,7 +607,7 @@ pub struct SessionBuildOptions {
     /// Optional wrapper applied to the final agent-facing LLM client.
     ///
     /// This is intentionally provider-agnostic and runs after raw clients are
-    /// adapted into [`AgentLlmClient`].
+    /// adapted into [`crate::AgentLlmClient`].
     pub agent_llm_client_decorator: Option<crate::AgentLlmClientDecorator>,
     // NOTE: ops_lifecycle_override was removed in Phase 3.
     // Use runtime_build_mode instead.
@@ -645,7 +645,7 @@ pub struct SessionBuildOptions {
     pub instance_id: Option<String>,
     /// Typed realm-pinned session-store backend for this build.
     ///
-    /// Carries the single typed owner ([`RecoveryBackendKind`]) rather than a
+    /// Carries the single typed owner ([`crate::session_recovery::RecoveryBackendKind`]) rather than a
     /// bare backend string, so a recovery-environment hint cannot
     /// silently become durable identity: any raw backend string is parsed
     /// fail-closed at its ingress boundary before it reaches this field.
@@ -2631,7 +2631,7 @@ pub trait SessionService: Send + Sync {
     /// A live (realtime) channel can terminalize for reasons that are not
     /// themselves Meerkat run outcomes (connection lost, provider error, auth
     /// failure, local config rejection). The live projection surface must route
-    /// the typed [`LiveAdapterErrorCode`] cause here instead of laundering it
+    /// the typed [`crate::live_adapter::LiveAdapterErrorCode`] cause here instead of laundering it
     /// into a warning log and an `Ok(())` — the fault is then observable on the
     /// session's owned event stream rather than only in tracing.
     ///

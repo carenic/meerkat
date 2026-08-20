@@ -1,10 +1,10 @@
 ---
-title: Scheduling
+title: "Scheduling Guide"
 description: Automate durable session and mob work with once, interval, and calendar schedules.
 icon: "clock"
 ---
 
-# Scheduling
+# Scheduling Guide
 
 Meerkat's scheduler persists **schedules** and projects concrete **occurrences** from them.
 
@@ -19,7 +19,8 @@ Use this guide when you want to:
 
 - A **schedule** is the durable rule: trigger + target + policies.
 - An **occurrence** is one planned delivery produced from that rule.
-- The **driver** claims due occurrences and delivers them to the target at runtime.
+- The **driver** first holds the store-issued executor lease, then claims due
+  occurrences and delivers them to the target at runtime.
 
 ```text
 Schedule (trigger + target + policies)
@@ -240,6 +241,50 @@ Example event delivery:
 }
 ```
 
+Inside an agent, `meerkat_schedule_create` and
+`meerkat_schedule_update` also accept the host-only `current_session`
+shortcut:
+
+```json
+{
+  "target_kind": "session",
+  "type": "current_session",
+  "action": {
+    "type": "prompt",
+    "prompt": "Check in on this work."
+  }
+}
+```
+
+The wrapper resolves this before persistence. A normal session becomes a
+`resumable_session` target. A mob member becomes a host-minted
+`resumable_identity` target, so replacing that member's session does not
+strand future occurrences. `current_session` is not part of the REST or
+JSON-RPC target schema.
+
+### Identity targets
+
+`target_kind` must be `"identity"`; the current variant is
+`resumable_identity`. The host resolves the stable identity to the current
+materialized session at delivery time.
+
+```json
+{
+  "target_kind": "identity",
+  "type": "resumable_identity",
+  "identity": "mob_member:{\"schema\":\"meerkat.schedule.mob_member_identity.v2\",\"mob_id\":\"ops\",\"member\":\"watcher\"}",
+  "action": {
+    "type": "prompt",
+    "prompt": "Check the overnight alerts."
+  }
+}
+```
+
+Use host-minted identities only. Public creation refuses free-form identities
+that the active schedule host cannot resolve. Mob-member identities accept
+prompt actions only and reject session-only prompt overrides such as
+`system_prompt`, `skill_refs`, and `additional_instructions`.
+
 ### Mob targets
 
 `target_kind` must be `"mob"` with one of these `type` variants:
@@ -280,7 +325,14 @@ records a `runtime_rejected` delivery failure.
 ```
 
 `params` is an optional host-owned JSON payload handed to the runnable
-verbatim; meerkat never interprets it.
+verbatim; Meerkat never interprets it. The payload must be non-null valid JSON
+and is canonicalized before it participates in the durable target identity.
+
+For long-running work, register a runnable that submits or ensures a durable
+job and returns immediately after durable acceptance. Use the occurrence ID as
+the stable submission key. The built-in `ScheduledDurableJobRunnable` follows
+this pattern: Schedule owns when to submit, while the jobs subsystem owns the
+attempt, lease, progress, cancellation, and terminal result.
 
 ## Policies
 
@@ -339,6 +391,24 @@ Occurrence phase is more detailed:
 
 Use `schedule/occurrences` or `GET /schedules/{id}/occurrences` to inspect what actually fired and why.
 
+## Executor Lease And Crash Recovery
+
+The store issues a fenced executor lease to one driver incarnation. Only that
+lease holder can plan or claim firing work. A standby driver reports a healthy
+non-authorized tick and can take over after release or expiry. The default
+occurrence claim lease is 60 seconds; a long delivery renews it around the
+half-lease point.
+
+Each dispatch also carries a stable occurrence-level delivery identity. If
+target admission succeeds but recording the receipt fails, recovery retries
+the same identity. Target hosts must reconcile or deduplicate that identity;
+the scheduler does not claim exactly-once behavior for arbitrary external
+effects.
+
+Poisoned schedule and occurrence rows are isolated as typed per-row faults so
+healthy rows can continue. Hosts should surface the driver fault report rather
+than treating a successful partial tick as a clean scheduler.
+
 ## Agent-side schedule tools
 
 When scheduling is exposed inside a running agent, the canonical tool names are:
@@ -354,8 +424,16 @@ When scheduling is exposed inside a running agent, the canonical tool names are:
 
 These are distinct from the host APIs (`schedule/*` over RPC and `/schedules/*` over REST).
 
+Agent-authored `spawn_helper` and `fork_helper` schedules capture the creator's
+effective tool-access policy at creation time. This prevents a scheduled
+helper from gaining tools the creator could not use. Public host APIs reject
+helper-tooling modes that depend on an active parent context.
+
 ## See also
 
 - [JSON-RPC API](/api/rpc)
 - [REST API](/api/rest)
 - [Builtin tools reference](/reference/builtin-tools)
+- [Scheduling concept](/concepts/scheduling)
+- [Durable jobs and monitors](/guides/durable-jobs)
+- [WorkGraph guide](/guides/workgraph)

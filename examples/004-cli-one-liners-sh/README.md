@@ -1,14 +1,14 @@
 # 004 — CLI One-Liners (Shell)
 
-Everything you can do with `rkat` from the command line — no code required.
+Common `rkat` workflows from the command line, with no application code.
 
 ## Concepts
 - `rkat run` — single-turn agent execution
 - `rkat run --resume last` — multi-turn session resumption
-- `rkat session list/show/delete` — session management
-- `--isolated` / `--realm` — workspace isolation
-- `--verbose` / `--stream` — output modes
-- `rkat config` — runtime configuration
+- `rkat session list` - inspect sessions created by earlier commands
+- `--isolated` / `--realm` - realm selection
+- `--verbose` / `--stream` - output modes
+- `rkat config` - runtime configuration
 
 ## Prerequisites
 ```bash
@@ -18,5 +18,5 @@ export ANTHROPIC_API_KEY=sk-...
 
 ## Run
 ```bash
-chmod +x examples.sh && ./examples.sh
+./examples/004-cli-one-liners-sh/examples.sh
 ```

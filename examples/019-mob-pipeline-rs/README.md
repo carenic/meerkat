@@ -1,22 +1,29 @@
 # 019 — Mob: Pipeline (Rust)
 
-Sequential stage processing where each stage must pass before the next
-starts. Models real-world CI/CD, data processing, and approval workflows.
+Construct and validate a staged mob definition, spawn a coordinator plus stage
+workers, wire their topology, and submit illustrative lint and test turns.
+The example is a topology and manual-dispatch walkthrough, not an executing
+pass/fail pipeline engine.
 
 ## Concepts
-- Sequential stage execution
-- Stage handoffs via directed peer requests
-- Pass/fail gating between stages
-- Artifact passing between stages
-- The pipeline prefab
+- `MobDefinition` profiles, skills, topology, limits, and a sample flow DAG
+- Definition validation before mob creation
+- Explicit coordinator and stage-worker wiring
+- Manual turns sent to the lint and test members
+- In-memory mob storage and ephemeral sessions
 
 ## Pipeline Stages
 ```
-Lint → Test → Deploy
-  ↓      ↓       ↓
- PASS   PASS    PASS → Success!
- FAIL → Stop pipeline, report failure
+MobDefinition -> validate -> create mob -> spawn members -> wire topology
+                                                        |
+                                                        +-> lint turn
+                                                        +-> test turn
 ```
+
+The deploy member is spawned for topology completeness, but this example does
+not run a deploy turn, inspect the lint result to gate the test turn, or invoke
+the declared `FlowSpec`. Use the flow APIs when application-owned execution and
+gating are required.
 
 ## Run
 ```bash

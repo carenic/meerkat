@@ -14,7 +14,12 @@ Load this reference as the first review lens when touching runtime, mob, comms, 
 8. **Errors separate mechanism from policy** — `ToolError → AgentError → SessionError`.
 9. **Wire types ≠ domain types** — `meerkat-contracts` owns wire format; `meerkat-core` owns domain types.
 10. **Sessions are first-class, persistence is optional** — Ephemeral and Persistent share the same trait.
-11. **No backward compatibility aliases** — clean cut. No serde aliases for old names, no `pub use` of deleted types under new names, no `#[deprecated]` markers.
+11. **No ad hoc backward-compatibility aliases** - make a clean cut unless an
+    owner explicitly maintains a compatibility surface. The deliberate
+    `meerkat-client`, `meerkat-providers`, and `meerkat-mob-adaptive` shim crates
+    are documented transitional import paths; their existence does not
+    authorize new serde aliases, renamed re-exports, or deprecation folklore
+    elsewhere.
 12. **No `.unwrap()`/`.expect()`/`panic!()` in library code** — use `?` propagation or explicit error handling.
 13. **Runtime-backed builds require bindings** — `RuntimeBuildMode::SessionOwned(bindings)` for runtime-backed surfaces; `StandaloneEphemeral` for WASM/tests/embedded. Factory never creates a competing registry for `SessionOwned`.
 14. **One recovery seam for epoch state** — `recover_or_create_ops_state()` on `MeerkatMachine` is the single canonical recovery helper. Both `register_session()` and `ensure_session_with_executor()` use it.

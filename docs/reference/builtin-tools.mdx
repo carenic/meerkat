@@ -6,10 +6,14 @@ icon: "wrench"
 
 ## Overview
 
-The built-in tools below are owned by the `meerkat-tools` builtin dispatcher
-(`build_builtin_dispatcher` / `BuiltinDispatcherConfig` in
-`meerkat-tools/src/builtin`), which is the source of truth for tool names,
-categories, and gates.
+This inventory combines the `meerkat-tools` builtin dispatcher with the
+runtime-composed memory, comms, schedule, WorkGraph, mob, image-generation,
+and web-search surfaces. Each family remains the source of truth for its own
+tool names, schemas, execution contract, mutation class, and gates.
+
+In the table, `Default` means enabled inside an already-selected tool family.
+It does not mean a bare `AgentFactory` exposes that family. Product surfaces
+may apply explicit presets of their own.
 
 | Tool | Category | Default | Gate | Description |
 |------|----------|---------|------|-------------|
@@ -21,25 +25,45 @@ categories, and gates.
 | `shell_jobs` | Shell | No | -- | List background shell jobs |
 | `shell_job_status` | Shell | No | -- | Check background job status |
 | `shell_job_cancel` | Shell | No | -- | Cancel a background job |
+| `monitor_start` | Shell monitor | No | durable job + blob stores | Start a high-trust framed script monitor |
 | `memory_search` | Memory | N/A | `memory-store-session` | Search semantic memory |
 | `datetime` | Utility | Yes | -- | Get current date/time |
 | `apply_patch` | Utility | Yes | -- | Apply structured file patches inside the project root |
 | `view_image` | Utility | Yes | `image_tool_results` | Read an image file and return base64 content |
-| `generate_image` | Image generation | Runtime-backed | image provider profile | Generate or edit assistant images and commit blob-backed image blocks |
+| `generate_image` | Image generation | Runtime-backed | image runtime dependencies; inherited in normal composite or explicitly enabled in minimal composition | Generate or edit assistant images and commit blob-backed image blocks |
+| `web_search` | Web search fallback | Runtime-backed | provider search executor | Search through Meerkat when the active model has no native search tool |
 | `blob_save_file` | Blob files | Runtime-backed | blob store | Save decoded blob bytes to a project-root-contained file |
 | `blob_load_file` | Blob files | Runtime-backed | blob store | Load a project-root-contained file into the realm blob store |
 | `blob_inspect` | Blob files | Runtime-backed | blob store | Inspect blob media type and decoded byte size without returning bytes |
 | `send_message` | Comms | Yes | `comms` | Send a collaboration message to a peer |
+| `reply_to_peer` | Comms | Yes | `comms` | Reply through the turn-scoped capability minted for an incoming peer message |
 | `send_request` | Comms | Yes | `comms` | Send a structured request to a peer |
 | `send_response` | Comms | Yes | `comms` | Send a response to a peer request |
 | `peers` | Comms | Yes | `comms` | List discoverable peers (trusted + inproc) |
-| `browse_skills` | Skills | Yes | `skills` | Browse skill collections and search skills |
-| `load_skill` | Skills | Yes | `skills` | Load a skill's full instructions into the conversation |
-| `skill_list_resources` | Skills | Yes | `skills` | List skill-owned resources |
-| `skill_read_resource` | Skills | Yes | `skills` | Read a specific skill-owned resource |
-| `skill_invoke_function` | Skills | Yes | `skills` | Invoke a skill-defined function |
-| `tool_catalog_search` | Control plane | Yes | `builtins` | Search deferred tool-catalog entries |
-| `tool_catalog_load` | Control plane | Yes | `builtins` | Load deferred tool-catalog entries into visibility |
+| `browse_skills` | Skills | No | `skills` + explicit tool policy | Browse skill collections and search skills |
+| `load_skill` | Skills | No | `skills` + explicit tool policy | Load a skill's full instructions into the conversation |
+| `skill_list_resources` | Skills | No | `skills` + explicit tool policy | List skill-owned resources |
+| `skill_read_resource` | Skills | No | `skills` + explicit tool policy | Read a specific skill-owned resource |
+| `skill_invoke_function` | Skills | No | `skills` + explicit tool policy | Invoke a skill-defined function |
+| `tool_catalog_search` | Control plane | Adaptive | exact deferred catalog | Search deferred tool-catalog entries |
+| `tool_catalog_load` | Control plane | Adaptive | exact deferred catalog | Stage deferred tool-catalog entries for visibility |
+| `delegate` | Mob | Yes | `mob` + generated authority | Run one bounded helper task in an implicit mob |
+| `conclude_objective` | Mob | Yes | `mob` + kickoff objective | Conclude the pre-addressed kickoff objective |
+| `mob_create` | Mob | Yes | `mob` + generated authority | Create an explicit mob |
+| `mob_destroy` | Mob | Yes | `mob` + mob scope | Destroy an explicit mob |
+| `mob_spawn_member` | Mob | Yes | `mob` + spawn scope | Spawn a member |
+| `mob_retire_member` | Mob | Yes | `mob` + mob scope | Retire a member and archive its session |
+| `mob_check_member` | Mob | Yes | `mob` + mob scope | Read member execution status and output |
+| `mob_list_members` | Mob | Yes | `mob` + mob scope | List a mob's members |
+| `mob_list` | Mob | Yes | `mob` + generated authority | List managed mobs |
+| `mob_wire` | Mob | Yes | `mob` + mob scope | Wire a member to a local or external peer |
+| `mob_unwire` | Mob | Yes | `mob` + mob scope | Remove a member wiring relationship |
+| `mob_profile_create` | Mob profile | Conditional | realm profile store | Create a reusable realm profile |
+| `mob_profile_get` | Mob profile | Conditional | realm profile store | Read a realm profile |
+| `mob_profile_list` | Mob profile | Conditional | realm profile store | List realm profiles |
+| `mob_profile_update` | Mob profile | Conditional | realm profile store | Update a realm profile by expected revision |
+| `mob_profile_delete` | Mob profile | Conditional | realm profile store | Delete a realm profile by expected revision |
+| `mob_profile_list_sources` | Mob profile | Conditional | profile store + snapshot provider | List visible tool sources for profile authoring |
 | `meerkat_schedule_create` | Schedule | Yes | `schedule` | Create a new schedule |
 | `meerkat_schedule_get` | Schedule | Yes | `schedule` | Read one schedule |
 | `meerkat_schedule_list` | Schedule | Yes | `schedule` | List schedules |
@@ -71,8 +95,8 @@ categories, and gates.
 
 | Flag | Builder Method | Default | Controls |
 |------|---------------|---------|----------|
-| `enable_builtins` | `.builtins(bool)` | `false` | Task tools, utility tools (`datetime`, `apply_patch`, `view_image`), runtime-backed `generate_image`, and blob file tools when a blob store is wired |
-| `enable_shell` | `.shell(bool)` | `false` | All shell tools (`shell`, `shell_jobs`, `shell_job_status`, `shell_job_cancel`) |
+| `enable_builtins` | `.builtins(bool)` | `false` | Task tools, utility tools (`datetime`, `apply_patch`, `view_image`), and blob file tools when a blob store is wired |
+| `enable_shell` | `.shell(bool)` | `false` | Standard shell tools (`shell`, `shell_jobs`, `shell_job_status`, `shell_job_cancel`); `monitor_start` remains an explicit high-trust policy decision |
 | `enable_memory` | `.memory(bool)` | `false` | `memory_search` (requires `memory-store-session` feature) |
 | `enable_schedule` | `.schedule(bool)` | `false` | Scheduler tools (`meerkat_schedule_*`) |
 | `enable_workgraph` | `.workgraph(bool)` | `false` | WorkGraph tools (`workgraph_*`) |
@@ -95,21 +119,54 @@ Each `AgentBuildConfig` can override factory-level flags for a single agent buil
 | `override_schedule` | `ToolCategoryOverride` | Explicit `enable`, `disable`, or `inherit` |
 | `override_workgraph` | `ToolCategoryOverride` | Explicit `enable`, `disable`, or `inherit` |
 | `override_mob` | `ToolCategoryOverride` | Explicit `enable`, `disable`, or `inherit` |
+| `override_comms` | `ToolCategoryOverride` | Explicit `enable`, `disable`, or `inherit` |
+| `override_image_generation` | `ToolCategoryOverride` | Controls assistant image-generation visibility independently from general builtins |
+| `override_web_search` | `ToolCategoryOverride` | Controls provider-native search or the Meerkat fallback independently from general builtins |
 
-All default to `inherit` (use the factory-level setting).
+All default to `inherit`. The categories backed by factory flags inherit those
+flags. Image generation treats `inherit` as visible once its session-owned
+substrate is wired into the normal composite dispatcher. The minimal
+no-builtins/no-shell early return requires an explicit image enable to create
+that dispatcher. The Meerkat-owned web-search fallback is different: it treats
+`inherit` as hidden and requires an explicit `enable`. An explicit enable fails
+closed if its runtime dependencies cannot be provisioned. Enabling either
+category does not enable general builtins.
 
 **Source:** `meerkat/src/factory.rs` -- `AgentBuildConfig` struct.
 </Accordion>
 
 <Accordion title="ToolPolicyLayer">
-Individual tools can be enabled or disabled via `ToolPolicyLayer` in `BuiltinToolConfig`. When shell is enabled, a `ToolPolicyLayer` is applied that activates the four shell tools (which have `default_enabled: false`).
+Individual tools can be enabled or disabled via `ToolPolicyLayer` in
+`BuiltinToolConfig`, but policy can only select tools from a category that was
+actually composed. When shell is enabled, the factory applies a policy that
+activates the four standard shell tools (which have `default_enabled: false`).
+The high-trust `monitor_start` and all five skill tools also default off and
+require an explicit policy enable in a custom dispatcher build.
+</Accordion>
+
+<Accordion title="Execution contracts and mutation classes">
+Every dispatcher exposes a `ToolExecutionContract` per tool. The default is
+`Fast`; tools may additionally support `Streaming` or `Detached`. Streaming
+contracts own progress/cancellation policy. Detached contracts declare runner
+identity, submission idempotency, restart class, and a bounded submission
+deadline. The resolved deadline is the narrowest contribution in the call's
+deadline chain.
+
+`RestartClass` values are `Adoptable`, `CheckpointResumable`, `Replayable`, and
+`NonResumable`. A tool can advertise only the classes its runner can honor.
+
+Separately, every dispatcher reports `ToolMutationClass::ReadOnly`,
+`Mutating`, or `Unknown`. Unknown is fail-closed uncertainty for third-party or
+undeclared tools, not an assertion that the call is harmless.
 </Accordion>
 
 <Accordion title="Capability registrations">
 Capabilities are registered via the `inventory` crate in `meerkat-tools/src/lib.rs`:
 
-- **Builtins** (`CapabilityId::Builtins`): `task_list`, `task_create`, `task_get`, `task_update`, `datetime`, `apply_patch`, `view_image`, runtime-backed `generate_image`, and runtime-backed `blob_save_file`/`blob_load_file`/`blob_inspect` when a blob store is available. Controlled by `config.tools.builtins_enabled`.
-- **Shell** (`CapabilityId::Shell`): `shell`, `shell_jobs`, `shell_job_status`, `shell_job_cancel`. Controlled by `config.tools.shell_enabled`.
+- **Builtins** (`CapabilityId::Builtins`): `task_list`, `task_create`, `task_get`, `task_update`, `datetime`, `apply_patch`, `view_image`, and runtime-backed `blob_save_file`/`blob_load_file`/`blob_inspect` when a blob store is available. Controlled by `config.tools.builtins_enabled`.
+- **Shell** (`CapabilityId::Shell`): `shell`, `shell_jobs`, `shell_job_status`, `shell_job_cancel`, plus opt-in `monitor_start`. Controlled by `config.tools.shell_enabled` and per-tool policy.
+- **Image generation**: runtime-owned `generate_image`, controlled by `override_image_generation` after runtime capability resolution.
+- **Web search**: provider-native search when the active model owns it, otherwise the Meerkat-owned `web_search` fallback; controlled by `override_web_search`.
 - **Schedule** (`CapabilityId::Schedule`): `meerkat_schedule_*`. Controlled by `config.tools.schedule_enabled`.
 - **WorkGraph** (`CapabilityId::WorkGraph`): `workgraph_*`. Controlled by `config.tools.workgraph_enabled`.
 </Accordion>
@@ -167,6 +224,71 @@ Set on `StartTurnRequest.turn_tool_overlay` by the flow engine and other per-tur
 **Source:** `meerkat-core/src/service/mod.rs`, `meerkat-mob/src/runtime/flow.rs`
 </Accordion>
 
+## Deferred tool catalog control plane
+
+An exact dispatcher can keep eligible session tools out of the LLM's inline
+schema set and expose two always-inline control tools instead. The adaptive
+selector enters deferred mode when a source is still pending, at least two
+eligible tools exist, or their combined name, description, and schema volume
+reaches 160 bytes. These tools are not part of the general builtins gate.
+
+<Accordion title="tool_catalog_search">
+Search deferred-eligible session tools without loading them.
+
+<ParamField body="query" type="String">
+  Optional case-insensitive substring search over canonical name and
+  description.
+</ParamField>
+
+<ParamField body="limit" type="usize" default="10">
+  Result limit, clamped to `1-50`.
+</ParamField>
+
+The response contains `catalog_exact`, `total_matches`, `results`, optional
+`pending_sources`, and optional `empty_result_status`. Each result reports
+`name`, `description`, `currently_callable`, and `visibility_status`:
+`loaded`, `deferred`, `blocked_by_filter`, or `temporarily_unavailable`.
+`pending_source` is used only as the empty-result status while a catalog source
+is pending.
+
+**Source:** `meerkat-tools/src/control_plane.rs`
+</Accordion>
+
+<Accordion title="tool_catalog_load">
+Stage one or more canonical deferred tool names for the next tool boundary.
+The control plane consults the bound `ToolScope` and fails closed when it has no
+authoritative visibility state.
+
+<ParamField body="names" type="String[]" required>
+  One or more canonical tool names.
+</ParamField>
+
+The response contains `catalog_exact`, `accepted_names`, `noop_names`, and one
+resolution per requested name. Rejection reasons are `unknown_key`,
+`not_deferred_eligible`, `not_filterable`, or `temporarily_unavailable`.
+Already staged or visible names are successful no-ops. Accepted loads take
+effect at the next boundary, not during the current tool call.
+
+**Source:** `meerkat-tools/src/control_plane.rs`,
+`meerkat-core/src/tool_catalog.rs`
+</Accordion>
+
+## Mob tools
+
+`AgentMobToolSurface` is composed only for sessions with generated MobMachine
+authority. It always defines the 11 core tools in the inventory above. Realm
+profile storage adds five profile CRUD tools; a parent-owned snapshot provider
+also adds `mob_profile_list_sources`. Admission is then checked again at each
+dispatch against the current typed mob, spawn, profile-mutation, or objective
+scope. See [Mob tools](/guides/mobs#agent-tools-vs-host-apis) for argument shapes
+and workflows.
+
+Host/operator surfaces for placement, binding, grants, observation, live
+member sessions, and hard cancellation are control-plane APIs, not agent
+builtins, so they are intentionally excluded from this inventory.
+
+**Source:** `meerkat-mob-mcp/src/agent_tools.rs`
+
 ## Schedule tools
 
 Schedule tools are the agent-facing scheduler surface. They are distinct from the host APIs (`schedule/*` over RPC and `/schedules/*` over REST).
@@ -218,7 +340,11 @@ is available. For the data model and host observability surfaces, see
 
 ## Task tools
 
-Task tools provide structured work tracking. They are enabled by default when builtins are on. Tasks are persisted via `TaskStore` (either `FileTaskStore` on disk or `MemoryTaskStore` in-memory).
+Task tools provide structured work tracking. They are enabled by default when
+builtins are on. With the `session-store` feature, factory-built sessions use a
+session-scoped `SqliteTaskStore`, so resume restores the same task set. Builds
+without that feature use `FileTaskStore` when a project root exists and
+`MemoryTaskStore` otherwise.
 
 <Accordion title="Task data model">
 A `Task` object returned by task tools has these fields:
@@ -381,7 +507,11 @@ Update an existing task. Only provided fields are modified; omitted fields remai
 
 ## Shell tools
 
-Shell tools execute commands and manage background jobs. They are all `default_enabled: false` and require the factory-level `enable_shell` flag (or a `ToolPolicyLayer` override) to be active.
+Shell tools execute commands and manage background jobs. They are all
+`default_enabled: false`. The effective shell category must first be composed;
+the factory then uses `ToolPolicyLayer` to activate the four standard shell
+tools. A policy cannot create an absent shell category, and `monitor_start`
+still requires its own explicit policy enable.
 
 <Warning>
 `background: true` is available only when the session has a persistent realm
@@ -438,8 +568,8 @@ Shell behavior is controlled by `ShellConfig`:
 | `shell` | `String` | `"nu"` | Shell binary name (Nushell by default; falls back to bash/zsh/sh) |
 | `shell_path` | `PathBuf?` | `None` | Explicit shell binary path |
 | `project_root` | `PathBuf` | CWD | Project root for path restriction |
-| `max_completed_jobs` | `usize` | `100` | Maximum completed jobs retained |
-| `completed_job_ttl_secs` | `u64` | `300` | TTL for completed job records (seconds) |
+| `max_completed_jobs` | `usize` | `100` | Accepted legacy compatibility field; the durable job runtime does not currently use it as retention authority. |
+| `completed_job_ttl_secs` | `u64` | `300` | Accepted legacy compatibility field; the durable job runtime does not currently expire records from this value. |
 | `max_concurrent_processes` | `usize` | `10` | Maximum concurrent background processes |
 | `security_mode` | `SecurityMode` | `Unrestricted` | Command security policy |
 | `security_patterns` | `Vec<String>` | `[]` | Glob patterns for allow/deny lists |
@@ -456,7 +586,9 @@ The `SecurityEngine` validates commands before execution using POSIX-compliant w
 | `AllowList` | Only commands matching `security_patterns` globs are allowed |
 | `DenyList` | Commands matching `security_patterns` globs are rejected |
 
-Patterns are matched against the canonicalized command invocation. The engine parses the full command string into individual words, then validates the executable (first word) and the full command string against the pattern set.
+The engine parses the command into an executable and arguments, canonicalizes
+that complete invocation, and matches the full canonical string against the
+pattern set.
 
 **Source:** `meerkat-tools/src/builtin/shell/security.rs`
 </Accordion>
@@ -498,8 +630,10 @@ Execute a shell command. Uses POSIX-style parsing for policy checks; runs via Nu
 ```json Returns (background)
 {
   "job_id": "job_<uuid-v7>",
-  "status": "running",
-  "message": "Background job started"
+  "status": "queued",
+  "restart_class": "non_resumable",
+  "awaitable": true,
+  "message": "Durable shell job submitted with ID: job_<uuid-v7>"
 }
 ```
 </CodeGroup>
@@ -509,6 +643,47 @@ Output is truncated to the last 100,000 characters if it exceeds that limit. Fie
 </Note>
 
 **Source:** `meerkat-tools/src/builtin/shell/tool.rs`
+</Accordion>
+
+<Accordion title="monitor_start">
+Start an explicitly enabled, high-trust durable script monitor. Unlike an
+ordinary background shell command, the monitor consumes a typed output
+protocol and can publish notifications, checkpoints, progress, and completion.
+Notifications do not complete the job.
+
+**Default enabled:** No. `enable_shell` alone does not grant this high-trust
+tool; an embedding surface must enable it through tool policy. Persistent realm
+job and blob stores are required.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `command` | required | Script or command to run. |
+| `working_dir` | project root | Validated working directory. |
+| `timeout_secs` | shell default | Command lifetime; must be greater than zero. |
+| `protocol` | `framed_jsonl` | `framed_jsonl` or plain `lines`. |
+| `restart_class` | `non_resumable` | `replayable`, `checkpoint_resumable`, or `non_resumable`. |
+| `delivery` | `notification` | `record`, `notification`, `event_steer`, or `event_queue`. |
+| `max_line_bytes` | `65536` | Maximum bytes in one protocol line. |
+| `max_notifications_per_window` | `60` | Notification rate limit. |
+| `notification_window_ms` | `60000` | Rate-limit window. |
+| `max_retained_diagnostic_bytes` | `262144` | Retained non-frame diagnostics cap. |
+
+```json
+{
+  "job_id": "job_<uuid-v7>",
+  "status": "running",
+  "restart_class": "checkpoint_resumable",
+  "output_protocol": "framed_jsonl",
+  "delivery": "notification",
+  "message": "Durable monitor submitted with ID: job_<uuid-v7>"
+}
+```
+
+Restart class is a declaration enforced by the detached execution contract,
+not a promise inferred from the command text. Replayable and resumable scripts
+must implement the corresponding idempotency/checkpoint behavior.
+
+**Source:** `meerkat-tools/src/builtin/shell/monitor_tool.rs`
 </Accordion>
 
 <Accordion title="shell_jobs">
@@ -529,7 +704,9 @@ List all background shell jobs.
 ]
 ```
 
-The `status` field is one of: `"running"`, `"completed"`, `"failed"`, `"timed_out"`, `"cancelled"`.
+The summary `status` field is one of: `"queued"`, `"running"`,
+`"completed"`, `"failed"`, `"cancelled"`, `"worker_lost"`, or
+`"needs_attention"`.
 
 **Source:** `meerkat-tools/src/builtin/shell/jobs_list_tool.rs`
 </Accordion>
@@ -550,7 +727,13 @@ Check status of a background shell job. Returns full job details including outpu
   "working_dir": "/path/to/project",
   "timeout_secs": 30,
   "started_at_unix": 1700000000,
-  "status": "completed"
+  "status": {
+    "status": "completed",
+    "exit_code": 0,
+    "stdout": "test\n",
+    "stderr": "",
+    "duration_secs": 0.01
+  }
 }
 ```
 
@@ -588,7 +771,10 @@ immediately because there is nothing to contain.
 <Accordion title="Shell types">
 **JobId format:** `"job_"` followed by a UUID v7 string.
 
-**JobStatus variants:** `Running`, `Completed`, `Failed`, `TimedOut`, `Cancelled` (serialized as lowercase snake_case strings).
+**JobStatus variants:** `Queued`, `Running`, `Completed`, `Failed`,
+`Cancelled`, `WorkerLost`, and `NeedsAttention` (serialized as lowercase
+snake_case status tags). A command timeout is represented by the worker's
+terminal failure facts; there is no current `TimedOut` enum variant.
 
 **Source:** `meerkat-tools/src/builtin/shell/types.rs`
 </Accordion>
@@ -655,6 +841,28 @@ Get the current date and time. Returns ISO 8601 formatted datetime and Unix time
 ```
 
 **Source:** `meerkat-tools/src/builtin/utility/datetime.rs`
+</Accordion>
+
+<Accordion title="apply_patch">
+Apply a line-oriented patch that can add, update, move with edits, or delete
+files inside the project root. This tool is classified `Mutating`.
+
+<ParamField body="patch" type="String" required>
+  Patch text wrapped by `*** Begin Patch` and `*** End Patch`. File operations
+  use `*** Add File:`, `*** Update File:`, optional `*** Move to:`, and
+  `*** Delete File:` markers. Update hunks use literal `@@` context plus space,
+  `-`, and `+` line prefixes.
+</ParamField>
+
+Paths must be project-root-relative. Lexical and symlink escapes are rejected.
+A pure rename is not supported: a move must include at least one update hunk.
+Multi-file patches are applied in order and are not transactional, so an error
+after an earlier operation can leave that earlier operation applied.
+
+The JSON result reports `status: "success"` plus `added_files`,
+`modified_files`, and `deleted_files`.
+
+**Source:** `meerkat-tools/src/builtin/utility/apply_patch.rs`
 </Accordion>
 
 <Accordion title="view_image">
@@ -736,7 +944,12 @@ Inspect a blob without returning its raw payload.
 <Accordion title="generate_image">
 Generate or edit an assistant-owned image through the session image-generation substrate. Generated bytes are committed to the realm blob store and returned as durable `AssistantImageRef` values.
 
-**Default enabled:** Yes when builtins are on and the runtime-backed session has image-generation machine, executor, planner, and blob-store wiring.
+**Tool policy default:** Yes after the category has been composed. **Factory
+category default:** `Inherit`, which is visible in the normal composite when
+the image-generation machine, executor, planner, session identity, and blob
+store are wired. A minimal no-builtins/no-shell composition needs explicit
+`Enable`; Mob profiles and in-process builds can use that override without
+opening general builtins. See the guide for the current surface matrix.
 
 <ParamField body="request" type="Object" required>
   Image generation request. The simple shape supports `intent`, `prompt`, `instruction`, `source_images`, `reference_images`, `size`, `quality`, `format`, `count`/`n`, `target`, `provider`, `model`, and `provider_params`.
@@ -771,12 +984,45 @@ Generate or edit an assistant-owned image through the session image-generation s
 See [Image generation](/guides/image-generation) for provider behavior, examples, and troubleshooting.
 </Accordion>
 
+## Web search fallback tool
+
+The active model may receive provider-native web search directly in its
+provider request. When the active model lacks native search and web search is
+explicitly enabled, `AgentFactory` can instead compose the Meerkat-owned
+`web_search` fallback against a configured OpenAI, Gemini, or Anthropic search
+executor. The explicit enable fails closed if no executor can be provisioned.
+
+<Accordion title="web_search">
+<ParamField body="query" type="String" required>
+  Non-empty natural-language search or research query.
+</ParamField>
+
+<ParamField body="provider" type="String">
+  Optional assertion: `openai`, `gemini`, or `anthropic`. When present it must
+  match the fallback provider selected for the session.
+</ParamField>
+
+<ParamField body="context" type="String">
+  Optional brief conversation context used to disambiguate the query.
+</ParamField>
+
+The result is `WebSearchResult`: `status`, `query`, optional `provider` and
+`model`, optional `answer`, typed `evidence`, provider-observed
+`native_events`, optional `error`, and `checked_at`. Native events are evidence
+from the provider, not Meerkat-owned truth.
+
+This tool is classified read-only. Visibility is controlled by
+`override_web_search`, independently from general builtins.
+
+**Source:** `meerkat-tools/src/builtin/web_search.rs`
+</Accordion>
+
 ## Comms tools
 
 Comms tools enable inter-agent communication. They require the `comms` Cargo feature (`dep:meerkat-comms`) and the factory-level `enable_comms` flag. Unlike other tool categories, comms tools are provided as a separate `CommsToolSurface` dispatcher (implementing `AgentToolDispatcher`) and composed via `DynamicToolComposite`, NOT bundled into `CompositeDispatcher`.
 
 Tool availability is reported per tool through the catalog
-(`comms_tool_unavailable_reason`): `send_message` and `peers` are advertised
+(`comms_tool_unavailable_reason`): `send_message`, `reply_to_peer`, and `peers` are advertised
 even before any peers are configured, while `send_request` and `send_response`
 require a runtime-bound command authority and are otherwise marked unavailable
 with the typed reason `RuntimeCommandAuthorityUnavailable`.
@@ -811,6 +1057,45 @@ Send a fire-and-forget collaboration message to a trusted peer.
 ```json
 { "status": "sent", "kind": "peer_message", "receipt": { ... } }
 ```
+
+**Source:** `meerkat-comms/src/mcp/tools.rs`
+</Accordion>
+
+<Accordion title="reply_to_peer">
+Reply to the peer message that triggered the current turn. This tool is
+pre-addressed by a turn-scoped reply capability, so it deliberately has no
+`peer_id` argument.
+
+**Default enabled:** Yes when comms is active. It does not require runtime
+request/response command authority.
+
+<ParamField body="body" type="String" required>
+  Reply text.
+</ParamField>
+
+<ParamField body="blocks" type="Array">
+  Optional multimodal text or `image_ref` blocks.
+</ParamField>
+
+<ParamField body="handling_mode" type="String" required>
+  `queue` for ordinary delivery or `steer` for urgent immediate processing.
+</ParamField>
+
+<ParamField body="reply_to" type="String">
+  Delivery ID selector. Omit when exactly one peer message triggered the turn.
+  When several arrived, retry with one ID listed by `ambiguous_reply`.
+</ParamField>
+
+```json
+{
+  "body": "Acknowledged. The migration is complete.",
+  "handling_mode": "queue"
+}
+```
+
+Typed failures include `no_reply_capability`, `ambiguous_reply`, and
+`unknown_reply_to`. Trust is revalidated at dispatch time, so revoking a peer
+after turn admission invalidates the previously minted reply capability.
 
 **Source:** `meerkat-comms/src/mcp/tools.rs`
 </Accordion>
@@ -898,7 +1183,9 @@ Send a response to a previously received request from a trusted peer. Requires a
 <Accordion title="peers">
 List all visible peers with connection info and optional metadata.
 
-Returns entries from the `TrustStore` (keyed by canonical `PeerId`), excluding the current agent ("self") by public key. Names are display labels and may not be unique — use `peer_id` for sends.
+Returns the runtime peer directory when runtime authority is attached, or a
+typed view of the trust store otherwise. The current agent is excluded. Names
+are display labels and may not be unique; use `peer_id` for sends.
 
 **Default enabled:** Yes (when comms is active)
 
@@ -910,7 +1197,17 @@ Returns entries from the `TrustStore` (keyed by canonical `PeerId`), excluding t
     {
       "name": "agent-beta",
       "peer_id": "0193a1b2-...",
-      "address": "tcp://127.0.0.1:4200"
+      "address": {
+        "transport": "tcp",
+        "endpoint": "127.0.0.1:4200"
+      },
+      "source": "trusted",
+      "sendable_kinds": ["peer_message"],
+      "capabilities": {
+        "version": 1,
+        "extensions": {}
+      },
+      "meta": {}
     }
   ]
 }
@@ -919,14 +1216,53 @@ Returns entries from the `TrustStore` (keyed by canonical `PeerId`), excluding t
 **Source:** `meerkat-comms/src/mcp/tools.rs` -- `PeersInput`
 </Accordion>
 
+## Skill tools
+
+The five skill tools are registered only when a `SkillRuntime` is present.
+Each has `default_enabled: false`, so an embedding that constructs the builtin
+dispatcher must explicitly enable the desired names in `BuiltinToolConfig`.
+Current factory-built CLI, REST, and JSON-RPC sessions register the set but do
+not add that policy enable; preload and typed `skill_refs` still work, but the
+interactive skill tools are not advertised there.
+
+Every skill identity is a typed pair of `source_uuid` and `skill_name`. The
+runtime canonicalizes source-lineage remaps before reading or invoking it.
+
+<Accordion title="browse_skills and load_skill">
+`browse_skills` accepts optional `query` and `source_uuid` filters and returns
+active skills as `{source_uuid, skill_name, name, description}` entries.
+
+`load_skill` requires `source_uuid` and `skill_name`. It resolves and renders
+the skill, returning the canonical identity, display `name`, rendered `body`,
+and `byte_size`.
+
+**Source:** `meerkat-tools/src/builtin/skills/browse.rs`,
+`meerkat-tools/src/builtin/skills/load.rs`
+</Accordion>
+
+<Accordion title="Skill resources and functions">
+`skill_list_resources` takes `source_uuid` and `skill_name` and returns the
+skill's artifact descriptors. `skill_read_resource` adds a required `path` and
+returns that artifact's content.
+
+`skill_invoke_function` takes `source_uuid`, `skill_name`, `function_name`, and
+optional JSON-object `arguments`. Its success response echoes the canonical
+identity and function name and carries the skill function's wire-opaque JSON in
+`output`.
+
+**Source:** `meerkat-tools/src/builtin/skills/resources.rs`,
+`meerkat-tools/src/builtin/skills/functions.rs`
+</Accordion>
+
 ## Cargo feature gates
 
 Tool availability depends on compile-time features in the `meerkat-tools` crate:
 
 | Feature | Default | Dependencies | Tools unlocked |
 |---------|---------|-------------|----------------|
-| `comms` | Yes | `dep:meerkat-comms` | `send_message`, `send_request`, `send_response`, `peers` |
+| `comms` | Yes | `dep:meerkat-comms` | `send_message`, `reply_to_peer`, `send_request`, `send_response`, `peers` |
 | `mcp` | Yes | `dep:meerkat-mcp` | External MCP tool routing (not builtin tools) |
+| `skills` | Yes | skill runtime types | The five policy-opt-in skill tool implementations |
 
 The `memory_search` tool is gated by the `memory-store-session` feature on the `meerkat` facade crate (not `meerkat-tools`), since `MemorySearchDispatcher` lives in `meerkat-memory`.
 

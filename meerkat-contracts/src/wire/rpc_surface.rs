@@ -87,7 +87,9 @@ pub struct ArchiveSessionParams {
 /// Parameters for `session/inject_context`, which appends one ordinary durable
 /// ordered System message at the admitted transcript boundary.
 ///
-/// The injected body is the typed [`CoreRenderable`] owner rather than a bare
+/// The injected body is the typed
+/// [`CoreRenderable`](meerkat_core::lifecycle::run_primitive::CoreRenderable)
+/// owner rather than a bare
 /// `text` string: surfaces parse their inbound payload into the renderable at
 /// the ingress boundary and the handler threads it straight through to
 /// `AppendSystemContextRequest.content`. A plain-text client payload still

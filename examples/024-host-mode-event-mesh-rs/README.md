@@ -1,38 +1,42 @@
-# 024 — Keep-Alive Event Mesh (Rust)
+# 024 - Multi-Turn Event Processing (Rust)
 
-Build reactive agents that stay alive to process incoming events from
-peers, webhooks, timers, and users.
+Submit multiple turns to one in-process session and observe context and event
+streaming across those turns.
 
 ## What This Example Does
 
-Creates an incident-response coordinator agent using `EphemeralSessionService`
-(the in-memory substrate underneath Meerkat session orchestration). The agent
-processes three turns that simulate real-time event injection:
+Creates an incident-response coordinator using `EphemeralSessionService`. The
+program directly submits three prompts that simulate an incident changing over
+time:
 
 1. **Turn 1**: Initial alert (CPU spike on prod-web-03)
 2. **Turn 2**: Monitoring update (memory high, recent deploy found)
 3. **Turn 3**: Resolution (rollback, metrics normalizing)
 
-Each turn streams `AgentEvent`s and the agent maintains full conversation
-context across all turns — demonstrating the reactive processing pattern
-that long-lived sessions enable.
+Each turn streams `AgentEvent`s and the agent maintains conversation context
+across all three turns within the current process.
 
 ## Concepts
-- `EphemeralSessionService` — in-memory session lifecycle with dedicated tokio tasks
-- `create_session()` — creates a session and runs the initial turn
-- `start_turn()` — injects a new prompt into a live session (the event injection primitive)
-- `AgentEvent` streaming — real-time events across multiple turns
-- Session state reads — observe accumulating context between turns
-- `archive()` — clean shutdown of the session task
+- `EphemeralSessionService` - in-memory session lifecycle with dedicated Tokio tasks
+- `create_session()` - creates a session and runs the initial turn
+- `start_turn()` - directly submits each later prompt
+- `AgentEvent` streaming - real-time events across multiple turns
+- Session state reads - observe accumulating context between turns
+- `archive()` - clean shutdown of the session task
 
-## When to Use Keep-Alive
-| Scenario | Standard Mode | Keep-Alive |
-|----------|--------------|------------|
-| Single query | Yes | No |
-| Multi-turn chat | Yes | Better |
-| Mob orchestrator | No | Yes |
-| Event processor | No | Yes |
-| Webhook handler | No | Yes |
+## Runtime Boundary
+
+This example does not register a comms identity, receive webhooks, run a
+scheduler, or recover after process exit. Those behaviors belong to the
+runtime-backed CLI, REST, JSON-RPC, MCP, and SDK surfaces. For example:
+
+```bash
+rkat run --keep-alive --comms-name processor "Process incoming events"
+```
+
+Use this example when embedding the standalone session service or testing
+multi-turn behavior. Use a runtime-backed surface for durable ingress and
+long-lived operational agents.
 
 ## Run
 ```bash

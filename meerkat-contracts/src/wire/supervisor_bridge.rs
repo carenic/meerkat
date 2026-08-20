@@ -1740,8 +1740,9 @@ pub struct BridgeHostRevokedResponse {
 }
 
 /// Transcript snapshot page for a remote member. Row type is the canonical
-/// wire transcript row (`WireSessionMessage`) — the same rows the local
-/// `SessionHistoryPage` projection produces — via the [`WireHistoryRow`]
+/// wire transcript row (`WireSessionMessage`) - the same rows the local
+/// `SessionHistoryPage` projection produces via the
+/// [`WireHistoryRow`](crate::wire::WireHistoryRow)
 /// equality adapter.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2907,7 +2908,7 @@ pub struct BridgeCapabilities {
     // capabilities payload (fields absent) still decodes. Field names stay
     // aligned with the DSL `HostCapabilityFlags` single enumeration (§6.1)
     // — this struct is its bind-ceremony wire carrier, not a second owner.
-    /// Host persists sessions durably (event-sourced); `false` means
+    /// Host persists session state durably; `false` means
     /// releases resolve `RuntimeReleasedOnly { NoDurableSessions }`.
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub durable_sessions: bool,

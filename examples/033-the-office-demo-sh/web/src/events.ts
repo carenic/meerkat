@@ -11,13 +11,13 @@ import { startCall, endCallsForAgent } from "./office/phonelines";
 // ── Agent address → AgentId mapping ──
 
 function addressToAgentId(addr: string): AgentId | null {
-  // Address format: the-office/{profile}/{meerkat_id}
+  // Address format: the-office/{profile}/{agent_identity}
   const parts = addr.split("/");
-  const meerkatId = parts[parts.length - 1] || addr;
-  if (AGENT_IDS.includes(meerkatId as AgentId)) return meerkatId as AgentId;
+  const agentIdentity = parts[parts.length - 1] || addr;
+  if (AGENT_IDS.includes(agentIdentity as AgentId)) return agentIdentity as AgentId;
   // Try matching by profile name
   for (const id of AGENT_IDS) {
-    if (meerkatId === id) return id;
+    if (agentIdentity === id) return id;
   }
   return null;
 }

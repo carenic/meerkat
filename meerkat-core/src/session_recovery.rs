@@ -315,7 +315,7 @@ pub fn session_allows_first_turn_build_overrides(session: &Session) -> bool {
 }
 
 /// Mirror the canonical resume LLM-binding selection from the
-/// [`SessionDocumentMachine`](crate::generated::session_document).
+/// [`crate::generated::session_document::SessionDocumentMachineAuthority`].
 ///
 /// This is the binding-only entry point for surfaces (e.g. the REST resume
 /// path) that do not run the full deferred-first-turn override admission: it
@@ -343,7 +343,7 @@ pub fn resolve_resume_llm_binding(
 }
 
 /// Mirror the canonical resume-override admission verdict from the
-/// [`SessionDocumentMachine`](crate::generated::session_document) onto a typed
+/// [`crate::generated::session_document::SessionDocumentMachineAuthority`] onto a typed
 /// [`ResumeLlmBinding`].
 ///
 /// This shell does NOT decide admission or binding: it feeds typed
@@ -458,7 +458,7 @@ pub fn resolve_effective_turn_config(
 
     // The resume-override admission verdict (provider-requires-model,
     // clear+set conflicts, build-only-after-first-turn) AND the effective
-    // LLM-binding selection are owned by the canonical SessionDocumentMachine.
+    // LLM-binding selection are owned by the canonical session-document authority.
     // The shell feeds the RAW first-turn phase (not the already-reduced
     // overrides-allowed bool) and mirrors the verdict. A rejection surfaces as
     // a typed `InvalidOverride` here.

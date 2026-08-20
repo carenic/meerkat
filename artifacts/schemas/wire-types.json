@@ -2372,7 +2372,7 @@
             "type": "object"
           },
           {
-            "description": "A `pre_*` background hook attempted a non-observe action (patch or deny),\nwhich is not permitted for observe-only background hooks.",
+            "description": "A background hook attempted a non-observe action, which is not\npermitted for observe-only background hooks at any hook point.",
             "properties": {
               "reason_code": {
                 "const": "observe_only_violation",
@@ -8015,7 +8015,7 @@
             "type": "boolean"
           },
           "durable_sessions": {
-            "description": "Host persists sessions durably (event-sourced); `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
+            "description": "Host persists session state durably; `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
             "type": "boolean"
           },
           "engine_version": {
@@ -8224,7 +8224,7 @@
         "type": "boolean"
       },
       "durable_sessions": {
-        "description": "Host persists sessions durably (event-sourced); `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
+        "description": "Host persists session state durably; `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
         "type": "boolean"
       },
       "engine_version": {
@@ -14477,7 +14477,7 @@
             "type": "boolean"
           },
           "durable_sessions": {
-            "description": "Host persists sessions durably (event-sourced); `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
+            "description": "Host persists session state durably; `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
             "type": "boolean"
           },
           "engine_version": {
@@ -14816,7 +14816,7 @@
             "type": "boolean"
           },
           "durable_sessions": {
-            "description": "Host persists sessions durably (event-sourced); `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
+            "description": "Host persists session state durably; `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
             "type": "boolean"
           },
           "engine_version": {
@@ -15082,7 +15082,7 @@
             "type": "boolean"
           },
           "durable_sessions": {
-            "description": "Host persists sessions durably (event-sourced); `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
+            "description": "Host persists session state durably; `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
             "type": "boolean"
           },
           "engine_version": {
@@ -20913,7 +20913,7 @@
             "type": "object"
           },
           {
-            "description": "A `pre_*` background hook attempted a non-observe action (patch or deny),\nwhich is not permitted for observe-only background hooks.",
+            "description": "A background hook attempted a non-observe action, which is not\npermitted for observe-only background hooks at any hook point.",
             "properties": {
               "reason_code": {
                 "const": "observe_only_violation",
@@ -24818,7 +24818,7 @@
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "Transcript snapshot page for a remote member. Row type is the canonical\nwire transcript row (`WireSessionMessage`) — the same rows the local\n`SessionHistoryPage` projection produces — via the [`WireHistoryRow`]\nequality adapter.",
+    "description": "Transcript snapshot page for a remote member. Row type is the canonical\nwire transcript row (`WireSessionMessage`) - the same rows the local\n`SessionHistoryPage` projection produces via the\n[`WireHistoryRow`](crate::wire::WireHistoryRow)\nequality adapter.",
     "properties": {
       "generation": {
         "description": "Member generation the page was read at; a bump means the visible\ngeneration window changed (the underlying session may be reused).",
@@ -29129,7 +29129,7 @@
             "type": "boolean"
           },
           "durable_sessions": {
-            "description": "Host persists sessions durably (event-sourced); `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
+            "description": "Host persists session state durably; `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
             "type": "boolean"
           },
           "engine_version": {
@@ -31466,7 +31466,7 @@
             "type": "object"
           },
           {
-            "description": "A `pre_*` background hook attempted a non-observe action (patch or deny),\nwhich is not permitted for observe-only background hooks.",
+            "description": "A background hook attempted a non-observe action, which is not\npermitted for observe-only background hooks at any hook point.",
             "properties": {
               "reason_code": {
                 "const": "observe_only_violation",
@@ -35774,7 +35774,7 @@
       },
       {
         "additionalProperties": false,
-        "description": "Transcript snapshot page for a remote member. Row type is the canonical\nwire transcript row (`WireSessionMessage`) — the same rows the local\n`SessionHistoryPage` projection produces — via the [`WireHistoryRow`]\nequality adapter.",
+        "description": "Transcript snapshot page for a remote member. Row type is the canonical\nwire transcript row (`WireSessionMessage`) - the same rows the local\n`SessionHistoryPage` projection produces via the\n[`WireHistoryRow`](crate::wire::WireHistoryRow)\nequality adapter.",
         "properties": {
           "generation": {
             "description": "Member generation the page was read at; a bump means the visible\ngeneration window changed (the underlying session may be reused).",
@@ -40259,7 +40259,7 @@
             "type": "boolean"
           },
           "durable_sessions": {
-            "description": "Host persists sessions durably (event-sourced); `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
+            "description": "Host persists session state durably; `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
             "type": "boolean"
           },
           "engine_version": {
@@ -43346,7 +43346,7 @@
           },
           {
             "additionalProperties": false,
-            "description": "Transcript snapshot page for a remote member. Row type is the canonical\nwire transcript row (`WireSessionMessage`) — the same rows the local\n`SessionHistoryPage` projection produces — via the [`WireHistoryRow`]\nequality adapter.",
+            "description": "Transcript snapshot page for a remote member. Row type is the canonical\nwire transcript row (`WireSessionMessage`) - the same rows the local\n`SessionHistoryPage` projection produces via the\n[`WireHistoryRow`](crate::wire::WireHistoryRow)\nequality adapter.",
             "properties": {
               "generation": {
                 "description": "Member generation the page was read at; a bump means the visible\ngeneration window changed (the underlying session may be reused).",
@@ -45150,7 +45150,7 @@
             "type": "object"
           },
           {
-            "description": "A `pre_*` background hook attempted a non-observe action (patch or deny),\nwhich is not permitted for observe-only background hooks.",
+            "description": "A background hook attempted a non-observe action, which is not\npermitted for observe-only background hooks at any hook point.",
             "properties": {
               "reason_code": {
                 "const": "observe_only_violation",
@@ -57416,7 +57416,7 @@
             "type": "boolean"
           },
           "durable_sessions": {
-            "description": "Host persists sessions durably (event-sourced); `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
+            "description": "Host persists session state durably; `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
             "type": "boolean"
           },
           "engine_version": {
@@ -58935,7 +58935,7 @@
           },
           {
             "additionalProperties": false,
-            "description": "Transcript snapshot page for a remote member. Row type is the canonical\nwire transcript row (`WireSessionMessage`) — the same rows the local\n`SessionHistoryPage` projection produces — via the [`WireHistoryRow`]\nequality adapter.",
+            "description": "Transcript snapshot page for a remote member. Row type is the canonical\nwire transcript row (`WireSessionMessage`) - the same rows the local\n`SessionHistoryPage` projection produces via the\n[`WireHistoryRow`](crate::wire::WireHistoryRow)\nequality adapter.",
             "properties": {
               "generation": {
                 "description": "Member generation the page was read at; a bump means the visible\ngeneration window changed (the underlying session may be reused).",
@@ -60461,7 +60461,7 @@
             "type": "object"
           },
           {
-            "description": "A `pre_*` background hook attempted a non-observe action (patch or deny),\nwhich is not permitted for observe-only background hooks.",
+            "description": "A background hook attempted a non-observe action, which is not\npermitted for observe-only background hooks at any hook point.",
             "properties": {
               "reason_code": {
                 "const": "observe_only_violation",
@@ -68070,7 +68070,7 @@
             "type": "object"
           },
           {
-            "description": "A `pre_*` background hook attempted a non-observe action (patch or deny),\nwhich is not permitted for observe-only background hooks.",
+            "description": "A background hook attempted a non-observe action, which is not\npermitted for observe-only background hooks at any hook point.",
             "properties": {
               "reason_code": {
                 "const": "observe_only_violation",
@@ -85281,7 +85281,7 @@
         "type": "string"
       },
       "MobMemberSpecWire": {
-        "description": "Per-member spec for `mob/ensure_member` and the `desired` entries of\n`mob/reconcile`.\n\nMirrors the essential, codegen-friendly fields of\n[`meerkat_mob::SpawnMemberSpec`]. Complex sub-types (tool access policy,\nbudget split, inherited tool filter, override profile) are not on this\nwire surface — callers that need that parity should use the non-declarative\n`mob/spawn` method.",
+        "description": "Per-member spec for `mob/ensure_member` and the `desired` entries of\n`mob/reconcile`.\n\nMirrors the essential, codegen-friendly fields of\n`meerkat_mob::SpawnMemberSpec`. Complex sub-types (tool access policy,\nbudget split, inherited tool filter, override profile) are not on this\nwire surface - callers that need that parity should use the non-declarative\n`mob/spawn` method.",
         "properties": {
           "additional_instructions": {
             "items": {
@@ -115150,7 +115150,7 @@
             "type": "object"
           },
           {
-            "description": "A `pre_*` background hook attempted a non-observe action (patch or deny),\nwhich is not permitted for observe-only background hooks.",
+            "description": "A background hook attempted a non-observe action, which is not\npermitted for observe-only background hooks at any hook point.",
             "properties": {
               "reason_code": {
                 "const": "observe_only_violation",
@@ -123509,7 +123509,7 @@
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Wire mirror of [`meerkat_core::live_adapter::LiveAdapterObservation`].\n\nFIX-SDK-OBS: closes the R5-4 verifier gap. The core enum is the canonical\nshape adapters emit, but it is not registered for schema emission and is\ntherefore invisible at the SDK boundary — browser/Python clients receive\nobservations as untyped JSON and cannot type-narrow on\n`assistant_audio_chunk` (to read the new `item_id` / `response_id` /\n`content_index` fields driving `live/truncate`) or on `command_rejected`\n(a typed channel-survives error introduced in R5-9). The wire mirror\nmakes every variant visible to schema codegen and produces a discriminated\nTypeScript union / typed Python `TypedDict` union.\n\nSerde shape mirrors the public subset of the core enum: internally-tagged\non `observation` (snake_case). Round-trip with public core variants is\nbyte-identical (see `wire_live_adapter_observation_byte_compatible_with_core`).\n\nField types reference other wire mirrors where they exist\n([`WireStopReason`], [`WireUsage`], [`WireLiveAdapterStatus`],\n[`WireLiveAdapterErrorCode`]) and the public-safe\n[`WireRealtimeTranscriptEvent`].\n\nAudio data is base64-encoded on the wire (matches the core\n[`LiveAdapterObservation::AssistantAudioChunk`] base64 mode); the wire\nmirror carries `data` as a `String` so the schema emits `String` instead\nof an opaque `Vec<u8>` JSON-array shape.",
+    "description": "Wire mirror of [`meerkat_core::live_adapter::LiveAdapterObservation`].\n\nFIX-SDK-OBS: closes the R5-4 verifier gap. The core enum is the canonical\nshape adapters emit, but it is not registered for schema emission and is\ntherefore invisible at the SDK boundary - browser/Python clients receive\nobservations as untyped JSON and cannot type-narrow on\n`assistant_audio_chunk` (to read the new `item_id` / `response_id` /\n`content_index` fields driving `live/truncate`) or on `command_rejected`\n(a typed channel-survives error introduced in R5-9). The wire mirror\nmakes every variant visible to schema codegen and produces a discriminated\nTypeScript union / typed Python `TypedDict` union.\n\nSerde shape mirrors the public subset of the core enum: internally-tagged\non `observation` (snake_case). Round-trip with public core variants is\nbyte-identical (see `wire_live_adapter_observation_byte_compatible_with_core`).\n\nField types reference other wire mirrors where they exist\n([`WireStopReason`], [`crate::wire::WireUsage`], [`WireLiveAdapterStatus`],\n[`WireLiveAdapterErrorCode`]) and the public-safe\n[`WireRealtimeTranscriptEvent`].\n\nAudio data is base64-encoded on the wire (matches the core\n[`LiveAdapterObservation::AssistantAudioChunk`] base64 mode); the wire\nmirror carries `data` as a `String` so the schema emits `String` instead\nof an opaque `Vec<u8>` JSON-array shape.",
     "oneOf": [
       {
         "properties": {

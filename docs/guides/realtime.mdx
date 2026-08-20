@@ -18,7 +18,10 @@ Use this guide when you want to:
 - reason about live channels in the context of the normal session model
 
 <Note>
-`ModelCapabilities.realtime` remains the capability bit that gates whether `live/open` succeeds. Image input is a separate per-channel capability: check `LiveOpenResult.capabilities.image_in` before sending an image. The `--live-ws <addr>` flag on `rkat-rpc` enables the WebSocket listener required for audio transport.
+`ModelCapabilities.realtime` remains the capability bit that gates whether `live/open` succeeds. Image input is a separate per-channel capability: check `LiveOpenResult.capabilities.image_in` before sending an image. The `--live-ws <addr>` flag on `rkat-rpc` enables the WebSocket audio transport.
+For WebRTC, the binary must be compiled with the `live-webrtc` feature and
+started with `--live-webrtc`. At least one of these runtime transport flags is
+required for the `live/*` methods to be advertised.
 </Note>
 
 ## Mental model
@@ -59,9 +62,10 @@ Use `GET /models/catalog` (REST) or `models/catalog` (RPC) to inspect which mode
 
 ## Opening a live channel
 
-A live channel is opened by creating a session on a realtime-capable model and calling `live/open`. Two paths:
+A live channel is opened by creating a session on a realtime-capable model and
+then calling `live/open`. These are separate lifecycle steps.
 
-### At session creation
+### Create, then open
 
 Create a session on a realtime-capable model, then call `live/open`:
 
@@ -93,18 +97,26 @@ Create a session on a realtime-capable model, then call `live/open`:
 ```python Python SDK
 from meerkat import MeerkatClient
 
-async with MeerkatClient() as client:
-    await client.connect(realm_id="team-alpha")
+client = MeerkatClient()
+await client.connect(realm_id="team-alpha", live_ws=True)
+try:
     session = await client.create_session(
         prompt="Let's talk.",
         model="gpt-realtime-2",
         provider="openai",
     )
     channel = await client.live_open(session.id)
+finally:
+    await client.close()
 ```
 </CodeGroup>
 
-`live/open` returns a `LiveOpenResult` containing the transport bootstrap (e.g. WebSocket URL), `WireLiveChannelCapabilities`, and `WireLiveContinuityMode`. The `--live-ws <addr>` flag must be set on `rkat-rpc` for WebSocket transport.
+`live/open` returns a `LiveOpenResult` containing a discriminated transport
+bootstrap, `WireLiveChannelCapabilities`, and `WireLiveContinuityMode`. Omitted
+`transport` prefers WebSocket when its listener is configured and otherwise
+selects WebRTC when that is the only enabled transport. Request
+`"transport": "websocket"` or `"transport": "webrtc"` when the choice must be
+stable. WebSocket requires `rkat-rpc --live-ws <addr>`.
 
 <Note>
 The direct WebSocket input path accepts JSON text chunks and negotiated raw
@@ -114,6 +126,104 @@ the JSONL control plane accepts frames up to 64 MiB (excluding the newline),
 which accommodates the documented 20 MiB decoded-image ceiling plus base64
 and envelope overhead.
 </Note>
+
+### WebRTC SDP exchange
+
+WebRTC is a feature-gated runtime transport. A binary without the
+`live-webrtc` Cargo feature does not expose `--live-webrtc` or
+`live/webrtc/answer`. Start a capable binary with:
+
+```bash
+rkat-rpc --live-webrtc
+```
+
+You can enable both transports at once:
+
+```bash
+rkat-rpc --live-ws 127.0.0.1:4900 --live-webrtc
+```
+
+Open the channel explicitly as WebRTC:
+
+```json JSON-RPC
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "live/open",
+  "params": {
+    "session_id": "01936f8a-7b2c-7000-8000-000000000001",
+    "transport": "webrtc"
+  }
+}
+```
+
+The result carries the channel-bound signaling material:
+
+```json Result shape
+{
+  "channel_id": "ch_01936f8a-...",
+  "transport": {
+    "transport": "webrtc",
+    "token": "single-use-bootstrap-token",
+    "answer_method": "live/webrtc/answer"
+  },
+  "capabilities": {
+    "audio_in": true,
+    "audio_out": true,
+    "text_in": true,
+    "text_out": true,
+    "image_in": true,
+    "video_in": false,
+    "transcript_supported": true,
+    "barge_in_supported": true,
+    "provider_native_resume": false
+  },
+  "continuity": {"mode": "fresh"}
+}
+```
+
+The browser creates the offer. Include an audio track or the
+`meerkat.live` data channel before `createOffer()` so the SDP contains a media
+section, set the local description, and wait for ICE gathering to finish. Send
+that complete offer through JSON-RPC and install the returned answer:
+
+```javascript Browser signaling sketch
+async function waitForIceGatheringComplete(peer) {
+  if (peer.iceGatheringState === "complete") return;
+  await new Promise((resolve) => {
+    function changed() {
+      if (peer.iceGatheringState === "complete") {
+        peer.removeEventListener("icegatheringstatechange", changed);
+        resolve();
+      }
+    }
+    peer.addEventListener("icegatheringstatechange", changed);
+  });
+}
+
+const peer = new RTCPeerConnection();
+const observations = peer.createDataChannel("meerkat.live");
+const media = await navigator.mediaDevices.getUserMedia({ audio: true });
+for (const track of media.getAudioTracks()) peer.addTrack(track, media);
+
+const offer = await peer.createOffer();
+await peer.setLocalDescription(offer);
+await waitForIceGatheringComplete(peer);
+
+const answered = await rpc("live/webrtc/answer", {
+  channel_id: opened.channel_id,
+  token: opened.transport.token,
+  offer_sdp: peer.localDescription.sdp,
+});
+await peer.setRemoteDescription({ type: "answer", sdp: answered.answer_sdp });
+```
+
+Here `opened` is the `live/open` result and `rpc` is the application's normal
+JSON-RPC request helper. The bootstrap token expires after 60 seconds, is
+single-use, and is bound to the returned channel. Replay, expiry, or a channel
+mismatch fails typed. JSON-RPC is the canonical signaling path; the optional
+`http_url` field in the transport union is only a convenience when a host
+provides one.
 
 ### Bounding the initial seed
 
@@ -191,6 +301,7 @@ Use `live/status` to read the current state of a live channel:
 | Method | Purpose |
 |--------|---------|
 | `live/open` | Open a live channel on a session; optionally bound its serialized seed messages with positive `seed_max_chars` |
+| `live/webrtc/answer` | Answer a browser SDP offer for an already-open WebRTC channel |
 | `live/status` | Read live channel status |
 | `live/send_input` | Send an audio, text, or model-supported image chunk to a live channel |
 | `live/commit_input` | Commit pending input on a live channel (turn boundary) |
@@ -200,8 +311,34 @@ Use `live/status` to read the current state of a live channel:
 | `live/close` | Close a live channel |
 
 <Warning>
-The `live/*` methods are registered when at least one live transport is configured: the WebSocket listener (`rkat-rpc --live-ws <addr>`) or WebRTC (builds with the `live-webrtc` feature). When no WebSocket listener is configured, `live/open` defaults to WebRTC transport; with neither transport configured, the `live/*` methods are not registered.
+The shared `live/*` family is registered when at least one live transport is
+enabled: the WebSocket listener (`rkat-rpc --live-ws <addr>`) or a binary built
+with `live-webrtc` and started with `--live-webrtc`.
+`live/webrtc/answer` is registered only for the second case. When no WebSocket
+listener is configured, `live/open` defaults to WebRTC; with neither runtime
+flag, the live methods are not registered.
 </Warning>
+
+## Live observations and durable history
+
+The media transport and the session event log answer different questions.
+WebSocket or WebRTC carries low-latency channel input, output, and observations;
+committed turn content still lands in the canonical session transcript.
+
+The associated session-level `session/subscribe` event stream is a bounded
+live subscription. A lagging consumer receives a typed `stream_truncated`
+event with `reason.kind: "stream_lagged"` and `reason.dropped`, then continues
+from the retained tail. This reports a gap in that subscriber's view, not a
+truncated transcript or durable event log.
+
+Built-in realm-backed persistent sessions can feed a separate durable event
+audit projector through an unbounded queue independent of the UI ring. The
+audit projection is asynchronous derived state, so when event evidence matters,
+resume from the last available durable cursor with `events/list_since` and
+reconcile against current session or channel state. Media frames and event
+projection are not session commit authority; the committed transcript and
+The `RuntimeStore`/backend carrier owns restart authority. `SessionStore` rows
+are component/content state, not a second currentness owner.
 
 ## Sending image input
 
@@ -348,8 +485,9 @@ reconnect never substitutes placeholders for accepted images.
 ```python
 from meerkat import MeerkatClient
 
-async with MeerkatClient() as client:
-    await client.connect(realm_id="team-alpha")
+client = MeerkatClient()
+await client.connect(realm_id="team-alpha", live_ws=True)
+try:
 
     # 1. Create a session on a realtime-capable model.
     session = await client.create_session(
@@ -359,9 +497,9 @@ async with MeerkatClient() as client:
     )
 
     # 2. Open a live channel (returns channel_id + transport bootstrap).
-    result = await client.live_open(session.id)
+    result = await client.live_open(session.id, transport="websocket")
     channel_id = result["channel_id"]
-    # result["transport"] contains the WebSocket URL + token
+    # result["transport"] is the WebSocket URL + single-use token bootstrap
     # result["capabilities"] describes supported input/output modalities,
     # including model-gated image_in
 
@@ -374,6 +512,8 @@ async with MeerkatClient() as client:
 
     # 5. The session's history accumulates committed turns — same as a text session.
     history = await client.read_session_history(session.id)
+finally:
+    await client.close()
 ```
 
 ## Live channels and mobs
@@ -390,6 +530,12 @@ peer_description = "Live audio host"
 ```
 
 Open a live channel against the member's session after the member is spawned.
+The dedicated CLI and RPC member-live controls are currently WebSocket-only,
+for both local and placed members. Session-scoped `live/open` plus
+`live/webrtc/answer` works only when the caller can address the owning session
+directly, such as a controller-local member. Controller `session/*` methods do
+not proxy a placed member's host-local session in multi-host v1, and
+`mob/member_live_open` rejects WebRTC.
 
 ## Limitations and known gaps
 

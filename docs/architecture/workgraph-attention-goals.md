@@ -1,13 +1,17 @@
 ---
 title: "WorkGraph Attention Goals"
-description: "Proposal for Codex-style goals in Meerkat without duplicating WorkGraph or leaking mob semantics into core."
+description: "Implemented architecture for Codex-style goals without duplicating WorkGraph or leaking mob semantics into core."
 icon: "crosshairs"
 ---
 
 # WorkGraph Attention Goals
 
-Status: Accepted design; initial WorkGraph, host API, explicit runtime handoff,
-tool scoping, and mob-lowering implementation is in progress.
+Status: Implemented architecture record. Initial WorkGraph goals, attention,
+host controls, turn overlays, tool scoping, and mob lowering shipped starting in
+v0.6.24. The durable WorkGraph-to-Mob Flow execution bridge shipped starting in
+v0.8.16. Automatic idle polling and hidden continuation production remain
+future work; the runtime has typed continuation admission, while ordinary turns
+resolve and revalidate attention before injecting their overlay.
 
 ## Summary
 
@@ -187,15 +191,15 @@ Pause/resume should be attention-state transitions. They must not be encoded as
 labels, descriptions, namespace strings, or prompt text. Timed resume should
 target the binding, not the WorkGraph item: either `Paused { until }` becomes
 eligible again when the clock passes, or `meerkat-schedule` resumes the binding.
-The item itself should not gain a general `snoozed_until` field just to express
-one actor's attention preference.
+A WorkGraph item may use its own `snoozed_until` for item-level readiness, but
+that fact must not substitute for one actor's attention pause.
 
 ## Machine Ownership
 
-This proposal requires a generated authority path. It should not add a generic
-core goal machine.
+The implemented architecture uses a generated authority path and does not add a
+generic core goal machine.
 
-Preferred shape:
+Current ownership shape:
 
 ```text
 WorkGraphLifecycleMachine
@@ -207,11 +211,14 @@ WorkAttentionLifecycleMachine
   revision. This is a WorkGraph-owned attention machine, not a generic core
   GoalLifecycleMachine.
 
-workgraph_attention_runtime seam
-  Owns the legal handoff from WorkGraph attention to runtime continuation,
-  including projection eligibility and fail-closed checks. The current
-  implementation keeps continuation enqueueing as trusted runtime-host
-  authority; automatic idle polling can later call the same seam.
+workgraph_attention_bundle composition
+  Owns the legal WorkGraph-item-close to attention-stop handoff.
+
+trusted WorkGraph/runtime host seam
+  Revalidates attention and projection eligibility before turn-overlay or
+  continuation admission. The current implementation keeps continuation
+  enqueueing as trusted runtime-host authority; no automatic idle-polling
+  producer ships yet.
 
 MeerkatMachine
   Owns input admission, WakeIfIdle, active turn state, continuation, and
@@ -237,6 +244,10 @@ durable goal authority beside WorkGraph."
 
 Runtime must treat attention as an observed input, not as its own commitment
 truth.
+
+The shipped trusted-host path performs the revalidation and admission steps
+below for explicit continuation requests and ordinary turn overlays. The
+automatic idle trigger in step 1 remains future work.
 
 Idle continuation flow:
 
@@ -394,11 +405,11 @@ Reviewer attention:
 ```
 
 Current `meerkat-mob` support lowers `AgentIdentity` targets into durable
-owner-key attention targets. Session-level runtime continuation is still bound
-to concrete session targets and fails closed for unresolved lowered owners. A
-mob identity resolver can later bind durable member identity to the member's
-current runtime/session before invoking session-level continuation, but that
-resolver is not part of this branch.
+owner-key attention targets. For ordinary turns, `meerkat/src/surface.rs`
+resolves those keys against the session's `mob_id` and `agent_identity` labels,
+selects the newest matching session generation deterministically, and
+revalidates the current attention projection before composing the turn overlay.
+Automatic idle continuation for a lowered owner remains future work.
 
 Mob docs should avoid saying the persisted mob owns "work" in the WorkGraph
 sense. Mob owns roster, wiring, member lifecycle, flows, and routing. WorkGraph
@@ -485,7 +496,7 @@ Suggested user-facing vocabulary:
   cancels it. Supersession is reserved for future binding replacement flows.
 - `/goal status`: show attention status plus referenced WorkGraph item status.
 
-Suggested minimal host APIs:
+Current trusted host surface:
 
 - `workgraph/goal/create`: transactionally create a WorkGraph item and its
   initial attention binding.
@@ -506,9 +517,10 @@ catalog. They are unavailable when WorkGraph is not compiled or enabled.
 
 The CLI mirrors the narrow session-first subset under `rkat workgraph`:
 `goal-create`, `goal-status`, `goal-confirm`, `goal-close`, `attention-list`,
-`attention-pause`, and `attention-resume`. Attention continuation injection is a
-runtime host operation, not a REST-backed CLI command, and CLI confirmation does
-not accept raw principal authority. The CLI intentionally
+`attention-pause`, and `attention-resume`. The runtime has a typed trusted-host
+continuation seam, but no automatic idle-polling producer or REST-backed CLI
+command ships today. CLI confirmation does not accept raw principal authority.
+The CLI intentionally
 does not expose the broad WorkGraph mutation surface as the goal UX.
 
 Core host goal creation targets a session handle. Mob/agent targets are not
@@ -563,7 +575,7 @@ The design must fail closed when:
 
 ## Acceptance Bar
 
-The proposal is acceptable only if:
+The implementation remains conformant only if:
 
 - WorkGraph remains the only owner of durable work truth.
 - Runtime remains the only owner of turn admission and continuation.

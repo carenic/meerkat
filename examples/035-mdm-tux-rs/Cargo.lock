@@ -759,6 +759,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -1349,6 +1350,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "hnsw_rs"
@@ -2117,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2131,6 +2141,7 @@ dependencies = [
  "meerkat-core",
  "meerkat-gemini",
  "meerkat-hooks",
+ "meerkat-jobs",
  "meerkat-live",
  "meerkat-llm-core",
  "meerkat-mcp",
@@ -2142,10 +2153,12 @@ dependencies = [
  "meerkat-schedule",
  "meerkat-session",
  "meerkat-skills",
+ "meerkat-sqlite",
  "meerkat-store",
  "meerkat-tools",
  "meerkat-workgraph",
  "parking_lot",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2156,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-anthropic"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2177,8 +2190,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "meerkat-atif"
+version = "0.8.24"
+dependencies = [
+ "chrono",
+ "meerkat-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "meerkat-auth-core"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "axum",
@@ -2210,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-capabilities"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "inventory",
  "meerkat-core",
@@ -2221,7 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-client"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "meerkat-anthropic",
  "meerkat-core",
@@ -2232,7 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-comms"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "base64",
@@ -2266,10 +2290,11 @@ dependencies = [
 
 [[package]]
 name = "meerkat-contracts"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "base64",
  "chrono",
+ "ciborium",
  "meerkat-capabilities",
  "meerkat-core",
  "meerkat-schedule",
@@ -2277,6 +2302,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "sha2",
  "strum 0.28.0",
  "thiserror 2.0.18",
  "uuid",
@@ -2284,12 +2310,13 @@ dependencies = [
 
 [[package]]
 name = "meerkat-core"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "base64",
  "chrono",
  "dirs",
+ "fs4 0.13.1",
  "futures",
  "getrandom 0.3.4",
  "humantime-serde",
@@ -2306,6 +2333,7 @@ dependencies = [
  "tokio",
  "tokio_with_wasm",
  "toml",
+ "toml_edit",
  "tracing",
  "uuid",
  "web-time",
@@ -2313,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-gemini"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2325,6 +2353,7 @@ dependencies = [
  "meerkat-auth-core",
  "meerkat-core",
  "meerkat-llm-core",
+ "meerkat-models",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2335,7 +2364,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-hooks"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2355,8 +2384,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "meerkat-jobs"
+version = "0.8.24"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "meerkat-core",
+ "meerkat-machine-schema",
+ "meerkat-sqlite",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio_with_wasm",
+ "uuid",
+]
+
+[[package]]
 name = "meerkat-live"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "axum",
@@ -2374,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-llm-core"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2398,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-machine-derive"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "quote",
  "syn 2.0.117",
@@ -2406,14 +2453,14 @@ dependencies = [
 
 [[package]]
 name = "meerkat-machine-dsl"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "meerkat-machine-dsl-core",
 ]
 
 [[package]]
 name = "meerkat-machine-dsl-core"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2422,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-machine-kernels"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "indexmap",
  "meerkat-core",
@@ -2433,18 +2480,19 @@ dependencies = [
 
 [[package]]
 name = "meerkat-machine-schema"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "indexmap",
  "meerkat-core",
  "meerkat-machine-dsl",
  "serde",
  "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
 name = "meerkat-mcp"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "futures",
@@ -2467,7 +2515,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-memory"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "hnsw_rs",
@@ -2476,6 +2524,7 @@ dependencies = [
  "meerkat-contracts",
  "meerkat-core",
  "meerkat-skills",
+ "meerkat-sqlite",
  "rusqlite",
  "schemars 1.2.1",
  "serde",
@@ -2487,11 +2536,12 @@ dependencies = [
 
 [[package]]
 name = "meerkat-mob"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "hmac",
  "indexmap",
  "jsonschema",
  "meerkat",
@@ -2506,6 +2556,7 @@ dependencies = [
  "meerkat-models",
  "meerkat-runtime",
  "meerkat-session",
+ "meerkat-sqlite",
  "notify",
  "rusqlite",
  "serde",
@@ -2517,14 +2568,16 @@ dependencies = [
  "tokio_with_wasm",
  "toml",
  "tracing",
+ "url",
  "uuid",
 ]
 
 [[package]]
 name = "meerkat-mob-mcp"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures",
  "indexmap",
  "meerkat",
@@ -2533,6 +2586,7 @@ dependencies = [
  "meerkat-core",
  "meerkat-mob",
  "meerkat-runtime",
+ "meerkat-session",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -2545,14 +2599,14 @@ dependencies = [
 
 [[package]]
 name = "meerkat-models"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "meerkat-core",
 ]
 
 [[package]]
 name = "meerkat-openai"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2580,7 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-providers"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "meerkat-auth-core",
  "meerkat-llm-core",
@@ -2588,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-rpc"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "axum",
@@ -2597,6 +2651,7 @@ dependencies = [
  "futures",
  "meerkat",
  "meerkat-anthropic",
+ "meerkat-atif",
  "meerkat-client",
  "meerkat-contracts",
  "meerkat-core",
@@ -2607,6 +2662,7 @@ dependencies = [
  "meerkat-providers",
  "meerkat-runtime",
  "meerkat-store",
+ "meerkat-tools",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2619,10 +2675,11 @@ dependencies = [
 
 [[package]]
 name = "meerkat-runtime"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures",
  "indexmap",
  "meerkat-auth-core",
  "meerkat-contracts",
@@ -2632,10 +2689,12 @@ dependencies = [
  "meerkat-machine-dsl",
  "meerkat-machine-kernels",
  "meerkat-machine-schema",
+ "meerkat-sqlite",
  "meerkat-store",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tokio_with_wasm",
@@ -2645,7 +2704,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-schedule"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2669,7 +2728,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-session"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "futures",
@@ -2693,7 +2752,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-skills"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "indexmap",
@@ -2713,8 +2772,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "meerkat-sqlite"
+version = "0.8.24"
+dependencies = [
+ "rusqlite",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "meerkat-store"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2722,6 +2789,7 @@ dependencies = [
  "fs4 0.12.0",
  "meerkat-core",
  "meerkat-schedule",
+ "meerkat-sqlite",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2736,7 +2804,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-tools"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "base64",
@@ -2750,10 +2818,13 @@ dependencies = [
  "meerkat-comms",
  "meerkat-contracts",
  "meerkat-core",
+ "meerkat-jobs",
  "meerkat-llm-core",
  "meerkat-mcp",
  "meerkat-runtime",
  "meerkat-skills",
+ "meerkat-sqlite",
+ "meerkat-store",
  "nix 0.29.0",
  "parking_lot",
  "rusqlite",
@@ -2772,7 +2843,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-workgraph"
-version = "0.7.28"
+version = "0.8.24"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2782,6 +2853,7 @@ dependencies = [
  "meerkat-core",
  "meerkat-machine-schema",
  "meerkat-skills",
+ "meerkat-sqlite",
  "rusqlite",
  "schemars 1.2.1",
  "serde",
@@ -5047,6 +5119,7 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.1",
 ]
 

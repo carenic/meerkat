@@ -22,10 +22,12 @@ and release manager.
 ```
 
 The live session has the real `meerkat-mob-mcp` agent tool surface enabled
-(`mob_create`, `mob_spawn_member`, `mob_list`, etc.) plus one small callback
-tool for note capture.
+(`mob_create`, `mob_spawn_member`, `mob_list`, profile CRUD, and related tools)
+plus two host callback tools: one saves notes and one writes longer output to
+the cockpit's text pane.
 The cockpit shows transcript observations, tool requests, created mobs/member
-status, saved notes, WebRTC state, data-channel state, and manual live controls.
+status, saved notes, text-pane output, WebRTC state, data-channel state, and
+manual live controls.
 
 ## Run
 
@@ -45,6 +47,16 @@ npm start
 ```
 
 Open http://127.0.0.1:4173/.
+
+With the server running and a Chrome installation available, the optional
+headless connectivity harness can capture fresh local evidence:
+
+```bash
+npm run smoke:webrtc
+```
+
+It writes `.smoke/webrtc-evidence.json`. That generated evidence is not kept
+in the repository because capabilities and provider behavior change over time.
 
 ## What To Test
 
@@ -72,5 +84,10 @@ What mobs exist right now?
 ## Notes
 
 JSON-RPC is the canonical signaling/control surface for this MVP. The Node host
-exists only because browsers cannot speak the SDK's stdio JSON-RPC transport
-directly. Media still terminates in Meerkat's WebRTC transport, not in Node.
+launches the SDK client, serves the web assets, executes the two callback tools,
+exposes the browser control routes, and polls mob state. Media still terminates
+in Meerkat's WebRTC transport, not in Node.
+
+`MEERKAT_LIVE_MODEL` and `MEERKAT_LIVE_WORKER_MODEL` set server-side defaults.
+The current page submits its prefilled model fields, so clear or replace those
+values in the cockpit if you want different settings.

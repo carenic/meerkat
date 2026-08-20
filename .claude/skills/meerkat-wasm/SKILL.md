@@ -74,10 +74,10 @@ The `sdks/web/` directory contains `@rkat/web` — a TypeScript wrapper around t
 
 Current release-line notes: `runtime_version()` and package compatibility
 should match the workspace `Cargo.toml` version (latest published release line
-is `0.6.x`; do not hardcode a stale pin). The OpenAI catalog default is
+is `0.8.x`; do not hardcode a stale patch pin). The OpenAI catalog default is
 `gpt-5.6-sol`, which is a limited preview; browser-facing examples should use
 `gpt-5.5` unless the proxy's API organization has preview access. Anthropic and
-Gemini examples should use the current `claude-opus-4-8` and
+Gemini examples should use the current `claude-opus-5` and
 `gemini-3.5-flash` defaults unless a test deliberately pins another model. WASM
 mob flows use the same current
 identity-first mob runtime, including helper/fork/respawn controls and
@@ -102,7 +102,7 @@ const runtime = await MeerkatRuntime.init(wasm, {
 });
 ```
 
-### Browser auth model (0.6)
+### Browser auth model
 
 For OAuth, cloud IAM, or any flow more dynamic than a static global key, use the external auth resolver path. The selected realm binding must use the WASM external-resolver credential source; the agent factory inside the WASM bundle then calls back into the host page via `register_external_auth_resolver` to obtain a typed `ExternalAuthLease` for a given `authBinding`:
 
@@ -138,7 +138,7 @@ const session = runtime.createSession(withAuthBinding(
 
 Notes:
 
-- WASM synthesizes its api-key binding section under the reserved `global` realm (`GLOBAL_REALM_SLUG`, the universal default head), in `meerkat-web-runtime/src/lib.rs`. A session built without an explicit `authBinding` heads to `global` and resolves there; this is a degenerate single-realm chain (no filesystem `global` doc, no parent edges) behaviorally identical to the pre-inheritance path. Do not synthesize under any other slug — historically `"default"`, which an omitted-auth-binding session can no longer reach.
+- WASM synthesizes its api-key binding section under the reserved `global` realm (`GLOBAL_REALM_SLUG`) in `meerkat-web-runtime/src/lib.rs`. A session built without an explicit `authBinding` uses `global` as its explicit head; this is a degenerate single-realm chain with no filesystem doc or parent edges. Do not synthesize under any other slug.
 - `authBinding` is structural and supported on `runtime.createSession({...})`, `mob.spawnHelper(...)`, and `mob.forkHelper(...)`. Plain `mob.spawn([...])` specs do not currently carry an auth binding.
 - `mob.spawnHelper(...)` and `mob.forkHelper(...)` options require `resultLabel` and `maxTextBytes` (wire `result_label` / `max_text_bytes`); the helper result carries required `output`, `tokens_used`, `agent_identity`, `member_ref`, `bounded_result`, `session_id`, `usage`, `turns`, and `tool_calls`, plus optional `retirement_error`.
 - `RuntimeConfig` in `@rkat/web` still exposes `apiKey` / `baseUrl` compatibility fields, but the current raw WASM config contract is provider-specific snake_case (`anthropic_api_key` / `openai_api_key` / `gemini_api_key` and matching base URLs). Do not add `apiKey` / `baseUrl` to `SessionConfig`; per-session credentials were removed in 0.6.

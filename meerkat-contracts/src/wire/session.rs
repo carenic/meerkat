@@ -86,10 +86,10 @@ pub struct ForkSessionAtParams {
 
 /// Request payload for `session/fork_replace`.
 ///
-/// `replacement` rides as the typed [`WireTranscriptReplacement`] mirror so
+/// `replacement` rides as the typed `WireTranscriptReplacement` mirror so
 /// the emitted JSON schema is the closed replacement enum rather than a bare
 /// `serde_json::Value`. The consuming surface lowers it into the core
-/// [`TranscriptReplacement`] via [`WireTranscriptReplacement::into_core`].
+/// [`TranscriptReplacement`] via `WireTranscriptReplacement::into_core`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -1008,7 +1008,8 @@ fn wire_provider_meta_to_core(value: WireProviderMeta) -> Option<ProviderMeta> {
 ///
 /// R7-5 (P3 dogma) replaced the previous fabrication of an empty
 /// `AssistantBlock::Text { "" }` for the `Unknown` arm with a typed
-/// [`WireConversionError::AssistantBlock`] error. SDK consumers and
+/// [`WireConversionError::AssistantBlock`](crate::wire::error::WireConversionError::AssistantBlock)
+/// error. SDK consumers and
 /// upstream callers now see a typed conversion failure rather than a
 /// zero-length text block silently injected into the canonical
 /// transcript.

@@ -15,7 +15,7 @@
 //! surface-specific adapters and policy inputs instead of reimplementing the
 //! lifecycle orchestration.
 //!
-//! Since phase 6b (DL4, ADJ-P6B-5) [`LiveOrchestrator`] IS the single
+//! Since phase 6b (DL4, ADJ-P6B-5) `LiveOrchestrator` IS the single
 //! live pipeline home: the full open sequencing (S1-S12, including the
 //! fail-closed `close_live_channel_after_open_failure` cleanup), the
 //! channel verbs (close/status/control/send_input), and the session-pin
@@ -25,7 +25,7 @@
 //! `meerkat::surface::ServiceMemberLiveHost` implementing
 //! `meerkat_runtime::member_live::MemberLiveHost`. Per-call transport
 //! inputs (WS state, advertised base URL, cfg'd webrtc) ride
-//! [`LiveTransportContext`]; the machine admission and token authorities
+//! `LiveTransportContext`; the machine admission and token authorities
 //! remain the owning session's `MeerkatMachine` — one pipeline, one
 //! admission path, two surfaces.
 //!
@@ -73,7 +73,7 @@ pub fn apply_precheck_gates(
     Ok(())
 }
 
-/// P1#5: build a [`LiveProjectionSnapshot`] from the resolved
+/// P1#5: build a [`meerkat_core::live_adapter::LiveProjectionSnapshot`] from the resolved
 /// [`RealtimeSessionOpenConfig`].
 ///
 /// Mirror of `build_live_projection_snapshot` in
@@ -221,7 +221,7 @@ pub fn should_apply_global_model_hot_swap(
 /// `propagate_config_to_live_channels` to active live channels.
 ///
 /// **Field set consulted by the propagate body** (verified against
-/// [`super::orchestrator::LiveOrchestrator::propagate_config_to_live_channels`]
+/// `LiveOrchestrator::propagate_config_to_live_channels`
 /// at the time of writing):
 ///
 /// - `agent.model` — read as `new_global_model` and threaded into the
@@ -295,7 +295,7 @@ pub enum LiveChannelCloseFailure {
     HostCommitFailed(String),
 }
 
-/// Aggregated typed outcome of [`propagate_config_to_live_channels`].
+/// Aggregated typed outcome of `LiveOrchestrator::propagate_config_to_live_channels`.
 ///
 /// Replaces the prior pure-logging fan-out: each per-session hot-swap and
 /// per-channel refresh outcome is recorded so the caller (the config/patch

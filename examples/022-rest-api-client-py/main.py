@@ -111,10 +111,9 @@ Start the server:
 Streaming via SSE:
   curl -N http://localhost:8080/sessions/{id}/events
 
-  Events:
-    data: {"type": "text_delta", "delta": "Hello"}
-    data: {"type": "tool_call_requested", "name": "search", ...}
-    data: {"type": "turn_completed", ...}
+  Agent events use a named SSE event plus a canonical event envelope:
+    event: text_delta
+    data: {"event_id":"...","source":{"type":"session","session_id":"..."},"seq":1,"timestamp_ms":0,"payload":{"type":"text_delta","delta":"Hello"}}
 """)
 
 

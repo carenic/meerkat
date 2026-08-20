@@ -97,8 +97,8 @@ pub struct SessionLlmCapabilitySurface {
     #[serde(default)]
     pub image_generation: bool,
     /// Whether the resolved model exposes a realtime bidirectional streaming
-    /// transport. Drives capability-based auto attach/detach in
-    /// `reconfigure_live_topology` and `apply_capability_driven_realtime_transport`.
+    /// transport. This is capability and model-routing evidence for explicit
+    /// live-channel admission; it does not auto-attach a provider transport.
     #[serde(default)]
     pub realtime: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -344,7 +344,7 @@ function handleObservation(obs) {
       logEvent(`turn interrupted${obs.response_id ? ` ${obs.response_id}` : ""}`);
       break;
     case "status_changed":
-      logEvent(`status ${obs.status?.state || "changed"}`);
+      logEvent(`status ${obs.status?.status || "changed"}`);
       break;
     case "command_rejected":
       logEvent(`command rejected: ${obs.message}`);
@@ -417,7 +417,7 @@ async function start() {
       logEvent("remote audio track attached");
     };
 
-    dc = pc.createDataChannel("meerkat-live");
+    dc = pc.createDataChannel("meerkat.live");
     dc.onopen = () => {
       $("dc-state").textContent = "open";
       $("composer").dataset.live = "true";

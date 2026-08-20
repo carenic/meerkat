@@ -2,7 +2,7 @@
 
 TypeScript client for the [Meerkat](https://github.com/lukacf/meerkat) runtime. The SDK is a thin session-first wrapper over the same runtime-backed contracts used by the CLI, REST, JSON-RPC, and MCP surfaces. It communicates with a local `rkat-rpc` subprocess over JSON-RPC 2.0 (newline-delimited JSON on stdin/stdout).
 
-Current contract version: `0.8.11`.
+Current contract version: `0.8.24`.
 
 ## Installation
 
@@ -12,7 +12,7 @@ npm install @rkat/sdk
 
 ## Prerequisites
 
-- **`rkat-rpc` binary on PATH** -- build it from the Meerkat repo with `cargo build -p meerkat-rpc`, then ensure the resulting `rkat-rpc` binary is in your `$PATH`.
+- **`rkat-rpc` binary on PATH** -- build the Meerkat repo through `make build`, then ensure the resulting `rkat-rpc` binary is in your `$PATH`. The SDK can also resolve and download a release binary automatically.
 - **Node.js >= 18** (uses `node:child_process`, `node:readline`, `node:test`).
 - **API key** for at least one LLM provider set in your environment (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY`).
 
@@ -79,7 +79,10 @@ async connect(options?: ConnectOptions): Promise<this>
 ```
 
 Spawns `rkat-rpc` as a child process, performs the `initialize` handshake, checks contract version compatibility, and fetches runtime capabilities via `capabilities/get`. Returns `this` for chaining.
-Pass `{ liveWs: true }` only for live-adapter flows that need `live/*`; it requires a configured live provider.
+Pass `{ liveWs: true }` only for WebSocket live-adapter flows that need
+`live/*`; it requires a configured live provider. WebRTC uses
+`{ liveWebrtc: true }` and a binary compiled with the non-default
+`meerkat-rpc/live-webrtc` Cargo feature.
 
 Throws `MeerkatError` with code `"VERSION_MISMATCH"` if the server's contract version is incompatible with the SDK's `CONTRACT_VERSION`.
 
@@ -107,25 +110,31 @@ Creates a new session and immediately runs the first turn with the given prompt.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `prompt` | `string \| ContentBlock[]` | **(required)** | The user prompt for the first turn. |
+| `options.injectedContext` | `readonly ContentInput[]` | `undefined` | Ordered durable host-attached context immediately before the prompt. |
+| `options.transientTurnContext` | `string` | `undefined` | Request-only host facts for the first turn. |
 | `options.model` | `string` | Server/config default | LLM model name (e.g. `"gpt-5.5"`, `"gemini-3.5-flash"`, `"claude-opus-4-8"`). |
 | `options.provider` | `string` | Resolved from the model registry | Force a specific provider (`"anthropic"`, `"openai"`, `"gemini"`). |
-| `options.systemPrompt` | `string` | `undefined` | Override the default system prompt. |
+| `options.authBinding` | `WireAuthBindingRef` | `undefined` | Resolve credentials through an explicit realm binding. |
+| `options.systemPrompt` | `string \| { action: "disable" }` | `undefined` | Override or explicitly disable inherited system prompts. |
 | `options.maxTokens` | `number` | `undefined` | Maximum output tokens for the LLM response. |
 | `options.outputSchema` | `Record<string, unknown>` | `undefined` | JSON Schema for structured output extraction. |
 | `options.structuredOutputRetries` | `number` | `2` (server default) | Max retries for structured output validation. |
 | `options.hooksOverride` | `Record<string, unknown>` | `undefined` | Run-scoped hook overrides. |
-| `options.enableBuiltins` | `boolean` | `false` | Enable built-in tools (task management, etc.). |
-| `options.enableShell` | `boolean` | `false` | Enable the shell tool (requires `enableBuiltins`). |
-| `options.enableMemory` | `boolean` | `false` | Enable semantic memory (memory_search tool + compaction indexing). |
-| `options.enableMob` | `boolean` | `false` | Enable mob orchestration helpers. |
+| `options.enableBuiltins` | `boolean` | Runtime/config default | Override built-in tool availability. |
+| `options.enableShell` | `boolean` | Runtime/config default | Override shell-tool availability; enabling it also requires built-ins. |
+| `options.enableMemory` | `boolean` | Runtime/config default | Override semantic-memory availability. |
+| `options.enableSchedule` | `boolean` | Runtime/config default | Override schedule-tool availability. Omission currently inherits the configured runtime default. |
+| `options.enableWorkGraph` | `boolean` | Runtime/config default | Override WorkGraph-tool availability. |
+| `options.enableMob` | `boolean` | Runtime/config default | Override mob-orchestration helper availability. |
+| `options.enableWebSearch` | `boolean` | Runtime/config default | Override the built-in web-search path. |
+| `options.toolFilter` | `WireToolFilter` | `undefined` | Apply the session tool visibility policy. |
 | `options.keepAlive` | `boolean` | `false` | Run in keep-alive mode for inter-agent comms. |
 | `options.commsName` | `string` | `undefined` | Agent name for comms (required when `keepAlive` is `true`). |
 | `options.peerMeta` | `Record<string, unknown>` | `undefined` | Metadata advertised to peer comms surfaces. |
 | `options.budgetLimits` | `Record<string, unknown>` | `undefined` | Runtime budget limits for the session. |
 | `options.providerParams` | `Record<string, unknown>` | `undefined` | Provider-specific parameters (e.g. thinking config). |
-| `options.preloadSkills` | `string[]` | `undefined` | Skill source UUIDs to load before the run. |
+| `options.preloadSkills` | `SkillRef[]` | `undefined` | Structured skills to load before the run. |
 | `options.skillRefs` | `SkillRef[]` | `undefined` | Canonical structured skill references. |
-| `options.skillReferences` | `string[]` | `undefined` | Legacy string skill references; prefer `skillRefs`. |
 | `options.labels` | `Record<string, string>` | `undefined` | Session labels used for filtering and metadata. |
 | `options.additionalInstructions` | `string[]` | `undefined` | Extra instruction blocks appended to the system prompt. |
 | `options.appContext` | `unknown` | `undefined` | Opaque app context passed to custom builders. |
@@ -141,7 +150,15 @@ async createDeferredSession(
 ): Promise<DeferredSession>
 ```
 
-Creates a session identity without running the first turn yet. Use `await deferred.startTurn(...)` when you want the first runtime-backed turn to happen later.
+The server rejects `options.transientTurnContext` on deferred create because no
+immediate turn exists. Current `DeferredTurnOptions` also omits
+`injectedContext`, `transientTurnContext`, and `selfHostedServerId`. Set
+injected context during deferred creation; transient first-turn context and a
+self-hosted server route are not expressible through this wrapper.
+
+Creates a session identity without running the first turn yet. Use
+`await deferred.startTurn(...)` for a result or `deferred.stream(...)` for an
+`EventStream` when you want the first runtime-backed turn to happen later.
 
 ### listSessions()
 
@@ -166,11 +183,27 @@ Returns typed session details including `model`, `provider`, `lastAssistantText`
 ### Session ingress helpers
 
 ```ts
-async sendExternalEvent(sessionId: string, payload: unknown, options?: { source?: string }): Promise<Record<string, unknown>>
+async sendExternalEvent(sessionId: string, eventType: string, payload: unknown, options?: { blocks?: ContentBlock[] }): Promise<Record<string, unknown>>
 async injectContext(sessionId: string, text: string, options?: { source?: string; idempotencyKey?: string }): Promise<{ status: string }>
 ```
 
 These expose `session/external_event` and `session/inject_context` as first-class public APIs.
+
+Input reconciliation, ATIF export, transcript revision read/list, forking,
+guarded rewriting, system-prompt update, and revision restore are also public
+through the corresponding `inputState`, `exportSessionAtif`, and
+`*SessionTranscript*` helpers.
+
+`Session.turn` and `Session.stream` accept
+`injectedContext`, `transientTurnContext`, `skillRefs`, `turnToolOverlay`,
+`additionalInstructions`, `keepAlive`, `model`, `provider`,
+`selfHostedServerId`, `maxTokens`, `systemPrompt`, `outputSchema`,
+`structuredOutputRetries`, and `providerParams`.
+
+`DeferredSession.startTurn` and `DeferredSession.stream` accept `skillRefs`,
+`turnToolOverlay`, `additionalInstructions`, `keepAlive`, `model`, `provider`,
+`maxTokens`, `systemPrompt`, `outputSchema`, `structuredOutputRetries`, and
+`providerParams`.
 
 ### Schedules, Models, and Mob profile APIs
 
@@ -205,6 +238,42 @@ async getMobProfile(name: string): Promise<MobProfileLookupResult>
 async listMobProfiles(): Promise<MobProfileLookupResult[]>
 async updateMobProfile(name: string, profile: MobProfile, expectedRevision: number): Promise<MobProfileLookupResult>
 async deleteMobProfile(name: string, expectedRevision: number): Promise<MobProfileDeleteResult>
+```
+
+The client additionally exposes detached jobs and monitors, approval and
+artifact lifecycles, projected event cursor replay/snapshots, and trusted
+multi-host mob controls. Every public TypeScript RPC wrapper binds its request
+and response transport boundary to generated RPC-schema contracts. Generated
+job/approval/artifact/event names are not re-exported from the package root in
+0.8.24; pass matching object literals. Multi-host host/grant mutations are
+trusted operator APIs and cannot be invoked through agent mob tools.
+
+Event cursor and snapshot methods require host event projection. Explicitly
+ephemeral memory realms do not expose those replay APIs.
+
+Approval calls maintain audit records only; they do not automatically gate,
+authorize, or execute an action. They persist when the RPC bundle exposes a
+store path and otherwise remain process-local.
+
+Auth profiles and credentials are realm-scoped. Provisioning returns an auth
+binding for `SessionOptions.authBinding` or a mob member spec, so the spec does
+not carry the provider secret. Remote hosts resolve bindings only inside their
+authorized realm.
+
+Live channels support both WebSocket and WebRTC. Branch on
+`opened.transport.transport`; only `websocket` has `url`. Use
+`client.liveWebrtcAnswer` for the canonical WebRTC SDP exchange.
+The Node SDK does not provide `RTCPeerConnection`; inject a compatible
+implementation or forward browser-created SDP to the Node process. Add an
+audio track or the `meerkat.live` data channel, set the local description,
+wait for ICE gathering to complete, and send `peer.localDescription.sdp`.
+The 0.8.24 `answerLiveWebrtcOffer` helper does not wait for ICE completion and
+sends the original offer SDP, so it is not the canonical browser exchange.
+The 0.8.24 release binary omits the non-default `live-webrtc` Cargo feature,
+so WebRTC requires a custom `rkat-rpc` build, for example:
+
+```bash
+./scripts/repo-cargo build -p meerkat-rpc --features live-webrtc
 ```
 
 ### Session lifecycle on wrappers
@@ -287,6 +356,14 @@ The TypeScript SDK exposes camelCase domain types at the package root. The JSON-
 - `Usage`, `SessionInfo`, `Capability`, and `SchemaWarning` model the runtime responses directly.
 - `Session` and `DeferredSession` are the canonical runtime-backed wrappers for session lifecycle.
 - `EventStream` yields typed events such as `text_delta`, `turn_completed`, and `tool_execution_completed`.
+
+`TurnCompletedEvent.usage` is optional; absent means unmeasured, not zero. The
+0.8.24 handwritten parser returns eight inventory-known event types as
+`UnknownEvent`, rejects current Rust `server_tool_content` and
+`transcript_rewrite_audit_receipt_committed` because the generated inventory
+omits them, and can preserve current `run_started`, `run_failed`, `retrying`,
+and `hook_failed` frames as `MalformedEvent` because their parser field shapes
+are stale. These are SDK/code-generation gaps.
 
 Use the built-in client helpers directly for capability and skill flows:
 
@@ -387,14 +464,14 @@ try {
 
 ## Version Compatibility
 
-The SDK exports `CONTRACT_VERSION` (currently `"0.8.11"`). During `connect()`, the SDK checks that the server's contract version is compatible:
+The SDK exports `CONTRACT_VERSION` (currently `"0.8.24"`). During `connect()`, the SDK checks that the server's contract version is compatible:
 
 - While the major version is `0`, minor versions must match exactly (e.g. SDK `0.1.x` requires server `0.1.x`).
 - Once `1.0.0` is reached, major versions must match (standard semver).
 
 ```ts
 import { CONTRACT_VERSION } from "@rkat/sdk";
-console.log(CONTRACT_VERSION);  // "0.8.11"
+console.log(CONTRACT_VERSION);  // "0.8.24"
 ```
 
 If the versions are incompatible, `connect()` throws a `MeerkatError` with code `"VERSION_MISMATCH"`.
@@ -461,7 +538,7 @@ await client.connect();
 
 // Create session with first turn.
 const session = await client.createSession("My name is Alice.", {
-  model: "claude-sonnet-4-5",
+  model: "claude-sonnet-4-6",
 });
 
 // Follow-up turns reuse the runtime-backed session handle.

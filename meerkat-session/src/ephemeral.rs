@@ -1330,9 +1330,9 @@ struct SessionHandle {
     /// Normal streams use the shared-envelope lane above, so large payloads
     /// are cloned only while a raw receiver is actually attached.
     raw_session_event_tx: tokio::sync::broadcast::Sender<EventEnvelope<AgentEvent>>,
-    /// Singular lossless queue reserved for the persistent service's
-    /// durable event projector. UI subscribers stay on the lossy broadcast
-    /// lane; durable projection must never consume from that lane.
+    /// Singular unbounded queue reserved for an installed persistent event
+    /// projector. UI subscribers stay on the lossy broadcast lane, so UI lag
+    /// cannot drop projector input.
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     lossless_event_projection_tx: Arc<tokio::sync::Mutex<Option<Arc<LosslessEventProjectionSink>>>>,
 }
@@ -1559,10 +1559,11 @@ struct SessionTaskControl {
 }
 
 impl SessionTaskControl {
-    /// Publish first to the singular durable projector lane, then fan out to
+    /// Publish first to the singular installed-projector lane, then fan out to
     /// best-effort broadcast subscribers. The dedicated queue absorbs bursts
-    /// without letting a slow durable projector perturb live session ordering
-    /// or lose canonical events through a UI-oriented broadcast ring.
+    /// without letting a slow projector perturb live session ordering or lose
+    /// its input through a UI-oriented broadcast ring. EventStore append
+    /// remains asynchronous derived state rather than session authority.
     async fn publish_session_event(&self, envelope: EventEnvelope<AgentEvent>) {
         #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
         publish_session_event_to_channels(
@@ -4123,7 +4124,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
 
     /// Get a raw broadcast receiver for a session's events.
     ///
-    /// Unlike [`subscribe_session_events`] which returns an `EventStream`,
+    /// Unlike [`Self::subscribe_session_events`] which returns an `EventStream`,
     /// this returns the raw `broadcast::Receiver` which supports synchronous
     /// `try_recv()` — useful for WASM where async polling with noop wakers
     /// doesn't work reliably.

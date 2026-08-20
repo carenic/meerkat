@@ -1,7 +1,7 @@
 # 002 — Hello Meerkat (Python SDK)
 
 The simplest Python agent. The SDK spawns `rkat-rpc` as a subprocess and
-communicates via JSON-RPC — zero HTTP servers, zero configuration.
+communicates via JSON-RPC, so no HTTP server setup is required.
 
 ## Prerequisites
 ```bash
@@ -22,5 +22,5 @@ export MEERKAT_BIN_PATH="$(./scripts/repo-cargo --print-env | sed -n 's/^CARGO_T
 
 ## Run
 ```bash
-ANTHROPIC_API_KEY=sk-... python3 main.py
+ANTHROPIC_API_KEY=sk-... python3 examples/002-hello-meerkat-py/main.py
 ```

@@ -21,7 +21,12 @@ This page is structured from common product usage to advanced extension work:
 
 ## Enable built-in tools
 
-Built-in tool categories: builtins, shell, semantic memory, WorkGraph, and mob orchestration. On the CLI, these are selected with tool presets. Other surfaces expose per-category booleans such as `enable_builtins`, `enable_shell`, `enable_memory`, `enable_workgraph`, and `enable_mob`.
+Built-in tool categories include general builtins, shell, semantic memory,
+schedule, WorkGraph, comms, mob orchestration, image generation, and web
+search. On the CLI, common groups are selected with tool presets. Other
+surfaces expose category booleans such as `enable_builtins`, `enable_shell`,
+`enable_memory`, `enable_workgraph`, `enable_mob`, and `enable_web_search`.
+Image generation and web search are independent from general builtins.
 
 <Tabs>
   <Tab title="CLI">
@@ -112,7 +117,7 @@ Built-in tool categories: builtins, shell, semantic memory, WorkGraph, and mob o
 
     let service = build_ephemeral_service(factory, config, 64); // Queue-only embedded/testing substrate
     let result = service.create_session(CreateSessionRequest {
-        model: "claude-sonnet-4-6".into(),
+        model: "gpt-5.6-sol".into(),
         prompt: "List files in /tmp".into(),
         system_prompt: SystemPromptOverride::Inherit,
         max_tokens: None,
@@ -126,6 +131,40 @@ Built-in tool categories: builtins, shell, semantic memory, WorkGraph, and mob o
   </Tab>
 </Tabs>
 
+## Run a durable background shell job
+
+Ask the `shell` tool for `background: true` when you need Meerkat-owned job
+truth rather than shell syntax that happens to include `&`:
+
+```json
+{
+  "command": "./scripts/long-check.sh",
+  "working_dir": ".",
+  "timeout_secs": 900,
+  "background": true
+}
+```
+
+The submission returns before the process completes:
+
+```json
+{
+  "job_id": "job_019467d9-7e3a-7000-8000-000000000000",
+  "status": "queued",
+  "restart_class": "non_resumable",
+  "awaitable": true,
+  "message": "Durable shell job submitted with ID: job_019467d9-7e3a-7000-8000-000000000000"
+}
+```
+
+Use `shell_job_status`, `shell_jobs`, and `shell_job_cancel` with that stable
+ID. The record survives restart, but the subprocess does not become resumable:
+a lost worker is terminally classified `worker_lost` and is not replayed.
+
+`monitor_start` is a separate high-trust, opt-in tool for scripts that emit
+framed notifications, checkpoints, progress, and completion. It is not enabled
+by the standard shell category alone.
+
 ## Register MCP servers
 
 ```bash
@@ -136,8 +175,8 @@ rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp
 rkat mcp add remote-api --url https://mcp.example.com/api
 
 # Add an OAuth-protected streamable HTTP server and log in
-rkat mcp add --transport http glean https://king-be.glean.com/mcp/default
-rkat mcp login glean
+rkat mcp add --transport http knowledge https://mcp.example.com/v1
+rkat mcp login knowledge
 
 # List all registered servers
 rkat mcp list
@@ -384,7 +423,19 @@ impl AgentToolDispatcher for MathTools {
                 },
                 "required": ["a", "b"]
             }),
+            provenance: Some(ToolProvenance {
+                kind: ToolSourceKind::RustBundle,
+                source_id: "math-tools".into(),
+            }),
         })].into()
+    }
+
+    fn tool_mutation_class(&self, tool_name: &str) -> ToolMutationClass {
+        if tool_name == "add" {
+            ToolMutationClass::ReadOnly
+        } else {
+            ToolMutationClass::Unknown
+        }
     }
 
     async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {

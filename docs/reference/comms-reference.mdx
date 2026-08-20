@@ -1,28 +1,143 @@
 ---
 title: "Comms Reference"
-description: "Low-level comms reference: agent-facing tools, host-side comms/send surfaces, peer discovery, and ingress distinctions."
+description: "Exact comms surface, identity, message, taint, reply-capability, ingress, and observation contracts."
 icon: "tower-broadcast"
 ---
 
-Use this page when you need exact comms vocabulary and surface distinctions rather than the operational guide.
+Use this page when you need exact comms vocabulary and surface distinctions
+rather than the operational guide.
+
+## Identity And Trust
+
+| Fact | Contract |
+| --- | --- |
+| `PeerId` | Canonical routing identity, derived from the Ed25519 public key |
+| `PeerName` | Display label only; duplicate names are legal |
+| `PeerAddress` | Typed `inproc`, `uds`, or `tcp` route |
+| `TrustStore` | Keyed by `PeerId`; name resolution fails as ambiguous instead of guessing |
+| Envelope signature | Ed25519 over canonical CBOR of `(id, from, to, kind)` |
+
+Signed transport is not admission by itself. Inbox classification checks the
+recipient and current trust authority before runtime ingress. A queue entry is
+removed only by an exact durable-runtime commit or an exact volatile-control
+handoff.
+
+Live trust mutation requires generated machine or composition authority.
+`trusted_peers.json` is a diagnostic persisted projection with stable rows,
+not a supported hand-edited startup seed; a non-empty seed fails runtime
+startup instead of silently becoming trust authority.
 
 ## Agent-facing comms tools
 
-- `send_message`
-- `send_request`
-- `send_response`
-- `peers`
+| Tool | Use | Authority boundary |
+| --- | --- | --- |
+| `send_message` | Unsolicited one-way collaboration | Explicit `peer_id`; runtime taint declaration is inherited |
+| `reply_to_peer` | Reply to the peer message that caused this turn | Pre-addressed, turn-scoped reply capability; no `peer_id` input |
+| `send_request` | Typed `intent + params` request needing correlation | Requires runtime command authority |
+| `send_response` | Progress or terminal response to a typed request | Requires runtime command authority |
+| `peers` | Read the typed peer directory | Names are display-only; route with `peer_id` |
+
+`reply_to_peer` accepts `body`, optional multimodal `blocks`, required
+`handling_mode`, and optional `reply_to`. The selector is needed only when
+several peer-message deliveries caused one turn. The typed failures are
+`no_reply_capability`, `ambiguous_reply`, and `unknown_reply_to`; dispatch also
+revalidates that the peer is still trusted and reachable.
+
+`send_request` and `send_response` are not general task-tracking tools. The
+agent-facing request intent vocabulary is closed to `checksum_token` and
+`supervisor.bridge`. Ordinary collaboration should use `send_message` or
+`reply_to_peer`.
 
 ## Host-side comms and ingress surfaces
 
-- `comms/send`
-- `comms/peers`
-- `session/external_event`
+| Surface | Contract |
+| --- | --- |
+| `comms/send` | Send one typed command through a session's comms/runtime authority |
+| `comms/peers` | List the session's canonical typed peer directory |
+| `session/external_event` | Append external runtime-backed work, separate from peer traffic |
+| REST `POST /comms/send` | HTTP adapter for `comms/send` |
+| REST `GET /comms/peers` | HTTP adapter for `comms/peers` |
+| MCP `meerkat_comms_send` / `meerkat_comms_peers` | Public MCP adapters for the same host operations |
+
+`comms/send` has a closed `kind` discriminator:
+
+| Kind | Required core fields | Notes |
+| --- | --- | --- |
+| `input` | `body` | Local session input; optional source, stream, blocks, handling mode |
+| `peer_message` | `to`, `body` | One-way peer content |
+| `peer_lifecycle` | `to`, `lifecycle_kind` | Typed one-way lifecycle notice |
+| `peer_request` | `to`, `intent`, `params` | Closed request intent and typed params |
+| `peer_response` | `to`, `in_reply_to`, `status` | `accepted`, `completed`, or `failed` |
+
+`queue` and `steer` are runtime admission modes. A `peer_response` may override
+handling mode only when its status is terminal (`completed` or `failed`);
+`accepted` progress cannot carry that override.
+
+The lower signed comms wire also carries ACKs and an internal
+`incarnation_fenced_message` used for exact placed-member residency. That kind
+is not an additional public `comms/send` discriminator.
+
+## Content Taint
+
+`SenderContentTaint` is `clean` or `tainted`, signed when present on content
+messages, requests, and responses. Absence means undeclared. It must never be
+coalesced into `clean`.
+
+Host send operations expose a tri-state override:
+
+- absent - inherit the host-owned runtime declaration
+- `declare` - stamp exactly `clean` or `tainted`
+- `undeclared` - suppress the declaration for this send
+
+Agent tools do not receive this per-send override. They inherit the declaration
+installed by the host. When incoming peer content is committed into session
+context, the runtime emits `peer_content_ingested` with the typed notice kind,
+canonical peer fact, request correlation, and sender declaration. The event is
+best-effort observation; the typed transcript block is the durable owner.
+
+## Delivery And Observation
+
+Delivery and observation are intentionally separate:
+
+- comms transport and inbox own delivery
+- the runtime machine owns durable admission and deduplication
+- typed system-notice blocks own durable transcript facts
+- session and mob subscriptions expose observation at the requested scope
+
+An in-process send is bounded by `ack_timeout_secs` while it waits for queue
+capacity and receiver resolution. Expiry before admission means nothing was
+delivered. Expiry after admission is `AmbiguousDelivery`: the item is queued
+and can still commit. Stream I/O or missing ACKs can also leave an ambiguous
+outcome. Reconcile against the envelope id and durable work truth before
+retrying. Exact runtime replay deduplication applies only to the same
+interaction identity; a newly generated retry id is new peer work. A higher
+layer can make a retry safe only when its durable idempotency key is coarser
+than the attempt. Per-attempt or timestamped keys provide no such protection.
+
+REST preserves this uncertainty as `send_ambiguous`, with the `envelope_id`,
+`retry_safe: false`, and `required_action: "reconcile"`. It does not flatten
+the result into `send_failed`.
+
+External events use `session/external_event`, stdin, REST webhook, or an
+explicit plain TCP/UDS event listener. Plain listeners are separate from the
+signed peer listener and require an explicit open-auth posture. Do not expose
+them beyond loopback without treating the input as untrusted prompt material.
+
+## Security Boundary
+
+- Signatures authenticate envelope bytes and peer identity; they do not encrypt content.
+- Runtime ingress durably deduplicates an exact interaction replay, but the envelope has no freshness timestamp or nonce window.
+- `supervisor.bridge` shares the signed transport with peer requests but is admitted by private machine authority.
+- Temporary request callback routes are derived from signed request metadata plus the kernel-observed source address; an arbitrary payload address is not callback authority.
+- Private keys and binding descriptors are operator credentials and should remain mode `0600` on Unix.
 
 ## Core distinction
 
 - agent-side comms tools are for the model inside a turn
 - host-side comms/session ingress surfaces are for applications and operators
+- agent or host callers can choose and carry typed `supervisor.bridge` intent,
+  but that choice grants no supervisor authority; receiver-machine admission
+  alone decides whether it executes
 
 ## See also
 

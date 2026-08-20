@@ -77,9 +77,10 @@ call:
 ```
 
 `provider` and `model` name the resolved model the request was actually lowered
-to, not configuration intent, so a consumer reading only the durable event log
-(`.rkat/sessions/<id>/events.jsonl`) can attribute the calls it does see without
-joining against session metadata. `presented_tokens` is the provider-normalized
+to, not configuration intent, so a consumer reading a successfully projected
+durable event audit log (`.rkat/sessions/<id>/events.jsonl`) can attribute the
+calls it does see without joining against session metadata. The log is optional
+derived state and may halt independently of session commits. `presented_tokens` is the provider-normalized
 input presented to the model for that one call, and `convention` records how the
 provider's counters were normalized to produce it.
 
@@ -112,6 +113,21 @@ the counters DID arrive but named a different provider/model than the request
 they answered. Those counters are internally consistent, so they are recorded
 exactly as reported and the axis advances normally; only the attribution is
 contested, and it is never rewritten to the active identity.
+
+### OpenAI-compatible usage trailers
+
+Chat Completions servers may emit `finish_reason` first and send the
+`stream_options.include_usage` counters in a later usage-only SSE event. The
+OpenAI-compatible adapter therefore latches the stop reason instead of ending
+the stream immediately. It continues reading until `[DONE]`, stream end, or a
+single post-finish trailer window expires. The standard window is 30 seconds,
+and keepalive comments do not extend it.
+
+Usage that arrives after `finish_reason` is retained and normalized normally.
+If the connection closes, becomes undecodable, or reaches the trailer deadline
+after the semantic finish, Meerkat treats that as stream end rather than
+retrying an answer the caller already received. If no usage arrived, the
+ordinary unmeasured-accounting contract above applies; no counters are minted.
 
 ## Worked example
 

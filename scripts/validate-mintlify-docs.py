@@ -9,6 +9,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -99,11 +100,18 @@ def has_unclosed_fence(text: str) -> bool:
 def slugify(heading: str) -> str:
     heading = re.sub(r"`([^`]*)`", r"\1", heading)
     heading = re.sub(r"<[^>]+>", "", heading)
-    heading = heading.strip().lower()
-    heading = re.sub(r"[^\w\s-]", "", heading)
-    heading = re.sub(r"\s+", "-", heading)
-    heading = re.sub(r"-+", "-", heading)
-    return heading.strip("-")
+    heading = re.sub(r"\s+", "-", heading.strip().lower())
+
+    # Mintlify first applies encodeURIComponent to the heading and then runs
+    # @sindresorhus/slugify while preserving percent escapes and underscores.
+    # In particular, `capabilities/get` becomes `capabilities%2Fget`, not
+    # `capabilitiesget`. Keep this local validator aligned so official Mintlify
+    # anchor checks cannot expose a false green after merge.
+    encoded = quote(heading, safe="-_.!~*'()")
+    encoded = encoded.replace("'", "")
+    encoded = re.sub(r"[^A-Za-z0-9%_]+", "-", encoded)
+    encoded = re.sub(r"-+", "-", encoded)
+    return encoded.strip("-")
 
 
 def heading_slugs(path: Path) -> set[str]:
@@ -119,7 +127,7 @@ def heading_slugs(path: Path) -> set[str]:
             continue
         count = counts.get(base, 0)
         counts[base] = count + 1
-        slugs.add(base if count == 0 else f"{base}-{count}")
+        slugs.add(base if count == 0 else f"{base}-{count + 1}")
     return slugs
 
 

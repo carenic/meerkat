@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 **Versioning policy (pre-1.0):** meerkat 0.x PATCH releases may contain
 breaking public-API changes - this project ships deliberate clean breaks
 instead of compatibility shims. Downstreams must EXACT-PIN the meerkat crate
-family (e.g. `meerkat = "=0.7.24"`) and bump deliberately. In exchange, every
+family with an exact `=X.Y.Z` Cargo requirement and bump deliberately. Every
 release that breaks public API declares it under a `### Breaking` heading
 naming the changed signatures.
 
@@ -45,6 +45,13 @@ them.
   `meerkat_contracts::SessionExternalEventParams`; downstream imports of the
   handler-local struct must move to that canonical contract type.
 
+### Changed
+
+- Python and TypeScript SDK transports now bind every public JSON-RPC request
+  and result boundary to generated contract types. The former grandfathered
+  hand-written wrapper baseline and expiry waiver are gone; signature parity
+  now rejects an ad hoc wrapper shape for both new and historical methods.
+
 ### Corrected
 
 - Python and TypeScript RPC clients now bind all 164 catalog methods to
@@ -72,7 +79,8 @@ them.
   while the durable projector appended events, permanently halting the session
   with `SessionEventProjectionLagged`. The singular durable projector now uses
   its own dedicated queue, while UI subscribers retain typed
-  `StreamLagged` markers when they fall behind. A rate-limited warning reports
+  `StreamTruncated(StreamLagged { dropped })` markers when they fall behind. A
+  rate-limited warning reports
   projector queue depth and high-water once the backlog reaches 1,024 events,
   and shared event envelopes avoid duplicating large payloads between the
   durable queue and ordinary broadcast stream.
@@ -91,6 +99,12 @@ them.
   consequence, such exhausted unknown failures now report error kind
   `retry_exhausted` rather than `llm_failure`; clients branching on that code
   must handle the new value.
+- CLI run and resume shutdown now await the exact epoch-fenced runtime
+  registration's terminal unregister before shutting down the session service.
+  The wait has an explicit timeout and returns a cleanup error instead of
+  acknowledging teardown while the runtime still owns the session. Mob
+  crash-stop handling likewise closes the command receiver before its
+  acknowledgement so no later command can be admitted behind the stop.
 
 ## [0.8.24] - 2026-08-18
 
@@ -1438,6 +1452,94 @@ checks that this section EXISTS, not that it covers every break.**
 - The compatible MobKit release is not yet named. Do not retain the previous
   Meerkat 0.8.21/MobKit 0.8.15 pairing for this release.
 
+## [0.8.21] - 2026-08-08
+
+### Breaking
+
+- `IncrementalSessionStore` implementations must implement
+  `cross_head_canonical_authority` before HeadCanonical v1 data is used through
+  the v2 write path. `RuntimeSessionAuthorityOps` implementations must provide
+  one atomic `load_session_resume_observation` over session authority, catalog
+  state, and the machine-lifecycle row.
+- Schedule stores return trusted-backend transition commits from definition
+  and occurrence mutations. Raw lifecycle-mutator destructors and
+  `ScheduleStore::append_receipt` were removed; claim, renewal, mutation, and
+  terminalization callers must consume the returned effects.
+- The body-only Mob resume compatibility projection was removed. Resume
+  consumers must retain and revalidate the owner-issued
+  `SessionResumeVerdict` authority.
+
+### Fixed
+
+- Mob restore, revival, host materialization, and reconciliation consume one
+  authority-bracketed resume verdict, preventing the body, catalog row,
+  lifecycle row, or runtime generation from being reclassified independently.
+- Schedule lifecycle effects remain attached to the durable store commit and
+  are validated by services and drivers. Missing lease, dispatch, terminal,
+  supersession, and revision effects now fail closed.
+- SQLite session stores cross HeadCanonical v1 authority to v2 transactionally
+  with source CAS, replay verification, rollback, and schema-v4 migration.
+- Context-budget forecasts now carry provenance and derive their ceiling only
+  from `ModelProfileWitness`; provider context rejection still terminalizes as
+  typed `ContextExceeded`.
+- A JSONL index failure after a canonical save or delete no longer turns a
+  committed durable write into an apparent failure. The projection is marked
+  degraded and reported by storage diagnostics.
+
+## [0.8.20] - 2026-08-07
+
+### Breaking
+
+- Removed `EphemeralRuntimeDriver::queue` and
+  `EphemeralRuntimeDriver::steer_queue`. Runtime lane membership and ordering
+  are exposed only through the machine-owned `queue_lane` and `steer_lane`
+  views.
+
+### Fixed
+
+- Runtime input execution no longer keeps mutable physical queue copies beside
+  generated `input_lane` authority. Authorized batches validate the exact
+  machine-owned prefix, hydrate payloads from the ledger, and remove work only
+  through the staging transition.
+- Mob-member rematerialization no longer replays profile, persisted-spawn, or
+  resume-time system-prompt configuration as a new System message. Callers that
+  intend ordered System input must use the typed System-context admission API.
+
+## [0.8.18] - 2026-08-06
+
+### Fixed
+
+- Runtime steer admission preserves the submitted content, and Mob steer input
+  arriving during member kickoff is queued behind kickoff instead of racing or
+  being dropped.
+
+## [0.8.17] - 2026-08-06
+
+### Fixed
+
+- Runtime comms drains admit one classified input at a time, preserving the
+  durable FIFO tail when a drain task is cancelled or replaced.
+- Automatic Mob-member rematerialization no longer replays persisted system
+  prompt configuration as a new System message. Explicit new System input
+  remains ordered through the normal admission path.
+- Audited transcript hydration accepts a semantically identical live prefix
+  after adapter rematerialization changes only physical row bookkeeping. The
+  content-addressed append path reanchors current row authority while still
+  rejecting divergent semantic prefixes.
+
+## [0.8.16] - 2026-08-05
+
+### Added
+
+- Added the durable WorkGraph-to-Mob-Flow execution bridge. A
+  `WorkExecutionLifecycleMachine` owns launch uncertainty, run observation,
+  terminal evidence projection, retry eligibility, and closure handoff without
+  taking WorkGraph item truth or Mob run truth away from their owners.
+- Added MCP launch, reconciliation, uncertain-launch abandonment, and redacted
+  binding-read tools for WorkGraph Flow execution. Bindings commit the exact
+  Flow configuration and deterministic run identity before launch so recovery
+  cannot blindly create a replacement run.
+
 ## [0.8.15] - 2026-08-03
 
 ### Added
@@ -2049,8 +2151,11 @@ checks that this section EXISTS, not that it covers every break.**
 
 ## [0.8.9] - 2026-07-27
 
-*(Consolidated section: entries below accumulated across 0.8.0–0.8.9;
-per-release stamping was not performed at release time.)*
+*(Historical cumulative detail: the release hook did not stamp
+v0.7.29-v0.8.8, so this section preserves entries accumulated across
+v0.7.29-v0.8.9. Release-local summaries for v0.7.29-v0.8.8 are backfilled
+below; treat this section as cumulative context, not an exclusive v0.8.9
+delta.)*
 
 ### Breaking
 
@@ -2973,6 +3078,258 @@ per-release stamping was not performed at release time.)*
   their cadence guard, preventing immediate retry loops as well as shifted
   source ranges or memory rows for content that never left the authoritative
   transcript.
+## [0.8.8] - 2026-07-25
+
+### Breaking
+
+- `AgentError::CallbackPending` gained the required `tool_use_id` field, and
+  exhaustive matches over `CompletionOutcome` and `CoreApplyTerminal` must
+  handle their new `CallbackBatchPending` variants.
+- `RuntimeStore::load_input_states` now returns per-row `InputStateRow`
+  outcomes instead of `Vec<StoredInputState>`; strict callers use
+  `load_input_states_strict`.
+- Exhaustive matches must handle `ToolError::InactivityTimeout`,
+  `OperationKind::DetachedJobWait`, and `OperationSource::DetachedJob`.
+
+### Added
+
+- Added durable detached jobs, persistent job stores, ordered runtime
+  delivery, callback batches, job monitoring and RPC control, and durable
+  background shell execution.
+- Added supervised streaming-tool execution with typed progress,
+  cancellation, inactivity, and absolute deadlines.
+- Composed detached jobs with WorkGraph and Schedule, and added Claude Opus 5
+  to the catalog as the Anthropic default.
+
+### Changed
+
+- The external-callback deadline increased from 30 seconds to 120 seconds.
+  `shell(background: true)` now fails closed without a durable job, blob, and
+  delivery runtime instead of falling back to process-local execution.
+
+### Fixed
+
+- Preserved pre-0.8.8 callback and event rows across upgrade, isolated corrupt
+  input-state rows, and prevented one unacknowledgeable delivery from blocking
+  other jobs or sessions.
+
+## [0.8.7] - 2026-07-24
+
+### Fixed
+
+- Restored WASM compilation by using Meerkat's WASM-compatible `SystemTime`
+  alias in checkpoint memo keys, and corrected the legacy digest fixture so it
+  actually omits the modern `digest_format` marker.
+
+## [0.8.6] - 2026-07-24
+
+### Breaking
+
+- `TranscriptHistoryState` gained the required public
+  `digest_format: u32` field. Stored rows default the field for compatibility,
+  but downstream struct literals must initialize it.
+
+### Changed
+
+- Added event-driven `MobHandle::machine_state_changes` and
+  `MobMcpState::mob_set_changes` seams so observers do not need to poll and
+  clone full machine projections.
+
+### Fixed
+
+- Removed the remaining per-member idle CPU amplification by memoizing
+  checkpoint verification, skipping converged identity loads, and borrowing
+  member projections instead of deep-cloning them.
+- Corrected the crate publication order for runtime, comms, and provider
+  packages.
+
+## [0.8.5] - 2026-07-24
+
+### Breaking
+
+- Exhaustive matches over `LegacyCheckpointMigrationDisposition` must handle
+  the new `ConvergeSnapshotOntoTypedProjection` variant.
+
+### Fixed
+
+- Upgraded fleets can converge a legacy runtime snapshot onto already-adopted
+  typed session-store authority when the transcript is identical or a prefix.
+  Divergent content still fails closed, and cursor-free migration eligibility
+  is preserved.
+
+## [0.8.4] - 2026-07-23
+
+### Breaking
+
+- Removed `meerkat_core::config::find_project_root`, `data_dir`, and the
+  `config::dirs` module. Path discovery now goes through `StorageLayout` and
+  `storage_layout::find_project_root`.
+- `realm_exists_under` now returns `Result<bool, RuntimeBootstrapError>`,
+  `DualRootResolution` gained required `candidate_roots`, and
+  `PersistenceError` gained `Bootstrap` and `FirstStart` variants.
+
+### Added
+
+- Shipped the storage-unification arc: `meerkat-sqlite`,
+  `meerkat-store-conformance`, the `RealmStorageProvider` seam, manifest-v2
+  durability declarations, dual-root resolution, and `rkat storage doctor`,
+  `migrate`, and `prune`.
+
+### Changed
+
+- Machine schemas are cached per process. Provider streams now have a
+  default-on 300-second inactivity watchdog, and running-member force cancel
+  is legal and idempotent.
+
+### Fixed
+
+- A cancelled shutdown checkpointer no longer silently drops a committed
+  SessionStore projection and leaves the runtime and session authorities
+  permanently divergent.
+
+## [0.8.3] - 2026-07-22
+
+### Breaking
+
+- Generated session-document alphabets gained
+  `ResolveRuntimeCheckpointProjection` and
+  `ResolveLegacyCheckpointMigration` inputs with their effects and
+  transitions. Generated Mob alphabets gained the
+  `ResolveAutonomousShutdownMemberAction` family. Downstream exhaustive
+  matches must handle the new variants.
+
+### Fixed
+
+- Added machine-owned late-write gates for archived sessions and terminal
+  shutdown anchors.
+- Added relation-aware, machine-owned migration of pre-typed session
+  checkpoints and hardened it against races and partial adoption.
+- Hardened flow dispatch, remote retirement recognition, release lockfile
+  provenance, and runtime reliability.
+
+## [0.8.2] - 2026-07-21
+
+### Breaking
+
+- Generated `MeerkatMachine` recovery alphabets replaced the eight
+  `RecoverRuntimeAuthority*` phase inputs with the total
+  `ClassifyRuntimeAuthorityReconciliation` observation.
+- `Session::set_runtime_checkpoint_provenance` and
+  `clear_runtime_checkpoint_provenance` became deprecated resultful calls;
+  `has_runtime_checkpoint_provenance` was replaced by
+  `try_has_runtime_checkpoint_provenance`.
+
+### Added
+
+- Added actor-serialized mob identity declaration manifests with durable
+  desired state, leases, receipts, row observations, and convergence status.
+
+### Fixed
+
+- Cold runtime recovery is level-triggered over every persisted lifecycle
+  shape, with checkpoint content authority separated from lease fencing and
+  cross-version fleet fixtures covering takeover and restart.
+
+## [0.8.1] - 2026-07-18
+
+### Added
+
+- Added dry-run-first `rkat session migrate` support for exact v0.6.34
+  completed-idle SQLite sessions, with lease checks, append-only source
+  retention, and one transactional apply path.
+
+### Fixed
+
+- Re-admitted exact machine-proven member-disposal retries, reclaimed cold
+  same-epoch runtime bindings, and joined an unregister already in progress
+  during shutdown.
+- Kept full-tools mob spawn within the 2 MiB worker-stack budget and completed
+  OAuth bootstrap before direct `rkat mob run` and `rkat mob deploy` config
+  loading.
+
+## [0.8.0] - 2026-07-17
+
+### Breaking
+
+- Removed `RefreshFailureObservation::requires_reauth`,
+  `OAuthRefreshPermanence`, and `OAuthError::refresh_permanence`; auth refresh
+  now projects AuthMachine's typed `RefreshFailureDisposition`.
+- `AdaptiveDriverRuntime::provision_layer` now returns
+  `AdaptiveLayerProvision`, and `AdaptiveKernel` gained resultful interruption,
+  cancellation, and lease-owning initialization contracts. Generated Auth and
+  Mob alphabets gained the corresponding exhaustive variants.
+- Exact per-turn routing added required `self_hosted_server_id` fields to
+  runtime and wire metadata and reconfiguration requests.
+  `SessionRuntimeLlmReconfigureHost::service` now accepts the service trait
+  object.
+
+### Added
+
+- Shipped distributed multi-host mobs and `rkat mob host`, including durable
+  host bindings, placement, supervisor recovery, and conservative remote bind
+  policy.
+- Added completion-bearing tracked member turns and exact per-turn provider,
+  model, self-hosted server, provider-parameter, and auth routing.
+
+### Fixed
+
+- Rejected runtime commits now abort every pre-commit session projection.
+  Nullable system-notice payloads remain byte-stable, and cold autonomous
+  members republish their exact startup-ready transition without a second
+  kickoff.
+
+## [0.7.31] - 2026-07-13
+
+### Changed
+
+- Updated Bazel `rules_cc` to 0.2.22.
+
+### Fixed
+
+- Re-drove ownerless missing-live mob-member materialization through
+  machine-authorized revival, while making executor publication and its
+  initial backlog wake cancellation-safe.
+
+## [0.7.30] - 2026-07-12
+
+### Changed
+
+- Release manifests are derived from uploaded assets, and Homebrew publishing
+  runs before the long Windows release build.
+
+### Fixed
+
+- Stopped quadratic transcript revision-history growth while preserving real
+  rewrite endpoints and strict lineage validation.
+- Revived archived mob-member sessions before executor attachment, with exact
+  rollback if later provisioning fails.
+
+## [0.7.29] - 2026-07-12
+
+### Breaking
+
+- `CompactionResult` and `CompactionOutcome` now carry typed summary,
+  retained, and discarded provenance; custom compactors must satisfy the new
+  reconstruction invariants.
+- `AgentLlmFallbackSwitch`, `AgentLlmClient`, and `ModelRoutingHandle` now use
+  registry-minted profile witnesses and staged sticky activation. Generated
+  MeerkatMachine and MobMachine alphabets gained the corresponding routing and
+  pending-spawn-retirement variants.
+- Runtime and mob unregister APIs are resultful, and custom `RuntimeStore`
+  implementations must atomically implement `commit_unregister_finalization`.
+- `MemoryStore` gained the staged compaction-projection lifecycle, and
+  `TranscriptRewriteSelection` gained typed edit and compaction ranges.
+
+### Fixed
+
+- Made durable compaction projection atomic, provenance-checked, restart-safe,
+  and protected by durable scope tombstones.
+- Made runtime stop, unregister, archive cleanup, completion publication, and
+  mob teardown authoritative and retryable.
+- Hardened SDK comms and member-result validation, preserved helper
+  `model_override` across SDK, Web, and WASM surfaces, flattened release asset
+  manifest paths, and corrected the Python helper parity fixture.
+
 ## [0.7.28] - 2026-07-11
 
 ### Breaking
@@ -4119,6 +4476,135 @@ initiative, plus a pre-existing schedule-store fix.
 - Prior compaction summaries and injected-context messages no longer count
   toward the compactor's retained-turn budget; retained turns keep their
   preceding injected-context run.
+
+## [0.7.11] - 2026-06-18
+
+### Breaking
+
+- Session and mob request types across REST, RPC, and MCP now carry
+  `WireAuthBindingRef` instead of core `AuthBindingRef` values. Downstream Rust
+  request literals must use the wire type.
+
+### Fixed
+
+- Closed auth-binding origin-provenance laundering across server surfaces.
+- Reduced Windows release-build memory pressure so the `meerkat-mob` binary
+  can be published without the prior rustc/LLVM out-of-memory failure.
+
+## [0.7.10] - 2026-06-18
+
+### Breaking
+
+- RPC and REST mob-helper request structs now carry `WireAuthBindingRef` and
+  no longer accept a client-owned `origin`. Downstream Rust literals and
+  helper adapters must provide the wire shape.
+
+### Fixed
+
+- Closed auth-binding origin-provenance laundering in mob helpers and made
+  the related surface-authority checks fail closed.
+
+## [0.7.9] - 2026-06-18
+
+### Breaking
+
+- Config `max_tokens` fields changed from `u32` to `Option<u32>` with explicit
+  resolution helpers. Realm configuration gained an explicit parent chain and
+  global realm, and exhaustive matches over `RealmBackend` must handle
+  `Memory`.
+- Web builds now require the generated JavaScript glue emitted by
+  `mob web build`; downstream packages cannot treat the raw WASM alone as a
+  complete bundle.
+
+### Added
+
+- Added hierarchical realm-config inheritance with owning-realm provenance,
+  explicit memory realm backends, typed provider cache hints, OpenAI stored
+  response continuations, prompt `@file` expansion, and runnable web bundles.
+
+### Fixed
+
+- Fixed scheduled delivery into already-attached sessions, mob readiness wait
+  starvation, and partial-feature races in realm and mob construction.
+
+## [0.7.8] - 2026-06-17
+
+### Breaking
+
+- `PersistentRuntimeExecutor` and its construction, materialization,
+  interrupt, peer-ingress, and schedule-host helpers gained a generic
+  `SessionAgentBuilder` parameter. Downstream type annotations and helper
+  signatures must supply or infer the builder type.
+
+### Added
+
+- Runtime-backed schedule hosts and executors can use custom session-agent
+  builders instead of the concrete default builder.
+
+## [0.7.7] - 2026-06-17
+
+### Fixed
+
+- Mob retirement now unregisters the runtime adapter before discarding the
+  live session, fixing idle-member retire, respawn, and reset failures while
+  preserving teardown ownership.
+
+## [0.7.6] - 2026-06-17
+
+### Breaking
+
+- `VideoData` and `WireVideoData` gained the exhaustive `Uri` variant.
+  Generated machine alphabets removed the dead
+  `BindAdmissionRuntimeGrouping` family and added machine-owned execution
+  control plans and effects; downstream exhaustive matches must be updated.
+
+### Added
+
+- Added Gemini provider-readable video URI input and preserved OpenAI image
+  blocks returned from tool results.
+
+### Changed
+
+- Runtime queues and run commits now flow through sealed, machine-authorized
+  execution plans instead of shell-owned dequeue and staging methods.
+
+### Fixed
+
+- Preserved mob member labels on session creation and closed the remaining
+  execution-authority audit findings.
+
+## [0.7.5] - 2026-06-15
+
+### Changed
+
+- Runtime ingress and execution control moved behind machine-owned typed run
+  identities and terminality checks.
+
+### Fixed
+
+- Joining the comms-drain task during detach prevents revival from colliding
+  with a still-active session identity.
+- Closed ten fail-closed, single-owner, typed-contract, and terminality audit
+  findings.
+
+## [0.7.4] - 2026-06-15
+
+### Breaking
+
+- Generated MobMachine spawn alphabets replaced the single spawn transition
+  family with `BeginSpawnExec`, `CommitSpawnMembership`,
+  `CommitSpawnActivation`, and `AbortSpawnExec`. Downstream generated-state
+  literals and exhaustive matches must handle the staged spawn phases.
+
+### Changed
+
+- Mob spawn now follows a machine-owned execution ladder with bounded
+  finalization and explicit membership and activation commits.
+
+### Fixed
+
+- Closed spawn authority gaps and reduced the spawn execution stack so the
+  production worker-stack budget is respected.
 
 ## [0.7.3] - 2026-06-14
 
@@ -6092,6 +6578,11 @@ Meerkat 0.5 is a large architecture and surface cutover. It formalizes runtime o
 
 ## [0.4.0] - 2026-02-23
 
+*(Historical cumulative detail: release stamping did not run for
+v0.3.1-v0.3.4, so some provider and release-pipeline work below first shipped
+in those tags. The release-local summaries below identify the first tagged
+availability; this section preserves the original v0.4.0 notes.)*
+
 ### Added
 
 #### Mobs (Multi-Agent Orchestration)
@@ -6144,6 +6635,81 @@ Meerkat 0.5 is a large architecture and surface cutover. It formalizes runtime o
 - Stabilized host-mode and provider-agnostic integration tests.
 - Addressed workspace clippy blockers and CI/push gate regressions.
 - Fixed release tooling portability (`sed`-portable hook path) and lock-step contract/package version handling.
+
+## [0.3.4] - 2026-02-17
+
+This tag was cut from the v0.3.2 mainline rather than from the sibling v0.3.3
+tag, so its comparison link uses v0.3.2 as the exact ancestry base.
+
+### Breaking
+
+- The `meerkat` facade default feature set changed from Anthropic plus bundled
+  subsystems to provider-only Anthropic, OpenAI, and Gemini. Storage, comms,
+  MCP, sub-agent, and skill support now require explicit features.
+- The Rust minimum supported version increased from 1.85 to 1.89.0.
+
+### Added
+
+- Added cross-platform release builds, registry dry-run and recovery flows,
+  checksums and asset manifests, and Python and TypeScript SDK binary
+  auto-download.
+
+### Changed
+
+- Server surfaces now compile all three default providers, and Unix-only comms
+  mechanics are configuration-gated for cross-platform builds.
+
+### Fixed
+
+- Fixed OpenAI stream deduplication, replay, terminal, and error handling;
+  fixed Anthropic missing terminal and streaming-error handling.
+- Fixed Windows packaging, `WireRunResult.session_ref` SDK code generation,
+  already-published registry recovery, and release-hook portability.
+
+## [0.3.3] - 2026-02-16
+
+### Breaking
+
+- Session, config, backend, skills, hooks, comms, and sub-agent state became
+  realm-scoped. Session references are realm-qualified, and config reads return
+  the realm envelope rather than an unscoped config value.
+- The `rkat rpc` subcommand was removed in favor of the dedicated `rkat-rpc`
+  binary. TypeScript streaming types removed the unsent `sequence` and
+  `contract_version` fields.
+
+### Added
+
+- Added realm manifests, backend pinning, lifecycle commands, isolation, and
+  release-distribution workflow scaffolding.
+
+### Changed
+
+- REST, MCP, and RPC use persistent sessions by default, and RPC host-mode
+  turns run in the background so the command plane remains responsive.
+
+## [0.3.2] - 2026-02-15
+
+This tag was cut from the v0.3.0 mainline rather than from the sibling v0.3.1
+tag, so its comparison link uses v0.3.0 as the exact ancestry base.
+
+### Fixed
+
+- Removed orphaned OpenAI reasoning items before replay so Responses requests
+  are not rejected.
+- Enabled crate publication and made the release hook workspace-rooted and
+  idempotent within one version.
+
+## [0.3.1] - 2026-02-15
+
+### Added
+
+- Added `PeerMeta` descriptions and friendly labels across comms discovery,
+  CLI, REST, MCP, RPC, Python, and TypeScript surfaces.
+
+### Fixed
+
+- Corrected the host-mode assertion and regenerated versioned schemas and SDK
+  artifacts for the release.
 
 ## [0.3.0] - 2026-02-14
 
@@ -6380,12 +6946,75 @@ Meerkat 0.5 is a large architecture and surface cutover. It formalizes runtime o
 
 Initial development release.
 
-[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.23...HEAD
+[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.24...HEAD
+[0.8.24]: https://github.com/lukacf/meerkat/compare/v0.8.23...v0.8.24
 [0.8.23]: https://github.com/lukacf/meerkat/compare/v0.8.22...v0.8.23
+[0.8.22]: https://github.com/lukacf/meerkat/compare/v0.8.21...v0.8.22
+[0.8.21]: https://github.com/lukacf/meerkat/compare/v0.8.20...v0.8.21
+[0.8.20]: https://github.com/lukacf/meerkat/compare/v0.8.18...v0.8.20
+[0.8.18]: https://github.com/lukacf/meerkat/compare/v0.8.17...v0.8.18
+[0.8.17]: https://github.com/lukacf/meerkat/compare/v0.8.16...v0.8.17
+[0.8.16]: https://github.com/lukacf/meerkat/compare/v0.8.15...v0.8.16
+[0.8.15]: https://github.com/lukacf/meerkat/compare/v0.8.14...v0.8.15
+[0.8.14]: https://github.com/lukacf/meerkat/compare/v0.8.13...v0.8.14
+[0.8.13]: https://github.com/lukacf/meerkat/compare/v0.8.12...v0.8.13
 [0.8.12]: https://github.com/lukacf/meerkat/compare/v0.8.11...v0.8.12
 [0.8.11]: https://github.com/lukacf/meerkat/compare/v0.8.10...v0.8.11
+[0.8.10]: https://github.com/lukacf/meerkat/compare/v0.8.9...v0.8.10
+[0.8.9]: https://github.com/lukacf/meerkat/compare/v0.8.8...v0.8.9
+[0.8.8]: https://github.com/lukacf/meerkat/compare/v0.8.7...v0.8.8
+[0.8.7]: https://github.com/lukacf/meerkat/compare/v0.8.6...v0.8.7
+[0.8.6]: https://github.com/lukacf/meerkat/compare/v0.8.5...v0.8.6
+[0.8.5]: https://github.com/lukacf/meerkat/compare/v0.8.4...v0.8.5
+[0.8.4]: https://github.com/lukacf/meerkat/compare/v0.8.3...v0.8.4
+[0.8.3]: https://github.com/lukacf/meerkat/compare/v0.8.2...v0.8.3
+[0.8.2]: https://github.com/lukacf/meerkat/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/lukacf/meerkat/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/lukacf/meerkat/compare/v0.7.31...v0.8.0
+[0.7.31]: https://github.com/lukacf/meerkat/compare/v0.7.30...v0.7.31
+[0.7.30]: https://github.com/lukacf/meerkat/compare/v0.7.29...v0.7.30
+[0.7.29]: https://github.com/lukacf/meerkat/compare/v0.7.28...v0.7.29
+[0.7.28]: https://github.com/lukacf/meerkat/compare/v0.7.27...v0.7.28
+[0.7.27]: https://github.com/lukacf/meerkat/compare/v0.7.26...v0.7.27
+[0.7.26]: https://github.com/lukacf/meerkat/compare/v0.7.25...v0.7.26
+[0.7.25]: https://github.com/lukacf/meerkat/compare/v0.7.24...v0.7.25
+[0.7.24]: https://github.com/lukacf/meerkat/compare/v0.7.23...v0.7.24
+[0.7.23]: https://github.com/lukacf/meerkat/compare/v0.7.22...v0.7.23
+[0.7.22]: https://github.com/lukacf/meerkat/compare/v0.7.21...v0.7.22
+[0.7.21]: https://github.com/lukacf/meerkat/compare/v0.7.20...v0.7.21
+[0.7.20]: https://github.com/lukacf/meerkat/compare/v0.7.19...v0.7.20
+[0.7.19]: https://github.com/lukacf/meerkat/compare/v0.7.18...v0.7.19
+[0.7.18]: https://github.com/lukacf/meerkat/compare/v0.7.17...v0.7.18
+[0.7.17]: https://github.com/lukacf/meerkat/compare/v0.7.16...v0.7.17
+[0.7.16]: https://github.com/lukacf/meerkat/compare/v0.7.15...v0.7.16
+[0.7.15]: https://github.com/lukacf/meerkat/compare/v0.7.14...v0.7.15
+[0.7.14]: https://github.com/lukacf/meerkat/compare/v0.7.13...v0.7.14
+[0.7.13]: https://github.com/lukacf/meerkat/compare/v0.7.12...v0.7.13
+[0.7.12]: https://github.com/lukacf/meerkat/compare/v0.7.11...v0.7.12
+[0.7.11]: https://github.com/lukacf/meerkat/compare/v0.7.10...v0.7.11
+[0.7.10]: https://github.com/lukacf/meerkat/compare/v0.7.9...v0.7.10
+[0.7.9]: https://github.com/lukacf/meerkat/compare/v0.7.8...v0.7.9
+[0.7.8]: https://github.com/lukacf/meerkat/compare/v0.7.7...v0.7.8
+[0.7.7]: https://github.com/lukacf/meerkat/compare/v0.7.6...v0.7.7
+[0.7.6]: https://github.com/lukacf/meerkat/compare/v0.7.5...v0.7.6
+[0.7.5]: https://github.com/lukacf/meerkat/compare/v0.7.4...v0.7.5
+[0.7.4]: https://github.com/lukacf/meerkat/compare/v0.7.3...v0.7.4
+[0.7.3]: https://github.com/lukacf/meerkat/compare/v0.7.2...v0.7.3
+[0.7.2]: https://github.com/lukacf/meerkat/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/lukacf/meerkat/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/lukacf/meerkat/compare/alpha/v0.7.0-alpha.0...v0.7.0
 [0.7.0-alpha.0]: https://github.com/lukacf/meerkat/releases/tag/alpha/v0.7.0-alpha.0
+[0.6.34]: https://github.com/lukacf/meerkat/compare/v0.6.33...v0.6.34
+[0.6.33]: https://github.com/lukacf/meerkat/compare/v0.6.32...v0.6.33
+[0.6.32]: https://github.com/lukacf/meerkat/compare/v0.6.31...v0.6.32
+[0.6.31]: https://github.com/lukacf/meerkat/compare/v0.6.30...v0.6.31
+[0.6.30]: https://github.com/lukacf/meerkat/compare/v0.6.29...v0.6.30
+[0.6.29]: https://github.com/lukacf/meerkat/compare/v0.6.28...v0.6.29
+[0.6.28]: https://github.com/lukacf/meerkat/compare/v0.6.27...v0.6.28
+[0.6.27]: https://github.com/lukacf/meerkat/compare/v0.6.26...v0.6.27
+[0.6.26]: https://github.com/lukacf/meerkat/compare/v0.6.25...v0.6.26
+[0.6.25]: https://github.com/lukacf/meerkat/compare/v0.6.24...v0.6.25
+[0.6.24]: https://github.com/lukacf/meerkat/compare/v0.6.23...v0.6.24
 [0.6.23]: https://github.com/lukacf/meerkat/compare/v0.6.22...v0.6.23
 [0.6.22]: https://github.com/lukacf/meerkat/compare/v0.6.21...v0.6.22
 [0.6.21]: https://github.com/lukacf/meerkat/compare/v0.6.20...v0.6.21
@@ -6413,6 +7042,10 @@ Initial development release.
 [0.5.2]: https://github.com/lukacf/meerkat/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/lukacf/meerkat/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/lukacf/meerkat/compare/v0.4.9...v0.5.0
+[0.4.13]: https://github.com/lukacf/meerkat/compare/v0.4.12...v0.4.13
+[0.4.12]: https://github.com/lukacf/meerkat/compare/v0.4.11...v0.4.12
+[0.4.11]: https://github.com/lukacf/meerkat/compare/v0.4.10...v0.4.11
+[0.4.10]: https://github.com/lukacf/meerkat/compare/v0.4.9...v0.4.10
 [0.4.9]: https://github.com/lukacf/meerkat/compare/v0.4.8...v0.4.9
 [0.4.8]: https://github.com/lukacf/meerkat/compare/v0.4.7...v0.4.8
 [0.4.7]: https://github.com/lukacf/meerkat/compare/v0.4.6...v0.4.7
@@ -6422,6 +7055,10 @@ Initial development release.
 [0.4.2]: https://github.com/lukacf/meerkat/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/lukacf/meerkat/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/lukacf/meerkat/compare/v0.3.0...v0.4.0
+[0.3.4]: https://github.com/lukacf/meerkat/compare/v0.3.2...v0.3.4
+[0.3.3]: https://github.com/lukacf/meerkat/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/lukacf/meerkat/compare/v0.3.0...v0.3.2
+[0.3.1]: https://github.com/lukacf/meerkat/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/lukacf/meerkat/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/lukacf/meerkat/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/lukacf/meerkat/releases/tag/v0.1.0

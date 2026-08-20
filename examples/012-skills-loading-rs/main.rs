@@ -332,8 +332,11 @@ Config (.rkat/config.toml):
   source = "git"
   url = "https://github.com/org/skills.git"
 
-CLI usage:
-  rkat run --skill review/rust-reviewer "Review this code..."
+CLI preload accepts only bare embedded-builtin slugs:
+  rkat run --skill shell-patterns "Inspect this shell workflow..."
+
+For local filesystem skills, resolve the typed source UUID and SkillKey through
+the RPC or SDK skill APIs, then preload that typed reference on session create.
 "#
     );
 

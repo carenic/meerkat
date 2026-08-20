@@ -1,5 +1,5 @@
 ---
-title: "Mobs"
+title: "Mobs Examples"
 description: "Create mobs, spawn members, wire peers, send work, and run flows through the current host control plane."
 icon: "users"
 ---
@@ -173,6 +173,101 @@ This page focuses on the host control plane. It does **not** treat agent-side `m
     ```
   </Tab>
 </Tabs>
+
+## Place a member on a bound host
+
+Run the member-host daemon in its own restart-stable realm. Keep this process
+running:
+
+```bash
+rkat --realm worker-west-host mob host \
+  --listen-tcp 0.0.0.0:4300 \
+  --advertise-tcp tcp://worker-west.example.com:4300 \
+  --allow-remote \
+  --descriptor-out ./worker-west.host.json
+```
+
+Bind its mode-`0600` descriptor to the mob from the controlling host, then use
+the reported host id as `placement`:
+
+```bash
+rkat --realm team-alpha mob bind-host release-triage \
+  --descriptor ./worker-west.host.json
+rkat --realm team-alpha mob hosts release-triage --json
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 30,
+  "method": "mob/spawn",
+  "params": {
+    "mob_id": "release-triage",
+    "profile": "analyst",
+    "agent_identity": "west-analyst-1",
+    "placement": "host-id-from-bind-report"
+  }
+}
+```
+
+Read host reachability, route convergence, and the member's owning-host history
+through the controller:
+
+```bash
+rkat --realm team-alpha mob hosts release-triage --json
+rkat --realm team-alpha mob route-installs release-triage
+rkat --realm team-alpha mob member-history release-triage west-analyst-1
+```
+
+<Note>
+REST and public MCP expose those three observations but not host binding,
+grants, member live control, or hard cancel. Python and TypeScript SDKs wrap
+the full JSON-RPC family. Trusted in-process `MobHandle` callers also expose
+hard cancel. Browser mobs stay single-host.
+</Note>
+
+<Warning>
+Do not use a placed member's session id with the controller's generic
+`session/*` methods. The session belongs to the member host's realm. Use
+identity-routed mob operations and `mob/member_history`; remote transcript
+revision and edit methods are not bridged in v1.
+</Warning>
+
+The placed profile must also be portable. Remote admission rejects Rust
+bundles, external tool dispatchers, WorkGraph tools, host-only MCP allow-lists,
+inherited tool filters, in-process compaction curators, and secret-bearing
+shell or MCP environment/header values. Placement cannot be combined with an
+explicit backend or runtime binding. Admission also rejects a member whose
+required capabilities are absent on the bound host.
+
+## Resume a durable member under a new role
+
+Role migration is a trusted Rust-host operation. It preserves the exact mob,
+member identity, session, and transcript while declaring the exact predecessor
+role for one cold Resume request:
+
+```rust
+let spec = SpawnMemberSpec::new(
+    "home-automation",
+    AgentIdentity::from("home-automation-1"),
+)
+.with_resume_bridge_session_id_from_role(session_id, "domain");
+
+handle.spawn_spec(spec).await?;
+```
+
+Use a `SpawnMemberCustomizer` with
+`ctx.spawn_source == SpawnSource::Resume` and
+`spec.declare_resume_from_role("domain")?` when cold restore reconstructs the
+spec after a process restart. The runtime rejects a missing or incorrect
+predecessor declaration and refuses migration while the exact session is live,
+even if that actor is idle.
+
+<Warning>
+Do not add `resume_from_role` to JSON-RPC, REST, MCP, SDK, CLI, Web, or
+agent-tool spawn payloads. It exists only on trusted in-process specs and the
+private member-host materialization wire.
+</Warning>
 
 ## Wire and unwire peers
 

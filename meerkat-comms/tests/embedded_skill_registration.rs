@@ -27,8 +27,8 @@ async fn comms_crate_owns_and_registers_both_embedded_comms_skills() {
         .await
         .expect("mob-communication must be registered by meerkat-comms");
     assert!(
-        mob_skill.body.contains("peer_request")
-            && mob_skill.body.contains("peer_message")
+        mob_skill.body.contains("send_request")
+            && mob_skill.body.contains("send_message")
             && mob_skill.body.contains("do not reply"),
         "the comms-owned body must retain concrete tool-kind guidance"
     );

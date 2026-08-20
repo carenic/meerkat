@@ -53,7 +53,7 @@ RKAT_BIN="$(resolve_rkat)"
 WASM_RUNTIME="${MEERKAT_WASM:-$WORKSPACE_ROOT/sdks/web/wasm/meerkat_web_runtime_bg.wasm}"
 if [[ ! -s "$WASM_RUNTIME" ]]; then
   echo "error: meerkat-web-runtime wasm not found at $WASM_RUNTIME" >&2
-  echo "Build it:  (cd \"$WORKSPACE_ROOT\" && wasm-pack build meerkat-web-runtime --target web --out-dir sdks/web/wasm)" >&2
+  echo "Build it: npm --prefix \"$WORKSPACE_ROOT/sdks/web\" run build:wasm" >&2
   echo "or set MEERKAT_WASM=/path/to/meerkat_web_runtime_bg.wasm" >&2
   exit 1
 fi

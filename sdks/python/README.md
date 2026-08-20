@@ -2,7 +2,7 @@
 
 Python SDK for the [Meerkat](https://github.com/lukacf/meerkat) runtime.
 
-- **Contract version:** `0.8.11`
+- **Contract version:** `0.8.24`
 - **Python:** `>=3.10`
 - **Package:** `meerkat-sdk`
 
@@ -45,13 +45,19 @@ asyncio.run(main())
 
 `create_session`, `create_session_streaming`, and `create_deferred_session` support:
 
+- host context and identity: `injected_context`, `auth_binding`, plus
+  `transient_turn_context` for immediate create/stream only
 - model/provider controls: `model`, `provider`, `max_tokens`, `system_prompt`, `provider_params`
 - structured output: `output_schema`, `structured_output_retries`
-- runtime/tool toggles: `enable_builtins`, `enable_shell`, `enable_memory`, `enable_mob`
+- runtime/tool toggles: `enable_builtins`, `enable_shell`, `enable_memory`, `enable_schedule`, `enable_workgraph`, `enable_mob`, `enable_web_search`
 - comms/runtime metadata: `keep_alive`, `comms_name`, `peer_meta`, `budget_limits`
-- skills: `preload_skills`, `skill_refs`, `skill_references`
+- skills: `preload_skills`, `skill_refs`
 - session metadata: `labels`
 - additional session config: `additional_instructions`, `app_context`, `shell_env`, `external_tools`
+
+Deferred creation stores injected context for its eventual first turn but does
+not accept transient turn context. Pass transient facts to
+`DeferredSession.start_turn(...)`.
 
 ### Session queries
 
@@ -67,16 +73,17 @@ Both use integer unix timestamps for `created_at` and `updated_at`.
 
 - `await client.inject_context(session_id, text, source=..., idempotency_key=...)`
 - `await session.inject_context(...)`
-- `await client.send_external_event(session_id, payload, source=...)`
-- `await session.send_external_event(...)`
+- `await client.send_external_event(session_id, event_type, payload, blocks=None)`
+- `await session.send_external_event(event_type, payload, blocks=None)`
 
 ### Turns and streaming
 
 `Session.turn(...)` and `Session.stream(...)` now expose full turn overrides:
 
-- `skill_refs`, `skill_references`, `turn_tool_overlay`
+- `injected_context`, `transient_turn_context`
+- `skill_refs`, `turn_tool_overlay`
 - `additional_instructions`
-- `keep_alive`, `model`, `provider`, `max_tokens`, `system_prompt`
+- `keep_alive`, `model`, `provider`, `self_hosted_server_id`, `max_tokens`, `system_prompt`
 - `output_schema`, `structured_output_retries`, `provider_params`
 
 `DeferredSession.start_turn(...)` supports the same override set.
@@ -141,13 +148,69 @@ work through their WorkGraph tools; SDK callers inspect the current graph.
 - `await client.get_workgraph_goal_status(GoalStatusRequest(...))`
 - `await client.list_workgraph_attention(AttentionListRequest(...))`
 
+### Jobs, approvals, artifacts, and projected event replay
+
+- jobs: `jobs_get/list/cancel/progress/result/artifacts/retry/health/subscribe/unsubscribe`
+- monitors and MobKit workers: `monitors_start`, `mobkit_job_*`
+- approvals: `request_approval`, `list_approvals`, `get_approval`, `decide_approval`
+- artifacts: `list_artifacts`, `get_artifact`, `download_artifact`
+- projected event recovery: `latest_event_cursor`, `list_events_since`,
+  `event_snapshot` when host event projection is enabled
+
+Approval calls maintain audit records only; they do not automatically gate,
+authorize, or execute an action. They persist when the RPC bundle exposes a
+store path and otherwise remain process-local.
+
+Explicitly ephemeral memory realms do not expose event cursor or snapshot
+replay APIs.
+
+Every public Python RPC wrapper binds its request and result transport boundary
+to generated RPC-schema contracts. Generated request/result classes for the
+families above currently live in `meerkat.generated.types`; they are not
+re-exported at the package root.
+
+Auth profiles and credentials are realm-scoped. Provisioning yields an
+`auth_binding` for a session or mob member spec, so the spec does not carry the
+provider secret. Remote hosts resolve bindings only inside their authorized
+realm.
+
+### Transcript editing and reconciliation
+
+- `input_state`, `export_session_atif`
+- transcript revision read/list, fork-at/fork-replace, rewrite, system-prompt
+  update, and revision restore
+
 ### Mob runtime
 
 - `await client.read_mob_events(mob_id, after_cursor=0, limit=100)`
 - `await mob.read_events(after_cursor=0, limit=100)`
 - `await mob.spawn_many(specs) -> MobSpawnManyResult`
 - `await mob.wait_for_kickoff_complete(...)`
-- helper methods use canonical `role_name` (legacy `profile_name` alias is still accepted)
+- helper methods use canonical `role_name`
+- trusted multi-host controls cover host bind/revoke, route installs,
+  scope grants, hard cancel, member history, and remote member live channels
+
+Multi-host mutations are trusted host APIs. They are not agent-callable, and
+the agent spawn wire cannot declare Rust's one-shot `resume_from_role` role
+migration authority.
+
+### Live WebSocket and WebRTC
+
+`LiveChannel` wraps the session-bound live lifecycle. `live_open` returns a
+discriminated `websocket` or `webrtc` bootstrap. Only the WebSocket variant has
+`url`; WebRTC callers create an SDP offer and call
+`live_webrtc_answer(channel_id, token, offer_sdp)`.
+
+WebRTC requires `connect(live_webrtc=True)` and an `rkat-rpc` binary compiled
+with its non-default `live-webrtc` Cargo feature. The 0.8.24 auto-downloaded
+release binary omits that feature. Build a custom binary with
+`./scripts/repo-cargo build -p meerkat-rpc --features live-webrtc`, and add an
+audio track or the `meerkat.live` data channel before the browser creates its
+offer. Set the local description, wait for ICE gathering to complete, and send
+`peer.localDescription.sdp`; there is no candidate-trickle RPC. Install the
+returned `answer_sdp` as the browser peer's remote description before live
+input. WebSocket uses `connect(live_ws=True)` and does not need that Cargo
+feature.
 
 ### Realm profile CRUD
 
@@ -171,6 +234,14 @@ async with session.stream("Explain this in detail.") as events:
                 print(chunk, end="", flush=True)
     result = events.result
 ```
+
+`TurnCompleted.usage` is optional. Skip an absent row instead of treating it
+as zero. Eight inventory-known events currently return `UnknownEvent` because
+the handwritten parser has no typed case. Current Rust `server_tool_content`
+and `transcript_rewrite_audit_receipt_committed` are missing from the generated
+inventory and are rejected, while the legacy `RunStarted`, `RunFailed`,
+`Retrying`, and `HookFailed` field parsers can produce malformed events. These
+are SDK/code-generation gaps, not alternate wire contracts.
 
 ## Run tests
 

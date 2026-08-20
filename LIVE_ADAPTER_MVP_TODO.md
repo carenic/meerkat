@@ -1,5 +1,9 @@
 # Live-Adapter MVP — Outstanding Issues
 
+> Historical PR #650 implementation ledger. Checkbox state below describes
+> that branch review, not current Meerkat. Use `docs/guides/realtime.mdx` and
+> `docs/reference/runtime-architecture.mdx` for current live-channel contracts.
+
 Tracking document for the `live-adapter-mvp` branch review (vs `origin/main`).
 
 **The MVP failure (one sentence):** The pipe works. The **projection contract** — provider realtime events become canonical Meerkat facts — is named in the host's doc-comment but **mostly unimplemented**. S71/S72 validate the pipe and pass without ever exercising the projection.

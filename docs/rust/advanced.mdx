@@ -4,7 +4,10 @@ description: "Expert-level direct agent construction, provider configuration, bu
 icon: "gears"
 ---
 
-Advanced Rust SDK usage for the cases where the runtime-backed `SessionService` path is intentionally not enough. This page covers expert-level direct agent construction, provider configuration, budgets, hook helpers, and lower-level delivery internals.
+Advanced Rust SDK usage for the cases where the runtime-backed persistent
+service plus `MeerkatMachine` host composition is intentionally not enough.
+This page covers expert-level direct agent construction, provider
+configuration, budgets, hook helpers, and lower-level delivery internals.
 
 ## Runtime-backed vs standalone builds
 
@@ -22,11 +25,31 @@ recovery-safe background completion handling.
 
 `meerkat::AgentBuilder` is the public facade builder. It accepts explicit client/tool/store overrides for embedded use, then still routes through `AgentFactory::build_agent()` so provider defaults, session metadata, hook wiring, and runtime build-mode defaults stay aligned with the factory path.
 
-`AgentFactory` (in the `meerkat` facade) is the opinionated composition layer. It knows about tool categories, runtime resources, comms, memory, mobs, and skills, and wires them into the dispatcher before passing them to `AgentBuilder`. All public surfaces go through the runtime-backed session path built on top of `AgentFactory`.
+`AgentFactory` (in the `meerkat` facade) is the opinionated composition layer.
+It knows about tool categories, runtime resources, comms, memory, mobs, and
+skills, and wires them into the dispatcher before passing them to
+`AgentBuilder`. Production surfaces pair its persistent session service with
+`MeerkatMachine` so the machine remains the transition authority.
 
-The lower-level `meerkat_core::AgentBuilder` is not re-exported by the facade. Its standalone build path is reserved for core tests; public embedding code should use the facade builder or `AgentFactory`.
+The lower-level `meerkat_core::AgentBuilder` is not re-exported by the facade.
+Its standalone build path is reserved for core tests; public embedding code
+should use the facade builder or `AgentFactory`.
 
-**Use `AgentFactory` via `build_persistent_service()` (main path), `build_ephemeral_service()` (substrate/testing path), or the public `meerkat::AgentBuilder` facade unless you explicitly need to bypass session lifecycle orchestration.** Direct core builder usage means you own composition, persistence, event handling, and any drift from the standard runtime-backed path.
+**Use `AgentFactory` via `build_persistent_service_with_runtime_adapter()` for
+a native persistent host, `build_ephemeral_service()` for a direct
+embedded/testing path, or the public `meerkat::AgentBuilder` facade when you
+intentionally own the lifecycle.** Direct core builder usage means you own
+composition, persistence, event handling, and any drift from the standard
+runtime-backed path.
+
+<Warning>
+`build_persistent_service()` returns only the low-level persistent service
+half. Direct `start_turn`, `interrupt`, and `archive` calls on that service
+fail with `SessionError::Unsupported`. A complete host retains the
+`MeerkatMachine` returned by
+`build_persistent_service_with_runtime_adapter()`, materializes through
+`meerkat::surface`, and routes runtime transitions through machine authority.
+</Warning>
 
 If you are building a runtime-backed surface around `SessionService`, avoid the
 old hand-rolled `register_session()` + registry extraction pattern. Prefer the
@@ -35,10 +58,10 @@ binding seam above so the runtime/session owner stays canonical.
 ## AgentBuilder
 
 <Note>
-For most use cases, prefer `SessionService` via the runtime-backed persistent path (see
-[overview](/rust/overview)). The public `AgentBuilder` delegates to the factory
-pipeline. Use the core builder only inside core-owned tests that bypass the
-session service and facade composition entirely.
+For most production hosts, prefer the persistent service plus machine path
+(see [overview](/rust/overview)). The public `AgentBuilder` delegates to the
+factory pipeline. Use the core builder only inside core-owned tests that
+bypass the session service and facade composition entirely.
 </Note>
 
 <Warning>
@@ -60,6 +83,7 @@ let mut agent = AgentBuilder::new()
 <Accordion title="All builder methods">
 | Method | Description | Default |
 |--------|-------------|---------|
+| `new()` | Create a facade builder with default config and the default user state root | Default config |
 | `model(name)` | Set the model identifier | Config default (`config.agent.model`); `build(client, ...)` falls back to `client.model()` |
 | `provider(provider)` | Set an explicit typed provider | Resolved from the model registry |
 | `system_prompt(prompt)` | Set an explicit per-request prompt (`SystemPromptOverride::Set`) | Inherit (config/AGENTS.md/default chain) |
@@ -73,7 +97,21 @@ let mut agent = AgentBuilder::new()
 | `output_schema(schema)` / `structured_output_retries(n)` | Structured-output extraction settings | None / canonical default |
 | `with_hook_engine(engine)` | Attach a hook engine | None |
 | `with_hook_run_overrides(overrides)` | Run-scoped hook overrides | Empty |
+| `with_skill_engine(engine)` | Attach the shared skill runtime | None |
+| `runtime_build_mode(mode)` | Select session-owned or standalone runtime bindings | `StandaloneEphemeral` for direct facade builds |
+| `llm_client(client)` | Supply the LLM client for `try_build()` | None |
+| `tools(dispatcher)` | Supply the tool dispatcher for `try_build()` | None |
+| `session_store(store)` | Supply the agent session store for `try_build()` | None |
+| `with_default_event_tx(tx)` | Set the default event sink | None |
+| `with_factory(factory)` / `with_config(config)` | Replace the composition factory or configuration | Default factory / `Config::default()` |
+| `try_build()` | Build from attached overrides plus the selected factory's canonical resources | Factory composition |
+| `build(client, tools, store)` | Attach the required dependencies and build | None |
 </Accordion>
+
+`provider_tool_defaults`, `compactor`, `memory_store`, and
+`with_turn_state_handle` remain source-compatible rejection points. They record
+an unsupported override and make `try_build()` fail instead of silently
+discarding the requested behavior.
 
 ---
 
@@ -204,7 +242,10 @@ use std::time::Duration;
 
 let budget = BudgetLimits::default()
     .with_max_tokens(100_000)
+    // Agent lifetime, measured from construction and never re-armed.
     .with_max_duration(Duration::from_secs(300))
+    // Aggregate wall-clock for each turn, re-armed at run entry.
+    .with_max_turn_duration(Duration::from_secs(120))
     .with_max_tool_calls(50);
 
 let mut build_config = AgentBuildConfig::new("claude-sonnet-4-6".into());
@@ -318,8 +359,8 @@ async fn handle_chat(
                     yield sse_event("done", result);
                     break;
                 }
-                AgentEvent::RunFailed { ref error, .. } => {
-                    yield sse_event("error", error);
+                AgentEvent::RunFailed { ref error_report, .. } => {
+                    yield sse_event("error", &error_report.message);
                     break;
                 }
                 _ => {}
@@ -329,6 +370,26 @@ async fn handle_chat(
 }
 ```
 </Accordion>
+
+### Durable event projection and live observation
+
+Persistent disk-backed runtime hosts can configure a dedicated lossless
+projector queue for session events. UI and other live subscribers use
+best-effort broadcast observation and can receive typed lag markers when they
+fall behind. Do not use a live broadcast receiver as a durability boundary.
+When projection is enabled, reconcile from the persisted event cursor or
+snapshot after lag, restart, or reconnect. Those replay APIs are unavailable
+when the host disables event projection, including explicitly ephemeral memory
+realms.
+
+### Trusted one-shot member role migration
+
+`MemberLaunchMode::Resume` can carry `resume_from_role: Option<ProfileName>`
+when a trusted Rust host spawns or materializes a remote member. This declares
+one exact durable role migration for the resumed session. It is intentionally
+absent from agent-callable spawn wires and standing profiles, and reuse or a
+mismatched source role fails closed. Ordinary resume should leave it as
+`None`.
 
 ---
 
@@ -351,6 +412,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = service.create_session(CreateSessionRequest {
         model: "claude-sonnet-4-6".into(),
         prompt: "What is 25 * 17?".into(),
+        injected_context: Vec::new(),
         system_prompt: SystemPromptOverride::Set("You are a helpful math assistant.".into()),
         max_tokens: Some(2048),
         event_tx: None,
@@ -364,6 +426,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = service.start_turn(&result.session_id, StartTurnRequest {
         prompt: "Now divide that result by 5.".into(),
+        injected_context: Vec::new(),
         system_prompt: None,
         event_tx: None,
         runtime: StartTurnRuntimeSemantics::default(),

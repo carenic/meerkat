@@ -249,28 +249,28 @@ function renderMarkdown(raw: string): string {
 
 // ── Routing helpers ──
 
-export function extractMeerkatId(peerAddress: string): string {
+export function extractAgentIdentity(peerAddress: string): string {
   const parts = peerAddress.split("/");
   return parts[parts.length - 1] || peerAddress;
 }
-export function meerkatTeam(id: string): Team | null {
-  const mid = extractMeerkatId(id);
-  for (const t of TEAMS) if (mid.startsWith(t)) return t;
+export function agentTeam(id: string): Team | null {
+  const identity = extractAgentIdentity(id);
+  for (const t of TEAMS) if (identity.startsWith(t)) return t;
   return null;
 }
-export function meerkatRole(id: string): MessageRole {
-  const mid = extractMeerkatId(id);
-  if (mid.includes("planner")) return "planner";
-  if (mid.includes("operator")) return "operator";
-  if (mid.includes("ambassador")) return "ambassador";
+export function agentRole(id: string): MessageRole {
+  const identity = extractAgentIdentity(id);
+  if (identity.includes("planner")) return "planner";
+  if (identity.includes("operator")) return "operator";
+  if (identity.includes("ambassador")) return "ambassador";
   return "system";
 }
 export function dmChannel(senderId: string, receiverId: string): ChannelId | null {
-  const sTeam = meerkatTeam(senderId);
-  const rTeam = meerkatTeam(receiverId);
+  const sTeam = agentTeam(senderId);
+  const rTeam = agentTeam(receiverId);
   if (!sTeam || !rTeam) return null;
-  const sRole = meerkatRole(senderId);
-  const rRole = meerkatRole(receiverId);
+  const sRole = agentRole(senderId);
+  const rRole = agentRole(receiverId);
   if (sTeam !== rTeam) {
     const sorted = [sTeam, rTeam].sort();
     return `${sorted[0][0]}-${sorted[1][0]}-diplo` as ChannelId;

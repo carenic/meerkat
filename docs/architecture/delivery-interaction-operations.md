@@ -6,8 +6,9 @@ icon: "route"
 
 # Delivery, Interaction, and Durable Operations
 
-Status: Accepted. Supervisor rotation is the first concrete operation; a
-reusable platform operation API is intentionally deferred.
+Status: Accepted and implemented. Supervisor rotation remains a
+feature-specific durable operation. The platform now also ships durable jobs
+and runtime delivery, but not one universal operation API.
 
 ## Context
 
@@ -59,6 +60,27 @@ the local authority change only after every affected member reports completion.
 No trust edge may be created solely to deliver an ACK to a revoked supervisor.
 Optional completion notification is one-way and non-authoritative.
 
+## Current Platform Substrate
+
+The later durable-job work introduced a reusable execution and delivery
+substrate without changing this decision's temporal split:
+
+- `DetachedJobMachine` and `meerkat-jobs` own durable submit, deduplication,
+  fenced attempts, leases, progress, cancellation, terminal results, and a
+  terminal outbox.
+- `RuntimeDeliveryMachine` and the runtime delivery inbox own stable delivery
+  identity, monotonic sequence, exact replay, and the ordered application
+  cursor.
+- The canonical `job_runtime_delivery` composition transfers terminal and
+  notification outbox entries into the runtime inbox, then acknowledges the
+  transfer back to the job store.
+
+This substrate serves reusable background execution. It does not replace the
+supervisor-rotation protocol, turn `meerkat-comms` into RPC, or require every
+feature-owned durable operation to become a detached job. A general host-facing
+`OperationId -> OperationState -> TerminalReceipt` API remains intentionally
+deferred.
+
 ## Consequences
 
 - `meerkat-comms` remains fundamentally one-way and does not become a general
@@ -69,5 +91,6 @@ Optional completion notification is one-way and non-authoritative.
   their result shape can remain compatible.
 - Ordinary current-supervisor verification may continue using the existing
   interaction compatibility path; it is not rotation authority.
-- A reusable `OperationId → OperationState → TerminalReceipt` platform surface
-  is follow-up work after this concrete contract has proven its shape.
+- A universal host-facing operation surface is not implied by the job API;
+  durable features may retain their own machine-owned command and receipt
+  protocols.

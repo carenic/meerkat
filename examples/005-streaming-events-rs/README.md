@@ -4,9 +4,10 @@ Real-time event processing from agent execution. Every LLM delta, tool call,
 and state transition is surfaced as a typed `AgentEvent`.
 
 ## Concepts
-- `AgentEvent` — the full event taxonomy (text deltas, tool calls, turns, errors)
-- `run_with_events()` — agent execution with an event channel
-- `spawn_event_logger()` — built-in helper for CLI-like streaming
+
+- `AgentEvent` - the full event taxonomy (text deltas, tool calls, turns, errors)
+- `run_with_events()` - agent execution with an event channel
+- `spawn_event_logger()` - built-in helper for CLI-like streaming
 - Custom event processing with `mpsc::Receiver`
 
 ## Event Types
@@ -14,7 +15,8 @@ and state transition is surfaced as a typed `AgentEvent`.
 |-------|-------------|
 | `TextDelta` | Incremental text from the LLM |
 | `ToolCallRequested` | Agent wants to invoke a tool |
-| `ToolResultReceived` | Tool execution completed |
+| `ToolResultReceived` | Conversation fact: the result was injected into the transcript |
+| `ToolExecutionCompleted` | Execution fact: the tool call finished, including its duration |
 | `TurnCompleted` | One agent loop iteration finished |
 | `BudgetWarning` | Warning emitted when approaching a token/time/tool-call budget limit |
 

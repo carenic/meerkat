@@ -6,8 +6,8 @@
 //! ## What you'll learn
 //! - Configuring `BudgetLimits` (max tokens, max tool calls, time limits)
 //! - Setting up `RetryPolicy` for transient LLM failures
-//! - Handling `AgentError::TokenBudgetExceeded` / `ToolCallBudgetExceeded` / `TimeBudgetExceeded`
-//! - Using `BudgetPool` for shared budgets across agents
+//! - Applying retry policy to an agent build
+//! - Handling budget exhaustion returned by an agent run
 //!
 //! ## Run
 //! ```bash
@@ -44,7 +44,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Example 1: Token budget ===\n");
     let budget = BudgetLimits::unlimited()
         .with_max_tokens(2000) // Hard cap on total tokens
-        .with_max_tool_calls(10); // Max tool invocations
+        .with_max_tool_calls(10) // Max tool invocations
+        .with_max_duration(Duration::from_secs(60)); // Wall-clock cap
 
     let mut agent = AgentBuilder::new()
         .model("claude-sonnet-4-6")
@@ -72,11 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_multiplier(2.0); // Double each time
 
     println!("Retry policy: {retry:?}");
-    println!("Retries are automatic — transient 429/500 errors trigger backoff.");
+    println!("Typed retryable provider errors use this backoff policy.");
 
     // ── Example 3: Budget exhaustion handling ──
 
-    println!("\n=== Example 3: Tight budget (will be exhausted) ===\n");
+    println!("\n=== Example 3: Tight budget (may be exhausted) ===\n");
 
     let tight_budget = BudgetLimits::unlimited().with_max_tokens(100); // Very tight budget
 
@@ -96,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .model("claude-sonnet-4-6")
         .max_tokens_per_turn(50)
         .budget(tight_budget)
+        .retry_policy(retry)
         .build(Arc::new(llm2), Arc::new(EmptyToolDispatcher), store2)
         .await?;
 

@@ -92,8 +92,8 @@ Base shared metadata type for session identity/timestamps/state.
 - `convention: str`
 - `aggregation: str`
 
-One `Usage` type serves two different accounts. On the `TurnCompleted` event it
-is per-call usage: `input_tokens` is the raw provider counter (for Anthropic,
+One `Usage` type serves two different accounts. When present on the
+`TurnCompleted` event it is per-call usage: `input_tokens` is the raw provider counter (for Anthropic,
 uncached input only) and `accounting` names the resolved provider/model plus the
 normalized `presented_tokens` for that call. On `RunResult.usage` and the
 `RunCompleted` event it is the **session**-cumulative total: `input_tokens` is
@@ -106,6 +106,10 @@ Do not sum the cumulative value with anything - take the latest one - and sum
 rows cover only the calls that closed a run, so they do not reconcile with the
 cumulative total. See [Usage accounting](/reference/usage-accounting) for the
 worked example.
+
+`TurnCompleted.usage` is `Usage | None`. `None` is honest unmeasured
+accounting, not a zero-token call. Skip the row; the paired
+`turn_usage_accounting_unmeasured` wire event carries the reason.
 
 ## Config API contract
 
@@ -164,7 +168,28 @@ there is no nested `config` or public `machine_state`. The wrappers reject a
 missing/malformed schedules, occurrences, or tools array and reject schedule
 entries missing required identity, policy, planning, or timestamp facts.
 
+### WorkGraph wrappers
+
+WorkGraph is a host-observation surface in the SDK. Use
+`get_workgraph_item`, `list_workgraph_items`, `list_ready_workgraph_items`,
+`get_workgraph_snapshot`, `list_workgraph_events`,
+`get_workgraph_goal_status`, and `list_workgraph_attention`. Agents own graph
+mutation through their WorkGraph tools.
+
 ## Session runtime input helpers
+
+Immediate creation and turn methods accept host-owned context separately from
+the user prompt:
+
+- `injected_context: list[ContentInput] | None` is ordered durable
+  user-channel context immediately before the prompt
+- `transient_turn_context: str | None` is request-only host context
+- turn methods also accept `self_hosted_server_id` for an exact configured
+  local model route
+
+Deferred creation can store `injected_context` for its eventual first turn but
+does not accept `transient_turn_context`; pass transient facts to
+`DeferredSession.start_turn(...)`.
 
 ### `inject_context`
 
@@ -182,6 +207,20 @@ await session.send_external_event(event_type, payload, blocks=None)
 
 Returns `ExternalEventOutcome` (runtime admission outcome payload).
 
+### Transcript and input reconciliation
+
+```python
+await client.input_state(session_id, idempotency_key="turn-42")
+await client.export_session_atif(session_id)
+await client.read_session_transcript_revision(session_id, revision_id)
+await client.list_session_transcript_revisions(session_id)
+await client.fork_session_at(session_id, message_index)
+await client.fork_session_replace(session_id, message_index, replacement)
+await client.rewrite_session_transcript(session_id, selection, replacement, reason)
+await client.update_system_prompt(session_id, key, content)
+await client.restore_session_transcript_revision(session_id, revision_id, reason)
+```
+
 ## Additional client wrappers
 
 The Python SDK also exposes:
@@ -191,8 +230,61 @@ The Python SDK also exposes:
 - blob/skill/MCP helpers: `get_blob(...)`, `list_skills()`, `mcp_add(...)`, `mcp_remove(...)`, `mcp_reload(...)`
 - comms helpers: `session.send(...)`, `session.peers()`
 - typed ingress helper: `send_peer_response_terminal(...)`
+- runtime host inspection: `get_runtime_host_info()`,
+  `get_runtime_host_capabilities()`, `get_runtime_host_health()`
+
+Auth profiles and persisted credentials are realm-scoped. Login/provisioning
+returns an auth binding; pass that binding through session `auth_binding` or a
+mob member spec instead of embedding provider secrets. A remote member host
+resolves the declared binding in its authorized realm.
+
+### Detached jobs and monitors
+
+The public job wrappers are `jobs_get`, `jobs_list`, `jobs_cancel`,
+`jobs_progress`, `jobs_result`, `jobs_artifacts`, `jobs_retry`, `jobs_health`,
+`jobs_subscribe`, and `jobs_unsubscribe`. `monitors_start` creates a detached
+monitor job. MobKit worker implementations additionally use the six
+`mobkit_job_*` authority-checked mutation methods.
+
+Every public Python RPC wrapper binds its request and result transport boundary
+to generated RPC-schema contracts. The job request and result dataclasses in
+0.8.24 are available from `meerkat.generated.types`, but are not re-exported
+from `meerkat`:
+
+```python
+from meerkat.generated.types import JobsListParams
+
+jobs = await client.jobs_list(JobsListParams(session_id=session.id))
+```
+
+### Approvals, artifacts, and projected events
+
+- approvals: `request_approval`, `list_approvals`, `get_approval`,
+  `decide_approval`
+- artifacts: `list_artifacts`, `get_artifact`, `download_artifact`
+- cursor-based event recovery: `latest_event_cursor`, `list_events_since`,
+  `event_snapshot` when host event projection is enabled
+
+Approval calls maintain audit records only; they do not automatically gate,
+authorize, or execute an action. Records persist when the RPC bundle exposes a
+store path and otherwise remain process-local. See
+[JSON-RPC approvals](/api/rpc#approvals).
+
+When projection is enabled, use cursor replay or a snapshot after reconnect or
+a typed live-stream lag marker. A live subscriber is an observation surface,
+not the persistence boundary. Explicitly ephemeral memory realms do not expose
+the replay APIs.
 
 ## Mob profile and events surfaces
+
+### Multi-host operator surface
+
+The client exposes host inventory and route installs, host bind/revoke,
+grant/revoke/list scopes, remote member history, hard cancel, and remote live
+channel control. These JSON-RPC methods are trusted operator controls. Public
+REST/MCP and agent-callable tools intentionally expose narrower read or member
+surfaces, and agent spawn cannot authorize the Rust-only `resume_from_role`
+durable role migration.
 
 ### Mob event history
 
@@ -239,7 +331,11 @@ from meerkat import LiveChannel, MeerkatClient
 
 client = MeerkatClient()
 await client.connect(live_ws=True)
-session = await client.create_session("Open a live channel")
+session = await client.create_session(
+    "Open a live channel",
+    model="gpt-realtime-2",
+    provider="openai",
+)
 channel = LiveChannel.session(
     client,
     session.id,
@@ -257,6 +353,7 @@ await client.close()
 Direct `MeerkatClient` helper names mirror the RPC methods:
 
 - `live_open(session_id, turning_mode=None, transport=None, seed_max_chars=None)`
+- `live_webrtc_answer(channel_id, token, offer_sdp)`
 - `live_status(channel_id)`
 - `live_close(channel_id)`
 - `live_send_input_text(channel_id, text)`
@@ -277,6 +374,37 @@ a core-owned whole-turn suffix at open time. Omission preserves the complete
 seed; zero is rejected. Every ordered System message must fit; an existing compaction
 summary may be retained, and any truncation reports degraded continuity.
 Canonical image identity, tombstone, and accounting sidecars remain complete.
+
+`live_open` returns a discriminated transport object. The `websocket` variant
+has `url` and `token`. The `webrtc` variant has `token`, `answer_method`, and
+an optional `http_url`; create an SDP offer and pass it to
+`live_webrtc_answer`. Do not assume every transport has a URL.
+
+WebRTC requires `connect(live_webrtc=True)` and an `rkat-rpc` binary compiled
+with its non-default `live-webrtc` Cargo feature. The 0.8.24 auto-downloaded
+release binary does not include that feature. Add an audio track or the
+`meerkat.live` data channel, set the browser peer's local description, wait for
+ICE gathering to complete, then send `peer.localDescription.sdp`. The protocol
+has no candidate-trickle RPC. Install the returned `answer_sdp` as the browser
+peer's remote description before sending live input.
+
+## Event compatibility note
+
+The generated event inventory in 0.8.24 knows `reasoning_delta`,
+`reasoning_complete`, `assistant_image_appended`,
+`turn_usage_accounting_unmeasured`,
+`turn_usage_accounting_identity_disputed`, `interaction_callback_pending`,
+`peer_content_ingested`, and `provider_cache_breakpoints_discarded`. The
+handwritten parser has no typed case for these eight rows, so they arrive as
+`UnknownEvent`.
+
+Current Rust `server_tool_content` and
+`transcript_rewrite_audit_receipt_committed` are absent from that generated
+inventory. Receiving either through this parser raises `UNKNOWN_EVENT_TYPE`.
+Current `run_started`, `run_failed`, `retrying`, and `hook_failed` use newer
+field shapes than the handwritten parser and can arrive as malformed events.
+Treat all of these as SDK/code-generation gaps, not stable alternate wire
+contracts.
 
 ## Capability and error model
 

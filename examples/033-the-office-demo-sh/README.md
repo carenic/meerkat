@@ -1,4 +1,4 @@
-# 033 — The Office (WASM Multi-Agent Demo)
+# 033 - The Office (WASM Multi-Agent Demo)
 
 10 autonomous AI agents run an office together. Events arrive at the mail room, get triaged and routed to department specialists, personal assistants, and an archivist — all visualized as a pixel art office with phone call arcs, speech bubbles, and a knowledge graph.
 
@@ -10,7 +10,8 @@
 - **Human-in-the-loop** — the Gate agent routes high-risk actions to a human approval popup
 - **Knowledge base** — the Archivist stores facts, viewable as an interactive force-directed graph
 - **Structured output** — each agent cycle produces a headline and category for the UI
-- **Full WASM runtime** — all 10 agents run in-browser via `meerkat-web-runtime`
+- **Browser WASM runtime** - all 10 agents run in-browser via
+  `meerkat-web-runtime`
 
 ## Agent Roster
 
@@ -74,13 +75,19 @@ repo-local `sdks/web` package, or from an installed `@rkat/web` package, into
 9. Click the filing cabinet in the Archive zone to view the knowledge graph
 10. Type messages to any agent via the chat input bar
 
+The approval popup is a demo protocol implemented with a JavaScript tool and
+agent instructions. It is not a security or authorization boundary. Archive
+records also live only in browser memory and disappear on page reload.
+
 ### Server/Proxy Mode
 
 ```
 http://127.0.0.1:4174?proxy=http://localhost:8080&model=claude-sonnet-4-6
 ```
 
-API keys provided by the proxy server. Auto-starts on load.
+Provider requests are routed to the configured proxy base URL, which must own
+the real credentials and expose `/anthropic`, `/openai`, and `/gemini` routes.
+The browser uses placeholder keys and auto-starts on load.
 
 ## Event Scenarios
 

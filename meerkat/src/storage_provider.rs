@@ -10,7 +10,7 @@
 //!
 //! Bootstrap convergence:
 //! `RuntimeBootstrap → StorageLayout → provider(manifest) → facade composition`
-//! ([`open_realm_persistence_with_provider`]); the built-in
+//! ([`crate::open_realm_persistence_with_provider`]); the built-in
 //! [`DiskStorageProvider`] reproduces today's sqlite/jsonl/memory realms.
 //!
 //! Fail-closed durability: every slot the provider returns carries a

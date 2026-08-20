@@ -33,8 +33,9 @@ pub use meerkat_llm_core::provider_runtime::{
 };
 pub use runtime::SelfHostedProviderRuntime;
 
-// auth-core impls are non-wasm by construction (filesystem, keyring,
-// OS lockfile primitives are not available in the browser).
+// Native auth-core implementations use filesystem, keyring, OAuth, or OS
+// lockfile facilities. Cross-target resolver and self-hosted modules are
+// re-exported above.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod auth_oauth {
     pub use meerkat_auth_core::auth_oauth::*;

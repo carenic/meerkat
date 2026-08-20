@@ -122,8 +122,8 @@ pub enum HookFailureReason {
         /// Display projection of the configuration error.
         message: String,
     },
-    /// A `pre_*` background hook attempted a non-observe action (patch or deny),
-    /// which is not permitted for observe-only background hooks.
+    /// A background hook attempted a non-observe action, which is not
+    /// permitted for observe-only background hooks at any hook point.
     ObserveOnlyViolation,
 }
 
@@ -134,7 +134,7 @@ impl std::fmt::Display for HookFailureReason {
             Self::ExecutionFailed { message } => write!(f, "{message}"),
             Self::ConfigInvalid { message } => write!(f, "{message}"),
             Self::ObserveOnlyViolation => {
-                write!(f, "pre_* background hooks are observe-only")
+                write!(f, "background hooks are observe-only")
             }
         }
     }

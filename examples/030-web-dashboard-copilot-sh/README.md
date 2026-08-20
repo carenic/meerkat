@@ -1,27 +1,27 @@
-# 030 — Web Dashboard Copilot (Shell)
+# 030 - Web Dashboard Copilot (Shell)
 
-Build a browser-deployable **release command center copilot** meant to live
-inside an internal ops dashboard next to rollout controls, latency charts, and
-incident notes.
+Package the definition and bootstrap assets for a browser-hosted **release
+command center copilot** meant to live inside an internal ops dashboard next
+to rollout controls, latency charts, and incident notes.
 
-This example is intentionally shell-driven, but it is no longer just an
-artifact recipe. It produces a believable multi-agent bundle, validates it,
-builds the browser runtime, and emits the supporting assets you would actually
-want when embedding the result into a product.
+This shell-driven example produces a production-shaped multi-agent artifact,
+validates it, assembles a browser runtime bootstrap, and emits supporting assets
+for a future host integration. The generated page initializes the runtime; it
+does not instantiate the mob or provide a dashboard copilot UI by itself.
 
 ## What This Example Teaches
 
-- **Embeddable browser bundle** built from a portable `.mobpack`
-- **A real dashboard workflow**: rollout triage, metrics analysis, rollback
-  recommendation, and status drafting
-- **Multi-agent specialization** inside a web-safe mob
+- **Browser bootstrap bundle** built from a portable `.mobpack`
+- **A dashboard-oriented mob definition** for rollout triage, metrics analysis,
+  rollback recommendations, and status drafting
+- **Multi-agent specialization** described by a web-safe artifact
 - **Derived web deployment metadata** via `manifest.web.toml`
 - **Pedagogical embedding assets**: sample dashboard state, example prompts,
   and a starter iframe snippet
 
 ## The Team Inside The Copilot
 
-The generated mob has four roles:
+The generated definition has four roles:
 
 | Role | Purpose |
 |------|---------|
@@ -30,17 +30,29 @@ The generated mob has four roles:
 | `rollout-guard` | Decides whether to continue, pause, or roll back based on blast radius and safeguards |
 | `status-scribe` | Produces Slack-ready status updates and next-step checklists |
 
-This is the kind of team you would actually embed in a release dashboard:
-specialists reason separately, then the user-facing copilot turns that into a
-clear operator recommendation.
+This is the kind of team a host application could embed in a release dashboard.
+The host still has to import the generated source `definition.json`, use
+`@rkat/web` to create the mob and spawn the specialists, route prompts, and
+render results. Runtime initialization does not expose or instantiate the full
+packed definition.
 
 ## Prerequisites
 
 ```bash
 export ANTHROPIC_API_KEY=sk-...
 ./scripts/repo-cargo build -p rkat --bin rkat
-wasm-pack --version
 ```
+
+The script uses `sdks/web/wasm/meerkat_web_runtime_bg.wasm` by default. To
+rebuild it after Rust changes, install Node.js and `wasm-pack`, then run:
+
+```bash
+npm --prefix sdks/web install
+npm --prefix sdks/web run build:wasm
+```
+
+Set `MEERKAT_WASM=/path/to/meerkat_web_runtime_bg.wasm` to select a different
+prebuilt runtime.
 
 If you are working from this repo checkout instead of a global install, the
 script will prefer repo-local binaries built by `./scripts/repo-cargo` when
@@ -49,7 +61,7 @@ present.
 ## Run
 
 ```bash
-./examples.sh
+./examples/030-web-dashboard-copilot-sh/examples.sh
 ```
 
 ## What The Script Does
@@ -59,20 +71,26 @@ The script will:
 1. Generate a realistic mobpack source tree under `.work/dashboard-copilot/`
 2. Create a portable `.mobpack`
 3. Run `rkat mob inspect` and `rkat mob validate`
-4. Build the browser bundle with `rkat mob web build`
+4. Assemble the browser bundle with `rkat mob web build --wasm ...`
 5. Emit supporting assets:
    - `.work/dashboard-context.json`
    - `.work/example-questions.md`
    - `.work/embed-snippet.html`
 
+These `.work` paths are relative to
+`examples/030-web-dashboard-copilot-sh/`.
+
 ## What The Browser Bundle Contains
 
-The generated `.work/dashboard-copilot-web/` directory is the embeddable
-browser artifact. It includes:
+The generated `.work/dashboard-copilot-web/` directory is a browser bootstrap
+artifact. It includes:
 
 - the WASM runtime files,
 - the generated `manifest.web.toml`,
 - the packed mob definition and skills prepared for web execution.
+
+Its generated `index.html` only trust-verifies the pack and initializes the
+WASM runtime. The Start button does not create or spawn the declared team.
 
 `manifest.web.toml` is **derived output**, not a source file you hand-author.
 It tells you what web-safe contract the build surface produced from the source
@@ -88,7 +106,8 @@ Imagine your internal release dashboard already shows:
 - queue depth,
 - the last 20 minutes of operator notes.
 
-This copilot is meant to sit beside those widgets and answer questions like:
+After a host application creates the mob and connects a prompt UI, the copilot
+could sit beside those widgets and answer questions like:
 
 - "Do we continue the rollout or pause it?"
 - "Which metric moved first after the deployment?"
@@ -114,23 +133,23 @@ Starter prompts that show what the copilot is for.
 
 ### `.work/embed-snippet.html`
 
-A minimal iframe-based integration sketch for teams evaluating how the web
-bundle would slot into an existing dashboard shell.
+A minimal iframe placement sketch. It embeds the generated initialization page,
+not a finished copilot panel.
 
 ## Suggested Host Integration Pattern
 
-1. Build the web bundle with this script
-2. Serve `.work/dashboard-copilot-web/` from your dashboard host
-3. Render it inside an iframe or side panel
-4. Inject current dashboard context from your host application
-5. Let operators ask release/incident questions against that live state
+1. Build the web bootstrap with this script
+2. Use `@rkat/web` in a host application to create the mob and spawn its members
+3. Add prompt, event, and transcript UI for the operator
+4. Pass current dashboard context into that host application
+5. Serve or embed the completed host experience in the dashboard
 
 ## Notes
 
-- This example focuses on **packaging and deployment ergonomics**, not on a
-  polished custom frontend. The browser UI comes from the standard Meerkat web
-  build surface.
-- `rkat mob web build` shells out to `wasm-pack`, so `wasm-pack` must be
-  installed and available on `PATH`.
+- This example focuses on **packaging and bootstrap ergonomics**, not on a
+  functional custom frontend. The standard generated page is an initialization
+  smoke surface.
+- `rkat mob web build` copies a prebuilt WASM artifact; it does not invoke
+  `wasm-pack`.
 - The generated assets under `.work/` are intentionally inspectable so you can
   understand what would be embedded and why.

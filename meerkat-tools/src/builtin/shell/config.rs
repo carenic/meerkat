@@ -81,17 +81,17 @@ pub struct ShellConfig {
     /// Project root directory
     pub project_root: PathBuf,
 
-    /// Maximum number of completed jobs to retain (default: 100)
+    /// Legacy completed-job count setting (default: 100).
     ///
-    /// When this limit is exceeded, the oldest completed jobs are automatically
-    /// removed during new job spawning. Set to 0 for unlimited (not recommended).
+    /// Retained for configuration compatibility. The durable job runtime does
+    /// not currently use this field as retention authority.
     #[serde(default = "default_max_completed_jobs")]
     pub max_completed_jobs: usize,
 
-    /// Seconds after which completed jobs are eligible for cleanup (default: 300)
+    /// Legacy completed-job TTL setting in seconds (default: 300).
     ///
-    /// Jobs that completed more than this many seconds ago will be removed
-    /// during cleanup, even if under the max_completed_jobs limit.
+    /// Retained for configuration compatibility. The durable job runtime does
+    /// not currently expire records from this field.
     #[serde(default = "default_completed_job_ttl_secs")]
     pub completed_job_ttl_secs: u64,
 

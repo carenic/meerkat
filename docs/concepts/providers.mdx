@@ -1,125 +1,107 @@
 ---
 title: "Providers"
-description: "Provider-agnostic: same tools, same sessions across Anthropic, OpenAI, Gemini, and configured self-hosted models."
+description: "Model catalog, provider resolution, capability gating, parameters, and fallback."
 icon: "server"
 ---
 
-Meerkat is provider-agnostic at the session/config/runtime model level. You can switch providers by changing the model name, and a configured self-hosted alias such as `gemma-4-31b` behaves like any other model ID in the runtime. Tool visibility and multimodal behavior still depend on model capabilities, so provider/model differences can affect the effective tool surface.
+Meerkat keeps one session and runtime model across Anthropic, OpenAI, Gemini,
+and configured self-hosted servers. Provider independence does not erase model
+differences: the selected catalog profile controls context limits, output
+limits, multimodal input, reasoning options, realtime support, provider-native
+tools, and the effective tool surface.
 
-<Note>
-This page is the concept layer for provider abstraction. Use [Auth](/guides/auth) and [Self-hosting models](/guides/self-hosting-models) for setup workflows, and use reference pages for exact capability and contract details.
-</Note>
+Query the effective catalog instead of inferring capabilities from a model
+name:
 
-## Instruction projection
+```bash
+rkat models
+```
 
-Provider independence does not make unlike wire formats identical. Meerkat
-keeps the exact ordered `System` / `SystemNotice` sequence in the durable
-Session transcript and derives each provider request from it:
+The same catalog is available through JSON-RPC `models/catalog`, REST
+`GET /models/catalog`, and MCP `meerkat_models_catalog`. Configured
+self-hosted aliases appear beside built-in models.
 
-- Standard OpenAI Responses and OpenAI-compatible Chat Completions preserve
-  each instruction at its position among user and assistant messages.
-- OpenAI Realtime preserves the same ordering with in-conversation System
-  items; its separate session `instructions` field is reserved for
-  provider-owned configuration.
-- Cataloged Anthropic Fable 5, Opus 4.8, and Opus 5 support
-  mid-conversation System messages. Meerkat lowers a turn-scoped canonical
-  `System -> User` boundary to Anthropic's legal
-  `User -> System -> Assistant` placement without changing the durable
-  transcript. Other Anthropic models and Gemini can represent only a leading
-  System prefix. The private ChatGPT Responses wire can represent at most one
-  leading System message. A limited provider projection returns a typed error
-  for an unrepresentable transcript instead of hoisting or merging messages.
-  The ordinary System row remains authored in the durable Session; selecting
-  a capable wire can execute that Session without rewriting it.
+## Current Defaults
 
-Empty, whitespace-only, and duplicate instructions are significant: adapters
-do not trim, deduplicate, replace, hoist, or silently drop them. System
-placement is never a Session persistence or resume restriction. Realtime
-reconnect replays the same ordered seed messages under the uniform replay
-window; a transcript change on an open channel requires exact append delivery
-or close-and-reopen rather than a retroactive instructions refresh.
+| Provider | Catalog default |
+|----------|-----------------|
+| Anthropic | `claude-opus-5` |
+| OpenAI | `gpt-5.6-sol` |
+| Gemini | `gemini-3.5-flash` |
+| Global catalog default | `gpt-5.6-sol` |
 
-## Provider setup
+<Warning>
+A catalog entry describes Meerkat's supported capability contract, not the
+entitlement of a particular API organization, ChatGPT workspace, cloud
+deployment, or OAuth account. If `gpt-5.6-sol` is unavailable to the active
+OpenAI account, explicitly select `gpt-5.5` or set a compatible binding
+`default_model`.
+</Warning>
+
+## Provider Setup
+
+The tables below are selected recommendations, not the exhaustive catalog.
+Use `rkat models` for every supported ID and its current limits.
 
 <Tabs>
   <Tab title="Anthropic">
     ```bash
-    export ANTHROPIC_API_KEY="sk-ant-..."
+    export RKAT_ANTHROPIC_API_KEY="sk-ant-..."
     ```
 
-    | Model | Context | Max output | Best for |
-    |-------|---------|------------|----------|
-    | `claude-opus-5` | 1M | 128K | Default Anthropic recommendation |
-    | `claude-fable-5` | 1M | 128K | Most capable Anthropic model (premium pricing) |
-    | `claude-opus-4-8` | 1M | 128K | Previous Anthropic default |
-    | `claude-sonnet-4-6` | 1M | 64K | Balanced performance and cost |
-    | `claude-sonnet-4-5` | 200K | 64K | Legacy supported Sonnet |
+    | Selected model | Context | Max output | Positioning |
+    |----------------|---------|------------|-------------|
+    | `claude-opus-5` | 1M | 128K | Default Anthropic model |
+    | `claude-fable-5` | 1M | 128K | Recommended catalog model |
+    | `claude-opus-4-8` | 1M | 128K | Recommended previous Opus generation |
+    | `claude-sonnet-4-6` | 1M | 64K | Recommended Sonnet model |
 
-    ```toml config.toml (active realm)
+    ```toml
     [agent]
     model = "claude-opus-5"
-    max_tokens_per_turn = 16384
     ```
   </Tab>
   <Tab title="OpenAI">
     ```bash
-    export OPENAI_API_KEY="sk-..."
+    export RKAT_OPENAI_API_KEY="sk-..."
     ```
 
-    | Model | Context | Best for |
-    |-------|---------|----------|
-    | `gpt-5.6-sol` | 1.05M | Default OpenAI selection; limited-preview frontier capability |
-    | `gpt-5.6-terra` | 1.05M | Balanced intelligence and cost |
-    | `gpt-5.6-luna` | 1.05M | Efficient high-volume workloads |
-    | `gpt-5.5` | 1.05M | Broadly available production recommendation |
-    | `gpt-5.5-pro` | 1.05M | Long-running pro-tier reasoning |
-    | `gpt-5.4` | 1.05M | Supported GPT-5 fallback |
-    | `gpt-5.4-mini` | 128K | Smaller fast-path model with compaction support |
-    | `gpt-5.3-codex` | 400K | Coding-focused workflows |
-    | `gpt-realtime-2` | 128K | Live audio/text with still-image input |
+    | Selected model | Context | Max output | Positioning |
+    |----------------|---------|------------|-------------|
+    | `gpt-5.6-sol` | 1.05M | 128K | Default OpenAI/global model |
+    | `gpt-5.6-terra` | 1.05M | 128K | GPT-5.6 catalog variant |
+    | `gpt-5.6-luna` | 1.05M | 128K | GPT-5.6 catalog variant |
+    | `gpt-5.5` | 1.05M | 128K | Recommended fallback |
+    | `gpt-5.3-codex` | 400K | 128K | Supported Codex model |
+    | `gpt-realtime-2` | 128K | 32K | Realtime audio/text and still-image input |
 
-    The GPT-5.6 tiers are limited-preview API models for selected trusted
-    partners and organizations. Each accepts up to 922K input tokens inside a
-    1.05M context window, emits up to 128K output tokens, accepts text and image
-    input, and has a February 16, 2026 knowledge cutoff. The official `gpt-5.6`
-    alias routes to `gpt-5.6-sol`.
+    `gpt-5.6` is a catalog alias for `gpt-5.6-sol`.
 
-    <Warning>
-    Meerkat deliberately defaults new OpenAI selection to `gpt-5.6-sol`, but
-    the model currently requires preview access for the relevant API
-    organization or Codex workspace. If that account context is not enabled for
-    the preview, explicitly configure `gpt-5.5` until OpenAI broadens access.
-    See OpenAI's
-    [preview availability notice](https://help.openai.com/en/articles/20001325-a-preview-of-gpt-5-6-sol-terra-and-luna).
-    </Warning>
-
-    ```toml config.toml (active realm)
+    ```toml
     [agent]
     model = "gpt-5.6-sol"
-    max_tokens_per_turn = 8192
     ```
   </Tab>
   <Tab title="Gemini">
     ```bash
-    export GOOGLE_API_KEY="AIza..."
+    export RKAT_GEMINI_API_KEY="AIza..."
     ```
 
-    | Model | Context | Best for |
-    |-------|---------|----------|
-    | `gemini-3.5-flash` | 1M | Default Gemini recommendation, stable fast reasoning |
-    | `gemini-3.1-pro-preview` | 1M | Advanced preview reasoning |
-    | `gemini-3.1-flash-lite-preview` | 1M | Lightweight fast-path tasks |
+    | Model | Context | Max output | Positioning |
+    |-------|---------|------------|-------------|
+    | `gemini-3.5-flash` | 1M | 64K | Default Gemini model |
+    | `gemini-3.1-pro-preview` | 1M | 64K | Advanced preview reasoning |
+    | `gemini-3.1-flash-lite-preview` | 1M | 64K | Lightweight preview model |
 
-    ```toml config.toml (active realm)
+    ```toml
     [agent]
     model = "gemini-3.5-flash"
-    max_tokens_per_turn = 8192
     ```
   </Tab>
   <Tab title="Self-hosted">
-    Configure an OpenAI-compatible local or remote server, then register aliases under `self_hosted.models`.
+    Register an alias for an OpenAI-compatible endpoint:
 
-    ```toml config.toml (active realm)
+    ```toml
     [self_hosted.servers.ollama]
     transport = "openai_compatible"
     base_url = "http://127.0.0.1:11434"
@@ -134,226 +116,160 @@ or close-and-reopen rather than a retroactive instructions refresh.
     context_window = 256000
     max_output_tokens = 8192
     vision = true
-    image_tool_results = true
+    image_tool_results = false
     inline_video = false
     supports_temperature = true
     supports_thinking = true
     supports_reasoning = true
+    supports_web_search = false
+    call_timeout_secs = 600
     ```
 
-    Running a self-hosted alias also requires a realm binding for
-    `provider = "self_hosted"` (credentials are realm-owned, not server-entry
-    fields). See [Self-hosting models](/guides/self-hosting-models).
+    Server entries contain connection facts only. Credentials belong to a
+    realm binding for `provider = "self_hosted"`, with an auth method of
+    `none`, `api_key`, or `static_bearer`. Legacy credential fields on
+    `self_hosted.servers` are rejected as unknown config.
+
+    See [Self-hosting models](/guides/self-hosting-models).
   </Tab>
 </Tabs>
 
-## Environment variables
+## Environment Credential Precedence
 
-| Variable | Fallback | Provider |
-|----------|----------|----------|
-| `RKAT_ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY` | Anthropic Claude |
-| `RKAT_OPENAI_API_KEY` | `OPENAI_API_KEY` | OpenAI GPT |
-| `RKAT_AZURE_OPENAI_API_KEY` plus `RKAT_AZURE_OPENAI_ENDPOINT` | `AZURE_OPENAI_API_KEY` plus `AZURE_OPENAI_ENDPOINT` | Azure OpenAI |
-| `RKAT_GEMINI_API_KEY` | `GEMINI_API_KEY`, `GOOGLE_API_KEY` | Google Gemini |
+`RKAT_*` variables let Meerkat use dedicated credentials without taking over
+keys used by other tools.
 
-<Note>
-The `RKAT_*` variants take precedence over provider-native names, so you can run Meerkat with dedicated keys separate from other tools.
-</Note>
+| Provider | Resolution order |
+|----------|------------------|
+| Anthropic | `RKAT_ANTHROPIC_API_KEY`, `ANTHROPIC_API_KEY` |
+| Public OpenAI | `RKAT_OPENAI_API_KEY`, `OPENAI_API_KEY` |
+| Gemini | `RKAT_GEMINI_API_KEY`, `GEMINI_API_KEY`, `RKAT_GOOGLE_API_KEY`, `GOOGLE_API_KEY` |
+| Azure OpenAI | `RKAT_AZURE_OPENAI_API_KEY` plus `RKAT_AZURE_OPENAI_ENDPOINT`, then unprefixed equivalents |
 
-Self-hosted servers do not use the shared provider env vars above. Server entries carry connection facts only; credentials are owned by a realm auth binding for `provider = "self_hosted"` (`auth_method` of `none`, `api_key`, or `static_bearer`). See [Self-hosting models](/guides/self-hosting-models) for the realm binding shape.
+If public OpenAI and only unprefixed Azure variables are both present, public
+OpenAI wins. Setting either prefixed Azure selector makes a complete Azure
+key/endpoint pair the OpenAI environment default.
 
-## Image generation providers
+Environment credentials are synthesized as a typed ephemeral binding and go
+through the same provider runtime resolver as configured bindings.
 
-The `generate_image` builtin uses provider-specific image profiles behind a single Meerkat request shape. The active session model does not have to be an image model; image operations can route to a provider default or a forced image target while preserving the original session identity.
+## Public OpenAI API Versus ChatGPT OAuth
 
-| Provider | Default image target | Notes |
-|----------|----------------------|-------|
-| OpenAI | `gpt-image-2` | Uses the hosted Responses image tool by default. Other OpenAI-owned `gpt-image*` or `dall-e*` targets use the Images API path. |
-| Gemini | `gemini-3.1-flash-image-preview` | Also accepts provider alias `google`. Gemini image targets run through an internal scoped image-model turn. |
+OpenAI has separate backend/auth pairs:
 
-Request `provider_params` are provider-specific and do not replace Meerkat's universal image fields. Use top-level `size`, `quality`, `format`, and `intent`; the OpenAI adapter lowers `format` to provider-side `output_format`. For the current `gpt-image-2` default, public callers should only need `background`, `output_compression`, `moderation`, hosted-tool-only `action`, hosted-tool-only `reasoning_effort`, and hosted-tool-only `web_search`; use `background: "auto"` or `"opaque"` (not `"transparent"`), use `output_compression` only with `format: "jpeg"` or `"webp"`, usually omit `action`, and omit `input_fidelity` because Meerkat rejects unknown OpenAI image provider params. Gemini accepts `aspect_ratio` and `image_size`. See [Image generation](/guides/image-generation) for the exact request shape and troubleshooting.
+| Backend | Auth | Account surface |
+|---------|------|-----------------|
+| `openai_api` | `api_key`, `static_bearer`, or host authorizer | Public OpenAI API organization/project |
+| `chatgpt_backend` | `managed_chatgpt_oauth` or host-supplied ChatGPT tokens | ChatGPT/Codex subscription and workspace |
+| `azure_openai` | `azure_api_key` | Azure deployment |
 
-## SDK feature flags
+These are not interchangeable credential paths. A model ID available to an API
+organization may be unavailable to a ChatGPT workspace, and vice versa.
+`rkat models` reports the Meerkat catalog, not account entitlement. Keep a
+binding's backend, auth method, and default model aligned.
 
-When using Meerkat as a Rust library, enable only the providers you need:
+See [Auth](/guides/auth) for the full backend/auth compatibility matrix.
 
-| Feature | Description | Default |
-|---------|-------------|---------|
-| `anthropic` | Anthropic Claude support | Yes |
-| `openai` | OpenAI GPT support | Yes |
-| `gemini` | Google Gemini support | Yes |
-| `all-providers` | All LLM providers (convenience alias) | No |
+## Model And Provider Resolution
+
+The effective model registry is the built-in catalog plus configured custom
+and self-hosted entries. Provider resolution uses exact registry ownership, not
+name prefixes.
+
+- An explicit model wins.
+- An explicit provider constrains every omitted-model choice.
+- An explicit binding infers and validates its provider; its
+  `default_model` wins when the model is omitted.
+- Otherwise Meerkat checks compatible configured defaults and then the
+  provider/global catalog default.
+- A known provider/model mismatch fails before agent construction.
+- An uncataloged model needs an explicit typed provider/binding owner; a name
+  that merely begins with `gpt-` or `claude-` is never guessed.
+
+All public session-creation surfaces use the same resolver. Inherited bindings
+retain the realm that owns their config.
+
+Rust applications can select only the provider adapters they use:
 
 <CodeGroup>
 
 ```toml Anthropic only (smallest binary)
-meerkat = { version = "0.8.25", features = ["anthropic", "jsonl-store"] }
+meerkat = { version = "=0.8.25", features = ["anthropic", "jsonl-store"] }
 ```
 
 ```toml All providers
-meerkat = { version = "0.8.25", features = ["all-providers", "jsonl-store"] }
+meerkat = { version = "=0.8.25", features = ["all-providers", "jsonl-store"] }
 ```
 
 </CodeGroup>
 
-## Provider parameters
+## Capability-Gated Projection
 
-Use `--param` for common top-level overrides such as `temperature`. Provider-native
-options use the canonical `provider_params.provider_tag` envelope; pass that shape
-with `--params-json` in the CLI or `provider_params` in an SDK. For OpenAI catalog
-models, `params_schema` describes the fields inside the `provider_tag` object.
+The durable session transcript remains provider-neutral and ordered. Each
+adapter projects that transcript and the effective tool surface to its wire
+format:
 
-Provider-native web search is on by default for catalog models that support it.
-Disable it in config with the matching `provider_tools.<provider>` search toggle,
-or for a single CLI run with `rkat run --no-web-search "..."`.
+- unsupported multimodal blocks or tools are rejected or hidden according to
+  the model profile;
+- system instructions remain ordered, and a limited provider projection fails
+  when it cannot represent their positions without changing meaning;
+- a model switch or fallback recomputes context/output limits and tool
+  visibility from the newly selected catalog profile.
+
+The transcript itself is not rewritten merely because a different provider
+wire has stricter placement rules.
+
+## Provider Parameters
+
+Use `--param` for common top-level parameters such as `temperature`. Use the
+typed `provider_params.provider_tag` envelope for provider-specific fields:
 
 <Tabs>
   <Tab title="Anthropic">
-    | Parameter | Values | Description |
-    |-----------|--------|-------------|
-    | `thinking_budget_tokens` | integer | Token budget for extended thinking |
-    | `top_k` | integer | Top-k sampling parameter |
-    | `cache_control` | `automatic`, `system_prefix`, `disabled` | Prompt-cache policy; native Anthropic, Vertex, and Foundry clients default to a moving automatic conversation breakpoint. Amazon Bedrock defaults to disabled because that backend does not support Anthropic automatic caching. |
-
     ```bash
     rkat run --model claude-sonnet-4-6 --params-json \
-      '{"provider_tag":{"provider":"anthropic","thinking_budget_tokens":10000}}' \
+      '{"provider_tag":{"provider":"anthropic","thinking_budget_tokens":10000,"cache_control":"automatic"}}' \
       "Solve this problem"
     ```
 
-    <Note>
-    Automatic caching uses Anthropic's five-minute ephemeral cache and advances
-    the breakpoint as the conversation grows. A qualifying cold write bills
-    input tokens at 1.25x the base rate; a cache hit bills cached input tokens
-    at 0.1x. Automatic lookup scans backward at most 20 cacheable blocks, so
-    adding more than 20 blocks between requests can still miss. Set
-    `cache_control: "disabled"` to opt out, or `system_prefix` when only the
-    stable system prompt should be cached. Amazon Bedrock rejects `automatic`
-    locally but continues to support `system_prefix`.
-    </Note>
+    Anthropic also supports `top_k` and the cataloged cache policies
+    `automatic`, `system_prefix`, and `disabled`. Backend support differs;
+    for example, Bedrock does not accept automatic conversation caching.
   </Tab>
   <Tab title="OpenAI">
-    | Parameter | Values | Description |
-    |-----------|--------|-------------|
-    | `reasoning_effort` | `none`, `low`, `medium`, `high`, `xhigh`, `max` | GPT-5.6 effort ladder; earlier models expose their cataloged subset |
-    | `reasoning_mode` | `standard`, `pro` | GPT-5.6 Responses execution mode; default is `standard` |
-    | `reasoning_context` | `auto`, `current_turn`, `all_turns` | GPT-5.6 persisted-reasoning context |
-    | `text_verbosity` | `low`, `medium`, `high` | GPT-5.6 default output detail |
-    | `prompt_cache_enabled` | boolean | Durable prompt-cache intent; `false` disables reads, writes, and cache-write charges |
-    | `prompt_cache_key` | string | Stable cache-routing affinity key; explicit host values override Meerkat's per-session default |
-    | `prompt_cache_options` | `mode`: `implicit` or `explicit`; `ttl`: `30m` | GPT-5.6 request-wide cache policy; explicit mode makes Meerkat mark deterministic message boundaries |
-
     ```bash
     rkat run --model gpt-5.6-terra --params-json \
-      '{"provider_tag":{"provider":"open_ai","reasoning_effort":"max","reasoning_mode":"pro","reasoning_context":"all_turns","text_verbosity":"high","prompt_cache_options":{"mode":"implicit","ttl":"30m"}}}' \
+      '{"provider_tag":{"provider":"open_ai","reasoning_effort":"max","reasoning_mode":"pro","reasoning_context":"all_turns","text_verbosity":"high"}}' \
       "Prove this theorem"
     ```
 
-    <Note>
-    Use `max`, not `ultra`, for the public OpenAI API. `ultra` is a Codex
-    multi-agent orchestration mode rather than a `reasoning.effort` value.
-    GPT-5.6 uses `prompt_cache_options`; the older `prompt_cache_retention`
-    field is deprecated for these models. The two fields remain independent at
-    the API boundary, and the only legacy retention value accepted by GPT-5.6
-    is `24h`. Factory-built public OpenAI API GPT-5.6 sessions default to
-    implicit caching and a stable
-    `meerkat:session:<durable-session-id>` routing key. A key supplied by the
-    caller wins, so a long-lived host can choose a coarser stable identity
-    bucket. The default is re-derived on resume rather than persisted into
-    provider parameters and is not automatically applied to the private
-    ChatGPT or Azure OpenAI backend wires. In `mode: "explicit"`, Meerkat re-authors stable
-    breakpoints at deterministic historical message boundaries and adds new
-    ones only as the conversation grows, for both Responses and Chat
-    Completions. Set `prompt_cache_enabled: false` for a durable opt-out;
-    Meerkat then emits explicit-only mode without authoring a breakpoint, so
-    the request performs no caching and incurs no cache-write charges.
-    Enabling explicit mode on a large cold transcript can create up to four
-    writes; normal growth adds one new boundary per model invocation.
-    OpenAI recommends keeping traffic near 15 requests per minute per cache
-    key; partition higher-volume traffic with a stable mapping rather than
-    assuming a coarser identity key always improves hits. Tool-calling agents
-    can make several model requests during one user turn, so one tool-heavy
-    turn can reach that guidance without any concurrent users. Per-session and
-    per-identity keys can both hit the ceiling; choose and monitor the
-    partition from actual request rate. Cache reads consider only the latest
-    50 breakpoints.
-    GPT-5.6 cache writes bill at 1.25x the uncached input token rate; hits use
-    the model's cached-input rate.
-    </Note>
+    The catalog validates each model's reasoning-effort subset. GPT-5.6 also
+    supports `prompt_cache_enabled`, `prompt_cache_key`, and
+    `prompt_cache_options` (`implicit` or `explicit`, with optional
+    `30m` TTL). Use `max`, not `ultra`, as the public provider effort.
   </Tab>
   <Tab title="Gemini">
-    | Parameter | Description |
-    |-----------|-------------|
-    | `thinking_budget` | Token budget for extended thinking (integer) |
-    | `top_k` | Top-k sampling parameter (integer) |
-
     ```bash
     rkat run --model gemini-3.5-flash --params-json \
       '{"provider_tag":{"provider":"gemini","thinking_budget":5000}}' \
       "Analyze this data"
     ```
+
+    Gemini provider parameters also include `top_k`.
   </Tab>
 </Tabs>
 
-## Model catalog
+Provider-native web search is enabled by default for catalog models that
+support it. Disable the relevant `provider_tools.<provider>` toggle in config
+or use `rkat run --no-web-search` for one run.
 
-Meerkat ships a curated built-in model catalog in the `meerkat-models` crate (`meerkat-core` owns only the vocabulary types and `ModelCatalog` mechanics) and merges it with any configured self-hosted aliases into one effective runtime registry used for capability detection, provider resolution, and catalog responses.
+## Model Fallback
 
-Query the catalog programmatically from any surface:
+Runtime model fallback is enabled by default for factory-built agents. With no
+custom chain, Meerkat builds an ordered chain from compatible configured and
+catalog defaults. Operators can provide an explicit chain:
 
-- **CLI**: `rkat models`
-- **RPC**: `models/catalog`
-- **REST**: `GET /models/catalog`
-- **MCP**: `meerkat_models_catalog`
-
-Configured self-hosted aliases appear under the `self_hosted` provider group and include their backing `server_id`.
-
-For Gemma 4 specifically, prefer `chat_completions` as the default OpenAI-compatible interface. It is the clearest common path for tool calling across Ollama, LM Studio, and vLLM, while reasoning-trace semantics still vary by server.
-
-## Provider resolution
-
-The provider for a model is resolved by exact match against the config-backed
-model registry (the compiled-in catalog merged with any configured self-hosted
-aliases). There is no name-prefix inference: a model id resolves to the
-provider recorded for its catalog entry (or its self-hosted alias config), and
-an uncatalogued id — even a prefix-shaped one like `gpt-unknown-preview` or
-`claude-unknown-preview` — is rejected rather than guessed at.
-
-A configured self-hosted alias such as `gemma-4-31b` resolves by exact model ID
-match, so it works without `--provider`.
-
-You can still override this with `--provider` on the CLI or `provider` in API requests.
-
-Session creation resolves model, provider, and credentials as one identity on
-CLI, RPC, REST, and MCP. An explicit model wins. An explicit provider constrains
-all omitted-model choices, and a named `auth_binding` is resolved through the
-effective realm inheritance chain to infer and validate its provider. The
-binding's `default_model` wins when the model is omitted; otherwise Meerkat
-uses a compatible configured global model, the configured per-provider model,
-and finally that provider's catalog default. With no provider or binding hint,
-the configured global model wins, followed by configured provider defaults in
-catalog priority and the global catalog default.
-
-A nonempty `agent.model` is always operator intent, including a still-supported
-model that appeared in an older generated config. Meerkat does not reinterpret
-model IDs through a frozen legacy-default list. Explicit provider/binding
-mismatches, malformed bindings, and binding defaults owned by another provider
-fail before agent construction; inherited bindings retain the realm that owns
-their configuration.
-
-## Model fallback chain
-
-Factory-built agents can use an ordered model fallback chain when the active
-model reaches a typed, recoverable LLM failure boundary. This protects long
-sessions from provider-side disruptions such as removed models, rate limits,
-provider overload, auth failures, and context-window overflow.
-
-Fallback is enabled by default. With no explicit chain, Meerkat builds a
-catalog-owned backup order from the configured provider defaults and the global
-catalog default, excluding the active model and duplicate targets. You can
-replace that order in realm config:
-
-```toml config.toml
+```toml
 [model_fallback]
 enabled = true
 
@@ -362,86 +278,56 @@ model = "claude-opus-4-8"
 provider = "anthropic"
 
 [[model_fallback.chain]]
-model = "gpt-5.6-sol"
+model = "gpt-5.5"
 provider = "openai"
-auth_binding = { realm = "dev", binding = "openai_oauth" }
-
-[[model_fallback.chain]]
-model = "gemma-4-31b"
-provider = "self_hosted"
-auth_binding = { realm = "lab", binding = "ollama" }
+auth_binding = { realm = "global", binding = "openai_oauth" }
 ```
 
-`provider` is optional when the model exists in the effective registry.
-`auth_binding` is optional; when omitted, the target resolves through the same
-provider-runtime registry used for normal session creation. The same
-model/provider with a different `auth_binding` is a distinct fallback target,
-so custom chains can fail over to another credential realm. For the catalog
-default chain, Meerkat keeps candidates inside the selected non-env realm when
-that realm has a matching provider binding; unavailable catalog-default
-candidates are skipped rather than silently bleeding into another realm. For an
-explicit custom chain, an unavailable target is a configuration error.
+Fallback activates only when generated recovery authority classifies the
+failure as recoverable and the core loop determines that switching is
+pre-stream safe. Call/network timeouts do not trigger cross-model fallback, and
+a switch is suppressed after user-visible text or reasoning has streamed.
 
-When a switch is applied, Meerkat validates a capability-profile witness minted
-by the agent's exact captured effective-registry authority, then freshly
-resolves the target profile, context window, output ceiling, and capability
-filter from that registry. An independently constructed registry cannot
-authorize the switch even when it contains an identical provider/model row;
-an unresolved target is rejected, and the public fallback proposal carries no
-client-owned capability or limit fields. Meerkat seals the accepted identity,
-profile, filter, and retry attempt in an opaque one-shot activation proof that
-only the core agent loop can mint; holding a public runtime routing handle is
-not enough to fabricate a commit. Meerkat
-prepares the next session/request policy and complete tool-visibility state,
-then asks generated authority to preauthorize an exact one-shot routing commit.
-After reversibly activating the exact prebuilt target client and rotating the
-auth lease, the runtime supervisor compare-and-swaps a control-only copy of the
-last committed session snapshot: only LLM identity and typed visibility change;
-the in-flight prompt, fallback notice, transcript history, and usage do not.
-The preauthorized token then atomically recommits the generated runtime's LLM
-identity, capability surface, routing baseline, visibility filters, and
-visibility revision before the agent publishes prepared local state. Lost store
-acknowledgements are resolved by reading back the exact old or target bytes, and
-a rejected machine realization restores the old bytes before client/auth
-compensation. An unprovable third outcome forces canonical executor teardown;
-it never enters ordinary failed-batch retry. Runtime routing status and
-image-generation `Auto` therefore observe the same sticky fallback provider as
-later agent turns, including the new provider parameters, output-token ceiling,
-and capability base filter. Later turns read the registry-minted active profile
-and canonical ToolScope projection, never client-local capability or limit
-projections. The immediate visibility commit rebases any pending
-staged revision, so a later normal turn boundary preserves pending intent but
-cannot roll the active revision backward. The supervised operation outlives a
-dropped run future, so hard interrupt settles the same result before the live
-session can be discarded. Once the control commit succeeds, the fallback stays
-sticky even if that provider retry is terminal; cold recovery loads the target
-identity with the pre-turn transcript, so the failed input can be retried once
-without duplicating its prompt or notice. The agent receives a hidden system notice with the
-source model, fallback model, failure reason, skipped targets, active model
-limits, and any tools hidden by the fallback model's capabilities.
+An accepted switch is sticky for later turns and recovery. Meerkat re-resolves
+credentials, output limits, context limits, provider parameters, and tool
+visibility for the target. An unavailable target in an explicit operator chain
+is a configuration error; unavailable candidates in the catalog-derived chain
+are skipped.
 
-For structured-output extraction turns, fallback keeps the extraction request
-deterministic: before changing any active state, Meerkat compiles the schema
-through the exact inactive target client, injects that provider-lowered
-representation into the target request, and keeps provider-native web
-search/grounding disabled on the retry. Target compilation failure leaves the
-client, lease, runtime identity, visibility, and session fallback state
-unchanged.
+Ordinary same-model retry is separate. Genuinely unknown provider failures now
+consume the existing bounded retry budget, while explicit terminal classes
+remain non-retryable.
 
-Capability changes are expected. For example, falling back from a 1M-context
-vision model to a 128K local model can clamp output tokens, hide image-result
-tools, and skip the local target entirely if the failure was a context overflow
-larger than that target's context window. Later turns remain sticky to the
-active fallback model until the session is explicitly hot-swapped or rebuilt.
+## Image Generation
 
-Meerkat does not fallback on call/network timeouts, and it suppresses
-cross-model fallback for any retryable error after user-visible text or
-reasoning stream output has been emitted. Ordinary same-model retry policy can
-still apply when the recovery authority permits it.
+The `generate_image` builtin routes independently of the active chat model:
 
-## See also
+| Provider | Default image target |
+|----------|----------------------|
+| OpenAI | `gpt-image-2` |
+| Gemini | `gemini-3.1-flash-image-preview` |
 
-- [Auth & bindings](/concepts/auth-and-bindings)
+Generated bytes are stored as realm blobs and can be fetched through CLI,
+RPC, MCP, or SDK blob methods. REST responses carry blob references but the
+current REST router does not expose a blob-byte fetch route. See
+[Image generation](/guides/image-generation) for the request shape.
+
+## Rust Provider Features
+
+```toml
+# Exactly pin the pre-1.0 Meerkat crate family.
+meerkat = { version = "=0.8.25", features = ["sqlite-store", "session-store"] }
+```
+
+The `meerkat` facade enables `anthropic`, `openai`, and `gemini` by
+default. Use `all-providers` as a convenience alias or disable default
+features and select only the provider/storage capabilities your embedded build
+needs. Shipped CLI/RPC/REST/MCP binaries use product feature sets rather than
+the minimal library profile.
+
+## See Also
+
+- [Auth and bindings](/concepts/auth-and-bindings)
+- [Auth guide](/guides/auth)
 - [Self-hosting models](/guides/self-hosting-models)
-- [Built-in tools reference](/reference/builtin-tools)
 - [Capability matrix](/reference/capability-matrix)

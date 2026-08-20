@@ -1,22 +1,23 @@
 # 023 — JSON-RPC IDE Integration (TypeScript)
 
-Build IDE extensions and desktop apps with the JSON-RPC interface. Agents
-stay alive between turns for instant multi-turn conversations.
+Build IDE extensions and desktop apps with the JSON-RPC interface. JSON-RPC
+and REST both use Meerkat's runtime-backed session path; JSON-RPC is convenient
+for local stdio or TCP clients and streams events as server notifications.
 
 ## Concepts
-- `rkat-rpc` — JSON-RPC 2.0 server over JSONL/stdio
-- `SessionRuntime` — keeps agents alive between turns (no reconstruction)
-- Capability detection — check features before using them
-- Config management — read/write runtime config
+- `rkat-rpc` - JSON-RPC 2.0 server over JSONL/stdio or TCP
+- Runtime-backed multi-turn session lifecycle
+- Capability detection - check features before using them
+- Config management - read/write runtime config
 - Event notifications are available on the JSON-RPC transport
 
 ## Why JSON-RPC over REST?
-| Feature | REST | JSON-RPC |
+| Concern | REST | JSON-RPC |
 |---------|------|----------|
-| Agent lifetime | Per-request | Kept alive |
-| Turn latency | Agent reconstruction | Instant |
-| Streaming | SSE setup | Stdio notifications |
-| Best for | Web apps, microservices | IDEs, desktop apps |
+| Session semantics | Runtime-backed | Runtime-backed |
+| Transport | HTTP + JSON | JSONL over stdio or TCP |
+| Streaming | Server-sent events | Server notifications |
+| Best for | Web apps and services | IDEs, desktop apps, local SDK clients |
 
 ## Run
 ```bash
@@ -25,5 +26,5 @@ stay alive between turns for instant multi-turn conversations.
 # (cd examples && npm install)
 # ./scripts/repo-cargo build -p meerkat-rpc --bin rkat-rpc
 # export MEERKAT_BIN_PATH="$(./scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')/debug/rkat-rpc"
-ANTHROPIC_API_KEY=sk-... npx tsx main.ts
+ANTHROPIC_API_KEY=sk-... npx tsx examples/023-rpc-ide-integration-ts/main.ts
 ```

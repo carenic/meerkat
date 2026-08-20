@@ -252,7 +252,10 @@ mod tests {
         assert_eq!(attached_tux_id, Some("tux-1".into()));
         let state = transition(state, Event::RegistrationAcked).unwrap();
         let (state, attached_tux_id) = register_sent(state).unwrap();
-        assert_eq!(state.state().phase(), TargetKennelSessionPhase::RegisteringRefresh);
+        assert_eq!(
+            state.state().phase(),
+            TargetKennelSessionPhase::RegisteringRefresh
+        );
         assert_eq!(attached_tux_id, None);
     }
 
@@ -262,7 +265,10 @@ mod tests {
         let state = transition(state, Event::RegistrationRejected).unwrap();
         assert_eq!(state.state().phase(), TargetKennelSessionPhase::Rejected);
         let state = transition(state, Event::ControlLost).unwrap();
-        assert_eq!(state.state().phase(), TargetKennelSessionPhase::Disconnected);
+        assert_eq!(
+            state.state().phase(),
+            TargetKennelSessionPhase::Disconnected
+        );
     }
 
     #[test]

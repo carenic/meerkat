@@ -136,7 +136,8 @@ pub enum SpawnTooling {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         deny_overlay: Option<Vec<String>>,
     },
-    /// Minimal: only comms tools (send_message, send_request, send_response, peers).
+    /// Minimal: only comms tools (send, send_message, reply_to_peer,
+    /// send_request, send_response, peers).
     Minimal,
     /// Use a specific profile for model/tool resolution.
     Profile {

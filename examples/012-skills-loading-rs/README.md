@@ -5,10 +5,12 @@ behavioral patterns, review checklists, output formats, and tool usage
 guidance — all without changing agent code.
 
 ## Concepts
+
 - Skills as composable behavioral modules
-- Skill sources: inline, file, git, HTTP
-- Skill references in session creation
-- Composing multiple skills in one agent
+- Direct use of `InMemorySkillSource` and `FilesystemSkillSource`
+- Source identity records and canonical `SkillKey` resolution
+- Composing named sources with `CompositeSkillSource`
+- Wiring `SkillRuntime` into `AgentBuilder`
 
 ## Skill Sources
 | Source | Use Case |
@@ -17,6 +19,10 @@ guidance — all without changing agent code.
 | `path` | Project-local skills checked into git |
 | `git` | Shared skills across teams/repos |
 | `http` | Dynamic skills from a skill registry |
+
+This runnable example constructs inline and filesystem sources. The architecture
+section printed by the program also shows the available Git, HTTP, embedded,
+and external source adapters; it does not fetch a Git or HTTP skill.
 
 ## When to Use Skills
 - Same agent logic, different domains (code review vs. API design)

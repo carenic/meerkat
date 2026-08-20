@@ -1,0 +1,240 @@
+---
+title: "Storage Operations"
+description: "Diagnose realm storage, run fenced offline migrations, resolve split-brain roots, bridge historical SQLite realms, and prune registered backups."
+icon: "database"
+---
+
+# Storage Operations
+
+Meerkat resolves durable realm state through one `StorageLayout` and one
+realm-level storage provider. The `rkat storage` commands operate below normal
+runtime scope so they can inspect or repair states that ordinary realm
+resolution correctly refuses.
+
+The three commands have deliberately different safety contracts:
+
+| Command | Default | Mutation boundary |
+|---------|---------|-------------------|
+| `storage doctor` | Read-only | Never mutates logical database content or creates a database/directory; SQLite may contact WAL/SHM sidecars |
+| `storage migrate` | Read-only dry run | `--apply` acquires the exclusive maintenance fence |
+| `storage prune` | Read-only listing | `--apply` deletes only registered maintenance artifacts |
+
+These commands never read, move, or report credential stores. A persistent
+`rkat-rpc` host also keeps approval records in `approvals.json` under its
+resolved persistence store path. That RPC-owned sidecar is not an eighth
+`StorageProvider` domain, and the current storage doctor, migration, and prune
+commands do not inventory, migrate, or delete it.
+
+## Select Roots And Realms
+
+Without explicit roots, storage commands inspect two sweep candidates:
+
+- invocation-context-local `<context-root>/.rkat/realms`
+- the user-global Meerkat data root
+
+Ordinary runtime resolution first walks up to the nearest ancestor containing
+`.rkat`, so run storage commands from that project root (or pass `--root`) when
+you want their local sweep to match the runtime's project-local candidate.
+
+Use global `--state-root` or repeatable command `--root` to provide an explicit
+set. Once either is present, only those roots are read; ambient candidates are
+not added. Global `--realm` restricts work to one validated realm ID while
+still detecting twins across every swept root.
+
+```bash
+rkat --realm home storage doctor --json
+
+rkat --state-root /srv/meerkat/realms \
+  --realm home \
+  storage doctor --json
+
+rkat --realm home storage doctor \
+  --root /srv/generation-a/realms \
+  --root /srv/generation-b/realms
+```
+
+Storage commands dispatch before a model or session runtime is built, so
+runtime-only flags such as `--default-model` are rejected.
+
+## Read-Only Diagnosis
+
+`rkat storage doctor` is safe against a live realm. It takes no realm lease or
+maintenance fence, never changes logical database content, and never creates a
+database or directory. A read-only SQLite connection may create or update the
+`-wal`/`-shm` sidecars required for a coherent read of a live WAL database.
+On truly read-only media, a WAL database without the required sidecars fails
+typed instead of falling back to an unsafe immutable read.
+
+```bash
+rkat --realm home storage doctor
+rkat --realm home storage doctor --json
+```
+
+The report covers:
+
+- realm inventory by root and manifest/backend state
+- per-database `meerkat_schema` ledger domains and versions
+- the same realm ID materialized under more than one swept root
+- persisted-session structural decode failures and transcript footprint
+- dangling session-to-blob references
+- orphaned lock, lease, index, and registered backup artifacts
+
+Exit status is `0` when there are no error-severity findings and `1` when
+errors are present. Warnings and informational findings alone do not make the
+command fail.
+
+<Note>
+The CLI reaches the built-in disk migrator because it intentionally runs
+before an external-provider realm can be composed. External providers expose
+the same `StorageMigrator::diagnose` contract through their provider-native
+operator surface; an unknown external backend is report-only to this CLI.
+</Note>
+
+## Dry-Run And Apply Migrations
+
+`storage migrate` is a dry run by default:
+
+```bash
+rkat --realm home storage migrate --json
+```
+
+The dry run reports ledger baselines, path adoption, split-brain state, and
+deprecated leftovers without changing bytes. Per-mob databases under `mobs/`
+remain report-only in migration v1.
+
+Apply only with the realm offline or after verifying all writers honor the
+shared maintenance fence:
+
+```bash
+rkat --realm home storage migrate --apply
+```
+
+Apply acquires the exclusive per-realm maintenance fence, waits for shared
+per-operation guards to drain, and then opens each store through its normal
+constructor so exact released predecessors migrate under their owning ledger
+domain. The default fence wait is 10 seconds; change it with
+`--fence-wait-secs`.
+
+Migration refuses when the fence cannot be acquired, a schema is from the
+future, the manifest is unreadable, durable identity is ambiguous, or input
+does not match a recognized predecessor. It never guesses a merge.
+
+Exit status is `0` for a clean report and `1` for an error or fail-closed
+refusal.
+
+## Resolve A Split-Brain Realm
+
+If one realm ID exists under multiple swept roots, ordinary runtime resolution
+and migration both fail closed. First inspect the divergence report:
+
+```bash
+rkat --realm home storage doctor \
+  --root /srv/root-a \
+  --root /srv/root-b \
+  --json
+```
+
+Choose the root whose copy should remain authoritative, then apply explicitly:
+
+```bash
+rkat --realm home storage migrate \
+  --root /srv/root-a \
+  --root /srv/root-b \
+  --apply \
+  --adopt-root /srv/root-a
+```
+
+All copies are fenced and divergence is recomputed while those fences are
+held. The selected copy remains where it lies. Other copies are archived
+read-only with the registered `*.pre-<version>-<timestamp>` naming scheme.
+Meerkat does not synthesize or merge divergent WorkGraph event streams,
+schedule aggregates, or session histories.
+
+`--adopt-root` requires `--apply` and must name one of the swept roots that
+actually contains the realm.
+
+## Recover Storage From Before 0.8.10
+
+Ordinary opens enforce the v0.8.10 compatibility floor. Current releases also
+provide an explicit, fenced bridge for authenticated historical SQLite
+schemas:
+
+```bash
+rkat --state-root /srv/meerkat/realms \
+  --realm home \
+  storage migrate \
+  --apply \
+  --bridge-pre-0-8-10
+```
+
+The bridge is apply-only and supported only when the realm manifest selects
+the `sqlite` backend. It verifies an exact known physical schema and durable
+evidence before importing, then normal strict migration continues under the
+same fence. Unknown, malformed, ambiguous, JSONL, memory, and external-provider
+state is refused without stamping a ledger version.
+
+Take an external backup or immutable generation snapshot before this recovery
+path. The bridge is not an authorization to repair by hand or invent missing
+authority.
+
+## Prune Registered Maintenance Artifacts
+
+`storage prune` is unrelated to live realm deletion. Its dry run lists only
+recognized migration backups and index quarantines:
+
+```bash
+rkat --realm home storage prune
+```
+
+Apply deletion to artifacts at least 30 days old (the default):
+
+```bash
+rkat --realm home storage prune --apply
+```
+
+Choose another minimum age explicitly:
+
+```bash
+rkat --realm home storage prune --apply --older-than-days 90
+```
+
+Only `*.pre-<version>-<timestamp>` backups and
+`*.corrupt-<timestamp>` quarantines under the swept roots are candidates.
+The command never deletes a live realm or an unregistered filename. Use
+`rkat realm delete` or `rkat realm prune` for realm lifecycle.
+
+Exit status is `1` only when deletion/reporting errors occur.
+
+## Recover From A Durable Projection Halt
+
+If appending a canonical session event fails, the persistent session path
+records a durable projection-halt marker and refuses replay or resume past the
+hole. There is currently no self-service command to clear or repair that
+marker, and `storage doctor` does not report it. Do not delete or edit it by
+hand. Stop writers, preserve the complete store for diagnostics, and restore
+an independently verified complete generation or escalate the store for
+provider-specific recovery.
+
+## Operational Runbook
+
+For an unreadable or refused realm:
+
+1. Stop writers if any mutation may be needed.
+2. Run `storage doctor --json` against an explicit root set and save the
+   report with the deployment evidence.
+3. If the issue is split-brain, identify the authoritative generation from
+   external provenance, then use `--apply --adopt-root`. Do not choose by
+   newest timestamp alone.
+4. If the report identifies pre-v0.8.10 SQLite state, take a backup and use
+   the explicit compatibility bridge.
+5. Run `storage migrate` as a dry run, then `--apply` only after the report is
+   clean and the maintenance fence can be acquired.
+6. Run `storage doctor` again and boot the candidate normally.
+7. Prune registered backups only after the rollback window expires.
+
+## See Also
+
+- [Realms](/concepts/realms)
+- [CLI commands](/cli/commands)
+- [Session contracts](/reference/session-contracts)
+- [Durable jobs and monitors](/guides/durable-jobs)

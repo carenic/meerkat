@@ -78,6 +78,41 @@ rkat run \
 This is different from `rkat-rpc --tcp`, which exposes JSON-RPC for hosts and
 SDKs rather than the signed peer channel.
 
+## Reply from inside an agent turn
+
+The agent-facing tools are separate from the host APIs below. When a peer
+message caused the current turn, use the pre-addressed `reply_to_peer` tool:
+
+```json
+{
+  "name": "reply_to_peer",
+  "arguments": {
+    "body": "I reproduced the failure and attached the minimal trace.",
+    "handling_mode": "queue"
+  }
+}
+```
+
+There is no `peer_id` input. The runtime mints a reply capability for the
+incoming delivery and revalidates trust when the reply is sent. If several
+peer messages were admitted in the same turn, the first call returns
+`ambiguous_reply` with delivery IDs; retry with one of them:
+
+```json
+{
+  "name": "reply_to_peer",
+  "arguments": {
+    "reply_to": "delivery-id-from-ambiguous-reply",
+    "body": "This result is for your review request.",
+    "handling_mode": "queue"
+  }
+}
+```
+
+For unsolicited outreach, discover a canonical identity with `peers`, then
+use `send_message`. Use `send_response` only when answering a typed
+`send_request`, not as a general reply tool.
+
 ## Send a typed comms command
 
 `comms/send` is the typed host-side comms surface. Use it for local input, peer messages, peer lifecycle notifications, peer requests, and peer responses. The `to` field is the canonical peer ID (from `comms/peers`), not a display name.
@@ -149,6 +184,48 @@ SDKs rather than the signed peer channel.
     ```
   </Tab>
 </Tabs>
+
+If REST cannot prove the terminal delivery outcome, it returns typed
+`send_ambiguous` details instead of `send_failed`:
+
+```json
+{
+  "code": "send_ambiguous",
+  "envelope_id": "0193a1b2-...",
+  "retry_safe": false,
+  "required_action": "reconcile"
+}
+```
+
+Reconcile that envelope against durable work truth before creating another
+attempt. A new envelope id is new peer work; only a higher-level durable
+idempotency key that is coarser than the retry can make a replay collapse.
+
+### Declare outbound content taint
+
+Host-side peer sends can inherit the runtime declaration, declare a value for
+one send, or explicitly send no declaration. This example affirmatively marks
+the content as tainted:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 20,
+  "method": "comms/send",
+  "params": {
+    "session_id": "01936f8a-...",
+    "kind": "peer_message",
+    "to": "0193a1b2-...",
+    "body": "This summary contains unvetted external web content.",
+    "content_taint": {"declare": "tainted"},
+    "handling_mode": "queue"
+  }
+}
+```
+
+Omit `content_taint` to inherit. Set it to `"undeclared"` to suppress a
+runtime-level declaration for that send. Agent-facing tools do not expose this
+override; they inherit the host-owned runtime declaration.
 
 ## List discoverable peers
 

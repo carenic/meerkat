@@ -10,9 +10,88 @@ For the full guide, see [Mobpack](/guides/mobpack).
 This page is intentionally deployment-focused and CLI-heavy. Use [Examples: Mobs](/examples/mobs) first if you want to understand the multi-agent runtime before packaging it, and continue to [Examples: WASM](/examples/wasm) if your next step is browser delivery.
 </Note>
 
+## Define the portable boundary
+
+A source directory needs `manifest.toml` and `definition.json`. Optional
+archive sections are `skills/`, `hooks/`, `mcp/`, `config/`, `adaptive/`, and
+`schemas/`.
+
+```toml manifest.toml
+surfaces = ["cli", "rpc"]
+
+[mobpack]
+name = "release-triage"
+version = "1.0.0"
+
+[requires]
+capabilities = ["comms"]
+
+[models]
+default = "gpt-5.5"
+```
+
+```json definition.json
+{
+  "id": "release-triage",
+  "orchestrator": {"profile": "lead"},
+  "profiles": {
+    "lead": {
+      "model": "gpt-5.5",
+      "external_addressable": true,
+      "tools": {"comms": true}
+    },
+    "reviewer": {
+      "model": "gpt-5.4-mini",
+      "tools": {"comms": true}
+    }
+  },
+  "flows": {
+    "main": {
+      "steps": {
+        "triage": {
+          "role": "lead",
+          "message": "Triage severity {{ params.severity }}: {{ params.prompt }}"
+        }
+      }
+    }
+  }
+}
+```
+
+To validate callable parameters, optionally add
+`schemas/main-input.json`:
+
+```json schemas/main-input.json
+{
+  "type": "object",
+  "properties": {
+    "prompt": {"type": "string"},
+    "severity": {"enum": ["low", "medium", "high", "critical"]}
+  },
+  "required": ["prompt", "severity"],
+  "additionalProperties": false
+}
+```
+
+If the pack needs defaults, keep `config/defaults.toml` inside the typed
+allow-list:
+
+```toml config/defaults.toml
+max_tokens = 4096
+
+[budget]
+max_tokens = 200000
+max_duration_secs = 900
+max_tool_calls = 200
+```
+
+Arbitrary `[agent]`, `[tools]`, `[shell]`, `[realm]`, `[comms]`, provider-key,
+and storage configuration is rejected. Mobpacks carry runtime intent and
+assets, not credentials or host infrastructure.
+
 ## Pack a mob directory
 
-Bundle a mob directory into a single portable `.mobpack` artifact containing the definition, skills, hooks, and config.
+Bundle the directory into one deterministic `.mobpack` artifact:
 
 ```bash
 rkat mob pack ./mobs/release-triage -o ./dist/release-triage.mobpack
@@ -49,25 +128,67 @@ Check structural integrity, schema conformance, and signature validity.
 rkat mob validate ./dist/release-triage.mobpack --trust-policy permissive
 ```
 
+Validation checks archive safety and digest, typed surface and capability
+requirements, definition and skill references, typed deploy defaults, adaptive
+assets, and signature policy before any mob is created.
+
+## Deploy a pack with an objective
+
+`mob deploy` runs the packaged team against one prompt. CLI model and budget
+flags remain host-owned overrides:
+
+```bash
+rkat mob deploy ./dist/release-triage.mobpack \
+  "triage latest regressions" \
+  --max-duration 15m \
+  --trust-policy permissive
+```
+
 ## Run a pack
 
-Invoke a `.mobpack` as a typed callable run. The input schema is validated
-before the flow starts; `--prompt` is sugar for `--param prompt=<text>`.
+Invoke a `.mobpack` as a typed callable run. When
+`schemas/main-input.json` is present, parameters are validated before the flow
+starts. `--prompt` is sugar for `--param prompt=<text>`.
 
 ```bash
 rkat mob run ./dist/release-triage.mobpack \
+  --flow main \
   --prompt "triage latest regressions" \
   --trust-policy permissive \
   --json
 ```
 
-Use `--detach` to get a run id, then inspect or attach to the same run resource:
+The mob and run records use durable realm custody. Use `--detach` on a callable
+flow to get a run id, then inspect or attach to that run resource:
 
 ```bash
-rkat mob run release-triage --flow main --param severity='"high"' --detach
+rkat mob run ./dist/release-triage.mobpack \
+  --flow main \
+  --prompt "triage latest regressions" \
+  --param severity='"high"' \
+  --detach \
+  --trust-policy permissive
+rkat mob runs release-triage --json
 rkat mob status release-triage <RUN_ID> --json
 rkat mob attach release-triage <RUN_ID> --json
 ```
+
+<Warning>
+`--detach` does not move execution into a daemon. The flow runs only while the
+CLI process lives; after it exits, the next hydration marks unfinished work
+`canceled` because execution custody was lost. The durable resource is still
+available for status and logs.
+</Warning>
+
+## Package an adaptive flow
+
+Adaptive packs add `[adaptive]` manifest metadata plus
+`adaptive/policies.toml`, `adaptive/flowmaster.prompt.md`, and a
+`schemas/registry.json` that points to required bundled schemas. Packing stamps
+the `adaptive_flow` capability and regenerates
+`adaptive/layer-decision.schema.json`; do not hand-maintain that generated
+schema. Validation fails on a policy digest mismatch, incomplete policy limits,
+missing schemas, or a target runtime without the adaptive capability.
 
 ## Trust policies
 
@@ -75,6 +196,10 @@ rkat mob attach release-triage <RUN_ID> --json
 |--------|---------------|----------------|-------------------|
 | `permissive` | Allowed (warns) | Allowed (warns) | Rejected |
 | `strict` | Rejected | Rejected | Rejected |
+
+For signed packs, both policies reject digest and signer-key mismatches.
+Permissive relaxes signer enrollment; it does not disable integrity
+verification.
 
 Trust policy resolution order:
 

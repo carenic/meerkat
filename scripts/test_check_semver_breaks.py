@@ -530,7 +530,11 @@ class CliAcceptanceTests(unittest.TestCase):
         end = REPO_CHANGELOG.index("## [0.8.22]")
         cls.section = REPO_CHANGELOG[start:end]
         cls.head = "# Changelog\n\npolicy blurb\n\n"
-        cls.tail = "## [0.8.22] - 2026-08-09\n\n- old\n"
+        cls.tail = (
+            "## [0.8.22] - 2026-08-09\n\n- old\n\n"
+            "[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.22...HEAD\n"
+            "[0.8.22]: https://github.com/lukacf/meerkat/compare/v0.8.21...v0.8.22\n"
+        )
         cls.tmp = tempfile.TemporaryDirectory()
         cls.report = str(FIXTURES / "report-meerkat-sqlite-0.8.22.txt")
 
@@ -623,7 +627,11 @@ class ChangelogStampTests(unittest.TestCase):
         end = REPO_CHANGELOG.index("## [0.8.22]")
         body = REPO_CHANGELOG[start:end].split("\n", 1)[1]
         cls.pending = "# Changelog\n\npolicy blurb\n\n## [Unreleased]\n" + body
-        cls.tail = "## [0.8.22] - 2026-08-09\n\n- old\n"
+        cls.tail = (
+            "## [0.8.22] - 2026-08-09\n\n- old\n\n"
+            "[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.22...HEAD\n"
+            "[0.8.22]: https://github.com/lukacf/meerkat/compare/v0.8.21...v0.8.22\n"
+        )
         cls.tmp = tempfile.TemporaryDirectory()
 
     @classmethod
@@ -658,6 +666,18 @@ class ChangelogStampTests(unittest.TestCase):
         self.assertIsNone(sections[0].version)
         self.assertTrue(sections[0].is_empty, "stub must stay empty or it becomes the pending one")
         self.assertEqual(sections[1].version, "0.8.24")
+
+    def test_the_stamp_advances_comparison_links(self) -> None:
+        _, path = self.stamp(self.pending + self.tail, "0.8.24")
+        text = path.read_text(encoding="utf-8")
+        self.assertIn(
+            "[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.24...HEAD",
+            text,
+        )
+        self.assertIn(
+            "[0.8.24]: https://github.com/lukacf/meerkat/compare/v0.8.22...v0.8.24",
+            text,
+        )
 
     def test_restamping_the_same_version_is_a_noop(self) -> None:
         # The stamp leaves an EMPTY stub on top, so "already done" and "nobody
@@ -707,6 +727,21 @@ class ChangelogStampTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("YYYY-MM-DD", result.stderr)
+
+    def test_a_stale_unreleased_comparison_base_is_refused(self) -> None:
+        stale = self.tail.replace("v0.8.22...HEAD", "v0.8.21...HEAD")
+        result, _ = self.stamp(self.pending + stale, "0.8.24", name="stale-link")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("expected v0.8.22", result.stderr)
+
+    def test_a_missing_previous_release_reference_is_refused(self) -> None:
+        missing = self.tail.replace(
+            "[0.8.22]: https://github.com/lukacf/meerkat/compare/v0.8.21...v0.8.22\n",
+            "",
+        )
+        result, _ = self.stamp(self.pending + missing, "0.8.24", name="missing-link")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("previous release comparison reference", result.stderr)
 
 
 if __name__ == "__main__":

@@ -29,5 +29,5 @@ session.archive()  → clean up
 # python -m pip install -e sdks/python
 # ./scripts/repo-cargo build -p meerkat-rpc --bin rkat-rpc
 # export MEERKAT_BIN_PATH="$(./scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')/debug/rkat-rpc"
-ANTHROPIC_API_KEY=sk-... python3 main.py
+ANTHROPIC_API_KEY=sk-... python3 examples/007-multi-turn-sessions-py/main.py
 ```

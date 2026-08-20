@@ -6,7 +6,7 @@ icon: "sliders"
 
 ## Global runtime scope flags
 
-All CLI commands accept realm scope flags:
+The top-level CLI parser exposes these realm scope and config flags:
 
 - `--realm <id>`
 - `--isolated`
@@ -14,8 +14,16 @@ All CLI commands accept realm scope flags:
 - `--realm-backend <sqlite|jsonl|memory>` (creation hint only)
 - `--state-root <path>`
 - `--context-root <path>`
+- `--user-config-root <path>`
+- `--default-model <model>`
 
-These flags decide which realm config/session state is used.
+The scope flags decide which realm config and state are used.
+`--user-config-root` overrides the user-level convention root.
+`--default-model` validates and persists the model in the scope-resolved
+config, then continues with the command or exits when no command was given.
+Storage maintenance verbs reject `--isolated` and `--default-model` because
+they dispatch before runtime-scope resolution. `rkat mob host` also rejects
+`--isolated`; a member host must use a stable workspace or explicit realm.
 
 ## Default realm behavior
 
@@ -24,11 +32,18 @@ These flags decide which realm config/session state is used.
 | `rkat run`, `rkat run --resume`, `rkat session ...` | Workspace-derived stable realm (`ws-...`) |
 | `rkat mob ...` | Workspace-derived stable realm (`ws-...`) |
 | `rkat-rpc` | New opaque realm (`realm-...`) |
+| `rkat-rest` | New opaque realm (`realm-...`) |
+| `rkat-mcp` | New opaque realm (`realm-...`) |
 
-If you want CLI + RPC to share the same state, pass the same explicit `--realm` to both.
+If you want CLI + RPC to share the same state, pass both the same explicit
+`--realm` and the same `--state-root`, or launch the server with a matching
+`--context-root` so both surfaces resolve the same project-local root.
 
-For CLI commands, the default context root is the current directory. The default
-state root is `<context-root>/.rkat/realms`.
+For CLI commands, the default invocation context is the current directory. The
+project-local state root is `<project-root>/.rkat/realms`, where the project
+root is the nearest ancestor containing a `.rkat` entry. If none exists, the
+context root is used. `--context-root` changes the ancestor-search starting
+point; `--state-root` bypasses discovery.
 
 Use `--verbose` on `rkat run` to print the active realm, context root, and
 physical realm root. See the [realm guide](/guides/realms) for the full
@@ -36,21 +51,24 @@ identity-vs-storage model.
 
 ## Environment variables
 
-Required API keys (at least one):
+For direct environment-backed provider auth, set at least one key pair below.
+Realm auth bindings and their configured credential stores can supply provider
+credentials instead, so these variables are not universally required.
 
 | Variable | Provider |
 |----------|----------|
-| `ANTHROPIC_API_KEY` | Anthropic Claude |
-| `OPENAI_API_KEY` | OpenAI GPT |
-| `AZURE_OPENAI_API_KEY` plus `AZURE_OPENAI_ENDPOINT` | Azure OpenAI |
-| `GOOGLE_API_KEY` / `GEMINI_API_KEY` | Google Gemini |
+| `RKAT_ANTHROPIC_API_KEY`, `ANTHROPIC_API_KEY` | Anthropic Claude |
+| `RKAT_OPENAI_API_KEY`, `OPENAI_API_KEY` | OpenAI GPT |
+| `RKAT_AZURE_OPENAI_API_KEY` plus `RKAT_AZURE_OPENAI_ENDPOINT`, or the unprefixed pair | Azure OpenAI |
+| `RKAT_GEMINI_API_KEY`, `GEMINI_API_KEY`, `RKAT_GOOGLE_API_KEY`, `GOOGLE_API_KEY` | Google Gemini |
 
 See [providers](/concepts/providers) for full key precedence (`RKAT_*` variants included).
 
 ## Config files
 
-Canonical runtime config for CLI commands is realm-scoped
-(`<context-root>/.rkat/realms/<realm>/config.toml` by default).
+The active realm document is the head of the runtime config chain. Under the
+default project-local state root it is
+`<project-root>/.rkat/realms/<realm>/config.toml`.
 
 Compatibility files still exist:
 
@@ -59,7 +77,25 @@ Compatibility files still exist:
 | User | `~/.rkat/config.toml` |
 | Project | `.rkat/config.toml` |
 
-These are useful for templates (`rkat init`) and compatibility workflows, but realm config is the runtime source of truth for CLI/RPC/REST/MCP surfaces.
+These remain convention inputs for templates and compatibility workflows.
+CLI, RPC, REST, and MCP all resolve the same realm chain.
+
+Realm config supports explicit inheritance:
+
+```toml
+[realm.team]
+parent = "org"
+```
+
+Resolution starts at the selected realm, follows each explicit parent, and
+appends the reserved `global` realm only when it is configured. Child values
+add to or override parent values. State never inherits: sessions, jobs,
+schedules, WorkGraph data, blobs, artifacts, and runtime rows remain owned by
+the selected realm. Credential reads inherit. A credential write must
+explicitly target the realm that owns the binding; a child-addressed inherited
+write is rejected with the owner identity. Named MCP, hook, and other
+union-by-name collections have no tombstones, so an empty child table does not
+delete an inherited entry.
 
 Common tool gates:
 
@@ -67,8 +103,28 @@ Common tool gates:
 [tools]
 builtins_enabled = false
 shell_enabled = false
+comms_enabled = false
+mob_enabled = false
 schedule_enabled = true
 workgraph_enabled = false
+default_timeout = "10m"
+max_concurrent = 10
+
+[tools.tool_timeouts]
+shell = "2m"
+```
+
+`tools.mcp_servers` is also accepted in runtime config, although the CLI's
+user/project MCP convention files are managed separately as described below.
+
+Streaming retries have a 300-second inactivity watchdog by default. Override
+it with a humantime value, or disable only this watchdog explicitly:
+
+```toml
+[retry]
+stream_inactivity_timeout = "2m"
+
+# Or: stream_inactivity_timeout = "disabled"
 ```
 
 ## Custom model registry entries
@@ -116,13 +172,17 @@ tier = "supported"
 context_window = 256000
 max_output_tokens = 8192
 vision = true
-image_tool_results = true
+image_tool_results = false
 inline_video = false
 supports_temperature = true
 supports_thinking = true
 supports_reasoning = true
 call_timeout_secs = 600
 ```
+
+`vision = true` covers image input. With `api_style = "chat_completions"`,
+`image_tool_results` must remain `false`; that result shape is available only
+through a validated `responses` endpoint.
 
 `transport` is currently `openai_compatible` only.
 
@@ -160,7 +220,7 @@ provider = "anthropic"
 [[model_fallback.chain]]
 model = "gpt-5.5"
 provider = "openai"
-auth_binding = { realm = "dev", binding = "openai_oauth" }
+auth_binding = { realm = "global", binding = "openai_oauth" }
 ```
 
 Omit `chain` to use the catalog default chain. Set `enabled = false` to fail
@@ -185,14 +245,22 @@ search remains disabled after a fallback switch.
 
 ## Session storage layout
 
-CLI realm storage lives under the active state root. By default, that is
-project-local:
+CLI realm storage resolves by realm identity across the configured candidate
+roots. By default, a fresh workspace realm is created under the nearest
+ancestor containing `.rkat`, falling back to the context root:
 
 ```text
-<context-root>/.rkat/realms/<realm>/
+<project-root>/.rkat/realms/<realm>/
 ```
 
 Pass `--state-root <path>` to use a different parent directory.
+
+An explicit state root wins. Otherwise, an existing unique realm copy is
+reused across project-local and user-global candidates. If the same realm is
+materialized under multiple candidates, normal opens fail closed as typed
+split-brain. Use `rkat storage doctor` to inspect it and the fenced
+`rkat storage migrate --apply --adopt-root <path>` path to choose the copy to
+keep.
 
 Important files:
 
@@ -201,10 +269,35 @@ Important files:
 - `config_state.json` (config generation CAS state)
 - `sessions.sqlite3` (when backend is sqlite)
 - `sessions_jsonl/` (when backend is jsonl)
+- `runtime.sqlite3` (JSONL runtime companion)
+- `jobs.sqlite3` (durable detached jobs)
+- `workgraph.sqlite3` (WorkGraph state)
+- `<projection_root>/.rkat/events/` (optional derived event audit/replay log)
+- `<projection_root>/.rkat/sessions/<session_id>/` (rebuildable materialized session views)
+- `blobs/` (realm blob objects)
+- `artifacts/` (stable artifact records)
+- `<store_path>/approvals.json` (RPC approval-record sidecar when the persistence bundle exposes a store path)
 - `mobs/` (per-mob `<mob_id>.db` SQLite storage plus `realm_profiles.db`)
+
+`<store_path>/approvals.json` is not an eighth `RealmStorageProvider` durability domain.
+The current `storage doctor` and `storage migrate` commands do not inventory or
+migrate this RPC-owned sidecar.
+For built-in SQLite and named memory realms, `store_path` is the realm root;
+for the JSONL backend, it is the `sessions_jsonl/` directory.
+
+The optional event audit log and its `.rkat/sessions/` materialized views belong
+to session/event projection, not additional `RealmStorageProvider` domains.
+Both are asynchronous derived state; the `RuntimeStore`/backend carrier remains
+authority. Per-session files may be regenerated when the audit log is healthy.
 
 `--realm-backend` is a creation hint. After first realm creation, backend selection is pinned by `realm_manifest.json`.
 This applies to both session storage and `rkat mob` command behavior in that realm.
+
+Manifest format 2 also records an optional external storage `provider` and
+explicit `ephemeral_domains`. Every storage provider must declare exactly one
+durability resolution for each of the seven domains: `sessions`, `runtime`,
+`schedule`, `workgraph`, `jobs`, `blobs`, and `artifacts`. A durable domain may
+not silently fall back to memory.
 
 When SQLite support is compiled in, new persistent realms default to `sqlite`.
 
@@ -226,8 +319,17 @@ Project servers override user servers with the same name.
 | 0 | Success |
 | 1 | Internal error |
 | 2 | Budget exhausted |
+| 45 | Mob control scope denied |
+| 46 | Mob member host unavailable |
+| 47 | Mob event cursor is stale |
+| 48 | Mob fence or generation is stale |
 
-Most richer session/provider/runtime failures are reported through structured error payloads and stderr text rather than a large exit-code taxonomy. In particular, session persistence/compaction disabled conditions are informational at the CLI transport layer and do not map to dedicated non-zero exit codes.
+Codes 45-48 are used only by mob-family commands that carry the matching typed
+multi-host error. Most richer session/provider/runtime failures are reported
+through structured error payloads and stderr text rather than a large exit-code
+taxonomy. In particular, session persistence/compaction disabled conditions are
+informational at the CLI transport layer and do not map to dedicated non-zero
+exit codes.
 
 ## See also
 

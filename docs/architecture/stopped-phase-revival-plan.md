@@ -4,7 +4,16 @@ description: "Root-cause design record for the 0.7.19–0.7.23 resume-strand cla
 icon: "rotate-right"
 ---
 
-# Stopped-Phase Revival — implementation plan (0.7.24)
+# Stopped-Phase Revival - Historical Implementation Record (0.7.24)
+
+> Current status (2026-08-20): **Implemented.** Machine-owned stopped-phase
+> revival shipped in v0.7.24. The cold-revival runtime rebind follow-up shipped
+> in v0.7.26. This document is the historical root-cause and implementation
+> record; current code lives in
+> `meerkat-runtime/src/meerkat_machine/session_management.rs`, with the stopped
+> lattice pinned by
+> `meerkat-machine-schema/tests/stopped_phase_revival_lattice.rs` and Mob
+> revival tests.
 
 Root cause (verified, wf_63cf2cb3-27c + field forensics): the MeerkatMachine session
 DSL classifies Stopped as terminal (only exits: UnregisterSessionStopped→Idle teardown,

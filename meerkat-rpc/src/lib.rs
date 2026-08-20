@@ -1,7 +1,8 @@
-//! meerkat-rpc - JSON-RPC stdio server for Meerkat
+//! meerkat-rpc - JSON-RPC server for Meerkat
 //!
-//! Provides a JSON-RPC 2.0 stdio interface for IDE integration,
-//! desktop apps, and automation tools.
+//! Provides JSON-RPC 2.0 over stdio by default, with an opt-in TCP listener
+//! for trusted host integrations. The same method router backs IDEs, desktop
+//! apps, SDK subprocesses, and automation tools.
 
 #![allow(
     dead_code,

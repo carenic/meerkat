@@ -1,4 +1,4 @@
-# 031 — WASM Mini Diplomacy Arena (Shell + Web)
+# 031 - WASM Mini Diplomacy Arena (Shell + Web)
 
 Flagship browser example: **9 autonomous AI agents** across 3 factions wage a territory war with real-time strategy, diplomacy, and deception — all running in-browser via the Meerkat WASM runtime.
 
@@ -6,11 +6,12 @@ Flagship browser example: **9 autonomous AI agents** across 3 factions wage a te
 
 This is primarily a **smoke test for the Meerkat WASM platform**, exercising:
 
-- **Autonomous keep-alive mode on WASM** — agents run continuous keep-alive loops, wake on comms messages, make LLM calls, all inside `wasm32-unknown-unknown`
+- **In-memory autonomous host loops on WASM** - agents wake on comms messages and make LLM calls inside `wasm32-unknown-unknown`
 - **Multi-mob orchestration** — 4 mobs (3 factions + narrator) created and managed via `MobMcpState`
 - **Cross-mob comms** — ambassadors in different mobs discover each other and negotiate via `InprocRegistry` cross-namespace routing
 - **Flow engine on WASM** — narrator mob uses a `turn_driven` flow for structured JSON output
-- **Event streaming** — `try_recv()` on raw `broadcast::Receiver` for real-time UI updates
+- **Event streaming** - subscription `StreamRef` handles polled with
+  `poll_subscription()` for real-time UI updates
 - **Inline skills** — per-agent system prompts delivered via `SkillSource::Inline` in the mob definition
 
 ## Architecture
@@ -56,17 +57,28 @@ JS detects quiescence → extracts orders → resolves combat → narrator flow
 ### Wiring
 
 - **Intra-mob**: explicit `mob_wire` — planner↔operator, planner↔ambassador
-- **Cross-mob**: `wire_cross_mob` — all ambassador pairs get bidirectional trust
+- **Cross-mob**: `mob_member_peer_target` plus `mob_wire_peer` gives each
+  ambassador pair bidirectional trust
 - Ambassadors have `external_addressable: true` for cross-namespace discovery
 
 ## Prerequisites
 
 ```bash
 ./scripts/repo-cargo build -p rkat --bin rkat  # builds rkat for repo-local runs
-wasm-pack --version                            # install if not already available
 node --version                                 # 20+
 npm --version
 ```
+
+The script uses the prebuilt runtime at
+`sdks/web/wasm/meerkat_web_runtime_bg.wasm`. If it is missing or Rust code has
+changed, install `wasm-pack` and rebuild it first:
+
+```bash
+npm --prefix sdks/web install
+npm --prefix sdks/web run build:wasm
+```
+
+You can instead set `MEERKAT_WASM=/path/to/meerkat_web_runtime_bg.wasm`.
 
 `./examples.sh` will automatically prefer repo-local binaries built by
 `./scripts/repo-cargo` when present.
@@ -80,7 +92,7 @@ chmod +x examples.sh && ./examples.sh
 
 This will:
 1. Create a minimal mobpack (definitions are constructed in TypeScript at runtime)
-2. Build the WASM runtime via `rkat mob web build`
+2. Assemble the browser runtime with `rkat mob web build --wasm ...`
 3. Build the Vite web app
 4. Copy WASM files to `web/dist/`
 
@@ -94,13 +106,13 @@ open http://127.0.0.1:4173
 
 ```bash
 ./scripts/repo-cargo build -p rkat --bin rkat
+npm --prefix sdks/web run build:wasm
 cd examples/031-wasm-mini-diplomacy-sh
 ./examples.sh
 ```
 
-That path stays aligned with the current browser packaging flow because it
-rebuilds the runtime through `rkat mob web build` instead of teaching a separate
-direct `wasm-pack` recipe.
+The SDK build step compiles the WASM runtime. `rkat mob web build` then assembles
+the prebuilt runtime and mobpack into the browser bundle.
 
 ## Usage
 
@@ -123,7 +135,7 @@ direct `wasm-pack` recipe.
 |------|---------|
 | `web/src/main.ts` | Game engine, mob definitions, event streaming, UI |
 | `web/src/styles.css` | Slack-like DM interface, territory map styling |
-| `examples.sh` | Build script (mobpack → WASM → Vite) |
+| `examples.sh` | Build script (mobpack + prebuilt WASM + Vite) |
 | `../../meerkat-web-runtime/src/lib.rs` | WASM exports powering the runtime |
 | `../../meerkat-mob/src/runtime/flow.rs` | Flow engine (narrator uses this) |
 | `../../meerkat-comms/src/router.rs` | Cross-namespace inproc routing |

@@ -27,7 +27,7 @@ Use this guide when you want:
 
 The comms system provides:
 
-- **Four LLM-facing tools**: `send_message`, `send_request`, `send_response`, and `peers`
+- **Five LLM-facing tools**: `send_message`, `reply_to_peer`, `send_request`, `send_response`, and `peers`
 - **Three transport layers**: Unix Domain Sockets (UDS), TCP, and in-process (`inproc`)
 - **Ed25519 cryptographic identity**: Every agent has a keypair; all messages are signed
 - **Trust-based peer model**: Agents only accept messages from explicitly trusted peers
@@ -70,7 +70,7 @@ graph TD
         PUDS["UDS Event Listener"]
         STDIN["Stdin Reader"]
         WEBHOOK["REST Webhook"]
-        RPC_EVT["RPC comms/send"]
+        RPC_EVT["RPC session/external_event"]
     end
 
     comms --> signed
@@ -91,10 +91,10 @@ graph TD
     Ensure the `comms` Cargo feature is compiled in (enabled by default in the CLI; opt-in on the `meerkat` facade crate).
   </Step>
   <Step title="Generate identity">
-    Identity is auto-generated on first run. Keys are stored under the realm runtime root (workspace `.rkat/identity/` for the default CLI workspace realm, realm data dir for non-workspace realms).
+    Identity is auto-generated on first run. Factory-built sessions use the canonical durable session-comms identity root so a session keeps its keypair across restarts. A standalone `CoreCommsConfig` resolves `identity_dir` relative to the base directory supplied by its host.
   </Step>
   <Step title="Configure trusted peers">
-    Add peers to `trusted_peers.json` under the active runtime root with their name, public key, and address.
+    Let mob wiring, host binding, or the typed pairing protocol install machine-authorized trust. Do not seed `trusted_peers.json` by hand: a non-empty persisted file is rejected at runtime startup because it is a projection, not trust authority. Route by the derived `PeerId`, never by the display name.
   </Step>
   <Step title="Run with comms enabled">
     Use `--comms-name <NAME>` on the CLI or set `enable_comms` on `AgentFactory`.
@@ -108,7 +108,7 @@ Each agent has an Ed25519 keypair managed by the `Keypair` type (`meerkat-comms/
 - **Key generation**: `Keypair::generate()` creates a new random keypair using `OsRng`.
 - **Key persistence**: `Keypair::save(dir)` writes `identity.key` (mode `0600` on Unix) and `identity.pub` to disk. `Keypair::load(dir)` reads them back. `Keypair::load_or_generate(dir)` is the canonical entry point.
 - **Public key format**: `PubKey` is a 32-byte Ed25519 public key. The canonical string format is `ed25519:<base64>` (standard Base64 with padding).
-- **Default identity directory**: `<runtime-root>/.rkat/identity/`.
+- **Standalone default identity directory**: `<base-dir>/.rkat/identity/`. Session-scoped factory builds use a durable per-session identity root instead.
 
 <Accordion title="Envelope signing">
 Every message is wrapped in a signed `Envelope`:
@@ -125,7 +125,15 @@ pub struct Envelope {
 
 The signable bytes are computed by serializing `(id, from, to, kind)` as CBOR, then recursively sorting all map keys by canonical order (RFC 8949) before encoding. This ensures deterministic signing across implementations.
 
-Content-bearing kinds (`Message` / `Request` / `Response`) carry optional signed-when-present metadata fields (`blocks`, `content_taint`, `handling_mode`): a field that is absent (`None`) is omitted from the encoding entirely, so older envelopes stay byte-identical and keep verifying, while a present field lives inside the signed region because `kind` is part of the signable tuple. `content_taint` is the sender-declared content-taint declaration (`clean` / `tainted`); an omitted declaration is a real third state that receivers must never coalesce into `clean`.
+Content-bearing kinds (`Message` / `IncarnationFencedMessage` / `Request` /
+`Response`) carry optional signed-when-present metadata fields (`blocks`,
+`content_taint`, `handling_mode`, and `objective_id`). A field that is absent
+(`None`) is omitted from the encoding entirely, so older envelopes stay
+byte-identical and keep verifying, while a present field lives inside the
+signed region because `kind` is part of the signable tuple. `content_taint` is
+the sender-declared content-taint declaration (`clean` / `tainted`); an
+omitted declaration is a real third state that receivers must never coalesce
+into `clean`.
 
 Cross-version note: an envelope carrying `content_taint` sent to an older receiver fails signature verification there (the older signable projection differs), so under the default `require_peer_auth = true` the envelope is dropped with a typed `InvalidSignature` error - loud and fail-closed. With `require_peer_auth = false` the older receiver skips verification and the declaration silently drops out of its typed view.
 </Accordion>
@@ -145,7 +153,12 @@ pub struct TrustEntry {
 }
 ```
 
-Stored as JSON at `<runtime-root>/.rkat/trusted_peers.json` with the stable persisted row shape `{ name, pubkey, addr, meta }`; the `PeerId` is re-derived from the pubkey on load, and rows with invalid names, addresses, key material, or duplicate canonical identities are rejected fail-closed:
+The projection written at `<runtime-root>/.rkat/trusted_peers.json` uses the
+stable row shape `{ name, pubkey, addr, meta }`; the `PeerId` is re-derived
+from the pubkey when the file is inspected. This is not a user-editable trust
+configuration or restart seed. `CommsRuntime` rejects a non-empty persisted
+seed at startup because live trust must be replayed through generated machine
+or composition authority. The shape is shown here for diagnostics only:
 
 ```json
 {
@@ -236,12 +249,14 @@ pub enum MessageKind {
         blocks: Option<Vec<ContentBlock>>,
         content_taint: Option<SenderContentTaint>,
         handling_mode: Option<HandlingMode>,
+        objective_id: Option<ObjectiveId>,
     },
     IncarnationFencedMessage {
         body: String,
         blocks: Option<Vec<ContentBlock>>,
         content_taint: Option<SenderContentTaint>,
         handling_mode: Option<HandlingMode>,
+        objective_id: Option<ObjectiveId>,
         expected_recipient: PeerRecipientIncarnation,
     },
     Request {
@@ -251,6 +266,7 @@ pub enum MessageKind {
         reply_endpoint: Option<PeerAddress>,
         content_taint: Option<SenderContentTaint>,
         handling_mode: Option<HandlingMode>,
+        objective_id: Option<ObjectiveId>,
     },
     Lifecycle { kind: PeerLifecycleKind, params: JsonValue },
     Response {
@@ -260,6 +276,7 @@ pub enum MessageKind {
         blocks: Option<Vec<ContentBlock>>,
         content_taint: Option<SenderContentTaint>,
         handling_mode: Option<HandlingMode>,
+        objective_id: Option<ObjectiveId>,
     },
     Ack { in_reply_to: Uuid },
 }
@@ -283,6 +300,10 @@ addresses are never callback authority. The legacy uncorrelated staging seam
 accepts only machine-authorized endpoints already held in runtime state.
 Controlled bridge responders use the correlated path for alternate-authority
 probes whose temporary listener port differs from the peer's durable route.
+
+`objective_id` is optional signed causality metadata for content-bearing kinds.
+`incarnation_fenced_message` is internal placed-member routing: the exact
+recipient generation and fence are signed and checked before work admission.
 </Accordion>
 
 ### ACK behavior
@@ -290,12 +311,17 @@ probes whose temporary listener port differs from the peer's durable route.
 | Message Kind | Sender waits for ACK? | Receiver sends ACK? |
 |-------------|----------------------|---------------------|
 | `Message` | Yes (with timeout) | Yes |
+| `IncarnationFencedMessage` | Yes (with timeout) | Yes |
 | `Request` | Yes (with timeout) | Yes |
 | `Lifecycle` | No | No |
 | `Response` | No | No |
 | `Ack` | No | No (would loop) |
 
-ACK timeout defaults to 30 seconds. If no ACK is received, the send fails with `SendError::PeerOffline`.
+ACK timeout defaults to 30 seconds. The low-level router reports a missing
+stream ACK as `PeerOffline`, but runtime and host surfaces preserve the
+uncertainty as `SendError::AmbiguousDelivery` with the envelope id. A receiver
+may have committed the envelope before the acknowledgement was lost, so this
+is not automatic retry authority.
 
 <Accordion title="MessageIntent variants">
 The `MessageIntent` enum (`meerkat-comms/src/agent/types.rs`) provides type-safe intent values for classifying incoming requests:
@@ -320,7 +346,7 @@ The LLM-facing `send_request` tool accepts a separate, closed intent vocabulary 
 
 ## LLM-facing tools
 
-Four tools are exposed to the LLM when comms is enabled.
+Five tools are exposed to the LLM when comms is enabled.
 
 <Accordion title="send_message">
 Send a collaboration message to a peer.
@@ -346,6 +372,37 @@ Send a collaboration message to a peer.
 </ParamField>
 
 **Response**: `{"status": "sent", "kind": "peer_message", "receipt": {...}}`
+</Accordion>
+
+<Accordion title="reply_to_peer">
+Reply to the peer message that triggered the current turn. The runtime mints a
+turn-scoped, pre-addressed reply capability, so this tool deliberately has no
+`peer_id` field.
+
+<ParamField path="reply_to" type="string">
+  Optional delivery ID. Supply it only when several peer messages were admitted into this turn; an `ambiguous_reply` error lists the valid IDs.
+</ParamField>
+
+<ParamField path="body" type="string" required>
+  Reply content.
+</ParamField>
+
+<ParamField path="blocks" type="array">
+  Optional multimodal text and `image_ref` blocks.
+</ParamField>
+
+<ParamField path="handling_mode" type="string" required>
+  Use `"queue"` for ordinary collaboration or `"steer"` for urgent preemption.
+</ParamField>
+
+**Response**: `{"status": "sent", "kind": "peer_message", "receipt": {...}}`
+
+The capability exists only for peer-message deliveries in the current turn.
+Calls fail with `no_reply_capability` when no such message caused the turn,
+`ambiguous_reply` when a selector is needed, and `unknown_reply_to` for an
+invalid selector. Trust and reachability are rechecked at dispatch time. Use
+`send_message` for unsolicited outreach and `send_response` only for typed
+request traffic.
 </Accordion>
 
 <Accordion title="send_request">
@@ -468,11 +525,12 @@ discovery metadata only.
 ### Tool availability
 
 Comms tool availability is reported per tool via the catalog
-(`comms_tool_unavailable_reason` in `meerkat-comms`). `send_message` and
-`peers` are advertised even before any peers are configured, so live providers
-can discover later wiring. `send_request` and `send_response` require a
-runtime-bound command authority; without one they are marked unavailable with
-the typed reason `RuntimeCommandAuthorityUnavailable`.
+(`comms_tool_unavailable_reason` in `meerkat-comms`). `send_message`,
+`reply_to_peer`, and `peers` do not require runtime command authority.
+`reply_to_peer` still needs a valid runtime-minted reply capability when it is
+called. `send_request` and `send_response` require runtime command authority;
+without one they are marked unavailable with the typed reason
+`RuntimeCommandAuthorityUnavailable`.
 
 ## Inbox
 
@@ -492,6 +550,20 @@ Queueing an inbox item and consuming it are separate truths:
 - volatile consumption is an exact FIFO handoff to a control consumer and does not claim durable admission
 
 This avoids the old assumption that turn-boundary drain is always the only real consumer.
+
+In-process sends wait for both queue capacity and the receiver's exact ingress
+resolution, bounded by `ack_timeout_secs`. If the bound expires before queue
+admission, nothing was delivered. If it expires after admission, the result is
+`AmbiguousDelivery`: the envelope remains on the receiver's queue and may
+still commit. Do not blindly retry an ambiguous send. Reconcile by envelope
+or durable work identity first; a retry with a fresh interaction id is not
+deduplicated against the original peer delivery. A higher-level durable
+idempotency key helps only when it is coarser than the retry. A per-attempt or
+timestamped key is not protection.
+
+REST reports this case as `send_ambiguous`, not `send_failed`, and includes
+`envelope_id`, `retry_safe: false`, and `required_action: "reconcile"` in the
+details payload.
 
 ## Configuration
 
@@ -528,7 +600,7 @@ pub struct CoreCommsConfig {
     pub event_listen_tcp: Option<SocketAddr>, // Plain event listener (auth = Open only)
     pub event_listen_uds: Option<PathBuf>,   // Plain event listener (Unix, auth = Open only)
     pub identity_dir: PathBuf,               // Default: ".rkat/identity"
-    pub trusted_peers_path: PathBuf,         // Default: ".rkat/trusted_peers.json"
+    pub trusted_peers_path: PathBuf,         // Persisted projection path, not startup authority
     pub ack_timeout_secs: u64,               // Default: 30
     pub max_message_bytes: u32,              // Default: 1,048,576
     pub auth: CommsAuthMode,
@@ -629,11 +701,19 @@ When another agent calls `peers()`, the output includes the metadata:
 ```json
 {
   "peers": [{
-    "name": "reviewer",
     "peer_id": "018f6b2a-...",
-    "address": "inproc://reviewer",
-    "description": "Reviews pull requests for style issues",
-    "labels": {"lang": "rust", "team": "infra"}
+    "name": "reviewer",
+    "address": {
+      "transport": "inproc",
+      "endpoint": "reviewer"
+    },
+    "source": "inproc",
+    "sendable_kinds": ["peer_message", "peer_request", "peer_response"],
+    "capabilities": {"version": 1, "extensions": {}},
+    "meta": {
+      "description": "Reviews pull requests for style issues",
+      "labels": {"lang": "rust", "team": "infra"}
+    }
   }]
 }
 ```
@@ -689,7 +769,9 @@ let (tools_with_comms, usage_instructions) =
     compose_tools_with_comms(base_tools, tool_usage_instructions, comms_material)?;
 ```
 
-This composes the base tool dispatcher with a `CommsToolSurface` (built from `CommsToolMaterial`) via `DynamicToolComposite`, registering `send_message`, `send_request`, `send_response`, and `peers`.
+This composes the base tool dispatcher with a `CommsToolSurface` (built from
+`CommsToolMaterial`) via `DynamicToolComposite`, registering `send_message`,
+`reply_to_peer`, `send_request`, `send_response`, and `peers`.
 </Accordion>
 
 <Accordion title="Using AgentFactory">
@@ -758,6 +840,12 @@ Incoming comms are persisted as typed `system_notice` blocks with `comms` payloa
 - **Request**: `comms.kind = "request"` plus peer identity, request id, intent, params payload, and response guidance in the model projection.
 - **Response**: `comms.kind = "response_terminal"` or `response_progress` plus peer identity, request id, status, and payload.
 
+At the commit seam, each incoming comms block also projects a
+`peer_content_ingested` event containing the typed comms kind, canonical peer
+fact, request correlation, and the sender's signed content-taint declaration.
+This event is best-effort observation. The typed transcript block remains the
+durable owner, and an absent taint declaration remains distinct from `clean`.
+
 ## Typed peer lifecycle notices
 
 Some peer lifecycle notices are informational and should not trigger an LLM turn. Mob lifecycle routing is typed at peer ingress (`PeerLifecycleKind`) instead of relying on `silent_comms_intents` folklore:
@@ -800,7 +888,7 @@ External systems can push events into a running agent without Ed25519 authentica
 | Webhook | REST | `POST /sessions/{id}/external-events` | `RKAT_WEBHOOK_SECRET` env var |
 | RPC | JSON-RPC | `session/external_event` method | None (implicit) |
 | TCP listener | Comms | Configure `event_address` in config | `auth = "none"` required |
-| UDS listener | Comms | Configure `event_address` in config | `auth = "none"` required |
+| UDS listener | Rust comms host | Set `CoreCommsConfig.event_listen_uds` | `auth = "none"` required |
 
 ### CLI stdin events
 
@@ -920,15 +1008,18 @@ This makes the public contract explicit: comms delivers work, and observability 
 ## Security
 
 <Warning>
-The current implementation does not include nonce-based replay prevention.
+Signatures authenticate bytes and identity; they do not encrypt content or
+prove wall-clock freshness. Runtime-backed ingress durably deduplicates exact
+interaction replays, but envelopes have no timestamp or nonce window.
 </Warning>
 
 - **All messages are signed** with Ed25519 using canonical CBOR encoding
-- **Trust is explicit**: only messages from peers in `trusted_peers.json` are accepted
+- **Trust is explicit**: only messages from peers in the live, machine-authorized `TrustStore` are accepted; the persisted JSON projection is not startup authority
 - **Misaddressed messages are dropped**: the receiver verifies `envelope.to` matches its own public key
 - **Private keys are stored with restrictive permissions**: `identity.key` is written with mode `0600` on Unix
 - **Secret bytes are zeroized**: `Keypair::from_secret()` zeroizes the input after copying
 - **ACK validation**: ACK signatures, sender, recipient, and `in_reply_to` ID are all verified
+- **Exact replay handling**: durable runtime ingress deduplicates the same interaction identity instead of starting a second turn
 
 ## See also
 

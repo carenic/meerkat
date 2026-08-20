@@ -4,22 +4,24 @@ description: "Realm-scoped credential resolution: from the env-var happy path to
 icon: "key"
 ---
 
-Meerkat's auth story has two layers. The **fast path** is env vars
-(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, or
-`AZURE_OPENAI_API_KEY` plus `AZURE_OPENAI_ENDPOINT`) — set them and
+Meerkat's auth story has two layers. The **fast path** is environment variables
+(`RKAT_ANTHROPIC_API_KEY`, `RKAT_OPENAI_API_KEY`,
+`RKAT_GEMINI_API_KEY`, or the matching provider-native names) - set them and
 `rkat run` works. The **powerful path** is realm-scoped bindings:
-declare a realm in your config, register credentials via `rkat auth
-login` or the REST/RPC surfaces, and pass `--auth-binding
-<realm>:<binding>` to scope a session or mob member to that specific
-binding.
+declare a realm in your config, register global credentials via `rkat auth
+login` or binding-scoped credentials through REST/RPC, and pass `--auth-binding
+<realm>:<binding>` for a session or structural `auth_binding` on a mob-member
+spawn.
 
 <Note>
 `rkat auth login` provisions the reserved `global` realm in the home-rooted doc
-at `~/.rkat/config.toml`. Because `global` is the universal tail of every realm
-chain, a single sign-in is inherited by every workspace realm (credential reads
-inherit down the chain). For a binding owned by a specific realm such as
+at `~/.rkat/config.toml`. Once configured, `global` is the implicit tail of a
+workspace realm's chain, so a single sign-in is inherited by every workspace
+realm (credential reads inherit down the chain). For a binding owned by a
+specific realm such as
 `prod:openai`, manage that realm's config entries directly; credential *writes*
-are strict-owner and land only in the realm that defines the binding. See
+are strict-owner and must explicitly target the realm that defines the binding.
+A child-addressed inherited write is rejected with the owner identity. See
 [Realm inheritance](/concepts/realm-inheritance).
 </Note>
 
@@ -32,35 +34,47 @@ Use this guide when you need more than the env-var fast path:
 - hot-swapping provider identity
 - per-mob-member credential overrides
 
-Both paths route through the same `ProviderRuntimeRegistry`. There's no
-hidden magic path: the env fallback is a synthesized realm with
-`CredentialSourceSpec::Env`, resolved by the same code that handles
-your configured realms.
+Both paths route through the same `ProviderRuntimeRegistry`. The environment
+fallback is a synthesized binding with a typed
+`origin = "synthetic_env_default"` and `CredentialSourceSpec::Env`. It is
+ephemeral, is not a durable realm, and cannot participate in inheritance.
 
 ## The fast path: env vars
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+export RKAT_ANTHROPIC_API_KEY=sk-ant-...
 rkat run "What's the weather like in 2026?"
 ```
 
-That's it. If the env var is set, Meerkat synthesizes a default realm
-(`env_default`) with a binding that reads the key via
-`CredentialSourceSpec::Env`, then resolves normally. `RKAT_*`-prefixed
-env vars (e.g., `RKAT_ANTHROPIC_API_KEY`) take precedence over the
-provider-native names.
+That's it. Meerkat synthesizes an ephemeral binding that reads the key, then
+uses the normal backend/auth compatibility and provider-resolution path.
+`RKAT_*` variants take precedence over provider-native names.
 
-| Provider | Primary env var | Fallback |
-|----------|-----------------|----------|
-| Anthropic | `ANTHROPIC_API_KEY` | — |
-| OpenAI | `OPENAI_API_KEY` | — |
-| OpenAI on Azure | `AZURE_OPENAI_API_KEY` plus `AZURE_OPENAI_ENDPOINT` | Optional `AZURE_OPENAI_IMAGE_GENERATION_DEPLOYMENT`, `AZURE_OPENAI_IMAGE_GENERATION_API_VERSION` |
-| Gemini | `GEMINI_API_KEY` | `GOOGLE_API_KEY` |
+| Provider | Resolution order |
+|----------|------------------|
+| Anthropic | `RKAT_ANTHROPIC_API_KEY`, `ANTHROPIC_API_KEY` |
+| Public OpenAI | `RKAT_OPENAI_API_KEY`, `OPENAI_API_KEY` |
+| OpenAI on Azure | Prefixed key + endpoint pair, then `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` |
+| Gemini | `RKAT_GEMINI_API_KEY`, `GEMINI_API_KEY`, `RKAT_GOOGLE_API_KEY`, `GOOGLE_API_KEY` |
 
 If both public OpenAI and unprefixed Azure OpenAI env vars are present, the
 public OpenAI env default wins. Use `RKAT_AZURE_OPENAI_API_KEY` plus
 `RKAT_AZURE_OPENAI_ENDPOINT`, or an explicit realm binding, to make Azure
 OpenAI the env default in that case.
+
+Azure image generation can additionally use
+`RKAT_AZURE_OPENAI_IMAGE_GENERATION_DEPLOYMENT` and
+`RKAT_AZURE_OPENAI_IMAGE_GENERATION_API_VERSION` (or their unprefixed
+equivalents).
+
+<Warning>
+`openai_api` with an API key and `chatgpt_backend` with ChatGPT OAuth are
+different account surfaces. The first uses an OpenAI API organization/project;
+the second uses ChatGPT/Codex subscription and workspace entitlement. A model
+listed by `rkat models` is supported by Meerkat but may still be unavailable
+to the active account. Keep the backend, auth method, and binding
+`default_model` aligned.
+</Warning>
 
 ## The powerful path: realms + bindings
 
@@ -76,7 +90,8 @@ and provider bindings. It lets you:
 ### Realm shape
 
 ```toml
-# ~/.rkat/config.toml (or project-local .rkat/config.toml)
+# The owning realm's config document:
+# <state-root>/prod/config.toml
 
 [realm.prod.backend.anthropic_primary]
 provider = "anthropic"
@@ -88,13 +103,13 @@ backend_kind = "openai_api"
 
 [realm.prod.auth.anthropic_oauth]
 provider = "anthropic"
-auth_method = "claude_ai_oauth"
-source = { kind = "managed_store" }
+auth_method = "api_key"
+source = { kind = "env", env = "PROD_ANTHROPIC_API_KEY" }
 
 [realm.prod.auth.openai_apikey]
 provider = "openai"
 auth_method = "api_key"
-source = { kind = "managed_store" }
+source = { kind = "env", env = "PROD_OPENAI_API_KEY" }
 
 [realm.prod.binding.default]
 backend_profile = "anthropic_primary"
@@ -118,7 +133,7 @@ options = { image_generation_deployment = "gpt-image-2", image_generation_api_ve
 [realm.prod.auth.azure_openai_key]
 provider = "openai"
 auth_method = "azure_api_key"
-source = { kind = "managed_store" }
+source = { kind = "env", env = "PROD_AZURE_OPENAI_API_KEY" }
 
 [realm.prod.binding.azure_openai]
 backend_profile = "azure_openai"
@@ -137,16 +152,25 @@ rkat auth login anthropic
 rkat auth login openai --non-interactive --secret "$OPENAI_KEY"
 ```
 
+Interactive `rkat auth login openai` provisions the ChatGPT OAuth backend.
+The non-interactive API-key example provisions the public OpenAI API backend.
+They can expose different model sets because they use different account
+systems.
+
 `rkat auth login` persists credentials and the matching `[realm.global]`
 binding section into the home-rooted `global` realm doc (`~/.rkat/config.toml`),
 so the sign-in is inherited by every workspace realm via the chain tail. To use
 a binding owned by another realm (for example `prod:openai`), declare that
-binding in the owning realm's config; credential writes are strict-owner and
-land only in the realm that defines the binding.
+binding in the owning realm's config and use an external source such as the env
+profiles above, or complete login through REST/RPC with explicit `realm_id`,
+`binding_id`, and `profile_id`. CLI login never populates a `prod` managed-store
+profile; credential writes are strict-owner.
 
 ### Use the binding
 
 ```bash
+export PROD_ANTHROPIC_API_KEY="..."
+export PROD_OPENAI_API_KEY="..."
 rkat run --auth-binding prod:default "hello"
 rkat run --auth-binding prod:openai   "hello"
 ```
@@ -160,7 +184,7 @@ rkat run --auth-binding prod:openai   "hello"
     rkat auth profiles --realm prod        # list profiles/backends/bindings
     rkat auth profile --realm prod <id>    # inspect one profile
     rkat auth login <provider>             # start OAuth or api_key flow
-    rkat auth logout <profile_id>          # clear persisted credentials
+    rkat auth logout [<realm>:]<binding_id> # clear persisted credentials; bare means global
     ```
   </Step>
   <Step title="Status and refresh">
@@ -213,19 +237,18 @@ auth_method)` pairs. The table below summarizes what's wired today.
 |-----------|---------------------|-------------------------|-------|
 | Anthropic | `anthropic_api`     | `api_key`, `static_bearer` | Direct to api.anthropic.com |
 | Anthropic | `anthropic_api`     | `claude_ai_oauth`       | Claude Pro/Max OAuth (PKCE, S256) |
-| Anthropic | `anthropic_api`     | `oauth_to_api_key`      | Console OAuth → provisions api_key |
+| Anthropic | `anthropic_api`     | `oauth_to_api_key`      | Console OAuth to API key |
 | Anthropic | `anthropic_api`     | `external_authorizer`   | Host-resolved auth injection |
-| Anthropic | `bedrock`           | `bedrock_bearer`, `bedrock_aws_sigv4` | AWS SigV4 / env-bearer |
-| Anthropic | `vertex`            | `vertex_google_auth`    | GoogleAuth / Vertex AI |
-| Anthropic | `foundry`           | `foundry_api_key`, `foundry_azure_ad` | Azure AI Foundry |
+| Anthropic | `bedrock`           | `bedrock_bearer`, `bedrock_aws_sigv4`, `external_authorizer` | AWS SigV4, bearer, or host auth |
+| Anthropic | `vertex`            | `vertex_google_auth`, `external_authorizer` | Google auth or host auth |
+| Anthropic | `foundry`           | `foundry_api_key`, `foundry_azure_ad`, `external_authorizer` | Azure AI Foundry |
 | OpenAI    | `openai_api`        | `api_key`, `static_bearer`, `external_authorizer` | Direct to api.openai.com or host-resolved auth |
 | OpenAI    | `azure_openai`      | `azure_api_key`       | Azure OpenAI Responses API; `base_url` required; session model is the Azure deployment name |
 | OpenAI    | `chatgpt_backend`   | `managed_chatgpt_oauth` | ChatGPT Plus/Pro OAuth |
 | OpenAI    | `chatgpt_backend`   | `external_chatgpt_tokens` | Host-supplied tokens |
 | Google    | `google_genai`      | `api_key`, `bearer_api_key`, `external_authorizer` | Direct to Google GenAI or host-resolved auth |
-| Google    | `vertex_ai`         | `api_key_express`       | Vertex API Express key |
-| Google    | `vertex_ai`         | `adc`, `compute_adc`    | ADC / compute metadata |
-| Google    | `google_code_assist` | `google_oauth`         | Gemini Code Assist OAuth |
+| Google    | `vertex_ai`         | `api_key_express`, `adc`, `external_authorizer` | Vertex API Express, ADC, or host auth |
+| Google    | `google_code_assist` | `google_oauth`, `compute_adc`, `external_authorizer` | Code Assist OAuth, compute metadata, or host auth |
 | Self-hosted | `self_hosted`, `openai_compatible` | `none`, `api_key`, `static_bearer` | Realm-bound credentials for configured `self_hosted` servers |
 
 External commands (`CredentialSourceSpec::Command`) and file
@@ -239,35 +262,35 @@ come from.
 
 | Kind | Description |
 |------|-------------|
-| `InlineSecret { secret }` | Secret stored inline in the TOML (use only for dev/local) |
-| `Env { env, fallback }` | Read env var at resolve time via `ResolverEnvironment::env_lookup` |
-| `ManagedStore` | Resolve via the `TokenStore`; the storage key is the resolved typed binding identity (`realm`, `binding`) |
-| `PlatformDefault` | Use the host platform's default credential chain where supported |
-| `ExternalResolver { handle }` | Host-registered JS callback (WASM) or Rust resolver (embedded) |
-| `Command { program, args, ... }` | Run an external binary; cache stdout for `refresh_interval_ms` |
-| `FileDescriptor { fd, scope_override }` | Read credentials from a host-supplied file descriptor |
+| `inline_secret` | Secret stored inline in TOML (local development only) |
+| `env` | Read the primary and ordered fallback variables at resolve time |
+| `managed_store` | Resolve through TokenStore by typed `realm` + `binding` identity |
+| `platform_default` | Use a supported cloud/platform default credential chain |
+| `external_resolver` | Call a host-registered JavaScript or Rust resolver |
+| `command` | Run an external binary and optionally cache stdout for `refresh_interval_ms` |
+| `file_descriptor` | Read credentials from a host-supplied descriptor |
 
 <Warning>
 Storing api keys inline in config files works but shouldn't be
-checked into git. Prefer `ManagedStore` (which writes to the OS
-keychain or a 0o600 file) or `Env`.
+checked into git. Prefer `managed_store` or `env`. The stock CLI uses its
+file-backed TokenStore profile (mode 0600 on Unix). Native hosts can enable
+`native-keyring` and deliberately select the keyring-aware profile.
 </Warning>
 
 <Note>
 `FileDescriptor` is a host-integration seam rather than a plain standalone resolver path. It requires a host-scoped reader/injection path, so treat it as an advanced embedding surface rather than a generic CLI config trick.
 </Note>
 
-## Hot-swap mid-session
+## Hot-Swap Between Turns
 
 When a session is created with `--auth-binding prod:default`, its
 persisted `SessionMetadata.auth_binding` carries that binding through
-resume and hot-swap. Changing the model/provider mid-turn via the RPC
-`turn/start` override keeps the binding by default; pass an explicit
+resume and hot-swap. Changing the model/provider on an RPC
+`turn/start` request keeps the binding by default; pass an explicit
 `auth_binding` on the turn request to scope the swap to a different
 realm or binding.
 
 ```json
-// RPC turn/start — hot-swap to openai binding in the same realm
 {
   "method": "turn/start",
   "params": {
@@ -280,13 +303,15 @@ realm or binding.
 ```
 
 The factory re-enters `ProviderRuntimeRegistry::resolve` with the new
-binding — no env-default fallback, no cross-realm credential bleed.
+binding. It does not silently replace an explicit configured binding with the
+environment fallback.
 
 ## Per-mob-member override
 
-Mob members default to env-default / config-realm fallback credentials.
-Pass `auth_binding` on the host-side mob spawn surface to scope a member to a
-specific binding:
+The mob runtime does not promote ambient credentials into member authority.
+Live model-backed spawn paths that require credentials must receive an explicit
+binding, either from the compiled member declaration/overlay or as
+`auth_binding` on the host-side spawn request:
 
 ```json
 {
@@ -359,11 +384,11 @@ not use the factory's standalone build mode for a runtime-backed desktop
 session:
 
 ```rust
-use meerkat::{AgentBuildConfig, RuntimeBuildMode, Session, SessionId};
+use meerkat::{AgentBuildConfig, RuntimeBuildMode, Session};
 
 let session = Session::new();
 let bindings = runtime.prepare_bindings(session.id().clone()).await?;
-let mut build = AgentBuildConfig::new("gpt-5.4");
+let mut build = AgentBuildConfig::new("gpt-5.5");
 build.resume_session = Some(session);
 build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings);
 let agent = factory.build_agent(build, &config).await?;
@@ -429,13 +454,15 @@ features so you only pay for what you use:
 | `google-oauth`   | Vertex + Code Assist + ADC |
 | `azure-auth`     | Foundry backend + Azure AD |
 
-The `rkat` CLI enables `anthropic`, `openai`, `gemini`, and `oauth`
-by default; add cloud-specific features at compile time for
-Bedrock/Vertex/Foundry.
+The shipped `rkat` CLI enables Anthropic, OpenAI, Gemini, OAuth,
+`native-keyring`, and refresh-file locking in its dependency graph, while its
+stock TokenStore profile remains file-backed. Bedrock, Vertex, and Foundry
+transport features live on the corresponding provider crates and must be
+selected deliberately in a custom build.
 
 ## See also
 
-- [Hooks](/guides/hooks) — observe auth events or gate turns on
+- [Hooks](/guides/hooks) - observe auth events or gate turns on
   credential state
-- [Mobs](/guides/mobs) — per-member `auth_binding` overrides
-- [Machine Authority](/reference/machine-authority) — rationale behind single-owner runtime state
+- [Mobs](/guides/mobs) - per-member `auth_binding` overrides
+- [Machine Authority](/reference/machine-authority) - rationale behind single-owner runtime state

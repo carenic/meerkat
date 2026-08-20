@@ -16,7 +16,7 @@ The single entry point for ALL surfaces. Key steps:
 8. Create session store (contract lives in `meerkat-core`; impls live in `meerkat-store`)
 9. Compose tools with comms, then optionally late-bind mob tools via `MobToolsFactory`
 10. Resolve hooks (override > filesystem layered config)
-11. Build system prompt + `AgentBuilder` + wire memory / compactor / skill engine / ops-lifecycle / event-tap / checkpointer
+11. Build system prompt + `AgentBuilder` + wire memory / compactor / skill engine / ops-lifecycle / event-tap / provisional persistence hook
 12. Build agent, set `SessionMetadata` (persist override intent + `auth_binding`, not flattened booleans)
 
 The factory validates `bindings.session_id == session.id()` for `SessionOwned` builds. Cross-wired bindings are rejected with `BuildAgentError::Config`.
@@ -61,16 +61,34 @@ ownership boundaries intact:
 
 ## Multimodal Content
 
-- `ContentBlock` (meerkat-core): `Text { text }`, `Image { media_type, ... }`, or `Video { media_type, duration_ms, ... }`
+- `ContentBlock` (meerkat-core): `Text { text }`, `Image { media_type, ... }`,
+  `Video { media_type, duration_ms, ... }`, `Structured { data }`, or
+  `SkillContext { skill_key, text }`
 - `ContentInput` (meerkat-core): `Text(String)` or `Blocks(Vec<ContentBlock>)`
-- `ToolOutput` (meerkat-tools): `Json(Value)` or `Blocks(Vec<ContentBlock>)`
+- `ToolOutput` (meerkat-tools): `Json(Value)`,
+  `JsonWithEffects { value, session_effects }`, or
+  `Blocks(Vec<ContentBlock>)`
 - `AssistantBlock::Image` (meerkat-core): canonical generated assistant image output; stores `image_id`, `blob_ref`, dimensions, revised prompt disposition, and provider metadata.
 
 ## Assistant Image Generation
 
 `generate_image` is a privileged built-in dispatch path, not an ordinary external tool. `AgentFactory` wires it only when the build has an image-generation machine, planner, executor, and blob store. The machine owns lifecycle semantics; provider crates own image target profiles and provider-specific parameters; the tool layer only normalizes the model-facing request, calls the planner/executor, commits blobs, and appends assistant image blocks after tool results to preserve provider tool-call adjacency.
 
-Image-target routing follows session identity: the planner resolves the provider from the typed `SessionModelRoutingStatus.session_provider` (meerkat-core/src/image_generation.rs); model-name inference (`infer_from_model`) was deleted from the planner path. References to the current turn's generated images travel as the typed `CurrentTurnImageRef` newtype (meerkat-core/src/agent.rs), not raw indices.
+Dependency availability alone does not expose the tool: the session-owned
+machine, planner, executor, and blob store must all be wired. In the ordinary
+`CompositeDispatcher` path, `override_image_generation = Inherit` resolves
+visible when that substrate is present; `Disable` hides it and `Enable` makes
+the intent explicit. One narrow early-return path differs: when both builtins
+and shell are disabled, the factory constructs a composite solely for image
+generation only when the override is explicitly `Enable`. A `ToolScope` allow
+list can narrow a visible catalog but cannot enable a policy-disabled category.
+
+For an `Auto` image target, the planner first uses the build's configured
+`image_generation_provider`; only when that is absent does it fall back to the
+typed `SessionModelRoutingStatus.session_provider`. It never infers provider
+identity from a model string. References to the current turn's generated
+images travel as the typed `CurrentTurnImageRef` newtype
+(`meerkat-core/src/agent.rs`), not raw indices.
 
 Generated images must be surfaced through transcript history plus blob retrieval. SDKs should parse `AssistantBlock::Image` into typed image fields and fetch bytes through `blob/get`; do not inline generated image bytes into history.
 
@@ -95,4 +113,4 @@ Tool visibility state lives in MeerkatMachine DSL (`active_filter`, `staged_filt
 - `meerkat-core/src/agent/builder.rs` — `AgentBuilder`
 - `meerkat-core/src/agent/state.rs` — `run_loop`, `WaitingForOps` dispatch
 - `meerkat-core/src/tool_scope.rs` — runtime tool visibility
-- `meerkat-core/src/content.rs` — `ContentBlock`, `ContentInput`
+- `meerkat-core/src/types.rs` - `ContentBlock`, `ContentInput`

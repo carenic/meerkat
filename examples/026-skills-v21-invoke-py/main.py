@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""026 — Skills V2.1 Invocation (Python SDK)
+"""026 - Canonical Skill Invocation (Python SDK)
 
-Invoke a specific skill using canonical refs (`SkillKey`) from the rebuilt
+Invoke a specific skill using canonical refs (`SkillKey`) from the current
 skill system.
 
 Run:

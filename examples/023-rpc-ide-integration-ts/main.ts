@@ -2,8 +2,8 @@
  * 023 — JSON-RPC IDE Integration (TypeScript)
  *
  * The JSON-RPC server (`rkat-rpc`) is designed for IDE and desktop
- * integrations. Unlike REST, it keeps agents alive between turns via
- * `SessionRuntime` for fast multi-turn workflows.
+ * integrations. Like REST, it uses the runtime-backed session path. JSON-RPC
+ * is convenient for local stdio or TCP clients and server notifications.
  *
  * What you'll learn:
  * - Session lifecycle via the SDK

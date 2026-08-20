@@ -10,7 +10,7 @@ Public SDK interfaces use camelCase by default. Protocol-bound multimodal conten
 
 ## Imports
 
-Everything public is re-exported from the package root:
+The stable domain types and helpers are re-exported from the package root:
 
 ```typescript
 import {
@@ -60,6 +60,13 @@ import type {
 } from "@rkat/sdk";
 ```
 
+Every public TypeScript RPC wrapper binds its request and response transport
+boundary to generated RPC-schema contracts. Generated job, approval, artifact,
+and durable-event parameter/result names appear in the public client
+declarations but are not re-exported from the package root in 0.8.24. Pass
+structural object literals to those methods. This is an export/code-generation
+gap, not a second wire contract.
+
 ## Additional client wrappers
 
 The package exports more than the core session lifecycle. The `MeerkatClient` also exposes:
@@ -70,10 +77,31 @@ The package exports more than the core session lifecycle. The `MeerkatClient` al
 - typed ingress helper: `sendPeerResponseTerminal`
 - MCP live-op helpers: `mcpAdd`, `mcpRemove`, `mcpReload`
 - blob/skill helpers: `getBlob`, `listSkills`
+- runtime host helpers: `getRuntimeHostInfo`, `getRuntimeHostCapabilities`,
+  `getRuntimeHostHealth`
+- transcript and recovery helpers: `inputState`, `exportSessionAtif`, revision
+  read/list, fork-at/fork-replace, rewrite, system-prompt update, and restore
+- WorkGraph observability: item/ready/event listing, snapshot, goal status,
+  and attention listing
+- detached jobs and monitors: the `jobs*` family plus `monitorsStart` and the
+  authority-checked `mobkitJob*` worker mutations
+- approvals and artifacts: request/list/get/decide plus
+  list/get/download artifacts
+- projected event recovery: `latestEventCursor`, `listEventsSince`,
+  `eventSnapshot` when host event projection is enabled
 - live-channel helpers: `liveOpen`, `liveStatus`, `liveClose`, `liveSendInput`,
   `liveSendInputImage`, `liveSendInputVideoFrame`, `liveCommitInput`,
-  `liveInterrupt`, `liveTruncate`, `liveRefresh`, and
+  `liveWebrtcAnswer`, `liveInterrupt`, `liveTruncate`, `liveRefresh`, and
   `parseLiveObservation`
+
+Approval calls maintain audit records only; they do not automatically gate,
+authorize, or execute an action. Records persist when the RPC persistence
+bundle exposes a store path. See [JSON-RPC approvals](/api/rpc#approvals).
+
+Auth profiles and persisted credentials are realm-scoped. Auth login or API
+key provisioning yields an auth binding; pass it as `SessionOptions.authBinding`
+or in a mob member spec instead of embedding provider secrets. A remote member
+host resolves that binding only inside its authorized realm.
 
 ---
 
@@ -142,7 +170,18 @@ The `Session` methods are thin conveniences over canonical runtime calls:
 
 ### DeferredSession
 
-`client.createDeferredSession()` reserves session identity now and runs the first turn later through `await deferred.startTurn(...)`.
+`client.createDeferredSession()` reserves session identity now and runs the
+first turn later through `await deferred.startTurn(...)`, or streams it through
+`deferred.stream(...) -> EventStream`. Although deferred creation reuses
+`SessionOptions`, the server rejects `transientTurnContext` because no
+immediate turn exists. Current `DeferredTurnOptions` omits `injectedContext`,
+`transientTurnContext`, and `selfHostedServerId`. Set injected context during
+deferred creation; transient first-turn context and a self-hosted server route
+are not expressible through the current deferred TypeScript wrapper. Both
+deferred turn methods accept `skillRefs`, `turnToolOverlay`,
+`additionalInstructions`, `keepAlive`, `model`, `provider`, `maxTokens`,
+`systemPrompt`, `outputSchema`, `structuredOutputRetries`, and
+`providerParams`.
 
 ### LiveChannel
 
@@ -168,8 +207,20 @@ await channel.close();
 ```
 
 The helper stores the `channel_id` returned by `live/open`. It does not own the
-WebSocket transport; connect to `opened.transport.url` with the returned token
-using the transport appropriate for your app.
+transport. Branch on `opened.transport.transport`: `websocket` carries `url`
+and `token`; `webrtc` carries `token`, `answer_method`, and optional
+`http_url`. Use `client.liveWebrtcAnswer(...)` to exchange a completed
+browser-created SDP offer. Do not assume every bootstrap has a URL.
+
+The Node SDK does not provide `RTCPeerConnection`; inject an implementation or
+forward browser-created SDP to the Node process. Add an audio track or the
+`meerkat.live` data channel, set the local description, wait for ICE gathering
+to complete, and send `peer.localDescription.sdp`. The 0.8.24
+`answerLiveWebrtcOffer(...)` helper does not perform that wait and sends the
+original offer SDP, so use direct `client.liveWebrtcAnswer(...)` for the
+canonical browser exchange. WebRTC also requires an `rkat-rpc` binary compiled
+with the non-default `live-webrtc` Cargo feature. The 0.8.24 release binary
+does not include that feature, so `liveWebrtc: true` requires a custom binary.
 
 The direct helper has the same required identity:
 `client.liveSendInputImage(channelId, idempotencyKey, mime, dataBase64)`.
@@ -203,7 +254,7 @@ interface Usage {
 }
 ```
 
-One type serves two different accounts. On `turn_completed` this is per-call
+One type serves two different accounts. When present on `turn_completed` this is per-call
 usage: `inputTokens` is the raw provider counter (for Anthropic, uncached input
 only) and `accounting` names the resolved provider/model plus the normalized
 `presentedTokens` for that call. On `RunResult.usage` and `run_completed` it is
@@ -442,6 +493,24 @@ type AgentEvent =
 
 Event parsing fails closed: a `type` outside the generated `KNOWN_AGENT_EVENT_TYPES` inventory throws a `MeerkatError` with code `UNKNOWN_EVENT_TYPE`. A known type without a parser case in this SDK version is surfaced as `UnknownEvent` for forward-compatibility, and a known type with a malformed payload is preserved as a `MalformedEvent` (`type: "malformed_event"`).
 
+The 0.8.24 handwritten parser has known integration gaps:
+
+- `reasoning_delta`, `reasoning_complete`, `assistant_image_appended`,
+  `turn_usage_accounting_unmeasured`,
+  `turn_usage_accounting_identity_disputed`,
+  `interaction_callback_pending`, `peer_content_ingested`, and
+  `provider_cache_breakpoints_discarded` are inventory-known but have no typed
+  parser case, so they arrive as `UnknownEvent`
+- current Rust `server_tool_content` and
+  `transcript_rewrite_audit_receipt_committed` are missing from the generated
+  inventory, so receiving either throws `UNKNOWN_EVENT_TYPE`
+- current `run_started`, `run_failed`, `retrying`, and `hook_failed` use newer
+  field shapes than the handwritten parser and are preserved as
+  `MalformedEvent`
+
+These are SDK/code-generation gaps. The legacy parser shapes below describe
+the exported 0.8.24 TypeScript interfaces, not an alternate server contract.
+
 ### Session lifecycle events
 
 ```typescript
@@ -486,7 +555,7 @@ interface TextDeltaEvent          { type: "text_delta";            delta: string
 interface TextCompleteEvent       { type: "text_complete";         content: string }
 interface ToolCallRequestedEvent  { type: "tool_call_requested";   id: string; name: string; args: ToolCallArguments }
 interface ToolResultReceivedEvent { type: "tool_result_received";  id: string; name: string; content: readonly ContentBlock[]; isError?: boolean }
-interface TurnCompletedEvent      { type: "turn_completed";        stopReason?: StopReason; usage: Usage }
+interface TurnCompletedEvent      { type: "turn_completed";        stopReason?: StopReason; usage?: Usage }
 ```
 
 ```typescript
@@ -561,7 +630,7 @@ interface SkillResolutionFailedEvent { type: "skill_resolution_failed"; skillKey
 
 ```typescript
 interface InteractionCompleteEvent { type: "interaction_complete"; interactionId: string; result: string; structuredOutput?: unknown }
-interface InteractionFailedEvent   { type: "interaction_failed";   interactionId: string; error: string }
+interface InteractionFailedEvent   { type: "interaction_failed";   interactionId: string; reason: InteractionFailureReason }
 ```
 
 ### Tool config events
@@ -610,7 +679,7 @@ interface BackgroundJobCompletedEvent {
 ### Stream management
 
 ```typescript
-interface StreamTruncatedEvent { type: "stream_truncated"; reason: string }
+interface StreamTruncatedEvent { type: "stream_truncated"; reason: StreamTruncationReason }
 ```
 
 ### Transcript rewrite events
@@ -623,24 +692,13 @@ interface TranscriptRewriteCommittedEvent {
 }
 ```
 
-### Peer content ingestion events
+### New inventory-known events
 
-```typescript
-interface PeerContentIngestedEvent {
-  type: "peer_content_ingested";
-  kind: CommsNoticeKind;                       // message | request | response_* | lifecycle
-  peer?: SystemNoticePeer | null;              // canonical peer id + display name, when resolved
-  request_id?: string | null;                  // correlation id for request/response conventions
-  sender_taint?: SenderContentTaint | null;    // "clean" | "tainted"; absent = no declaration
-}
-```
-
-Emitted when inbound peer content is committed into the session's context
-(both queued deliveries and steered mid-turn context). `sender_taint` is the
-sender's own signed content-taint declaration; an absent value means the
-sender made no declaration and must never be treated as `"clean"`. Host
-taint trackers should consume this event instead of parsing rendered peer
-message text.
+The usage-accounting, peer-ingestion, provider-cache-discard, reasoning,
+assistant-image, and interaction-callback event rows listed above currently
+arrive as `UnknownEvent`. Inspect `event.type` and raw fields only as a
+temporary compatibility measure; there is no exported typed
+`PeerContentIngestedEvent` in 0.8.24.
 
 ### Type guard utilities
 
@@ -661,7 +719,7 @@ for await (const event of session.stream("prompt")) {
     process.stdout.write(event.delta);  // TypeScript knows event.delta exists
   }
   if (isTurnCompleted(event)) {
-    console.log(event.stopReason, event.usage.inputTokens);
+    console.log(event.stopReason, event.usage?.inputTokens ?? "unmeasured");
   }
 }
 ```

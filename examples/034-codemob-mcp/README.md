@@ -1,8 +1,12 @@
-# 034 — codemob-mcp
+# 034 - codemob-mcp
 
-Multi-agent MCP server powered by Meerkat mobs. Gives Claude Code (or any MCP client) access to collaborative AI teams for second opinions, code reviews, architecture decisions, brainstorming, and full RCT implementation pipelines.
+Multi-agent MCP server powered by Meerkat mobs. Gives Claude Code (or any MCP
+client) access to collaborative AI teams for second opinions, code reviews,
+architecture decisions, brainstorming, and RCT implementation pipelines.
 
-Each `deliberate` call spins up an ephemeral mob, agents collaborate (via structured flows or free-form comms), and the result is returned as a single tool response. MCP progress notifications provide live feedback during execution.
+Each `deliberate` call runs a machine-owned structured flow and returns its
+terminal result as one tool response. MCP progress notifications report flow
+step progress during execution.
 
 This example intentionally uses the standalone/embedded session path. It does
 not pre-create runtime-backed `SessionRuntimeBindings`; session builds opt into
@@ -14,11 +18,14 @@ standalone runtime mode explicitly.
 # Build from the repository root
 ./scripts/repo-cargo build --manifest-path examples/034-codemob-mcp/Cargo.toml --release
 
+# The binary is written under the repo-cargo target root:
+export CODEMOB_BIN="$(./scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')/release/codemob-mcp"
+
 # Register in Claude Code (.mcp.json in your project root)
 {
   "mcpServers": {
     "codemob": {
-      "command": "/path/to/codemob-mcp",
+      "command": "/absolute/path/to/codemob-mcp",
       "env": {
         "ANTHROPIC_API_KEY": "sk-ant-...",
         "OPENAI_API_KEY": "sk-...",
@@ -29,7 +36,10 @@ standalone runtime mode explicitly.
 }
 ```
 
-Provide API keys for at least one provider. More providers = more model diversity in multi-agent packs.
+`consult` needs the key for its selected model. The built-in multi-agent packs
+use several providers by default, so configure every provider used by the
+selected pack or override every role onto models whose credentials are
+available.
 
 ## Tools
 
@@ -76,7 +86,10 @@ consult(question: "What about the edge case?", session_id: "<id from previous ca
 
 ### `deliberate`
 
-Spawn a team of agents from a named pack. Returns structured results after collaboration, plus a `session_id` for follow-up tasks with the same mob.
+Spawn a team of agents from a named pack and return the final flow output.
+The response currently includes a `session_id` label containing the
+mob ID, but this example does not provide correct multi-call mob continuation.
+Omit `session_id` and include earlier output in `context` for a follow-up task.
 
 ```
 deliberate(pack: "review", task: "Review this auth module", context: "<code>")
@@ -86,17 +99,18 @@ deliberate(pack: "red-team", task: "Should we migrate to microservices?")
 deliberate(pack: "panel", task: "Review our API design", context: "<specs>")
 deliberate(pack: "rct", task: "Implement the session compaction feature")
 
-# Continue with the same mob
-deliberate(pack: "review", task: "Now review the tests", session_id: "<id>")
+# Follow up with the earlier result as explicit context
+deliberate(pack: "review", task: "Now review the tests", context: "<prior result>")
 ```
 
 ### `list_sessions`
 
-List active sessions with IDs, timestamps, model, and message count. Use to see what sessions are available for continuation or cleanup.
+List active consult sessions with IDs, timestamps, model, and message count.
 
 ### `destroy_session`
 
-Destroy a session to free resources. Pass the `session_id` from a previous consult/deliberate response.
+Destroy a consult session to free resources. Pass the `session_id` from a
+previous `consult` response.
 
 ### `create_mob` / `get_mob` / `update_mob` / `delete_mob`
 
@@ -104,7 +118,7 @@ CRUD for user-created mob definitions. Saved to `.codemob-mcp/mobs/` and immedia
 
 ## Packs
 
-### Flow-based (structured step execution)
+### Built-in packs (structured step execution)
 
 | Pack | Agents | Pattern | Default Models |
 |------|--------|---------|---------------|
@@ -114,27 +128,25 @@ CRUD for user-created mob definitions. Saved to `.codemob-mcp/mobs/` and immedia
 | **brainstorm** | 4 | 3 diverse ideators → ranked synthesis | Gemini 3.1 Pro, GPT-5.5, Gemini 3.1 Flash Lite, Opus |
 | **red-team** | 3 | Advocate + adversary → judge | Gemini 3.1 Flash Lite, GPT-5.5, Opus |
 | **rct** | 6 | Plan → implement → 3 parallel gate reviews → aggregate | Opus, GPT-5.5, Gemini 3.1 Pro, GPT-5.5 Pro, Gemini 3.1 Flash Lite, Sonnet |
-| **implement** | 2 | Implementer ↔ reviewer loop (max 3 rounds) | Sonnet, GPT-5.5 |
+| **implement** | 2 | Implement once, then emit one reviewer gate verdict | Sonnet, GPT-5.5 |
+| **panel** | 5 | Moderator brief, 4 parallel viewpoints, moderator synthesis | Opus, Gemini 3.1 Pro, GPT-5.5, Gemini 3.1 Flash Lite, Sonnet |
 
-### Comms-based (autonomous debate)
-
-| Pack | Agents | Pattern | Default Models |
-|------|--------|---------|---------------|
-| **panel** | 5 | Free-form moderated debate (full mesh, moderator authority) | Opus, Gemini 3.1 Pro, GPT-5.5, Gemini 3.1 Flash Lite, Sonnet |
-
-Every agent in every pack uses a distinct model by default — different training data produces genuinely different perspectives.
+Each pack uses a diverse set of models by default so its roles can contribute
+different perspectives.
 
 ## Available Models
 
 | Model | Provider | Strengths | Used as default for |
 |-------|----------|-----------|-------------------|
-| `claude-opus-4-8` | Anthropic | Strongest reasoning | Judge, moderator, synthesizer, orchestrator |
+| `claude-opus-5` | Anthropic | Latest Anthropic reasoning model | Available for override |
+| `claude-opus-4-8` | Anthropic | Advanced reasoning | Judge, moderator, synthesizer, orchestrator |
 | `gpt-5.6-sol` | OpenAI | Frontier capability and quality | Preview-enabled override |
 | `gpt-5.6-terra` | OpenAI | Balanced intelligence and cost | Preview-enabled override |
 | `gpt-5.6-luna` | OpenAI | Efficient high-volume work | Preview-enabled override |
 | `gpt-5.5` | OpenAI | Broadly available general + code | Standalone consult, implementer, critic, advisor, security reviewer |
 | `gemini-3.1-pro-preview` | Google | Strong general | General reviewer, purist, guardian |
 | `gemini-3.1-flash-lite-preview` | Google | Fastest | Advocate, skeptic, perf reviewer, contrarian |
+| `gemini-3.5-flash` | Google | Current fast model | Available for override |
 | `claude-sonnet-4-6` | Anthropic | Fast + capable | RCT aggregator, implementer |
 | `gpt-5.5-pro` | OpenAI | Deepest reasoning | Available for override (slow — use sparingly) |
 
@@ -156,12 +168,15 @@ Available skills (depends on your environment):
 
 ## Session Continuation
 
-Both `consult` and `deliberate` return a `session_id` in their response. Passing this ID back in a follow-up call continues the conversation:
+`consult` returns a real session ID. Passing it back in a follow-up `consult`
+call continues the conversation with its retained history, model, system
+prompt, shell setting, and injected skills.
 
-- **consult**: The agent retains its full conversation history, system prompt, model, and shell access settings.
-- **deliberate**: The mob is kept alive between calls. Agents retain their state and conversation history for follow-up tasks.
-
-Use `list_sessions` to see active sessions and `destroy_session` to clean up when done.
+`deliberate` also labels its mob ID as `session_id`, but its current reuse path
+does not preserve the first call's history reliably or replace an existing
+flow's baked task on later calls. Treat each deliberate call as independent;
+pass prior results explicitly through `context`. `list_sessions` and
+`destroy_session` manage `consult` sessions only.
 
 ## Model Overrides
 
@@ -197,7 +212,10 @@ consult(
 
 ## Progress Notifications
 
-The server sends MCP `notifications/progress` during `deliberate` calls. Claude Code displays these as a progress bar. Flow-based packs report per-step completion. The panel pack reports event counts during the debate.
+When the MCP caller supplies `_meta.progressToken`, the server sends
+`notifications/progress` during `deliberate` calls. Every built-in pack,
+including `panel`, reports machine-owned flow step progress through that
+optional channel.
 
 ## Architecture
 
@@ -209,28 +227,31 @@ Claude Code ──(stdio)──► codemob-mcp
                consult              deliberate
             (SessionService)     (MobMcpState)
                    │                     │
-              Single agent        ┌──────┴──────┐
-              Multi-turn          │             │
-              (continuation)    Flow          Comms
-                                (steps with    (autonomous
-                                 deps +        agents, full
-                                 templates)    mesh, quiescence)
-                                    │             │
-                                Structured    Moderator's
-                                last step     final summary
-                                output        extracted
+              Single agent              Flow
+              Multi-turn          (steps with deps
+              (continuation)       and templates)
+                                         │
+                                  Final step output
 ```
 
-- **MCP stdio server** — JSONL JSON-RPC 2.0 over stdin/stdout (hand-rolled, no SDK)
-- **Lazy state init** — MCP handshake responds instantly; `ForceState` created on first tool call
-- **Session continuation** — Sessions persist for multi-turn conversations via `session_id`
-- **Skills injection** — `.claude/skills/` domain knowledge loaded into agent context
-- **Auto-compaction** — Long conversations automatically compacted to stay within context limits
-- **Semantic memory** — Agents have `memory_search` for cross-session knowledge retrieval
-- **Two execution modes** — Flow-based (structured steps with dependency DAG) or comms-based (autonomous agents with quiescence detection)
-- **Template forwarding** — Flow steps reference prior outputs via `{{ steps.<id> }}`
-- **Progress** — MCP `notifications/progress` with step-level granularity
-- **Model diversity** — Every agent uses a distinct model; no duplicates within any pack
+- **MCP stdio server** - JSONL JSON-RPC 2.0 over stdin/stdout (hand-rolled, no SDK)
+- **Lazy state init** - MCP handshake responds instantly; `ForceState` created on first tool call
+- **Session continuation** - Consult sessions persist for multi-turn conversations via `session_id`
+- **Skills injection** - `.claude/skills/` domain knowledge loaded into agent context
+- **Auto-compaction** - Long conversations automatically compacted to stay within context limits
+- **Semantic memory** - Agents can search compaction-indexed memory scoped to their session
+- **Structured execution** - Every built-in pack uses a machine-owned flow with
+  a dependency DAG
+- **Template forwarding** - Flow steps reference prior outputs via `{{ steps.<id> }}`
+- **Progress** - Optional MCP `notifications/progress` with step-level granularity
+- **Model diversity** - Built-in packs distribute roles across multiple models
+
+## Security Boundary
+
+Built-in deliberation profiles and custom flow profiles enable shell access in
+the server workspace. Treat this example as a trusted local MCP server: only
+connect trusted clients, run it in a workspace whose files and commands those
+clients may access, and only load trusted custom skills and mob definitions.
 
 ## File Structure
 
@@ -241,17 +262,17 @@ src/
 ├── tools/
 │   ├── mod.rs           # Tool schemas, dispatch, list_sessions, destroy_session
 │   ├── consult.rs       # Single session with continuation, skills, shell, custom prompts
-│   ├── deliberate.rs    # Mob lifecycle: create → spawn → flow|comms → cleanup/persist
+│   ├── deliberate.rs    # Mob lifecycle: create, spawn, run flow, destroy
 │   └── mobs.rs          # CRUD for user-created mob definitions (create, get, update, delete)
 └── packs/
-    ├── mod.rs           # Pack trait, registry, shared helpers (6 reusable builders)
+    ├── mod.rs           # Pack trait, 8-pack registry, shared builders
     ├── advisor.rs       # 1 agent  — quick opinion
     ├── review.rs        # 4 agents — parallel review + synthesis
     ├── architect.rs     # 3 agents — plan → critique → revise → ADR
     ├── brainstorm.rs    # 4 agents — diverse ideation + synthesis
     ├── red_team.rs      # 3 agents — advocate + adversary + judge
-    ├── panel.rs         # 5 agents — comms-based moderated debate
-    ├── implement.rs     # 2 agents — gated implementation with review loop
+    ├── panel.rs         # 5 agents - structured moderated panel
+    ├── implement.rs     # 2 agents - implementation plus reviewer gate
     └── rct.rs           # 6 agents — RCT pipeline with parallel gate reviews
 skills/                  # 26 embedded .md files (agent system prompts)
 ```

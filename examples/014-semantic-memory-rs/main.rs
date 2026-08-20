@@ -1,8 +1,8 @@
 //! # 014 -- Semantic Memory (Rust)
 //!
-//! Semantic memory lets agents store and retrieve information across sessions.
-//! Unlike session history (which is per-conversation), memory persists and
-//! is searchable via similarity matching.
+//! Semantic memory lets agents index and retrieve information outside the
+//! current transcript. This runnable example uses an in-memory store; durable
+//! cross-session memory uses the HNSW/SQLite implementation.
 //!
 //! ## What this example actually does
 //! - Creates a `SimpleMemoryStore` (in-memory keyword-matching implementation)
@@ -151,8 +151,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .model("claude-sonnet-4-6")
         .system_prompt(
             "You are a helpful assistant with access to a semantic memory store.\n\n\
-             You have a `memory_search` tool that searches your long-term memory.\n\
-             Your memory contains facts from earlier conversations that were \
+             You have a `memory_search` tool that searches indexed memory.\n\
+             Your memory contains facts representing earlier context that was \
              compacted away. When the user asks about things you don't see in \
              the current conversation, use `memory_search` to look them up.\n\n\
              Always use the memory_search tool when asked about team details, \
@@ -206,12 +206,11 @@ Wiring in the factory (AgentFactory::build_agent):
   3. Wraps it in MemorySearchDispatcher for the memory_search tool
   4. Composes into ToolGateway alongside other dispatchers
 
-Enable via config:
-  [tools]
-  memory = true  # Gives the agent memory_search tool + compaction indexing
+Direct Rust embedding:
+  AgentFactory::new(store_path).memory(true)
 
 CLI usage:
-  rkat run --memory "What did I tell you about the API key?"
+  rkat run --tools full "What did I tell you about the API key?"
 "#
     );
 

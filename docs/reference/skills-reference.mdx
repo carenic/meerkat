@@ -1,5 +1,5 @@
 ---
-title: "Skills Reference"
+title: "Skills reference"
 description: "Low-level skill runtime reference: source transports, identity, injection paths, and discovery tools."
 icon: "graduation-cap"
 ---
@@ -55,7 +55,8 @@ skills as their operating manuals. A companion skill is a normal skill:
 - source: embedded builtin source
 - identity: normal `SkillKey { source_uuid, skill_name }`
 - gating: `requires_capabilities`
-- activation: `preload_skills`, `skill_refs`, or `load_skill`
+- activation: `preload_skills`, `skill_refs`, or an explicitly policy-enabled
+  `load_skill` tool
 
 There is no auto-preload path for companion skills. Availability in the
 inventory means "this instruction manual can be loaded", not "this manual has
@@ -69,7 +70,9 @@ schedules, or when to use builtin tasks versus durable work.
 
 - **Preload at session creation**: `preload_skills: SkillKey[]`; content is resolved into the system prompt before the first turn.
 - **First-turn or per-turn injection**: `skill_refs: SkillRef[]`; content is injected for that turn.
-- **CLI preload convenience**: `rkat run --skill <skill-name>` resolves a runtime-local slug to a builtin-source key.
+- **CLI preload convenience**: `rkat run --skill <skill-name>` materializes a
+  builtin-source key from a bare slug. It does not currently address a local
+  filesystem source discovered from a path.
 
 There is no slash-delimited public wire format. Use typed keys.
 
@@ -85,19 +88,37 @@ Agent-facing discovery tools use typed key fields:
 | `skill_read_resource` | `source_uuid`, `skill_name`, resource path | Read a specific skill-owned resource. |
 | `skill_invoke_function` | `source_uuid`, `skill_name`, function name, arguments | Invoke a skill-defined structured function. |
 
+These five tools are default-disabled in `SkillToolSet`. A custom
+`BuiltinToolConfig` must explicitly enable them. Current factory-built CLI,
+REST, and JSON-RPC sessions do not do so, and a later `ToolScope` allow-list
+cannot make an uncomposed tool callable.
+
 ## Rendering
 
 Flat inventory renders full key IDs:
 
 ```xml
 <available_skills>
-  <skill id="00000000-0000-4b11-8111-000000000001/task-workflow">
+  <skill source_uuid="00000000-0000-4b11-8111-000000000001" skill_name="task-workflow">
     <description>How to use task tools</description>
   </skill>
 </available_skills>
 ```
 
-Collection mode groups by `source_uuid` and instructs the agent to use `browse_skills` and `load_skill`. Injection blocks are size-limited to 32 KiB and rendered as `<skill id="source_uuid/skill_name">...</skill>`.
+Collection mode groups by `source_uuid` and currently instructs the agent to
+use `browse_skills` and `load_skill`. Those names are usable only when the
+embedding explicitly enables the tool implementations; otherwise use public
+introspection and typed activation. The default injection limit is 32 KiB and
+is configurable. Injection blocks render the same two typed attributes:
+
+```xml
+<skill source_uuid="00000000-0000-4b11-8111-000000000001" skill_name="task-workflow">
+...skill body...
+</skill>
+```
+
+The public prompt and wire contracts never encode identity as a slash-delimited
+string that another component must parse.
 
 ## Public Introspection
 

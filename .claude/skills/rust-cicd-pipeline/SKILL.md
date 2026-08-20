@@ -12,7 +12,8 @@ description: |
 
 This skill provides a complete, production-ready CI/CD pipeline for Rust projects featuring:
 
-- **Progressive Testing**: Fast tests on commit, full tests on push
+- **Progressive Validation**: Auto-fix and generated-file sync on commit;
+  secret, format, codegen, lock, Clippy, and deterministic repo gates on push
 - **Makefile as Single Source of Truth**: Identical commands locally and in any CI system
 - **No GitHub Actions Dependency**: Works with Jenkins, GitLab CI, or any CI runner
 - **Version Consistency**: Automatic verification between tag and Cargo.toml
@@ -25,15 +26,16 @@ This skill provides a complete, production-ready CI/CD pipeline for Rust project
 │     Hooks       │     │    System       │     │    Process      │
 ├─────────────────┤     ├─────────────────┤     ├─────────────────┤
 │ On commit:      │     │ On push/PR:     │     │ On v* tag:      │
-│ - cargo fmt     │     │ - make lint     │     │ - Verify version│
-│ - cargo clippy  │     │ - make test     │     │ - Extract notes │
-│ - cargo test    │     │ - make test-all │     │ - Build release │
-│ - gitleaks      │     │ - make audit    │     │ - Tag artifacts │
+│ - cargo fmt fix │     │ - make lint     │     │ - Verify version│
+│ - sync generated│     │ - make test     │     │ - Read notes    │
+│   files         │     │ - make test-all │     │ - Build release │
+│                 │     │ - make audit    │     │ - Tag artifacts │
 │                 │     │                 │     │                 │
 ├─────────────────┤     └─────────────────┘     └─────────────────┘
 │ On push:        │              │
-│ - make test-all │              ▼
-│ - make doc      │     ┌─────────────────┐
+│ - secrets/fmt   │              ▼
+│ - changed clippy│     ┌─────────────────┐
+│ - repo gates    │     │    Makefile     │
 └─────────────────┘     │    Makefile     │
          │              │ (Single Source) │
          └──────────────┤ - test          │
@@ -134,23 +136,26 @@ Bazel metadata freshness, selector behavior, or lane isolation.
 
 The `.pre-commit-config.yaml` runs:
 
-**On every commit** (fast, <30s):
-- rustfmt formatting check
-- Clippy linting (fast mode)
-- Gitleaks secret detection
-- Fast unit tests via `make test`
+**On every commit**:
+- Rust formatting auto-fix
+- Bazel BUILD regeneration when Cargo metadata changes
+- Meerkat dogma mirror synchronization when its sources change
 
-**On push only** (thorough):
-- Full test suite via `make test-all`
-- Documentation build via `make doc`
+**On push only**:
+- Secret, YAML/TOML, merge-conflict, and large-file checks
+- Rust formatting verification and changed-crate Clippy
+- machine/codegen, lock, generated-header, and documentation contract gates
+- the deterministic workspace unit, integration, and e2e gate
 
 Customize hooks based on your project needs.
 
 See `references/pre-commit-config.yaml` for the template.
 
-### CI Integration
+### Portable CI Integration
 
-Since GitHub Actions is not available, use the Makefile targets with your CI system:
+For projects without GitHub Actions, use the same Makefile targets with another
+CI system. Meerkat itself does use GitHub Actions; the examples below show that
+the Make command surface is not coupled to it.
 
 **Jenkins Pipeline Example:**
 ```groovy
@@ -232,16 +237,14 @@ See `references/cargo-example.toml` for complete configuration.
 
 ## Release Process
 
-To create a new release:
+For Meerkat, write pending notes under `## [Unreleased]`, run
+`make release-preflight`, and use the configured `cargo release` workflow. Do
+not bump every package or stamp the changelog by hand. The pre-release hook
+binds the new version to the notes, bumps SDK/docs/contract versions,
+regenerates schemas and wrappers, and stages those files in the version-bump
+commit. The pushed tag then drives exact-main GitHub Actions publication.
 
-1. **Update changelog** with all changes since last release
-2. **Bump version** in `Cargo.toml`
-3. **Commit**: `git commit -m "chore: bump version to X.Y.Z"`
-4. **Tag**: `git tag -a vX.Y.Z -m "Release vX.Y.Z - description"`
-5. **Push**: `git push origin main && git push origin vX.Y.Z`
-6. **Build release**: `make release` (creates optimized binaries)
-
-See `references/release-process.md` for detailed instructions.
+See `references/release-process.md` for the current repository-specific steps.
 
 ## Troubleshooting
 
@@ -252,10 +255,10 @@ pre-commit install --hook-type pre-push
 ```
 
 ### Clippy warnings in CI but not locally
-Ensure you have the same Rust version. Pin in `rust-toolchain.toml`:
+Use the repository's committed `rust-toolchain.toml` pin. The current pin is:
 ```toml
 [toolchain]
-channel = "1.75.0"
+channel = "1.94.1"
 components = ["rustfmt", "clippy"]
 ```
 
@@ -271,6 +274,10 @@ git commit --no-verify -m "message"
 git push --no-verify
 ```
 
+Do not bypass Meerkat's installed pre-push hook unless the repository owner
+explicitly authorizes that exact push. The hook is part of the normal release
+and publication evidence.
+
 ### Test features not found
 Ensure feature flags are consistent between Cargo.toml and test commands.
 
@@ -280,18 +287,19 @@ The pipeline uses test categories with clear boundaries:
 
 | Category | Speed | I/O | Dependencies | When Run |
 |----------|-------|-----|--------------|----------|
-| **Unit** | <100ms each | None | All mocked | Every commit |
-| **Integration** | <1s each | Mocked | Real components, mocked external | Every push |
-| **E2E** | Minutes | Real | Full system | Manual / Release |
+| **Unit** | Fast | Usually none | Focused components | Pre-push and CI |
+| **Integration** | Moderate | Local fixtures | Real components, mocked external | Pre-push and CI |
+| **E2E** | Minutes | Real or hermetic system | Full system | Named CI/manual lanes |
 
 ### Unit Tests (`src/` with `#[cfg(test)]`)
 
-Pure logic tests with no I/O. All dependencies mocked.
+Keep pure logic tests isolated. Core tests that exercise bounded native config,
+path, lock, or fence I/O use temporary fixtures rather than claiming zero I/O.
 
 - **Purpose**: Verify individual functions/modules in isolation
 - **Speed**: Must complete in <100ms per test, total suite <10s
 - **Mocking**: Mock everything external (DB, APIs, file system)
-- **Run**: `make test` (pre-commit)
+- **Run**: `make test` (the repository's pre-push/CI command surface)
 
 ```rust
 #[cfg(test)]

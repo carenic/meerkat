@@ -1,6 +1,6 @@
 //! Small, store-issued session-persistence carriers.
 //!
-//! These values cross the core/runtime boundary without entering [`Session`].
+//! These values cross the core/runtime boundary without entering [`crate::Session`].
 //! They name provisional physical state only; a store must compare every field
 //! with its exact current rows before promotion.
 

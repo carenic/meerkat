@@ -26,7 +26,8 @@ rkat mob pack ./mobs/release-triage -o dist/release-triage.mobpack
 
 ## Global flags
 
-All commands accept the same realm and convention-root flags:
+The top-level parser exposes the same realm and convention-root flags to each
+command family:
 
 ```bash
 rkat [--realm <id>] [--isolated] [--instance <id>] \
@@ -44,11 +45,18 @@ given without a command — `rkat --default-model claude-fable-5` is the
 one-liner for switching what every future run talks to. The model is
 validated against the catalog and configured custom models.
 
-By default, CLI commands use the current directory as the context root, derive a
-stable workspace realm id from that path, and store realm state under
-`<context-root>/.rkat/realms/<realm>/`. `--context-root` changes both the
-derived workspace identity and the default project-local state root.
-`--state-root` changes only where realm directories are stored.
+By default, CLI commands use the current directory as the invocation context
+and derive a stable workspace realm id from that path. For project-local state,
+`StorageLayout` walks upward to the nearest ancestor containing a `.rkat`
+entry and stores realms under `<project-root>/.rkat/realms/<realm>/`. When no
+ancestor contains `.rkat`, the context root is the project root fallback.
+`--context-root` changes the derived workspace identity and the starting point
+for that ancestor search; it does not necessarily change the project root when
+both contexts are inside the same project. `--state-root` bypasses discovery
+and changes only where realm directories are stored.
+Some maintenance or host commands reject combinations that have no safe
+meaning. In particular, storage verbs reject `--isolated` and
+`--default-model`, and `rkat mob host` rejects `--isolated`.
 
 Fresh prompt-first runs and `rkat help` are fail-soft only at the default
 workspace storage boundary. If the workspace-derived realm cannot be opened,
@@ -125,7 +133,7 @@ rkat run --yolo --param temperature=0.2 "take the gloves off"
 - `--no-web-search`
 - `--export-atif` (write an ATIF trajectory to the realm `trajectories/` directory after the turn; default off)
 - `--resume[=<SESSION>]`
-- `--skill <PATH_OR_ID>` repeatable
+- `--skill <BUILTIN_ID>` repeatable
 - `-d, --max-duration <DURATION>`
 - `-t, --tools <safe|workspace|full|none>`
 - `--stdin <auto|blob|lines|off>`
@@ -139,6 +147,15 @@ For the full advanced set, use:
 ```bash
 rkat run --help
 ```
+
+<Warning>
+Current CLI help labels this value `PATH_OR_ID`, but `rkat run --skill` and
+resume currently construct builtin skill keys. Direct local-path preload is
+therefore unsupported. `rkat skill add <PATH>` registers a filesystem source
+but does not make this flag source-aware, and ordinary CLI sessions do not
+currently advertise the skill-discovery tool set. Use typed RPC/SDK preload
+fields when a host must address a source UUID directly.
+</Warning>
 
 ### Tool presets
 
@@ -274,6 +291,12 @@ rkat session interrupt <SESSION_ID>
 
 This is the human/operator session surface. CLI-internal control-plane session APIs are not exposed here.
 
+`session export-atif` reads the currently available event audit/replay
+projection. A slow live subscriber can receive a typed stream-truncation
+marker without dropping projector input, but projection is asynchronous
+best-effort derived state and export does not first drain it to the latest
+committed session boundary.
+
 Meerkat supports ordinary durable-state opens from 0.8.10 onward. For an older
 SQLite realm, stop every process that can access it and run the explicit
 current maintenance bridge:
@@ -287,6 +310,34 @@ opens remain strict. JSONL and memory realms are rejected before any database
 is mutated. The maintenance transaction preserves queued and
 nonterminal input rows without scheduling or replaying them. A later session
 activation follows normal recovery.
+
+## blob
+
+```bash
+rkat blob get <BLOB_ID> [--output <FILE>] [--json]
+```
+
+Without either output flag, `blob get` writes the decoded raw bytes to stdout.
+`--output` writes those bytes to a file. `--json` prints the complete
+`BlobPayload` (`blob_id`, `media_type`, and base64 `data`) instead of raw bytes. Blob
+IDs are realm-scoped, so use the same realm that produced the session or
+artifact reference.
+
+## realm
+
+```bash
+rkat realm current
+rkat realm list
+rkat realm show <REALM_ID>
+rkat realm create <REALM_ID> [--backend <sqlite|jsonl|memory>]
+rkat realm delete <REALM_ID> [--force]
+rkat realm prune [--isolated-only] [--older-than-hours <HOURS>] [--force]
+```
+
+`realm current` prints the realm selected by the CLI scope. `realm list` and
+`realm show` inspect manifests in the active state root. `realm prune` defaults
+to a 24-hour age threshold. `--force` bypasses active-lease safety checks, so
+use it only after confirming that no process still owns the target realm.
 
 ## config
 
@@ -317,23 +368,26 @@ rkat auth login [<PROVIDER>] [--backend <KIND>] [--method <METHOD>] [--non-inter
 rkat auth status <PROFILE_ID>          # realm config shape + AuthMachine lease lifecycle state
 rkat auth test <BINDING_ID>            # dry-run resolve the binding
 rkat auth refresh <PROFILE_ID>         # force-refresh OAuth tokens
-rkat auth logout <PROFILE_ID>          # clear persisted credentials
+rkat auth logout [<REALM>:]<BINDING_ID> # clear persisted credentials; bare means global
 rkat auth profile-delete <PROFILE_ID> -y
 ```
 
 `rkat auth login` provisions the reserved **`global`** realm in the home-rooted
 doc at `~/.rkat/config.toml` — both the credential token and the
-`[realm.global]` binding section. Because `global` is the universal tail of
-every realm chain, a single sign-in is inherited by every workspace realm,
-across workspaces, without a per-realm re-login. Earlier `dev`-realm logins are
+`[realm.global]` binding section. Login therefore materializes `global` as the
+optional chain tail, after which a single sign-in is inherited by workspace
+realms without a per-realm re-login. Earlier `dev`-realm logins are
 migrated to `global` on the run path (one-time, idempotent, no-clobber), so an
 existing sign-in keeps working without re-auth.
 
 Credential **reads inherit** down the realm chain (a child realm resolves a
 binding defined in a parent or in `global`), but credential **writes are
-strict-owner**: a write targets the realm that defines the binding. `--realm`
-on an `auth` command selects the realm and composes its chain for resolution,
-without changing where an owned credential is persisted.
+strict-owner**: the caller must explicitly target the realm that defines the
+binding; a child-addressed inherited write is rejected. `--realm`
+on profile, status, test, and refresh commands selects the realm and composes
+its chain for resolution. Logout is different: its positional
+`[<realm>:]<binding>` selects the token owner directly, and a bare binding
+means `global`; `--realm` does not retarget logout.
 
 See [Realm inheritance](/concepts/realm-inheritance) and the
 [auth guide](/guides/auth) for the full model.
@@ -371,9 +425,14 @@ the sweep with `--realm`, `--root`, or `--state-root` instead.
 rkat storage doctor [--json] [--root PATH]...
 ```
 
-Read-only and safe against a live realm: takes no leases, opens read-only
-connections only, creates nothing. Sweeps the project-local
-(`<context-root>/.rkat/realms`) and user-global candidate roots by default;
+Read-only and safe against a live realm: takes no leases, never changes
+logical database content, and never creates a database or directory. SQLite
+may create or update the `-wal`/`-shm` sidecars needed for a coherent WAL read.
+Sweeps the invocation-context-local
+(`<context-root>/.rkat/realms`) and user-global roots by default. Ordinary
+runtime resolution first walks to the nearest ancestor containing `.rkat`, so
+run the storage verb from that project root (or pass `--root`) to inspect the
+same local candidate;
 any explicit root (`--state-root` or repeatable `--root`) restricts the
 sweep to exactly those roots. `--realm` focuses the sweep on one realm.
 Reports per-root realm inventory, schema-ledger state per database,
@@ -462,9 +521,9 @@ Examples:
 
 ```bash
 rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .
-rkat mcp add linear --url https://mcp.example.com
-rkat mcp add --transport http glean https://king-be.glean.com/mcp/default
-rkat mcp login glean
+rkat mcp add api --url https://mcp.example.com/api
+rkat mcp add --transport http remote https://mcp.example.com/api
+rkat mcp login remote
 rkat mcp list
 rkat mcp get filesystem --scope project
 ```
@@ -488,7 +547,7 @@ rkat mob pack <DIR> -o <OUT.mobpack> [--sign <KEY_FILE> --signer-id <ID>]
 rkat mob inspect <PACK.mobpack>
 rkat mob validate <PACK.mobpack> [--trust-policy <permissive|strict>]
 rkat mob run <PACK.mobpack|MOB_ID> [--flow <FLOW_ID>] [--param <KEY=VALUE>...] [--prompt <TEXT>] [--detach] [--json] [--trust-policy <permissive|strict>]
-rkat mob deploy <PACK.mobpack> <PROMPT> [--trust-policy <permissive|strict>] [--surface <cli|rpc>]
+rkat mob deploy <PACK.mobpack> <PROMPT> [-m|--model <MODEL>] [--max-total-tokens <N>] [-d|--max-duration <DURATION>] [--max-tool-calls <N>] [--trust-policy <permissive|strict>] [--surface <cli|rpc>]
 rkat mob web build <PACK.mobpack> -o <OUT_DIR> --wasm <PKG_DIR|name_bg.wasm> [--trust-policy <permissive|strict>]
 rkat mob run-flow <MOB_ID> --flow <FLOW_ID> [--params <JSON>] [--stream|--no-stream]
 rkat mob flow-status <MOB_ID> <RUN_ID>
@@ -541,10 +600,21 @@ Multi-host notes:
   live URL and single-use token — to **stdout only**; stderr carries a
   token-free note. The socket it names is the input plane: there is no
   `live send` verb.
+- Member live channels are WebSocket-only in the current runtime. The shared
+  CLI transport enum accepts `--transport webrtc`, but the member host rejects
+  that selection. Session-scoped JSON-RPC `live/open` plus
+  `live/webrtc/answer` supports WebRTC only when the caller can address the
+  owning session directly. Controller `session/*` methods do not proxy a
+  placed member's host-local session in multi-host v1.
 - Mob verbs exit with typed codes for the four multi-host error classes:
   scope denied `45`, host unavailable `46`, stale cursor `47`, stale fence
   `48`, each with a one-line `detail: {...}` JSON rendering on stderr.
   Everything else keeps the generic exit `1`.
+- Durable member role migration is not a CLI spawn option. The one-shot
+  `resume_from_role` declaration is restricted to trusted in-process
+  `SpawnMemberSpec` construction and the private member-host materialization
+  protocol. CLI helpers, public RPC/SDK spawn requests, REST, MCP, and standing
+  profiles cannot grant it.
 
 Examples:
 
@@ -579,14 +649,17 @@ wasm-pack build meerkat-web-runtime --target web --out-dir pkg
 
 The emitted bundle is self-contained and runnable: serve the output directory and
 open `index.html` (it includes the glue, a `meerkat-bootstrap.js` module, and the
-mobpack).
+mobpack). The generated page trust-verifies the package and initializes the
+WASM runtime only. It does not call `mob_create`, spawn members, or provide a
+transcript UI; integrate the package with the generated WASM glue or
+`@rkat/web` to build those application flows.
 
 ## skill
 
 ```bash
-rkat skill add <PATH_OR_ID> [--name <NAME>]
-rkat skill remove <NAME_OR_ID_OR_PATH>
-rkat skill get <NAME_OR_ID_OR_PATH> [--json]
+rkat skill add <PATH> [--name <NAME>]
+rkat skill remove <NAME_OR_SOURCE_UUID_OR_PATH>
+rkat skill get <NAME_OR_SOURCE_UUID_OR_PATH> [--json]
 rkat skill list [--json]
 rkat skill inspect <skill-name> --source-uuid <uuid> [--json]
 ```
@@ -614,14 +687,6 @@ Agents mutate WorkGraph through `workgraph_*` tools. The CLI exposes only the
 narrow trusted goal/attention controls above; attention continuation injection
 remains runtime-host owned rather than a REST-backed CLI command.
 
-## models
-
-```bash
-rkat models
-```
-
-Lists all available models grouped by provider, including display name, tier, context window, max output tokens, and profile capabilities (temperature, thinking, reasoning support). Data is compiled from the `meerkat-models` catalog (injected into `meerkat-core` as a `ModelCatalog`).
-
 ## capabilities
 
 ```bash
@@ -629,20 +694,6 @@ rkat capabilities
 ```
 
 Shows status for compiled/runtime capabilities.
-
-## doctor
-
-```bash
-rkat doctor
-```
-
-Checks:
-
-- config readability
-- common provider API keys
-- MCP config loading
-- `wasm-pack` availability as one way to generate the required `--wasm`
-  artifacts; `mob web build` copies them and does not invoke wasm-pack
 
 ## init
 

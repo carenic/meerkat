@@ -1,24 +1,25 @@
 # 014 — Semantic Memory (Rust)
 
-Give agents persistent, searchable memory that spans across sessions.
-Unlike conversation history, semantic memory uses similarity search
-to find relevant past knowledge.
+Give agents searchable semantic recall outside conversation history. The
+runnable example uses `SimpleMemoryStore`, so its indexed facts live only for
+the current process. Production realms can use `HnswMemoryStore` with SQLite
+for durable cross-session memory.
 
 ## Concepts
 - `MemoryStore` trait — index and search interface
-- `HnswMemoryStore` — production HNSW-based implementation (SQLite)
-- `SimpleMemoryStore` — in-memory for tests
-- `memory_search` — the built-in agent tool for semantic recall
-- `MemoryStore::index_scoped()` — the Rust API used to index facts (also runs automatically during compaction)
+- `HnswMemoryStore` - production HNSW-based implementation (SQLite)
+- `SimpleMemoryStore` - in-memory store used by this example
+- `memory_search` - the built-in agent tool for semantic recall
+- `MemoryStore::index_scoped()` - the Rust API used to index facts (also runs automatically during compaction)
 
 ## Architecture
 ```
 App indexes a fact via MemoryStore::index_scoped("team uses Rust")
-  → text indexed in HNSW vector space
+  -> fact enters the selected store (in-memory keyword matching in this demo)
 
 Later: Agent calls the memory_search("what language for backend?") tool
-  → similarity search finds "team uses Rust"
-  → result injected into agent context
+  -> search finds "team uses Rust"
+  -> result injected into agent context
 ```
 
 ## Run

@@ -4,7 +4,7 @@
 //! per-provider clients (`AnthropicClient`, `OpenAiClient`, `GeminiClient`,
 //! `OpenAiLiveClient`, `OpenAiCompatibleClient`)
 //! moved to `meerkat-anthropic`, `meerkat-openai`, `meerkat-gemini`.
-//! Provider-runtime types moved to `meerkat-core::provider_runtime`.
+//! Provider-runtime types moved to `meerkat-llm-core::provider_runtime`.
 //! Auth primitives moved to `meerkat-auth-core`.
 //!
 //! This crate is retained as a thin shim so that downstream

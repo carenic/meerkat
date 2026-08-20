@@ -1,13 +1,20 @@
 ---
 title: "Realm Config Inheritance Plan"
-description: "Implementation plan for deterministic realm configuration inheritance and credential provenance."
+description: "Historical implementation record for deterministic realm configuration inheritance and credential provenance."
 icon: "diagram-project"
 ---
 
-# Realm Config Inheritance — Implementation Plan (amended)
+# Realm Config Inheritance - Historical Implementation Record
+
+> Current status (2026-08-20): **Implemented.** Realm inheritance shipped in
+> v0.7.9. This document preserves the reviewed implementation rationale; its
+> line references and phase language are design-era evidence, not the current
+> source map. Current behavior lives in `meerkat-core/src/connection.rs`,
+> `meerkat-core/src/config.rs`, and `meerkat-core/src/config_store.rs` and is
+> documented in [Realm inheritance](/concepts/realm-inheritance).
 
 > Decisions: **(A)** owning-realm credential provenance, **(B)** general parent-chain inheritance.
-> Status: red-team verdict = **amend_then_ship**. Architecture sound; 14 must-fixes folded in below.
+> Historical review status: red-team verdict = **amend_then_ship**. Architecture sound; 14 must-fixes folded in below before implementation.
 > Source artifacts: `realm_synthesis.json` (design), `realm_redteam_verdict.json` (red-team). This doc is the merged, authoritative plan.
 
 ## Canonical design

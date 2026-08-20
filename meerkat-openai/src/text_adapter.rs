@@ -1,7 +1,7 @@
 //! OpenAI Realtime **text-turn** adapter.
 //!
-//! Implements [`LlmClient`] for realtime-capable OpenAI models (e.g.
-//! `gpt-realtime-1.5`). The Responses API endpoint `/v1/responses` rejects
+//! Implements [`LlmClient`] for realtime-capable OpenAI models (currently
+//! `gpt-realtime-2`). The Responses API endpoint `/v1/responses` rejects
 //! realtime model IDs with `model_not_found`, so any session whose resolved
 //! model advertises `ModelCapabilities.realtime == true` must reach the
 //! model through the Realtime WebSocket instead.

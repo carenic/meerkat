@@ -1,4 +1,4 @@
-# 032 — Meerkat WebCM Agent
+# 032 - Meerkat WebCM Agent
 
 Collaborative multi-agent coding system running entirely in your browser.
 Four LLM agents from three providers coordinate via Meerkat comms to plan,
@@ -8,7 +8,8 @@ implement, and review code in a sandboxed Linux VM — no backend required.
 
 - **TUI-style UI**: Claude Code-inspired layout with main agent stream + three specialist panels
 - **Multi-provider mob**: Anthropic (orchestrator), OpenAI (planner + coder), Gemini (reviewer)
-- **Comms-driven orchestration**: Agents communicate via `send_message`/`peers` tools — no polling, no custom delegation
+- **Comms-driven orchestration**: Agents communicate via `send_message`/`peers`
+  tools; the host does not have to re-trigger them after each peer message
 - **Real-time streaming**: Reasoning traces, tool calls, and text stream incrementally in all panels
 - **100% browser-native**: LLM calls via fetch, VM via RISC-V WASM emulator, agent loop in Rust WASM
 
@@ -22,6 +23,7 @@ implement, and review code in a sandboxed Linux VM — no backend required.
 ## Quick start
 
 ```bash
+cd examples/032-wasm-webcm-agent
 ./examples.sh
 # Open http://127.0.0.1:4032
 # Enter API keys (pre-filled from env if ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY are set)
@@ -47,7 +49,7 @@ Browser Tab
 │   ├── EphemeralSessionService + AgentFactory
 │   ├── JsToolDispatcher → WebCM tool callbacks
 │   ├── Comms (send_message/peers) for inter-agent messaging
-│   └── Event streaming via broadcast channels
+│   └── Event subscriptions exposed as pollable `StreamRef` handles
 ├── WebCM (Cartesi Machine, RISC-V Alpine Linux)
 │   └── xterm-pty bridge for serialized command I/O
 └── TUI
@@ -69,8 +71,11 @@ User message
   → If clean: Alpha Meerkat summarizes results for user
 ```
 
-Each step is a separate turn — agents end their turn after sending a message.
-Runtime-backed keep-alive sessions are re-admitted when replies arrive. No polling.
+Each step is a separate turn. Agents end their turn after sending a message,
+and the in-memory autonomous host loop re-admits them when replies arrive. No
+application polling is required to wake agents. The UI does poll each event
+subscription to render incremental output. This is a standalone browser
+runtime; page reload clears its session and mob state.
 
 ## What's in the VM
 

@@ -840,7 +840,7 @@ pub struct FactoryAgentBuilder {
     config_store: Option<Arc<dyn ConfigStore>>,
     /// Realm parent-chain inheritance slot.
     ///
-    /// When populated, [`Self::resolve_config`] folds the head realm's durable
+    /// When populated, `Self::resolve_config` folds the head realm's durable
     /// config (the live `config_store`, or the `config_snapshot` when no store is
     /// configured) with its ancestor chain so top-level fields (models, mcp,
     /// hooks, skills, limits) inherit from parent realms on every agent build —

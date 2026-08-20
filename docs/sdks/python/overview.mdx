@@ -70,10 +70,19 @@ asyncio.run(main())
 
 `Session.turn(...)`, `Session.stream(...)`, and `DeferredSession.start_turn(...)` support:
 
+- `injected_context`, `transient_turn_context`
 - `skill_refs`, `turn_tool_overlay`
 - `additional_instructions`
-- `keep_alive`, `model`, `provider`, `max_tokens`, `system_prompt`
+- `keep_alive`, `model`, `provider`, `self_hosted_server_id`, `max_tokens`, `system_prompt`
 - `output_schema`, `structured_output_retries`, `provider_params`
+
+Immediate session creation also accepts `injected_context`,
+`transient_turn_context`, `auth_binding`, the schedule/WorkGraph/web-search
+feature toggles, and a typed system-prompt override. Deferred creation accepts
+the same durable setup except `transient_turn_context`; supply request-only
+host facts to `DeferredSession.start_turn(...)` instead. Injected context
+becomes ordered user-channel context immediately before the prompt. Transient
+turn context is not durable transcript history.
 
 ### Config APIs
 
@@ -97,6 +106,54 @@ All config APIs return an **envelope** (`config`, `generation`, realm metadata),
 - `await client.list_schedule_tools()`
 - `await client.call_schedule_tool(...)`
 
+### WorkGraph observability
+
+WorkGraph mutation remains agent-owned through tools. Host SDK callers can
+inspect the graph and its goal/attention projections:
+
+- `await client.get_workgraph_item(...)`
+- `await client.list_workgraph_items(...)`
+- `await client.list_ready_workgraph_items(...)`
+- `await client.get_workgraph_snapshot(...)`
+- `await client.list_workgraph_events(...)`
+- `await client.get_workgraph_goal_status(...)`
+- `await client.list_workgraph_attention(...)`
+
+### Jobs, approvals, artifacts, and projected event replay
+
+- detached jobs: `jobs_get`, `jobs_list`, `jobs_cancel`, `jobs_progress`,
+  `jobs_result`, `jobs_artifacts`, `jobs_retry`, `jobs_health`,
+  `jobs_subscribe`, `jobs_unsubscribe`
+- monitors: `monitors_start`
+- MobKit workers: `mobkit_job_heartbeat`, `mobkit_job_progress`,
+  `mobkit_job_checkpoint`, `mobkit_job_complete`, `mobkit_job_fail`,
+  `mobkit_job_cancel_ack`
+- approvals: `request_approval`, `list_approvals`, `get_approval`,
+  `decide_approval`
+- artifacts: `list_artifacts`, `get_artifact`, `download_artifact`
+- projected events: `latest_event_cursor`, `list_events_since`,
+  `event_snapshot` when host event projection is enabled
+
+Approval methods maintain audit records only. Requesting or deciding a record
+does not automatically gate, authorize, or execute an action. Records persist
+when the RPC bundle exposes a store path. See
+[JSON-RPC approvals](/api/rpc#approvals).
+
+Every public Python RPC wrapper binds its request and result transport boundary
+to generated RPC-schema contracts. For the families above, the generated
+parameter and result class names in 0.8.24 are imported from
+`meerkat.generated.types` rather than re-exported at the package root.
+
+### Transcript history, revisions, and recovery
+
+- `input_state(...)` reconciles an admitted input by input id or idempotency key
+- `export_session_atif(...)` exports a session trajectory
+- `read_session_transcript_revision(...)` and
+  `list_session_transcript_revisions(...)` inspect durable revisions
+- `fork_session_at(...)` and `fork_session_replace(...)` create a new branch
+- `rewrite_session_transcript(...)`, `update_system_prompt(...)`, and
+  `restore_session_transcript_revision(...)` perform guarded edits
+
 ### Live channel APIs
 
 The old `RealtimeChannel` helper has been removed. Use `LiveChannel.session(...)`
@@ -107,18 +164,34 @@ for a session-bound wrapper, or call the direct `live/*` RPC helpers on
 from meerkat import LiveChannel, MeerkatClient
 
 client = MeerkatClient()
-await client.connect(live_ws=True)
+await client.connect(live_webrtc=True)
 try:
-    session = await client.create_session("Open a live channel")
+    session = await client.create_session(
+        "Open a live channel",
+        model="gpt-realtime-2",
+        provider="openai",
+    )
     channel = LiveChannel.session(
         client,
         session.id,
         turning_mode="explicit_commit",
+        transport="webrtc",
         seed_max_chars=24_000,
     )
 
     opened = await channel.open()
-    # Connect to opened["transport"]["url"] externally.
+    transport = opened["transport"]
+    if transport["transport"] != "webrtc":
+        raise RuntimeError("server did not return the requested WebRTC bootstrap")
+    # The browser must add an audio track or "meerkat.live" data channel,
+    # setLocalDescription(), wait for ICE gathering to complete, then forward
+    # peer.localDescription.sdp.
+    offer_sdp = "..."  # ICE-complete SDP forwarded from the browser.
+    answer = await client.live_webrtc_answer(
+        opened["channel_id"], transport["token"], offer_sdp
+    )
+    # Forward answer["answer_sdp"] to the browser and wait until it has called
+    # setRemoteDescription({"type": "answer", "sdp": ...}) before input.
     await channel.send_input_text("hello")
     await channel.commit_input(response_modality="text")
     await channel.close()
@@ -126,7 +199,23 @@ finally:
     await client.close()
 ```
 
+For WebSocket instead, connect with `live_ws=True` and request
+`transport="websocket"`; only that bootstrap has a URL.
+
+The server exposes one offer-to-answer exchange and no candidate-trickle RPC.
+Install the returned `answer_sdp` as the browser peer's remote description.
+
+<Warning>
+`live_webrtc=True` passes the `--live-webrtc` process flag, which exists only
+when `rkat-rpc` was compiled with its non-default `live-webrtc` Cargo feature.
+The 0.8.24 auto-downloaded release binary and a normal default-feature build do
+not include that flag. From the Meerkat repository, build an explicit binary
+with `./scripts/repo-cargo build -p meerkat-rpc --features live-webrtc`, then
+put it on `PATH` or pass its path as `MeerkatClient(rkat_path)`.
+</Warning>
+
 - `await client.live_open(session_id, turning_mode=None, transport=None, seed_max_chars=None)`
+- `await client.live_webrtc_answer(channel_id, token, offer_sdp)`
 - `await client.live_status(channel_id)`
 - `await client.live_close(channel_id)`
 - `await client.live_send_input_text(channel_id, text)`
@@ -159,6 +248,16 @@ degraded continuity. Zero is rejected by the server.
 - `await mob.wait_for_kickoff_complete(...)`
 - `await mob.spawn_helper(..., result_label=..., max_text_bytes=..., role_name=...)`
 - `await mob.fork_helper(..., result_label=..., max_text_bytes=..., role_name=...)`
+- host/grant control: `mob.hosts()`, `mob.route_installs()`,
+  `mob.bind_host(...)`, `mob.revoke_host(...)`, `mob.grant_scopes(...)`,
+  `mob.revoke_scopes(...)`, `mob.grants()`
+- remote member control: `mob.hard_cancel(...)`, member history, member live
+  open/status/control/close, and member/mob event subscriptions
+
+Multi-host placement and host/grant mutations are trusted operator APIs on the
+JSON-RPC SDK surface. They are intentionally not exposed as agent-callable mob
+tools. The agent-callable spawn wire also cannot declare the Rust-only
+`resume_from_role` durable role-migration authority.
 
 ### Realm profile CRUD
 
@@ -177,6 +276,13 @@ The Python client also exposes:
 - blob/skill/MCP helpers: `get_blob(...)`, `list_skills()`, `mcp_add(...)`, `mcp_remove(...)`, `mcp_reload(...)`
 - comms helpers: `session.send(...)`, `session.peers()`
 - typed ingress helpers: `send_peer_response_terminal(...)`
+- runtime host inspection: `get_runtime_host_info()`,
+  `get_runtime_host_capabilities()`, `get_runtime_host_health()`
+
+Auth profiles and credentials are realm-scoped. Login/provisioning yields an
+auth binding that sessions and mob member specs can reference without carrying
+the provider secret itself; a remote member host resolves the binding within
+its authorized realm.
 
 ### Generated assistant images
 
@@ -211,3 +317,17 @@ async with session.stream("Summarize logs") as events:
         ...
     result = events.result
 ```
+
+`TurnCompleted.usage` is optional. Absence means the provider supplied no
+normalized accounting for that call; skip the row instead of treating it as
+zero.
+
+<Warning>
+The generated 0.8.24 inventory has eight event types with no handwritten
+parser case, so they arrive as `UnknownEvent`. Current Rust
+`server_tool_content` and `transcript_rewrite_audit_receipt_committed` are
+missing from that inventory and are rejected as `UNKNOWN_EVENT_TYPE`.
+`RunStarted`, `RunFailed`, `Retrying`, and `HookFailed` also retain legacy
+parser field shapes and can arrive malformed. See the reference page for the
+exact list; do not treat these SDK fallbacks as alternate wire contracts.
+</Warning>

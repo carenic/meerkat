@@ -13,7 +13,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[command(name = env!("CARGO_BIN_NAME"), version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "Meerkat JSON-RPC stdio server")]
+#[command(about = "Meerkat JSON-RPC server (stdio by default, optional TCP)")]
 struct Cli {
     /// Explicit realm ID to join.
     #[arg(long)]

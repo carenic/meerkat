@@ -1,19 +1,22 @@
-//! Meerkat - Rust Agentic Interface Kit
+//! Meerkat - library-first agent platform facade.
 //!
-//! A minimal, high-performance agent harness for LLM-powered applications.
+//! This crate provides the public construction and orchestration entry points
+//! shared by embedded Rust applications and the CLI, REST, RPC, and MCP
+//! adapters.
 //!
 //! # Architecture
 //!
-//! All production surfaces (CLI, REST, RPC, MCP) use the **runtime-backed** path:
-//! `SessionService` (substrate) + `MeerkatMachine` (control plane).
-//! The runtime owns keep-alive, Queue/Steer routing, comms drain, and ingress.
+//! Production surfaces use the runtime-backed path: `MeerkatSessionRuntime`
+//! built with `SessionRuntimeBuilder`, over `SessionService` as the substrate
+//! and `MeerkatMachine` as the control plane. The runtime owns keep-alive,
+//! Queue/Steer routing, comms drain, external ingress, and durable delivery.
 //!
 //! `build_ephemeral_service` is available for **testing and embedded use** where
 //! runtime semantics (keep-alive, Steer, comms-driven admission) are not needed.
 //! It supports Queue-only turns and will reject Steer/render_metadata.
 //!
-//! For the runtime-backed entry point, see [`meerkat_rpc::SessionRuntime`] or
-//! the REST/MCP server crates.
+//! RPC's `SessionRuntime` and the REST/MCP server crates are surface adapters
+//! around that shared runtime rather than the canonical Rust entry point.
 
 #![cfg_attr(
     test,

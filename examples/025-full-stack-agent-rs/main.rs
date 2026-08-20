@@ -1,15 +1,14 @@
-//! # 025 — Full-Stack Agent (Rust)
+//! # 025 - Composed Agent (Rust)
 //!
-//! A production-grade agent that combines every Meerkat feature: custom tools,
-//! built-in tools (task management, shell), hooks, skills, budget control,
-//! session persistence, and event streaming. This is the reference architecture
-//! for building real-world agentic applications.
+//! A focused standalone example that composes built-in tools, domain tools,
+//! budget limits, inline behavior instructions, a JSONL store, and event
+//! streaming. It is not an exhaustive production architecture.
 //!
 //! ## What you'll learn
-//! - Combining all Meerkat features in one agent
+//! - Combining built-in and domain-specific tools
 //! - The `AgentFactory.build_agent()` pipeline
-//! - Production configuration patterns
-//! - The recommended architecture for real applications
+//! - Applying token and tool-call budgets
+//! - Streaming events while writing session state to JSONL
 //!
 //! ## Run
 //! ```bash
@@ -152,9 +151,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_tool_calls(50);
 
     // ── 4. Build the agent ─────────────────────────────────────────────────
-    let skill_content = r"
+    let behavior_instructions = r"
 ## Role
-You are a full-stack support agent for a software product.
+You are a software support agent for a product.
 
 ## Capabilities
 1. Search documentation to answer user questions
@@ -174,8 +173,8 @@ Professional, concise, action-oriented. Always provide next steps.
 ";
 
     let system_prompt = format!(
-        "You are a production support agent.\n\n<skill>\n{}\n</skill>",
-        skill_content.trim()
+        "You are a production support agent.\n\n<behavior_instructions>\n{}\n</behavior_instructions>",
+        behavior_instructions.trim()
     );
 
     let mut agent = AgentBuilder::new()
@@ -187,7 +186,7 @@ Professional, concise, action-oriented. Always provide next steps.
         .await?;
 
     // ── 5. Run with event streaming ────────────────────────────────────────
-    println!("=== Full-Stack Agent: Production Support ===\n");
+    println!("=== Composed Agent: Product Support ===\n");
 
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(256);
     let logger = spawn_event_logger(
@@ -218,39 +217,38 @@ Professional, concise, action-oriented. Always provide next steps.
     println!("Tool calls: {}", result.tool_calls);
     println!("Tokens:     {}", result.usage.total_tokens());
 
-    // ── Architecture summary ───────────────────────────────────────────────
+    // Architecture summary
 
-    println!("\n\n=== Full-Stack Agent Architecture ===\n");
+    println!("\n\n=== Composed Agent Architecture ===\n");
     println!(
-        r"This example combines every Meerkat feature:
+        r"This example composes a focused set of Meerkat features:
 
 ┌────────────────────────────────────────────────────────────┐
-│                    FULL-STACK AGENT                          │
+│                    COMPOSED AGENT                            │
 │                                                            │
 │  Model:     claude-sonnet-4-6                              │
-│  Skills:    support-agent (inline)                         │
+│  Behavior:  inline system-prompt instructions              │
 │  Budget:    50K tokens / 50 tool calls                      │
 │                                                            │
 │  Tools:                                                    │
 │  ├── Built-in: task_create, task_list, task_update, datetime │
 │  ├── Domain:   search_docs, create_ticket                  │
-│  └── (Optional: shell, MCP, comms, delegated work)        │
 │                                                            │
 │  Events:    Streaming to event logger (verbose mode)       │
-│  Storage:   JsonlStore (file-based session persistence)    │
-│  Hooks:     (Configurable via .rkat/config.toml)           │
+│  Storage:   JsonlStore in a temporary directory             │
 └────────────────────────────────────────────────────────────┘
 
-Production checklist:
-  ✓ Budget limits prevent runaway costs
-  ✓ Retry policy handles transient LLM failures
-  ✓ Session persistence survives restarts
-  ✓ Event streaming enables real-time UI
-  ✓ Skills separate behavior from code
-  ✓ Hooks enable audit logging and guardrails
-  ✓ CompositeDispatcher merges builtin + domain tools
-  ✓ Structured output for programmatic parsing
-  ✓ MCP for external tool servers (add via config)
+Configured in this program:
+  - Budget limits for total tokens and tool calls
+  - Event streaming through the built-in logger
+  - CompositeDispatcher with built-in and domain tools
+  - JSONL session writes for the duration of the temporary directory
+  - Inline behavior instructions in the system prompt
+
+Not configured here:
+  - Canonical skill resolution, hooks, or structured output
+  - Shell, MCP, comms, or delegation tools
+  - Runtime-backed recovery after process exit
 "
     );
 

@@ -1,5 +1,5 @@
 ---
-title: "Structured output"
+title: "Structured output guide"
 description: "Force agents to produce validated JSON conforming to a user-provided schema"
 icon: "square-code"
 ---
@@ -39,6 +39,54 @@ When `output_schema` is configured on an agent, the execution flow is:
     Retries validation failures up to `structured_output_retries` times with error feedback, then returns the completed main run with `RunResult.extraction_error`.
   </Step>
 </Steps>
+
+### Event lifecycle
+
+The event stream preserves the boundary between completed agentic work and the
+post-main extraction phase. After provider schema compilation succeeds and the
+main turn is accepted, Meerkat emits:
+
+```json
+{
+  "type": "run_completed",
+  "session_id": "019467d9-7e3a-7000-8000-000000000000",
+  "result": "Main assistant answer",
+  "extraction_required": true,
+  "usage": { "input_tokens": 1200, "output_tokens": 180 }
+}
+```
+
+It then emits exactly one extraction terminal:
+
+```json
+{
+  "type": "extraction_succeeded",
+  "session_id": "019467d9-7e3a-7000-8000-000000000000",
+  "structured_output": { "summary": "Complete", "score": 0.91 }
+}
+```
+
+or:
+
+```json
+{
+  "type": "extraction_failed",
+  "session_id": "019467d9-7e3a-7000-8000-000000000000",
+  "last_output": "Main assistant answer",
+  "attempts": 3,
+  "reason": "Schema validation failed: ..."
+}
+```
+
+Extraction attempts do not publish ordinary streamed text or additional
+`turn_completed` events. A failed extraction is not a `run_failed` event: the
+main agentic run completed, and `RunResult.extraction_error` carries the
+post-main failure.
+
+Provider schema compilation is a fallible setup boundary. If it fails before
+the main turn can be accepted, Meerkat emits `extraction_failed` without first
+emitting success-shaped `turn_completed` or `run_completed` events. This keeps
+an invalid provider lowering from being advertised as a completed run.
 
 ## Schema types
 
@@ -358,7 +406,7 @@ let schema = OutputSchema::new(json!({
 }))?;
 
 // Configure via AgentBuildConfig
-let mut build_config = AgentBuildConfig::new("claude-sonnet-4-6");
+let mut build_config = AgentBuildConfig::new("gpt-5.6-sol");
 build_config.output_schema = Some(schema);
 build_config.structured_output_retries = Some(3);  // None inherits the default (2)
 ```

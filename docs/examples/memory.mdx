@@ -81,7 +81,7 @@ When memory is enabled, discarded conversation turns are indexed into a semantic
         .memory(true);
 
     let agent = factory
-        .build_agent(AgentBuildConfig::new("claude-sonnet-4-6"), &config)
+        .build_agent(AgentBuildConfig::new("gpt-5.6-sol"), &config)
         .await?;
     ```
   </Tab>
@@ -153,6 +153,12 @@ The compaction cycle emits events into the session stream:
 }
 ```
 
+If the built-in summarization request itself is rejected as over-context or
+too large, Meerkat uses a deterministic mechanical handoff summary so the
+session can shed old rows and continue. Ordinary LLM errors still emit
+`compaction_failed` and preserve the original transcript. A configured curator
+never falls back to the mechanical or LLM path.
+
 Custom thresholds via the Rust SDK:
 
 <Tabs>
@@ -160,6 +166,7 @@ Custom thresholds via the Rust SDK:
     ```rust
     let compactor = DefaultCompactor::new(CompactionConfig {
         auto_compact_threshold: 50_000,
+        max_request_bytes: Some(9_000_000),
         recent_turn_budget: 6,
         max_summary_tokens: 8192,
         min_turns_between_compactions: 5,
@@ -167,6 +174,46 @@ Custom thresholds via the Rust SDK:
     ```
   </Tab>
 </Tabs>
+
+`max_request_bytes` is a host cap, not an estimate of the current request.
+Compaction triggers at four-fifths of the effective cap. When the provider also
+supplies an exact request-body cap, the stricter cap wins.
+
+## Supply a compaction curator
+
+Use a curator when a host application has its own deterministic or supervised
+handoff-summary path. The runtime still decides when compaction is required and
+validates the resulting rewrite.
+
+```rust
+use async_trait::async_trait;
+use meerkat_core::{
+    CompactionCurator, CompactionCuratorError, CompactionWindow,
+    CuratedCompactionSummary,
+};
+use std::sync::Arc;
+
+struct HostCurator;
+
+#[async_trait]
+impl CompactionCurator for HostCurator {
+    async fn curate_summary(
+        &self,
+        window: CompactionWindow<'_>,
+    ) -> Result<CuratedCompactionSummary, CompactionCuratorError> {
+        let summary = host_summary_service(window.messages).await
+            .map_err(|error| CompactionCuratorError::Failed(error.to_string()))?;
+        CuratedCompactionSummary::new(summary)
+    }
+}
+
+let mut build = AgentBuildConfig::new("gpt-5.6-sol");
+build.compaction_curator_override = Some(Arc::new(HostCurator));
+```
+
+There is no automatic LLM fallback. A curator error emits
+`compaction_failed`, records no transcript rewrite, and leaves the original
+history authoritative.
 
 ## Budget limits
 

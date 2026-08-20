@@ -56,16 +56,16 @@ export interface RuntimeModule {
   mob_member_peer_target: (mobId: string, member: string) => Promise<string>;
   /** Install trust from `member` to an external peer (JSON PeerTarget). */
   mob_wire_peer: (mobId: string, member: string, peerJson: string) => Promise<void>;
-  mob_member_send: (mobId: string, meerkatId: string, requestJson: string) => Promise<string>;
+  mob_member_send: (mobId: string, agentIdentity: string, requestJson: string) => Promise<string>;
   mob_run_flow: (mobId: string, flowId: string, paramsJson: string) => Promise<unknown>;
   mob_flow_status: (mobId: string, runId: string) => Promise<unknown>;
   mob_list_members: (mobId: string) => Promise<unknown>;
-  mob_member_subscribe: (mobId: string, meerkatId: string) => Promise<string>;
+  mob_member_subscribe: (mobId: string, agentIdentity: string) => Promise<string>;
   poll_subscription: (handle: string) => string;
   close_subscription: (handle: string) => void;
 }
 
-export interface AgentSub { meerkatId: string; handle: string; role: MessageRole; team: Team }
+export interface AgentSub { agentIdentity: string; handle: string; role: MessageRole; team: Team }
 export interface FactionMob { team: Team; mobId: string }
 export interface MatchSession {
   factions: FactionMob[];
