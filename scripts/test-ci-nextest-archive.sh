@@ -127,6 +127,8 @@ assert_file_contains() {
 stable_artifact_name="nextest-\${{ inputs.family }}-\${{ github.sha }}"
 assert_file_contains "$BUILD_ACTION" "name: ${stable_artifact_name}"
 assert_file_contains "$BUILD_ACTION" 'overwrite: true'
+assert_file_contains "$BUILD_ACTION" "if: \${{ inputs.publish == 'true' }}"
+assert_file_contains "$BUILD_ACTION" 'value: ${{ steps.archive.outputs.path }}'
 assert_file_contains "$RUN_ACTION" "name: ${stable_artifact_name}"
 assert_file_contains "$RUN_ACTION" 'uses: ./.github/actions/setup-rust-ci'
 assert_file_contains "$RUN_ACTION" 'components: rustfmt'
@@ -136,7 +138,7 @@ for dependency in unit-archive int-archives; do
   assert_file_contains "$WORKFLOW" "      - ${dependency}"
   assert_file_contains "$WORKFLOW" "            \${{ needs.${dependency}.result }}"
 done
-for execution_job in unit int-heavy int-mob int-else int-rest; do
+for execution_job in unit int-mob int-else int-rest; do
   assert_file_contains "$WORKFLOW" "      - ${execution_job}"
   assert_file_contains "$WORKFLOW" "            \${{ needs.${execution_job}.result }}"
 done
@@ -146,17 +148,23 @@ unit_job="$(sed -n '/^  unit:$/,/^  int-archives:$/p' "$WORKFLOW")"
   echo "unit execution does not depend on unit-archive" >&2
   exit 1
 }
-archive_job="$(sed -n '/^  int-archives:$/,/^  int-heavy:$/p' "$WORKFLOW")"
+archive_job="$(sed -n '/^  int-archives:$/,/^  int-mob:$/p' "$WORKFLOW")"
 for family in int-heavy int-mob int-everything-else; do
   [[ "$archive_job" == *"          family: ${family}"* ]] || {
     echo "integration archive builder omits ${family}" >&2
     exit 1
   }
 done
-
-heavy_job="$(sed -n '/^  int-heavy:$/,/^  int-mob:$/p' "$WORKFLOW")"
-[[ "$heavy_job" == *'      - int-archives'* ]] || {
-  echo "int-heavy execution does not depend on int-archives" >&2
+[[ "$archive_job" == *'          publish: "false"'* ]] || {
+  echo "int-heavy archive must not be published to redundant execution runners" >&2
+  exit 1
+}
+[[ "$archive_job" == *'scripts/ci-nextest-archive.sh run'* ]] || {
+  echo "int-heavy archive is not executed on its build runner" >&2
+  exit 1
+}
+[[ "$archive_job" == *'          hash:1/1'* ]] || {
+  echo "int-heavy local archive execution is not fail-closed over the whole family" >&2
   exit 1
 }
 mob_job="$(sed -n '/^  int-mob:$/,/^  int-else:$/p' "$WORKFLOW")"

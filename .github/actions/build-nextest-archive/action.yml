@@ -1,10 +1,19 @@
 name: Build Nextest archive
-description: Build one canonical Meerkat test family and publish its portable Nextest archive.
+description: Build one canonical Meerkat test family and optionally publish its portable archive.
 
 inputs:
   family:
     description: Canonical archive family.
     required: true
+  publish:
+    description: Upload the archive for execution on another runner.
+    required: false
+    default: "true"
+
+outputs:
+  path:
+    description: Absolute path to the built archive on this runner.
+    value: ${{ steps.archive.outputs.path }}
 
 runs:
   using: composite
@@ -22,6 +31,7 @@ runs:
         echo "path=${archive_path}" >>"${GITHUB_OUTPUT}"
 
     - name: Upload portable test archive
+      if: ${{ inputs.publish == 'true' }}
       uses: actions/upload-artifact@v7
       with:
         name: nextest-${{ inputs.family }}-${{ github.sha }}

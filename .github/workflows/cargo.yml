@@ -18,8 +18,9 @@ name: Cargo CI
 #   unit-archive    - build lib unit tests once into a portable archive
 #   unit (x8)       - run hash partitions from the shared unit archive
 #   int-archives    - build the three fast-profile integration families on one
-#                     runner so their shared dependency graph is compiled once
-#   int-heavy, int-mob, int-else (x3 each)
+#                     runner so their shared dependency graph is compiled once;
+#                     run the sub-second integration-crate family in place
+#   int-mob, int-else (x3 each)
 #                   - run hash partitions from the shared family archives
 #   int-rest (x2)   - direct singleton crate-group integration lanes
 #   e2e-fast        — deterministic end-to-end lane (real binaries)
@@ -338,11 +339,14 @@ jobs:
           partition: hash:${{ matrix.partition }}/8
 
   # Integration tests split by build scope, not just run partition. One runner
-  # builds the three shared fast-profile archives so matching dependencies are
-  # compiled once; two singleton feature shapes stay direct. The complement
-  # archive keeps coverage complete when new workspace crates are added.
+  # builds the three fast-profile families so matching dependencies are
+  # compiled once; two singleton feature shapes stay direct. The tiny
+  # integration-crate family runs beside its freshly built archive instead of
+  # uploading 367 MB to three runners for less than one second of total tests.
+  # The complement archive keeps coverage complete when new workspace crates
+  # are added.
   int-archives:
-    name: Build integration-test archives
+    name: Build integration archives + run integration-crate tests
     needs: changes
     if: ${{ needs.changes.outputs.code_changed == 'true' }}
     runs-on: ubuntu-latest
@@ -372,9 +376,18 @@ jobs:
           HOME: ${{ runner.temp }}/install-action-home-${{ github.job }}
 
       - name: Build integration-crate archive
+        id: int-heavy-archive
         uses: ./.github/actions/build-nextest-archive
         with:
           family: int-heavy
+          publish: "false"
+
+      - name: Run integration-crate tests from the local archive
+        run: >-
+          scripts/ci-nextest-archive.sh run
+          int-heavy
+          "${{ steps.int-heavy-archive.outputs.path }}"
+          hash:1/1
 
       - name: Build Mob integration archive
         uses: ./.github/actions/build-nextest-archive
@@ -385,27 +398,6 @@ jobs:
         uses: ./.github/actions/build-nextest-archive
         with:
           family: int-everything-else
-
-  int-heavy:
-    name: Integration tests, meerkat-integration-tests (shard ${{ matrix.partition }}/3)
-    needs:
-      - changes
-      - int-archives
-    if: ${{ needs.changes.outputs.code_changed == 'true' }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2, 3]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Integration-fast tests (integration crate shard)
-        uses: ./.github/actions/run-nextest-archive
-        with:
-          family: int-heavy
-          partition: hash:${{ matrix.partition }}/3
 
   int-mob:
     name: Integration tests, mob-${{ matrix.partition }}of3 crates
@@ -936,7 +928,6 @@ jobs:
       - unit-archive
       - unit
       - int-archives
-      - int-heavy
       - int-mob
       - int-else
       - int-rest
@@ -961,7 +952,6 @@ jobs:
             ${{ needs.unit-archive.result }}
             ${{ needs.unit.result }}
             ${{ needs.int-archives.result }}
-            ${{ needs.int-heavy.result }}
             ${{ needs.int-mob.result }}
             ${{ needs.int-else.result }}
             ${{ needs.int-rest.result }}

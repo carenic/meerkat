@@ -111,7 +111,6 @@ fn cargo_workflow_covers_the_full_per_push_gate_set() {
             "gate",
             "int-archives",
             "int-else",
-            "int-heavy",
             "int-mob",
             "int-rest",
             "locks",
