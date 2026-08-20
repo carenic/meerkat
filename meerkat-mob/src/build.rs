@@ -68,6 +68,7 @@ fn stamp_standard_mob_member_labels(
     peer_meta
         .with_label("mob_id", binding.mob_id.as_str())
         .with_label("role", binding.role.as_str())
+        .with_label("profile_name", binding.role.as_str())
         .with_label("meerkat_id", binding.member.as_str())
         .with_label("agent_identity", binding.member.as_str())
 }
@@ -137,6 +138,9 @@ pub struct BuildAgentConfigParams<'a> {
 pub struct BuildResumedAgentConfigParams<'a> {
     pub base: BuildAgentConfigParams<'a>,
     pub(crate) expected_session_id: &'a SessionId,
+    /// One-request predecessor-role declaration carried by the exact Resume
+    /// launch. `None` preserves strict same-role durable identity.
+    pub resume_from_role: Option<&'a ProfileName>,
     pub resumed_session: Session,
 }
 
@@ -377,6 +381,7 @@ pub async fn build_resumed_agent_config(
     let BuildResumedAgentConfigParams {
         base,
         expected_session_id,
+        resume_from_role,
         resumed_session,
     } = params;
     let inherited_tool_filter = base.inherited_tool_filter.clone();
@@ -398,7 +403,7 @@ pub async fn build_resumed_agent_config(
     let metadata = resumed_session
         .session_metadata()
         .ok_or_else(|| MobError::Internal("missing durable session metadata".to_string()))?;
-    apply_resumed_session_metadata(&mut config, &metadata)?;
+    apply_resumed_session_metadata_with_role_migration(&mut config, &metadata, resume_from_role)?;
     // Rematerialization authors nothing. Prompt configuration can be needed
     // to rebuild the disposable executor, but it is never new durable input.
     // New ordered System content enters through the typed admission API after
@@ -416,6 +421,14 @@ fn apply_resumed_session_metadata(
     config: &mut AgentBuildConfig,
     metadata: &SessionMetadata,
 ) -> Result<(), MobError> {
+    apply_resumed_session_metadata_with_role_migration(config, metadata, None)
+}
+
+fn apply_resumed_session_metadata_with_role_migration(
+    config: &mut AgentBuildConfig,
+    metadata: &SessionMetadata,
+    resume_from_role: Option<&ProfileName>,
+) -> Result<(), MobError> {
     let Some(current_comms_name) = config.comms_name.clone() else {
         return Err(MobError::Internal(
             "missing current comms_name for resumed mob member".to_string(),
@@ -426,39 +439,27 @@ fn apply_resumed_session_metadata(
             "missing durable comms_name for resumed mob member".to_string(),
         ));
     };
-    if !resumed_comms_name_matches_current_or_legacy(&current_comms_name, &stored_comms_name) {
-        return Err(MobError::Internal(format!(
-            "persisted comms_name '{stored_comms_name}' does not match current mob identity '{current_comms_name}'"
-        )));
-    }
     if let Some(current_binding) = config.mob_member_binding.as_ref() {
-        let current_binding_comms = current_binding.comms_name().map_err(|error| {
-            MobError::Internal(format!(
-                "current mob member binding cannot render a comms_name: {error}"
-            ))
-        })?;
-        if current_binding_comms.to_string() != current_comms_name {
+        if !member_binding_proves_comms_name(current_binding, &current_comms_name) {
             return Err(MobError::Internal(format!(
-                "current mob member binding '{current_binding_comms}' does not match current comms_name '{current_comms_name}'"
+                "current mob member binding '{current_binding:?}' does not match current comms_name '{current_comms_name}'"
             )));
         }
     }
-    if let Some(stored_binding) = metadata.mob_member_binding.as_ref() {
-        let Some(current_binding) = config.mob_member_binding.as_ref() else {
-            return Err(MobError::Internal(
-                "persisted mob member binding has no current binding to resume into".to_string(),
-            ));
-        };
-        let stored_binding_comms = stored_binding.comms_name().map_err(|error| {
-            MobError::Internal(format!(
-                "persisted mob member binding cannot render a comms_name: {error}"
-            ))
-        })?;
-        if !resumed_member_binding_matches_current_or_legacy(current_binding, stored_binding) {
-            return Err(MobError::Internal(format!(
-                "persisted mob member binding '{stored_binding_comms}' does not match current mob identity '{current_comms_name}'"
-            )));
-        }
+    let role_migrated = admit_resumed_member_identity(
+        &current_comms_name,
+        &stored_comms_name,
+        config.mob_member_binding.as_ref(),
+        metadata.mob_member_binding.as_ref(),
+        resume_from_role,
+    )?;
+    if role_migrated {
+        // AgentFactory performs its own generic resume projection after this
+        // mob-specific admission. Fence the two identity projections that
+        // must stay current so durable metadata cannot overwrite the admitted
+        // target role before the factory restamps SessionMetadata.
+        config.resume_override_mask.comms_name = true;
+        config.resume_override_mask.peer_meta = true;
     }
 
     // Durable metadata restores only the fields the profile did not claim via
@@ -562,13 +563,159 @@ pub(crate) fn resumed_comms_name_matches_current_or_legacy(current: &str, stored
         && resumed_member_segment_matches_current_or_legacy(current_member, stored_member)
 }
 
-fn resumed_member_binding_matches_current_or_legacy(
-    current: &meerkat_core::MobMemberBinding,
-    stored: &meerkat_core::MobMemberBinding,
+/// Admit one durable member identity into a resumed build.
+///
+/// Mob id and member identity never migrate. Role may change only when the
+/// exact Resume launch declares the durable predecessor role. The declaration
+/// is consumed here and is not copied into session metadata; successful build
+/// materialization restamps the current binding through the ordinary factory
+/// path.
+fn admit_resumed_member_identity(
+    current_comms_name: &str,
+    stored_comms_name: &str,
+    current_binding: Option<&meerkat_core::MobMemberBinding>,
+    stored_binding: Option<&meerkat_core::MobMemberBinding>,
+    resume_from_role: Option<&ProfileName>,
+) -> Result<bool, MobError> {
+    let Some((current_mob, current_role, current_member)) =
+        split_member_comms_name(current_comms_name)
+    else {
+        return Err(MobError::Internal(format!(
+            "current mob comms_name '{current_comms_name}' is malformed"
+        )));
+    };
+    let Some((stored_mob, stored_role_from_name, stored_member_from_name)) =
+        split_member_comms_name(stored_comms_name)
+    else {
+        return Err(MobError::Internal(format!(
+            "persisted comms_name '{stored_comms_name}' is malformed"
+        )));
+    };
+    let canonical_member = current_binding
+        .map(|binding| binding.member.as_str())
+        .unwrap_or(current_member);
+
+    if current_mob != stored_mob {
+        return Err(role_migration_identity_rejection(
+            canonical_member,
+            current_role,
+            resume_from_role,
+            format!(
+                "persisted comms_name '{stored_comms_name}' does not prove the current mob/member identity '{current_comms_name}'"
+            ),
+        ));
+    }
+
+    if let Some(binding) = current_binding {
+        if !member_binding_proves_comms_components(
+            binding,
+            current_mob,
+            current_role,
+            current_member,
+        ) {
+            return Err(MobError::Internal(format!(
+                "current mob member binding '{binding:?}' contradicts current comms_name '{current_comms_name}'"
+            )));
+        }
+    }
+
+    let stored_role = if let Some(binding) = stored_binding {
+        if !member_binding_proves_comms_components(
+            binding,
+            stored_mob,
+            stored_role_from_name,
+            stored_member_from_name,
+        ) || binding.mob_id != current_mob
+            || !member_segments_prove_same_identity(canonical_member, &binding.member)
+        {
+            return Err(role_migration_identity_rejection(
+                canonical_member,
+                current_role,
+                resume_from_role,
+                format!(
+                    "persisted mob member binding '{binding:?}' contradicts persisted comms_name '{stored_comms_name}' or the requested mob/member identity"
+                ),
+            ));
+        }
+        binding.role.as_str()
+    } else {
+        if !member_segments_prove_same_identity(canonical_member, stored_member_from_name) {
+            return Err(role_migration_identity_rejection(
+                canonical_member,
+                current_role,
+                resume_from_role,
+                format!(
+                    "persisted comms_name '{stored_comms_name}' does not prove the current mob/member identity '{current_comms_name}'"
+                ),
+            ));
+        }
+        stored_role_from_name
+    };
+
+    if stored_role == current_role {
+        return Ok(false);
+    }
+
+    let member_id = AgentIdentity::from(canonical_member);
+    let requested_role = ProfileName::from(current_role);
+    let Some(declared_predecessor_role) = resume_from_role else {
+        return Err(MobError::MemberRoleMigrationRequired {
+            member_id,
+            stored_role: ProfileName::from(stored_role),
+            requested_role,
+        });
+    };
+    if declared_predecessor_role.as_str() != stored_role {
+        return Err(MobError::MemberRoleMigrationRejected {
+            member_id,
+            declared_predecessor_role: declared_predecessor_role.clone(),
+            requested_role,
+            reason: format!("durable predecessor role is '{stored_role}', not the declared role"),
+        });
+    }
+    Ok(true)
+}
+
+fn role_migration_identity_rejection(
+    current_member: &str,
+    current_role: &str,
+    resume_from_role: Option<&ProfileName>,
+    reason: String,
+) -> MobError {
+    match resume_from_role {
+        Some(declared_predecessor_role) => MobError::MemberRoleMigrationRejected {
+            member_id: AgentIdentity::from(current_member),
+            declared_predecessor_role: declared_predecessor_role.clone(),
+            requested_role: ProfileName::from(current_role),
+            reason,
+        },
+        None => MobError::Internal(reason),
+    }
+}
+
+fn member_segments_prove_same_identity(left: &str, right: &str) -> bool {
+    resumed_member_segment_matches_current_or_legacy(left, right)
+        || resumed_member_segment_matches_current_or_legacy(right, left)
+}
+
+fn member_binding_proves_comms_name(
+    binding: &meerkat_core::MobMemberBinding,
+    comms_name: &str,
 ) -> bool {
-    current.mob_id == stored.mob_id
-        && current.role == stored.role
-        && resumed_member_segment_matches_current_or_legacy(&current.member, &stored.member)
+    split_member_comms_name(comms_name).is_some_and(|(mob_id, role, member)| {
+        member_binding_proves_comms_components(binding, mob_id, role, member)
+    })
+}
+
+fn member_binding_proves_comms_components(
+    binding: &meerkat_core::MobMemberBinding,
+    mob_id: &str,
+    role: &str,
+    member: &str,
+) -> bool {
+    binding.mob_id == mob_id
+        && binding.role == role
+        && member_segments_prove_same_identity(&binding.member, member)
 }
 
 fn resumed_member_segment_matches_current_or_legacy(current: &str, stored: &str) -> bool {
@@ -587,8 +734,13 @@ fn resumed_member_segment_matches_current_or_legacy(current: &str, stored: &str)
 
 fn mobkit_generation_zero_identity_runtime_alias(current: &str) -> Option<String> {
     let mut encoded = String::with_capacity(current.len() + 26);
-    encoded.push_str("mk--rt_cidentity_c");
-    for character in current.chars() {
+    encoded.push_str("mk--rt_c");
+    let canonical_identity = if current.contains(':') {
+        current.to_string()
+    } else {
+        format!("identity:{current}")
+    };
+    for character in canonical_identity.chars() {
         match character {
             '_' => encoded.push_str("__"),
             ':' => encoded.push_str("_c"),
@@ -1154,6 +1306,7 @@ mod tests {
                 system_prompt_override: None,
             },
             expected_session_id: &session_id,
+            resume_from_role: None,
             resumed_session: resumed_session_with_metadata(session_id.clone()),
         })
         .await
@@ -1874,6 +2027,7 @@ mod tests {
                 system_prompt_override: None,
             },
             expected_session_id: &session_id,
+            resume_from_role: None,
             resumed_session,
         })
         .await
@@ -1939,6 +2093,7 @@ mod tests {
                 )),
             },
             expected_session_id: &session_id,
+            resume_from_role: None,
             resumed_session,
         })
         .await
@@ -2000,6 +2155,7 @@ mod tests {
                 )),
             },
             expected_session_id: &session_id,
+            resume_from_role: None,
             resumed_session,
         })
         .await
@@ -2059,6 +2215,7 @@ mod tests {
                 system_prompt_override: None,
             },
             expected_session_id: &session_id,
+            resume_from_role: None,
             resumed_session,
         })
         .await
@@ -2150,6 +2307,7 @@ mod tests {
                 system_prompt_override: None,
             },
             expected_session_id: &session_id,
+            resume_from_role: None,
             resumed_session,
         })
         .await
@@ -2250,6 +2408,7 @@ mod tests {
                 system_prompt_override: None,
             },
             expected_session_id: &session_id,
+            resume_from_role: None,
             resumed_session,
         })
         .await
@@ -2717,6 +2876,7 @@ mod tests {
                 system_prompt_override: None,
             },
             expected_session_id: &session_id,
+            resume_from_role: None,
             resumed_session,
         })
         .await
@@ -3388,6 +3548,18 @@ mod tests {
     }
 
     #[test]
+    fn generation_zero_runtime_alias_encodes_typed_colon_identity_once() {
+        assert_eq!(
+            mobkit_generation_zero_identity_runtime_alias("domain:home-automation").as_deref(),
+            Some("mk--rt_cdomain_chome-automation_c0")
+        );
+        assert_eq!(
+            mobkit_generation_zero_identity_runtime_alias("parent-1").as_deref(),
+            Some("mk--rt_cidentity_cparent-1_c0")
+        );
+    }
+
+    #[test]
     fn test_resumed_metadata_rejects_tampered_binding_even_with_valid_comms_alias() {
         let mut config = AgentBuildConfig::new("gpt-5.5");
         config.comms_name = Some("homecore/identity/parent-1".to_string());
@@ -3425,6 +3597,127 @@ mod tests {
         assert!(
             error.to_string().contains("persisted mob member binding"),
             "unexpected refusal: {error}"
+        );
+    }
+
+    fn role_migration_fixture() -> (AgentBuildConfig, SessionMetadata) {
+        let mut config = AgentBuildConfig::new("gpt-5.5");
+        config.comms_name =
+            Some("homecore/home-automation/mk--rt_cdomain_chome-automation_c0".to_string());
+        config.mob_member_binding = Some(meerkat_core::MobMemberBinding {
+            mob_id: "homecore".to_string(),
+            role: "home-automation".to_string(),
+            member: "domain:home-automation".to_string(),
+        });
+        config.override_shell = meerkat_core::ToolCategoryOverride::Enable;
+
+        let tooling = meerkat_core::SessionTooling {
+            shell: meerkat_core::ToolCategoryOverride::Disable,
+            ..Default::default()
+        };
+        let metadata = SessionMetadata {
+            schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+            model: "gpt-5.5".to_string(),
+            max_tokens: 16_384,
+            structured_output_retries: 2,
+            provider: meerkat_core::Provider::OpenAI,
+            self_hosted_server_id: None,
+            provider_params: None,
+            tooling,
+            keep_alive: false,
+            comms_name: Some("homecore/domain/mk--rt_cdomain_chome-automation_c0".to_string()),
+            peer_meta: Some(PeerMeta::default().with_label("role", "domain")),
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+            auth_binding: None,
+            mob_member_binding: Some(meerkat_core::MobMemberBinding {
+                mob_id: "homecore".to_string(),
+                role: "domain".to_string(),
+                member: "domain:home-automation".to_string(),
+            }),
+        };
+        (config, metadata)
+    }
+
+    #[test]
+    fn resumed_role_drift_requires_an_explicit_one_request_declaration() {
+        let (mut config, metadata) = role_migration_fixture();
+        let error =
+            apply_resumed_session_metadata_with_role_migration(&mut config, &metadata, None)
+                .expect_err("role drift without authority must fail closed");
+
+        assert!(matches!(
+            error,
+            MobError::MemberRoleMigrationRequired {
+                member_id,
+                stored_role,
+                requested_role,
+            } if member_id.as_str() == "domain:home-automation"
+                && stored_role.as_str() == "domain"
+                && requested_role.as_str() == "home-automation"
+        ));
+    }
+
+    #[test]
+    fn resumed_role_migration_rejects_the_wrong_predecessor() {
+        let (mut config, metadata) = role_migration_fixture();
+        let declared = ProfileName::from("assistant");
+        let error = apply_resumed_session_metadata_with_role_migration(
+            &mut config,
+            &metadata,
+            Some(&declared),
+        )
+        .expect_err("a declaration cannot authorize a different predecessor");
+
+        assert!(matches!(
+            error,
+            MobError::MemberRoleMigrationRejected {
+                declared_predecessor_role,
+                requested_role,
+                ..
+            } if declared_predecessor_role.as_str() == "assistant"
+                && requested_role.as_str() == "home-automation"
+        ));
+    }
+
+    #[test]
+    fn exact_role_migration_keeps_current_tooling_and_restamps_current_identity() {
+        let (mut config, metadata) = role_migration_fixture();
+        let declared = ProfileName::from("domain");
+        apply_resumed_session_metadata_with_role_migration(&mut config, &metadata, Some(&declared))
+            .expect("exact predecessor declaration should authorize the restamp");
+
+        assert!(
+            config.resume_override_mask.comms_name && config.resume_override_mask.peer_meta,
+            "the generic AgentFactory resume pass must not restore the predecessor role over an admitted restamp"
+        );
+        assert_eq!(
+            config.comms_name.as_deref(),
+            Some("homecore/home-automation/mk--rt_cdomain_chome-automation_c0")
+        );
+        assert_eq!(
+            config.mob_member_binding,
+            Some(meerkat_core::MobMemberBinding {
+                mob_id: "homecore".to_string(),
+                role: "home-automation".to_string(),
+                member: "domain:home-automation".to_string(),
+            })
+        );
+        assert_eq!(
+            config.override_shell,
+            meerkat_core::ToolCategoryOverride::Enable,
+            "the current profile's explicit shell enablement must survive resume"
+        );
+        assert_eq!(
+            config
+                .peer_meta
+                .as_ref()
+                .and_then(|meta| meta.labels.get("role"))
+                .map(String::as_str),
+            Some("home-automation"),
+            "peer metadata must be restamped to the current durable role"
         );
     }
 

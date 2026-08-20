@@ -895,6 +895,7 @@ async fn resume_launch_on_ephemeral_substrate_rejects_realm_backend_unavailable(
         1,
         MaterializeLaunchMode::Resume {
             session_id: meerkat_core::SessionId::new().to_string(),
+            resume_from_role: None,
         },
     );
     let reply = probe
@@ -987,6 +988,7 @@ async fn materialize_resume_launch_outcomes() {
         2,
         MaterializeLaunchMode::Resume {
             session_id: fresh_ack.session_id.clone(),
+            resume_from_role: None,
         },
     );
     let reply = probe
@@ -1017,6 +1019,7 @@ async fn materialize_resume_launch_outcomes() {
         1,
         MaterializeLaunchMode::Resume {
             session_id: meerkat_core::SessionId::new().to_string(),
+            resume_from_role: None,
         },
     );
     let reply = probe
@@ -1028,6 +1031,69 @@ async fn materialize_resume_launch_outcomes() {
         .await
         .expect("typed reply");
     assert_rejected(&reply, &BridgeRejectionCause::ResumeSessionNotFound);
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn materialize_resume_carries_exact_predecessor_role_into_host_build() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let fixture = member_build_fixture("mat-role-migration-host").await;
+    let probe = spawn_peer_comms_endpoint("mat-role-migration-supervisor", true, None).await;
+    probe.trust(fixture.host_peer_descriptor()).await;
+    raw_bind(&probe, &fixture, "mob-role-migration", 1).await;
+
+    let fresh = sample_materialize_payload(
+        &probe,
+        1,
+        sample_portable_member_spec("mob-role-migration", "member-1", "domain"),
+        1,
+        1,
+        MaterializeLaunchMode::Fresh {},
+    );
+    let fresh_reply = probe
+        .send_bridge_command_raw(
+            &fixture.host_peer_descriptor(),
+            &BridgeCommand::MaterializeMember(fresh),
+            REPLY_TIMEOUT,
+        )
+        .await
+        .expect("fresh predecessor materialization");
+    let BridgeReply::MemberMaterialized(fresh_ack) = fresh_reply else {
+        panic!("expected predecessor materialization, got {fresh_reply:?}");
+    };
+
+    let mut target =
+        sample_portable_member_spec("mob-role-migration", "member-1", "home-automation");
+    target.profile.tools.shell = true;
+    let migrating = sample_materialize_payload(
+        &probe,
+        1,
+        target,
+        2,
+        2,
+        MaterializeLaunchMode::Resume {
+            session_id: fresh_ack.session_id.clone(),
+            resume_from_role: Some("domain".to_string()),
+        },
+    );
+    let migrating_reply = probe
+        .send_bridge_command_raw(
+            &fixture.host_peer_descriptor(),
+            &BridgeCommand::MaterializeMember(migrating),
+            REPLY_TIMEOUT,
+        )
+        .await
+        .expect("role-migrating materialization");
+    let BridgeReply::MemberMaterialized(migrated) = migrating_reply else {
+        panic!("expected migrated materialization, got {migrating_reply:?}");
+    };
+    assert_eq!(migrated.session_id, fresh_ack.session_id);
+    assert_eq!(
+        migrated.launch_outcome,
+        MaterializeLaunchOutcome::ResumedFromSnapshot,
+        "the trusted host must carry the exact predecessor declaration into the resumed build"
+    );
 
     fixture.shutdown().await;
 }
@@ -1114,6 +1180,7 @@ async fn same_session_generation_cutover_drains_old_events_before_floor_capture(
         2,
         MaterializeLaunchMode::Resume {
             session_id: fresh.session_id.clone(),
+            resume_from_role: None,
         },
     );
     let reply = probe
@@ -1204,6 +1271,7 @@ async fn generation_cutover_projection_failure_preserves_replayable_old_owner() 
         2,
         MaterializeLaunchMode::Resume {
             session_id: fresh.session_id.clone(),
+            resume_from_role: None,
         },
     );
     let reply = probe
@@ -1301,6 +1369,7 @@ async fn one_session_id_cannot_alias_two_host_member_owners() {
         1,
         MaterializeLaunchMode::Resume {
             session_id: owned.session_id.clone(),
+            resume_from_role: None,
         },
     );
     let reply = intruder
@@ -1850,6 +1919,7 @@ async fn executor_stop_between_ensure_and_attach_return_cleans_preinstalled_side
         1,
         MaterializeLaunchMode::Resume {
             session_id: preserved_session.to_string(),
+            resume_from_role: None,
         },
     ));
 
@@ -1934,6 +2004,7 @@ async fn materialize_persist_failure_preserves_resumable_session_and_quiesces_ex
         1,
         MaterializeLaunchMode::Resume {
             session_id: preserved_session.to_string(),
+            resume_from_role: None,
         },
     ));
     let reply = probe
@@ -1999,6 +2070,7 @@ async fn same_session_resume_definite_cas_failure_preserves_snapshot_for_retry()
         2,
         MaterializeLaunchMode::Resume {
             session_id: fresh.session_id.clone(),
+            resume_from_role: None,
         },
     ));
     let reply = probe

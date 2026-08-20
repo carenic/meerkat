@@ -2366,7 +2366,7 @@ fn scripted_materialize_reply(
                 meerkat_core::SessionId::new().to_string(),
                 MaterializeLaunchOutcome::Fresh,
             ),
-            MaterializeLaunchMode::Resume { session_id } => (
+            MaterializeLaunchMode::Resume { session_id, .. } => (
                 session_id.clone(),
                 MaterializeLaunchOutcome::ResumedFromSnapshot,
             ),

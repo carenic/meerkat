@@ -1840,6 +1840,10 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::InvalidTransition { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::InvalidTransition
         }
+        MobError::MemberRoleMigrationRequired { .. }
+        | MobError::MemberRoleMigrationRejected { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::InvalidTransition
+        }
         MobError::MobMachineRejected { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::InvalidTransition
         }
@@ -4528,8 +4532,47 @@ impl SpawnMemberSpec {
     pub fn with_resume_bridge_session_id(mut self, id: meerkat_core::types::SessionId) -> Self {
         self.launch_mode = crate::launch::MemberLaunchMode::Resume {
             bridge_session_id: id,
+            resume_from_role: None,
         };
         self
+    }
+
+    /// Resume one exact durable session while authorizing a role migration
+    /// from one exact predecessor role.
+    ///
+    /// The enclosing spec binds the mob member identity and target role. This
+    /// declaration therefore authorizes only `(mob, identity, from_role) ->
+    /// target_role` for this request. It is not persisted as standing
+    /// permission; callers restoring after a process restart must re-supply it
+    /// through [`SpawnMemberCustomizer`] at [`SpawnSource::Resume`].
+    pub fn with_resume_bridge_session_id_from_role(
+        mut self,
+        id: meerkat_core::types::SessionId,
+        predecessor_role: impl Into<ProfileName>,
+    ) -> Self {
+        self.launch_mode = crate::launch::MemberLaunchMode::Resume {
+            bridge_session_id: id,
+            resume_from_role: Some(predecessor_role.into()),
+        };
+        self
+    }
+
+    /// Attach a predecessor-role declaration to an already configured Resume
+    /// launch. Customizers use this on the pre-populated cold-resume spec.
+    pub fn declare_resume_from_role(
+        &mut self,
+        predecessor_role: impl Into<ProfileName>,
+    ) -> Result<(), MobError> {
+        let crate::launch::MemberLaunchMode::Resume {
+            resume_from_role, ..
+        } = &mut self.launch_mode
+        else {
+            return Err(MobError::WiringError(
+                "resume_from_role requires launch_mode=resume".to_string(),
+            ));
+        };
+        *resume_from_role = Some(predecessor_role.into());
+        Ok(())
     }
 
     /// Set an explicit [`crate::launch::MemberLaunchMode`].
@@ -8046,6 +8089,7 @@ impl MobHandle {
         let mut spec = SpawnMemberSpec::new(profile_name, agent_identity);
         spec.launch_mode = crate::launch::MemberLaunchMode::Resume {
             bridge_session_id: session_id,
+            resume_from_role: None,
         };
         spec.runtime_mode = runtime_mode;
         spec.backend = backend;
@@ -10859,6 +10903,7 @@ impl MobHandle {
         let fork_session_id = fork.session_id.clone();
         member.launch_mode = crate::launch::MemberLaunchMode::Resume {
             bridge_session_id: fork_session_id.clone(),
+            resume_from_role: None,
         };
         if let Err(error) = self
             .spawn_spec_internal_with_source(member, SpawnSource::PersistedForkResume)
@@ -13292,7 +13337,25 @@ mod tests {
             SpawnMemberSpec::new("worker", "worker-1").with_resume_bridge_session_id(sid.clone());
 
         assert_eq!(spec.launch_mode.resume_bridge_session_id(), Some(&sid));
+        assert!(spec.launch_mode.resume_from_role().is_none());
+    }
+
+    #[test]
+    fn spawn_member_spec_role_migration_requires_and_preserves_resume() {
+        let sid = SessionId::new();
+        let spec = SpawnMemberSpec::new("home-automation", "member-1")
+            .with_resume_bridge_session_id_from_role(sid.clone(), "domain");
         assert_eq!(spec.launch_mode.resume_bridge_session_id(), Some(&sid));
+        assert_eq!(
+            spec.launch_mode.resume_from_role(),
+            Some(&ProfileName::from("domain"))
+        );
+
+        let mut fresh = SpawnMemberSpec::new("home-automation", "member-1");
+        assert!(matches!(
+            fresh.declare_resume_from_role("domain"),
+            Err(MobError::WiringError(_))
+        ));
     }
 
     #[test]
@@ -13300,6 +13363,7 @@ mod tests {
         let sid = SessionId::new();
         let resume = crate::launch::MemberLaunchMode::Resume {
             bridge_session_id: sid,
+            resume_from_role: None,
         };
         let fork = crate::launch::MemberLaunchMode::Fork {
             source_member_id: AgentIdentity::from("lead-1"),

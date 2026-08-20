@@ -922,11 +922,11 @@ fn wire_runtime_mode(mode: crate::MobRuntimeMode) -> WireMobRuntimeMode {
 fn wire_launch_mode(mode: crate::launch::MemberLaunchMode) -> WireMemberLaunchMode {
     match mode {
         crate::launch::MemberLaunchMode::Fresh => WireMemberLaunchMode::Fresh,
-        crate::launch::MemberLaunchMode::Resume { bridge_session_id } => {
-            WireMemberLaunchMode::Resume {
-                bridge_session_id: bridge_session_id.to_string(),
-            }
-        }
+        crate::launch::MemberLaunchMode::Resume {
+            bridge_session_id, ..
+        } => WireMemberLaunchMode::Resume {
+            bridge_session_id: bridge_session_id.to_string(),
+        },
         crate::launch::MemberLaunchMode::Fork {
             source_member_id,
             fork_context,

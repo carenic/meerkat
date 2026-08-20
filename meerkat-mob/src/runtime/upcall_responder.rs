@@ -1035,6 +1035,7 @@ fn domain_launch_mode(
                 })?;
             crate::launch::MemberLaunchMode::Resume {
                 bridge_session_id: session_id,
+                resume_from_role: None,
             }
         }
         WireMemberLaunchMode::Fork {

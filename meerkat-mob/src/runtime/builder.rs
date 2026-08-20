@@ -2785,6 +2785,7 @@ pub(super) async fn latest_persisted_session_for_member(
     mob_id: &crate::ids::MobId,
     role: &crate::ids::ProfileName,
     agent_identity: &crate::ids::AgentIdentity,
+    resume_from_role: Option<&crate::ids::ProfileName>,
 ) -> Result<
     Option<(
         meerkat_core::types::SessionId,
@@ -2797,11 +2798,21 @@ pub(super) async fn latest_persisted_session_for_member(
         role.as_str(),
         agent_identity.as_str(),
     )?;
+    let predecessor_comms_name = resume_from_role
+        .map(|predecessor_role| {
+            super::actor::render_member_comms_name(
+                mob_id.as_str(),
+                predecessor_role.as_str(),
+                agent_identity.as_str(),
+            )
+        })
+        .transpose()?;
 
     // Candidate matching runs over the metadata-only read seam: the member
     // identity facts (typed binding, comms name) live on session metadata, so
     // scanning the realm never materializes full transcripts.
     let mut best: Option<(
+        u8,
         meerkat_core::time_compat::SystemTime,
         meerkat_core::types::SessionId,
     )> = None;
@@ -2816,24 +2827,27 @@ pub(super) async fn latest_persisted_session_for_member(
         else {
             continue;
         };
-        if !persisted_session_matches_member(
+        let Some(match_rank) = persisted_session_member_match_rank(
             view.session_metadata.as_ref(),
             mob_id,
             role,
             agent_identity,
             &canonical_comms_name,
-        ) {
+            resume_from_role,
+            predecessor_comms_name.as_deref(),
+        ) else {
             continue;
-        }
-        let replace = best
-            .as_ref()
-            .is_none_or(|(updated_at, _)| summary.updated_at > *updated_at);
+        };
+        let replace = best.as_ref().is_none_or(|(best_rank, updated_at, _)| {
+            match_rank > *best_rank
+                || (match_rank == *best_rank && summary.updated_at > *updated_at)
+        });
         if replace {
-            best = Some((summary.updated_at, summary.session_id.clone()));
+            best = Some((match_rank, summary.updated_at, summary.session_id.clone()));
         }
     }
 
-    let Some((_, winner_session_id)) = best else {
+    let Some((_, _, winner_session_id)) = best else {
         return Ok(None);
     };
     // Operationally prepare and full-load ONLY the winner. A winner that
@@ -2859,27 +2873,42 @@ pub(super) async fn latest_persisted_session_for_member(
     Ok(Some((winner_session_id, authorized)))
 }
 
-fn persisted_session_matches_member(
+fn persisted_session_member_match_rank(
     metadata: Option<&meerkat_core::SessionMetadata>,
     mob_id: &crate::ids::MobId,
     role: &crate::ids::ProfileName,
     agent_identity: &crate::ids::AgentIdentity,
     canonical_comms_name: &str,
-) -> bool {
+    resume_from_role: Option<&crate::ids::ProfileName>,
+    predecessor_comms_name: Option<&str>,
+) -> Option<u8> {
     let Some(metadata) = metadata else {
-        return false;
+        return None;
     };
     if let Some(binding) = metadata.mob_member_binding.as_ref() {
         // Typed durable ownership is authoritative. The comms-name fallback
         // exists only for journals written before MobMemberBinding; it must
         // never override a present but contradictory typed identity.
-        return binding.mob_id == mob_id.as_str()
-            && binding.role == role.as_str()
-            && binding.member == agent_identity.as_str();
+        if binding.mob_id != mob_id.as_str() || binding.member != agent_identity.as_str() {
+            return None;
+        }
+        if binding.role == role.as_str() {
+            return Some(2);
+        }
+        return resume_from_role
+            .is_some_and(|predecessor| binding.role == predecessor.as_str())
+            .then_some(1);
     }
-    metadata.comms_name.as_deref().is_some_and(|comms_name| {
-        crate::build::resumed_comms_name_matches_current_or_legacy(canonical_comms_name, comms_name)
-    })
+    let comms_name = metadata.comms_name.as_deref()?;
+    if crate::build::resumed_comms_name_matches_current_or_legacy(canonical_comms_name, comms_name)
+    {
+        return Some(2);
+    }
+    predecessor_comms_name
+        .is_some_and(|predecessor| {
+            crate::build::resumed_comms_name_matches_current_or_legacy(predecessor, comms_name)
+        })
+        .then_some(1)
 }
 
 fn authorize_seeded_session_provision_operation_owner(
@@ -8937,6 +8966,10 @@ impl MobBuilder {
 
             let mut restore_spec =
                 super::SpawnMemberSpec::new(entry.role.clone(), entry.agent_identity.clone());
+            restore_spec.launch_mode = crate::launch::MemberLaunchMode::Resume {
+                bridge_session_id: bridge_session_id.clone(),
+                resume_from_role: None,
+            };
             restore_spec.runtime_mode = Some(entry.runtime_mode);
             restore_spec.labels = Some(entry.labels.clone());
             restore_spec.override_profile = entry.effective_profile_override.clone();
@@ -8963,6 +8996,23 @@ impl MobBuilder {
                     entry.agent_identity, entry.role, restore_spec.role_name
                 )));
             }
+            let crate::launch::MemberLaunchMode::Resume {
+                bridge_session_id: customized_session_id,
+                resume_from_role: restore_resume_from_role,
+            } = &restore_spec.launch_mode
+            else {
+                return Err(MobError::Internal(format!(
+                    "spawn customizer removed the resume launch for '{}'",
+                    entry.agent_identity
+                )));
+            };
+            if customized_session_id != &bridge_session_id {
+                return Err(MobError::Internal(format!(
+                    "spawn customizer cannot change resume session for '{}' from '{}' to '{}'",
+                    entry.agent_identity, bridge_session_id, customized_session_id
+                )));
+            }
+            let restore_resume_from_role = restore_resume_from_role.clone();
             // Seed the actor's retention map so a later machine-authorized
             // revival recomposes the customizer-supplied per-spawn overlay.
             if let Some(tools) = restore_spec.external_tools.clone() {
@@ -9011,6 +9061,7 @@ impl MobBuilder {
                                 &definition.id,
                                 &entry.role,
                                 &entry.agent_identity,
+                                restore_resume_from_role.as_ref(),
                             )
                             .await?
                         {
@@ -9138,6 +9189,7 @@ impl MobBuilder {
                             system_prompt_override: restore_spec.system_prompt_override.clone(),
                         },
                         expected_session_id: &bridge_session_id,
+                        resume_from_role: restore_resume_from_role.as_ref(),
                         resumed_session: stored_session,
                     })
                     .await;
@@ -10381,6 +10433,103 @@ mod tests {
     };
     use chrono::Utc;
     use meerkat_core::time_compat::UNIX_EPOCH;
+
+    fn member_session_metadata(
+        mob_id: &str,
+        role: &str,
+        member: &str,
+    ) -> meerkat_core::SessionMetadata {
+        meerkat_core::SessionMetadata {
+            schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+            model: "test-model".to_string(),
+            max_tokens: 1024,
+            structured_output_retries: 0,
+            provider: meerkat_core::Provider::Anthropic,
+            self_hosted_server_id: None,
+            provider_params: None,
+            tooling: Default::default(),
+            keep_alive: false,
+            comms_name: Some(format!("{mob_id}/{role}/{member}")),
+            peer_meta: None,
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+            auth_binding: None,
+            mob_member_binding: Some(meerkat_core::MobMemberBinding {
+                mob_id: mob_id.to_string(),
+                role: role.to_string(),
+                member: member.to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn persisted_member_selector_ranks_current_role_before_declared_predecessor() {
+        let mob_id = MobId::from("homecore");
+        let current_role = ProfileName::from("home-automation");
+        let predecessor_role = ProfileName::from("domain");
+        let member = AgentIdentity::from("mk--rt_cdomain_chome-automation_c0");
+        let current_comms = "homecore/home-automation/mk--rt_cdomain_chome-automation_c0";
+        let predecessor_comms = "homecore/domain/mk--rt_cdomain_chome-automation_c0";
+        let current =
+            member_session_metadata(mob_id.as_str(), current_role.as_str(), member.as_str());
+        let predecessor =
+            member_session_metadata(mob_id.as_str(), predecessor_role.as_str(), member.as_str());
+        let unrelated = member_session_metadata("other-mob", "domain", member.as_str());
+
+        assert_eq!(
+            persisted_session_member_match_rank(
+                Some(&current),
+                &mob_id,
+                &current_role,
+                &member,
+                current_comms,
+                Some(&predecessor_role),
+                Some(predecessor_comms),
+            ),
+            Some(2),
+            "a current-role row must outrank even a newer predecessor row"
+        );
+        assert_eq!(
+            persisted_session_member_match_rank(
+                Some(&predecessor),
+                &mob_id,
+                &current_role,
+                &member,
+                current_comms,
+                Some(&predecessor_role),
+                Some(predecessor_comms),
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            persisted_session_member_match_rank(
+                Some(&predecessor),
+                &mob_id,
+                &current_role,
+                &member,
+                current_comms,
+                None,
+                None,
+            ),
+            None,
+            "a predecessor row is invisible without the exact one-shot declaration"
+        );
+        assert_eq!(
+            persisted_session_member_match_rank(
+                Some(&unrelated),
+                &mob_id,
+                &current_role,
+                &member,
+                current_comms,
+                Some(&predecessor_role),
+                Some(predecessor_comms),
+            ),
+            None,
+            "mob and member identity never migrate"
+        );
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     struct NoAcceptorMaterial;

@@ -38,6 +38,7 @@ use meerkat_runtime::SessionServiceRuntimeExt as _;
 use crate::MobRuntimeMode;
 use crate::build::{BuildAgentConfigParams, BuildResumedAgentConfigParams};
 use crate::definition::{MobDefinition, SkillSource};
+use crate::ids::ProfileName;
 use crate::profile::{Profile, ProfileBinding, ResumeOverrideField, ToolConfig};
 use crate::runtime::SpawnSystemPromptOverride;
 use crate::runtime::host_actor::{
@@ -767,7 +768,7 @@ pub async fn assemble_preflight_observations(
     };
     let identity = match launch {
         MaterializeLaunchMode::Fresh {} => Some(candidate_identity),
-        MaterializeLaunchMode::Resume { session_id } => match SessionId::parse(session_id) {
+        MaterializeLaunchMode::Resume { session_id, .. } => match SessionId::parse(session_id) {
             Err(_) => {
                 // The materializer owns the stable typed invalid-id reply.
                 // No identity can be authoritatively derived before that.
@@ -1645,6 +1646,7 @@ impl HostMemberMaterializer {
             resume_materialization,
             resume_authority,
             resume_preparation,
+            resume_from_role,
             launch_outcome,
             generation_start_seq,
             residency_update,
@@ -1664,13 +1666,17 @@ impl HostMemberMaterializer {
                     None,
                     None,
                     None,
+                    None,
                     MaterializeLaunchOutcome::Fresh,
                     1,
                     residency_update,
                     Some(boundary),
                 )
             }
-            MaterializeLaunchMode::Resume { session_id } => {
+            MaterializeLaunchMode::Resume {
+                session_id,
+                resume_from_role,
+            } => {
                 let id = SessionId::parse(session_id).map_err(|err| {
                     MaterializeServeError::ResumeSessionIdInvalid {
                         session_id: session_id.clone(),
@@ -1744,6 +1750,7 @@ impl HostMemberMaterializer {
                             Some(materialization),
                             Some(authority),
                             Some(preparation),
+                            resume_from_role.as_deref().map(ProfileName::from),
                             MaterializeLaunchOutcome::ResumedFromSnapshot,
                             generation_start_seq,
                             residency_update,
@@ -1758,7 +1765,12 @@ impl HostMemberMaterializer {
         };
 
         let mut config = self
-            .compile_member_config(&decompiled, &session_id, resumed_session)
+            .compile_member_config(
+                &decompiled,
+                &session_id,
+                resumed_session,
+                resume_from_role.as_ref(),
+            )
             .await?;
 
         // Step 2 tail — runtime bindings for the (possibly pre-created) id.
@@ -2301,7 +2313,7 @@ impl HostMemberMaterializer {
         };
 
         let mut config = self
-            .compile_member_config(&decompiled, &session_id, Some(session))
+            .compile_member_config(&decompiled, &session_id, Some(session), None)
             .await?;
         let mut prepared = match self
             .substrate
@@ -2655,6 +2667,7 @@ impl HostMemberMaterializer {
         decompiled: &DecompiledMemberBuild,
         session_id: &SessionId,
         resumed_session: Option<meerkat_core::Session>,
+        resume_from_role: Option<&ProfileName>,
     ) -> Result<meerkat::AgentBuildConfig, MaterializeServeError> {
         let base = BuildAgentConfigParams {
             mob_id: &decompiled.mob_id,
@@ -2692,6 +2705,7 @@ impl HostMemberMaterializer {
                 crate::build::build_resumed_agent_config(BuildResumedAgentConfigParams {
                     base,
                     expected_session_id: session_id,
+                    resume_from_role,
                     resumed_session: session,
                 })
                 .await?

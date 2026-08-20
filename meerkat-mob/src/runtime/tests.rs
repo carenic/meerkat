@@ -1428,6 +1428,9 @@ struct CreateSessionRecord {
     runtime_build_mode_session_owned: bool,
     budget_limits: Option<meerkat_core::BudgetLimits>,
     model: String,
+    override_shell: ToolCategoryOverride,
+    mob_member_binding: Option<meerkat_core::MobMemberBinding>,
+    app_context: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2886,6 +2889,19 @@ impl MockSessionService {
                     .as_ref()
                     .and_then(|build| build.budget_limits.clone()),
                 model: req.model.clone(),
+                override_shell: req
+                    .build
+                    .as_ref()
+                    .map(|build| build.override_shell)
+                    .unwrap_or(ToolCategoryOverride::Inherit),
+                mob_member_binding: req
+                    .build
+                    .as_ref()
+                    .and_then(|build| build.mob_member_binding.clone()),
+                app_context: req
+                    .build
+                    .as_ref()
+                    .and_then(|build| build.app_context.clone()),
             });
 
         let mcp_server_names: Vec<String> = req
@@ -24666,6 +24682,7 @@ async fn test_build_resumed_agent_config_rejects_mismatched_session_identity() {
                 system_prompt_override: None,
             },
             expected_session_id: &wrong_session_id,
+            resume_from_role: None,
             resumed_session: resumed,
         })
         .await
@@ -56974,6 +56991,248 @@ impl SpawnMemberCustomizer for ResumeOverlayCustomizer {
     }
 }
 
+#[derive(Clone)]
+struct ResumeRoleMigrationCustomizer {
+    called: Arc<AtomicBool>,
+}
+
+impl SpawnMemberCustomizer for ResumeRoleMigrationCustomizer {
+    fn customize_spawn(
+        &self,
+        ctx: &SpawnCustomizationContext,
+        spec: &mut SpawnMemberSpec,
+    ) -> Result<(), MobError> {
+        if ctx.spawn_source == SpawnSource::Resume
+            && spec.identity.as_str() == "mk--rt_cdomain_chome-automation_c0"
+        {
+            if ctx.requested_profile.as_str() != "home-automation" {
+                return Err(MobError::Internal(format!(
+                    "unexpected migration target profile '{}'",
+                    ctx.requested_profile
+                )));
+            }
+            spec.declare_resume_from_role("domain")?;
+            spec.context = Some(serde_json::json!({
+                "homecore_profile": "home-automation",
+                "identity": "domain:home-automation",
+            }));
+            self.called.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+fn role_migration_definition(mob_id: &str) -> MobDefinition {
+    let mut definition = sample_definition_with_turn_driven_worker();
+    definition.id = MobId::from(mob_id);
+    let mut predecessor = definition
+        .profiles
+        .get(&ProfileName::from("worker"))
+        .expect("worker profile")
+        .clone();
+    predecessor
+        .as_inline_mut()
+        .expect("inline predecessor")
+        .tools
+        .shell = false;
+    let mut target = predecessor.clone();
+    target.as_inline_mut().expect("inline target").tools.shell = true;
+    definition
+        .profiles
+        .insert(ProfileName::from("domain"), predecessor);
+    definition
+        .profiles
+        .insert(ProfileName::from("home-automation"), target);
+    definition
+}
+
+#[tokio::test]
+async fn role_migration_refuses_an_exact_live_session_even_when_idle() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let definition = role_migration_definition("role-migration-live");
+
+    let predecessor = MobBuilder::new(definition.clone(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create predecessor mob");
+    predecessor
+        .spawn_spec(SpawnMemberSpec::new(
+            "domain",
+            "mk--rt_cdomain_chome-automation_c0",
+        ))
+        .await
+        .expect("spawn predecessor member");
+    let session_id = predecessor
+        .resolve_bridge_session_id(&AgentIdentity::from("mk--rt_cdomain_chome-automation_c0"))
+        .await
+        .expect("predecessor session");
+    crash_stop_and_release_routes(predecessor).await;
+    assert!(
+        service
+            .has_live_session(&session_id)
+            .await
+            .expect("observe exact live session"),
+        "the fixture must retain an idle live actor so the migration cannot be mistaken for cold resume"
+    );
+
+    let successor = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(service)
+        .with_spawn_member_customizer(Arc::new(ResumeRoleMigrationCustomizer {
+            called: Arc::new(AtomicBool::new(false)),
+        }))
+        .create()
+        .await
+        .expect("create successor mob");
+    let error = successor
+        .spawn_spec(
+            SpawnMemberSpec::new("home-automation", "mk--rt_cdomain_chome-automation_c0")
+                .with_resume_bridge_session_id(session_id),
+        )
+        .await
+        .expect_err("a one-shot role migration must never restamp a live actor");
+    assert!(
+        matches!(
+            error,
+            MobError::MemberRoleMigrationRejected { ref reason, .. }
+                if reason.contains("exact session is still live")
+        ),
+        "live role migration must fail with the typed migration refusal, got {error:?}"
+    );
+    successor.shutdown().await.expect("shutdown successor mob");
+}
+
+/// The adopter-shaped regression: an existing durable member was created as
+/// `domain` with shell disabled, then a new activation resumes the same exact
+/// mob/member/session as `home-automation` with shell enabled. The one-shot
+/// declaration must survive the public Resume customizer round trip, reach the
+/// real resumed build, and keep the target role/tooling at the AgentFactory
+/// boundary.
+#[tokio::test]
+async fn resume_customizer_carries_exact_role_migration_into_cold_build() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let definition = role_migration_definition("role-migration-cold");
+
+    let predecessor = MobBuilder::new(definition.clone(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create predecessor mob");
+    let mut predecessor_spec = SpawnMemberSpec::new("domain", "mk--rt_cdomain_chome-automation_c0");
+    predecessor_spec.labels = Some(BTreeMap::from([(
+        "identity".to_string(),
+        "domain:home-automation".to_string(),
+    )]));
+    predecessor_spec.context = Some(serde_json::json!({
+        "homecore_profile": "domain",
+        "identity": "domain:home-automation",
+    }));
+    predecessor
+        .spawn_spec(predecessor_spec)
+        .await
+        .expect("spawn predecessor member");
+    let session_id = predecessor
+        .resolve_bridge_session_id(&AgentIdentity::from("mk--rt_cdomain_chome-automation_c0"))
+        .await
+        .expect("predecessor session");
+    // Model an actual process restart: copy only durable session state into a
+    // fresh service/runtime adapter. Reusing the predecessor adapter would
+    // retain its exact attachment authority and would test a concurrent warm
+    // takeover, which this one-shot cold migration deliberately does not
+    // authorize.
+    let restarted_service = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let _ = restarted_service.enable_runtime_adapter();
+    crash_stop_and_release_routes(predecessor).await;
+    drop(service);
+
+    let called = Arc::new(AtomicBool::new(false));
+    let successor = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(restarted_service.clone())
+        .with_spawn_member_customizer(Arc::new(ResumeRoleMigrationCustomizer {
+            called: Arc::clone(&called),
+        }))
+        .create()
+        .await
+        .expect("create successor mob");
+    successor
+        .spawn_spec(
+            SpawnMemberSpec::new("home-automation", "mk--rt_cdomain_chome-automation_c0")
+                .with_resume_bridge_session_id(session_id.clone()),
+        )
+        .await
+        .expect("one-shot role migration should resume the exact session");
+
+    assert!(
+        called.load(Ordering::SeqCst),
+        "the declaration must travel through SpawnMemberCustomizer at SpawnSource::Resume"
+    );
+    assert_eq!(
+        successor
+            .resolve_bridge_session_id(&AgentIdentity::from("mk--rt_cdomain_chome-automation_c0",))
+            .await
+            .expect("successor session"),
+        session_id,
+        "role migration must preserve the exact durable session"
+    );
+    let request = restarted_service
+        .create_requests
+        .read()
+        .await
+        .last()
+        .cloned()
+        .expect("resumed build request");
+    assert_eq!(
+        request.comms_name.as_deref(),
+        Some("role-migration-cold/home-automation/mk--rt_cdomain_chome-automation_c0")
+    );
+    assert_eq!(
+        request.mob_member_binding,
+        Some(meerkat_core::MobMemberBinding {
+            mob_id: "role-migration-cold".to_string(),
+            role: "home-automation".to_string(),
+            member: "mk--rt_cdomain_chome-automation_c0".to_string(),
+        })
+    );
+    assert_eq!(
+        request.peer_meta_labels.get("role").map(String::as_str),
+        Some("home-automation")
+    );
+    assert_eq!(
+        request
+            .peer_meta_labels
+            .get("profile_name")
+            .map(String::as_str),
+        Some("home-automation")
+    );
+    assert_eq!(
+        request.peer_meta_labels.get("identity").map(String::as_str),
+        Some("domain:home-automation"),
+        "the adopter-owned raw identity label must survive beside the encoded transport identity"
+    );
+    assert_eq!(
+        request
+            .peer_meta_labels
+            .get("agent_identity")
+            .map(String::as_str),
+        Some("mk--rt_cdomain_chome-automation_c0")
+    );
+    assert_eq!(
+        request.app_context,
+        Some(serde_json::json!({
+            "homecore_profile": "home-automation",
+            "identity": "domain:home-automation",
+        })),
+        "Meerkat must persist the current callback-owned context, never rewrite or restore the opaque predecessor profile"
+    );
+    assert_eq!(
+        request.override_shell,
+        ToolCategoryOverride::Enable,
+        "the target profile's explicit shell capability must survive durable resume"
+    );
+}
+
 /// Restore-seeded retention: tools attached by a `SpawnMemberCustomizer` at
 /// `SpawnSource::Resume` seed the actor's retention map, so a later
 /// machine-authorized revival in the restored incarnation recomposes them
@@ -63073,6 +63332,12 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             format!("session_unavailable_for_resume:{reason:?}")
         }
         MobError::MemberAlreadyExists(_) => "meerkat_already_exists".to_string(),
+        MobError::MemberRoleMigrationRequired { .. } => {
+            "member_role_migration_required".to_string()
+        }
+        MobError::MemberRoleMigrationRejected { .. } => {
+            "member_role_migration_rejected".to_string()
+        }
         MobError::NotExternallyAddressable(_) => "not_externally_addressable".to_string(),
         MobError::InvalidTransition { from, to } => {
             format!("invalid_transition:{}->{}", from.as_str(), to.as_str())

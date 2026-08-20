@@ -352,6 +352,7 @@ async fn held_envelope_is_fenced_after_same_session_resume_generation_bump() {
     let mut replacement = support::placed_spawn_spec("worker", "b2", &harness.host_id);
     replacement.launch_mode = meerkat_mob::launch::MemberLaunchMode::Resume {
         bridge_session_id: old_session.clone(),
+        resume_from_role: None,
     };
     harness
         .controlling
@@ -377,7 +378,7 @@ async fn held_envelope_is_fenced_after_same_session_resume_generation_bump() {
     assert!(
         matches!(
             &replacement_payload.launch,
-            meerkat_mob::runtime::bridge_protocol::MaterializeLaunchMode::Resume { session_id }
+            meerkat_mob::runtime::bridge_protocol::MaterializeLaunchMode::Resume { session_id, .. }
                 if session_id == &old_session.to_string()
         ),
         "the generation bump resumes the same session"
