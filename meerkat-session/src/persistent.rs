@@ -472,18 +472,20 @@ async fn append_and_project_event(
     event_store: &Arc<dyn EventStore>,
     projector: &Arc<SessionProjector>,
     session_id: &SessionId,
-    envelope: meerkat_core::event::EventEnvelope<meerkat_core::event::AgentEvent>,
+    envelope: &meerkat_core::event::EventEnvelope<meerkat_core::event::AgentEvent>,
     projection_faults: &EventProjectionFaultRegistry,
     projection_gates: &EventProjectionGateRegistry,
 ) -> Result<u64, SessionError> {
-    let envelopes = [envelope];
     let seq = {
         let gate = event_projection_gate(projection_gates, session_id).await;
         let _guard = gate.lock().await;
         if let Some(cause) = projection_faults.lock().await.get(session_id).cloned() {
             return Err(event_projection_halted_error(session_id, cause));
         }
-        match event_store.append_envelopes(session_id, &envelopes).await {
+        match event_store
+            .append_envelopes(session_id, std::slice::from_ref(envelope))
+            .await
+        {
             Ok(seq) => seq,
             Err(error) => {
                 // The append failure and its absorbing latch are one critical
@@ -520,7 +522,7 @@ async fn project_session_event_stream(
     event_store: Arc<dyn EventStore>,
     projector: Arc<SessionProjector>,
     session_id: SessionId,
-    mut stream: meerkat_core::comms::EventStream,
+    mut stream: crate::ephemeral::LosslessEventProjectionStream,
     projection_faults: EventProjectionFaultRegistry,
     projection_gates: EventProjectionGateRegistry,
 ) {
@@ -551,7 +553,7 @@ async fn project_session_event_stream(
         }
         if let meerkat_core::event::AgentEvent::StreamTruncated {
             reason: meerkat_core::event::StreamTruncationReason::StreamLagged { dropped },
-        } = &envelope.payload
+        } = &envelope.envelope().payload
         {
             let error = SessionError::Store(Box::new(SessionEventProjectionLagged {
                 session_id: session_id.clone(),
@@ -577,7 +579,7 @@ async fn project_session_event_stream(
             &event_store,
             &projector,
             &session_id,
-            envelope,
+            envelope.envelope(),
             &projection_faults,
             &projection_gates,
         )
@@ -610,7 +612,7 @@ async fn flush_projected_events(
             event_store,
             projector,
             session_id,
-            envelope,
+            &envelope,
             projection_faults,
             projection_gates,
         )
@@ -6959,10 +6961,15 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         };
         self.ensure_event_projection_admitted(id).await?;
         let session_id = id.clone();
-        let stream = self.inner.subscribe_session_events(&session_id).await;
-        let Ok(stream) = stream else {
-            return Ok(());
-        };
+        let stream = self
+            .inner
+            .install_lossless_event_projection_stream(&session_id)
+            .await
+            .map_err(|error| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "failed to install lossless event projection stream for session {session_id}: {error}"
+                )))
+            })?;
 
         let (drain_tx, drain_rx) = watch::channel(EventProjectionDrainState::Running);
         register_event_projection_drain(&self.event_projection_drains, &session_id, drain_rx).await;
@@ -11466,8 +11473,8 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
 mod tests {
     use super::*;
     use crate::ephemeral::{
-        EphemeralSessionService, ObservedSessionTailKind, SessionAgent, SessionAgentBuilder,
-        SessionSnapshot,
+        EphemeralSessionService, ObservedSessionTailKind, QueuedLosslessEvent, SessionAgent,
+        SessionAgentBuilder, SessionSnapshot,
     };
     use crate::event_store::{
         EVENT_SCHEMA_VERSION, EventStoreError, ExactInteractionAppend, StoredEvent,
@@ -11516,6 +11523,12 @@ mod tests {
 
     fn memory_blob_store() -> Arc<dyn BlobStore> {
         Arc::new(MemoryBlobStore::new())
+    }
+
+    fn queued_lossless_event(
+        envelope: meerkat_core::event::EventEnvelope<AgentEvent>,
+    ) -> QueuedLosslessEvent {
+        QueuedLosslessEvent::new(Arc::new(envelope), Arc::new(AtomicUsize::new(0)))
     }
 
     #[tokio::test]
@@ -11966,7 +11979,7 @@ mod tests {
             &event_store_trait,
             &projector,
             &session_id,
-            started(),
+            &started(),
             &projection_faults,
             &projection_gates,
         )
@@ -11987,7 +12000,7 @@ mod tests {
             &event_store_trait,
             &projector,
             &session_id,
-            started(),
+            &started(),
             &projection_faults,
             &projection_gates,
         )
@@ -12219,8 +12232,11 @@ mod tests {
                 reason: meerkat_core::event::StreamTruncationReason::ChannelFull,
             },
         );
-        let stream: meerkat_core::comms::EventStream =
-            Box::pin(futures::stream::iter(vec![gap, later]));
+        let stream: crate::ephemeral::LosslessEventProjectionStream =
+            Box::pin(futures::stream::iter(vec![
+                queued_lossless_event(gap),
+                queued_lossless_event(later),
+            ]));
 
         project_session_event_stream(
             event_store,
@@ -12248,6 +12264,92 @@ mod tests {
             SessionError::Store(source)
                 if source.downcast_ref::<SessionEventProjectionLagged>().is_some()
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persistent_projection_queues_instead_of_dropping_dense_event_bursts()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const EXTRA_EVENTS: usize = 300;
+        const EXPECTED_EVENTS: usize = EXTRA_EVENTS + 2;
+
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let runtime_store = Arc::new(InMemoryRuntimeStore::new());
+        let event_store = Arc::new(PausingAppendEventStore::default());
+        let event_store_trait: Arc<dyn EventStore> = event_store.clone();
+        let dir = tempfile::tempdir()?;
+        let service = Arc::new(
+            PersistentSessionService::new(
+                FloodingEventBuilder {
+                    extra_events: EXTRA_EVENTS,
+                },
+                4,
+                store,
+                Arc::clone(&runtime_store) as Arc<dyn RuntimeStore>,
+                memory_blob_store(),
+            )
+            .with_event_projection(
+                event_store_trait,
+                Arc::new(SessionProjector::new(dir.path().join(".rkat"))),
+            ),
+        );
+        let created = service
+            .create_session(create_request("seed", InitialTurnPolicy::Defer))
+            .await?;
+        let session_id = created.session_id;
+
+        let turn_service = Arc::clone(&service);
+        let turn_session_id = session_id.clone();
+        let mut turn = tokio::spawn(async move {
+            turn_service
+                .apply_runtime_turn(
+                    &turn_session_id,
+                    RunId::new(),
+                    runtime_content_turn_request("dense projection"),
+                    RunApplyBoundary::RunStart,
+                    vec![InputId::new()],
+                )
+                .await
+        });
+
+        event_store.wait_for_append().await;
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), &mut turn)
+            .await
+            .expect("dense turn must not wait on durable projector latency")
+            .expect("dense turn task joined")?;
+        assert_eq!(
+            event_store.inner.last_seq(&session_id).await?,
+            0,
+            "the durable append gate must still be holding the projector"
+        );
+
+        event_store.release_appends(EXPECTED_EVENTS);
+        machine_commit_runtime_output(
+            service.as_ref(),
+            runtime_store.as_ref(),
+            &session_id,
+            &output,
+        )
+        .await?;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            event_store
+                .inner
+                .wait_for_seq(&session_id, EXPECTED_EVENTS as u64),
+        )
+        .await
+        .expect("dedicated projector queue must drain every dense-burst event");
+        assert!(
+            event_store.projection_halt(&session_id).await?.is_none(),
+            "a dedicated durable projector queue must not record a synthetic lag halt"
+        );
+        let events = event_store.read_from(&session_id, 1).await?;
+        assert_eq!(events.len(), EXPECTED_EVENTS);
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            (1..=EXPECTED_EVENTS as u64).collect::<Vec<_>>()
+        );
         Ok(())
     }
 
@@ -12281,16 +12383,17 @@ mod tests {
 
         let stream_faults: EventProjectionFaultRegistry = Arc::new(Mutex::new(HashMap::new()));
         let stream_gates: EventProjectionGateRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let later_stream: meerkat_core::comms::EventStream = Box::pin(futures::stream::iter(vec![
-            meerkat_core::event::EventEnvelope::new_session(
-                session_id.clone(),
-                2,
-                None,
-                AgentEvent::StreamTruncated {
-                    reason: meerkat_core::event::StreamTruncationReason::ChannelFull,
-                },
-            ),
-        ]));
+        let later_stream: crate::ephemeral::LosslessEventProjectionStream =
+            Box::pin(futures::stream::iter(vec![queued_lossless_event(
+                meerkat_core::event::EventEnvelope::new_session(
+                    session_id.clone(),
+                    2,
+                    None,
+                    AgentEvent::StreamTruncated {
+                        reason: meerkat_core::event::StreamTruncationReason::ChannelFull,
+                    },
+                ),
+            )]));
         project_session_event_stream(
             restarted_event_store.clone(),
             projector.clone(),
@@ -12441,7 +12544,7 @@ mod tests {
                 &append_store,
                 &append_projector,
                 &append_session_id,
-                meerkat_core::event::EventEnvelope::new_session(
+                &meerkat_core::event::EventEnvelope::new_session(
                     append_session_id.clone(),
                     1,
                     None,
@@ -12997,6 +13100,10 @@ mod tests {
 
         fn release_append(&self) {
             self.release_append.add_permits(1);
+        }
+
+        fn release_appends(&self, count: usize) {
+            self.release_append.add_permits(count);
         }
     }
 
@@ -14633,6 +14740,7 @@ mod tests {
 
     struct EventfulDummyAgent {
         inner: DummyAgent,
+        extra_events: usize,
     }
 
     #[async_trait::async_trait]
@@ -14651,6 +14759,13 @@ mod tests {
                     },
                 })
                 .await;
+            for index in 0..self.extra_events {
+                let _ = event_tx
+                    .send(AgentEvent::TextDelta {
+                        delta: format!("dense event {index}"),
+                    })
+                    .await;
+            }
             let result = self.inner.run_with_events(prompt, event_tx.clone()).await?;
             let _ = event_tx
                 .send(AgentEvent::RunCompleted {
@@ -15470,6 +15585,40 @@ mod tests {
                     execution_snapshot: None,
                     compaction_abort_failure: None,
                 },
+                extra_events: 0,
+            })
+        }
+    }
+
+    struct FloodingEventBuilder {
+        extra_events: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionAgentBuilder for FloodingEventBuilder {
+        type Agent = EventfulDummyAgent;
+
+        async fn build_agent(
+            &self,
+            req: &CreateSessionRequest,
+            _event_tx: tokio::sync::mpsc::Sender<meerkat_core::event::AgentEvent>,
+        ) -> Result<Self::Agent, SessionError> {
+            let session = req
+                .build
+                .as_ref()
+                .and_then(|build| build.resume_session.clone())
+                .unwrap_or_default();
+            Ok(EventfulDummyAgent {
+                inner: DummyAgent {
+                    session: Arc::new(std::sync::Mutex::new(session)),
+                    transient_turn_context_state: test_transient_turn_context_state_handle(),
+                    run_failure: None,
+                    flow_overlay_failure: None,
+                    callback_pending_after_run: false,
+                    execution_snapshot: None,
+                    compaction_abort_failure: None,
+                },
+                extra_events: self.extra_events,
             })
         }
     }
@@ -15584,6 +15733,7 @@ mod tests {
                     execution_snapshot: Some(machine_terminal_tool_failure_snapshot()),
                     compaction_abort_failure: None,
                 },
+                extra_events: 0,
             })
         }
     }

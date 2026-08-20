@@ -36,6 +36,8 @@ use meerkat_core::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -61,6 +63,12 @@ use crate::turn_admission::{
 
 /// Capacity for the internal agent event channel.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+const LOSSLESS_EVENT_PROJECTION_WARN_DEPTH: usize = 1_024;
+
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+const LOSSLESS_EVENT_PROJECTION_WARN_INTERVAL_MS: u64 = 60_000;
 
 /// Capacity for session command channel.
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
@@ -348,13 +356,13 @@ fn require_standalone_archive_verdict(
 
 fn lag_aware_session_event_stream(
     session_id: SessionId,
-    rx: tokio::sync::broadcast::Receiver<EventEnvelope<AgentEvent>>,
+    rx: tokio::sync::broadcast::Receiver<Arc<EventEnvelope<AgentEvent>>>,
 ) -> meerkat_core::comms::EventStream {
     Box::pin(futures::stream::unfold(
         (rx, session_id),
         |(mut rx, stream_session_id)| async move {
             match rx.recv().await {
-                Ok(event) => Some((event, (rx, stream_session_id))),
+                Ok(event) => Some((Arc::unwrap_or_clone(event), (rx, stream_session_id))),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
                     let marker = EventEnvelope::new_session(
                         stream_session_id.clone(),
@@ -374,6 +382,154 @@ fn lag_aware_session_event_stream(
     ))
 }
 
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+struct LosslessEventProjectionSink {
+    tx: mpsc::UnboundedSender<QueuedLosslessEvent>,
+    queued_events: Arc<AtomicUsize>,
+    high_water_events: AtomicUsize,
+    last_warning_at_ms: AtomicU64,
+}
+
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+impl LosslessEventProjectionSink {
+    fn new(
+        tx: mpsc::UnboundedSender<QueuedLosslessEvent>,
+        queued_events: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            tx,
+            queued_events,
+            high_water_events: AtomicUsize::new(0),
+            last_warning_at_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn observe_backlog(&self, session_id: Option<&SessionId>) {
+        let queued_events = self.queued_events.load(Ordering::Relaxed);
+        let prior_high_water = self
+            .high_water_events
+            .fetch_max(queued_events, Ordering::Relaxed);
+        let high_water_events = prior_high_water.max(queued_events);
+        if queued_events < LOSSLESS_EVENT_PROJECTION_WARN_DEPTH {
+            return;
+        }
+
+        let now_ms = SystemTime::now()
+            .duration_since(meerkat_core::time_compat::UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let mut last_warning_at_ms = self.last_warning_at_ms.load(Ordering::Relaxed);
+        loop {
+            if now_ms.saturating_sub(last_warning_at_ms)
+                < LOSSLESS_EVENT_PROJECTION_WARN_INTERVAL_MS
+            {
+                return;
+            }
+            match self.last_warning_at_ms.compare_exchange_weak(
+                last_warning_at_ms,
+                now_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => last_warning_at_ms = observed,
+            }
+        }
+
+        tracing::warn!(
+            session_id = ?session_id,
+            queued_events,
+            high_water_events,
+            warning_threshold_events = LOSSLESS_EVENT_PROJECTION_WARN_DEPTH,
+            degraded_event_projection = true,
+            "lossless durable event projection backlog is growing"
+        );
+    }
+}
+
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub(crate) struct QueuedLosslessEvent {
+    envelope: Arc<EventEnvelope<AgentEvent>>,
+    queued_events: Arc<AtomicUsize>,
+}
+
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+impl QueuedLosslessEvent {
+    pub(crate) fn new(
+        envelope: Arc<EventEnvelope<AgentEvent>>,
+        queued_events: Arc<AtomicUsize>,
+    ) -> Self {
+        queued_events.fetch_add(1, Ordering::Relaxed);
+        Self {
+            envelope,
+            queued_events,
+        }
+    }
+
+    pub(crate) fn envelope(&self) -> &EventEnvelope<AgentEvent> {
+        self.envelope.as_ref()
+    }
+}
+
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+impl Drop for QueuedLosslessEvent {
+    fn drop(&mut self) {
+        self.queued_events.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub(crate) type LosslessEventProjectionStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = QueuedLosslessEvent> + Send>>;
+
+fn publish_session_event_to_broadcasts(
+    session_event_tx: &tokio::sync::broadcast::Sender<Arc<EventEnvelope<AgentEvent>>>,
+    raw_session_event_tx: &tokio::sync::broadcast::Sender<EventEnvelope<AgentEvent>>,
+    envelope: Arc<EventEnvelope<AgentEvent>>,
+) {
+    let raw_envelope =
+        (raw_session_event_tx.receiver_count() > 0).then(|| envelope.as_ref().clone());
+    let _ = session_event_tx.send(envelope);
+    if let Some(raw_envelope) = raw_envelope {
+        let _ = raw_session_event_tx.send(raw_envelope);
+    }
+}
+
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+async fn publish_session_event_to_channels(
+    lossless_event_projection_tx: &Arc<
+        tokio::sync::Mutex<Option<Arc<LosslessEventProjectionSink>>>,
+    >,
+    session_event_tx: &tokio::sync::broadcast::Sender<Arc<EventEnvelope<AgentEvent>>>,
+    raw_session_event_tx: &tokio::sync::broadcast::Sender<EventEnvelope<AgentEvent>>,
+    envelope: EventEnvelope<AgentEvent>,
+) {
+    let envelope = Arc::new(envelope);
+    let lossless_sink = lossless_event_projection_tx.lock().await.clone();
+    if let Some(lossless_sink) = lossless_sink.as_ref() {
+        let queued = QueuedLosslessEvent::new(
+            Arc::clone(&envelope),
+            Arc::clone(&lossless_sink.queued_events),
+        );
+        if lossless_sink.tx.send(queued).is_err() {
+            tracing::error!(
+                session_id = ?envelope.source_session_id(),
+                "lossless durable event projection sink closed"
+            );
+            let mut slot = lossless_event_projection_tx.lock().await;
+            if slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, lossless_sink))
+            {
+                *slot = None;
+            }
+        } else {
+            lossless_sink.observe_backlog(envelope.source_session_id());
+        }
+    }
+    publish_session_event_to_broadcasts(session_event_tx, raw_session_event_tx, envelope);
+}
+
 #[cfg(test)]
 mod session_event_stream_tests {
     use super::*;
@@ -387,14 +543,14 @@ mod session_event_stream_tests {
         let mut stream = lag_aware_session_event_stream(session_id.clone(), rx);
 
         for seq in 1..=3 {
-            tx.send(EventEnvelope::new_session(
+            tx.send(Arc::new(EventEnvelope::new_session(
                 session_id.clone(),
                 seq,
                 None,
                 AgentEvent::StreamTruncated {
                     reason: meerkat_core::event::StreamTruncationReason::ChannelFull,
                 },
-            ))
+            )))
             .map_err(|_| "test receiver unexpectedly closed".to_string())?;
         }
 
@@ -419,6 +575,70 @@ mod session_event_stream_tests {
             .await
             .ok_or_else(|| "expected first retained event".to_string())?;
         assert_eq!(retained.seq, 2);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn lossless_projection_sink_receives_every_event_when_broadcast_lags()
+    -> Result<(), String> {
+        const EVENT_COUNT: u64 = 1_100;
+        let session_id = SessionId::new();
+        let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(2);
+        let (raw_broadcast_tx, raw_broadcast_rx) = tokio::sync::broadcast::channel(2);
+        drop(raw_broadcast_rx);
+        let mut broadcast_stream = lag_aware_session_event_stream(session_id.clone(), broadcast_rx);
+        let (lossless_tx, mut lossless_rx) = mpsc::unbounded_channel::<QueuedLosslessEvent>();
+        let queued_events = Arc::new(AtomicUsize::new(0));
+        let lossless_sink = Arc::new(LosslessEventProjectionSink::new(lossless_tx, queued_events));
+        let lossless_slot = Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(&lossless_sink))));
+
+        for seq in 1..=EVENT_COUNT {
+            publish_session_event_to_channels(
+                &lossless_slot,
+                &broadcast_tx,
+                &raw_broadcast_tx,
+                EventEnvelope::new_session(
+                    session_id.clone(),
+                    seq,
+                    None,
+                    AgentEvent::StreamTruncated {
+                        reason: meerkat_core::event::StreamTruncationReason::ChannelFull,
+                    },
+                ),
+            )
+            .await;
+        }
+        *lossless_slot.lock().await = None;
+        assert_eq!(
+            lossless_sink.high_water_events.load(Ordering::Relaxed),
+            EVENT_COUNT as usize
+        );
+        assert_ne!(
+            lossless_sink.last_warning_at_ms.load(Ordering::Relaxed),
+            0,
+            "crossing the queue-depth threshold must arm a rate-limited warning"
+        );
+        drop(lossless_sink);
+
+        let mut lossless_seqs = Vec::new();
+        while let Some(event) = lossless_rx.recv().await {
+            lossless_seqs.push(event.envelope().seq);
+        }
+        assert_eq!(lossless_seqs, (1..=EVENT_COUNT).collect::<Vec<_>>());
+
+        let gap = broadcast_stream
+            .next()
+            .await
+            .ok_or_else(|| "expected broadcast lag marker".to_string())?;
+        assert!(matches!(
+            gap.payload,
+            AgentEvent::StreamTruncated {
+                reason: meerkat_core::event::StreamTruncationReason::StreamLagged {
+                    dropped: 1_098
+                }
+            }
+        ));
         Ok(())
     }
 }
@@ -1105,7 +1325,16 @@ struct SessionHandle {
     /// task owns the receiver and drains it at the next boundary.
     cancel_after_boundary_handle: Option<CancelAfterBoundarySender>,
     /// Broadcast channel for session-wide event subscription.
-    session_event_tx: tokio::sync::broadcast::Sender<EventEnvelope<AgentEvent>>,
+    session_event_tx: tokio::sync::broadcast::Sender<Arc<EventEnvelope<AgentEvent>>>,
+    /// Owned-event broadcast reserved for the public synchronous raw receiver.
+    /// Normal streams use the shared-envelope lane above, so large payloads
+    /// are cloned only while a raw receiver is actually attached.
+    raw_session_event_tx: tokio::sync::broadcast::Sender<EventEnvelope<AgentEvent>>,
+    /// Singular lossless queue reserved for the persistent service's
+    /// durable event projector. UI subscribers stay on the lossy broadcast
+    /// lane; durable projection must never consume from that lane.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    lossless_event_projection_tx: Arc<tokio::sync::Mutex<Option<Arc<LosslessEventProjectionSink>>>>,
 }
 
 /// Cancellation-safe custody of one generated turn-admission claim.
@@ -1315,7 +1544,10 @@ struct SessionTaskControl {
     llm_identity_tx: watch::Sender<SessionLlmIdentity>,
     turn_admission: Arc<std::sync::Mutex<TurnAdmissionSlot>>,
     interrupt_notify: Arc<tokio::sync::Notify>,
-    session_event_tx: tokio::sync::broadcast::Sender<EventEnvelope<AgentEvent>>,
+    session_event_tx: tokio::sync::broadcast::Sender<Arc<EventEnvelope<AgentEvent>>>,
+    raw_session_event_tx: tokio::sync::broadcast::Sender<EventEnvelope<AgentEvent>>,
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    lossless_event_projection_tx: Arc<tokio::sync::Mutex<Option<Arc<LosslessEventProjectionSink>>>>,
     archive_snapshot_gate: Arc<ArchiveSnapshotGate>,
     /// Session-context DSL handle (W2-E / issue #264). `None` on standalone
     /// / ephemeral builds that have no runtime-backed DSL authority. The
@@ -1327,6 +1559,27 @@ struct SessionTaskControl {
 }
 
 impl SessionTaskControl {
+    /// Publish first to the singular durable projector lane, then fan out to
+    /// best-effort broadcast subscribers. The dedicated queue absorbs bursts
+    /// without letting a slow durable projector perturb live session ordering
+    /// or lose canonical events through a UI-oriented broadcast ring.
+    async fn publish_session_event(&self, envelope: EventEnvelope<AgentEvent>) {
+        #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+        publish_session_event_to_channels(
+            &self.lossless_event_projection_tx,
+            &self.session_event_tx,
+            &self.raw_session_event_tx,
+            envelope,
+        )
+        .await;
+        #[cfg(not(all(feature = "session-store", not(target_arch = "wasm32"))))]
+        publish_session_event_to_broadcasts(
+            &self.session_event_tx,
+            &self.raw_session_event_tx,
+            Arc::new(envelope),
+        );
+    }
+
     fn advance_session_context_at(&self, observed_at: SystemTime, reason: &'static str) {
         let Some(handle) = self.session_context.as_ref() else {
             return;
@@ -3798,6 +4051,46 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         Ok(lag_aware_session_event_stream(id.clone(), rx))
     }
 
+    /// Install the singular lossless event stream consumed by the persistent
+    /// service's durable projector.
+    ///
+    /// This is deliberately not a general subscription API. Ordinary readers
+    /// use the bounded broadcast stream above and receive typed truncation
+    /// markers when they lag. The durable projector gets one dedicated MPSC
+    /// queue so persistence never depends on broadcast retention and projector
+    /// latency does not become part of live session execution ordering.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    pub(crate) async fn install_lossless_event_projection_stream(
+        &self,
+        id: &SessionId,
+    ) -> Result<LosslessEventProjectionStream, meerkat_core::comms::StreamError> {
+        let slot = {
+            let sessions = self.sessions.read().await;
+            let handle = sessions.get(id).ok_or_else(|| {
+                meerkat_core::comms::StreamError::NotFound(format!("session {id}"))
+            })?;
+            Arc::clone(&handle.lossless_event_projection_tx)
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let queued_events = Arc::new(AtomicUsize::new(0));
+        let mut current = slot.lock().await;
+        if current.as_ref().is_some_and(|sink| !sink.tx.is_closed()) {
+            return Err(meerkat_core::comms::StreamError::Internal(format!(
+                "lossless event projection stream already installed for session {id}"
+            )));
+        }
+        *current = Some(Arc::new(LosslessEventProjectionSink::new(
+            tx,
+            queued_events,
+        )));
+        drop(current);
+
+        Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })))
+    }
+
     /// Wait until the session summary reflects a mutation newer than `after`.
     ///
     /// This is intentionally summary-backed rather than agent-event-backed:
@@ -3845,7 +4138,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         let handle = sessions
             .get(id)
             .ok_or_else(|| meerkat_core::comms::StreamError::NotFound(format!("session {id}")))?;
-        Ok(handle.session_event_tx.subscribe())
+        Ok(handle.raw_session_event_tx.subscribe())
     }
 
     fn is_session_state_active(state: SessionState) -> bool {
@@ -4059,9 +4352,15 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             last_assistant_text: None,
         });
         let (llm_identity_tx, llm_identity_rx) = watch::channel(llm_identity);
-        let (session_event_tx, session_event_rx) =
-            tokio::sync::broadcast::channel::<EventEnvelope<AgentEvent>>(EVENT_CHANNEL_CAPACITY);
+        let (session_event_tx, session_event_rx) = tokio::sync::broadcast::channel::<
+            Arc<EventEnvelope<AgentEvent>>,
+        >(EVENT_CHANNEL_CAPACITY);
         drop(session_event_rx);
+        let (raw_session_event_tx, raw_session_event_rx) =
+            tokio::sync::broadcast::channel::<EventEnvelope<AgentEvent>>(EVENT_CHANNEL_CAPACITY);
+        drop(raw_session_event_rx);
+        #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+        let lossless_event_projection_tx = Arc::new(tokio::sync::Mutex::new(None));
         let interrupt_notify = Arc::new(tokio::sync::Notify::new());
 
         // Spawn the session task using the platform-appropriate task API.
@@ -4081,6 +4380,9 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
                 turn_admission: Arc::clone(&turn_admission),
                 interrupt_notify: interrupt_notify.clone(),
                 session_event_tx: session_event_tx.clone(),
+                raw_session_event_tx: raw_session_event_tx.clone(),
+                #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+                lossless_event_projection_tx: Arc::clone(&lossless_event_projection_tx),
                 session_context: session_context.clone(),
                 archive_snapshot_gate: Arc::clone(&archive_snapshot_gate),
             },
@@ -4101,6 +4403,9 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
                 turn_admission: Arc::clone(&turn_admission),
                 interrupt_notify: interrupt_notify.clone(),
                 session_event_tx: session_event_tx.clone(),
+                raw_session_event_tx: raw_session_event_tx.clone(),
+                #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+                lossless_event_projection_tx: Arc::clone(&lossless_event_projection_tx),
                 session_context: session_context.clone(),
                 archive_snapshot_gate: Arc::clone(&archive_snapshot_gate),
             },
@@ -4128,6 +4433,9 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             interrupt_notify,
             cancel_after_boundary_handle,
             session_event_tx,
+            raw_session_event_tx,
+            #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+            lossless_event_projection_tx,
         };
 
         let inserted = {
@@ -5006,7 +5314,7 @@ async fn publish_interaction_terminal_batch(
     if actor_still_exact {
         *next_seq = canonical_tail;
         for (_, envelope) in inserted {
-            let _ = control.session_event_tx.send(envelope);
+            control.publish_session_event(envelope).await;
         }
     }
     Ok(receipts)
@@ -5263,7 +5571,7 @@ async fn drain_session_task_commands<A: SessionAgent>(
                         },
                     },
                 );
-                let _ = control.session_event_tx.send(failed);
+                control.publish_session_event(failed).await;
                 let _ = reply_tx.send(());
             }
             SessionCommand::RecordLiveOutputAudioDegraded { dropped, reply_tx } => {
@@ -5276,7 +5584,7 @@ async fn drain_session_task_commands<A: SessionAgent>(
                         },
                     },
                 );
-                let _ = control.session_event_tx.send(truncated);
+                control.publish_session_event(truncated).await;
                 let _ = reply_tx.send(());
             }
             // Mutations during drain — resolve with Cancelled; the session
@@ -5929,7 +6237,7 @@ async fn session_task<A: SessionAgent>(
                                     &source,
                                     event,
                                 );
-                                let _ = control.session_event_tx.send(envelope.clone());
+                                control.publish_session_event(envelope.clone()).await;
                                 if event_stream_open
                                     && let Some(ref tx) = event_tx
                                     && tx.send(envelope).await.is_err()
@@ -5948,7 +6256,7 @@ async fn session_task<A: SessionAgent>(
                     // Drain any remaining events
                     while let Ok(event) = agent_event_rx.try_recv() {
                         let envelope = stamp_event_envelope(&mut next_seq, &source, event);
-                        let _ = control.session_event_tx.send(envelope.clone());
+                        control.publish_session_event(envelope.clone()).await;
                         if event_stream_open
                             && let Some(ref tx) = event_tx
                             && tx.send(envelope).await.is_err()
@@ -6158,7 +6466,7 @@ async fn session_task<A: SessionAgent>(
                         },
                     },
                 );
-                let _ = control.session_event_tx.send(failed);
+                control.publish_session_event(failed).await;
                 let _ = reply_tx.send(());
             }
             SessionCommand::RecordLiveOutputAudioDegraded { dropped, reply_tx } => {
@@ -6171,7 +6479,7 @@ async fn session_task<A: SessionAgent>(
                         },
                     },
                 );
-                let _ = control.session_event_tx.send(truncated);
+                control.publish_session_event(truncated).await;
                 let _ = reply_tx.send(());
             }
             SessionCommand::AppendExternalUserContent { content, reply_tx } => {
@@ -6226,7 +6534,7 @@ async fn session_task<A: SessionAgent>(
                                 content: text_content,
                             },
                         );
-                        let _ = control.session_event_tx.send(envelope);
+                        control.publish_session_event(envelope).await;
                     }
                     // The completion is published whether or not the host
                     // supplied normalized accounting. Withholding it when the
@@ -6240,7 +6548,7 @@ async fn session_task<A: SessionAgent>(
                             usage: usage_for_event,
                         },
                     );
-                    let _ = control.session_event_tx.send(envelope);
+                    control.publish_session_event(envelope).await;
                 }
                 let _ = reply_tx.send(result);
             }
@@ -6271,7 +6579,7 @@ async fn session_task<A: SessionAgent>(
                                         content: text.clone(),
                                     },
                                 );
-                                let _ = control.session_event_tx.send(envelope);
+                                control.publish_session_event(envelope).await;
                             }
                             let envelope = stamp_event_envelope(
                                 &mut next_seq,
@@ -6281,7 +6589,7 @@ async fn session_task<A: SessionAgent>(
                                     usage: usage.clone(),
                                 },
                             );
-                            let _ = control.session_event_tx.send(envelope);
+                            control.publish_session_event(envelope).await;
                         }
                     }
                 }
