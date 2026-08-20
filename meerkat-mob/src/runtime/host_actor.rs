@@ -6547,7 +6547,7 @@ impl MobHostActor {
         // one member key across every mob served by this daemon. Check before
         // preflight/build/rebind side effects; the machine's injectivity
         // invariant independently fail-closes the eventual record commit.
-        if let MaterializeLaunchMode::Resume { session_id } = &payload.launch
+        if let MaterializeLaunchMode::Resume { session_id, .. } = &payload.launch
             && let Some((owner, _)) = self
                 .binding_authority
                 .state()
@@ -6647,7 +6647,7 @@ impl MobHostActor {
         let superseded_session_id = superseded_session_id.filter(|old_session_id| {
             !matches!(
                 &payload.launch,
-                MaterializeLaunchMode::Resume { session_id } if session_id == old_session_id
+                MaterializeLaunchMode::Resume { session_id, .. } if session_id == old_session_id
             )
         });
         let mut superseded_residency_update = None;

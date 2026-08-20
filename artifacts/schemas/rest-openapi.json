@@ -9184,6 +9184,13 @@
                 "const": "resume",
                 "type": "string"
               },
+              "resume_from_role": {
+                "description": "One-request predecessor role declaration for an exact durable\nmember identity. Absence preserves strict same-role resume.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "session_id": {
                 "type": "string"
               }

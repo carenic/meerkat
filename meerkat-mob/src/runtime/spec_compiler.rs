@@ -324,6 +324,7 @@ pub(crate) fn spawn_spec_from_desired_member(
     spec.initial_message = None;
     spec.launch_mode = crate::launch::MemberLaunchMode::Resume {
         bridge_session_id: session.session_id.clone(),
+        resume_from_role: None,
     };
     spec.runtime_mode = Some(domain_runtime_mode(material.overlay.runtime_mode));
     spec.context = material

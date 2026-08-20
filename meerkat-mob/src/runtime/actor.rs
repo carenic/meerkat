@@ -67,6 +67,12 @@ enum ActorLoopWakeSelection {
     BreakActor,
 }
 
+struct RevivedMemberMaterializationOptions<'a> {
+    resume_from_role: Option<&'a ProfileName>,
+    recovered_binding_without_endpoint: bool,
+    restore_topology_immediately: bool,
+}
+
 // Expand the command match synchronously so each arm constructs and erases
 // its own async future. A single async block around the whole match recreates
 // the aggregate command-loop poll frame this boundary exists to avoid.
@@ -3618,6 +3624,7 @@ struct DeferredResumeProvision {
     inherited_tool_filter: Option<meerkat_core::InheritedToolVisibilityAuthority>,
     tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
     system_prompt_override: Option<super::handle::SpawnSystemPromptOverride>,
+    resume_from_role: Option<ProfileName>,
     resume_id: SessionId,
     prompt: ContentInput,
     budget_limits: Option<meerkat_core::BudgetLimits>,
@@ -3709,6 +3716,7 @@ impl DeferredResumeProvision {
             inherited_tool_filter,
             tool_access_policy,
             system_prompt_override,
+            resume_from_role,
             resume_id,
             prompt,
             budget_limits,
@@ -3749,6 +3757,7 @@ impl DeferredResumeProvision {
                 system_prompt_override,
             },
             expected_session_id: &resume_id,
+            resume_from_role: resume_from_role.as_ref(),
             resumed_session: stored_session,
         })
         .await?;
@@ -4967,6 +4976,7 @@ mod placed_route_session_tests {
 /// All mutations go through here; reads bypass via shared `Arc` state.
 struct ExplicitResumeMemberRebuild {
     entry: RosterEntry,
+    restore_spec: super::handle::SpawnMemberSpec,
     member_ref: MemberRef,
     bridge_session_id: SessionId,
     requires_materialization: bool,
@@ -10822,6 +10832,7 @@ impl MobActor {
         entry: &RosterEntry,
         member_ref: &MemberRef,
         bridge_session_id: &SessionId,
+        resume_from_role: Option<&ProfileName>,
         recovered_binding_without_endpoint: bool,
         restore_topology_immediately: bool,
     ) -> Result<(), MobError> {
@@ -10959,8 +10970,11 @@ impl MobActor {
                             member_ref,
                             bridge_session_id,
                             authorized,
-                            recovered_binding_without_endpoint,
-                            restore_topology_immediately,
+                            RevivedMemberMaterializationOptions {
+                                resume_from_role,
+                                recovered_binding_without_endpoint,
+                                restore_topology_immediately,
+                            },
                         )
                         .await
                     }
@@ -11594,6 +11608,7 @@ impl MobActor {
             spec_digest: record.spec_digest.clone(),
             launch: super::bridge_protocol::MaterializeLaunchMode::Resume {
                 session_id: binding.0.clone(),
+                resume_from_role: None,
             },
         });
 
@@ -11709,8 +11724,7 @@ impl MobActor {
         member_ref: &MemberRef,
         bridge_session_id: &SessionId,
         authorized_resume: super::session_service::AuthorizedSessionResume,
-        recovered_binding_without_endpoint: bool,
-        restore_topology_immediately: bool,
+        options: RevivedMemberMaterializationOptions<'_>,
     ) -> Result<(), MobError> {
         let agent_identity = entry.agent_identity.clone();
         let domain_identity = AgentIdentity::from(agent_identity.as_str());
@@ -11765,6 +11779,7 @@ impl MobActor {
                 system_prompt_override: None,
             },
             expected_session_id: bridge_session_id,
+            resume_from_role: options.resume_from_role,
             resumed_session: stored_session,
         })
         .await?;
@@ -11888,7 +11903,7 @@ impl MobActor {
         // materialized comms incarnation before any topology is restored.
         // An already-live replacement supplied its endpoint to the first
         // carrier and therefore remains the ordinary one-event path.
-        if recovered_binding_without_endpoint {
+        if options.recovered_binding_without_endpoint {
             let runtime = self
                 .provisioner
                 .comms_runtime(member_ref)
@@ -11927,7 +11942,7 @@ impl MobActor {
         self.ensure_mob_comms_drain(&agent_identity, member_ref)
             .await?;
 
-        if restore_topology_immediately {
+        if options.restore_topology_immediately {
             // Dispatch-triggered one-member revival restores its topology
             // immediately. Explicit mob Resume passes `false`: its shared
             // all-member reconciliation must preflight the complete trust
@@ -15208,6 +15223,53 @@ impl MobActor {
                 continue;
             }
 
+            // The cold explicit-resume request is customized before either
+            // exact-session admission or successor search. This makes a
+            // one-shot resume_from_role declaration part of the actual
+            // recovery request instead of an after-the-fact build tweak.
+            let mut restore_spec = super::handle::SpawnMemberSpec::new(
+                entry.role.clone(),
+                entry.agent_identity.clone(),
+            );
+            restore_spec.launch_mode = crate::launch::MemberLaunchMode::Resume {
+                bridge_session_id: session_id.clone(),
+                resume_from_role: None,
+            };
+            restore_spec.runtime_mode = Some(entry.runtime_mode);
+            restore_spec.labels = Some(entry.labels.clone());
+            restore_spec.override_profile = entry.effective_profile_override.clone();
+            restore_spec.model_override = entry.effective_model_override.clone();
+            self.customize_spawn_spec(super::handle::SpawnSource::Resume, None, &mut restore_spec)?;
+            if restore_spec.identity != entry.agent_identity {
+                return Err(MobError::Internal(format!(
+                    "spawn customizer cannot change explicit-resume identity from '{}' to '{}'",
+                    entry.agent_identity, restore_spec.identity
+                )));
+            }
+            if restore_spec.role_name != entry.role {
+                return Err(MobError::Internal(format!(
+                    "spawn customizer cannot change explicit-resume profile for '{}' from '{}' to '{}'",
+                    entry.agent_identity, entry.role, restore_spec.role_name
+                )));
+            }
+            let crate::launch::MemberLaunchMode::Resume {
+                bridge_session_id: customized_session_id,
+                resume_from_role,
+            } = &restore_spec.launch_mode
+            else {
+                return Err(MobError::Internal(format!(
+                    "spawn customizer removed the explicit-resume launch for '{}'",
+                    entry.agent_identity
+                )));
+            };
+            if customized_session_id != &session_id {
+                return Err(MobError::Internal(format!(
+                    "spawn customizer cannot change explicit-resume session for '{}' from '{}' to '{}'",
+                    entry.agent_identity, session_id, customized_session_id
+                )));
+            }
+            let resume_from_role = resume_from_role.clone();
+
             let current_snapshot_present = self.session_service.supports_persistent_sessions()
                 && self
                     .session_service
@@ -15218,6 +15280,7 @@ impl MobActor {
             if current_snapshot_present || !self.session_service.supports_persistent_sessions() {
                 rebuild.push(ExplicitResumeMemberRebuild {
                     entry,
+                    restore_spec,
                     member_ref,
                     bridge_session_id: session_id,
                     requires_materialization,
@@ -15242,6 +15305,7 @@ impl MobActor {
                 &self.definition.id,
                 &entry.role,
                 &entry.agent_identity,
+                resume_from_role.as_ref(),
             )
             .await?;
             let Some((replacement_session_id, _replacement_session)) = replacement else {
@@ -15250,6 +15314,7 @@ impl MobActor {
                 // terminal Broken after Resume commits.
                 rebuild.push(ExplicitResumeMemberRebuild {
                     entry,
+                    restore_spec,
                     member_ref,
                     bridge_session_id: session_id,
                     requires_materialization,
@@ -15277,6 +15342,12 @@ impl MobActor {
                     Some(admission.clone()),
                 )
                 .await?;
+            if let crate::launch::MemberLaunchMode::Resume {
+                bridge_session_id, ..
+            } = &mut restore_spec.launch_mode
+            {
+                *bridge_session_id = replacement_session_id.clone();
+            }
             // Publish an endpoint from a live successor only when this exact
             // provisioner is allowed to reuse that attachment. If preparation
             // retires foreign attachment A, its descriptor is stale by
@@ -15304,6 +15375,7 @@ impl MobActor {
             };
             rebuild.push(ExplicitResumeMemberRebuild {
                 entry,
+                restore_spec,
                 member_ref: replacement_member_ref,
                 bridge_session_id: replacement_session_id,
                 requires_materialization: replacement_requires_materialization,
@@ -15328,6 +15400,7 @@ impl MobActor {
         for rebuild in rebuild {
             let ExplicitResumeMemberRebuild {
                 mut entry,
+                restore_spec,
                 member_ref,
                 bridge_session_id,
                 requires_materialization,
@@ -15370,33 +15443,27 @@ impl MobActor {
                 continue;
             }
 
-            // A cold actor has no persisted copy of per-spawn external tools.
-            // The public SpawnMemberCustomizer contract explicitly re-supplies
-            // those process-local mechanics at SpawnSource::Resume. Startup
-            // reconciliation already seeds this map for a Running mob; the
-            // explicit Stopped -> Running seam must do the same before its
-            // machine-authorized revival build.
-            let mut restore_spec = super::handle::SpawnMemberSpec::new(
-                entry.role.clone(),
-                entry.agent_identity.clone(),
-            );
-            restore_spec.runtime_mode = Some(entry.runtime_mode);
-            restore_spec.labels = Some(entry.labels.clone());
-            restore_spec.override_profile = entry.effective_profile_override.clone();
-            restore_spec.model_override = entry.effective_model_override.clone();
-            self.customize_spawn_spec(super::handle::SpawnSource::Resume, None, &mut restore_spec)?;
-            if restore_spec.identity != entry.agent_identity {
+            // The public SpawnMemberCustomizer already ran before exact
+            // session/successor selection in prepare_explicit_resume. Keep the
+            // resulting process-local overlay and one-shot migration
+            // declaration on this exact rebuild request.
+            let crate::launch::MemberLaunchMode::Resume {
+                bridge_session_id: customized_session_id,
+                resume_from_role,
+            } = &restore_spec.launch_mode
+            else {
                 return Err(MobError::Internal(format!(
-                    "spawn customizer cannot change explicit-resume identity from '{}' to '{}'",
-                    entry.agent_identity, restore_spec.identity
+                    "explicit-resume rebuild lost its Resume launch for '{}'",
+                    entry.agent_identity
+                )));
+            };
+            if customized_session_id != &bridge_session_id {
+                return Err(MobError::Internal(format!(
+                    "explicit-resume rebuild session drifted for '{}': request='{}' selected='{}'",
+                    entry.agent_identity, customized_session_id, bridge_session_id
                 )));
             }
-            if restore_spec.role_name != entry.role {
-                return Err(MobError::Internal(format!(
-                    "spawn customizer cannot change explicit-resume profile for '{}' from '{}' to '{}'",
-                    entry.agent_identity, entry.role, restore_spec.role_name
-                )));
-            }
+            let resume_from_role = resume_from_role.clone();
             entry.effective_profile_override = restore_spec.override_profile.clone();
             entry.effective_model_override = restore_spec.model_override.clone();
             entry.labels = restore_spec
@@ -15426,6 +15493,7 @@ impl MobActor {
                     &entry,
                     &member_ref,
                     &bridge_session_id,
+                    resume_from_role.as_ref(),
                     repoints_session_binding && recovered_peer_endpoint.is_none(),
                     false,
                 )
@@ -23785,6 +23853,7 @@ impl MobActor {
         }
         // Normalize launch-mode resume/fork details for the provisioning path.
         let resume_bridge_session_id = launch_mode.resume_bridge_session_id().cloned();
+        let resume_from_role = launch_mode.resume_from_role().cloned();
         let fork_spec = match launch_mode {
             crate::launch::MemberLaunchMode::Fork {
                 source_member_id,
@@ -23895,6 +23964,23 @@ impl MobActor {
             if let Some(resume_id) = resume_bridge_session_id {
                 let member_ref = MemberRef::from_bridge_session_id(resume_id.clone());
 
+                // A role migration is a cold, one-shot restamp of durable
+                // identity. Never let it reuse or race an exact live actor,
+                // even when that actor is idle and `SessionInfo::is_active`
+                // is false. Ordinary same-role resume keeps its established
+                // live-session fast path below.
+                if let Some(declared_predecessor_role) = resume_from_role.as_ref()
+                    && self.session_service.has_live_session(&resume_id).await?
+                {
+                    return Err(MobError::MemberRoleMigrationRejected {
+                        member_id: agent_identity.clone(),
+                        declared_predecessor_role: declared_predecessor_role.clone(),
+                        requested_role: profile_name.clone(),
+                        reason: "the exact session is still live; stop or retire its current runtime before restamping durable comms identity"
+                            .to_string(),
+                    });
+                }
+
                 // Validate the session exists and is active.
                 let is_active = self
                     .provisioner
@@ -23906,6 +23992,15 @@ impl MobActor {
                         ))
                     })?;
                 if is_active.unwrap_or(false) {
+                    if let Some(declared_predecessor_role) = resume_from_role.as_ref() {
+                        return Err(MobError::MemberRoleMigrationRejected {
+                            member_id: agent_identity.clone(),
+                            declared_predecessor_role: declared_predecessor_role.clone(),
+                            requested_role: profile_name.clone(),
+                            reason: "the exact session is still live; stop or retire its current runtime before restamping durable comms identity"
+                                .to_string(),
+                        });
+                    }
                     // Validate interaction-scoped injection for autonomous mode.
                     if selected_runtime_mode == crate::MobRuntimeMode::AutonomousHost
                         && self.provisioner.interaction_event_injector(&resume_id).await.is_none()
@@ -24000,6 +24095,7 @@ impl MobActor {
                             inherited_tool_filter: inherited_tool_filter.clone(),
                             tool_access_policy: tool_access_policy.clone(),
                             system_prompt_override: system_prompt_override.clone(),
+                            resume_from_role: resume_from_role.clone(),
                             resume_id,
                             prompt: prompt.clone(),
                             budget_limits: budget_limits.clone(),
@@ -24072,6 +24168,7 @@ impl MobActor {
                                 system_prompt_override: system_prompt_override.clone(),
                             },
                             expected_session_id: &resume_id,
+                            resume_from_role: resume_from_role.as_ref(),
                             resumed_session: stored_session,
                         },
                     )
@@ -25545,6 +25642,9 @@ impl MobActor {
         // with a local source renders context text controlling-side; the
         // wire launch is Fresh (Fork unrepresentable, A6).
         let resume_session_id = launch_mode.resume_bridge_session_id().cloned();
+        let resume_from_role = launch_mode
+            .resume_from_role()
+            .map(|role| role.as_str().to_string());
         let fork_spec = match launch_mode {
             crate::launch::MemberLaunchMode::Fork {
                 source_member_id,
@@ -26047,6 +26147,7 @@ impl MobActor {
         let launch = match resume_session_id.as_ref() {
             Some(session_id) => super::bridge_protocol::MaterializeLaunchMode::Resume {
                 session_id: session_id.to_string(),
+                resume_from_role,
             },
             None => super::bridge_protocol::MaterializeLaunchMode::Fresh {},
         };
@@ -47952,6 +48053,7 @@ impl MobActor {
                         entry,
                         &machine_member_ref,
                         bridge_session_id,
+                        None,
                         false,
                         true,
                     )

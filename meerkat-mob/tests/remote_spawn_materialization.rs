@@ -671,6 +671,7 @@ async fn launch_modes_map_to_wire_launch_without_local_probes() {
     let mut spec = support::placed_spawn_spec("worker", "resumer", &report.host_id);
     spec.launch_mode = meerkat_mob::launch::MemberLaunchMode::Resume {
         bridge_session_id: remote_session.clone(),
+        resume_from_role: None,
     };
     controlling
         .handle
@@ -685,7 +686,7 @@ async fn launch_modes_map_to_wire_launch_without_local_probes() {
     assert!(
         matches!(
             &resume_payload.launch,
-            MaterializeLaunchMode::Resume { session_id } if *session_id == remote_session.to_string()
+            MaterializeLaunchMode::Resume { session_id, .. } if *session_id == remote_session.to_string()
         ),
         "Resume launch rides the payload verbatim, got {:?}",
         resume_payload.launch

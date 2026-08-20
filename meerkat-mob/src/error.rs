@@ -738,6 +738,31 @@ pub enum MobError {
         participant_name: String,
         holder_pubkey: meerkat_comms::PubKey,
     },
+
+    /// A durable session belongs to the same mob member but carries a
+    /// different role, and this exact resume request supplied no migration
+    /// declaration. Role remains part of durable comms identity; callers must
+    /// opt into the one-way restamp explicitly.
+    #[error(
+        "durable member '{member_id}' has predecessor role '{stored_role}', but resume targets role '{requested_role}'; supply resume_from_role='{stored_role}' on this exact resume request"
+    )]
+    MemberRoleMigrationRequired {
+        member_id: AgentIdentity,
+        stored_role: ProfileName,
+        requested_role: ProfileName,
+    },
+
+    /// A resume request supplied a role-migration declaration, but the
+    /// durable identity facts did not prove the exact declared predecessor.
+    #[error(
+        "role migration for durable member '{member_id}' from '{declared_predecessor_role}' to '{requested_role}' was rejected: {reason}"
+    )]
+    MemberRoleMigrationRejected {
+        member_id: AgentIdentity,
+        declared_predecessor_role: ProfileName,
+        requested_role: ProfileName,
+        reason: String,
+    },
 }
 
 /// THE single owner of the operator-facing name-occupancy remedy text, shared

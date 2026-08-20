@@ -6,7 +6,7 @@
 //! `ForkContext` is a mob-native type defined here (not in `meerkat-core`)
 //! because forking is a mob-level orchestration concept.
 
-use crate::ids::AgentIdentity;
+use crate::ids::{AgentIdentity, ProfileName};
 use meerkat_core::types::SessionId;
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +24,17 @@ pub enum MemberLaunchMode {
     #[default]
     Fresh,
     /// Resume an existing bridge session binding by ID.
-    Resume { bridge_session_id: SessionId },
+    ///
+    /// `resume_from_role` is a one-request migration declaration for a
+    /// durable member whose role changed while its mob id and agent identity
+    /// stayed the same. Absence preserves the strict same-role resume
+    /// invariant. A populated declaration authorizes only the named
+    /// predecessor role; it is never a standing profile permission.
+    Resume {
+        bridge_session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_from_role: Option<ProfileName>,
+    },
     /// Fork from another member's conversation history.
     Fork {
         source_member_id: AgentIdentity,
@@ -38,7 +48,19 @@ impl MemberLaunchMode {
     /// the session id. Returns `None` for `Fresh` and `Fork` modes.
     pub fn resume_bridge_session_id(&self) -> Option<&SessionId> {
         match self {
-            Self::Resume { bridge_session_id } => Some(bridge_session_id),
+            Self::Resume {
+                bridge_session_id, ..
+            } => Some(bridge_session_id),
+            _ => None,
+        }
+    }
+
+    /// Declared predecessor role for this exact resume request.
+    pub fn resume_from_role(&self) -> Option<&ProfileName> {
+        match self {
+            Self::Resume {
+                resume_from_role, ..
+            } => resume_from_role.as_ref(),
             _ => None,
         }
     }
@@ -68,6 +90,7 @@ mod tests {
         let sid = SessionId::new();
         let mode = MemberLaunchMode::Resume {
             bridge_session_id: sid.clone(),
+            resume_from_role: None,
         };
 
         assert_eq!(mode.resume_bridge_session_id(), Some(&sid));
@@ -85,6 +108,26 @@ mod tests {
             serde_json::from_value(payload).expect("resume launch mode should deserialize");
 
         assert_eq!(mode.resume_bridge_session_id(), Some(&sid));
+        assert!(mode.resume_from_role().is_none());
+    }
+
+    #[test]
+    fn resume_launch_mode_round_trips_one_request_predecessor_role() {
+        let sid = SessionId::new();
+        let mode = MemberLaunchMode::Resume {
+            bridge_session_id: sid.clone(),
+            resume_from_role: Some(ProfileName::from("domain")),
+        };
+
+        let encoded = serde_json::to_value(&mode).expect("migration resume serializes");
+        assert_eq!(encoded["resume_from_role"], "domain");
+        let decoded: MemberLaunchMode =
+            serde_json::from_value(encoded).expect("migration resume deserializes");
+        assert_eq!(decoded.resume_bridge_session_id(), Some(&sid));
+        assert_eq!(
+            decoded.resume_from_role(),
+            Some(&ProfileName::from("domain"))
+        );
     }
 
     /// DELETE_ME A3 + C1 regression: `MemberLaunchMode` and its variants
@@ -106,6 +149,7 @@ mod tests {
         let sid = SessionId::new();
         let resume = MemberLaunchMode::Resume {
             bridge_session_id: sid.clone(),
+            resume_from_role: None,
         };
         assert_eq!(resume.resume_bridge_session_id(), Some(&sid));
 

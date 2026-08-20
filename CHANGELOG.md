@@ -28,8 +28,31 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- **`meerkat_mob::MemberLaunchMode::Resume` gains
+  `resume_from_role: Option<ProfileName>`**, and the trusted remote-host
+  **`meerkat_contracts::MaterializeLaunchMode::Resume` gains
+  `resume_from_role: Option<String>`**. Direct struct-variant constructors must
+  provide the new field. Omitted JSON remains backward compatible and means a
+  strict same-role resume. `meerkat_mob::MobError` gains
+  `MemberRoleMigrationRequired` and `MemberRoleMigrationRejected`; exhaustive
+  matches must add both arms.
+
 ### Corrected
 
+- Durable mob members can now perform an explicitly declared, one-shot role
+  migration on an exact Resume request. The declaration must name the one
+  durable predecessor role; mob id and member identity never migrate, wrong or
+  absent declarations fail closed, and an exact live session is refused. A
+  successful cold build preserves the session and transcript while restamping
+  the current comms name, typed member binding, role/profile labels, callback
+  context, and explicitly configured tooling. The declaration is available on
+  trusted host `SpawnMemberSpec` and remote-host materialization paths, not on
+  agent-callable spawn wire commands or standing profiles. The restamp is
+  forward-only against a shared durable store: rollback requires another
+  declared forward migration (or separately versioned durable state), not an
+  old binary silently reclaiming the predecessor role.
 - Provider failures whose class is genuinely unknown now enter the existing
   machine-authorized, bounded retry path instead of terminalizing the agent on
   the first attempt. The retry budget and exponential backoff are unchanged;

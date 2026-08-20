@@ -989,7 +989,13 @@ pub enum MaterializeLaunchMode {
     // would silently accept smuggled sibling fields. Wire bytes are identical
     // ({"mode":"fresh"}).
     Fresh {},
-    Resume { session_id: String },
+    Resume {
+        session_id: String,
+        /// One-request predecessor role declaration for an exact durable
+        /// member identity. Absence preserves strict same-role resume.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_from_role: Option<String>,
+    },
 }
 
 /// Which launch path actually ran on the member host (§19.L1).
@@ -5543,6 +5549,7 @@ mod tests {
                 spec_digest: "d".repeat(64),
                 launch: MaterializeLaunchMode::Resume {
                     session_id: "sess-9".to_string(),
+                    resume_from_role: None,
                 },
             })),
             BridgeCommand::ReleaseMember(BridgeReleasePayload {
@@ -6111,7 +6118,21 @@ mod tests {
         assert_eq!(
             resume,
             MaterializeLaunchMode::Resume {
-                session_id: "sess-1".to_string()
+                session_id: "sess-1".to_string(),
+                resume_from_role: None,
+            }
+        );
+        let migrating: MaterializeLaunchMode = serde_json::from_value(json!({
+            "mode": "resume",
+            "session_id": "sess-1",
+            "resume_from_role": "domain",
+        }))
+        .expect("trusted host materialization carries the one-request predecessor role");
+        assert_eq!(
+            migrating,
+            MaterializeLaunchMode::Resume {
+                session_id: "sess-1".to_string(),
+                resume_from_role: Some("domain".to_string()),
             }
         );
 
