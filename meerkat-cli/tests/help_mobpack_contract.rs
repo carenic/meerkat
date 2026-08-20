@@ -177,11 +177,12 @@ fn embedded_help_mobpack_examples_match_typed_authoring_contracts()
         "0707070707070707070707070707070707070707070707070707070707070707\n",
     )?;
     let pack = dist.join("release-triage.mobpack");
-    let rkat = env!("CARGO_BIN_EXE_rkat");
+    let rkat = std::env::var_os("CARGO_BIN_EXE_rkat")
+        .ok_or("Cargo or Nextest must provide the runtime rkat binary path")?;
 
     let empty_path = temp.path().join("empty-path");
     std::fs::create_dir_all(&empty_path)?;
-    let doctor = Command::new(rkat)
+    let doctor = Command::new(&rkat)
         .current_dir(temp.path())
         .env("HOME", temp.path())
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
@@ -200,7 +201,7 @@ fn embedded_help_mobpack_examples_match_typed_authoring_contracts()
         "doctor restored the false direct dependency claim: {doctor_output}"
     );
 
-    let packed = Command::new(rkat)
+    let packed = Command::new(&rkat)
         .current_dir(temp.path())
         .env("HOME", temp.path())
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
@@ -219,7 +220,7 @@ fn embedded_help_mobpack_examples_match_typed_authoring_contracts()
         output_text(&packed)
     );
 
-    let inspected = Command::new(rkat)
+    let inspected = Command::new(&rkat)
         .current_dir(temp.path())
         .env("HOME", temp.path())
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
@@ -233,7 +234,7 @@ fn embedded_help_mobpack_examples_match_typed_authoring_contracts()
         output_text(&inspected)
     );
 
-    let permissive = Command::new(rkat)
+    let permissive = Command::new(&rkat)
         .current_dir(temp.path())
         .env("HOME", temp.path())
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
@@ -255,7 +256,7 @@ fn embedded_help_mobpack_examples_match_typed_authoring_contracts()
         output_text(&permissive)
     );
 
-    let strict = Command::new(rkat)
+    let strict = Command::new(&rkat)
         .current_dir(temp.path())
         .env("HOME", temp.path())
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
@@ -281,7 +282,7 @@ fn embedded_help_mobpack_examples_match_typed_authoring_contracts()
         "export default function init() {}\n",
     )?;
     let web_out = dist.join("release-triage-web");
-    let web_build = Command::new(rkat)
+    let web_build = Command::new(&rkat)
         .current_dir(temp.path())
         .env("HOME", temp.path())
         .env("XDG_CONFIG_HOME", temp.path().join("config"))

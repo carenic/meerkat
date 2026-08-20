@@ -62,6 +62,8 @@ impl KennelSession {
 /// port if the child exits early or never becomes reachable.
 async fn spawn_kennel() -> anyhow::Result<(String, tokio::process::Child, tempfile::TempDir)> {
     let mut last_err = None;
+    let kennel = std::env::var_os("CARGO_BIN_EXE_mdm-kennel")
+        .expect("Cargo or Nextest must provide the runtime kennel binary path");
 
     for attempt in 0..10 {
         let temp = tempfile::tempdir()?;
@@ -70,7 +72,7 @@ async fn spawn_kennel() -> anyhow::Result<(String, tokio::process::Child, tempfi
         let port = listener.local_addr()?.port();
         drop(listener);
 
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_mdm-kennel"))
+        let mut child = tokio::process::Command::new(&kennel)
             .arg("--listen")
             .arg(format!("127.0.0.1:{port}"))
             .arg("--data-dir")

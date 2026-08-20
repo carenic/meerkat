@@ -100,6 +100,13 @@ repos:
   # On push: formatting check
   - repo: local
     hooks:
+      - id: ci-nextest-archive-contract
+        name: CI nextest archive family and fail-closed contracts
+        entry: scripts/test-ci-nextest-archive.sh
+        language: script
+        pass_filenames: false
+        stages: [pre-push]
+
       - id: cargo-fmt
         name: cargo fmt --check
         entry: scripts/repo-cargo fmt --all -- --check
