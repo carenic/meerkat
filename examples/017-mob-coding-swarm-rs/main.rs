@@ -1,15 +1,16 @@
 //! # 017 — Mob: Coding Swarm (Rust)
 //!
-//! A "mob" is a coordinated group of Meerkat agents with defined roles,
-//! wiring rules, and agent roles. The `coding_swarm` prefab creates
-//! a lead orchestrator that spawns and manages worker agents for coding tasks.
+//! A "mob" is a coordinated group of Meerkat agents with defined roles and
+//! wiring. This example parses and validates coding-team definitions, spawns
+//! one lead and one worker, wires them, and submits a planning prompt to the
+//! lead. It does not delegate work to the worker or merge worker results.
 //!
 //! ## What you'll learn
 //! - `MobDefinition` — declaring agents, profiles, and wiring
 //! - `MobBuilder` — creating and starting a mob runtime
 //! - `MobHandle` — spawning agents and running turns
 //! - Parsing mob definitions from TOML
-//! - The coding swarm pattern (lead + workers)
+//! - A lead + worker topology
 //!
 //! Note: Uses `build_ephemeral_service` (in-memory substrate) for simplicity.
 //! Production mob deployments use the runtime-backed path.
@@ -206,9 +207,9 @@ content = "Implement Rust services, APIs, and data models."
     let session_service = Arc::new(build_ephemeral_service(factory, config, 16));
 
     // Create the mob from the coding swarm definition.
-    let prefab_def = MobDefinition::from_toml(CODING_SWARM_TOML)?;
+    let definition = MobDefinition::from_toml(CODING_SWARM_TOML)?;
     let storage = MobStorage::in_memory();
-    let handle = MobBuilder::new(prefab_def, storage)
+    let handle = MobBuilder::new(definition, storage)
         .with_session_service(session_service)
         .allow_ephemeral_sessions(true)
         .create()

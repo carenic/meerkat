@@ -66,7 +66,10 @@ async function analyzeSentiment(
     },
   );
 
-  return JSON.parse(session.text) as SentimentResult;
+  if (session.structuredOutput == null) {
+    throw new Error("Structured output completed without a validated value");
+  }
+  return session.structuredOutput as SentimentResult;
 }
 
 async function main() {

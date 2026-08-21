@@ -1226,7 +1226,7 @@
             "type": "object"
           },
           {
-            "description": "A `pre_*` background hook attempted a non-observe action (patch or deny),\nwhich is not permitted for observe-only background hooks.",
+            "description": "A background hook attempted a non-observe action, which is not\npermitted for observe-only background hooks at any hook point.",
             "properties": {
               "reason_code": {
                 "const": "observe_only_violation",
@@ -6287,7 +6287,7 @@
             "type": "object"
           },
           {
-            "description": "A `pre_*` background hook attempted a non-observe action (patch or deny),\nwhich is not permitted for observe-only background hooks.",
+            "description": "A background hook attempted a non-observe action, which is not\npermitted for observe-only background hooks at any hook point.",
             "properties": {
               "reason_code": {
                 "const": "observe_only_violation",

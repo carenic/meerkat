@@ -1,6 +1,6 @@
 [package]
 name = "meerkat-core"
-description = "Core agent logic for Meerkat (no I/O deps)"
+description = "Foundational agent contracts, config, and runtime-neutral logic for Meerkat"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

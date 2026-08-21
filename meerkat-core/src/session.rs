@@ -2347,7 +2347,7 @@ impl TransientTurnContextStateHandle {
     }
 }
 /// Typed terminal-lifecycle projection of the canonical
-/// [`session_document::SessionDocumentMachine`] `session_lifecycle_terminal`
+/// [`session_document::SessionDocumentMachineAuthority`] `session_lifecycle_terminal`
 /// fact.
 ///
 /// The machine owns archive lifecycle truth for ALL profiles (LUC-524 R004
@@ -2883,7 +2883,7 @@ impl ConsumedDeferredTurnInputs {
 }
 
 /// Per-session registry key for the first-turn region of the
-/// [`session_document::SessionDocumentMachine`]. Each
+/// [`session_document::SessionDocumentMachineAuthority`]. Each
 /// [`SessionDeferredTurnState`] is a single session's projection, so its
 /// machine instance carries exactly one registry entry under this key.
 const SESSION_DOCUMENT_FIRST_TURN_KEY: &str = "first_turn";
@@ -2893,7 +2893,7 @@ fn usize_to_u64(value: usize) -> u64 {
 }
 
 /// Authorize a durable deferred-turn snapshot through the canonical
-/// [`session_document::SessionDocumentMachine`] recovery transition.
+/// [`session_document::SessionDocumentMachineAuthority`] recovery transition.
 ///
 /// The machine validates that the persisted first-turn phase is a legal
 /// recovery target and adopts it into its per-session registry, emitting
@@ -2945,7 +2945,7 @@ impl SessionDeferredTurnState {
         &mut self.pending_tool_results
     }
 
-    /// Build a [`SessionDocumentMachineAuthority`] seeded with this session's
+    /// Build a [`session_document::SessionDocumentMachineAuthority`] seeded with this session's
     /// current durable first-turn projection.
     ///
     /// The machine owns the canonical first-turn phase + presence/count in its
@@ -4356,7 +4356,7 @@ impl Session {
     /// when the *next* turn's `AssistantTurnCompleted` (synthesized by the
     /// CC2 fix in `signal_turn_completed`) sweeps the materializer.
     ///
-    /// Order is the [`SessionRealtimeTranscriptState::first_seen_order`]
+    /// Order is the `SessionRealtimeTranscriptState::first_seen_order`
     /// projection so callers see deterministic iteration. Items already
     /// materialized or skipped are excluded — only response_ids with at
     /// least one live unmaterialized assistant item are returned.
@@ -5216,7 +5216,7 @@ impl Session {
     /// metadata map.
     ///
     /// The lifecycle-terminal fact is owned by the canonical
-    /// [`session_document::SessionDocumentMachine`]; production archive paths
+    /// [`session_document::SessionDocumentMachineAuthority`]; production archive paths
     /// call this only to realize a machine-emitted `SessionArchiveResolved`
     /// verdict (the value written mirrors the machine's decision — the shell
     /// decides nothing here).
@@ -5629,7 +5629,7 @@ impl Session {
     ///   [`SESSION_TRANSCRIPT_HISTORY_STATE_KEY`]) — rebuilt by recovery
     ///   through the mutation seam; owned by the target.
     /// - the lifecycle terminal — merged through generated
-    ///   `SessionDocumentMachine` authority because Archived is absorbing; it
+    ///   `SessionDocumentMachineAuthority` because Archived is absorbing; it
     ///   never rides the generic metadata overwrite.
     /// - `updated_at`, `usage`, and EVERY other metadata key (compaction
     ///   projection intents, visibility state, deferred context, ...) — the
@@ -6900,7 +6900,7 @@ impl ToolCategoryOverride {
     /// Construct from a resolved effective bool.
     ///
     /// **Warning:** this collapses `Inherit` into `Enable`/`Disable`. Prefer
-    /// [`from_override`] when persisting session metadata so that `Inherit`
+    /// [`Self::from_override`] when persisting session metadata so that `Inherit`
     /// survives across save/resume cycles. Only use `from_effective` in test
     /// helpers or when constructing metadata from external sources that only
     /// provide a resolved bool.
@@ -6915,7 +6915,7 @@ impl ToolCategoryOverride {
     /// - `Some(false)` → `Disable`
     /// - `None` → `Inherit` (factory default was used, no explicit intent)
     ///
-    /// This is the inverse of [`to_override`] and should be used when persisting
+    /// This is the inverse of [`Self::to_override`] and should be used when persisting
     /// session tooling metadata so that `Inherit` survives across save/resume
     /// cycles.
     #[must_use]
@@ -12842,7 +12842,7 @@ mod tests {
             })
             .expect_err("forged build state must be rejected by generated authority");
         // The build-state-persist admission decision now lives in the canonical
-        // SessionDocumentMachine durable-config region (LUC-524); the rejection
+        // SessionDocumentMachineAuthority durable-config region (LUC-524); the rejection
         // surfaces with that machine's authority wording.
         assert!(
             err.to_string()

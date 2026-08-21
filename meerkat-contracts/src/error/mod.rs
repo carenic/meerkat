@@ -266,7 +266,7 @@ impl WireError {
     }
 }
 
-/// Convert from [`SessionError`] to [`WireError`].
+/// Convert from [`meerkat_core::SessionError`] to [`WireError`].
 impl From<meerkat_core::SessionError> for WireError {
     fn from(err: meerkat_core::SessionError) -> Self {
         let code = match &err {

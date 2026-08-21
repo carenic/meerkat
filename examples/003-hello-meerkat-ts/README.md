@@ -22,5 +22,5 @@ export MEERKAT_BIN_PATH="$(./scripts/repo-cargo --print-env | sed -n 's/^CARGO_T
 
 ## Run
 ```bash
-ANTHROPIC_API_KEY=sk-... npx tsx main.ts
+ANTHROPIC_API_KEY=sk-... npx tsx examples/003-hello-meerkat-ts/main.ts
 ```

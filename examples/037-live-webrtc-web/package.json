@@ -4,12 +4,15 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/server.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "smoke:webrtc": "node .smoke/run-webrtc-smoke.cjs",
+    "smoke:webrtc:test": "playwright test .smoke/webrtc-smoke.spec.cjs"
   },
   "dependencies": {
     "@rkat/sdk": "file:../../sdks/typescript"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@types/node": "^22",
     "tsx": "^4.20.6",
     "typescript": "^5.9.2"

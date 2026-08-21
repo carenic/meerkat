@@ -1,13 +1,12 @@
-//! # 024 — Keep-Alive Event Mesh (Rust)
+//! # 024 - Multi-Turn Event Processing (Rust)
 //!
-//! Demonstrates multi-turn event-driven processing using `EphemeralSessionService`
-//! as substrate. The session stays alive between turns, accumulating context as
-//! new events arrive.
+//! Demonstrates explicit multi-turn processing with `EphemeralSessionService`.
+//! The program directly submits each turn and the in-process session retains
+//! context between calls.
 //!
 //! ## What this example demonstrates
-//! - `EphemeralSessionService`: in-memory session lifecycle (substrate for
-//!   testing/embedded use — production surfaces use runtime-backed paths)
-//! - Multi-turn event-driven processing via repeated `start_turn()` calls
+//! - `EphemeralSessionService`: standalone in-memory session lifecycle
+//! - Multi-turn processing via repeated `start_turn()` calls
 //! - Event streaming via `AgentEvent` across multiple injected turns
 //! - Reading session state to observe accumulating context
 //!
@@ -15,11 +14,12 @@
 //! `EphemeralSessionService` spawns a dedicated tokio task per session. That task
 //! exclusively owns the `Agent` and processes commands via channels.
 //! `create_session()` runs the first turn; subsequent `start_turn()` calls inject
-//! new prompts. The agent retains full conversation history across turns.
+//! new prompts. The agent retains full conversation history across turns in
+//! the current process.
 //!
-//! For production keep-alive with comms (peer messaging, event mesh), use the
-//! runtime-backed path (`rkat --keep-alive --comms-name "processor"`). The runtime
-//! owns the comms drain lifecycle, Queue/Steer routing, and ingress admission.
+//! This example does not configure comms, external-event ingress, schedules, or
+//! process recovery. For those behaviors, use a runtime-backed surface such as
+//! `rkat run --keep-alive --comms-name processor`.
 //!
 //! ## Run
 //! ```bash
@@ -44,26 +44,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Architecture overview ──────────────────────────────────────────────
 
     println!(
-        r#"=== Multi-Turn Event Mesh ===
+        r"=== In-Process Multi-Turn Session ===
 
 Single-turn mode:
   User prompt --> Agent runs --> Agent stops
 
-Multi-turn via SessionService (this example):
-  create_session() --> Agent runs turn 1 --> Session task STAYS ALIVE
-                                                |
-  start_turn("event 1") -----> Agent processes --> Session task stays alive
-  start_turn("event 2") -----> Agent processes --> Session task stays alive
-  ...                          (full history retained across turns)
-  archive()            -----> Session task exits
+This example:
+  create_session() --> run initial prompt
+  start_turn(...)  --> run monitoring update with prior context
+  start_turn(...)  --> run resolution update with prior context
+  archive()        --> stop the in-process session task
 
-Production keep-alive with comms (rkat --keep-alive --comms-name "processor"):
-  Runtime owns comms drain --> inbox poll --> accept_input --> policy table
-  Peer messages and external events route through runtime ingress.
-
-This example uses EphemeralSessionService (substrate) for simplicity.
-Production surfaces (CLI, REST, RPC, MCP) use the runtime-backed path.
-"#
+The prompts are submitted directly by this program. No webhook, peer message,
+timer, or durable external ingress is configured here.
+"
     );
 
     // ── 1. Build the session service ───────────────────────────────────────
@@ -134,10 +128,9 @@ Production surfaces (CLI, REST, RPC, MCP) use the runtime-backed path.
     let (event_tx, event_rx) = mpsc::channel::<EventEnvelope<AgentEvent>>(256);
     let event_collector = spawn_event_collector(event_rx);
 
-    // start_turn injects a new prompt into the live session. The agent has
-    // full access to the prior conversation history. In production,
-    // runtime-backed keep-alive sessions admit webhooks, peer messages, and
-    // CLI input as future turn work through the runtime layer.
+    // start_turn submits a new prompt to the in-process session. The agent has
+    // access to the prior conversation history. This call is made directly by
+    // the example; it is not external-event ingress.
     let result = service
         .start_turn(
             &session_id,
@@ -204,69 +197,27 @@ Production surfaces (CLI, REST, RPC, MCP) use the runtime-backed path.
     service.archive(&session_id).await?;
     println!("  Session archived (task stopped).\n");
 
-    // ── Architecture reference ─────────────────────────────────────────────
+    // Scope and runtime boundary
 
     println!(
-        r#"
-=== Event Mesh Architecture ===
+        r"
+=== Scope and Runtime Boundary ===
 
-The event mesh connects agents, external systems, and users:
+Configured here:
+  - Direct create_session() and start_turn() calls
+  - Context retention within the current process
+  - AgentEvent streaming for each submitted turn
+  - Explicit archive() cleanup
 
-+--------------------------------------------------------------+
-|                       EVENT MESH                             |
-|                                                              |
-|  +----------+    +----------+    +----------+                |
-|  | Agent A  |<-->| Agent B  |<-->| Agent C  |                |
-|  | (host)   |    | (host)   |    | (host)   |                |
-|  +----+-----+    +----+-----+    +----+-----+                |
-|       |               |               |                      |
-|       v               v               v                      |
-|  +----------+    +----------+    +----------+                |
-|  | Webhook  |    | Timer    |    | User CLI |                |
-|  | Source   |    | Source   |    | Input    |                |
-|  +----------+    +----------+    +----------+                |
-+--------------------------------------------------------------+
+Not configured here:
+  - Comms identity or peer messaging
+  - Webhook or external-event ingress
+  - Scheduler wakeups
+  - Runtime-backed recovery after process exit
 
-Event sources that feed into a keep-alive agent:
-  1. Peer messages (agent-to-agent via comms, Ed25519-signed)
-  2. External webhooks (REST POST -> agent inbox)
-  3. Timer events (scheduled processing)
-  4. User input (CLI --stdin, SDK start_turn, RPC turn/start)
-  5. System events (compaction, budget alerts)
-
-Configuration:
-
-  # CLI: Start agent in keep-alive mode
-  rkat run --keep-alive --comms-name "processor" "Process incoming events"
-
-  # Python SDK
-  result = await client.create_session(
-      "Process incoming events",
-      keep_alive=True,
-      comms_name="processor",
-  )
-
-  # TypeScript SDK
-  const result = await client.createSession({{
-      prompt: "Process incoming events",
-      keepAlive: true,
-      commsName: "processor",
-  }});
-
-  # Inject events via REST
-  curl -X POST http://localhost:8080/sessions/{{id}}/external-events \
-    -H "Content-Type: application/json" \
-    -d '{{"event_type": "order.received", "body": "New order received"}}'
-
-  # Or via JSON-RPC
-  {{"method": "turn/start", "params": {{"session_id": "...", "prompt": "..."}}}}
-
-Keep-alive sessions are essential for:
-  - Mob orchestrators (need to receive worker reports)
-  - Chat interfaces (bidirectional communication)
-  - Event processors (react to webhooks/triggers)
-  - Long-running agents (monitoring, ops automation)
-"#
+Use the runtime-backed CLI, REST, JSON-RPC, MCP, or SDK host when those
+operational behaviors are required.
+"
     );
 
     Ok(())

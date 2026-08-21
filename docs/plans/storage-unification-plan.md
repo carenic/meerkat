@@ -1,11 +1,21 @@
 ---
 title: "Storage Unification Plan"
-description: "Plan to unify Meerkat's fragmented storage: one path authority, shared SQLite mechanics, a fail-closed StorageProvider seam for ephemeral-disk/remote backends, and an offline auto-migration framework."
+description: "Implemented design record for Meerkat's path authority, shared SQLite mechanics, storage-provider seam, diagnosis, and fenced migration framework."
 icon: "database"
 ---
 
-**Revision 5 (implementation).** The arc is implemented on the
-`storage-unification` branch (phases 0-6). Deltas discovered and decided
+# Storage Unification - Implemented Design Record
+
+**Revision 6 (current status).** The storage arc shipped on main in Meerkat
+v0.8.4 through PR #912 and remains the active architecture at `8138813cb`.
+The v0.8.10 compatibility floor shipped later; v0.8.15 added the explicit
+fenced `--bridge-pre-0-8-10` recovery path for authenticated historical SQLite
+realms. For current commands and recovery procedures, use
+[Storage Operations](/guides/storage-operations). The phase language below is
+the accepted implementation record, not an unshipped roadmap.
+
+**Revision 5 (implementation).** The arc was implemented on the
+`storage-unification` branch and merged to main (phases 0-6). Deltas discovered and decided
 during implementation, recorded here so the plan stays honest against the
 code: the dead config field is `StorageConfig.directory` (no
 `SessionStoreConfig` exists); the two `find_project_root` copies were NOT
@@ -45,9 +55,9 @@ auto-migration (a conscious, recorded override of the quiescent-step
 requirement) and exports the stamping helper. A disposition ledger is at
 the end.
 
-## Context
+## Historical Context
 
-A survey of the workspace (2026-07) found the storage layer fragmented along
+A pre-implementation survey of the workspace (2026-07) found the storage layer fragmented along
 these axes:
 
 1. **Surfaces disagree on storage defaults — root *and* identity.** The CLI
@@ -82,12 +92,12 @@ these axes:
    platform-aware `dirs` crate within that file. `Config::global_config_path()`
    and `data_dir()` are HOME-only while realm, auth, and REST paths use the
    real crate — two notions of "home" inside one crate.
-4. **Duplicated resolution logic.** `find_project_root` exists twice
-   byte-for-byte (`meerkat-core/src/config.rs`,
+4. **Duplicated resolution logic.** `find_project_root` exists twice with
+   different `exists()`/directory semantics (`meerkat-core/src/config.rs`,
    `meerkat-tools/src/builtin/project.rs`); `default_state_root()` /
    `default_realms_root()` are identical duplicates in core and store;
    `home_dir` stubs exist in both `config.rs` and `mcp_config.rs`.
-5. **Dead config trap.** `SessionStoreConfig.directory` defaults to a
+5. **Dead config trap.** `StorageConfig.directory` defaults to a
    `sessions/` directory that no live surface code consumes.
 6. **Three unrelated path regimes** for user-scoped state: realm data under
    XDG `data_dir/meerkat/realms`, config/project state under `.rkat/` and
@@ -158,10 +168,12 @@ are.
 > reconciliation are no longer live architecture. Exact 0.8.10 state is
 > converted once inside the owning backend's activation transaction, which
 > binds the released source row and schema before installing store-issued
-> authority. State older than 0.8.10 must first be upgraded with an older
-> release.
+> authority. State older than 0.8.10 is refused by normal opens. Since v0.8.15,
+> an operator may recover an exact authenticated historical SQLite schema with
+> `rkat storage migrate --apply --bridge-pre-0-8-10`; unknown, ambiguous,
+> malformed, non-SQLite, or provider-owned state remains refused.
 
-## Phase 0 — Storage conformance harness
+## Phase 0 - Storage conformance harness (shipped)
 
 Prerequisite that protects every later phase. A published crate
 (`meerkat-store-conformance`) so downstream backends run the identical suite.
@@ -196,7 +208,7 @@ Coverage, by chapter:
 - **Blobs** (new): a session-referenced blob survives provider
   round-trip/restart; references never dangle silently.
 
-## Phase 1 — Read-only `rkat storage doctor`
+## Phase 1 - Read-only `rkat storage doctor` (shipped)
 
 Land the diagnostic surface *before* anything mutates:
 
@@ -213,7 +225,7 @@ Land the diagnostic surface *before* anything mutates:
   strip-to-placeholder repair for dangling blob refs there (today the only
   remedy is hand-editing production session JSON).
 
-## Phase 2 — Path authority
+## Phase 2 - Path authority (shipped)
 
 One module, `meerkat_core::storage_layout`, producing an immutable
 `StorageLayout` at bootstrap:
@@ -275,10 +287,10 @@ StorageLayout {
 - **Delete the duplicates**: `default_realms_root()` delegates to the one
   function in core; the second `find_project_root` is replaced by a passed-in
   `StorageLayout`.
-- **Retire `SessionStoreConfig.directory`**: deprecate with a load-time
-  warning in 0.9, remove in 0.10.
+- **Retire `StorageConfig.directory`**: it is deprecated, accepted for
+  published compatibility, and ignored by live surfaces.
 
-## Phase 3 — Shared SQLite mechanics
+## Phase 3 - Shared SQLite mechanics (shipped)
 
 A new leaf crate `meerkat-sqlite` (rusqlite + serde only — `meerkat-schedule`
 and `meerkat-workgraph` sit below `meerkat-store` in the dependency order, so
@@ -330,7 +342,7 @@ cross-domain invariant justifies designing a narrow composite-commit seam;
 any table move that does happen gets changelog treatment equivalent to a
 binary rename, because operators read these files directly.
 
-## Phase 4 — The provider seam
+## Phase 4 - The provider seam (shipped)
 
 `PersistenceBundle` already accepts injected session/runtime/schedule/
 workgraph/blob/artifact stores; what is missing is standardized selection and
@@ -409,7 +421,7 @@ obligations the companion's dependency table relies on:
   standalone mobkit gateways with no `rkat` CLI on the box run their
   migrations under the same fence via a gateway-native maintenance command.
 
-## Phase 5 — Surface cleanup and the anti-regression gate
+## Phase 5 - Surface cleanup and the anti-regression gate (shipped)
 
 - Delete `default_cli_state_root` and per-surface locator defaults in favor
   of the shared resolver; route the REST task-store fallback through the
@@ -422,7 +434,7 @@ obligations the companion's dependency table relies on:
   databases) stay with their owners — banning all path literals would create
   a storage god-module, which is its own fragmentation.
 
-## Phase 6 — Migration framework
+## Phase 6 - Migration framework (shipped)
 
 `rkat storage migrate [--apply]`, dry-run by default, offline, resumable,
 fail-closed.
@@ -470,6 +482,11 @@ Migration cases:
    strips the retired document proof carrier, and installs current
    store-issued authority atomically. There is no lazy per-read adoption path
    and no generic caller-minted authority.
+   Current releases additionally expose the operator-requested
+   `--bridge-pre-0-8-10` path for exact authenticated historical SQLite state.
+   It runs before normal strict migration under the same realm fence; it never
+   runs automatically and never applies to JSONL, memory, or external-provider
+   realms.
 5. **Deprecated leftovers (report-only).** Legacy `~/.rkat/sessions`-style
    directories, orphaned `session_index.sqlite3`, stale lease files.
    Credentials do not move.
@@ -486,7 +503,7 @@ the same lifecycle: a version ledger in their own medium (for BigQuery, a
 `meerkat_schema` table) and ordered migrations under a provider-supplied
 lock. Meerkat ships the framework and the disk implementation.
 
-## Sequencing, risk, and gates
+## Historical Sequencing, Risk, And Gates
 
 - Hotfix ships first, on 0.8.x, independent of the arc.
 - Phase order 0 → 1 → 2 → 3 → 4 → 5 → 6; Phases 2 and 3 are independent and
@@ -501,8 +518,10 @@ lock. Meerkat ships the framework and the disk implementation.
   when the opener-profile port lands, since contention texture may shift.
 - Contract changes (manifest v2, provider discriminator) require the
   `make regen-schemas` cycle and SDK codegen per the standard CI gates.
-- Target: hotfix on 0.8.x now; the arc lands across 0.9; deprecations removed
-  in 0.10.
+- Landed result: the storage arc shipped in v0.8.4. Later releases replaced
+  the checkpoint-era compatibility path with the v0.8.10 floor and added the
+  explicit pre-floor SQLite bridge in v0.8.15. Published deprecated helpers
+  remain compatibility surfaces unless a separate semver change removes them.
 
 ## Review disposition ledger (v1 → v2)
 

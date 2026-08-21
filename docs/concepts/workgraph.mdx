@@ -18,6 +18,11 @@ It answers:
 WorkGraph is realm-scoped and optional. It is not semantic memory, not schedule,
 and not the lightweight builtin task list.
 
+Enabling the `work_graph` capability is not enough by itself. Every agent build
+must also receive a host-issued `WorkGraphNamespaceGrant` for one exact realm
+and one immutable namespace. The service rejects cross-realm, cross-namespace,
+and `all_namespaces` requests through that grant.
+
 ## Mental Model
 
 ```text
@@ -44,6 +49,7 @@ topology.
 - claim ownership, leases, and revision checks
 - terminal state
 - evidence references
+- direct-child join policy
 - event history and current-state projections
 
 Machines and services own these semantics. Tools and host surfaces act on or
@@ -56,6 +62,7 @@ observe that state; they do not reinterpret it.
 | Shared durable work, dependencies, readiness, claims, evidence | WorkGraph |
 | One-off private scratch tracking | Builtin `task_*` tools |
 | Time-based wakeups and recurrence | Schedule |
+| Detached execution, attempts, progress, results, and retry | Durable jobs |
 | Recalled knowledge and compacted context | Memory |
 | Live collaboration messages | Comms |
 | Executable multi-agent DAGs | Mob Flow |
@@ -98,10 +105,35 @@ observed or a future sealed host authority proves a safe resolution.
 
 ## Namespaces
 
-Every item belongs to a realm and namespace. The default namespace is
-`default`, but applications can use names such as `session/{id}`, `mob/{id}`,
-or domain-specific namespaces. Namespaces are a scoping tool, not a promise
-that every group is semantically meaningful.
+Every item belongs to a realm and namespace. The standard persistent surfaces
+grant `default`. An embedding host may issue another namespace, but a session
+still receives exactly one grant and must use it consistently. Namespace
+renames are unsupported because the namespace is durable identity; archive the
+old namespace and mint a new one instead.
+
+## Parent And Child Joins
+
+A `parent` edge points from child to parent. A parent is not ready while any
+direct child is active. Its `failed_child_join_policy` and
+`cancelled_child_join_policy` independently decide what terminal child failure
+or cancellation means:
+
+- `require_success` keeps the join unsatisfied.
+- `propagate` terminalizes the parent with the same failure class when a
+  readiness/claim observation reconciles the join.
+- `accept` treats that child terminal as satisfying the join.
+
+Both policies default to `require_success`. `blocks` edges are stricter:
+their source satisfies the edge only by reaching `completed`.
+
+## Durable Facts, Not Timers
+
+WorkGraph commits typed facts such as `item_ready`, `lease_expired`, and
+`namespace_terminal` in the same durable mutation that first observes them.
+It never owns a timer or wake loop. Schedule or another trusted host may cause
+the observation; WorkGraph revalidates graph state and owns the resulting
+fact. An elapsed lease is therefore not silently released by wall-clock time
+alone.
 
 ## Surfaces
 
@@ -128,10 +160,17 @@ do not receive a replica of the WorkGraph store. The controlling host owns the
 binding, launches local or remotely placed Flow steps, and projects terminal
 evidence back into that same WorkGraph authority.
 
+Durable jobs compose through the same ownership rule. `DetachedJobMachine`
+owns execution and terminal result, while a terminal evidence projector adds a
+typed reference to the item and asks WorkGraph to close it under its existing
+completion policy. A scheduled job likewise leaves time with Schedule and
+execution with the jobs subsystem.
+
 ## See Also
 
 - [WorkGraph guide](/guides/workgraph)
 - [WorkGraph example](/examples/workgraph)
 - [WorkGraph reference](/reference/workgraph-reference)
 - [Scheduling](/concepts/scheduling)
+- [Durable jobs and monitors](/guides/durable-jobs)
 - [Tools](/concepts/tools)

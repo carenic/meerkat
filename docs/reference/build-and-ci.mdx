@@ -5,8 +5,10 @@ icon: "helmet-safety"
 ---
 
 Make is the developer-facing command surface. Cargo is the default backend.
-BuildBuddy/Bazel is an opt-in acceleration backend for machines with access to
-the GCP-backed runner pool.
+BuildBuddy/Bazel is an opt-in acceleration backend for developers with
+BuildBuddy access and for owner-selected release validation and Linux/macOS
+binary packaging. GitHub Actions CI runs on GitHub-hosted runners through the
+Cargo lane; the former GCP BuildBuddy CI fleet was retired on 2026-07-03.
 
 ## Local Commands
 
@@ -42,6 +44,13 @@ MEERKAT_BUILDBUDDY=1 make e2e-smoke
 Use `BUILDBUDDY_DRY_RUN=1` with explicit BuildBuddy Make targets to inspect the
 selected command without running it.
 
+The explicit targets are `make buildbuddy-build`, `make buildbuddy-check`,
+`make buildbuddy-clippy`, `make buildbuddy-test`,
+`make buildbuddy-test-unit`, `make buildbuddy-test-int`,
+`make buildbuddy-e2e-fast`, and `make buildbuddy-e2e-system`. The live-provider
+targets are `make buildbuddy-e2e-live` and `make buildbuddy-e2e-smoke` when
+credentials are configured.
+
 The Make targets delegate through `scripts/run-build-backend-lane`; when
 BuildBuddy is enabled, that switch calls `scripts/buildbuddy-dev`.
 
@@ -76,17 +85,47 @@ make audit-generated-headers
 ```
 
 These gates protect generated schemas, SDK wrappers, machine artifacts, and
-runtime authority invariants.
+runtime authority invariants. `make machine-verify` is the bounded TLC lane used
+for normal validation. Use `make machine-verify-full` only when you deliberately
+need the unbounded verification set.
 
 ## CI Shape
 
-GitHub Actions runs the Cargo lane for normal contributor and main-branch CI:
+GitHub Actions runs one reusable Cargo workflow for pull requests and ordinary
+pushes. Its current per-push shape is:
 
-- path-classified Cargo jobs cover formatting, lint, deterministic tests,
-  generated artifacts, SDK suites, and release configuration
-- the final gate emits a small attestation that binds the successful result to
-  the exact commit SHA, Git tree SHA, workflow run, and workflow attempt
-- attestations are emitted only for successful pushes to `main`
+- change classification, formatting and governance, lock consistency, and
+  workspace clippy
+- one prebuilt unit-test archive consumed by eight unit shards
+- prebuilt integration archives consumed by mob, everything-else, and remaining
+  crate groups
+- deterministic `e2e-fast`, generation ratchets, and bounded machine
+  verification
+- WASM checks, with the browser contract and full Web SDK lane path-gated to
+  relevant changes
+- host Python and TypeScript SDK suites plus dependency audit
+- one aggregate Cargo gate, followed by the top-level CI gate
+
+Docs-only changes skip code build and test work, but governance still runs.
+Machine-authority paths are classified fail-closed so a classifier miss cannot
+silently skip machine verification.
+
+The final top-level gate emits a small attestation that binds a successful
+`main` push to the exact commit SHA, Git tree SHA, workflow run, and workflow
+attempt. Attestations are not emitted for pull requests or failed runs.
+
+## Nightly Lanes
+
+Expensive or low-churn coverage runs daily and on demand on GitHub-hosted
+runners:
+
+- clippy across all targets and all features
+- feature-matrix lint and tests
+- minimal-feature and surface-modularity tests
+- `e2e-system`
+- the full Web SDK and WASM browser contract suites
+- release packaging dry-runs
+- security audit
 
 The tag release workflow consumes that exact-tree attestation instead of
 re-running the same validation suite. It still builds and publishes the
@@ -99,9 +138,12 @@ successful hook run writes a local Git-tree-keyed evidence stamp. A later push
 of the identical tree, including its release tag, validates the pushed object
 and checked-out `HEAD` identity and then reuses the complete gate result.
 
-BuildBuddy remains an opt-in developer and release-recovery backend. Its
-control-plane workflow starts the executor pool, submits the selected lanes,
-and scales the pool down when the work completes.
+BuildBuddy remains an opt-in developer and owner-selected release validation or
+binary packaging backend. The former CI control-plane workflow at
+`.github/workflows/buildbuddy.yml` is `workflow_call`-only and has no caller,
+so it is inert and is not a fleet that CI starts automatically. Release
+validation and packaging use explicit BuildBuddy actions when selected by the
+owner; Windows packaging and registry publication remain GitHub-hosted.
 
 ## Doctor
 

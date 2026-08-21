@@ -1,5 +1,5 @@
 ---
-title: "Sessions & streaming"
+title: "Examples: Sessions & streaming"
 description: "Session lifecycle, multi-turn conversations, event streaming, model selection, and config management."
 icon: "arrows-rotate"
 ---
@@ -7,7 +7,9 @@ icon: "arrows-rotate"
 For concepts, see [Sessions](/concepts/sessions) and [Realms](/concepts/realms).
 
 <Note>
-Rust examples use the runtime-backed `SessionService` path, which is the same canonical session lifecycle used by the other surfaces.
+The Rust snippets on this page use the `SessionService` API. Production
+surfaces host that service behind the runtime control plane; small standalone
+Rust examples may instead construct `EphemeralSessionService` directly.
 </Note>
 
 ## Create a session
@@ -72,6 +74,7 @@ Rust examples use the runtime-backed `SessionService` path, which is the same ca
     let result = service.create_session(CreateSessionRequest {
         model: "claude-sonnet-4-6".into(),
         prompt: "What is the capital of France?".into(),
+        injected_context: Vec::new(),
         system_prompt: SystemPromptOverride::Inherit,
         max_tokens: None,
         event_tx: None,
@@ -146,11 +149,65 @@ Rust examples use the runtime-backed `SessionService` path, which is the same ca
     ```rust
     let result = service.start_turn(&session_id, StartTurnRequest {
         prompt: "Now explain it in more detail".into(),
+        injected_context: Vec::new(),
         system_prompt: None,
         event_tx: None,
         runtime: StartTurnRuntimeSemantics::default(),
     }).await?;
     println!("{}", result.text);
+    ```
+  </Tab>
+</Tabs>
+
+## Attach host context without merging it into the prompt
+
+Use `injected_context` for ambient facts that should be retained as separate,
+typed transcript messages immediately before the user's message. These entries
+are visible in transcript reads but excluded from semantic-memory indexing.
+Use `transient_turn_context` instead when host-regenerated facts must apply to
+one provider request without entering the session transcript at all.
+
+<Tabs>
+  <Tab title="JSON-RPC">
+    ```json
+    {
+      "jsonrpc": "2.0", "id": 3,
+      "method": "turn/start",
+      "params": {
+        "session_id": "01936f8a-...",
+        "injected_context": [
+          "Current incident severity: SEV-1",
+          "On-call owner: payments-platform"
+        ],
+        "prompt": "Recommend the next action"
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="REST">
+    ```bash
+    curl -X POST http://localhost:8080/sessions/01936f8a-.../messages \
+      -H "Content-Type: application/json" \
+      -d '{
+        "session_id": "01936f8a-...",
+        "injected_context": ["Current incident severity: SEV-1"],
+        "prompt": "Recommend the next action"
+      }'
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    result = await session.turn(
+        "Recommend the next action",
+        injected_context=["Current incident severity: SEV-1"],
+    )
+    ```
+  </Tab>
+  <Tab title="TypeScript">
+    ```typescript
+    const result = await session.turn("Recommend the next action", {
+      injectedContext: ["Current incident severity: SEV-1"],
+    });
     ```
   </Tab>
 </Tabs>
@@ -270,6 +327,78 @@ rkat --resume "Keep going"
     ```
   </Tab>
 </Tabs>
+
+## Audit and restore transcript revisions
+
+Persistent sessions retain an append-only revision graph when their transcript
+head is rewritten. Revision reads and restores keep the same session identity.
+These mutations are available over JSON-RPC and the RPC-backed SDKs, not REST.
+The target must be idle; `running_behavior: "reject"` fails with
+`SESSION_BUSY` instead of racing active work.
+
+<Tabs>
+  <Tab title="JSON-RPC">
+    ```json
+    {
+      "jsonrpc": "2.0", "id": 5,
+      "method": "session/transcript_revisions",
+      "params": { "session_id": "01936f8a-...", "offset": 0, "limit": 50 }
+    }
+    ```
+
+    Read the active head with `session/transcript_revision` and
+    `"revision": "current"`. Restore a retained revision with:
+
+    ```json
+    {
+      "jsonrpc": "2.0", "id": 6,
+      "method": "session/restore_transcript_revision",
+      "params": {
+        "session_id": "01936f8a-...",
+        "revision": "sha256:...",
+        "reason": { "kind": "restore", "note": "Restore reviewed head" },
+        "running_behavior": "reject"
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    revisions = await client.list_session_transcript_revisions(session.id)
+    current = await client.read_session_transcript_revision(session.id, "current")
+
+    if revisions.entries:
+        restored = await session.restore_transcript_revision(
+            revisions.entries[0].revision,
+            {"kind": "restore", "note": "Restore reviewed head"},
+            expected_parent_revision=revisions.head_revision,
+            running_behavior="reject",
+        )
+    ```
+  </Tab>
+  <Tab title="TypeScript">
+    ```typescript
+    const revisions = await client.listSessionTranscriptRevisions(session.id);
+    const current = await client.readSessionTranscriptRevision(session.id, "current");
+
+    if (revisions.entries.length > 0) {
+      const restored = await session.restoreTranscriptRevision(
+        revisions.entries[0].revision,
+        { kind: "restore", note: "Restore reviewed head" },
+        {
+          expectedParentRevision: revisions.headRevision,
+          runningBehavior: "reject",
+        },
+      );
+    }
+    ```
+  </Tab>
+</Tabs>
+
+`session/rewrite_transcript` and the corresponding SDK methods commit typed
+message-range replacements. A rewrite cannot mint the runtime-owned
+`compaction_summary` role, while an existing `injected_context` role may be
+preserved.
 
 ## Archive a session
 
@@ -468,7 +597,7 @@ Cancel an in-flight turn. No-op if the session is idle.
         while let Some(event) = rx.recv().await {
             match event {
                 AgentEvent::TextDelta { delta } => print!("{}", delta),
-                AgentEvent::TurnCompleted { usage, .. } => {
+                AgentEvent::TurnCompleted { usage: Some(usage), .. } => {
                     // Per-call usage: `accounting` names the resolved model and
                     // the normalized presented input for this one call.
                     println!(
@@ -501,7 +630,7 @@ fields use different denominators. Read
     ```bash
     rkat run --model gpt-5.5 --provider openai "Hello"
     rkat run --model gemini-3.5-flash --provider gemini "Hello"
-    rkat run --model claude-opus-4-8 "Hello"
+    rkat run --model claude-opus-5 "Hello"
     ```
   </Tab>
   <Tab title="JSON-RPC">
@@ -565,6 +694,7 @@ fields use different denominators. Read
     let result = service.create_session(CreateSessionRequest {
         model: "gpt-5.5".into(),
         prompt: "Explain monads".into(),
+        injected_context: Vec::new(),
         system_prompt: SystemPromptOverride::Inherit,
         max_tokens: None,
         event_tx: None,
@@ -583,6 +713,75 @@ fields use different denominators. Read
         }),
         labels: None,
     }).await?;
+    ```
+  </Tab>
+</Tabs>
+
+### Switch model on a running session
+
+A follow-up turn may replace the active model and provider without changing
+the session identity. The persisted auth binding is re-resolved for the new
+model unless the surface explicitly supplies another binding.
+
+<Tabs>
+  <Tab title="CLI">
+    ```bash
+    rkat run --resume 01936f8a-... --model gpt-5.5 --provider openai \
+      "Re-evaluate the answer with the OpenAI model"
+    ```
+  </Tab>
+  <Tab title="JSON-RPC">
+    ```json
+    {
+      "jsonrpc": "2.0", "id": 8,
+      "method": "turn/start",
+      "params": {
+        "session_id": "01936f8a-...",
+        "prompt": "Re-evaluate the answer",
+        "model": "gpt-5.5",
+        "provider": "openai"
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="REST">
+    ```bash
+    curl -X POST http://localhost:8080/sessions/01936f8a-.../messages \
+      -H "Content-Type: application/json" \
+      -d '{
+        "session_id":"01936f8a-...",
+        "prompt":"Re-evaluate the answer",
+        "model":"gpt-5.5",
+        "provider":"openai"
+      }'
+    ```
+  </Tab>
+  <Tab title="MCP">
+    ```json
+    {
+      "session_id": "01936f8a-...",
+      "prompt": "Re-evaluate the answer",
+      "model": "gpt-5.5",
+      "provider": "openai"
+    }
+    ```
+    Called via the `meerkat_resume` tool.
+  </Tab>
+  <Tab title="Python">
+    ```python
+    result = await session.turn(
+        "Re-evaluate the answer",
+        model="gpt-5.5",
+        provider="openai",
+    )
+    ```
+  </Tab>
+  <Tab title="TypeScript">
+    ```typescript
+    const result = await session.turn("Re-evaluate the answer", {
+      model: "gpt-5.5",
+      provider: "openai",
+    });
     ```
   </Tab>
 </Tabs>
@@ -688,42 +887,57 @@ fields use different denominators. Read
 
 ## Realm selection
 
-Realms scope sessions and config. Surfaces that share a `realm_id` see the same state. Realm is set at **startup** for server surfaces (RPC, REST, MCP) and **per-command** or **per-connection** for CLI and SDKs.
+Realms scope sessions and config. Surfaces see the same state only when both
+the `realm_id` and resolved physical provider/root match. Realm is set at
+**startup** for server surfaces (RPC, REST, MCP) and **per-command** or
+**per-connection** for CLI and SDKs.
+
+<Note>
+Without an explicit override, the CLI derives a stable workspace realm from
+the context root (normally the current directory) and stores it under the
+project-local `.rkat/realms` root. RPC, REST, MCP, and SDK connections create a
+new opaque realm unless the caller supplies one.
+</Note>
 
 <Tabs>
   <Tab title="CLI">
     ```bash
-    rkat --realm team-alpha run "Plan release"
-    rkat --realm team-alpha --instance worker-1 session list
-    rkat --realm team-alpha --realm-backend sqlite run --resume last "Continue"
+    rkat --state-root /data/meerkat --realm team-alpha run "Plan release"
+    rkat --state-root /data/meerkat --realm team-alpha --instance worker-1 session list
+    rkat --state-root /data/meerkat --realm team-alpha --realm-backend sqlite run --resume last "Continue"
     ```
   </Tab>
   <Tab title="JSON-RPC server">
     ```bash
-    rkat-rpc --realm team-alpha --instance worker-1
-    rkat-rpc --realm team-alpha --realm-backend sqlite --state-root /data/meerkat
+    rkat-rpc --state-root /data/meerkat --realm team-alpha --realm-backend sqlite --instance worker-1
     ```
   </Tab>
   <Tab title="REST server">
     ```bash
-    rkat-rest --realm team-alpha --instance api-1
-    rkat-rest --realm team-alpha --realm-backend sqlite --state-root /data/meerkat
+    rkat-rest --state-root /data/meerkat --realm team-alpha --realm-backend sqlite --instance api-1
     ```
   </Tab>
   <Tab title="MCP server">
     ```bash
-    rkat-mcp --realm team-alpha --instance mcp-1
-    rkat-mcp --realm team-alpha --realm-backend sqlite --state-root /data/meerkat
+    rkat-mcp --state-root /data/meerkat --realm team-alpha --realm-backend sqlite --instance mcp-1
     ```
   </Tab>
   <Tab title="Python">
     ```python
-    await client.connect(realm_id="team-alpha", instance_id="worker-1")
+    await client.connect(
+        realm_id="team-alpha",
+        state_root="/data/meerkat",
+        instance_id="worker-1",
+    )
     ```
   </Tab>
   <Tab title="TypeScript">
     ```typescript
-    await client.connect({ realmId: "team-alpha", instanceId: "worker-1" });
+    await client.connect({
+      realmId: "team-alpha",
+      stateRoot: "/data/meerkat",
+      instanceId: "worker-1",
+    });
     ```
   </Tab>
 </Tabs>

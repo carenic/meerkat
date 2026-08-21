@@ -56,8 +56,8 @@ async fn skills_feature_links_comms_owned_mob_communication_for_cross_surface_re
     // Content pin against dead-copy swaps: the load-bearing operating rules
     // must be present in the feature-owned body that the facade links.
     assert!(
-        skill.body.contains("peer_request")
-            && skill.body.contains("peer_message")
+        skill.body.contains("send_request")
+            && skill.body.contains("send_message")
             && skill.body.contains("do not reply"),
         "the canonical body's concrete tool-kind guidance must be present in \
          the registered mob-communication skill"

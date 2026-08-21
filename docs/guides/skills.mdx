@@ -1,5 +1,5 @@
 ---
-title: "Skills"
+title: "Skills guide"
 description: "Domain-specific knowledge injection via markdown documents with YAML frontmatter"
 icon: "graduation-cap"
 ---
@@ -24,7 +24,7 @@ Use this guide when you want to:
 Skills are discovered from multiple source transports:
 
 - **Embedded** builtin skills from component crates
-- **Project/runtime root** (`<context-root>/.rkat/skills/`) when a context root is active
+- **Project context root** (`<context-root>/.rkat/skills/`) when a context root is active
 - **Configured filesystem sources**
 - **Git repositories** cloned to local cache and refreshed on TTL
 - **HTTP endpoints** fetched from remote skill servers
@@ -48,9 +48,14 @@ git_ref = "main"
 ref_type = "branch"    # "branch", "tag", or "commit"
 refresh_seconds = 300  # TTL for branch refs (tags/commits are immutable)
 depth = 1              # shallow clone depth
-# auth = { scheme = "token", token = "${GITHUB_TOKEN}" }    # optional HTTPS token; env vars expanded
-# auth = { scheme = "ssh-key", path = "~/.ssh/id_ed25519" } # or an SSH private key path
+# auth = { scheme = "token", token = "<token>" }                          # optional HTTPS token
+# auth = { scheme = "ssh-key", path = "/absolute/path/to/id_ed25519" }    # or an SSH private key path
 ```
+
+Skill repository auth values are literal configuration values. The skills
+resolver does not expand `${ENV_VAR}` references or `~` in these fields. Keep
+realm configuration access restricted, or materialize secrets and absolute
+paths before starting Meerkat.
 
 ### HTTP sources
 
@@ -60,7 +65,7 @@ name = "remote"
 source_uuid = "22222222-2222-2222-2222-222222222222"
 type = "http"
 url = "https://skills.example.com/api"
-auth = { scheme = "bearer", token = "${SKILLS_API_KEY}" }  # or { scheme = "header", name = "...", value = "..." }
+auth = { scheme = "bearer", token = "<token>" }  # or { scheme = "header", name = "...", value = "..." }
 refresh_seconds = 300
 timeout_seconds = 15
 ```
@@ -125,7 +130,8 @@ They are:
 - embedded in the crate or tool family that owns the capability
 - gated with `requires_capabilities`
 - discoverable through the normal skills inventory
-- loadable with `load_skill`
+- loadable through typed activation, and with `load_skill` when that
+  default-disabled tool is explicitly policy-enabled
 - not automatically preloaded
 
 Tool descriptions should stay short and schema-focused: what the tool does and
@@ -148,7 +154,9 @@ Every runtime skill reference resolves to:
 
 The source identity registry applies source lifecycle gates and lineage/remap rules before load. Disabled or retired sources fail resolution; configured source rotations, renames, splits, and merges require explicit lineage and per-skill remap entries where needed.
 
-Legacy slash-delimited strings are no longer accepted by wire `skill_refs`. Some local CLI paths still accept a bare skill slug as a convenience, but API and tool surfaces should use structured keys.
+Legacy slash-delimited strings are no longer accepted by wire `skill_refs`.
+`rkat run --skill` still accepts a bare embedded-builtin skill slug as a
+convenience, but API and tool surfaces should use structured keys.
 
 ## Rendering
 
@@ -200,7 +208,9 @@ The renderer produces two output formats:
 
 ### Size limits
 
-`MAX_INJECTION_BYTES` is set to 32 KiB (32 * 1024 bytes). If an injection block exceeds this limit, it is truncated with a warning log.
+The default injection limit is 32 KiB (32 * 1024 bytes), configurable through
+`skills.max_injection_bytes`. If an injection block exceeds the active limit,
+it is truncated with a warning log.
 
 ## Built-in skills
 
@@ -256,14 +266,25 @@ The following skills are embedded in component crates:
     2. Deploy via `./deploy.sh production`.
     ```
   </Tab>
-  <Tab title="User-level">
-    Same structure under `~/.rkat/skills/`. These are available across all projects but have lower precedence than project-level skills.
+  <Tab title="Shared filesystem source">
+    To reuse a skill directory across projects, register it explicitly as a
+    filesystem repository with an absolute `path`. Meerkat does not
+    automatically scan `~/.rkat/skills/`.
+
+    ```toml
+    [[skills.repositories]]
+    name = "user-shared"
+    source_uuid = "66666666-6666-6666-6666-666666666666"
+    type = "filesystem"
+    path = "/Users/example/.rkat/skills"
+    ```
   </Tab>
 </Tabs>
 
 ## Discovery tools
 
-When skills are active and builtins are enabled, these tools are registered:
+When skills are active and general builtins are enabled, the runtime registers
+these implementations with `CompositeDispatcher`:
 
 | Tool | Description |
 |------|-------------|
@@ -273,7 +294,16 @@ When skills are active and builtins are enabled, these tools are registered:
 | `skill_read_resource` | Read a specific skill-owned resource |
 | `skill_invoke_function` | Invoke a skill-defined function with structured arguments |
 
-In collection mode (when there are more than 12 skills), the system prompt shows collection summaries. The LLM can use `browse_skills` to explore collections and `load_skill` to activate specific skills.
+All five implementations have `default_enabled: false`. A custom embedding must
+explicitly enable the desired names through `BuiltinToolConfig`. Current
+factory-built CLI, REST, and JSON-RPC sessions do not add that policy enable, so
+they do not advertise these tools even though skill inventory, preload, and
+typed `skill_refs` remain available. An allow-list applied later through
+`ToolScope` cannot compose a policy-disabled implementation.
+
+Collection-mode prompt rendering (more than 12 skills) still mentions
+`browse_skills` and `load_skill`; on a normal factory-built session, use public
+skill introspection plus typed preload or `skill_refs` instead.
 
 ## Invoking skills
 
@@ -281,13 +311,23 @@ Skills can be activated in three ways:
 
 ### 1. CLI preload convenience
 
-The CLI `--skill` option accepts local skill slugs and materializes builtin-source `SkillKey` values for preload:
+The CLI `--skill` option accepts bare embedded-builtin skill slugs and
+materializes builtin-source `SkillKey` values for preload:
 
 ```bash
-rkat run "Extract emails" --skill email-extractor
+rkat run "Track the implementation work as tasks" --skill task-workflow
 ```
 
 Use typed keys for API and tool surfaces.
+
+<Warning>
+Do not pass a filesystem path or a non-builtin source slug to `rkat run
+--skill` in the current release. The path resolver can discover the directory,
+but the preload carrier still materializes a builtin-source key and cannot
+address the derived filesystem source. Register the directory under
+`skills.repositories` (or with `rkat skill add`), inspect the registered source
+UUID, then use its typed `SkillKey` through an API surface.
+</Warning>
 
 ### 2. Programmatic typed `skill_refs` (per-turn, recommended)
 
@@ -335,7 +375,7 @@ Pass `preload_skills` to inject skills into the system prompt at session creatio
 }
 ```
 
-See the [Python SDK](/sdks/python/reference) and [TypeScript SDK](/sdks/typescript/reference#skills) for SDK wrappers. CLI `--skill` is the preload-oriented path for runtime-local skill loading; it is not the same surface as typed per-turn `skill_refs`.
+See the [Python SDK](/sdks/python/reference) and [TypeScript SDK](/sdks/typescript/reference#skills) for SDK wrappers. CLI `--skill` is a builtin-slug preload convenience; it is not the same surface as typed per-turn `skill_refs`.
 
 ## Skill introspection
 

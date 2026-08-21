@@ -60,13 +60,16 @@ lead = "claude-opus-4-8"
 TOML
 
 cat > "$MOB_DIR/config/defaults.toml" <<'TOML'
-[agent]
-model = "claude-sonnet-4-6"
-structured_output_retries = 2
+max_tokens = 8192
+
+[models]
+anthropic = "claude-sonnet-4-6"
 
 [budget]
-max_tokens_per_turn = 8192
-warning_threshold = 0.8
+max_tokens = 50000
+max_duration_secs = 900
+max_tool_calls = 50
+
 TOML
 
 cat > "$MOB_DIR/definition.json" <<'JSON'
@@ -243,7 +246,7 @@ echo "==> Inspecting artifact contents"
 
 echo ""
 echo "==> Validating artifact contract"
-"$RKAT" mob validate "$PACK"
+"$RKAT" mob validate "$PACK" --trust-policy permissive
 
 echo ""
 echo "==> Deploying the exact signed artifact for a realistic incident prompt"

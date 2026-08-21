@@ -333,7 +333,7 @@ pub trait ProviderPresenceProbe: Send + Sync {
 /// daemon composition.
 #[derive(Debug, Clone, Copy)]
 pub struct HostCapabilityFacts {
-    /// The opened realm persistence backend is durable/event-sourced (A7).
+    /// The opened realm persistence backend provides durable session state (A7).
     pub durable_sessions: bool,
     /// A semantic memory store is compiled in and composed.
     pub memory_store: bool,

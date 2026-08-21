@@ -16,8 +16,8 @@ The TypeScript SDK (`@rkat/sdk`) is a thin wrapper over Meerkat's settled runtim
   </Step>
   <Step title="Install the RPC binary">
     ```bash
-    cargo build -p meerkat-rpc --release
-    # Ensure target/release/rkat-rpc is on your $PATH
+    make build
+    # Ensure the resulting rkat-rpc binary is on your $PATH
     ```
 
     By default the SDK can also auto-resolve and download `rkat-rpc` for the current platform, so a manual binary install is optional unless you want to control the binary path yourself.
@@ -70,20 +70,27 @@ The TypeScript SDK (`@rkat/sdk`) is a thin wrapper over Meerkat's settled runtim
 | `close()` | Kill the subprocess |
 | `createSession(prompt, options?)` | Create a session, run the first turn, return a `Session` |
 | `createSessionStreaming(prompt, options?)` | Create a session and stream typed events from the first turn |
-| `listSessions()` | List active sessions |
+| `listSessions(options?)` | List active sessions |
 | `readSession(sessionId)` | Read typed session metadata (`SessionInfo`) |
 | `readSessionHistory(sessionId, options?)` | Read committed session transcript history |
+| `inputState/exportSessionAtif/readSessionTranscriptRevision/listSessionTranscriptRevisions/forkSessionAt/forkSessionReplace/rewriteSessionTranscript/updateSystemPrompt/restoreSessionTranscriptRevision` | Input reconciliation, export, branching, and guarded transcript edits |
 | `sendExternalEvent(sessionId, eventType, payload, options?)` | Inject a canonical external event into a session |
 | `injectContext(sessionId, text, options?)` | Append one ordinary durable ordered System message |
 | `getModelsCatalog()` | Read config-backed model catalog |
 | `createSchedule/getSchedule/listSchedules/updateSchedule/pauseSchedule/resumeSchedule/deleteSchedule/listScheduleOccurrences/listScheduleTools/callScheduleTool` | Schedule API wrappers |
+| `getWorkGraphItem/listWorkGraphItems/listReadyWorkGraphItems/getWorkGraphSnapshot/listWorkGraphEvents/getWorkGraphGoalStatus/listWorkGraphAttention` | Read-only WorkGraph, goal, and attention projections |
+| `jobsGet/jobsList/jobsCancel/jobsProgress/jobsResult/jobsArtifacts/jobsRetry/jobsHealth/jobsSubscribe/jobsUnsubscribe` | Detached job control and observation |
+| `monitorsStart/mobkitJobHeartbeat/mobkitJobProgress/mobkitJobCheckpoint/mobkitJobComplete/mobkitJobFail/mobkitJobCancelAck` | Monitor creation and authority-checked MobKit worker updates |
+| `requestApproval/listApprovals/getApproval/decideApproval` | Approval record lifecycle; persists when the RPC bundle exposes a store path |
+| `listArtifacts/getArtifact/downloadArtifact` | Artifact metadata and payload access |
+| `latestEventCursor/listEventsSince/eventSnapshot` | Cursor replay and snapshots when host event projection is enabled |
 | `createMob(options?)` | Create a mob, return a `Mob` |
 | `createDeferredSession(prompt, options?)` | Create a session without running the first turn; returns a `DeferredSession` |
 | `listMobs()` | List mobs |
 | `getConfig()` | Read runtime configuration |
 | `setConfig(config)` | Replace runtime configuration |
 | `patchConfig(patch)` | Merge-patch runtime configuration |
-| `liveOpen/liveStatus/liveClose/liveSendInput/liveCommitInput/liveInterrupt/liveTruncate/liveRefresh` | Direct wrappers for the `live/*` RPC surface |
+| `liveOpen/liveWebrtcAnswer/liveStatus/liveClose/liveSendInput/liveCommitInput/liveInterrupt/liveTruncate/liveRefresh` | Direct wrappers for the `live/*` RPC surface |
 
 Schedule methods parse the canonical flattened response shape: planning,
 timestamps, labels, and other schedule configuration are top-level fields,
@@ -103,6 +110,23 @@ The SDK also exposes the auth-profile wrappers from the RPC surface:
 - `sendPeerResponseTerminal(...)`
 - `mcpAdd(...)`, `mcpRemove(...)`, `mcpReload(...)`
 - `getBlob(...)`, `listSkills()`
+- `getRuntimeHostInfo()`, `getRuntimeHostCapabilities()`, `getRuntimeHostHealth()`
+
+Every public TypeScript RPC wrapper binds its request and response transport
+boundary to generated RPC-schema contracts. In 0.8.24, generated names used by
+the job, approval, artifact, and durable-event declarations are not re-exported
+from the package root; callers can pass object literals matching the displayed
+method signature.
+
+Approval methods maintain audit records only. Requesting or deciding a record
+does not automatically gate, authorize, or execute an action. See
+[JSON-RPC approvals](/api/rpc#approvals) for persistence and single-writer
+details.
+
+Auth profiles and credentials are realm-scoped. Login/provisioning yields an
+auth binding that can be referenced by `SessionOptions.authBinding` or a mob
+member spec without placing the provider secret in that spec. Remote hosts
+resolve bindings only within their authorized realm.
 
 ### Generated assistant images
 
@@ -145,35 +169,82 @@ Image-generation wire contracts are exported for integrations that inspect tool 
 
 `RealtimeChannel` and the old realtime convenience helpers are no longer part of
 the public SDK. Use `LiveChannel.session(client, session.id, options?)` for a
-session-bound wrapper around the `live/*` methods. The SDK returns the transport
-bootstrap from `live/open`; callers still own the WebSocket connection to
-`openResult.transport.url`.
+session-bound wrapper around the `live/*` methods. The SDK returns a
+discriminated transport bootstrap from `live/open`; callers own the WebSocket
+or WebRTC connection. The example below requests WebRTC explicitly. For
+WebSocket, connect with `liveWs: true` and request `transport: "websocket"`.
 
 ```typescript
-import { LiveChannel, MeerkatClient } from "@rkat/sdk";
+import {
+  LiveChannel,
+  MeerkatClient,
+  isLiveWebrtcBootstrap,
+} from "@rkat/sdk";
 
-const client = new MeerkatClient();
-await client.connect({ liveWs: true });
+async function runLiveWebrtc(
+  completedOfferSdp: string,
+  installRemoteAnswer: (answerSdp: string) => Promise<void>,
+  imageDataBase64: string,
+): Promise<void> {
+  const client = new MeerkatClient();
+  await client.connect({ liveWebrtc: true });
 
-const session = await client.createSession("Open a live channel");
-const channel = LiveChannel.session(client, session.id, {
-  turningMode: "explicit_commit",
-  seedMaxChars: 24_000,
-});
+  const session = await client.createSession("Open a live channel", {
+    model: "gpt-realtime-2",
+    provider: "openai",
+  });
+  const channel = LiveChannel.session(client, session.id, {
+    turningMode: "explicit_commit",
+    transport: "webrtc",
+    seedMaxChars: 24_000,
+  });
 
-const openResult = await channel.open();
-// Connect to openResult.transport.url externally.
-await channel.sendInputImage(
-  "turn-42-diagram",
-  "image/png",
-  imageDataBase64,
-);
-// Promise resolution is queue acceptance. Wait for user_content_committed
-// carrying "turn-42-diagram" before treating the image as durable context.
-await channel.sendInputText("hello");
-await channel.commitInput("text");
-await channel.close();
+  const openResult = await channel.open();
+  if (!isLiveWebrtcBootstrap(openResult.transport)) {
+    throw new Error("server did not return the requested WebRTC bootstrap");
+  }
+  const answered = await client.liveWebrtcAnswer({
+    channel_id: openResult.channel_id,
+    token: openResult.transport.token,
+    offer_sdp: completedOfferSdp,
+  });
+  await installRemoteAnswer(answered.answer_sdp);
+  await channel.sendInputImage(
+    "turn-42-diagram",
+    "image/png",
+    imageDataBase64,
+  );
+  // Promise resolution is queue acceptance. Wait for user_content_committed
+  // carrying "turn-42-diagram" before treating the image as durable context.
+  await channel.sendInputText("hello");
+  await channel.commitInput("text");
+  await channel.close();
+  await client.close();
+}
 ```
+
+`@rkat/sdk` is Node-only and does not provide `RTCPeerConnection`. Keep the
+peer connection in a browser or inject a Node WebRTC implementation. Add an
+audio track or the `meerkat.live` data channel, call `setLocalDescription`,
+wait for ICE gathering to complete, then forward `peer.localDescription.sdp`
+to the Node process. Install the returned answer as the browser peer's remote
+description. A media-less or pre-ICE SDP cannot establish the live channel.
+
+<Warning>
+The 0.8.24 `answerLiveWebrtcOffer(...)` convenience helper does not wait for
+ICE gathering and sends the original `createOffer()` SDP instead of the final
+local description. Use the direct `client.liveWebrtcAnswer(...)` exchange
+above for the canonical browser flow until the helper is fixed.
+</Warning>
+
+<Warning>
+`liveWebrtc: true` passes the `--live-webrtc` process flag, which exists only
+when `rkat-rpc` was compiled with its non-default `live-webrtc` Cargo feature.
+The 0.8.24 release binary and a normal default-feature build do not include
+that flag. From the Meerkat repository, build an explicit binary with
+`./scripts/repo-cargo build -p meerkat-rpc --features live-webrtc`, then put it
+on `PATH` or pass its path to `new MeerkatClient(path)`.
+</Warning>
 
 Image keys are required, caller-stable, and session-scoped. See
 [Live Channels](/guides/realtime#sending-image-input) for same-key replay,
@@ -210,6 +281,15 @@ sidecars remain complete. The server rejects zero.
 | `mob.cancelFlow(runId)` | Cancel a flow run |
 | `mob.subscribeMemberEvents(agentIdentity)` | Subscribe to member events; returns `EventSubscription<AgentEventEnvelope>` |
 | `mob.subscribeEvents()` | Subscribe to mob-wide events; returns `EventSubscription<AttributedMobEvent>` |
+| `mob.hosts()` / `mob.routeInstalls()` | Inspect member hosts and pending cross-host routes |
+| `mob.bindHost(...)` / `mob.revokeHost(...)` | Bind or revoke a remote member host |
+| `mob.grantScopes(...)` / `mob.revokeScopes(...)` / `mob.grants()` | Manage trusted operator control grants |
+| `mob.memberHistory(...)` / `mob.hardCancel(...)` | Read remote/local history or perform an immediate hard cancel |
+| `mob.memberLiveOpen/status/control/close(...)` | Control a live channel on a local or remote member |
+
+Multi-host placement and host/grant mutation are trusted JSON-RPC operator
+surfaces, not agent-callable mob tools. Agent-callable spawn also cannot carry
+the Rust-only `resume_from_role` one-shot durable role-migration declaration.
 
 ---
 
@@ -247,9 +327,11 @@ export interface ConnectOptions {
 ```
 
 `realmId` and `isolated` are mutually exclusive. If `realmId` is omitted and `isolated` is not set, the spawned `rkat-rpc` process uses its normal isolated-mode default rather than a shared default realm. Reuse `realmId` explicitly to share sessions and config across processes or surfaces.
-Set `liveWs: true` when you need the `live/*` adapter surface; the SDK starts
-`rkat-rpc` with an ephemeral live WebSocket listener and `live/open` returns the
-transport URL/token for your client to connect.
+Set `liveWs: true` for the WebSocket live adapter; the SDK starts `rkat-rpc`
+with an ephemeral listener and `live/open` returns its URL/token bootstrap.
+Set `liveWebrtc: true` for the WebRTC bootstrap/SDP-answer path, using a binary
+built with the non-default `meerkat-rpc/live-webrtc` feature. When both are
+enabled, select the requested transport through `LiveChannelOptions.transport`.
 
 ### createSession()
 
@@ -302,9 +384,12 @@ All fields are camelCase:
 
 ```typescript
 interface SessionOptions {
+  injectedContext?: readonly ContentInput[];
+  transientTurnContext?: string;
   model?: string;
   provider?: string;
-  systemPrompt?: string;
+  authBinding?: WireAuthBindingRef;
+  systemPrompt?: string | { action: "disable" };
   maxTokens?: number;
   outputSchema?: Record<string, unknown>;
   structuredOutputRetries?: number;
@@ -331,6 +416,16 @@ interface SessionOptions {
   externalTools?: Record<string, unknown>[];
 }
 ```
+
+`createDeferredSession(...)` reuses `SessionOptions`, but the server rejects
+`transientTurnContext` when no immediate turn exists. The current TypeScript
+`DeferredTurnOptions` also does not expose `transientTurnContext`,
+`injectedContext`, or `selfHostedServerId`: set injected context on deferred
+creation, and use `startTurn(...)` or `stream(...)` only with `skillRefs`,
+`turnToolOverlay`, `additionalInstructions`, `keepAlive`, `model`, `provider`,
+`maxTokens`, `systemPrompt`, `outputSchema`, `structuredOutputRetries`, and
+`providerParams`. Transient first-turn context and a self-hosted server route
+are not expressible through the current deferred TypeScript wrapper.
 
 ---
 
@@ -371,12 +466,15 @@ successive readings together. See
 async turn(
   prompt: string | ContentBlock[],
   options?: {
+    injectedContext?: readonly ContentInput[];
+    transientTurnContext?: string;
     skillRefs?: SkillRef[];
     turnToolOverlay?: TurnToolOverlay;
     additionalInstructions?: string[];
     keepAlive?: boolean;
     model?: string;
     provider?: string;
+    selfHostedServerId?: string;
     maxTokens?: number;
     systemPrompt?: string;
     outputSchema?: Record<string, unknown>;
@@ -399,12 +497,15 @@ console.log(result.text);
 stream(
   prompt: string | ContentBlock[],
   options?: {
+    injectedContext?: readonly ContentInput[];
+    transientTurnContext?: string;
     skillRefs?: SkillRef[];
     turnToolOverlay?: TurnToolOverlay;
     additionalInstructions?: string[];
     keepAlive?: boolean;
     model?: string;
     provider?: string;
+    selfHostedServerId?: string;
     maxTokens?: number;
     systemPrompt?: string;
     outputSchema?: Record<string, unknown>;
@@ -424,6 +525,10 @@ for await (const event of session.stream("Elaborate on point three")) {
 }
 // session.text is now updated
 ```
+
+Injected context is durable ordered user-channel context immediately before the
+prompt. `transientTurnContext` carries request-only host facts and is not a
+transcript message.
 
 ### interrupt()
 
@@ -614,10 +719,14 @@ for await (const event of session.stream("Explain Rust lifetimes in two sentence
       console.log(`\nStop reason: ${event.stopReason}`);
       // `accounting` names the resolved model and the normalized presented
       // input for this one call; `inputTokens` is the raw provider counter.
-      console.log(
-        `${event.usage.accounting?.model}: ` +
-          `${event.usage.accounting?.presentedTokens} in / ${event.usage.outputTokens} out`,
-      );
+      if (event.usage) {
+        console.log(
+          `${event.usage.accounting?.model}: ` +
+            `${event.usage.accounting?.presentedTokens} in / ${event.usage.outputTokens} out`,
+        );
+      } else {
+        console.log("Usage: unmeasured");
+      }
       break;
   }
 }

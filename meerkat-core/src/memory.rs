@@ -487,7 +487,7 @@ impl MemoryIndexScope {
 
 /// One scoped semantic-memory indexing request.
 ///
-/// The request carries the typed [`MemoryIndexableContent`] decision rather
+/// The request carries the typed [`crate::types::MemoryIndexableContent`] decision rather
 /// than a flattened `String`, so the store — not the producer — owns the
 /// include/exclude policy. An `Excluded(_)` request reaches the store with its
 /// typed exclusion reason intact; the store decides what (if anything) to

@@ -35,7 +35,7 @@ The CLI's default features include the memory backend/session wiring, but **not*
 </Note>
 
 ```bash
-cargo build -p rkat --features session-compaction,memory-store
+./scripts/repo-cargo build -p rkat --features session-compaction,memory-store
 ```
 
 At runtime, `AgentFactory::memory(true)` enables the semantic memory path (`HnswMemoryStore` + `memory_search`). Compaction is controlled independently by whether the binary is built with `session-compaction` and whether a compactor is wired into the session path.
@@ -46,7 +46,7 @@ let factory = AgentFactory::new(store_path)
     .memory(true);  // enable semantic memory
 
 // Per-request override:
-let mut build_config = AgentBuildConfig::new("claude-sonnet-4-6");
+let mut build_config = AgentBuildConfig::new("gpt-5.6-sol");
 build_config.override_memory = ToolCategoryOverride::Enable;
 ```
 
@@ -62,8 +62,9 @@ Controls when and how compaction runs.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `auto_compact_threshold` | `u64` | `100_000` | Compaction triggers when `last_input_tokens >= threshold` OR `estimated_history_tokens >= threshold` OR the measured whole-request token budget crosses the threshold. |
-| `recent_turn_budget` | `usize` | `4` | Number of recent complete turns to retain after compaction. A turn is a User message followed by all subsequent non-User messages until the next User message. |
+| `auto_compact_threshold` | `u64` | model-aware; raw struct default `100_000` | Token high-water mark. If config leaves it implicit, `AgentFactory` uses four-fifths of the selected catalog model's context window. An explicit config or per-build override wins. |
+| `max_request_bytes` | `Option<u64>` | `None` | Optional host request-body cap. Byte compaction triggers at four-fifths of the stricter available cap: this value or an exact provider-reported cap. |
+| `recent_turn_budget` | `usize` | `4` | Maximum number of recent complete conversational turns to retain. A turn starts only at a conversational User message; typed injected context stays attached to that turn. Capacity recovery may retain fewer turns. |
 | `max_summary_tokens` | `u32` | `4096` | Maximum tokens the LLM may produce for the compaction summary. |
 | `min_turns_between_compactions` | `u32` | `3` | Minimum turns that must elapse between consecutive compactions (loop guard to prevent runaway compaction). |
 
@@ -77,20 +78,27 @@ The decision flow:
   <Step title="Skip turn 0">
     The first turn always skips compaction.
   </Step>
-  <Step title="Loop guard check">
-    If compaction occurred at turn N, no compaction until turn N + `min_turns_between_compactions`.
+  <Step title="Cadence check">
+    Ordinary compaction attempts respect `min_turns_between_compactions`.
+    Current-history or request-byte capacity recovery bypasses this cost guard.
   </Step>
   <Step title="Threshold evaluation">
     Compaction triggers if ANY of:
     - `last_input_tokens >= auto_compact_threshold` (input tokens from the last LLM response), OR
-    - `estimated_history_tokens >= auto_compact_threshold` (JSON bytes of all messages / 4), OR
+    - `estimated_history_tokens >= auto_compact_threshold` (a conservative
+      current-history estimate: text and serialized structure use a bytes/4
+      heuristic, while images and video use media-aware estimates), OR
     - the measured request budget for this boundary crosses the threshold on its
       input side. This is the same measurement the pre-dispatch preflight
       performs - fully hydrated request messages, the exact visible tool
       definitions, and the effective output reserve - so tool schemas and
       hydrated media, which the provider counts but a transcript-only estimate
       cannot see, are visible to the trigger. It is available whenever the
-      active model declares a context window.
+      active model declares a context window, OR
+    - request bytes cross four-fifths of the effective byte cap. An exact
+      provider-lowered witness is preferred; otherwise an explicitly
+      configured `max_request_bytes` is compared with the conservative
+      transcript request estimate.
   </Step>
 </Steps>
 
@@ -102,28 +110,60 @@ When compaction triggers:
   <Step title="Emit CompactionStarted event">
     Emitted with input/estimated token counts and message count.
   </Step>
-  <Step title="Send compaction prompt to LLM">
-    The current conversation history plus a compaction prompt is sent to the LLM with no tools and `max_summary_tokens` as the response limit.
+  <Step title="Produce the summary">
+    Without a curator, a provider-safe projection of the current history plus
+    the compaction prompt is sent to the LLM with no tools and
+    `max_summary_tokens` as the response limit. Media and reasoning are
+    projected for summarization, and an oversized source projection is bounded
+    to a head/tail handoff excerpt. With a curator, this LLM call is skipped.
   </Step>
   <Step title="Handle result">
-    **On failure**: a CompactionFailed event is emitted and the session is not mutated (safe failure).
+    **On ordinary failure**: a CompactionFailed event is emitted and the session is not mutated (safe failure).
+
+    **If the summarization request itself exceeds provider capacity**: the
+    built-in path uses a deterministic mechanical handoff summary with zero
+    provider usage so the oversized session can still make progress. This is
+    not used for curator failures.
 
     **On success**: `DefaultCompactor::rebuild_history` produces new messages:
-    - System prompt is preserved verbatim (if present).
-    - A summary message is injected as a User message with the prefix `[Context compacted]`.
-    - The last `recent_turn_budget` complete turns are retained.
+    - Every unkeyed System message and the latest version of each keyed System
+      prompt are preserved verbatim and in source order. Superseded keyed
+      versions are discarded.
+    - A User-channel summary message is injected with the typed
+      `CompactionSummary` transcript role and the rendered prefix
+      `[Context compacted]`.
+    - Up to `recent_turn_budget` complete turns are retained. The compactor
+      shrinks that set when request-body pressure requires more room.
     - All other messages become `discarded`.
   </Step>
-  <Step title="Index discarded memory">
-    If semantic memory is enabled, discarded messages are indexed before the compacted history is committed.
+  <Step title="Project discarded memory">
+    If semantic memory is enabled, the runtime pairs the validated transcript
+    rewrite with a scoped memory batch. The in-memory store publishes the pair
+    synchronously; the durable HNSW store stages the batch under the exact
+    rewrite identity for session-runtime commit.
   </Step>
-  <Step title="Replace session messages">
-    The session messages are replaced with the rebuilt history after memory indexing accepts the discarded content.
+  <Step title="Commit the rewrite">
+    The session messages become authoritative only after the memory projection
+    accepts the same rewrite. A store rejection, transcript validation error,
+    or runtime handoff refusal preserves the original history.
   </Step>
   <Step title="Record usage and emit completion event">
     Compaction usage is recorded against the session and budget. A **CompactionCompleted** event is emitted with summary token count and before/after message counts.
   </Step>
 </Steps>
+
+### Host-supplied summary curation
+
+`AgentBuildConfig.compaction_curator_override` accepts an
+`Arc<dyn CompactionCurator>`. When present, the curator receives the typed
+`CompactionWindow` and produces the summary instead of the summarization LLM
+call. Summary usage is recorded as zero. The runtime does not fall back to an
+LLM if the curator fails or returns an empty summary; it emits a typed
+`CompactionFailed` event and preserves the original history.
+
+The curator does not control trigger timing, retained/discarded provenance,
+memory indexing, or transcript commit. Those remain runtime-owned and are
+validated before mutation.
 
 <Accordion title="The compaction prompt">
 The compactor sends this prompt to the LLM:
@@ -145,8 +185,12 @@ The compactor sends this prompt to the LLM:
 When both a `Compactor` and a `MemoryStore` are wired into the agent, discarded messages are indexed into semantic memory before compacted history is committed. If the memory store rejects indexing, Meerkat preserves the original history, emits a `CompactionFailed` event, and skips that compaction attempt instead of dropping the only authoritative copy of the discarded text.
 
 For each discarded message:
-- The message's indexable text content is extracted via `message.as_indexable_text()`.
-- If non-empty, it is indexed with `MemoryMetadata` containing the session ID, the typed source handle (the offset range of the source message(s)), and a timestamp.
+- The producer carries `message.indexable_content()` into a typed
+  `MemoryIndexRequest`. The store owns the include/exclude decision; the
+  producer does not use an empty-string convention. Compaction summaries and
+  injected context are excluded from ordinary semantic recall.
+- The request carries `MemoryMetadata` containing the session ID, the typed
+  source handle (the offset range of the source message), and a timestamp.
 
 This means previously discarded conversation content becomes searchable via the `memory_search` tool.
 
@@ -234,7 +278,10 @@ When the `memory-store-session` feature is compiled in and memory is enabled:
 1. An `HnswMemoryStore` is opened at `{store_path}/memory/`.
 2. The `memory_search` tool is added to the agent's tool set.
 3. A `DefaultCompactor` is attached only if `session-compaction` is also enabled.
-4. A built-in `memory-retrieval` skill is injected into the system prompt, teaching the agent how to use memory search.
+4. The embedded `memory-retrieval` companion skill is available in the skill
+   inventory when its capability gate is satisfied. It is not automatically
+   preloaded; callers or the agent can activate it through the normal typed
+   skill paths.
 
 ## Examples
 
@@ -242,7 +289,7 @@ When the `memory-store-session` feature is compiled in and memory is enabled:
   <Tab title="CLI">
     ```bash
     # Build with memory + compaction features
-    cargo build -p rkat --features session-compaction,memory-store
+    ./scripts/repo-cargo build -p rkat --features session-compaction,memory-store
 
     # Enable the richer tool preset so memory_search is available
     rkat run --tools full "Analyze this large codebase..."
@@ -260,7 +307,7 @@ When the `memory-store-session` feature is compiled in and memory is enabled:
         .builtins(true)
         .memory(true);
 
-    let mut build_config = AgentBuildConfig::new("claude-sonnet-4-6");
+    let mut build_config = AgentBuildConfig::new("gpt-5.6-sol");
     // Memory + compaction are wired automatically when:
     //   1. The factory has memory(true)
     //   2. The binary is compiled with session-compaction + memory-store-session features
@@ -278,6 +325,7 @@ use meerkat_session::DefaultCompactor;
 
 let compactor = DefaultCompactor::new(CompactionConfig {
     auto_compact_threshold: 50_000,   // Compact earlier
+    max_request_bytes: Some(9_000_000), // Optional host request-body cap
     recent_turn_budget: 6,            // Keep more recent turns
     max_summary_tokens: 8192,         // Allow longer summaries
     min_turns_between_compactions: 5, // More spacing between compactions

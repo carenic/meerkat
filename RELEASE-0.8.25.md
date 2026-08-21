@@ -1,25 +1,21 @@
 # Meerkat 0.8.25 release train
 
-## Blocking train-opening item: migrate SDK wrappers to generated types
+## Completed train-opening item: generated SDK wrapper migration
 
 Owner: sdk-contracts
 
-The first 0.8.25 change must advance
-`BASELINE_HAND_ROLLED_CURRENT_TRAIN` in
-`scripts/verify_rpc_signature_parity.py` from 0.8.24 to 0.8.25. That mutation
-must remain failing until the migration below is complete.
+Completed on 2026-08-19 by PR #964. All public Python and TypeScript RPC
+wrappers now use the generated parameter and result contracts at the request
+boundary.
 
-Migrate all 239 entries in `BASELINE_HAND_ROLLED` to the generated SDK
-parameter and result types. The reviewed inventory is 110 TypeScript sides and
-129 Python sides. This work is complete only when the baseline is empty and
-the RPC signature-parity verifier passes without grandfathered wrappers.
+`scripts/verify_rpc_signature_parity.py` no longer contains
+`BASELINE_HAND_ROLLED`, `BASELINE_HAND_ROLLED_CURRENT_TRAIN`, an entry cap, or
+an expiry waiver. The verifier now rejects hand-rolled wrapper shapes for both
+new and historical methods and requires exact catalog type references.
 
-The 0.8.24 release may retain the exact reviewed 239-entry baseline and cap.
-The verifier binds that exception to release trains before 0.8.25. Advancing
-the explicit train marker to 0.8.25 makes the verifier fail while any baseline
-entry remains, avoiding a calendar-date renewal and the package-version bump
-that occurs during release closeout.
+The post-migration release gate is:
 
-The migration must not weaken wrapper coverage, admit new hand-rolled shapes,
-or suppress stale-entry detection. Delete each baseline entry only with the
-corresponding generated-type wrapper migration.
+- keep the generated RPC method artifact current;
+- keep the documented Params and Result columns exactly aligned with it;
+- keep SDK request sites bound to generated contract types;
+- do not add a new grandfathered baseline or suppress stale-entry detection.

@@ -5,27 +5,49 @@ icon: "table-cells"
 ---
 
 Meerkat is modular. The `meerkat` facade defaults to the three provider
-features (`anthropic`, `openai`, `gemini`); storage, comms, MCP, skills,
-schedule, memory, and live-channel orchestration are opt-in. This matrix shows
-what works in common build profiles.
+features (`anthropic`, `openai`, `gemini`); realm persistence, compaction,
+comms, MCP, skills, semantic memory, ATIF facade export, and live-channel
+orchestration are compile-time options. Schedule, WorkGraph, and durable-job
+substrates are always linked by the facade. Their runtime services and tools
+still require host composition and policy activation; the empty `schedule`
+and `workgraph` Cargo features are compatibility aliases, not selectors.
+These matrices show what works in common profiles.
+
+This page contains several intentionally separate matrices. Build profiles
+describe facade compile-time composition. The session-operation matrix covers
+only session lifecycle behavior. Generic `CapabilityId` entries describe
+tool-family policy, while `runtime/capabilities` describes one host process.
+None of those projections is a complete list of every API method or runtime
+authority.
 
 ## Build profiles
 
 | Profile | Cargo Features | Use Case |
 |---------|---------------|----------|
-| **Minimal** | `--no-default-features` | Ephemeral agent, no persistence, no compaction |
-| **Provider default** | default features | Anthropic + OpenAI + Gemini providers, no persistence or optional subsystems |
-| **Persistent** | `session-store` | Sessions survive restart with the realm-pinned backend (`sqlite` by default when compiled) |
+| **Minimal** | `--no-default-features` | Ephemeral agent core for a host that supplies its own provider path; no persistence or compaction |
+| **Provider default** | default features | Anthropic + OpenAI + Gemini providers; no session persistence, compaction, live transport, comms, MCP, skills, or semantic memory |
+| **Persistent SQLite** | `session-store` | Persistent session service with the built-in SQLite backend; the feature also compiles the explicitly ephemeral `memory` backend |
+| **Persistent JSONL** | `session-store,jsonl-store` | Persistent session service with the separately enabled JSONL backend |
 | **Compacting** | `session-compaction` | Auto-compact long conversations |
-| **Full** | `session-store,session-compaction` | Persistent + compacting |
-| **Live-capable** | `openai-realtime,live` | Caller-initiated `live/*` channels for realtime-capable sessions |
+| **Persistent + compacting** | `session-store,session-compaction` | Persistent session state plus automatic compaction |
+| **Live host core** | `openai-realtime,live` | Live orchestration for realtime-capable sessions; the host must still configure a transport |
+| **WebRTC-capable live host** | `openai-realtime,live-webrtc` | Compiles WebRTC support; `rkat-rpc` must also start with `--live-webrtc` |
+
+Durable jobs do not have a facade feature switch of their own. The job types
+and services are compiled into the facade, but durable detached execution needs
+a persistent realm job store, persistent blob store, runtime delivery inbox,
+and realm-bound delivery projector. Memory-only and standalone builds fail
+detached shell submission closed instead of falling back to a volatile process.
 
 ## Capability behavior
 
-| Operation | Minimal | Persistent | Compacting | Full |
+This table is scoped to session lifecycle operations. It does not describe
+jobs, approvals, mobs, live transports, or every host surface.
+
+| Operation | Minimal | Persistent | Compacting | Persistent + compacting |
 |-----------|---------|-----------|------------|------|
 | `create_session` | Works | Works | Works | Works |
-| `start_turn` | Works | Works + snapshot saved | Works | Works + snapshot saved |
+| `start_turn` | Works | Works + exact physical successor committed | Works | Works + exact physical successor committed |
 | `interrupt` | Works | Works | Works | Works |
 | `read` (running session) | Works | Works | Works | Works |
 | `read` (archived) | Final in-memory view | `SESSION_NOT_FOUND` | Final in-memory view | `SESSION_NOT_FOUND` |
@@ -78,10 +100,10 @@ parsing messages.
 
 ### Transport error mapping summary
 
-- **JSON-RPC**: `NotFound`/`Busy` keep dedicated codes (-32001/-32002); typed agent causes use the canonical `meerkat_contracts::ErrorCode::jsonrpc_code()` values; all other session variants collapse to -32603 with the message preserved.
+- **JSON-RPC**: `NotFound`/`Busy` keep dedicated codes (-32001/-32002), durable resume holds use `SessionNotRunning` (-32003), and typed agent causes use the canonical `meerkat_contracts::ErrorCode::jsonrpc_code()` values. Remaining session variants collapse to -32603 with the message preserved.
 - **REST**: Endpoint-typed `ApiError` mapping (`NotFound` -> 404; `Busy` -> 400 on create/turn, 409 on interrupt conflicts; archived/unavailable history -> 400; agent/internal -> 500). Where canonical wire errors are emitted, `ErrorCode::http_status()` decides the status. Error body includes `{ "code": "...", "message": "..." }`.
 - **MCP Server**: Tool calls return `is_error: true` with the error message and code in the content.
-- **CLI**: Exit codes are coarse: 0 success, 1 error, 2 graceful budget exhaustion. Error details are printed to stderr.
+- **CLI**: General commands use 0 for success, 1 for error, and 2 for graceful budget exhaustion. Multi-host mob commands additionally preserve the typed operator failures: 45 scope denied, 46 host unavailable, 47 stale cursor, and 48 stale fence. Error details are printed to stderr.
 
 ## Mob control scopes
 
@@ -113,50 +135,174 @@ v1 (recorded v2 hardening).
 ```toml
 # Minimal: just the agent loop
 [dependencies]
-meerkat = { version = "0.8.25", default-features = false, features = ["anthropic"] }
+meerkat = { version = "=0.8.25", default-features = false, features = ["anthropic"] }
 
 # Add persistence
-meerkat = { version = "0.8.25", default-features = false, features = ["anthropic", "session-store"] }
+meerkat = { version = "=0.8.25", default-features = false, features = ["anthropic", "session-store"] }
 
 # Add compaction
-meerkat = { version = "0.8.25", default-features = false, features = ["anthropic", "session-store", "session-compaction"] }
+meerkat = { version = "=0.8.25", default-features = false, features = ["anthropic", "session-store", "session-compaction"] }
 
-# Add scheduling
-meerkat = { version = "0.8.25", default-features = false, features = ["anthropic", "session-store", "schedule"] }
+# Add facade-local predicate-schedule helper re-exports. The schedule service
+# and WorkGraph substrate are already linked.
+meerkat = { version = "=0.8.25", default-features = false, features = ["anthropic", "session-store", "schedule"] }
 
-# Kitchen sink
-meerkat = { version = "0.8.25", features = [
+# Broad native facade with WebSocket live support
+meerkat = { version = "=0.8.25", features = [
   "all-providers", "openai-realtime", "session-store", "session-compaction",
-  "memory-store-session", "comms", "mcp", "skills", "schedule", "workgraph", "live",
+  "memory-store-session", "comms", "mcp", "skills", "schedule", "live",
   "atif", # 0.8.23+
 ] }
+
+# WebRTC is separate and still needs `rkat-rpc --live-webrtc` at runtime
+meerkat = { version = "=0.8.25", features = ["openai-realtime", "live-webrtc"] }
 ```
 
-## Runtime Capabilities
+## Runtime capabilities
 
-`GET /capabilities` and `capabilities/get` report compiled and policy-enabled
-runtime capabilities. Tool-family companion skills use the same capability
-tokens for gating.
+Meerkat exposes two related capability projections:
 
-| Capability | Config gate | Notes |
-|------------|-------------|-------|
-| `builtins` | `tools.builtins_enabled` | Builtin tasks and utility tools |
-| `shell` | `tools.shell_enabled` | Shell and shell job tools |
-| `schedule` | `tools.schedule_enabled` | Durable schedules and occurrence delivery |
-| `work_graph` | `tools.workgraph_enabled` | WorkGraph tools and companion workflow |
-| `memory_store` | feature/runtime store | Semantic memory retrieval |
-| `skills` | `skills.enabled` and compiled skills support | Skill discovery and loading |
+- `GET /capabilities` and JSON-RPC `capabilities/get` return the registered
+  `CapabilityStatus` inventory. A status distinguishes available,
+  policy-disabled, and not-compiled behavior.
+- `GET /runtime/capabilities` and JSON-RPC `runtime/capabilities` return
+  `RuntimeHostCapabilities`, including explicit boolean facts about the
+  current host and its registered endpoints.
 
-WorkGraph's companion skill uses the same canonical capability token as public
-capability reports: `work_graph`.
+Do not infer one layer from the other. A generic capability token describes a
+feature or policy family; a host feature flag answers whether this concrete
+runtime surface can serve the corresponding host protocol.
+
+### Capability inventory
+
+The complete `CapabilityId` vocabulary is:
+
+| Capability | Registration or policy gate | Meaning |
+|------------|-----------------------------|---------|
+| `sessions` | Core, always registered | Agent loop and session lifecycle |
+| `streaming` | Core, always registered | Agent event streaming |
+| `structured_output` | Core, always registered | Schema-validated output extraction |
+| `hooks` | Registered when the hooks crate is linked | Hook execution; no separate config gate |
+| `builtins` | Tools crate plus `tools.builtins_enabled` | Builtin task, file, image, and utility tools |
+| `shell` | Native tools crate plus `tools.shell_enabled` | Shell and shell-job tools; absent on WASM |
+| `comms` | Compiled comms capability | Inter-agent messaging and keep-alive support |
+| `memory_store` | Compiled `memory-store` support | Semantic memory retrieval over compacted history |
+| `schedule` | Schedule crate plus `tools.schedule_enabled` | Durable schedules and occurrence delivery |
+| `work_graph` | WorkGraph crate plus `tools.workgraph_enabled` | Realm-scoped dependency-aware work |
+| `session_store` | Native `session-store` feature | Persistent sessions and event projection |
+| `session_compaction` | Native `session-compaction` feature | Automatic transcript compaction |
+| `skills` | Compiled skills support plus `skills.enabled` | Skill discovery, resolution, and injection |
+| `mcp_live` | Compiled `mcp` support | Add, remove, or reload MCP servers on a live session |
+| `adaptive_flow` | Known mobpack requirement token | Adaptive FlowMaster execution; not an automatically registered inventory row |
+
+WorkGraph's companion skill uses the same canonical `work_graph` token as the
+public inventory. Adaptive mobpacks stamp `adaptive_flow` into their
+requirements so a host that does not know or satisfy the requirement fails
+closed instead of silently running a downgraded flow.
 
 Optional capability bundles are declared by the owning feature crate.
 `meerkat-capabilities` supplies the typed vocabulary and collection seam;
 contracts and facades may project those declarations into `CapabilityStatus`,
-but they must not invent feature policy or translate capability aliases. For
-example, `meerkat-schedule` owns the Schedule policy declaration,
-`meerkat-workgraph` owns the WorkGraph policy declaration and registration, and
-`meerkat-skills` owns the Skills policy declaration.
+but they must not invent feature policy or translate aliases. For example,
+`meerkat-schedule` owns Schedule policy, `meerkat-workgraph` owns WorkGraph
+policy and registration, and `meerkat-skills` owns Skills policy.
+
+### Runtime host feature flags
+
+`RuntimeHostFeatureFlags` contains these exact boolean fields:
+
+| Flag | Host fact |
+|------|-----------|
+| `runtime_backed_sessions` | Session operations lower through the runtime control plane |
+| `mobs` | Mob runtime methods are available |
+| `mcp_live` | Live MCP mutation methods are available |
+| `comms` | Host comms operations are available |
+| `blobs` | Realm blob retrieval is available |
+| `session_events` | Session event subscription is available |
+| `session_streams` | Session output stream subscription is available |
+| `schedules` | Schedule methods are available |
+| `skills` | Skill inspection is available |
+| `event_replay` | Durable session-event replay is available |
+| `artifacts` | Stable artifact record and download methods are available |
+| `approvals` | Persistent RPC-host approval records are available |
+| `external_members` | External mob-member hosting is available |
+| `secure_remote_rpc` | This host advertises the secure remote-RPC contract |
+| `multi_host_mobs` | Host binding and remote member materialization are available |
+| `durable_jobs` | The job and monitor protocol family is wired; each detached submission still checks durable realm storage and delivery |
+
+Older payloads that predate `multi_host_mobs` or `durable_jobs` decode those
+fields as `false`. Clients must check the explicit flag instead of guessing
+from `mobs`, the server version, or the presence of shared schema components.
+
+The approval flag covers request, decision, status, and audit truth. It does
+not claim an automatic in-loop tool gate. A named built-in memory realm still
+has a `store_path`, so RPC persists its approval sidecar and may report
+`approvals=true`; only an ad hoc bundle without a store path falls back to a
+process-local service and reports the flag as false.
+
+Likewise, `durable_jobs=true` reports host protocol wiring, not permission to
+silently run a volatile detached process. Background shell needs a persistent
+realm job store, blob store, runtime delivery inbox, and delivery projector or
+fails closed.
+
+### Public surface coverage
+
+This table describes dedicated public protocol or command families. It does
+not treat an agent's ability to call a model-visible tool as an operator API.
+
+| Domain | CLI | REST | JSON-RPC | MCP server |
+|--------|-----|------|----------|------------|
+| Session lifecycle and history | Yes | Yes | Yes | Yes |
+| Live session events | Stream output | SSE | Subscriptions | Open/read/close stream tools |
+| Durable event replay | ATIF export | No | `events/latest_cursor`, `events/list_since`, `events/snapshot` | No |
+| Blob fetch | `blob get` | No | `blob/get` | `meerkat_blob_get` |
+| Stable artifact records/downloads | No | No | `artifact/*` | No |
+| Approval records | No | No | `approval/*` | No |
+| Durable jobs and monitors | No dedicated command | No | `jobs/*`, `monitors/start` | No |
+| Schedules | Agent tools only | Full CRUD and tool call | Full CRUD and tool call | Schedule tools |
+| WorkGraph | Observation plus trusted goal/attention controls | Observation | Observation | Agent mutation tools plus observation |
+| Live audio | Placed mob-member WebSocket controls | No | Session `live/*` supports WebSocket/WebRTC; member control is WebSocket-only | No |
+| Multi-host mobs | Admin and observation | Observation only | Admin and observation | Placement plus observation only |
+| Provider credential management | Yes | Yes | Yes | No |
+
+Shared wire types do not grant exposure. In particular, durable member role
+migration is absent from every public CLI, REST, JSON-RPC, MCP, and generated
+SDK spawn request even though the private remote-host bridge shares schema
+types with public artifacts.
+
+### Live transport gates
+
+Realtime model capability, live orchestration, and transport activation are
+separate facts:
+
+| Gate | Requirement |
+|------|-------------|
+| Realtime model | The selected `ModelProfile.realtime` is `true` |
+| Live orchestration | The host is built with `live` and the appropriate realtime provider support, such as `openai-realtime` |
+| Direct WebSocket | `rkat-rpc` starts with `--live-ws <addr>` |
+| WebRTC | `rkat-rpc` is built with `live-webrtc` and starts with `--live-webrtc` |
+
+The WebRTC build feature alone does not enable signaling. The `live/*` family
+is advertised only when at least one live transport is active, and
+`live/webrtc/answer` is advertised only when the WebRTC runtime gate is active.
+
+### Event delivery and durability
+
+Live session subscriptions use a bounded 256-entry best-effort broadcast. A
+consumer that falls behind receives `stream_truncated` with
+`reason.kind: "stream_lagged"` and an exact `reason.dropped` count, then
+continues from the retained tail. Built-in realm-backed persistent sessions
+separately feed event envelopes into a dedicated unbounded projector queue and
+append them asynchronously to a durable audit/replay log. Custom persistent
+hosts receive this surface only when they install the optional event projection seam. The
+projector warns when its backlog reaches 1,024. A
+durable append fault latches a typed halt and refuses to append later sequence
+numbers past the hole, but does not undo the committed turn. A slow UI
+subscriber therefore does not itself truncate audit projection input.
+Reconcile live gaps through available durable replay, a snapshot, or ATIF
+export rather than treating the live tail as complete evidence. SessionStore
+and RuntimeStore remain session authority; `.rkat/sessions/` views and ATIF
+output are derived projections.
 
 ## Model capabilities
 
@@ -165,7 +311,7 @@ example, `meerkat-schedule` owns the Schedule policy declaration,
 | Capability | Description | Anthropic | OpenAI | Gemini |
 |------------|-------------|-----------|--------|--------|
 | `vision` | Model can process image content in user messages | Yes | Yes | Yes |
-| `image_tool_results` | Model can process image content in tool results | Yes | No | Yes |
+| `image_tool_results` | Model can process image content in tool results | Yes | Yes for current chat and Responses rows; no for `gpt-realtime-2` | Yes |
 | `inline_video` | Model can process video content in user messages, including inline bytes and provider-readable URI references | No | No | Yes |
 | `realtime` | Model can back a caller-initiated live channel | No | `gpt-realtime-2` only | No current catalog row |
 | `supports_web_search` | Model supports provider-native web search tools | Yes | Yes for chat catalog rows; not `gpt-realtime-2` / Codex | Yes |
@@ -272,10 +418,12 @@ Events emitted: `CompactionStarted`, `CompactionCompleted`, `CompactionFailed`.
 ## Durability
 
 - **Ephemeral**: Process death loses all state.
-- **Persistent**: Snapshot saved after turn completion according to the pinned realm backend.
-- Backends are pinned per realm (`realm_manifest.json`) and shared across surfaces only when `realm_id` matches.
+- **Persistent**: A successful turn commits an exact store-issued physical successor according to the pinned realm backend. The serialized `Session` remains domain state, not an embedded checkpoint or proof of currentness.
+- Intra-turn persistence may write provisional physical successors. Each write returns an exact receipt, and the final runtime boundary promotes the latest receipt without reserializing or reapplying the turn.
+- `WholeBlob` currentness binds the session ID, store revision, and blob digest. `HeadCanonical` currentness binds the session ID, store revision, boundary head, and committed head token.
+- Backends are pinned per realm (`realm_manifest.json`). Surfaces share state only when both `realm_id` and the resolved physical provider/root match.
 - SQLite-backed realms are the standard same-realm multi-process mode.
-- Every composed store slot carries a machine-readable durability class (`durable` / `rebuildable_cache` / `scratch`); a durable slot resolving to a non-persistent store without a manifest `ephemeral_domains` declaration is a typed startup error, never a silent in-memory fallback.
+- Every composed store slot carries a machine-readable durability class (`durable` / `rebuildable_cache` / `scratch`). An undeclared non-persistent durable slot needs a manifest `ephemeral_domains` declaration or startup fails typed. A provider can instead return typed `DeclaredEphemeral` directly; neither path permits silent in-memory fallback.
 
 ## See also
 

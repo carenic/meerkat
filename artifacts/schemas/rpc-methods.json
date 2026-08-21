@@ -137,7 +137,7 @@
       "result_type": "WireSessionHistory"
     },
     {
-      "description": "Export the complete durable session event log as an ATIF trajectory",
+      "description": "Export currently projected session replay evidence as an ATIF trajectory",
       "name": "session/export_atif",
       "params_type": "ExportAtifParams",
       "result_type": "Value"
@@ -240,25 +240,25 @@
       "result_type": "RuntimeHostHealth"
     },
     {
-      "description": "Create a durable approval request",
+      "description": "Create an approval audit record; persistence depends on the host store",
       "name": "approval/request",
       "params_type": "ApprovalRequestParams",
       "result_type": "ApprovalRecord"
     },
     {
-      "description": "List durable approval requests",
+      "description": "List approval audit records",
       "name": "approval/list",
       "params_type": "ApprovalListParams",
       "result_type": "ApprovalListResult"
     },
     {
-      "description": "Get one durable approval request",
+      "description": "Get one approval audit record",
       "name": "approval/get",
       "params_type": "ApprovalGetParams",
       "result_type": "ApprovalRecord"
     },
     {
-      "description": "Record a durable approval decision",
+      "description": "Record an approval audit decision",
       "name": "approval/decide",
       "params_type": "ApprovalDecideParams",
       "result_type": "ApprovalRecord"
@@ -275,19 +275,19 @@
       "result_type": "WireAuthProfilesList"
     },
     {
-      "description": "Get one auth profile by id",
+      "description": "Resolve one binding's auth profile with an optional profile override",
       "name": "auth/profile/get",
       "params_type": "BindingIdParams",
       "result_type": "WireAuthProfileDetail"
     },
     {
-      "description": "Create an auth profile",
+      "description": "Store direct credentials for a configured auth binding",
       "name": "auth/profile/create",
       "params_type": "CreateProfileParams",
       "result_type": "WireAuthProfileCreated"
     },
     {
-      "description": "Delete an auth profile",
+      "description": "Clear credentials for a configured auth binding",
       "name": "auth/profile/delete",
       "params_type": "BindingIdParams",
       "result_type": "WireAuthProfileCleared"
@@ -323,7 +323,7 @@
       "result_type": "WireProvisionApiKeyResult"
     },
     {
-      "description": "Get auth status for a profile",
+      "description": "Get binding-resolved auth status with an optional profile override",
       "name": "auth/status/get",
       "params_type": "BindingIdParams",
       "result_type": "WireAuthStatusDetail"

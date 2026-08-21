@@ -1,10 +1,10 @@
 ---
 title: "JSON-RPC stdio server"
-description: "Stateful JSON-RPC 2.0 interface for stdio, TCP, and optional live-channel WebSocket hosting."
+description: "Stateful JSON-RPC 2.0 interface for stdio, TCP, and optional WebSocket or WebRTC live channels."
 icon: "terminal"
 ---
 
-Meerkat exposes a JSON-RPC 2.0 surface for IDE integration, desktop apps, and automation tools. Stdio is the default, and the binary also supports TCP plus an optional live-channel WebSocket listener (`--live-ws`). Unlike REST and MCP, the RPC server keeps agents alive between turns for fast multi-turn conversations.
+Meerkat exposes a JSON-RPC 2.0 surface for IDE integration, desktop apps, and automation tools. Stdio is the default, and the binary also supports TCP plus optional WebSocket and feature-gated WebRTC live transports. Like the REST and MCP servers, RPC composes the shared runtime-backed service so agents can stay alive between turns. RPC adds a broad typed method and notification surface suited to interactive clients.
 
 The RPC surface is fully runtime-backed:
 
@@ -27,6 +27,7 @@ The RPC surface is fully runtime-backed:
     ```bash
     rkat-rpc --tcp 127.0.0.1:9001
     rkat-rpc --tcp 127.0.0.1:9001 --live-ws 127.0.0.1:9002
+    rkat-rpc --live-webrtc # requires the live-webrtc build feature
     ```
 
     TCP and live WebSocket listeners are local-only by default. Binding
@@ -54,7 +55,9 @@ The RPC surface is fully runtime-backed:
 </Steps>
 
 <Note>
-`rkat-rpc` defaults to a new isolated realm each time. Use `--realm <id>` to share config/sessions with other surfaces or processes.
+`rkat-rpc` defaults to a new isolated realm each time. To share sessions with
+another process, use the same `--realm <id>` and physical `--state-root`, or a
+matching `--context-root` that resolves the same project-local root.
 </Note>
 
 ## Runtime scope
@@ -68,6 +71,17 @@ rkat-rpc [--realm <id>] [--isolated] [--instance <id>] [--realm-backend <sqlite|
 - `--realm`: explicit sharing/isolation key
 - `--instance`: optional instance metadata
 - `--realm-backend`: creation hint only; actual backend is pinned per realm manifest
+
+Transport and live-channel flags are:
+
+```bash
+rkat-rpc [--tcp <ADDR>] [--allow-remote] [--live-ws <ADDR>] \
+  [--live-webrtc] [--live-tool-timeout-ms <MS>] [--live-ws-scheme <ws|wss>]
+```
+
+`--live-webrtc` is present only in builds with the `live-webrtc` feature.
+`--live-ws-scheme wss` changes the advertised bootstrap URL for a
+TLS-terminating proxy; the listener itself still accepts plain WebSocket bytes.
 
 ## Method overview
 
@@ -105,7 +119,7 @@ subset.
 | `session/list` | Session | `ListSessionsParams` | `ListSessionsResult` | List active sessions |
 | `session/read` | Session | `ReadSessionParams` | `WireSessionInfo` | Get session state |
 | `session/history` | Session | `ReadSessionHistoryParams` | `WireSessionHistory` | Get committed session transcript messages |
-| `session/export_atif` | Session | `ExportAtifParams` | `Value` | Export the complete durable session event log as an ATIF trajectory |
+| `session/export_atif` | Session | `ExportAtifParams` | `Value` | Export currently projected session replay evidence as an ATIF trajectory |
 | `session/update_system_prompt` | Session | `UpdateSystemPromptParams` | `SystemPromptUpdateResult` | Explicitly replace one durable versioned system-prompt key |
 | `session/rewrite_transcript` | Session | `RewriteSessionTranscriptParams` | `SessionTranscriptRewriteResult` | Commit a same-session transcript rewrite |
 | `session/transcript_revision` | Session | `ReadSessionTranscriptRevisionParams` | `WireSessionTranscriptRevision` | Read a transcript revision by id |
@@ -117,10 +131,10 @@ subset.
 | `artifact/list` | Artifact | `ArtifactListParams` | `ArtifactListResult` | List stable artifact records |
 | `artifact/get` | Artifact | `ArtifactIdParams` | `ArtifactRecord` | Get one stable artifact record |
 | `artifact/download` | Artifact | `ArtifactDownloadParams` | `ArtifactDownloadResult` | Download blob-backed artifact payload bytes |
-| `approval/request` | Approval | `ApprovalRequestParams` | `ApprovalRecord` | Create a durable approval request |
-| `approval/list` | Approval | `ApprovalListParams` | `ApprovalListResult` | List approval records |
-| `approval/get` | Approval | `ApprovalGetParams` | `ApprovalRecord` | Get one approval record |
-| `approval/decide` | Approval | `ApprovalDecideParams` | `ApprovalRecord` | Record an approval decision |
+| `approval/request` | Approval | `ApprovalRequestParams` | `ApprovalRecord` | Create an approval audit record; persistence depends on the host store |
+| `approval/list` | Approval | `ApprovalListParams` | `ApprovalListResult` | List approval audit records |
+| `approval/get` | Approval | `ApprovalGetParams` | `ApprovalRecord` | Get one approval audit record |
+| `approval/decide` | Approval | `ApprovalDecideParams` | `ApprovalRecord` | Record an approval audit decision |
 | `events/latest_cursor` | Events | `EventsLatestCursorParams` | `EventsLatestCursorResult` | Read the latest replay cursor for a typed event scope |
 | `events/list_since` | Events | `EventsListSinceParams` | `EventsListSinceResult` | List replayable events after a typed cursor |
 | `events/snapshot` | Events | `EventsSnapshotParams` | `EventsSnapshotResult` | Read a point-in-time snapshot with its replay cursor |
@@ -230,15 +244,15 @@ subset.
 | `config/set` | Config | `ConfigSetParams` | `ConfigWriteResult` | Replace config |
 | `config/patch` | Config | `ConfigPatchParams` | `ConfigWriteResult` | Merge-patch config (RFC 7396) |
 | `auth/profile/list` | Auth | `RealmIdParams` | `WireAuthProfilesList` | List auth profiles in a realm |
-| `auth/profile/get` | Auth | `BindingIdParams` | `WireAuthProfileDetail` | Get one auth profile |
-| `auth/profile/create` | Auth | `CreateProfileParams` | `WireAuthProfileCreated` | Create an auth profile (CLI-driven for now) |
-| `auth/profile/delete` | Auth | `BindingIdParams` | `WireAuthProfileCleared` | Delete an auth profile (CLI-driven for now) |
+| `auth/profile/get` | Auth | `BindingIdParams` | `WireAuthProfileDetail` | Resolve one binding's auth profile with an optional profile override |
+| `auth/profile/create` | Auth | `CreateProfileParams` | `WireAuthProfileCreated` | Store direct credentials for a configured auth binding |
+| `auth/profile/delete` | Auth | `BindingIdParams` | `WireAuthProfileCleared` | Clear credentials for a configured auth binding |
 | `auth/login/start` | Auth | `LoginStartParams` | `WireLoginStart` | Begin interactive authorization-code OAuth (returns authorize_url + pkce_verifier) |
 | `auth/login/complete` | Auth | `LoginCompleteParams` | `WireLoginReady` | Exchange authorization code for tokens; persists to TokenStore |
 | `auth/login/device_start` | Auth | `DeviceStartParams` | `WireDeviceStart` | Begin device-code OAuth; returns user_code + verification URL |
 | `auth/login/device_complete` | Auth | `DeviceCompleteParams` | `WireDeviceCompleteResult` | Single-poll completion for a device-code OAuth login |
 | `auth/login/provision_api_key` | Auth | `ProvisionApiKeyParams` | `WireProvisionApiKeyResult` | Console-OAuth → API key provisioning (Anthropic oauth_to_api_key) |
-| `auth/status/get` | Auth | `BindingIdParams` | `WireAuthStatusDetail` | Get auth status for a profile |
+| `auth/status/get` | Auth | `BindingIdParams` | `WireAuthStatusDetail` | Get binding-resolved auth status with an optional profile override |
 | `auth/logout` | Auth | `BindingIdParams` | `WireAuthProfileCleared` | Revoke + remove persisted credentials |
 | `realm/list` | Realm | — | `WireRealmList` | List realm summaries |
 | `realm/get` | Realm | `RealmIdParams` | `WireRealmConnectionSet` | Get full realm connection set |
@@ -287,6 +301,35 @@ through the `workgraph_*` tools. Authority-bearing attention reassignment and
 policy escalation are runtime-injected WorkGraph tool operations, not public
 JSON-RPC methods.
 </Note>
+
+## Runtime host projections and health
+
+`runtime/host_info` is a read-only projection of process identity, host ID
+scope, realm and endpoint metadata, feature flags, and health. It does not
+enroll a member host or grant mob placement authority.
+
+`runtime/capabilities` returns a contract version plus boolean
+`RuntimeHostFeatureFlags`: `runtime_backed_sessions`, `mobs`, `mcp_live`,
+`comms`, `blobs`, `session_events`, `session_streams`, `schedules`, `skills`,
+`event_replay`, `artifacts`, `approvals`, `external_members`,
+`secure_remote_rpc`, `multi_host_mobs`, and `durable_jobs`. These host facts are
+distinct from the generic status-bearing `CapabilityId` entries returned by
+`capabilities/get`. Older payloads that omit `multi_host_mobs` or
+`durable_jobs` decode those fields as `false`; clients should use the flag and
+not infer multi-host support from a version number.
+
+`runtime/health` returns the worse-wins rollup across five declared dimensions:
+`jobs`, `session_liveness`, `session_durability`, `session_runtime_loop`, and
+`session_run_start`. This RPC host probes all five. A plain check key is a
+measured result. `unreadable:<dimension>` means a probe ran but could not
+obtain a reading and rolls the overall status to at least `degraded`.
+`unmeasured:<dimension>` is a coverage marker for a surface with no probe and
+does not enter the rollup.
+
+The session liveness check covers queued work parked on an active executor with
+no run in flight, including repeated staging churn. `session_run_start` covers
+a current staged run that is overdue to begin. Neither claims to measure a run
+that began and then stopped producing progress.
 
 ## Protocol
 
@@ -587,8 +630,8 @@ fail with `INVALID_PARAMS` before the session store is queried.
 
 ### session/export_atif
 
-Export the complete durable session event log as an ATIF (Agent Trajectory
-Interchange Format) v1.7 trajectory document.
+Export the currently available event audit/replay projection as an ATIF (Agent
+Trajectory Interchange Format) v1.7 trajectory document.
 
 ```json
 {
@@ -598,7 +641,7 @@ Interchange Format) v1.7 trajectory document.
   "params": {
     "session_id": "01936f8a-7b2c-7000-8000-000000000001",
     "agent_name": "meerkat",
-    "agent_version": "0.8.22",
+    "agent_version": "0.8.25",
     "model_name": "claude-opus-5"
   }
 }
@@ -608,8 +651,10 @@ Interchange Format) v1.7 trajectory document.
 trajectory's `agent` block; when `model_name` is omitted the session's model is
 used.
 
-The export replays the durable event log page by page, so it requires a host
-with the durable event projection installed. Outcomes:
+The export replays the currently projected event log page by page, so it
+requires a host with event projection installed. Projection is asynchronous
+best-effort derived state and the handler does not drain it first; an export can
+therefore lag the latest committed session state. Outcomes:
 
 - A host without durable event replay fails with `INVALID_REQUEST` and
   `event replay is not enabled for this runtime host`.
@@ -1240,9 +1285,194 @@ Returns error `-32603` if skills are not enabled.
 
 `skills/inspect` is not part of the advertised RPC catalog. Use `skills/list` for provenance, or the CLI/MCP skill inspection surfaces when full skill bodies are needed.
 
+## Event replay and durable projection
+
+The `events/*` family is the complete cursor-based replay surface for hosts that
+report `runtime/capabilities.features.event_replay = true`:
+
+- `events/latest_cursor` returns the latest cursor for a typed scope
+- `events/list_since` pages envelopes after an optional cursor and reports
+  `latest_cursor` plus `has_more`
+- `events/snapshot` returns a point-in-time session snapshot paired with its
+  cursor
+
+The current public `EventReplayScope` is
+`{"type":"session","session_id":"..."}`. A cursor is scope-bound and
+monotonic; scope mismatch and a cursor ahead of the latest sequence fail typed
+rather than being silently clamped.
+
+Live session subscribers use a bounded 256-entry broadcast. If a consumer
+falls behind, it receives `AgentEvent::StreamTruncated` with
+`StreamLagged { dropped }`, then retained events. Persistent hosts can install
+one internal audit projector through a separate unbounded queue and warn when
+the queue reaches 1,024 pending events. UI lag cannot drop projector input.
+EventStore append remains asynchronous best-effort derived state: an append
+fault latches projection halt and replay fails closed, but does not undo the
+committed turn. The `RuntimeStore`/backend carrier remains session authority;
+`SessionStore` rows and EventStore are component/content and projection seams.
+
+## Durable jobs and monitors
+
+The app-facing `jobs/*` methods expose realm-scoped job projections without
+worker attempt IDs or fence tokens. Read methods cover summaries, progress,
+terminal results, artifact references, and health. `jobs/cancel` commits a
+cancellation request, `jobs/retry` asks the generated job machine to schedule a
+retry at `retry_due_at_ms`, and subscribe/unsubscribe manage durable
+record/notification/event delivery.
+
+`monitors/start` is the explicit high-trust script-monitor entry point. It
+requires `session_id`, a caller-stable `submission_key`, `command`, positive
+`timeout_secs`, `restart_class`, and `delivery`. The default output protocol is
+`framed_jsonl`; `lines` is also supported. Agent-authored monitors cannot claim
+the `adoptable` restart class. Detached shell execution fails closed unless the
+realm supplies persistent job and blob stores plus its runtime delivery
+projector; there is no volatile fallback.
+
+The `mobkit/jobs/*` methods are host-worker mutation methods. Every heartbeat,
+progress, checkpoint, completion, failure, or cancellation acknowledgement is
+admitted under the exact attempt and fence authority carried by its typed
+params. Application clients should not synthesize worker mutations from the
+safe `JobSummary` projection.
+
+### jobs/health
+
+`jobs/health` returns `{ "detached_jobs": JobHealthSummary }`. The summary
+separates three states:
+
+- `ok`: the complete census observed no unhealthy job fact
+- `degraded`: the census observed a stale lease, attention state, or backlog
+- `unreadable`: a read failed or the bounded census was truncated, so it did
+  not establish health
+
+`coverage` is either `{"kind":"complete"}` or
+`{"kind":"truncated","scanned":N,"limit":N}`. A truncated census always
+has `status: "unreadable"`; its counts are lower bounds. Keep
+`pending_outbox_jobs` separate from `runtime_inbox_backlog`: the former counts
+realm jobs whose delivery was never handed to a runtime, while the latter is a
+host-store-scoped count of committed runtime deliveries that were accepted but
+not drained. It can therefore include sessions from other logical realm IDs on
+the same host.
+
+## Blobs and artifacts
+
+`blob/get` accepts a realm-local blob ID and returns `BlobPayload` with
+`blob_id`, `media_type`, and base64 `data`. Assistant image blocks and job
+results can carry blob references instead of inline bytes.
+
+Artifacts are stable metadata records over generated output. `artifact/list`
+filters by optional `session_id` and exact labels, `artifact/get` reads one
+record, and `artifact/download` resolves a blob-backed payload with an optional
+`expected_media_type` integrity check. Artifact IDs are opaque realm-local
+identities, not filesystem paths.
+
+## Approvals
+
+The approval family consists of `approval/request`, `approval/list`,
+`approval/get`, and `approval/decide`. Requests carry a typed owner, resource,
+proposed action, risk, non-empty `allowed_decisions`, optional expiry,
+metadata, and provenance.
+
+```json Request
+{
+  "jsonrpc": "2.0",
+  "id": 30,
+  "method": "approval/request",
+  "params": {
+    "requester": "human:alice",
+    "owner": {"owner_type": "session", "session_id": "01936f8a-7b2c-7000-8000-000000000001"},
+    "resource": {"kind": "shell_command", "id": "shell:deploy"},
+    "proposed_action": {
+      "kind": "shell_command",
+      "summary": "deploy the current release",
+      "body": {"command": "./deploy.sh"}
+    },
+    "risk": "high",
+    "allowed_decisions": ["approve", "deny"]
+  }
+}
+```
+
+Owners are `runtime`, `session`, `mob`, `run`, `tool_call`, or
+`external_member`. Resource kinds are `file`, `shell_command`, `tool_call`,
+`device`, `runtime`, `network`, or `other`; risk is `low`, `medium`, `high`, or
+`critical`. Proposed action kinds are `shell_command`, `file_write`,
+`file_delete`, `network_call`, `device_control`, `tool_call`, or `other`.
+Decisions are `approve` or `deny`, and record status is `pending`,
+`approved`, `denied`, `expired`, or `cancelled`. The service rejects an empty
+decision set, an unsupported decision, or a second terminal decision. Expiry
+is evaluated lazily on `approval/get`, `approval/list`, or `approval/decide`:
+a past-due request may first be stored as pending, but its next observation
+persists `expired` and it can no longer be decided. `cancelled` is a durable
+status that can be restored, but the current public RPC service has no
+`approval/cancel` transition.
+
+`external_member` is an audit owner shape, not a cross-host forwarding
+contract. Multi-host v1 keeps approval records and decisions host-local.
+
+RPC opens `<store_path>/approvals.json` whenever its `PersistenceBundle`
+exposes a store path, including a named built-in memory realm. Only an ad hoc
+bundle with no store path falls back to process-local approval records. The
+`approvals` runtime host feature is true only when this approval service is
+persistent.
+
+The file store is a one-host sidecar. It serializes updates with a
+process-local mutex and atomic temp-file rename, but has no cross-process lock,
+revision, or CAS. Run only one approval-owning RPC host against a given
+`approvals.json`; shared-state multi-host approval writing is not supported.
+
+<Warning>
+Approval records are audit data, not a secret store. The proposed action body,
+request body, metadata, and provenance are persisted as supplied. Do not put
+credentials or tokens in those fields, and protect the resolved realm store
+directory with host filesystem permissions. `FileApprovalStore` does not
+currently force a private file mode independently of the process umask.
+</Warning>
+
+These methods maintain approval audit lifecycle records only. Creating or
+deciding a record does not automatically gate, authorize, or execute a shell
+command, tool call, device action, or any other side effect.
+
+<Warning>
+`requester` and the `actor` supplied to `approval/decide` are audit identities,
+not transport authentication proofs. `rkat-rpc` does not authenticate them.
+Authorize approval decisions in the trusted host or authenticated proxy before
+forwarding the RPC call. REST, MCP, and CLI do not expose approval methods.
+</Warning>
+
+## Schedules, WorkGraph, and multi-host mobs
+
+The schedule family provides CRUD, pause/resume, occurrence listing, tool
+schema discovery, and direct typed tool calls. Schedule and WorkGraph state are
+realm-scoped durable domains when the owning feature and store are available.
+
+Public WorkGraph RPC is intentionally observational: item get/list, ready work,
+snapshot, event history, goal status, and attention-list reads. Agents mutate
+WorkGraph through the `workgraph_*` tool family; trusted in-process hosts own
+goal and attention mutation authority.
+
+Multi-host mob RPC includes host bind/revoke, host and route observation,
+scope grants, hard cancel, placed member history, and member live-channel
+control. Check `runtime/capabilities.features.multi_host_mobs` rather than
+inferring support from generic `mobs` or the server version.
+
+`mob/member_live_open` supports WebSocket transport only for both local and
+placed members. A request for `transport: "webrtc"` is rejected; WebRTC uses
+the session-scoped `live/open` and `live/webrtc/answer` flow below only when
+the caller can address the owning session directly. In multi-host v1,
+controller `session/*` methods do not proxy a placed member's host-local
+session, so there is no controller-side WebRTC path to a placed member.
+
+Durable member role migration is not part of `mob/spawn`, profiles, or any
+public JSON-RPC/SDK params. The one-shot `resume_from_role` declaration exists
+only on trusted in-process `SpawnMemberSpec` and the private remote-host
+`MaterializeLaunchMode::Resume` wire. It authorizes one exact cold migration
+from the stored predecessor role while keeping mob ID, member identity,
+session, and transcript fixed; live sessions and mismatched declarations fail
+closed.
+
 ## Live channel methods
 
-Live channels provide low-latency audio and text streaming plus model-gated still-image input on sessions that use a realtime-capable model. Create a session with a model like `gpt-realtime-2`, then call `live/open` to start the channel explicitly. The `--live-ws <addr>` flag on `rkat-rpc` enables the WebSocket listener required for audio transport. See the [Live Channels guide](/guides/realtime) for the full flow.
+Live channels provide low-latency audio and text streaming plus model-gated still-image input on sessions that use a realtime-capable model. Create a session with a model like `gpt-realtime-2`, then call `live/open` to start the channel explicitly. Start `rkat-rpc` with `--live-ws <addr>` for WebSocket transport, or with the feature-gated `--live-webrtc` flag for WebRTC signaling. At least one live transport must be enabled for the `live/*` family to be advertised. See the [Live Channels guide](/guides/realtime) for the full flow.
 
 ### Opening a live channel
 
@@ -1299,6 +1529,29 @@ System messages are ordinary ordered transcript data and are retained by the
 message window rules above. Canonical multimodal sidecars remain outside the
 message window. Image identity, tombstones, and aggregate accounting stay
 complete even when older seed messages are omitted.
+
+### live/webrtc/answer
+
+For WebRTC, request `"transport": "webrtc"` on `live/open`. The returned
+transport bootstrap contains a single-use `token` and names
+`live/webrtc/answer` as the canonical signaling method. Send the browser offer
+SDP with that token:
+
+```json Request
+{
+  "jsonrpc": "2.0",
+  "id": 21,
+  "method": "live/webrtc/answer",
+  "params": {
+    "channel_id": "ch_01936f8a-...",
+    "token": "single-use-bootstrap-token",
+    "offer_sdp": "v=0..."
+  }
+}
+```
+
+The result is `{ "answer_sdp": "v=0..." }`. Tokens are channel-bound,
+short-lived, and single-use; replay, expiry, or a channel mismatch fails typed.
 
 ### live/status
 
@@ -1397,7 +1650,9 @@ transport details.
 | `live/truncate` | Truncate assistant output at a client-tracked playback cursor |
 | `live/refresh` | Apply mutable session config (instructions/tools/audio) to an open channel; config-only, does not replay history; identity swaps and canonical transcript/user-content rewrites return typed reopen-required errors |
 
-These require `rkat-rpc` to be started with `--live-ws <addr>` for WebSocket transport.
+WebSocket calls require `--live-ws <addr>`. WebRTC open/answer requires a build
+with the `live-webrtc` feature and startup with `--live-webrtc`. If both are
+enabled, select the transport explicitly or accept the server default.
 
 ## MCP methods
 
@@ -1836,7 +2091,12 @@ and this table.
 | `interaction_complete` | Interaction-scoped stream completed |
 | `interaction_callback_pending` | Interaction reached a callback boundary and is waiting for tool results |
 | `interaction_failed` | Interaction-scoped stream failed |
-| `stream_truncated` | Backpressure dropped intermediate events |
+| `stream_truncated` | This bounded live subscriber lagged; `reason.kind` is `stream_lagged` and `reason.dropped` reports the dropped count |
+
+`stream_truncated` is subscriber-local. It reports UI-ring lag, not an
+EventStore projection result. Use `events/list_since` or `events/snapshot`
+when that optional replay surface is healthy, and reconcile against current
+session state after receiving it.
 
 ### session/stream_event notifications
 
@@ -1897,7 +2157,7 @@ Standard JSON-RPC codes plus Meerkat-specific application codes:
 
 ## Architecture
 
-The RPC server is **stateful**: agents stay alive between turns. This is the key difference from REST (stateless per-request) and MCP (callback pattern).
+The RPC server is **stateful**: agents stay alive between turns through the shared runtime-backed service also used by REST and MCP. RPC's distinguishing surface is its broad JSON-RPC method catalog, scoped subscriptions, and server notifications.
 
 ```text
 Client (IDE, app) <--stdio JSONL--> RpcServer
@@ -1916,18 +2176,24 @@ Client (IDE, app) <--stdio JSONL--> RpcServer
 Each session gets a dedicated tokio task that exclusively owns the `Agent`. This solves the `cancel(&mut self)` requirement without mutex. Commands (`StartTurn`, `Interrupt`, `Shutdown`) are sent via channels.
 
 <Note>
-**Backpressure:** The notification channel is bounded. When the client reads slowly, the agent naturally slows down.
+The JSONL writer and notification queues are bounded, and ordinary session
+subscriptions are best-effort. A slow client can therefore receive a typed
+`stream_truncated` marker instead of every live event. Persistent event audit
+projection can use a separate unbounded internal queue, so UI lag does not drop
+projector input. The EventStore remains asynchronous derived state rather than
+session completeness authority.
 </Note>
 
 ## Comparison with other surfaces
 
 | | CLI | REST | MCP | RPC |
 |---|---|---|---|---|
-| Stateful | No | No | No | **Yes** |
-| Streaming | stderr | SSE | Optional | JSONL notifications |
-| Multi-session | No | No | No | **Yes** |
-| Cancellation | Ctrl+C | N/A | N/A | `turn/interrupt` |
-| Bidirectional | No | No (SSE one-way) | Partial | **Yes** |
+| Host lifecycle | One command | Long-lived | Long-lived | Long-lived |
+| Realm-backed sessions | Yes | Yes | Yes | Yes |
+| Multiple session IDs | Sequential commands | Yes | Yes | Yes |
+| Streaming | Terminal rendering | SSE | Optional protocol notifications | JSONL notifications |
+| Cancellation | Ctrl+C or `session interrupt` | `POST /sessions/{id}/interrupt` | `meerkat_interrupt` | `turn/interrupt` |
+| Bidirectional host channel | No | HTTP plus one-way SSE | Tool request/response | Yes |
 
 ## See also
 

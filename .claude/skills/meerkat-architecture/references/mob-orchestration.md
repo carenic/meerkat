@@ -24,8 +24,12 @@ MobBuilder::new(definition, storage)
 `MemberLaunchMode` (in `meerkat-mob/src/launch.rs`):
 
 - `Fresh` — new session (default)
-- `Resume { session_id }` — resume existing session
-- `Fork { source_member_id, fork_context }` — fork from another member's history
+- `Resume { bridge_session_id, resume_from_role }` - resume the exact bridge
+  session. `resume_from_role` is an optional one-request predecessor-role
+  declaration for a cold durable role migration; omission keeps strict
+  same-role resume.
+- `Fork { source_member_id, fork_context }` - start a fresh child session from
+  another member's rendered history
 
 Resume resolves through the REQUIRED (defaultless)
 `MobSessionService::load_session_for_resume`, returning the typed
@@ -39,12 +43,18 @@ directly — a composition over the legacy optional reads can never produce
 
 `ForkContext`:
 
-- `FullHistory` — `Session::fork()` (O(1) CoW)
-- `LastMessages { count }` — `source.last_n(n).to_vec()` (shallow copy)
+- `FullHistory` - render the full source conversation into a text context block
+  prepended to the fresh child's opening input
+- `LastMessages { count }` - render the last `count` source messages into that
+  context block
 
 ## Spawn Policies
 
-`SpawnMemberSpec` carries: `launch_mode`, `tool_access_policy` (inherit/allow-list/deny-list), `auto_wire_parent` (bool), `budget_limits` (hard per-member caps).
+`SpawnMemberSpec` carries the stable identity and role plus launch mode,
+tool-access policy, auto-wiring, budget, auth, prompt/tooling overrides,
+continuity intent, and optional multi-host placement. In-process executable
+overrides such as external tools and a compaction curator are rejected for
+remote placement because they have no portable wire representation.
 
 ## Helper Convenience
 
@@ -55,7 +65,13 @@ Profile source rule: agent-internal surfaces inherit from caller config. Non-age
 
 ## Agent-Facing Delegation Tools
 
-`AgentMobToolSurface` (`meerkat-mob-mcp/src/agent_tools.rs`) provides `delegate`, `mob_create`, `mob_destroy`, `mob_spawn_member`, `mob_retire_member`, `mob_check_member`, `mob_list_members`, `mob_list`, `mob_wire`, `mob_unwire`. When a realm profile store is present it also exposes `mob_profile_create`, `mob_profile_get`, `mob_profile_list`, `mob_profile_update`, `mob_profile_delete`, and `mob_profile_list_sources`.
+`AgentMobToolSurface` (`meerkat-mob-mcp/src/agent_tools.rs`) provides
+`delegate`, `conclude_objective`, `mob_create`, `mob_destroy`,
+`mob_spawn_member`, `mob_retire_member`, `mob_check_member`,
+`mob_list_members`, `mob_list`, `mob_wire`, and `mob_unwire`. When a realm
+profile store is present it also exposes `mob_profile_create`,
+`mob_profile_get`, `mob_profile_list`, `mob_profile_update`,
+`mob_profile_delete`, and `mob_profile_list_sources`.
 
 `mob_wire` / `mob_unwire` create and remove comms trust relationships between mob members (local or external peers). Reuses `MobMcpState::mob_wire()` / `mob_unwire()` state API.
 
@@ -70,7 +86,15 @@ Operator capabilities are runtime-injected through `MobToolAuthorityContext`. `c
 - `retire_member(id)` — archive session, remove from roster
 - `force_cancel_member(id)` — cancel in-flight turn (distinct from retire)
 - `respawn(id, initial_message)` — retire old bridge/runtime binding → enqueue spawn with same identity/profile/wiring/labels → new runtime incarnation/fence. Restore/respawn failure classification fans out over MobMachine-owned restore edges (`member_restore_failures: Map<AgentIdentity, String>` in the DSL); the orchestration sequencing is shell convenience, the lifecycle facts are machine-owned.
-- `member_status(id)` → `MobMemberSnapshot`. Public fields: status, output_preview, error, tokens_used, is_final, current_session_id, peer_connectivity, kickoff, external_member, resolved_capabilities. Binding atoms (agent_identity, agent_runtime_id, fence_token, current_bridge_session_id) are `pub(crate)` + `#[serde(skip)]` — bridge-internal, not app-facing.
+- `member_status(id)` returns `MobMemberSnapshot`. Its current public fields
+  are `status`, `output_preview`, `error`, `tokens_used`, `is_final`,
+  `current_session_id`, `peer_connectivity`, `kickoff`, `external_member`,
+  `resolved_capabilities`, `progress`, `placement`, `control_reachability`,
+  `comms_reachability`, `last_seen_ms`, `freshness_reason`,
+  `lifecycle_capabilities`, and `non_portable_disabled`. Binding atoms
+  (`agent_identity`, `agent_runtime_id`, `fence_token`, and
+  `current_bridge_session_id`) are `pub(crate)` plus `#[serde(skip)]` -
+  bridge-internal, not app-facing.
 - `wait_one(id)`, `wait_all(ids)`, `collect_completed()`
 - `MobHandle::member(identity)` → `MemberHandle` — per-member handle. `MemberHandle::internal_turn(content)` is the in-process direct turn write (no peer comms, no handling-mode selection); it is distinct from `mob/turn_start` (RPC turn with overrides via the bridge session) and `mob/member_send` (peer delivery over comms into the member's inbox). Keep the three delivery paths separate.
 
@@ -82,9 +106,25 @@ Operator capabilities are runtime-injected through `MobToolAuthorityContext`. `c
 
 `SessionBackend::runtime_session_state()` is the canonical owner of session registration + runtime-loop attachment for mob members. Autonomous readiness helpers should only do autonomous-specific work (drain startup, capability checks), not duplicate registration.
 
-**RuntimeBinding**: `SpawnMemberSpec.binding: Option<RuntimeBinding>` separates backend kind (definition level) from concrete runtime binding (spawn level). `RuntimeBinding::External` carries the real external process address, Ed25519 public identity, and typed supervisor `bootstrap_token`; the real peer id is derived from the public key. The provisioner dispatches on `ProvisionMemberRequest.binding` (required `RuntimeBinding`, not optional). `resolve_binding()` in the actor translates `SpawnMemberSpec.binding` / legacy `backend` into `RuntimeBinding`, rejecting bare `External` without explicit binding.
+**RuntimeBinding**: `SpawnMemberSpec.binding: Option<RuntimeBinding>` separates
+backend kind (definition level) from concrete runtime binding (spawn level).
+`Session` is a controlling-host session. `HostMaterialized { host }` is still a
+managed Meerkat session, but MobMachine placement sends materialization to a
+bound member host. `External` is only for an unmanaged or preconstructed
+external process and carries its address, Ed25519 public identity, and typed
+supervisor `bootstrap_token`; the real peer id is derived from the public key.
+The provisioner dispatches on required `ProvisionMemberRequest.binding`.
+`resolve_binding()` translates `SpawnMemberSpec.binding` or legacy `backend`
+into that concrete binding and rejects bare `External` without details.
 
 **External member identity**: `BackendPeer.peer_id` is the real external process comms key, not the placeholder session's key. The bridge session still exists for lifecycle transport. `trusted_peer_spec()` uses the bridge key (from `comms.public_key()`, passed as `fallback_peer_id`) for transport trust, keeping identity and transport separate.
+
+Managed placement must not be described as External binding. The controlling
+host retains roster, placement, grant, and teardown authority while the bound
+member host owns the placed session's runtime. Member-live control is
+WebSocket-only for both local and placed members; controller-level `session/*`
+live methods do not proxy a placed member, and the placed-member surface does
+not currently offer WebRTC.
 
 **Member kickoff state** lives in MobMachine DSL as a multi-field decomposition keyed on `AgentIdentity`: `member_kickoff_pending` / `member_kickoff_starting` / `member_kickoff_callback_pending` / `member_kickoff_started` / `member_kickoff_failed` / `member_kickoff_cancelled` (Sets) plus `member_kickoff_error: Map<AgentIdentity, String>`. `MobActor` drives `KickoffMarkPending`/`KickoffMarkStarting`/`KickoffResolveStarted`/`KickoffCancelRequested` transitions directly via `self.dsl_authority.apply(mob_dsl::MobMachineInput::…)` (in-crate access; no cross-crate handle needed). Persistence flows through `MobEventKind::MemberKickoffUpdated` emitted from the DSL effect handler.
 
@@ -109,20 +149,30 @@ Recipient-side trust is a machine-owned obligation, not fire-and-forget: MobMach
 
 ## Actor Decomposition
 
-`MobActor` is composed of narrowly-scoped service objects:
+`MobActor` is the serialized shell around one generated
+`MobMachineAuthority`. Current supporting components have narrower mechanical
+roles:
 
-- `MobLifecycleOwner` — state transitions (lock-free AtomicU8)
-- `MobOrchestratorKernel` — coordinator binding, spawn/flow tracking
-- `FlowRunKernel` — flow run creation, scheduler state, frame-step projection, terminalization
-- `FlowFrameEngine` — scheduler-backed frame execution and revisit/healing
-- `SpawnPolicyService` — runtime policy swap (RwLock)
-- `MobOpsAdapter` — bridges to `OpsLifecycleRegistry`
+- `RosterAuthority` - actor-owned event-backed roster projection; membership
+  and lifecycle meaning stay in MobMachine
+- `FlowEngine` - thin flow execution shell over MobMachine-authorized run and
+  step transitions
+- `FlowFrameEngine` and `FlowFrameKernel` - scheduler-backed frame execution
+  plus an authority-validating store mutation adapter
+- `MobTopologyService` - pure evaluator for declarative topology rules; it
+  owns no runtime state
+- `SpawnPolicyService` - dynamic callback observation source whose resolution
+  is submitted back to MobMachine before auto-provisioning
+- `MobOpsAdapter` - runtime-adapter capability plumbing to
+  `OpsLifecycleRegistry`, not lifecycle authority
 
 Mob no longer owns a separate task-board service. Durable cross-agent
 commitments live in WorkGraph; mob-owned services stay focused on orchestration,
 member lifecycle, flow execution, wiring, and runtime bridges.
 
-Remaining `*_authority.rs` files under `meerkat-mob/src/runtime/` (roster, loop_iteration, member_lifecycle, wiring, runtime_bridge) are shell mechanics — data projections, pure planners, sealed mutators — not state machines. They never contain `fn apply(input) -> Result<Transition, Error>` match tables; that logic lives in MobMachine DSL.
+The `*_authority.rs` modules under `meerkat-mob/src/runtime/` are bounded
+shell helpers, projections, or sealed mutation adapters, not competing state
+machines. Canonical transition match tables live in MobMachine DSL.
 
 ## Key files
 

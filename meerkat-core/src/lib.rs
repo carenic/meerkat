@@ -1,7 +1,9 @@
-//! meerkat-core - Core agent logic for Meerkat (no I/O deps)
+//! meerkat-core - Foundational agent contracts and logic for Meerkat.
 //!
 //! This crate contains all the core types, traits, and logic for Meerkat agents.
-//! It is intentionally free of I/O dependencies to enable easy testing and embedding.
+//! Most runtime implementations live in satellite crates. Native builds also
+//! own the canonical config-store, config-runtime, path-layout, and maintenance
+//! fence primitives, so this crate is not a blanket no-I/O layer.
 
 // On wasm32, use tokio_with_wasm as a drop-in replacement for tokio.
 // All internal code uses `tokio::` paths — the alias makes them resolve

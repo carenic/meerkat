@@ -1112,7 +1112,7 @@ impl ProviderParamsCarrier {
     }
 }
 
-/// Error returned when [`merge_batch_turn_metadata`] sees two distinct scalar
+/// Error returned when [`RuntimeTurnMetadata::merge`] sees two distinct scalar
 /// overrides for the same field in a single batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnMetadataMergeConflict {

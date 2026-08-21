@@ -1,14 +1,16 @@
 # 015 — Session Persistence (Rust)
 
-Persist sessions to disk so agents survive restarts. Demonstrates file-based
-persistence with `JsonlStore`, compares the available storage backends, and
-walks the full session lifecycle.
+Write a session to an inspectable JSONL store and load it back by ID. The
+example uses a temporary directory and directly exercises the low-level store,
+so it demonstrates the persistence roundtrip rather than process recovery.
+Runtime-backed persistent realms use `RealmStorageProvider` and default to
+SQLite.
 
 ## Concepts
-- `JsonlStore` — file-based JSONL storage (simple, human-readable)
-- `MemoryStore` — in-memory (for tests and ephemeral use)
-- `SqliteSessionStore` — embedded SQLite database (production)
-- `SessionFilter` — query sessions by date, limit, offset
+- `JsonlStore` - file-based JSONL storage (simple, human-readable)
+- `MemoryStore` - in-memory session storage (tests and ephemeral use)
+- `SqliteSessionStore` - embedded SQLite database (production)
+- `SessionFilter` - query sessions by date, limit, offset
 - Session save/load roundtrip
 
 ## Storage Architecture

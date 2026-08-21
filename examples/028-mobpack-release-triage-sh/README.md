@@ -11,7 +11,7 @@ then deploys the exact signed artifact against a concrete production scenario.
 
 It demonstrates why mobpacks matter in real workflows:
 - you can hand off one signed artifact between teams and environments
-- the behavior is deterministic because deploy runs the exact packed contents
+- deploy uses the exact packaged definition, skills, and defaults
 - inspection and validation happen before the incident prompt hits the model
 - skill files, defaults, and runtime contract travel together
 
@@ -31,11 +31,11 @@ real release-triage coordination pattern.
 
 `examples.sh` generates a temporary mob source tree under `.work/release-triage/`
 with:
-- `manifest.toml` — artifact identity, runtime requirements, surface support
-- `definition.json` — a 4-role mob with orchestrator + specialists
-- `skills/*.md` — role playbooks packed into the artifact
-- `config/defaults.toml` — default agent/budget settings
-- `release.key` — demo signing key for local verification
+- `manifest.toml` - artifact identity, runtime requirements, and model aliases
+- `definition.json` - a 4-role mob with orchestrator and specialists
+- `skills/*.md` - role playbooks packed into the artifact
+- `config/defaults.toml` - typed deploy defaults for per-turn output, provider model, and total budget
+- `release.key` - demo signing key for local verification
 
 ## Concepts
 
@@ -45,6 +45,12 @@ with:
 - `rkat mob validate` to check the artifact contract before use
 - `rkat mob deploy` to run the same signed artifact with a real prompt
 - skill files referenced by `path` and inlined at pack time
+- fail-closed `MobpackDeployPolicy` parsing for `max_tokens`, `models`, and `budget`
+
+Unknown sections or fields in `config/defaults.toml` are rejected rather than
+merged into arbitrary runtime configuration. The typed policy also supports a
+`[compaction]` group, but this example omits it because CLI deploy cannot
+currently satisfy a mobpack-declared `session_compaction` capability.
 
 ## Prerequisites
 
@@ -59,7 +65,7 @@ export RKAT=/path/to/rkat
 ## Run
 
 ```bash
-./examples.sh
+./examples/028-mobpack-release-triage-sh/examples.sh
 ```
 
 ## What The Script Does

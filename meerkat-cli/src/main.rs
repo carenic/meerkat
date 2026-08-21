@@ -105,10 +105,10 @@ const EXIT_USAGE: u8 = 2;
 
 const CLI_ABOUT: &str = "Run agent tasks and manage local Meerkat surfaces from the terminal";
 
-const ROOT_AFTER_HELP: &str = "Command groups:\n  Runtime:      run, help\n  Realm config: init, config, realm\n  Utility:      session, blob, models, capabilities, doctor, storage\n\nAdditional commands appear when their supporting capabilities are compiled in.\n\nRealm defaults:\n  - context root: current directory, unless --context-root is supplied\n  - state root: <context-root>/.rkat/realms, unless --state-root is supplied\n  - realm id: workspace-derived ws-... unless --realm or --isolated is supplied\n\nExamples:\n  rkat \"summarize this repository\"\n  rkat help \"How do I add an mcp server?\"\n  cat story.txt | rkat \"summarize the story\"\n  git diff | rkat run \"review these changes\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nUse `<binary> <command> -h` for the basic view and `<binary> <command> --help` for all options.";
+const ROOT_AFTER_HELP: &str = "Command groups:\n  Runtime:      run, help\n  Realm config: init, config, realm\n  Utility:      session, blob, models, capabilities, doctor, storage\n\nAdditional commands appear when their supporting capabilities are compiled in.\n\nRealm defaults:\n  - context root: current directory, unless --context-root is supplied\n  - state root: <project-root>/.rkat/realms, where project root is the nearest ancestor containing .rkat (or the context root when none exists), unless --state-root is supplied\n  - realm id: workspace-derived ws-... unless --realm or --isolated is supplied\n\nExamples:\n  rkat \"summarize this repository\"\n  rkat help \"How do I add an mcp server?\"\n  cat story.txt | rkat \"summarize the story\"\n  git diff | rkat run \"review these changes\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nUse `<binary> <command> -h` for the basic view and `<binary> <command> --help` for all options.";
 const HELP_AFTER_HELP: &str = "Examples:\n  rkat help \"How do I add an mcp server and schedule to remove it in 30 minutes\"\n  rkat help \"Use gemini with my vertex auth, load ~/codex/skills\" --prompt \"Write a match-3 game in Erlang\"";
 
-const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --html \"make a visual explainer\"\n  rkat run --browser \"create an implementation plan\"\n  rkat run --resume \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - realm state under <context-root>/.rkat/realms; use --verbose to print the active realm root\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set";
+const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --html \"make a visual explainer\"\n  rkat run --browser \"create an implementation plan\"\n  rkat run --resume \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - realm state under <project-root>/.rkat/realms, using the nearest ancestor containing .rkat or the context root when none exists; use --verbose to print the active realm root\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set";
 
 const DEFAULT_TRACE_FILTER: &str = "off";
 const VERBOSE_TRACE_FILTER: &str = "info";
@@ -1302,7 +1302,8 @@ struct Cli {
         help_heading = "Realm options"
     )]
     realm_backend: Option<RealmBackendArg>,
-    /// Override realm state root. Defaults to <context-root>/.rkat/realms.
+    /// Override realm state root. By default, uses the nearest ancestor's
+    /// .rkat/realms directory, or <context-root>/.rkat/realms when none exists.
     #[arg(
         long,
         global = true,
@@ -2070,7 +2071,7 @@ enum Commands {
 
     #[cfg(feature = "mcp")]
     #[command(
-        after_help = "Examples:\n  rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .\n  rkat mcp add glean --url https://king-be.glean.com/mcp/default\n  rkat mcp add --transport http glean https://king-be.glean.com/mcp/default\n  rkat mcp login glean\n  rkat mcp list\n  rkat mcp get filesystem --scope project"
+        after_help = "Examples:\n  rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .\n  rkat mcp add api --url https://mcp.example.com/api\n  rkat mcp add --transport http remote https://mcp.example.com/api\n  rkat mcp login remote\n  rkat mcp list\n  rkat mcp get filesystem --scope project"
     )]
     /// MCP server management
     Mcp {
@@ -2116,7 +2117,9 @@ enum Commands {
 
     /// Storage diagnostics and offline maintenance
     ///
-    /// `storage doctor` never mutates anything. `storage migrate` is the
+    /// `storage doctor` never mutates logical database content or creates a
+    /// database/directory; SQLite may contact WAL/SHM sidecars while reading.
+    /// `storage migrate` is the
     /// offline migration framework (dry-run by default; `--apply` runs the
     /// fenced structural migration). `storage prune` owns the lifecycle of
     /// registered migration backup artifacts only; realm deletion stays
@@ -2146,15 +2149,17 @@ enum Commands {
 enum StorageCommands {
     /// Read-only diagnosis of realm storage across candidate state roots
     ///
-    /// Safe against live realms: takes no leases, opens databases
-    /// read-only, and creates nothing. Reports per-root realm inventory,
+    /// Safe against live realms: takes no leases, never mutates logical
+    /// database content, and never creates a database/directory. A read-only
+    /// SQLite open may contact the WAL/SHM sidecars required for a coherent
+    /// live read. Reports per-root realm inventory,
     /// manifest state, schema-ledger versions per database, dual-root
     /// split-brain twins, persisted-session structural decode failures,
     /// transcript-history footprint, dangling session→blob references, and
     /// orphaned lock/lease/backup artifacts.
     ///
-    /// By default the sweep covers the project-local root
-    /// (`<context-root>/.rkat/realms`) and the user-global data root. When
+    /// By default the sweep covers the invocation-context-local
+    /// root (`<context-root>/.rkat/realms`) and the user-global data root. When
     /// any explicit root is given (the global `--state-root` or one or more
     /// `--root`), ONLY those roots are read. `--realm` restricts the sweep
     /// to one realm id (split-brain twins for it are still detected across
@@ -2162,7 +2167,7 @@ enum StorageCommands {
     ///
     /// Exit codes: 0 = no error-severity findings; 1 = errors found.
     ///
-    /// This command never mutates anything. It is unrelated to
+    /// This command never mutates logical database content. It is unrelated to
     /// `rkat realm prune` (destructive realm deletion); `rkat storage
     /// prune` owns migration-backup-artifact lifecycle only.
     Doctor {
@@ -2348,11 +2353,11 @@ enum AuthCommands {
         secret: Option<String>,
     },
 
-    /// Clear persisted credentials for an auth profile from the TokenStore.
+    /// Clear persisted credentials for an auth binding from the TokenStore.
     Logout {
-        /// Auth profile id (either `realm:binding` or bare `binding` — the
-        /// latter assumes realm `dev`).
-        profile_id: String,
+        /// Auth binding token key (either `realm:binding` or bare `binding`; the
+        /// latter assumes realm `global`).
+        binding_key: String,
     },
 
     /// Force a refresh of the persisted credential for an auth profile.
@@ -5023,7 +5028,7 @@ async fn handle_auth_command(
         AuthCommands::Realms => {
             if config.realm.is_empty() {
                 println!(
-                    "No realms configured. Add a [realm.dev] section to your config \
+                    "No realms configured. Add a [realm.global] section to your config \
                      or continue using env-var auth (ANTHROPIC_API_KEY etc.)."
                 );
                 return Ok(());
@@ -5373,14 +5378,14 @@ async fn handle_auth_command(
                 );
             }
         }
-        AuthCommands::Logout { profile_id } => {
+        AuthCommands::Logout { binding_key } => {
             #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
             {
-                interactive_logout(&profile_id, scope).await?;
+                interactive_logout(&binding_key, scope).await?;
             }
             #[cfg(not(all(feature = "anthropic", feature = "openai", feature = "gemini")))]
             {
-                let _ = profile_id;
+                let _ = binding_key;
                 anyhow::bail!(
                     "`rkat auth logout` requires the `anthropic`, `openai`, and `gemini` \
                      features to be enabled at build time."
@@ -7218,7 +7223,7 @@ fn token_store_load_error_allows_clear(e: &meerkat_providers::auth_store::TokenS
 }
 
 #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
-async fn interactive_logout(profile_id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
+async fn interactive_logout(binding_key: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
     use meerkat_providers::auth_store::{TokenKey, TokenStoreBackend};
 
     let persistence = TokenStoreBackend::default_auto()
@@ -7227,18 +7232,18 @@ async fn interactive_logout(profile_id: &str, scope: &RuntimeScope) -> anyhow::R
         .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?;
     let store = persistence.token_store();
     // Wave-c C-12: TokenKey now takes typed atoms; parse the raw
-    // `profile_id` form at this logout boundary. This is the
+    // `binding_key` form at this logout boundary. This is the
     // non-AuthBindingRef carve-out `split_once(':')` site explicitly
     // documented in `cli_parse.rs` — TokenKey shares the same flat
     // `realm:binding` grammar but has no profile component.
-    let keys = match profile_id.split_once(':') {
+    let keys = match binding_key.split_once(':') {
         Some((realm, binding)) => vec![
             TokenKey::parse(realm, binding)
-                .map_err(|e| anyhow::anyhow!("invalid token-key `{profile_id}`: {e}"))?,
+                .map_err(|e| anyhow::anyhow!("invalid token-key `{binding_key}`: {e}"))?,
         ],
         None => vec![
-            TokenKey::parse(meerkat_core::connection::GLOBAL_REALM_SLUG, profile_id)
-                .map_err(|e| anyhow::anyhow!("invalid token-key `global:{profile_id}`: {e}"))?,
+            TokenKey::parse(meerkat_core::connection::GLOBAL_REALM_SLUG, binding_key)
+                .map_err(|e| anyhow::anyhow!("invalid token-key `global:{binding_key}`: {e}"))?,
         ],
     };
     let mut cleared = 0;
@@ -7279,7 +7284,7 @@ async fn interactive_logout(profile_id: &str, scope: &RuntimeScope) -> anyhow::R
         }
     }
     if cleared == 0 {
-        anyhow::bail!("No credentials found for profile '{profile_id}'");
+        anyhow::bail!("No credentials found for binding key '{binding_key}'");
     }
     Ok(())
 }
@@ -7779,9 +7784,11 @@ async fn handle_storage_command(command: &StorageCommands, cli: &Cli) -> anyhow:
 /// Candidate state roots for the storage verbs, resolved WITHOUT opening
 /// persistence, taking leases, or building a service: an explicit
 /// `--state-root`/`--root` set is used verbatim (and nothing else is read);
-/// otherwise the sweep covers the CLI's project-local candidate and the
-/// user-global data root — the same two candidates the dual-root realm
-/// resolver probes.
+/// otherwise the sweep covers the invocation-context-local candidate and the
+/// user-global data root. Unlike ordinary runtime scope, this deliberately
+/// does not walk up to the nearest ancestor containing `.rkat`; callers that
+/// want the runtime's project-local candidate must invoke the verb there or
+/// pass it explicitly.
 fn storage_sweep_roots(cli: &Cli, extra_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut state_roots: Vec<PathBuf> = Vec::new();
     if let Some(explicit) = &cli.state_root {
@@ -11768,7 +11775,7 @@ async fn resume_session_with_llm_override(
             override_memory: explicit_tooling.map(|resolved| resolved.memory),
             override_workgraph: explicit_tooling.map(|resolved| resolved.workgraph),
             override_mob: explicit_tooling.map(|resolved| resolved.mob),
-            override_web_search: if no_web_search { Some(true) } else { None },
+            override_web_search: if no_web_search { Some(false) } else { None },
             preload_skills: resumed_preload_skills,
             app_context: parsed_app_context,
             ..Default::default()
@@ -16417,14 +16424,15 @@ async fn execute_mob_validate(
 const WEB_BOOTSTRAP_JS_TEMPLATE: &str = r"// Auto-generated by `rkat mob web build`. Reusable browser bootstrap module.
 //
 // Import `bootMobpack` from your own app, or open the generated index.html for a
-// ready-to-run demo. Loads the bundled mobpack into the Meerkat WASM runtime.
+// runtime-initialization demo. Trust-verifies the bundled mobpack and installs
+// it as bootstrap data in the Meerkat WASM runtime; it does not create a mob.
 import init, { init_runtime, runtime_version } from './__GLUE_JS__';
 
 export const mobpackUrl = './mobpack.bin';
 export const wasmUrl = './__WASM__';
 
 /**
- * Boot the bundled mob in the browser.
+ * Initialize the browser runtime from the bundled mobpack.
  * @param {Object} [opts]
  * @param {string} [opts.anthropicApiKey]
  * @param {string} [opts.openaiApiKey]
@@ -16466,7 +16474,7 @@ const WEB_INDEX_HTML_TEMPLATE: &str = r#"<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Meerkat Mob - __TITLE__</title>
+  <title>Meerkat Web Package - __TITLE__</title>
   <style>
     body { font: 15px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
     label { display: block; margin: .5rem 0; }
@@ -16476,12 +16484,12 @@ const WEB_INDEX_HTML_TEMPLATE: &str = r#"<!doctype html>
   </style>
 </head>
 <body>
-  <h1>Meerkat Mob - __TITLE__</h1>
-  <p>This mob runs entirely in your browser via the Meerkat WASM runtime. Enter an API key and start it.</p>
+  <h1>Meerkat Web Package - __TITLE__</h1>
+  <p>This package contains a mobpack and a Meerkat WASM runtime bootstrap. Enter credentials to trust-verify the pack and initialize the runtime. This step does not create or start a mob.</p>
   <label>Anthropic API key <input id="anthropic" type="password" placeholder="sk-ant-..." /></label>
   <label>OpenAI API key (optional) <input id="openai" type="password" placeholder="sk-..." /></label>
   <label>Gemini API key (optional) <input id="gemini" type="password" placeholder="..." /></label>
-  <button id="start">Start mob</button>
+  <button id="start">Initialize runtime</button>
   <pre id="status">Idle.</pre>
   <script type="module">
     import { bootMobpack } from './meerkat-bootstrap.js';
@@ -16496,8 +16504,8 @@ const WEB_INDEX_HTML_TEMPLATE: &str = r#"<!doctype html>
           openaiApiKey: $('openai').value || undefined,
           geminiApiKey: $('gemini').value || undefined,
         });
-        log('Runtime ' + version + ' initialized; mob loaded from mobpack.bin.');
-        log('The mob is live. Drive it via the @rkat/web runtime API (see meerkat-bootstrap.js).');
+        log('Runtime ' + version + ' initialized; mobpack.bin was trust-verified and loaded as bootstrap data.');
+        log('No mob has been created. Use the generated WASM glue or integrate this package with @rkat/web to create a mob and build its UI.');
       } catch (err) {
         log('Error: ' + (err && err.message ? err.message : String(err)));
         $('start').disabled = false;
@@ -23070,9 +23078,9 @@ default_model = "gemma"
             "rkat",
             "mcp",
             "add",
-            "glean",
+            "remote",
             "--url",
-            "https://king-be.glean.com/mcp/default",
+            "https://mcp.example.com/api",
         ])
         .expect("mcp add name --url URL should parse");
         match codex_style
@@ -23088,11 +23096,8 @@ default_model = "gemma"
                         ..
                     },
             } => {
-                assert_eq!(name, "glean");
-                assert_eq!(
-                    url.as_deref(),
-                    Some("https://king-be.glean.com/mcp/default")
-                );
+                assert_eq!(name, "remote");
+                assert_eq!(url.as_deref(), Some("https://mcp.example.com/api"));
                 assert_eq!(positional_url, None);
             }
             _ => unreachable!("expected mcp add"),
@@ -23104,8 +23109,8 @@ default_model = "gemma"
             "add",
             "--transport",
             "http",
-            "glean",
-            "https://king-be.glean.com/mcp/default",
+            "remote",
+            "https://mcp.example.com/api",
         ])
         .expect("mcp add --transport http name URL should parse");
         match claude_style
@@ -23121,11 +23126,11 @@ default_model = "gemma"
                         ..
                     },
             } => {
-                assert_eq!(name, "glean");
+                assert_eq!(name, "remote");
                 assert!(matches!(transport, Some(CliTransport::Http)));
                 assert_eq!(
                     positional_url.as_deref(),
-                    Some("https://king-be.glean.com/mcp/default")
+                    Some("https://mcp.example.com/api")
                 );
             }
             _ => unreachable!("expected mcp add"),
@@ -23143,13 +23148,13 @@ default_model = "gemma"
             _ => unreachable!("expected run"),
         }
 
-        let login = Cli::try_parse_from(["rkat", "mcp", "login", "glean", "--scope", "project"])
+        let login = Cli::try_parse_from(["rkat", "mcp", "login", "remote", "--scope", "project"])
             .expect("mcp login should parse");
         match login.command.expect("test invocation parses a subcommand") {
             Commands::Mcp {
                 command: McpCommands::Login { name, scope },
             } => {
-                assert_eq!(name, "glean");
+                assert_eq!(name, "remote");
                 assert!(matches!(scope, Some(CliMcpScope::Project)));
             }
             _ => unreachable!("expected mcp login"),
@@ -23160,8 +23165,8 @@ default_model = "gemma"
     #[test]
     fn test_cli_mcp_oauth_resolver_is_needed_only_for_streamable_http_without_static_auth() {
         let streamable = meerkat_core::McpServerConfig::streamable_http(
-            "glean",
-            "https://king-be.glean.com/mcp/default",
+            "remote",
+            "https://mcp.example.com/api",
             std::collections::HashMap::new(),
         );
         assert!(mcp_server_may_need_oauth(&streamable));
@@ -23828,6 +23833,17 @@ url = "https://user.example/mcp"
         assert!(
             bootstrap.contains("from './real.js'") && bootstrap.contains("'permissive'"),
             "bootstrap must import the emitted glue and bake the build-time trust policy"
+        );
+        let index = tokio::fs::read_to_string(real_out.join("index.html"))
+            .await
+            .expect("read emitted index page");
+        assert!(
+            index.contains("Initialize runtime")
+                && index.contains("This step does not create or start a mob")
+                && index.contains("No mob has been created")
+                && !index.contains("Start mob")
+                && !index.contains("The mob is live"),
+            "generated page must describe package verification and runtime initialization without claiming a live mob"
         );
     }
 

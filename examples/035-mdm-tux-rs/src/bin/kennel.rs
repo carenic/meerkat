@@ -73,9 +73,15 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         eprintln!(
-            "Usage: mdm-kennel --listen HOST:PORT [--data-dir PATH] \
+            "Usage: mdm-kennel --listen HOST:PORT [--advertise IP] [--data-dir PATH] \
              [--hive-rpc-port PORT] [--hive-model MODEL --hive-provider PROVIDER] \
              [--experimental-hive-mob]"
+        );
+        eprintln!(
+            "The hive model defaults to gpt-5.5; API-key environment variables do not select it."
+        );
+        eprintln!(
+            "WARNING: hive RPC is unauthenticated plaintext on 0.0.0.0 and exposes shell-capable sessions."
         );
         std::process::exit(1);
     }
@@ -184,7 +190,8 @@ async fn main() -> anyhow::Result<()> {
         hive_jsonl as Arc<dyn SessionStore>,
         Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
         Arc::new(MemoryBlobStore::new()),
-        hive_schedule_store);
+        hive_schedule_store,
+    );
 
     // ── Hive agent: SessionRuntime with mob tools ───────────────────────────
     let hive_config_store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(
@@ -194,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
     // SessionRuntime + NotificationSink (carrying RpcNotification mpsc::Sender) +
     // serve_tcp form the canonical RPC-host triad. Lifting these would require an
     // alternate transport stack; this surface legitimately owns the RPC-host role.
-    let mut hive_runtime = meerkat_rpc::session_runtime::SessionRuntime::new(
+    let hive_runtime = meerkat_rpc::session_runtime::SessionRuntime::new(
         hive_factory,
         hive_config,
         1024,
@@ -277,7 +284,10 @@ async fn main() -> anyhow::Result<()> {
             build.override_builtins = meerkat_core::ToolCategoryOverride::Enable;
             build.override_shell = meerkat_core::ToolCategoryOverride::Enable;
             build.override_mob = meerkat_core::ToolCategoryOverride::Enable;
-            match hive_runtime.create_session(build, None, None).await {
+            match hive_runtime
+                .create_session(build, None, None, Vec::new())
+                .await
+            {
                 Ok(sid) => {
                     let sid_str = sid.to_string();
                     eprintln!("[kennel] hive session created: {sid_str}");
@@ -396,12 +406,13 @@ async fn main() -> anyhow::Result<()> {
     let hive_rpc_addr = format!("tcp://{advertise_ip}:{hive_rpc_port}");
     let hive_comms_addr = format!("tcp://{advertise_ip}:{hive_comms_port}");
 
-    println!("=== MCM Kennel ===");
+    println!("=== MDM Kennel ===");
     println!("listen    : {listen}");
     println!("kennel_id : {kennel_id}");
     println!("advertise : {advertise_ip}");
     println!("hive_rpc  : {hive_rpc_addr}");
     println!("hive_comms: {hive_comms_addr}");
+    println!("warning   : hive RPC is unauthenticated plaintext on 0.0.0.0");
     if let Some(mob_id) = &hive_mob_id {
         println!("hive_mob  : {mob_id}");
     }

@@ -598,7 +598,7 @@ pub struct AgentBuildConfig {
     pub tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
     /// Pre-built session comms runtime, type-erased (multi-host mobs
     /// DEC-P3H-3 — the `llm_client_override` precedent). Produced by
-    /// [`crate::encode_session_comms_runtime_override_for_service`]; the
+    /// `crate::encode_session_comms_runtime_override_for_service`; the
     /// factory's comms arm downcasts fail-closed, verifies the participant
     /// name equals `comms_name`, and skips config-mode construction. Set by
     /// the mob member-host materializer; never by ordinary surfaces.

@@ -3,14 +3,15 @@
 //! This trait lives in `meerkat-core` so that custom storage implementations
 //! (Postgres, DynamoDB, etc.) can be written without depending on `meerkat-store`.
 //!
-//! # Snapshot = projection
+//! # Session row authority
 //!
-//! The `Session` row a `SessionStore` persists is a **projection of the
-//! canonical event log**. The event log (`EventStore`) is append-only at
-//! the trait level; the snapshot is a rebuildable materialization of
-//! replaying that log. Deleting a `.rkat/sessions/<id>/session.json` and
-//! replaying the event store produces an identical snapshot (the
-//! `CLAUDE.md` invariant).
+//! The `Session` row is persisted domain content. In runtime-backed mode,
+//! `RuntimeStore` and its backend carrier own physical currentness, lifecycle,
+//! and catalog authority; a `SessionStore` row may be a HeadCanonical component
+//! store or an explicit import source, but it is not runtime authority. A host
+//! may additionally install an asynchronous `EventStore` audit/replay
+//! projection, but that best-effort derived state is neither the source of the
+//! row nor guaranteed complete.
 //!
 //! Wave-c C-H1 (F1 closure from the state-scope-audit) makes the
 //! append-only nature of that projection enforceable at the
@@ -1278,10 +1279,9 @@ impl From<serde_json::Error> for SessionStoreError {
 ///
 /// # Append-only contract (F1 closure, wave-c C-H1)
 ///
-/// The snapshot written by [`save`](Self::save) is a **projection of the
-/// canonical event log** ([`crate::session_store`] doc: "snapshot =
-/// projection"). Implementations that persist across calls MUST enforce
-/// that the message vector stored for a given `SessionId` is monotonically
+/// The session row written by [`save`](Self::save) is persisted domain content,
+/// not runtime currentness authority. Implementations that persist across calls
+/// MUST enforce that the message vector stored for a given `SessionId` is monotonically
 /// non-shrinking — a subsequent `save()` for the same id must not have a
 /// smaller `messages().len()` than the previously persisted row.
 ///

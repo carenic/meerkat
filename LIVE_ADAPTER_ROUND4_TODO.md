@@ -1,5 +1,10 @@
 # Live-Adapter Round-4 — Live-output lane split
 
+> Historical PR #650 follow-up ledger. Checkbox state and coordination notes
+> below describe that implementation cycle, not current Meerkat. Use
+> `docs/guides/realtime.mdx` and `docs/reference/runtime-architecture.mdx` for
+> current live-channel contracts.
+
 Tracking document for the architectural follow-up on PR #650 after
 Review-2 + Review-3 closed (12/12). Round-4 stops the live boundary
 from collapsing distinct output lanes (display text, spoken transcript,

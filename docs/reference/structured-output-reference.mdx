@@ -1,5 +1,5 @@
 ---
-title: "Structured Output Reference"
+title: "Structured output reference"
 description: "Low-level structured-output reference: schema types, compatibility modes, warnings, and result fields."
 icon: "square-code"
 ---
@@ -8,28 +8,72 @@ Use this page when you need exact structured-output terminology and types rather
 
 ## Core types
 
-- `OutputSchema`
-- `MeerkatSchema`
-- `SchemaCompat`
-- `SchemaFormat`
-- `SchemaWarning`
-- `CompiledSchema`
+| Type | Contract |
+|------|----------|
+| `OutputSchema` | Owns `schema`, optional `name`, `strict`, `compat`, and `format`. |
+| `MeerkatSchema` | Normalized JSON Schema value. The root must be an object. Object-typed nodes gain explicit `properties` and `required` arrays. |
+| `SchemaCompat` | `Lossy` drops provider-unsupported schema features with warnings; `Strict` rejects them. |
+| `SchemaFormat` | Currently `MeerkatV1`. |
+| `SchemaWarning` | Provider, JSON path, and explanation for a lossy lowering decision. |
+| `CompiledSchema` | Provider-lowered schema plus warnings. |
 
 ## Request-side controls
 
-- `output_schema`
-- `structured_output_retries`
-- provider-specific lowering / strictness
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `output_schema` | `None` | Declared extraction schema. When absent, there is no extraction phase. |
+| `structured_output_retries` | `2` | Validation retries after the first attempt, for at most three extraction calls by default. |
+
+Provider adapters compile the normalized schema before extraction. Strictness
+is a provider-lowering request; local JSON Schema validation still runs before
+Meerkat accepts the result.
 
 ## Result-side fields
 
-- `structured_output`
-- `schema_warnings`
-- extraction-turn retry behavior
+| Field | Meaning |
+|-------|---------|
+| `RunResult.text` | Committed main-turn assistant output after provider schema compilation succeeds. Extraction does not replace it. |
+| `RunResult.structured_output` | Validated JSON value on success. |
+| `RunResult.extraction_error` | Main output, attempts, and reason when the post-main extraction phase fails. |
+| `RunResult.schema_warnings` | Lossy provider-compilation warnings, when any. |
+| `RunResult.turns` | Includes extraction attempts. |
+
+Provider schema compilation happens before the main output is saved into the
+result. A compilation failure can therefore return the typed extraction failure
+with an empty `RunResult.text`; output retention applies to failures after
+schema compilation succeeds.
+
+## Event ordering
+
+After provider schema compilation succeeds, a schema-bearing run has two
+terminal observability stages:
+
+1. The normal agentic turn completes and emits `run_completed` with
+   `extraction_required: true`. `result` is the main assistant output.
+2. Extraction emits exactly one follow-up terminal event:
+   `extraction_succeeded` with `structured_output` and optional
+   `schema_warnings`, or `extraction_failed` with `last_output`, `attempts`,
+   and `reason`.
+
+Extraction does not emit ordinary text or `turn_completed` events. Extraction
+failure does not emit `run_failed`; the main run already completed, and the
+returned `RunResult` carries `extraction_error`.
+
+Provider schema compilation happens before these success-shaped boundaries. A
+compile failure emits `extraction_failed` directly and emits neither
+`turn_completed` nor `run_completed` first.
 
 ## Validation note
 
-Schema validation depends on the `jsonschema` feature. Without it, Meerkat still parses JSON but skips schema validation.
+Schema validation depends on the `jsonschema` feature. A build without that
+feature fails closed with typed `InvalidOutputSchema` when an output schema is
+configured. Meerkat never marks merely parsed, unvalidated JSON as structured
+output.
+
+Each extraction attempt runs with no tools and temperature `0.0`. Markdown code
+fences are stripped before parsing. A provider may wrap a named root object in
+the schema name; Meerkat unwraps that envelope only when the inner object is a
+clearly better match and the wrapper key is not itself declared by the schema.
 
 ## See also
 

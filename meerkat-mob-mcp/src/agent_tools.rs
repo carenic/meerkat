@@ -625,7 +625,8 @@ impl AgentMobToolSurface {
     /// Resolve spawn tooling into inherited tool filter and optional override profile.
     ///
     /// - `InheritParent`: snapshot parent's visible tools, apply overlays
-    /// - `Minimal`: only comms tools (send, send_message, send_request, send_response, peers)
+    /// - `Minimal`: only comms tools (send, send_message, reply_to_peer,
+    ///   send_request, send_response, peers)
     /// - `Profile`: resolve the profile from inline/realm source and apply overlays
     async fn resolve_spawn_tooling(
         &self,
@@ -2095,11 +2096,11 @@ fn build_tool_defs_with_profile_support(
              Override via the tooling parameter:\n\
              - {\"mode\":\"inherit_parent\"} -- default. Helper gets your tools. Add \
                allow_overlay/deny_overlay arrays to narrow the set.\n\
-             - {\"mode\":\"minimal\"} -- comms tools only (send_message, send_request, \
-               send_response, peers). Lightweight helper.\n\
+             - {\"mode\":\"minimal\"} -- comms tools only (send, send_message, \
+               reply_to_peer, send_request, send_response, peers). Lightweight helper.\n\
              - {\"mode\":\"profile\",\"source\":{\"type\":\"realm_profile\",\"name\":\"my-profile\"}} \
                -- use a saved realm profile for model + tool config.\n\
-             - {\"mode\":\"profile\",\"source\":{\"type\":\"inline\",\"model\":\"claude-sonnet-4-5\",\
+             - {\"mode\":\"profile\",\"source\":{\"type\":\"inline\",\"model\":\"claude-sonnet-4-6\",\
                \"tools\":{\"builtins\":true,\"shell\":true,\"comms\":true}}} -- inline profile.\n\n\
              RESULT CONTRACT:\n\
              The call returns only after the exact admitted helper turn reaches its committed \

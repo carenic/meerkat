@@ -8,8 +8,8 @@ import { pushMessage, pushStructuredSummary, dmChannel } from "./ui";
 
 export interface DrainResult { events: number; errors: string[] }
 
-function agentFallbackChannel(meerkatId: string, team: Team): ChannelId {
-  if (meerkatId.includes("ambassador")) return `${team[0]}-plan-amb` as ChannelId;
+function agentFallbackChannel(agentIdentity: string, team: Team): ChannelId {
+  if (agentIdentity.includes("ambassador")) return `${team[0]}-plan-amb` as ChannelId;
   return `${team[0]}-plan-op` as ChannelId;
 }
 
@@ -59,7 +59,7 @@ export function drainAllEvents(mod: RuntimeModule, session: MatchSession, turn: 
     const event = env.payload;
     events++;
     if (event.type === "run_failed" && event.error) {
-      errors.push(`${sub.meerkatId}: ${event.error}`);
+      errors.push(`${sub.agentIdentity}: ${event.error}`);
     }
 
     // Comms: agent used send_message/send tool → route raw message to DM channel
@@ -72,7 +72,7 @@ export function drainAllEvents(mod: RuntimeModule, session: MatchSession, turn: 
         const to = args.to || "";
         const body = args.body || "";
         if (to && body) {
-          const ch = dmChannel(sub.meerkatId, to);
+          const ch = dmChannel(sub.agentIdentity, to);
           if (ch) {
             pushMessage({ channel: ch, role: sub.role, faction: sub.team, content: body, turn });
           }
@@ -89,7 +89,7 @@ export function drainAllEvents(mod: RuntimeModule, session: MatchSession, turn: 
           const routed = new Set<ChannelId>();
 
           for (const dispatch of dispatches) {
-            const ch = dmChannel(sub.meerkatId, dispatch.peer);
+            const ch = dmChannel(sub.agentIdentity, dispatch.peer);
             if (!ch || routed.has(ch)) continue;
             routed.add(ch);
             pushStructuredSummary({
@@ -100,7 +100,7 @@ export function drainAllEvents(mod: RuntimeModule, session: MatchSession, turn: 
             });
           }
 
-          const ownCh = agentFallbackChannel(sub.meerkatId, sub.team);
+          const ownCh = agentFallbackChannel(sub.agentIdentity, sub.team);
           if (!routed.has(ownCh)) {
             pushStructuredSummary({
               channel: ownCh, role: sub.role, faction: sub.team, turn,

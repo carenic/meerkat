@@ -1,90 +1,93 @@
 ---
 title: "Concepts Overview"
-description: "The conceptual map of Meerkat: composability, identity, lifecycle, capabilities, and orchestration."
+description: "The conceptual map of Meerkat: realms, sessions, runtime capabilities, and orchestration."
 icon: "compass"
 ---
 
-Meerkat is easiest to understand as a **composable agent runtime** with a practical product layer on top.
+Meerkat is a composable agent runtime. Its CLI, services, SDKs, and browser
+runtime are peer surfaces over shared lifecycle and capability contracts.
 
-You can approach it from any surface:
-
-- Rust embedding
-- Python or TypeScript SDKs
-- CLI
-- REST / JSON-RPC / MCP
-- multi-agent orchestration
-
-The core concepts fit together like this:
+The central idea is a **realm**: the identity and storage boundary within which
+config, credentials, sessions, schedules, WorkGraph commitments, jobs, blobs,
+artifacts, and mobs can coordinate.
 
 ```mermaid
 flowchart TD
-    C["Composability"] --> R["Realms"]
+    SF["Rust, CLI, REST, RPC, MCP, SDKs, Web/WASM"] --> RT["Shared Runtime"]
+    RT --> R["Realm"]
+    R --> CFG["Config and Auth Bindings"]
     R --> S["Sessions"]
-    R --> CFG["Configuration"]
-    C --> P["Providers"]
-    C --> T["Tools"]
-    T --> M["Memory & Compaction"]
-    T --> H["Hooks"]
-    T --> SK["Skills"]
-    C --> CB["Comms"]
-    CB --> MB["Mobs"]
-    C --> SCH["Scheduling"]
-    C --> RT["Live Channels"]
-    R --> AB["Auth & Bindings"]
+    R --> ST["Durable Stores"]
+    RT --> CAP["Capability Composition"]
+    CAP --> P["Providers and Model Catalog"]
+    CAP --> T["Tools, MCP, Hooks, Skills"]
+    CAP --> MEM["Memory and Compaction"]
+    RT --> ORCH["Orchestration"]
+    ORCH --> MOB["Mobs and Comms"]
+    ORCH --> SCH["Schedules and Jobs"]
+    ORCH --> WG["WorkGraph and Attention"]
+    RT --> LIVE["Live Channels"]
 ```
 
-## Read order
+## Core Read Order
 
-If you are new to Meerkat, a good concepts path is:
+1. [Composability](/concepts/composability) explains why the surfaces share
+   contracts instead of implementing separate agent loops.
+2. [Realms](/concepts/realms) defines state identity, isolation, storage
+   discovery, and backend pinning.
+3. [Sessions](/concepts/sessions) covers transcript, lifecycle, history,
+   concurrency, persistence, and recovery.
+4. [Configuration](/concepts/configuration) covers raw realm documents,
+   effective inheritance, runtime overrides, and generation CAS.
+5. [Auth and bindings](/concepts/auth-and-bindings) separates model/backend
+   choice from credentials and account identity.
+6. [Providers](/concepts/providers) explains the model catalog, capability
+   gating, provider parameters, and fallback.
+7. [Tools](/concepts/tools) explains how an agent acts on the world.
 
-1. [Composability](/concepts/composability)
-2. [Realms](/concepts/realms)
-3. [Sessions](/concepts/sessions)
-4. [Configuration](/concepts/configuration)
-5. [Providers](/concepts/providers)
-6. [Tools](/concepts/tools)
+Then add the systems your product needs:
 
-Then branch into the systems you need:
-
-- [Auth & bindings](/concepts/auth-and-bindings)
-- [Memory & compaction](/concepts/memory-and-compaction)
+- [Memory and compaction](/concepts/memory-and-compaction)
+- [Hooks](/guides/hooks)
+- [Skills](/guides/skills)
 - [Comms](/concepts/comms)
 - [Mobs](/concepts/mobs)
 - [Scheduling](/concepts/scheduling)
-- [Live Channels](/guides/realtime)
+- [Durable jobs and monitors](/guides/durable-jobs)
+- [WorkGraph](/concepts/workgraph)
+- [Live channels](/guides/realtime)
 
-## What each concept owns
+## Ownership At A Glance
 
 | Concept | Main question |
 |---------|---------------|
-| `Composability` | What kind of product is Meerkat, and why do the surfaces behave like peers? |
-| `Realms` | What defines shared vs isolated state? |
-| `Sessions` | How does one conversation live, continue, and end? |
-| `Configuration` | How are runtime settings stored and updated? |
-| `Providers` | How are models resolved, selected, and capability-gated? |
-| `Tools` | How does the agent act on the world? |
-| `Auth & bindings` | Under what identity/credentials does the runtime talk to a provider? |
-| `Memory & compaction` | How does Meerkat handle context beyond one model window? |
-| `Comms` | How do long-lived agents exchange messages? |
-| `Mobs` | How does Meerkat coordinate multiple agents as one system? |
-| `Scheduling` | How does durable automation fire over time? |
-| `Live Channels` | How does low-latency interactive transport fit into the session model? |
+| Composability | Which capabilities should this product assemble, and through which surface? |
+| Realms | What state is shared, where is it stored, and what stays isolated? |
+| Sessions | How does one agent conversation execute, persist, resume, and end? |
+| Configuration | Which settings are raw, inherited, or overridden for one request? |
+| Auth and bindings | Which backend, account, and credential source serves this model call? |
+| Providers | Which model owns an ID, and what can it do? |
+| Tools | Which actions are visible and authorized for this session or turn? |
+| Memory and compaction | How does useful context outlive one request window? |
+| Comms and mobs | How do session-backed agents coordinate as a team? |
+| Scheduling and jobs | How does timed or detached work run durably outside an immediate user turn? |
+| WorkGraph | How are durable goals, commitments, evidence, and attention tracked? |
+| Live channels | How does realtime audio/text transport attach to session identity? |
 
-## Where To Go Next
+## Choose A Build Path
 
-After the core concepts, choose the path that matches the system you are
-building:
-
-| Path | Start with |
+| Goal | Start with |
 |------|------------|
-| Embedding Meerkat in Rust | [Rust SDK overview](/rust/overview) |
-| Driving Meerkat from an app | [Python SDK](/sdks/python/overview) or [TypeScript SDK](/sdks/typescript/overview) |
-| Running Meerkat as a service | [JSON-RPC](/api/rpc) or [REST](/api/rest) |
-| Building multi-agent systems | [Mobs](/guides/mobs) |
-| Running private models | [Self-hosting models](/guides/self-hosting-models) |
-| Understanding ownership | [Architecture](/reference/architecture) |
+| Embed Meerkat in Rust | [Rust SDK overview](/rust/overview) |
+| Build in Python or TypeScript | [Python SDK](/sdks/python/overview) or [TypeScript SDK](/sdks/typescript/overview) |
+| Run a browser/WASM agent | [Web/WASM example](/examples/wasm) |
+| Host Meerkat as a service | [JSON-RPC](/api/rpc) or [REST](/api/rest) |
+| Build a coordinated team | [Mobs guide](/guides/mobs) |
+| Run detached work | [Durable jobs and monitors](/guides/durable-jobs) |
+| Run private models | [Self-hosting models](/guides/self-hosting-models) |
+| Study ownership and internals | [Architecture](/reference/architecture) |
 
-## See also
+## See Also
 
 - [Introduction](/introduction)
 - [Quickstart](/quickstart)

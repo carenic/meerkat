@@ -44,7 +44,7 @@ if (PROXY_URL) {
   const keySection = document.querySelector(".key-section") as HTMLElement | null;
   if (keySection) keySection.style.display = "none";
   const hint = document.querySelector(".key-hint") as HTMLElement | null;
-  if (hint) hint.textContent = "API keys provided by server";
+  if (hint) hint.textContent = "Provider requests routed through configured server";
 } else {
   // Standalone: pre-fill from environment variables (baked in at build/dev time)
   if (__ANTHROPIC_API_KEY__) anthropicKeyInput.value = __ANTHROPIC_API_KEY__;

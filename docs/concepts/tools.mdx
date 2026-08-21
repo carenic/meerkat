@@ -65,31 +65,66 @@ Register any MCP server and its tools automatically appear in the agent's tool s
 ```bash
 rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp
 rkat mcp add api --url https://mcp.example.com/api
-rkat mcp add --transport http glean https://king-be.glean.com/mcp/default
+rkat mcp add --transport http knowledge https://mcp.example.com/v1
 ```
 
 Config is stored in `.rkat/mcp.toml` (project) or `~/.rkat/mcp.toml` (user). Supports stdio, streamable HTTP, and SSE transports. OAuth-protected HTTP servers discover auth at connect time; use `rkat mcp login <name>` or `rkat run --mcp-auth interactive` when browser login is needed. See the [MCP reference](/api/mcp) for full details.
 
 ## Built-in tools
 
-Meerkat ships with tool categories you enable per-agent. Nothing is on by default -- you choose what your agent can do.
+Meerkat ships with tool categories resolved per agent. Factory category flags
+default off; product surfaces may apply their own explicit preset (for example,
+the CLI defaults to `--tools safe`).
 
 | Category | Tools | Enable with |
 |----------|-------|-------------|
-| Builtins | `task_create`, `task_list`, `task_get`, `task_update`, `datetime`, `apply_patch`, `view_image`, `generate_image`, `blob_save_file`, `blob_load_file`, `blob_inspect` | `enable_builtins` |
-| Shell | `shell`, `shell_jobs`, `shell_job_status`, `shell_job_cancel` | `enable_shell` |
+| Builtins | `task_create`, `task_list`, `task_get`, `task_update`, `datetime`, `apply_patch`, `view_image`, `blob_save_file`, `blob_load_file`, `blob_inspect` | `enable_builtins` |
+| Image generation | `generate_image` | inherited visibility when the normal runtime substrate is wired; explicit `override_image_generation` for independent minimal composition |
+| Web search | provider-native search or the Meerkat-owned `web_search` fallback | `override_web_search` (or a surface convenience flag) |
+| Shell | `shell`, `shell_jobs`, `shell_job_status`, `shell_job_cancel`; high-trust `monitor_start` is opt-in | `enable_shell` plus tool policy |
 | Memory | `memory_search` | `enable_memory` |
 | Scheduler | `meerkat_schedule_*` | `enable_schedule` |
 | WorkGraph | `workgraph_*` | `enable_workgraph` |
-| Comms | `send_message`, `send_request`, `send_response`, `peers` | `enable_comms` |
-| Mob orchestration | `delegate`, `mob_*` | `enable_mob` |
+| Comms | `send_message`, `reply_to_peer`, `send_request`, `send_response`, `peers` | `enable_comms` |
+| Mob orchestration | `delegate`, `conclude_objective`, `mob_*` | `enable_mob` |
 
 Shell tools support allow/deny list security policies. Runtime tool visibility can also be shaped with mob overlays and turn-boundary tool-scope updates. See the [built-in tools reference](/reference/builtin-tools) for parameter details.
+
+Image generation and web search are independent category decisions. Enabling
+either one does not implicitly expose general builtins. Conversely, disabling
+general builtins does not prevent a runtime-backed build from explicitly
+enabling one of those capabilities. Explicit enables fail closed when the
+selected runtime cannot provision the requested capability.
+
+The current direct `rkat run`, REST, and JSON-RPC session builders leave image
+generation at `inherit`, which the outer factory treats as hidden; they do not
+yet expose an image-generation enable switch. `--allow-tool generate_image`
+only narrows an already composed surface and cannot enable the category.
 
 For nontrivial Meerkat-owned tool families, companion skills provide the agent
 instruction manual. Tool descriptions stay short and schema-oriented; skills
 such as `workgraph-workflow`, `schedule-workflow`, `task-workflow`, and
 `shell-patterns` explain the operating posture for the tool family.
+
+## Execution contracts
+
+Tool visibility and tool execution are separate decisions. A visible tool has
+an execution contract that declares the modes it supports:
+
+- fast execution for ordinary request/response calls
+- streaming execution with progress and cancellation policy
+- detached execution backed by a durable job record
+
+The runtime resolves a call to one supported mode, applies the narrowest
+deadline in the chain, and supervises progress or cancellation through the
+same tool gateway. Detached execution records its restart class explicitly.
+For example, a background shell command is `non_resumable`: its durable job
+truth survives a host restart, but a lost subprocess becomes `worker_lost` and
+is never silently replayed.
+
+Tool definitions also carry source provenance, and dispatchers classify calls
+as read-only, mutating, or unknown. Hooks and policy layers receive those typed
+facts rather than inferring authority from a tool name.
 
 ## Tool scoping
 
@@ -142,11 +177,15 @@ Tools can return rich content beyond plain text. The injected runtime shape is `
 - **`ToolResult::with_blocks(...)`** -- returns one or more content blocks directly, including images and video.
 - Built-in tools that expose richer output may internally use `ToolOutput::Blocks(...)`, but the persisted/runtime-facing result shape is still `ToolResult.content`.
 
-`ContentBlock` currently has three variants:
+`ContentBlock` is non-exhaustive and currently has five variants:
 
 - `ContentBlock::Text { text }` -- plain text content.
 - `ContentBlock::Image { media_type, ... }` -- inline or blob-backed image content.
 - `ContentBlock::Video { media_type, duration_ms, ... }` -- inline or URI-referenced video content. Video blocks are accepted only on Gemini user-message input paths and are rejected in tool results. Vertex Gemini can consume `gs://` references directly; Gemini API sessions can consume public or already-registered file URIs, and register `gs://` references first when the session has Google bearer auth.
+- `ContentBlock::Structured { data }` -- canonical opaque JSON returned by a
+  tool without first stringifying it into text.
+- `ContentBlock::SkillContext { skill_key, text }` -- runtime-authored skill
+  activation context with its canonical source identity preserved.
 
 The built-in `view_image` tool reads an image file from disk and returns a result containing image content blocks. It supports PNG, JPEG, GIF, WebP, and SVG formats up to 5 MB. The tool is automatically hidden from models that lack vision support via capability-aware tool visibility.
 
@@ -154,11 +193,18 @@ The built-in `generate_image` tool is session-owned runtime dispatch. It lets a 
 
 The blob file bridge tools are registered only when the session has a blob store. `blob_save_file` writes decoded blob bytes to a file inside the project root, `blob_load_file` reads a project file into the blob store, and `blob_inspect` returns blob metadata without raw payload bytes. They do not expose blob listing or deletion.
 
-Custom tools can return multimodal content by returning `ToolResult::with_blocks(...)` with the appropriate content blocks.
+Custom tools can return text, image, or structured content through
+`ToolResult::with_blocks(...)`. Video tool results are rejected, and
+`SkillContext` is reserved for the runtime skill-injection path.
 
 ## Image generation
 
-`generate_image` is a session-owned builtin for creating or editing assistant images. It is registered when builtins are enabled and the runtime-backed surface supplies the image-generation machine, provider executor, planner, and blob store. CLI sessions wire this automatically; the default `--tools safe` preset includes builtins.
+`generate_image` is a session-owned tool for creating or editing assistant
+images. It is registered when the runtime-backed surface supplies the
+image-generation machine, provider executor, planner, and blob store. In the
+normal composite dispatcher, `Inherit` is visible once that substrate is wired.
+The category can also be enabled independently from general builtins through a
+Mob profile or an in-process `override_image_generation: Enable`.
 
 The tool accepts a typed request under `request`, routes it to OpenAI or Gemini image backends, stores generated image bytes in the realm blob store, and returns structured `ImageGenerationToolResult` JSON with durable `images[].blob_ref` values. A model can then call `blob_save_file` to materialize that blob as a project file, for example `top-news-infographic.png`.
 

@@ -1,5 +1,5 @@
 ---
-title: "Hooks Reference"
+title: "Hooks reference"
 description: "Low-level hook surface reference: hook points, capabilities, execution modes, and payload fields."
 icon: "anchor"
 ---
@@ -14,17 +14,69 @@ Use this page when you need exact hook vocabulary and structure rather than a pr
 | `HookCapability` | `Observe`, `Guardrail` |
 | `HookExecutionMode` | `Foreground`, `Background` |
 
+`Rewrite` is not a capability. Runtime responses accept only an optional
+`decision` and reject unknown fields, including legacy `patches` payloads.
+
 ## Runtime families
 
-- in-process
-- command
-- HTTP
+| Runtime | Input/output contract |
+|---------|-----------------------|
+| in-process | Registered async Rust handler receives `HookInvocation` and returns `RuntimeHookResponse`. |
+| command | Invocation JSON on stdin, response JSON on stdout. Non-zero exit is a typed execution failure. |
+| HTTP | Invocation JSON in a POST body, response JSON in the body. |
+
+Command and HTTP payloads are bounded by `payload_max_bytes` (128 KiB by
+default). Hook timeouts default to 5000 ms. Foreground runtime failures fail
+closed through typed hook errors. Background hooks are non-blocking: saturation
+can skip or drop their work, and their later failures do not retroactively fail
+the foreground operation.
 
 ## Payload highlights
 
-- `HookInvocation`
-- `HookToolResult`
-- `HookDecision`
+| Field | Type | Hook point |
+|-------|------|------------|
+| `point`, `session_id` | `HookPoint`, `SessionId` | all |
+| `turn_number` | `Option<u32>` | most points |
+| `prompt_input` | `Option<RunInput>` | `RunStarted` |
+| `error_report`, `error_class` | typed failure projections | `RunFailed` |
+| `llm_request` | `HookLlmRequest` | `PreLlmRequest` |
+| `llm_response` | `HookLlmResponse` | `PostLlmResponse` |
+| `tool_call` | `HookToolCall` | `PreToolExecution` |
+| `tool_result` | `HookToolResult` | `PostToolExecution` |
+
+External command/HTTP serialization also adds `prompt` and `error` text
+projections. They are serialize-only convenience fields and are never accepted
+back as authority.
+
+`HookToolCall` contains `tool_use_id`, `name`, typed arguments, and optional
+`ToolProvenance`. `HookToolResult` contains the same identity/provenance plus
+ordered `content_blocks` and `is_error`; its external wire form adds a derived
+`content` text projection. `HookLlmResponse.server_tool_content` projects
+provider-native server-tool blocks, such as web search, into typed kinds.
+
+## Decisions and ordering
+
+`Observe` hooks never deny. `Guardrail` hooks may return `Allow` or typed
+`Deny { hook_id, reason_code, message, payload }`. Foreground hooks run by
+ascending priority and then registration order. The first denial short-circuits
+remaining foreground and background hooks.
+
+Background hooks are observational. Every background hook must have `Observe`
+capability or configuration validation rejects it, regardless of hook point.
+
+## Failure reasons
+
+Hook failure events carry one typed `HookFailureReason`:
+
+| Variant | Fields |
+|---------|--------|
+| `timeout` | `timeout_ms` |
+| `execution_failed` | `message` |
+| `config_invalid` | `message` |
+| `observe_only_violation` | none |
+
+Agent events are `hook_started`, `hook_completed`, `hook_failed`, and
+`hook_denied`.
 
 ## See also
 

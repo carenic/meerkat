@@ -168,7 +168,7 @@ impl TranscriptRewritePrefixReceipt {
         })
     }
 
-    /// Session whose canonical event log supplied this receipt.
+    /// Session whose projected event log supplied this receipt.
     #[must_use]
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
@@ -4057,7 +4057,7 @@ impl FileEventStore {
             };
             if receipt.start_prefix() != &proved_start {
                 return Err(EventStoreError::Store(format!(
-                    "transcript rewrite receipt starts at occurrence {}, but the canonical event log proves occurrence {}",
+                    "transcript rewrite receipt starts at occurrence {}, but the projected event log proves occurrence {}",
                     receipt.start_prefix().occurrence_count(),
                     proved_start.occurrence_count()
                 )));

@@ -1,7 +1,9 @@
 //! meerkat-mcp-server - MCP server exposing Meerkat as a tool
 //!
-//! This crate provides an MCP server that exposes Meerkat agent capabilities
-//! as MCP tools: meerkat_run and meerkat_resume.
+//! This crate exposes Meerkat's session, config, catalog, skill, history,
+//! blob, live-MCP, and event-stream operations as MCP tools. Feature-owned
+//! schedule, WorkGraph, and mob tool families can also contribute to the
+//! published registry.
 
 #![allow(dead_code, unused_imports, clippy::expect_used, clippy::large_futures)]
 

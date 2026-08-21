@@ -175,7 +175,7 @@ mod inner {
         }
 
         /// Attach a live-adapter host. Subsequent `live/open` calls
-        /// resolve it through [`live_adapter_host`].
+        /// resolve it through [`Self::live_adapter_host`].
         #[cfg(feature = "live")]
         pub fn set_live_adapter_host(&self, host: Arc<meerkat_live::LiveAdapterHost>) {
             if let Ok(mut slot) = self.live_adapter_host.write() {
@@ -202,7 +202,7 @@ mod inner {
 
         /// Replace the skill-identity registry unconditionally. Most
         /// callers should prefer
-        /// [`set_skill_identity_registry_for_generation`] which guards
+        /// [`Self::set_skill_identity_registry_for_generation`] which guards
         /// against stale-write races.
         pub fn set_skill_identity_registry(
             &self,

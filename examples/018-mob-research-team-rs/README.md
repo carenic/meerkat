@@ -1,13 +1,22 @@
 # 018 — Mob: Research Team (Rust)
 
-A research team where specialized researchers explore different domains
-and a lead analyst synthesizes findings into a cohesive report.
+Define and validate a research-team mob, spawn a lead plus two specialists,
+wire the team, and submit one question-generation prompt to the lead.
 
 ## Concepts
-- Diverge/converge coordination pattern
+
+- Diverge/converge roles encoded in the definition and skills
 - Multiple specialized profiles (market, tech)
 - Role wiring for cross-referencing between researchers
-- Evidence-based synthesis
+- Inline role instructions for evidence and synthesis
+
+The runnable path does not send research turns to the specialists or synthesize
+their outputs. It demonstrates the roster and topology that an application can
+use to implement that workflow.
+
+The example uses the standalone in-memory mob and session path. Use a
+runtime-backed surface when the mob must survive process restarts or accept
+durable external work.
 
 ## Profiles
 | Profile | Model | Role |

@@ -1,5 +1,11 @@
 # Meerkat 0.6 (codex/realtime-voice) — Verified findings
 
+> Historical branch-review ledger. This file records the 0.6
+> `codex/realtime-voice` review and is not maintained as current architecture
+> or an open-work list. Use `docs/reference/runtime-architecture.mdx`,
+> `docs/reference/mob-architecture.mdx`, and current source for present
+> contracts.
+
 Verified against worktree `/Users/luka/.codex/worktrees/ae76/meerkat` on branch `codex/realtime-voice` (HEAD), 93 commits ahead of `main`.
 
 ## Status (updated as fixes land)

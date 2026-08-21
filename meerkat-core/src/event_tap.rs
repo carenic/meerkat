@@ -14,10 +14,14 @@
 //! The authoritative truth a tap event mirrors lives elsewhere:
 //! - terminal run outcome → the `Agent::run*` return value / `RunResult`;
 //! - lifecycle/turn phase → the generated MeerkatMachine turn-state authority;
-//! - durable history → the persisted event store.
+//! - durable runtime-backed session state -> the selected `RuntimeStore` and
+//!   backend authority carrier.
+//!
+//! A host may install an asynchronous `EventStore` audit/replay projection,
+//! but that best-effort derived state does not become session authority.
 //!
 //! No consumer may reconstruct terminal or lifecycle truth from tap events.
-//! In particular, [`AgentEvent::StreamTruncated`](crate::event::AgentEvent::StreamTruncated)
+//! In particular, [`AgentEvent::StreamTruncated`]
 //! is a UI hint that the stream lost frames under backpressure — it must never be
 //! read as a terminal or failure verdict.
 

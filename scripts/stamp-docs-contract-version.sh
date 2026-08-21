@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Stamp the workspace/contract version into version-bearing docs lines.
 #
-# Public docs must not hand-maintain version strings: every marker line below
-# is a read-only projection of `workspace.package.version` (which is
-# lock-stepped with `ContractVersion::CURRENT`). This script rewrites those
-# projections; `--check` verifies them without writing (wired into
+# Repository-owned user documentation must not hand-maintain current-version
+# strings: every marker line below is a read-only projection of
+# `workspace.package.version` (which is lock-stepped with
+# `ContractVersion::CURRENT`). This script rewrites those projections;
+# `--check` verifies them without writing (wired into
 # scripts/verify-version-parity.sh so CI fails closed on drift).
 #
 # Usage:
@@ -59,10 +60,20 @@ SEMVER = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?")
 # contract/package version.
 MARKERS = [
     (re.compile(r'"contract_version"\s*:\s*"'), "docs/"),
+    (re.compile(r'"agent_version"\s*:\s*"'), "docs/api/"),
     (re.compile(r'"version"\s*:\s*"'), "docs/api/"),
     (re.compile(r"CONTRACT_VERSION"), "docs/"),
     (re.compile(r"\*\*Contract version:\*\*"), "docs/"),
     (re.compile(r'^\s*meerkat(?:-[a-z-]+)?\s*=\s*(?:"|\{)'), "docs/"),
+    (re.compile(r'^\s*meerkat(?:-[a-z-]+)?\s*=\s*(?:"|\{)'), "README.md"),
+    (
+        re.compile(r'^\s*meerkat(?:-[a-z-]+)?\s*=\s*(?:"|\{)'),
+        ".claude/skills/meerkat-platform/",
+    ),
+    (
+        re.compile(r"cargo install rkat --version"),
+        ".claude/skills/meerkat-platform/",
+    ),
 ]
 
 # `ContractVersion` also serializes in struct form
@@ -86,9 +97,15 @@ def stamp_struct_form(match: "re.Match[str]") -> str:
 
 changed = []
 stale = []
-for path in sorted(root.joinpath("docs").rglob("*.mdx")) + sorted(
-    root.joinpath("docs").rglob("*.md")
-):
+paths = list(root.joinpath("docs").rglob("*.mdx"))
+paths.extend(root.joinpath("docs").rglob("*.md"))
+paths.extend(
+    [
+        root / "README.md",
+        root / ".claude/skills/meerkat-platform/SKILL.md",
+    ]
+)
+for path in sorted(set(paths)):
     rel = path.relative_to(root).as_posix()
     # MobKit is an independently released product. Its generated documentation
     # is pinned to the public MobKit release recorded in docs/mobkit/_source.json

@@ -2654,7 +2654,7 @@ pub enum ConfigError {
 /// [`crate::config_store::RealmConfigSource`]). [`crate::connection::RealmChain`]
 /// is the single chain authority (cycle/depth/global/env_default validation),
 /// so this composition order can never diverge from the connection resolvers'
-/// chain order. The fold reuses the one [`Config::merge`] engine.
+/// chain order. The fold reuses the one `Config` merge engine.
 pub fn compose_effective_config(
     docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
     raw_docs: &std::collections::BTreeMap<crate::connection::RealmId, toml::Value>,
@@ -2728,7 +2728,7 @@ pub fn compose_effective_config(
     Ok(effective)
 }
 
-/// Serde helpers for Option<Duration> with humantime format
+/// Serde helpers for `Option<Duration>` with humantime format.
 mod optional_duration_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::Duration;

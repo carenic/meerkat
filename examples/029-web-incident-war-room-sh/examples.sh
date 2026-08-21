@@ -49,7 +49,7 @@ RKAT="$(resolve_rkat)"
 WASM_RUNTIME="${MEERKAT_WASM:-$WORKSPACE_ROOT/sdks/web/wasm/meerkat_web_runtime_bg.wasm}"
 if [[ ! -s "$WASM_RUNTIME" ]]; then
   echo "error: meerkat-web-runtime wasm not found at $WASM_RUNTIME" >&2
-  echo "Build it:  (cd \"$WORKSPACE_ROOT\" && wasm-pack build meerkat-web-runtime --target web --out-dir sdks/web/wasm)" >&2
+  echo "Build it: npm --prefix \"$WORKSPACE_ROOT/sdks/web\" run build:wasm" >&2
   echo "or set MEERKAT_WASM=/path/to/meerkat_web_runtime_bg.wasm" >&2
   exit 1
 fi
@@ -62,7 +62,7 @@ rm -rf "$MOB_DIR" "$WEB_OUT"
 mkdir -p "$WORK"
 cp -R "$SRC" "$MOB_DIR"
 
-echo "=== 029 — Web Incident War Room ==="
+echo "=== 029 - Web Incident War Room ==="
 echo ""
 echo "Source mobpack: $SRC"
 echo "Working copy:   $MOB_DIR"
@@ -102,6 +102,6 @@ echo "Then open:"
 echo "  http://127.0.0.1:4173"
 echo ""
 echo "Suggested user flow:"
-echo "  1. Bring your own API key in the browser UI."
-echo "  2. Paste the kickoff prompt above."
-echo "  3. Ask the commander for a 15-minute incident plan, then request status updates each turn."
+echo "  1. Enter an API key and verify that the WASM runtime initializes."
+echo "  2. Integrate the bundle with an @rkat/web host that creates the mob and members."
+echo "  3. Add a prompt UI and send the kickoff prompt above to the commander."

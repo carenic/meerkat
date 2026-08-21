@@ -18,8 +18,8 @@ as the conversation progresses.
 Install the SDK and the audio dependency:
 
 ```bash
-python3 -m pip install -e ../../sdks/python
-python3 -m pip install -r requirements.txt
+python3 -m pip install -e sdks/python
+python3 -m pip install -r examples/036-realtime-audio-py/requirements.txt
 ```
 
 When running from a source checkout, build the local RPC binary from the
@@ -39,7 +39,7 @@ sudo apt-get install portaudio19-dev
 Then run:
 
 ```bash
-OPENAI_API_KEY=sk-... python3 main.py
+OPENAI_API_KEY=sk-... python3 examples/036-realtime-audio-py/main.py
 ```
 
 The example asks `rkat-rpc` to start its live WebSocket host, creates an
@@ -61,23 +61,24 @@ same mob and prints the helper's final output when it is available.
 ## Options
 
 ```bash
-python3 main.py --help
-python3 main.py --text-probe
-python3 main.py --input-device 1 --output-device 2
-python3 main.py --helper-model gpt-5.5
-python3 main.py --realm live-demo
+python3 examples/036-realtime-audio-py/main.py --help
+python3 examples/036-realtime-audio-py/main.py --text-probe
+python3 examples/036-realtime-audio-py/main.py --input-device 1 --output-device 2
+python3 examples/036-realtime-audio-py/main.py --helper-model gpt-5.5
+python3 examples/036-realtime-audio-py/main.py --realm live-demo
 ```
 
 `--text-probe` keeps the live WebSocket path but sends one text chunk
-instead of opening local audio devices. It waits for a tool completion
-or turn completion event, so it is useful for checking runtime plumbing on
+instead of opening local audio devices. It waits for a tool request or turn
+completion event, so it is useful for checking runtime plumbing on
 machines without a microphone.
 
 ## Troubleshooting
 
-If startup reports that live audio input is unavailable, `rkat-rpc` started
-without an OpenAI live sideband factory. Check that `OPENAI_API_KEY` or your
-OpenAI auth binding is available to the runtime.
+If `live/open` fails or reports that live audio input is unavailable, check
+that `OPENAI_API_KEY` or a usable OpenAI auth binding is available to the
+runtime. This example does not fall back to a local text-only adapter when
+live authentication is unavailable.
 
 If audio devices fail to open, run `python3 -m sounddevice` to list device names
 and pass `--input-device` or `--output-device`.

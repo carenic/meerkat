@@ -16,6 +16,9 @@ legal, and what effects follow.
 - Schedule is the time authority. It owns trigger calculation, recurrence,
   occurrence claims, delivery attempts, and occurrence outcomes. A scheduled
   wake does not decide whether WorkGraph work remains ready or complete.
+- Detached Jobs own durable background execution, while Runtime Delivery owns
+  delivery identity, sequence, replay, and application progress. A job terminal
+  receipt does not by itself prove that the target runtime applied the result.
 - Peer delivery accelerates discovery of durable work and wakes disposable
   execution shells. A peer send or handoff receipt is not a WorkGraph claim,
   Schedule occurrence verdict, or proof that shared work completed.
@@ -32,31 +35,42 @@ The canonical registry is `canonical_machine_schemas()` in
 
 | Machine | Production owner | Scope |
 | --- | --- | --- |
-| `MeerkatMachine` | `meerkat-runtime` | Session runtime lifecycle, input admission, turn execution, tool visibility, comms drain, peer interaction, durable-tail recovery authorization. |
-| `MobMachine` | `meerkat-mob` | Mob lifecycle, roster, member runtime bindings, wiring, flows, tasks, and supervisor handoffs. |
-| `AuthMachine` | `meerkat-runtime` auth handles | Per-binding auth lease and OAuth flow lifecycle. |
-| `ApprovalLifecycleMachine` | `meerkat-core` | Approval request and decision lifecycle and gating. |
-| `DetachedJobMachine` | `meerkat-jobs` | Durable job lifecycle, fenced attempts, leases, retry/loss classification, cancellation, terminality, and delivery acknowledgement. |
-| `RuntimeDeliveryMachine` | `meerkat-runtime` | Stable durable-inbox identity, monotonic delivery/feed sequence assignment, exact replay, and ordered application cursor. |
-| `SessionDocumentMachine` | `meerkat-core` | Session document, transcript, pending-continuation lifecycle, the session lifecycle terminal fact for all profiles, cold-read source disposition, and durable-tail recovery classification. |
-| `SessionTurnAdmissionMachine` | `meerkat-session` | Per-turn input admission and classification lifecycle. |
-| `ScheduleLifecycleMachine` | `meerkat-schedule` | Schedule definition lifecycle, trigger state, and revision handling. |
-| `OccurrenceLifecycleMachine` | `meerkat-schedule` | Claimed occurrence delivery and terminal outcomes. |
-| `WorkGraphLifecycleMachine` | `meerkat-workgraph` | Work item lifecycle, readiness, dependency eligibility, claim leases, terminal state, and evidence revision handling. |
-| `WorkAttentionLifecycleMachine` | `meerkat-workgraph` | Goal attention binding lifecycle, pause/resume/supersession/stop state, and binding revision handling. |
-| `WorkExecutionLifecycleMachine` | `meerkat-workgraph` | Durable WorkGraph-to-executor binding lifecycle, launch uncertainty, terminal evidence projection, closure feedback, and retry eligibility. |
+| `MeerkatMachine` | `meerkat-runtime::meerkat_machine::dsl` | Session runtime lifecycle, input admission, turn execution, tool visibility, comms drain, peer interaction, durable-tail recovery authorization. |
+| `MobMachine` | `meerkat-mob::machines::mob_machine` | Mob lifecycle, roster, member runtime bindings, wiring, flows, tasks, and supervisor handoffs. |
+| `ScheduleLifecycleMachine` | `meerkat-schedule::machines::schedule_lifecycle` | Schedule definition lifecycle, trigger state, and revision handling. |
+| `OccurrenceLifecycleMachine` | `meerkat-schedule::machines::occurrence_lifecycle` | Claimed occurrence delivery and terminal outcomes. |
+| `AuthMachine` | `meerkat-runtime::auth_machine::dsl` | Per-binding auth lease and OAuth flow lifecycle. |
+| `ApprovalLifecycleMachine` | `meerkat-core::generated::approval_lifecycle` | Approval request and decision lifecycle legality. `ApprovalService` and its configured store own records and optional persistence; this machine does not imply an automatic in-loop tool gate. |
+| `DetachedJobMachine` | `meerkat-jobs::machines::detached_job` | Durable job lifecycle, fenced attempts, leases, retry/loss classification, cancellation, terminality, and delivery acknowledgement. |
+| `RuntimeDeliveryMachine` | `meerkat-runtime::delivery_inbox::dsl` | Stable durable-inbox identity, monotonic delivery/feed sequence assignment, exact replay, and ordered application cursor. |
+| `SessionDocumentMachine` | `meerkat-core::generated::session_document` | Session document, transcript, pending-continuation lifecycle, the session lifecycle terminal fact for all profiles, cold-read source disposition, and durable-tail recovery classification. |
+| `SessionTurnAdmissionMachine` | `meerkat-session::generated::session_turn_admission` | Per-turn input admission and classification lifecycle. |
+| `WorkGraphLifecycleMachine` | `meerkat-workgraph::machines::workgraph_lifecycle` | Work item lifecycle, readiness, dependency eligibility, claim leases, terminal state, and evidence revision handling. |
+| `WorkAttentionLifecycleMachine` | `meerkat-workgraph::machines::work_attention_lifecycle` | Goal attention binding lifecycle, pause/resume/supersession/stop state, and binding revision handling. |
+| `WorkExecutionLifecycleMachine` | `meerkat-workgraph::execution_machine` | Durable WorkGraph-to-executor binding lifecycle, launch uncertainty, terminal evidence projection, closure feedback, and retry eligibility. |
 
-`MeerkatMachine` and `MobMachine` are the two runtime kernels. Auth,
-scheduling, durable jobs, and runtime delivery are auxiliary authority machines that protect
-specific perimeter state. WorkGraph is an optional subsystem authority for
-durable agent commitments, dependency-aware claim state, and goal attention
-bindings. `WorkExecutionLifecycleMachine` owns the cross-system obligation for
-one execution attempt without absorbing either WorkGraph item truth or Mob Flow
-run truth. Its effects are realized mechanically by the Mob composition facade,
-and every launch, evidence, or closure outcome returns through a typed machine
-input before the binding advances.
+`MeerkatMachine` and `MobMachine` are the two runtime kernels. The other
+canonical machines protect narrower domain facts: auth and approval, schedules
+and occurrences, detached jobs and runtime delivery, session document and turn
+admission, and WorkGraph lifecycle, attention, and execution. WorkGraph is an
+optional subsystem authority for durable agent commitments, dependency-aware
+claim state, and goal attention bindings. `WorkExecutionLifecycleMachine` owns
+the cross-system obligation for one execution attempt without absorbing either
+WorkGraph item truth or Mob Flow run truth. Its effects are realized
+mechanically by the Mob composition facade, and every launch, evidence, or
+closure outcome returns through a typed machine input before the binding
+advances.
 
-One scoped authority sits outside the canonical registry:
+Two scoped authorities sit outside the canonical registry.
+
+`SessionPersistenceVersionAuthority` owns admission of released session
+envelope and metadata schema versions. Its catalog DSL lives at
+`meerkat-machine-schema/src/catalog/dsl/session_persistence_version_authority.rs`,
+and its production expansion lives at
+`meerkat-core/src/generated/session_persistence_version_authority.rs`. It is a
+small restore-time authority, not a persistence-currentness or recovery
+authority, and it has no entry in `canonical_machine_schemas()`.
+
 `MobHostBindingAuthority` (catalog DSL source
 `meerkat-machine-schema/src/catalog/dsl/mob_host_binding_authority.rs`,
 production expansion `meerkat-mob/src/machines/mob_host_binding_authority.rs`).
@@ -184,12 +198,12 @@ The canonical registry is `canonical_composition_schemas()` in
 | Composition | Purpose |
 | --- | --- |
 | `meerkat_mob_seam` | Session-runtime and mob-runtime handoffs. |
-| `auth_lease_bundle` | Auth authority publication into runtime credential consumers. |
-| `job_runtime_delivery` | Durable job-terminal outbox transfer into runtime-owned delivery identity, sequence, and application-cursor authority. |
+| `job_runtime_delivery` | Durable job terminal and notification outbox transfer into runtime-owned delivery identity, sequence, and application-cursor authority. |
 | `schedule_bundle` | Schedule and occurrence lifecycle coordination. |
 | `schedule_runtime_bundle` | Occurrence delivery into runtime sessions. |
 | `schedule_mob_bundle` | Occurrence delivery into mob runs. |
 | `adaptive_mob_bundle` | Adaptive control/layer mob composition, including generated layer-terminal feedback into the control kernel. |
+| `auth_lease_bundle` | Auth authority publication into runtime credential consumers. |
 | `workgraph_attention_bundle` | WorkGraph lifecycle and attention binding coordination. |
 | `workgraph_flow_bundle` | Work execution launch, run observation, terminal evidence, uncertain-launch resolution, and WorkGraph closure handoffs through the shared Mob runtime bridge. |
 

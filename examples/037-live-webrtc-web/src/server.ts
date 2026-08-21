@@ -126,6 +126,7 @@ const CALLBACK_TOOL_DEFS: ToolDefinition[] = [
 
 const MOB_MCP_TOOL_NAMES = [
   "delegate",
+  "conclude_objective",
   "mob_create",
   "mob_destroy",
   "mob_spawn_member",
@@ -135,6 +136,12 @@ const MOB_MCP_TOOL_NAMES = [
   "mob_list",
   "mob_wire",
   "mob_unwire",
+  "mob_profile_create",
+  "mob_profile_get",
+  "mob_profile_list",
+  "mob_profile_update",
+  "mob_profile_delete",
+  "mob_profile_list_sources",
 ];
 
 const LIVE_CONTROLLER_BLOCKED_TOOLS = ["mob_check_member"];

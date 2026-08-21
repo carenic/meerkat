@@ -13,7 +13,7 @@
 //! DSL-owned discriminants (turn phase, drain mode, surface phase, surface
 //! pending/staged op, auth lease phase) flow as typed enums defined here in
 //! `meerkat-core` — each maps 1-to-1 with the typed DSL state that
-//! [`meerkat-runtime::meerkat_machine`] owns. Free-form `String` values are
+//! `meerkat_runtime::meerkat_machine` owns. Free-form `String` values are
 //! reserved for opaque identifiers (surface ids, binding keys, error
 //! messages).
 //!

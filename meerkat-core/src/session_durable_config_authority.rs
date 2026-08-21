@@ -1,5 +1,5 @@
 //! Session durable-config authority — shell adapter over the canonical
-//! [`SessionDocumentMachine`](crate::generated::session_document).
+//! [`crate::generated::session_document::SessionDocumentMachineAuthority`].
 //!
 //! Every SEMANTIC admission decision for durable session config lives in the
 //! canonical machine's durable-config region (folded from the retired
@@ -12,9 +12,8 @@
 //!
 //! This module performs only the MECHANICAL work the DSL cannot express: it
 //! extracts the typed facts the machine's verdict actually reads from the bulky
-//! [`SessionMetadata`](crate::SessionMetadata) /
-//! [`SessionBuildState`](crate::SessionBuildState) records and feeds those —
-//! and only those — to the machine, then mirrors the machine's admit/reject
+//! [`SessionMetadata`] and [`SessionBuildState`] records, feeds exactly those
+//! facts to the machine, then mirrors the machine's admit/reject
 //! verdict. It NEVER decides admission itself, and it passes the original typed
 //! value through unchanged on admit — no fact is pre-reduced before the machine
 //! sees it. The shell does not mirror the full record into machine inputs: a
@@ -26,7 +25,7 @@ use crate::{SessionBuildState, SessionMetadata};
 /// Error surfaced when the canonical machine rejects a durable-config request.
 ///
 /// Carries the rejection message produced by the canonical
-/// [`SessionDocumentMachine`](crate::generated::session_document) so callers
+/// [`crate::generated::session_document::SessionDocumentMachineAuthority`], so callers
 /// keep a stable durable-config error type while the underlying authority is
 /// the canonical session-document machine.
 #[derive(Debug, Clone, PartialEq, Eq)]

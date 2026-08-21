@@ -953,7 +953,7 @@ where
     /// Cloneable producer handle for boundary-only cancellation requests.
     ///
     /// Returns a sender on the typed cancel-after-boundary command channel.
-    /// The requesting surface sends a [`CancelAfterBoundaryCommand`]; the agent
+    /// The requesting surface sends a [`crate::agent::CancelAfterBoundaryCommand`]; the agent
     /// loop observes it at the next turn boundary.
     pub fn cancel_after_boundary_handle(&self) -> super::CancelAfterBoundarySender {
         self.cancel_after_boundary_tx.clone()

@@ -1,5 +1,11 @@
 # SessionRuntime Split — surface-agnostic session orchestrator extraction
 
+> Historical session-runtime extraction ledger. Checkbox state and
+> coordination notes below belong to that implementation cycle, not current
+> Meerkat. Use `docs/reference/runtime-architecture.mdx` and
+> `docs/reference/session-contracts.mdx` for current ownership and lifecycle
+> contracts.
+
 ## Goal
 
 Move the surface-agnostic session orchestration logic out of

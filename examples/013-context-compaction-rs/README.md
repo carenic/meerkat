@@ -1,13 +1,13 @@
 # 013 — Context Compaction (Rust)
 
-Run agents indefinitely without exceeding the context window. The compactor
-automatically summarizes old messages while preserving critical context.
+Keep longer conversations within the context window by summarizing older
+messages while preserving recent and structurally important context.
 
 ## Concepts
 - `DefaultCompactor` — the built-in compaction strategy
 - `CompactionConfig` — threshold, summary size, preservation rules
 - Compaction events in the event stream
-- Infinite conversation support
+- Repeated compaction for long-running conversations
 
 ## How It Works
 ```

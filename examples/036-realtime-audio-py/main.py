@@ -79,7 +79,7 @@ class SharedState:
 
 @dataclass
 class TextProbeSignals:
-    tool_completed: asyncio.Event = field(default_factory=asyncio.Event)
+    tool_requested: asyncio.Event = field(default_factory=asyncio.Event)
     turn_completed: asyncio.Event = field(default_factory=asyncio.Event)
     channel_closed: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -138,9 +138,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Model used when the voice agent delegates work to a helper mob member.",
     )
     parser.add_argument("--realm", default=None, help="Optional existing Meerkat realm to use.")
-    parser.add_argument("--rkat-path", default=os.environ.get("RKAT_RPC", "rkat-rpc"))
-    parser.add_argument("--input-device", default=None, help="sounddevice input device name or index.")
-    parser.add_argument("--output-device", default=None, help="sounddevice output device name or index.")
+    parser.add_argument(
+        "--rkat-path",
+        default=os.environ.get("RKAT_RPC", "rkat-rpc"),
+        help=(
+            "Path to rkat-rpc. Defaults to RKAT_RPC or rkat-rpc; the SDK also "
+            "honors MEERKAT_BIN_PATH."
+        ),
+    )
+    parser.add_argument(
+        "--input-device",
+        default=None,
+        type=parse_sounddevice_selector,
+        help="sounddevice input device name or numeric index.",
+    )
+    parser.add_argument(
+        "--output-device",
+        default=None,
+        type=parse_sounddevice_selector,
+        help="sounddevice output device name or numeric index.",
+    )
     parser.add_argument("--chunk-ms", type=int, default=100, help="Microphone frame size in milliseconds.")
     parser.add_argument("--mic-queue", type=int, default=24, help="Buffered microphone chunks before dropping.")
     parser.add_argument("--no-speaker", action="store_true", help="Do not play assistant audio.")
@@ -150,6 +167,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Send one text live turn instead of opening microphone devices.",
     )
     return parser
+
+
+def parse_sounddevice_selector(value: str) -> str | int:
+    return int(value) if value.isdecimal() else value
 
 
 def voice_host_skill() -> str:
@@ -498,10 +519,10 @@ async def live_receiver(
             elif kind == "tool_call_requested":
                 printer.tool(f"requested {obs.get('tool_name')} ({obs.get('provider_call_id')})")
                 if text_probe_signals is not None:
-                    text_probe_signals.tool_completed.set()
+                    text_probe_signals.tool_requested.set()
             elif kind == "status_changed":
                 status = obs.get("status", {})
-                printer.status(f"channel {read_field(status, 'state', 'unknown')}")
+                printer.status(f"channel {read_field(status, 'status', 'unknown')}")
             elif kind == "error":
                 code = obs.get("code", {})
                 message = obs.get("message", "live channel error")
@@ -563,22 +584,22 @@ async def run_text_probe(
         }
     )
     await channel.commit_input(response_modality="text")
-    printer.status("text probe sent; waiting for a tool or turn completion event")
+    printer.status("text probe sent; waiting for a tool request or turn completion event")
     completed = await wait_for_first_event(
         {
-            "tool completion": signals.tool_completed,
+            "tool request": signals.tool_requested,
             "turn completion": signals.turn_completed,
             "channel close": signals.channel_closed,
         },
         timeout_s=timeout_s,
     )
     if completed == "channel close":
-        if signals.tool_completed.is_set():
-            completed = "tool completion"
+        if signals.tool_requested.is_set():
+            completed = "tool request"
         elif signals.turn_completed.is_set():
             completed = "turn completion"
     if completed == "channel close":
-        raise RuntimeError("text probe channel closed before a tool or turn completion event")
+        raise RuntimeError("text probe channel closed before a tool request or turn completion event")
     printer.status(f"text probe observed {completed}")
     stop_event.set()
 
@@ -624,14 +645,13 @@ def require_audio_capabilities(open_result: dict[str, Any]) -> tuple[AudioFormat
     if not read_field(capabilities, "audio_in", False):
         raise RuntimeError(
             "Live audio input is unavailable. Check OPENAI_API_KEY or your OpenAI "
-            "auth binding; without OpenAI credentials rkat-rpc exposes a "
-            "text-only fallback channel."
+            "auth binding. This example requires an authenticated live adapter."
         )
-    input_format = read_field(capabilities, "audio_input_format")
-    output_format = read_field(capabilities, "audio_output_format")
-    input_audio = AudioFormat.from_wire(input_format)
-    output_audio = AudioFormat.from_wire(output_format, fallback=input_audio)
-    return input_audio, output_audio
+    # The current WebSocket transport contract pins binary audio to
+    # pcm_24k_mono; LiveOpenResult capabilities expose support booleans rather
+    # than negotiated format objects.
+    pcm_24k_mono = AudioFormat(mime_type="audio/pcm", sample_rate_hz=24_000, channels=1)
+    return pcm_24k_mono, pcm_24k_mono
 
 
 def require_text_capabilities(open_result: dict[str, Any]) -> None:
@@ -785,6 +805,7 @@ async def async_main(argv: list[str] | None = None) -> int:
     }
     output_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
     connection = None
+    channel: LiveChannel | None = None
     tasks: list[asyncio.Task[Any]] = []
     text_probe_signals = TextProbeSignals() if args.text_probe else None
 
@@ -848,8 +869,9 @@ async def async_main(argv: list[str] | None = None) -> int:
         if connection is not None:
             with contextlib.suppress(Exception):
                 await connection.close()
-        with contextlib.suppress(Exception):
-            await channel.close()
+        if channel is not None:
+            with contextlib.suppress(Exception):
+                await channel.close()
         await output_queue.put(None)
         for task in tasks:
             task.cancel()

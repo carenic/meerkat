@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # 004 — CLI One-Liners (Shell)
 #
-# Meerkat ships a CLI binary `rkat` that covers every surface without writing
-# code. This script demonstrates the most common CLI patterns.
+# Meerkat ships a CLI binary `rkat` for runtime and configuration workflows.
+# This script demonstrates a small set of common CLI patterns.
 #
 # What you'll learn:
 # - Running single-turn prompts
-# - Managing sessions (create, resume, list, show, delete)
+# - Managing sessions (create, resume, list)
 # - Using realms for isolation
 # - Configuring the runtime from the command line
 #
@@ -68,7 +68,7 @@ echo "=== 4. List sessions ==="
 $RKAT session list
 
 echo ""
-echo "=== 5. Isolated realm (ephemeral workspace) ==="
+echo "=== 5. Fresh isolated realm ==="
 $RKAT run --isolated "This session lives in its own isolated realm."
 
 echo ""

@@ -1,4 +1,4 @@
-//! # 035 — MDM TUX: RPC Client TUI
+//! # 035 - MDM TUX: RPC Client TUI
 //!
 //! Ratatui-based terminal UI that controls remote Meerkat agents via JSON-RPC.
 //!
@@ -8,11 +8,15 @@
 //! ```
 //!
 //! ## Architecture
-//! TUX has NO comms identity and NO agent runtime. It is a pure RPC client:
+//! TUX has no Meerkat comms runtime and no agent runtime. It is a pure RPC
+//! client, but kennel mode persists an Ed25519 identity for signed kennel
+//! protocol messages:
 //! - Connects to target agents via `RpcClient` (JSON-RPC over TCP)
 //! - Streams `session/stream_event` notifications for live display
 //! - In kennel mode, the kennel is just a broker that gives TUX the target's
 //!   RPC address; all subsequent interaction goes direct to the target
+//! - Target and hive RPC are unauthenticated plaintext and must remain inside
+//!   an authenticated, encrypted network boundary
 //!
 //! ## Keys
 //! Tab=mode  Up/Down=target  PgUp/PgDn=scroll  End=auto-scroll  Esc=quit
@@ -72,7 +76,7 @@ struct TargetView {
     /// Channel to cancel background notification listener.
     _cancel_tx: Option<mpsc::Sender<()>>,
     /// Cached model IDs from the last `/models` catalog fetch. Used to
-    /// validate `/model <name>` before persisting a potentially bad name.
+    /// validate a `/model <name>` next-turn override.
     known_models: HashSet<String>,
 }
 
@@ -319,24 +323,21 @@ enum RpcCommand {
     },
     /// List models.
     ListModels { target_id: String },
-    /// Change model.
-    SetModel {
-        target_id: String,
-        session_id: String,
-        model: String,
-    },
     /// Interrupt a running turn.
     Interrupt {
         target_id: String,
         session_id: String,
     },
-    /// Resume the most recent session, or create new if none exist.
+    /// Resume the most recent session. Session creation is not implemented
+    /// for a fresh direct target.
     ResumeLatestOrCreate { target_id: String },
     /// Respawn a mob member via the hive. Retires + re-spawns with fresh
     /// comms wiring. Used instead of raw session/create for mob members.
     MobRespawn {
-        /// The target name (mob member meerkat_id).
+        /// The target name (mob member agent identity).
         target_name: String,
+        /// Current session to archive before creating a new hive session.
+        current_session_id: Option<String>,
     },
     /// Connect to a target's RPC address.
     Connect { target_id: String, rpc_addr: String },
@@ -588,19 +589,32 @@ async fn rpc_command_loop(
                             .await;
                         return;
                     };
-                    // Open the stream on the existing session
-                    let _ = client
+                    // Bind only after the server confirms that the session
+                    // exists and its stream was opened.
+                    match client
                         .request(
                             "session/stream_open",
                             serde_json::json!({ "session_id": session_id }),
                         )
-                        .await;
-                    let _ = event_tx
-                        .send(TuiEvent::SessionBound {
-                            target_id,
-                            session_id,
-                        })
-                        .await;
+                        .await
+                    {
+                        Ok(_) => {
+                            let _ = event_tx
+                                .send(TuiEvent::SessionBound {
+                                    target_id,
+                                    session_id,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = event_tx
+                                .send(TuiEvent::RpcError {
+                                    target_id,
+                                    message: format!("session/stream_open failed: {e}"),
+                                })
+                                .await;
+                        }
+                    }
                 });
             }
             RpcCommand::ListModels { target_id } => {
@@ -637,56 +651,6 @@ async fn rpc_command_loop(
                                 .send(TuiEvent::RpcError {
                                     target_id,
                                     message: format!("models/catalog failed: {e}"),
-                                })
-                                .await;
-                        }
-                    }
-                });
-            }
-            RpcCommand::SetModel {
-                target_id,
-                session_id,
-                model,
-            } => {
-                let event_tx = event_tx.clone();
-                let clients = clients.clone();
-                tokio::spawn(async move {
-                    let client = {
-                        let map = clients.lock().await;
-                        map.get(&target_id).cloned()
-                    };
-                    let Some(client) = client else {
-                        let _ = event_tx
-                            .send(TuiEvent::RpcError {
-                                target_id,
-                                message: "not connected".into(),
-                            })
-                            .await;
-                        return;
-                    };
-                    match client
-                        .request(
-                            "config/patch",
-                            serde_json::json!({
-                                "session_id": session_id,
-                                "config": { "model": model },
-                            }),
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            let _ = event_tx
-                                .send(TuiEvent::RpcResponse {
-                                    target_id,
-                                    body: format!("model set to {model}"),
-                                })
-                                .await;
-                        }
-                        Err(e) => {
-                            let _ = event_tx
-                                .send(TuiEvent::RpcError {
-                                    target_id,
-                                    message: format!("config/patch failed: {e}"),
                                 })
                                 .await;
                         }
@@ -739,7 +703,10 @@ async fn rpc_command_loop(
                     }
                 });
             }
-            RpcCommand::MobRespawn { target_name } => {
+            RpcCommand::MobRespawn {
+                target_name,
+                current_session_id,
+            } => {
                 let event_tx = event_tx.clone();
                 let clients = clients.clone();
                 tokio::spawn(async move {
@@ -760,10 +727,25 @@ async fn rpc_command_loop(
                                 .await;
                             return;
                         };
-                        // Archive current session, then create fresh one.
-                        let _ = client
-                            .request("session/archive", serde_json::json!({}))
-                            .await;
+                        // Archive the current session when it is known, then
+                        // create a fresh hive session.
+                        if let Some(session_id) = current_session_id {
+                            if let Err(e) = client
+                                .request(
+                                    "session/archive",
+                                    serde_json::json!({ "session_id": session_id }),
+                                )
+                                .await
+                            {
+                                let _ = event_tx
+                                    .send(TuiEvent::RpcError {
+                                        target_id: target_name,
+                                        message: format!("session/archive failed: {e}"),
+                                    })
+                                    .await;
+                                return;
+                            }
+                        }
                         match client
                             .request("session/create", serde_json::json!({
                                 "prompt": "You are the hive orchestrator. Use peers as the source of truth, then use send_request and send_message to manage the fleet.",
@@ -804,7 +786,8 @@ async fn rpc_command_loop(
                     }
 
                     // mob/respawn routes to the hive (kennel mode) or the
-                    // target itself (direct mode — target has its own mob).
+                    // target itself. Fresh direct targets do not currently
+                    // create the local mob definition required by this call.
                     let (client, mob_id) = {
                         let map = clients.lock().await;
                         if let Some(hive) = map.get("hive").cloned() {
@@ -827,7 +810,7 @@ async fn rpc_command_loop(
                             "mob/respawn",
                             serde_json::json!({
                                 "mob_id": mob_id,
-                                "meerkat_id": target_name,
+                                "agent_identity": target_name,
                             }),
                         )
                         .await
@@ -870,30 +853,44 @@ async fn rpc_command_loop(
                             if let Some(latest) = sessions.first() {
                                 if let Some(sid) = latest.get("session_id").and_then(|v| v.as_str())
                                 {
-                                    let _ = client
+                                    match client
                                         .request(
                                             "session/stream_open",
                                             serde_json::json!({ "session_id": sid }),
                                         )
-                                        .await;
-                                    let _ = event_tx
-                                        .send(TuiEvent::SessionBound {
-                                            target_id: target_id.clone(),
-                                            session_id: sid.to_string(),
-                                        })
-                                        .await;
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            let _ = event_tx
+                                                .send(TuiEvent::SessionBound {
+                                                    target_id: target_id.clone(),
+                                                    session_id: sid.to_string(),
+                                                })
+                                                .await;
+                                        }
+                                        Err(e) => {
+                                            let _ = event_tx
+                                                .send(TuiEvent::RpcError {
+                                                    target_id: target_id.clone(),
+                                                    message: format!(
+                                                        "session/stream_open failed: {e}"
+                                                    ),
+                                                })
+                                                .await;
+                                        }
+                                    }
                                     return;
                                 }
                             }
                         }
                     }
-                    // No existing session. For targets this shouldn't happen
-                    // (the mob creates sessions at spawn time). For the hive,
-                    // the kennel pre-creates the session. Report the gap.
+                    // No existing session. Kennel mode normally creates one
+                    // before TUX connects, but fresh direct mode does not.
                     let _ = event_tx
                         .send(TuiEvent::RpcError {
                             target_id,
-                            message: "no session found — target may not be registered yet".into(),
+                            message: "no persisted session found; fresh direct-session creation is not implemented"
+                                .into(),
                         })
                         .await;
                 });
@@ -1396,8 +1393,9 @@ async fn spawn_kennel_client(
                     rpc_addr: addr.clone(),
                 })
                 .await;
-            // Pre-bind the hive session so ResumeLatestOrCreate doesn't
-            // create a new session (the kennel already created it).
+            // Pre-bind the hive session supplied by the kennel. The fallback
+            // connection path only resumes persisted sessions; it does not
+            // create one.
             if let Some(sid) = hive_session_id {
                 let _ = event_tx
                     .send(TuiEvent::SessionBound {
@@ -1610,16 +1608,20 @@ async fn main() -> anyhow::Result<()> {
     {
         rust_log.push_str(",tui_markdown=error");
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(rust_log)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(rust_log).init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         eprintln!("Usage: mdm-tux --target HOST:PORT [--target HOST2:PORT2]");
-        eprintln!("   or: mdm-tux --kennel HOST:PORT [--listen PORT] [--advertise IP]");
+        eprintln!("   or: mdm-tux --kennel HOST:PORT [--data-dir PATH]");
         eprintln!("\nDirect mode: connect to target RPC servers directly");
         eprintln!("Kennel mode: broker discovers targets and provides their RPC addresses");
+        eprintln!(
+            "Fresh direct targets have no session; direct mode can only resume persisted sessions."
+        );
+        eprintln!(
+            "WARNING: target and hive RPC are unauthenticated plaintext; use only inside an authenticated, encrypted network boundary."
+        );
         std::process::exit(1);
     }
 
@@ -1720,7 +1722,8 @@ async fn run_kennel_tux(args: &[String]) -> anyhow::Result<()> {
 
     println!("=== TUX -- Meerkat Device Manager (Kennel Mode) ===");
     println!("kennel    : {kennel_addr}");
-    println!("direct    : {direct_addr}");
+    println!("legacy_hint: {direct_addr} (not used for RPC or kennel registration)");
+    println!("warning   : discovered RPC endpoints are unauthenticated plaintext");
     println!();
 
     let (event_tx, event_rx) = mpsc::channel::<TuiEvent>(256);
@@ -1883,7 +1886,8 @@ fn process_event(
                 if was_disconnected {
                     app.targets[idx].session_id = None;
                 }
-                // Auto-resume latest session or create new
+                // Resume the latest persisted session. Fresh direct targets
+                // currently have no session-creation path.
                 if app.targets[idx].session_id.is_none() {
                     let _ = rpc_tx.send(RpcCommand::ResumeLatestOrCreate { target_id });
                 }
@@ -1969,16 +1973,30 @@ fn process_event(
             sessions,
         } => {
             if let Some(idx) = app.find_target_by_id(&target_id) {
-                let display = if let Some(arr) = sessions.as_array() {
-                    arr.iter()
-                        .enumerate()
-                        .map(|(i, s)| {
-                            let id = s.get("session_id").and_then(|v| v.as_str()).unwrap_or("?");
-                            let model = s.get("model").and_then(|v| v.as_str()).unwrap_or("?");
-                            format!("  {}: {} ({})", i + 1, short_id(id), model)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                let session_rows = sessions
+                    .get("sessions")
+                    .and_then(|value| value.as_array())
+                    .or_else(|| sessions.as_array());
+                let display = if let Some(arr) = session_rows {
+                    if arr.is_empty() {
+                        "  (no persisted sessions)".to_string()
+                    } else {
+                        arr.iter()
+                            .map(|s| {
+                                let id =
+                                    s.get("session_id").and_then(|v| v.as_str()).unwrap_or("?");
+                                let message_count =
+                                    s.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let active = s
+                                    .get("is_active")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let state = if active { ", active" } else { "" };
+                                format!("  {id} ({message_count} messages{state})")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
                 } else {
                     serde_json::to_string_pretty(&sessions).unwrap_or_else(|_| sessions.to_string())
                 };
@@ -1986,7 +2004,7 @@ fn process_event(
                     "**Sessions**".to_string(),
                     display,
                     String::new(),
-                    "Use `/resume <N>` to resume a session.".to_string(),
+                    "Use `/resume <ID>` with the full session ID.".to_string(),
                 ]);
             }
         }
@@ -2047,9 +2065,7 @@ fn process_event(
                         if let Some(idx) = app.find_target_by_id(&entry.target_id) {
                             let addr_changed = app.targets[idx].rpc_addr != *rpc_addr;
                             app.targets[idx].rpc_addr = rpc_addr.clone();
-                            if addr_changed
-                                || app.targets[idx].phase == TargetPhase::Disconnected
-                            {
+                            if addr_changed || app.targets[idx].phase == TargetPhase::Disconnected {
                                 let _ = rpc_tx.send(RpcCommand::Connect {
                                     target_id: entry.target_id.clone(),
                                     rpc_addr: rpc_addr.clone(),
@@ -2293,7 +2309,12 @@ fn handle_key(
                     return;
                 }
                 if target.session_id.is_none() {
-                    app.targets[idx].push_notice("error", "no session; use /new first");
+                    let message = if app.transport == TransportMode::Direct {
+                        "no persisted session is available; fresh direct-session creation is not implemented"
+                    } else {
+                        "no session is bound; wait for kennel registration or use /new"
+                    };
+                    app.targets[idx].push_notice("error", message);
                     return;
                 }
                 // Kennel claim check (skip for hive — it's directly connected
@@ -2384,13 +2405,22 @@ fn handle_slash_command(
                 return;
             }
             let target_name = app.targets[idx].name.clone();
+            let current_session_id = app.targets[idx].session_id.clone();
             app.targets[idx].push_user_turn("/new");
             if target_name == "hive" {
                 app.targets[idx].push_notice("session", "creating fresh hive session...");
+            } else if app.transport == TransportMode::Direct {
+                app.targets[idx].push_notice(
+                    "unsupported",
+                    "fresh direct-session creation is not implemented; mob/respawn will fail without a local mob definition",
+                );
             } else {
                 app.targets[idx].push_notice("mob", &format!("respawning {target_name}..."));
             }
-            let _ = rpc_tx.send(RpcCommand::MobRespawn { target_name });
+            let _ = rpc_tx.send(RpcCommand::MobRespawn {
+                target_name,
+                current_session_id,
+            });
         }
         "/resume" if arg.is_empty() => {
             if app.targets.is_empty() {
@@ -2423,7 +2453,14 @@ fn handle_slash_command(
                         "  `/release`      -- release selected target back to kennel".into(),
                     );
                 }
-                t.push_line("  `/new`          -- start a fresh session".into());
+                let new_help = if t.target_id == "hive" {
+                    "  `/new`          -- archive and replace the hive session"
+                } else if app.transport == TransportMode::Direct {
+                    "  `/new`          -- unsupported for a fresh direct target"
+                } else {
+                    "  `/new`          -- respawn the selected kennel target"
+                };
+                t.push_line(new_help.into());
                 t.push_line("  `/resume`       -- list past sessions".into());
                 t.push_line("  `/resume <ID>`  -- resume session by ID".into());
                 t.push_line("  `/model <name>` -- set model for next turn".into());
@@ -2446,14 +2483,6 @@ fn handle_slash_command(
                 }
                 app.pending_model = Some(arg.to_string());
                 t.push_notice("model", &format!("next turn will use model: {arg}"));
-                // Also push to server if we have a session
-                if let Some(session_id) = t.session_id.clone() {
-                    let _ = rpc_tx.send(RpcCommand::SetModel {
-                        target_id: t.target_id.clone(),
-                        session_id,
-                        model: arg.to_string(),
-                    });
-                }
             }
         }
         "/model" => {
@@ -2817,7 +2846,9 @@ fn render_input(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) 
         if let Some(hive_idx) = app.find_target_by_id("hive") {
             let hive = &app.targets[hive_idx];
             match hive.phase {
-                TargetPhase::Disconnected => "Hive disconnected -- waiting for RPC connection".into(),
+                TargetPhase::Disconnected => {
+                    "Hive disconnected -- waiting for RPC connection".into()
+                }
                 TargetPhase::Running => "Hive is working; new messages queue.".into(),
                 TargetPhase::Idle => "Ready to send to hive.".into(),
             }

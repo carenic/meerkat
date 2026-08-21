@@ -8,7 +8,8 @@ For upgrade and terminology changes, also load:
 
 Use explicit realm to control sharing/isolation.
 
-- Same `realm_id` => shared sessions/config/backend.
+- Same `realm_id` plus the same physical storage provider/root => shared
+  sessions and state.
 - Different `realm_id` => isolated state.
 - Backend is pinned per realm via `realm_manifest.json`.
 - New persistent realms default to `sqlite` when sqlite support is compiled.
@@ -44,8 +45,8 @@ Global flags (available on all commands):
 --realm <id>              # explicit realm ID
 --isolated                # start in isolated mode (new generated realm)
 --instance <id>           # optional instance ID inside a realm
---realm-backend <sqlite|jsonl>
---state-root <path>       # override realm state root; default <context-root>/.rkat/realms
+--realm-backend <sqlite|jsonl|memory>
+--state-root <path>       # override realm state root; default <project-root>/.rkat/realms, walking up to the nearest .rkat
 --context-root <path>     # realm identity + project files root; default CWD
 --user-config-root <path> # optional user-global convention root
 ```
@@ -166,8 +167,8 @@ Examples:
 ```bash
 rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .
 rkat mcp add linear --url https://mcp.example.com
-rkat mcp add --transport http glean https://king-be.glean.com/mcp/default
-rkat mcp login glean
+rkat mcp add --transport http remote-tools https://mcp.example.com/api
+rkat mcp login remote-tools
 rkat mcp list
 ```
 
@@ -334,12 +335,13 @@ remote peer, start `rkat run` with `--comms-listen-tcp` and usually
 
 Generated assistant images appear in `session/history` as assistant blocks with `block_type: "image"`; fetch bytes via `blob/get` using `data.blob_ref.blob_id`.
 
-CLI image generation is assistant-mediated; there is no direct `rkat image` command and no `rkat rpc` subcommand. Use:
-
-```bash
-rkat run --allow-tool generate_image "Use generate_image to create a 1024x1024 PNG of a meerkat on a laptop. Return the blob id."
-rkat blob get <BLOB-ID> --output meerkat.png
-```
+There is no direct `rkat image` command and no `rkat rpc` subcommand. Normal
+runtime composites treat image-generation `Inherit` as visible when the image
+machine, executor, planner, and blob store are wired. `--allow-tool
+generate_image` can narrow that catalog but cannot create missing dependencies.
+The minimal no-builtins/no-shell path requires explicit `Enable`, available
+through a Mob profile or an in-process runtime-backed build. After a generated
+result returns a blob id, fetch it with `rkat blob get <BLOB-ID>`.
 
 ### Live channels (caller-initiated)
 
@@ -351,6 +353,7 @@ rkat blob get <BLOB-ID> --output meerkat.png
 - `live/interrupt` — interrupt the assistant turn on a live channel (barge-in)
 - `live/truncate` — truncate assistant output at a client-tracked playback cursor
 - `live/refresh` — apply mutable session config (instructions/tools/audio) to an open live channel
+- `live/webrtc/answer` - exchange a browser offer for a server SDP answer using the single-use token returned by a WebRTC `live/open`
 
 Set `model: "gpt-realtime-2"` on `session/create` and call `live/open` to open a live channel; capability is gated on `ModelCapabilities.realtime`. Check the returned `capabilities.image_in` boolean before calling `live/send_input` with `{ "kind": "image", "idempotency_key": "turn-42-diagram", "mime": "image/png", "data": "<base64>" }`. Image input is staged context for the next text, audio, or explicitly committed response. `status: "sent"` is queue acceptance only; wait for `user_content_committed` with the matching key for durable success. An exact same-key replay returns the prior receipt without resending provider input; different MIME/bytes reject with `image_input_idempotency_conflict`. Commit staged text/audio before submitting an image (`image_input_requires_commit`). Canonical live image history is capped at 40 MiB decoded in aggregate; new input that would cross it rejects before provider send as `image_input_history_budget_exceeded`. Legacy/out-of-band overflow, missing blobs, and content-address mismatches fail `live/open`; reconnect never trims accepted image context.
 
@@ -362,7 +365,12 @@ truncation reports degraded continuity. Runtime system context and full
 canonical image identity, tombstone, and accounting sidecars stay outside the
 message window.
 
-The `live/*` methods require at least one configured live transport: `rkat-rpc --live-ws <addr>` for WebSocket and/or the WebRTC listener flags for WebRTC.
+The `live/*` methods require at least one configured live transport: use
+`rkat-rpc --live-ws <addr>` for WebSocket, or build with the `live-webrtc`
+feature and pass `rkat-rpc --live-webrtc` for WebRTC signaling. A WebRTC
+client requests `transport: "webrtc"`, creates a local offer, calls the
+returned `answer_method` (currently `live/webrtc/answer`) with the channel id,
+single-use token, and `offer_sdp`, then applies the returned `answer_sdp`.
 
 ### Auth (realm/binding model)
 
@@ -384,7 +392,7 @@ rkat auth bindings
 rkat auth test <BINDING_ID>
 rkat auth status <PROFILE_ID>
 rkat auth login [PROVIDER] [--backend <BACKEND>] [--method <METHOD>] [--non-interactive --secret <SECRET>]
-rkat auth logout <PROFILE_ID>
+rkat auth logout [<REALM>:]<BINDING_ID>
 rkat auth refresh <PROFILE_ID>
 ```
 
@@ -394,7 +402,11 @@ Interactive OAuth writes `global:anthropic_oauth`, `global:openai_oauth`, or
 `global:google_oauth`; non-interactive api-key login writes
 `global:default_<provider>`. Legacy `dev`-realm logins migrate to `global` on the
 run path (idempotent, no-clobber). Credential reads inherit down the chain;
-writes are strict-owner (land only in the realm that defines the binding).
+writes are strict-owner and must explicitly address the realm that defines the
+binding. A child-addressed inherited write is rejected with owner information;
+it is not forwarded automatically. Logout parses the positional
+`[<realm>:]<binding>` as the token owner; a bare binding means `global`, and
+`--realm` does not retarget it.
 
 ### Scheduling
 
@@ -466,6 +478,11 @@ Multi-host operator control:
 - `mob/grant_scopes`, `mob/revoke_scopes`, `mob/grants`
 - `mob/bind_host`, `mob/revoke_host`, `mob/hard_cancel_member`
 - `mob/member_live_open`, `mob/member_live_close`, `mob/member_live_status`, `mob/member_live_control`
+
+The mob member-live family is WebSocket-only for both local and placed
+members. Session-scoped `live/*` can use WebRTC only for a session local to the
+RPC host; the controller's generic session surface cannot proxy a placed
+member's remote session.
 
 Flows:
 

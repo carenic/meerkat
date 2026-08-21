@@ -55,6 +55,7 @@ resolver source, the registered resolver is invoked (see auth section).
 | `mob_force_cancel` | mob_id, agent_identity | `()` | async, force-cancel an in-flight turn |
 | `mob_member_status` | mob_id, agent_identity | JSON | async, execution status snapshot |
 | `mob_member_send` | mob_id, agent_identity, payload JSON | `()` | async, send a message to a member |
+| `mob_member_peer_target` | mob_id, member | peer target JSON | async, resolve a member name to its canonical comms peer target; wrapped by `Member.peerTarget()` in `@rkat/web` |
 | `mob_list_members` | mob_id | RosterEntry[] JSON | async |
 | `mob_append_system_context` | mob_id, agent_identity, request JSON | result JSON | async, append context to a member's system prompt |
 | `mob_wire` / `mob_unwire` | mob_id, a, b | `()` | async, identity-keyed wiring |

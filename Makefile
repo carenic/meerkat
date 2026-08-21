@@ -490,6 +490,7 @@ doc:
 docs-check:
 	@echo "$(GREEN)Checking Mintlify docs...$(NC)"
 	@$(PYTHON) scripts/validate-mintlify-docs.py
+	@$(PYTHON) scripts/test_validate_mintlify_docs.py
 	@$(PYTHON) scripts/test_sync_mobkit_docs.py
 	@$(PYTHON) scripts/test_publish_mobkit_docs.py
 	@$(PYTHON) scripts/test_usage_accounting_docs.py
@@ -697,11 +698,11 @@ release-preflight: release-doctor verify-lock-consistency verify-bazel-locks-str
 	@echo "  2. All CI checks passed (above)"
 	@echo "  3. Schema artifacts are fresh (above)"
 	@echo ""
-	@echo "$(YELLOW)  4. STAMP THE NOTES BEFORE BUMPING.$(NC)"
-	@echo "     Nothing stamps CHANGELOG.md automatically: not cargo-release,"
-	@echo "     not scripts/release-hook.sh. Rename '## [Unreleased]' to"
-	@echo "     '## [<next version>] - <YYYY-MM-DD>' and leave a fresh empty"
-	@echo "     '## [Unreleased]' stub above it, THEN run cargo release."
+	@echo "$(YELLOW)  4. LEAVE THE NOTES UNDER [Unreleased].$(NC)"
+	@echo "     cargo-release invokes scripts/release-hook.sh in the version-bump"
+	@echo "     commit. The hook stamps the pending section as"
+	@echo "     '## [<next version>] - <YYYY-MM-DD>' and leaves a fresh empty"
+	@echo "     '## [Unreleased]' stub above it. Do not stamp it by hand first."
 	@echo "     0.8.23 shipped with ~420 lines of notes still titled"
 	@echo "     'Unreleased'; the release_semver_gate job now fails the tag"
 	@echo "     for exactly that."

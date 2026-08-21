@@ -111,7 +111,7 @@ pub struct BuildAgentConfigParams<'a> {
     /// `None` means "no persisted authority" — when the profile says enable,
     /// the canonical resolver synthesizes a generated `create_only` shape.
     /// `Some(authority)` carries forward an already-issued capability scope
-    /// (typically restored from event-sourced session metadata) and the
+    /// (typically restored from durable session metadata) and the
     /// resolver preserves it.
     pub mob_tool_authority_context: Option<MobToolAuthorityContext>,
     /// Pre-resolved inherited tool filter from spawn tooling.

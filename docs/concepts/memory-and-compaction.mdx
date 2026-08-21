@@ -25,10 +25,58 @@ This is not just an implementation detail or optional addon. It shapes how Meerk
 
 ```text
 conversation grows
-  -> compaction rebuilds active history
+  -> capacity-aware compaction rebuilds active history
   -> discarded content can be indexed
   -> agent recalls via memory_search when needed
 ```
+
+Compaction is a transcript rewrite, not deletion in place. The runtime commits
+one typed `compaction_summary` message, retains a proven subset of source
+messages, and records the discarded source offsets. A failed summary, invalid
+rewrite, or failed memory projection leaves the original transcript intact.
+
+`injected_context` is also a typed transcript role. It does not start a turn,
+does not dilute the recent-turn retention budget, and stays attached to the
+conversational user message it preceded. Neither injected context nor a prior
+compaction summary is indexed as ordinary semantic memory.
+
+## Capacity and cadence
+
+The default compactor can react to four different pressure signals:
+
+- the last provider-reported input token count
+- an estimate of active transcript tokens
+- the whole-request token forecast, including visible tool definitions and
+  output reserve
+- request-body bytes, preferably from the exact provider-lowered request
+
+The minimum-boundary cadence is a cost guard, not capacity authority. It may
+suppress an ordinary provider high-water mark, but it cannot veto recovery
+when live history or request bytes already cross a capacity threshold. Under
+byte pressure, the compactor may retain fewer recent turns than the configured
+maximum so the rebuilt request actually fits.
+
+## Summary authority
+
+By default, Meerkat asks the active LLM to write the compaction summary. Hosts
+can instead supply a `CompactionCurator`. A curator replaces only summary
+content production: the runtime still owns the trigger, rewrite validation,
+memory projection, and commit. Curator failure has no LLM fallback and leaves
+history untouched.
+
+The built-in LLM path has one capacity-recovery exception. If the summary call
+itself fails because its request is over the provider context or byte limit,
+Meerkat uses a deterministic mechanical handoff summary so the oversized
+session can still shed old rows. Other LLM failures preserve the original
+transcript. This fallback never applies to a host curator.
+
+## Memory lifecycle
+
+Semantic memory is session-scoped. The production HNSW store persists rows in
+SQLite and loads each session index lazily. Administrative code can page a
+scope deterministically with `enumerate_scoped` and remove a complete owner
+scope atomically with `drop_scope`; these are lifecycle APIs, not agent-facing
+cross-session recall.
 
 ## What this concept owns
 

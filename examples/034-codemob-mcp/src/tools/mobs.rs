@@ -1,6 +1,6 @@
 //! CRUD tools for user-created mobs.
 //!
-//! User mobs are stored as mobpack archives (`.mobpack`) under
+//! User mobs are stored as JSON definitions under
 //! `.codemob-mcp/mobs/` in the project root. They are loaded dynamically
 //! and available to `deliberate` without MCP restart.
 
@@ -218,9 +218,7 @@ impl UserMobConfig {
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 let message = if peer_outputs.is_empty() {
-                    format!(
-                        "Return the final answer for this task.\n\n## Task\n{task}{ctx}"
-                    )
+                    format!("Return the final answer for this task.\n\n## Task\n{task}{ctx}")
                 } else {
                     format!(
                         "Synthesize the peer flow outputs into the final answer. Do not message peer agents directly.\n\n## Task\n{task}{ctx}\n\n## Peer outputs\n{peer_outputs}"
@@ -250,7 +248,11 @@ impl UserMobConfig {
                 );
                 flows.insert(
                     FlowId::from("main"),
-                    FlowSpec::new(Some("Comms-mode orchestrator flow".into()), step_specs, None),
+                    FlowSpec::new(
+                        Some("Comms-mode orchestrator flow".into()),
+                        step_specs,
+                        None,
+                    ),
                 );
             }
         } else {

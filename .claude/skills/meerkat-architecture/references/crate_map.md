@@ -7,16 +7,22 @@ meerkat-sqlite            (shared SQLite mechanics: connection profiles, meerkat
                            ledger, JsonColumnBytes codec, per-operation maintenance-fence guards,
                            error classification — rusqlite only, no meerkat deps; consumed by
                            store/runtime/tools/memory/workgraph/jobs/mob)
-meerkat-models            (canonical provider model catalog/capabilities data; core stays provider-free)
-meerkat-llm-core          (LLM client trait surface, streaming primitives shared by providers)
-meerkat-auth-core         (token stores, OAuth helpers, MCP OAuth discovery/DCR/PKCE/refresh,
-                           cloud authorizers — no meerkat-core deps)
+meerkat-agent-build-authority (retired compatibility marker; no minting API)
 
-meerkat-core              (pure types, traits, agent loop, domain-only Session + session-store and
+meerkat-core              (types, foundational traits, agent loop, domain-only Session + session-store and
                            provisional-receipt contracts, model_profile vocabulary + ModelCatalog mechanics,
                            DSL handle traits, StorageLayout path authority + realm-id-first dual-root
-                           resolution, DurabilityClass vocabulary, StorageMigrator diagnose seam)
+                           resolution, bounded native config/path/lock/fence I/O, DurabilityClass
+                           vocabulary, StorageMigrator diagnose seam)
+  ├── meerkat-models         (canonical provider model catalog/capability rows; depends on core)
+  ├── meerkat-llm-core       (LLM client, streaming, realtime, and provider-runtime contracts;
+                              depends on core and contracts)
+  ├── meerkat-auth-core      (cross-target credential resolver plus native token stores, OAuth,
+                              keyring, lockfile, and cloud authorizers; depends on core + llm-core)
+  ├── meerkat-providers      (compatibility shim re-exporting llm-core provider runtime and
+                              auth-core primitives)
   ├── meerkat-capabilities    (typed capability vocabulary, feature-owned declaration collection)
+  ├── meerkat-atif            (ATIF-v1.7 trajectory model and committed-event exporter)
   ├── meerkat-contracts       (wire types, error codes, generated surface schema projections)
   ├── meerkat-store-conformance (published storage conformance harness: per-trait capability
                                 profiles, capability-discovery, append-only media, blob/artifact
@@ -35,7 +41,8 @@ meerkat-core              (pure types, traits, agent loop, domain-only Session +
   ├── meerkat-jobs            (generated DetachedJobMachine authority, fenced attempts,
                                 typed terminal results, atomic outbox, memory/disk stores)
   ├── meerkat-workgraph       (realm-scoped durable WorkGraph service, stores, tools, read surface)
-  ├── meerkat-live            (LiveAdapterHost, live projection sink, WebSocket transport)
+  ├── meerkat-live            (LiveAdapterHost, live projection sink, WebSocket transport,
+                                optional WebRTC media/signaling transport)
   ├── meerkat-comms           (inter-agent: inproc, TCP, UDS, Ed25519)
   ├── meerkat-hooks           (hook engine: in-process, command, HTTP)
   ├── meerkat-skills          (skill loading: filesystem, git, HTTP, embedded)
@@ -54,9 +61,11 @@ meerkat (facade)              (AgentFactory, FactoryAgentBuilder, persistence he
                                 DiskStorageProvider + fail-closed durability enforcement)
   ├── meerkat-mob              (multi-agent: MobBuilder, MobActor, FlowEngine, FlowFrameEngine,
                                   member provisioning, identity-first binding, supervisor bridge)
+  ├── meerkat-mob-adaptive     (transitional re-export of the mob-owned adaptive module)
   ├── meerkat-mob-pack         (mobpack archive: signing, trust, validation)
   ├── meerkat-mob-mcp          (mob tools as MCP dispatcher + agent delegation surface, profile tools)
-  ├── meerkat-schedule         (scheduler: cron/interval triggers, occurrence lifecycle, delivery, schedule tools)
+  ├── meerkat-schedule         (scheduler: once/interval/calendar triggers, occurrence lifecycle,
+                                delivery, schedule tools)
   └── meerkat-web-runtime      (WASM embedded runtime — wasm_bindgen exports)
 
 Surface binaries:
@@ -110,7 +119,7 @@ profiles; the in-repo stores run the same suite in
 | `AgentToolDispatcher` | Tool routing and dispatch | `CompositeDispatcher` (meerkat-tools), `DynamicToolComposite` / `ToolGateway` (meerkat-core), `AgentMobToolSurface` (meerkat-mob-mcp), `EmptyToolDispatcher` (meerkat-tools) |
 | `AgentSessionStore` | Agent-loop-facing persistence adapter | `StoreAdapter<S>` (meerkat-store) |
 | `SessionStore` | Canonical session persistence contract for backend authors | `MemoryStore`, `JsonlStore`, `SqliteSessionStore` (meerkat-store) |
-| `SessionCheckpointer` / `RunCheckpointReceipt` | Intra-turn persistence hook and exact latest provisional candidate; receipts remain outside `Session` and advance contiguously within one base/run | `PersistentSessionService` (meerkat-session) |
+| `SessionCheckpointer` / `RunCheckpointReceipt` | Intra-turn persistence hook and exact latest provisional candidate; receipts remain outside `Session` and advance contiguously within one base/run | Private `StoreCheckpointer` installed and owned by `PersistentSessionService` (meerkat-session) |
 | `SessionService` | Full substrate lifecycle; the runtime control plane (`MeerkatMachine`, meerkat-runtime) layers canonical runtime semantics on top | `EphemeralSessionService<B>` (meerkat-session), `PersistentSessionService<B>` (meerkat-session) |
 | `CommsRuntime` | Inter-agent communication | `meerkat_comms::CommsRuntime` |
 | `HookEngine` | Hook execution | `DefaultHookEngine` (meerkat-hooks) |
@@ -127,7 +136,7 @@ profiles; the in-repo stores run the same suite in
 
 | Trait | Purpose | Implementors |
 |-------|---------|-------------|
-| `RuntimeControlPlane` | Multi-session runtime control (ingest, retire, respawn, reset, recover, destroy) | `MeerkatMachine` |
+| `RuntimeControlPlane` | Multi-session runtime control (ingest, publish event, retire, recycle, reset, recover, inspect state, destroy, load boundary receipt) | `MeerkatMachine` |
 | `RuntimeDriver` | Per-session input lifecycle (accept, run events, control, recover, retire, destroy) | `EphemeralRuntimeDriver`, `PersistentRuntimeDriver` |
 
 ### Durable job traits (defined in meerkat-jobs)
@@ -172,9 +181,9 @@ profiles; the in-repo stores run the same suite in
 
 | Type | Purpose |
 |------|---------|
-| `MemberLaunchMode` | Fresh / Resume / Fork (how to start a member) |
-| `ForkContext` | FullHistory (CoW) / LastMessages(n) (how much history to fork) |
-| `MobMemberSnapshot` | Public: status, output_preview, error, tokens_used, is_final, current_session_id, peer_connectivity, kickoff, external_member, resolved_capabilities. Binding atoms (agent_identity, agent_runtime_id, fence_token, current_bridge_session_id) are `pub(crate)` + `#[serde(skip)]` — bridge-internal, never app-facing |
+| `MemberLaunchMode` | Fresh / Resume / Fork; Resume is strict same-role unless one exact cold request declares `resume_from_role` |
+| `ForkContext` | FullHistory / LastMessages(n); selected source history is rendered into fresh child context rather than using `Session::fork()` CoW state |
+| `MobMemberSnapshot` | Public status/output fields plus progress, placement, control/comms reachability, freshness, lifecycle capabilities, and disabled non-portable resources. Binding atoms (`agent_identity`, `agent_runtime_id`, `fence_token`, `current_bridge_session_id`) are `pub(crate)` plus `#[serde(skip)]` - bridge-internal, never app-facing |
 | `FrameSpec` / `FlowNodeSpec` / `RepeatUntilSpec` | Frame-based flow graphs and repeat-until loop nodes |
 | `MobDefinition.owner_bridge_session_id` / `MobDefinition.is_implicit` | Session-scoped mob ownership, access control, implicit cleanup |
 
@@ -182,7 +191,7 @@ profiles; the in-repo stores run the same suite in
 
 | Type | Purpose |
 |------|---------|
-| `ContentBlock` | Text, Image, or Video content unit |
+| `ContentBlock` | Text, Image, Video, Structured JSON, or SkillContext content unit |
 | `ContentInput` | Prompt type for session requests |
 | `ToolOutput` | Return type for `BuiltinTool::call()` (defined in meerkat-tools) |
 | `GenerateImageRequest` / `ImageGenerationToolResult` | Universal model-facing image-generation request/result contract |
@@ -196,7 +205,7 @@ profiles; the in-repo stores run the same suite in
 | `ToolCategoryOverride` | Tri-state tooling intent across save/resume (`Inherit` / `Enable` / `Disable`) |
 | `PeerInput.handling_mode` | Typed per-input policy override for actionable peer traffic only |
 | `RuntimeBuildMode` | Explicit runtime ownership mode for builds (`SessionOwned` / `StandaloneEphemeral`) |
-| `SessionRuntimeBindings` | Runtime-backed session bindings carrying `session_id`, `epoch_id`, ops lifecycle, cursor state, tool visibility owner, and all session-owned DSL handles |
+| `SessionRuntimeBindings` | Runtime-backed epoch bundle carrying identity, ops/cursors, MeerkatMachine-owned session handles, the independently owned generated auth lease handle, and cross-owner coordinators |
 | `RuntimeEpochId` / `EpochCursorState` | Epoch-local runtime continuity identity and consumer cursor state |
 | `RuntimeCompletionFeed` | Read handle to the completion feed (implements `CompletionFeed`) — meerkat-runtime |
 | `PersistedOpsSnapshot` | Serializable snapshot for durable epoch recovery — meerkat-runtime |
@@ -240,11 +249,28 @@ profiles; the in-repo stores run the same suite in
 | `WholeBlobStoreAuthority` / `HeadCanonicalStoreAuthority` | Committed profile-specific physical authority: row revision+SHA or store revision+boundary head+head token — meerkat-runtime/src/store/mod.rs |
 | `RuntimeSessionCatalogEntry` | Transcript-free, graph-free catalog projection committed atomically with body authority — meerkat-runtime/src/store/mod.rs |
 
-## Agent Loop State Machine
+### 0.8.23-HEAD additions
 
-`CallingLlm` → `WaitingForOps` → `DrainingEvents` → `Completed`
+| Type | Purpose |
+|------|---------|
+| `ToolAccessPolicy::ReadOnly` / `ToolMutationClass` | Fail-closed call-level read-only intent based only on the owning dispatcher's positive declaration; unknown and provider-bypassing tools are not inferred safe |
+| `BoundedSubmission` / `SubmitBound` / `BoundedSubmitReport` | Mandatory-idempotency runtime admission with a caller-observation bound and typed admitted/collapsed/refused/timed-out fate - meerkat-runtime/src/bounded_submit.rs |
+| `AgentEvent::TurnUsageAccountingUnmeasured` / `TurnUsageAccountingIdentityDisputed` | Separate completion from missing or disputed provider accounting; `TurnCompleted.usage` is optional |
+| `JobHealthCoverage` / `JobHealthReading` / `JobHealthSummary` | Separate job outbox and runtime inbox backlog, declare census coverage, and preserve unreadable as a third state |
+| `LiveOpenTransport::Webrtc` / `LiveWebrtcAnswerParams` / `LiveWebrtcAnswerResult` | Feature-gated WebRTC selection and single-use SDP offer/answer signaling over `live/webrtc/answer` |
+| `MemberLaunchMode::Resume.resume_from_role` / `MaterializeLaunchMode::Resume.resume_from_role` | One-request, exact-cold, forward-only durable member role migration for trusted host paths |
 
-With branches: `ErrorRecovery`, `Cancelling`
+## Agent Loop And Turn Phases
+
+The persisted/user-facing `LoopState` projection has six variants:
+`CallingLlm`, `WaitingForOps`, `DrainingEvents`, `ErrorRecovery`, `Cancelling`,
+and terminal `Completed`.
+
+The canonical `TurnPhase` roster is `Ready`, `ApplyingPrimitive`, `CallingLlm`,
+`WaitingForOps`, `DrainingBoundary`, `Extracting`, `ErrorRecovery`,
+`Cancelling`, `Completed`, `Failed`, and `Cancelled`. Transition legality and
+terminal classification come from the generated turn authority, not from a
+handwritten phase diagram.
 
 **WaitingForOps** is a real barrier state, but the load-bearing truth is barrier membership, not a raw bag of operation IDs. The architecture is moving toward typed async-op references and explicit wait policy so long-lived detached work does not accidentally become a turn barrier.
 
@@ -320,5 +346,7 @@ MobHandle::run_flow(flow_id, params)
 - Agent delegation tools are mob-backed and session-scoped via `owner_bridge_session_id` / `is_implicit`; operator authority is injected, not ambient.
 - Tooling persistence is tri-state via `ToolCategoryOverride`; resume paths must preserve `Inherit`.
 - Mob persistence switched to SQLite/WAL; the previous exclusive-handle mob store is gone.
-- Flow loops are machine-backed through `FlowFrameKernel`, `LoopIterationKernel` (internal sub-machines of MobMachine), and the `FlowFrameEngine` runtime.
+- Flow and loop state is owned by `MobMachine`. `FlowFrameEngine` is the
+  scheduler-backed execution shell, while `FlowFrameKernel` is its
+  authority-validating store mutation adapter rather than a separate machine.
 - `FlowEngine::execute_step_with_all_guards()` is the single canonical step path for both flat and frame execution.

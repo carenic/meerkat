@@ -28,8 +28,9 @@
 //!    are one fact under one lock, not a status map mirrored beside a
 //!    handle-side permit slot; and
 //! 3. the staged→active promotion verdict is owned here:
-//!    [`Self::begin_promotion`] is the single-winner gate, and an in-flight
-//!    promotion is settled (committed or restored) through the same owner.
+//!    [`StagedSessionRegistry::begin_promotion`] is the single-winner gate,
+//!    and an in-flight promotion is settled (committed or restored) through
+//!    the same owner.
 //!
 //! The `Semaphore` remains a pure **resource gate** (concurrency limiter): it
 //! bounds how many sessions may hold live work at once. It never decides

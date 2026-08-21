@@ -1,146 +1,171 @@
 ---
 title: "Realms"
-description: "Realm-first identity and storage model across CLI, RPC, REST, MCP, and SDK surfaces."
+description: "The identity, isolation, storage, and durability boundary shared across Meerkat surfaces."
 icon: "earth-americas"
 ---
 
-Meerkat is realm-first. A `realm_id` is the only identity key for sharing or isolating state across surfaces.
+A realm is Meerkat's state boundary. Sessions, config, auth bindings, runtime
+state, schedules, WorkGraph, jobs, blobs, artifacts, and mob state are all
+scoped by a `realm_id`.
 
-For task-oriented CLI behavior, filesystem layout, and troubleshooting, see the
+Sharing requires both the same logical realm and the same physical storage
+provider/root. Supplying the same ID with two deliberately different explicit
+state roots selects two different stores.
+
+For task-oriented commands and troubleshooting, see the
 [realm guide](/guides/realms).
 
-## Core rules
+## Identity Rules
 
-1. Same `realm_id` means shared sessions, config, and runtime metadata.
-2. Different `realm_id` means strict isolation, even from the same folder.
-3. Persistent backends (`sqlite` or `jsonl`) are pinned once per realm via `realm_manifest.json`; `memory` is an explicit ephemeral backend for single-process runs.
-4. Realm IDs are user-chosen stable identifiers with syntax constraints. Reuse the same value to collaborate across surfaces.
+Explicit user-facing realm IDs:
 
-Realm IDs must be 1-64 characters, start with an ASCII alphanumeric character, and may contain only ASCII alphanumerics, `_`, and `-`. They cannot contain whitespace or `:`, and UUID-like opaque values are rejected for explicit user-facing realm IDs.
+- are 1-64 characters;
+- start with an ASCII alphanumeric character;
+- contain only ASCII alphanumerics, `_`, and `-`;
+- cannot contain whitespace or `:`; and
+- cannot use a UUID-like opaque value.
 
-## Surface defaults
+Use a stable descriptive ID such as `team-alpha`, `prod`, or `audit_2026`.
+Meerkat-generated workspace and isolated IDs use separate typed construction
+paths.
 
-| Surface | If `realm_id` is not provided |
-|---------|-------------------------------|
-| CLI (`rkat run`, `run --resume`, `session`) | Workspace-derived stable realm (`ws-...`) |
-| RPC (`rkat-rpc`) | New opaque realm (`realm-...`) |
-| REST (`rkat-rest`) | New opaque realm (`realm-...`) |
-| MCP server (`rkat-mcp`) | New opaque realm (`realm-...`) |
-| Python/TypeScript SDK | Whatever the spawned `rkat-rpc` process picks (new opaque realm unless `realm_id` is passed) |
+## Surface Defaults
 
-This means CLI is workspace-friendly by default, while non-CLI surfaces are isolated by default.
+| Surface | No explicit realm |
+|---------|-------------------|
+| CLI run/resume/session commands | Stable `ws-...` ID derived from the canonicalized current directory or `--context-root`, with raw-path fallback only if canonicalization fails |
+| `rkat-rpc` | Fresh opaque `realm-...` ID |
+| `rkat-rest` | Fresh opaque `realm-...` ID |
+| `rkat-mcp` | Fresh opaque `realm-...` ID |
+| Python/TypeScript SDK | The realm selected by the connected/spawned `rkat-rpc`; fresh unless the client passes one |
 
-The CLI workspace default uses the current directory as `context_root`, derives
-identity from that path, and stores realm runtime state under
-`<context-root>/.rkat/realms/` unless `--context-root` or `--state-root` is
-provided.
+The CLI is workspace-friendly by default. Server processes are isolated by
+default so unrelated launches do not collide.
 
-### Realm-id-first root resolution
+## Context Root And Project Root
 
-Every surface resolves the realm identity *first*, then probes for that
-specific realm under both candidate state roots — the project-local
-`<context-root>/.rkat/realms` and the user-global data-dir root:
+Meerkat keeps two path facts distinct:
 
-- an explicit `--state-root` always wins (no probing);
-- a realm that already exists under exactly one candidate root is used
-  where it lies (so an explicit `--realm` finds its data regardless of
-  which surface materialized it);
-- a realm materialized under **both** roots is a typed split-brain refusal
-  pointing at `rkat storage doctor` — no surface will silently pick one and
-  deepen the split;
-- a realm that exists nowhere is created under the surface's documented
-  default root (CLI: project-local; servers: user-global). First
-  materialization reserves a marker in **every** candidate root before
-  writing the manifest (the cross-candidate first-start reservation), so
-  two surfaces with different default roots racing the same fresh realm
-  cannot each mint a copy: exactly one manifest materializes, and a racer
-  whose realm appeared under a *different* candidate refuses typed instead
-  of manufacturing a twin — its next resolution finds the winner's copy and
-  uses it where it lies.
+- **Invocation context** is the supplied current directory or `--context-root`.
+  Its canonicalized path determines the workspace-derived realm ID (raw path
+  only if canonicalization fails), while the supplied path remains the
+  no-walk-up boundary for MCP config/trust discovery.
+- **Project root** is found by walking upward from the invocation context to the
+  nearest existing `.rkat` entry. Its `.rkat/realms` directory is the
+  project-local realm-storage candidate. Outside any existing project, the
+  exact invocation context is used for a fresh local candidate.
 
-Server surfaces probe the project-local candidate only when started with an
-explicit `--context-root`, which keeps their no-flags behavior unchanged.
+Running from a nested directory can therefore derive a different default
+`ws-...` realm while storing that realm under the ancestor project's
+`.rkat/realms`. Use an explicit `--realm` or a common `--context-root` when
+the nested command should share the parent's logical realm.
 
-An existing split heals offline: `rkat storage doctor` reports the realm's
-twin locations, `rkat storage migrate` (dry-run) computes their per-domain
-divergence under held fences, and `rkat storage migrate --apply
---adopt-root <path>` adopts one root while archiving the other copy
-read-only under the registered backup naming — nothing is merged or
-discarded. See [CLI commands](/cli/commands#storage).
+## Realm-ID-First Root Resolution
 
-## Explicit sharing
+Meerkat resolves identity first, then looks for that realm under candidate
+roots:
 
-Use the same realm everywhere:
+1. `--state-root` selects one explicit root and disables candidate probing.
+2. Otherwise, the resolver probes the project-local candidate and user-global
+   platform data root for the resolved realm ID.
+3. If the realm exists under exactly one candidate, Meerkat opens it where it
+   already lives.
+4. If it exists under both, startup refuses with a typed split-brain error
+   rather than choosing silently.
+5. If it exists nowhere, the surface creates it under its default root: local
+   for CLI and user-global for servers.
+
+Server surfaces include the project-local candidate only when started with an
+explicit context root.
+
+First creation reserves the realm across the candidate set that invocation
+actually resolved before writing the manifest. Processes using the same
+multi-root candidate set cannot mint twins, but a bare server that probes only
+the user-global root does not coordinate with a CLI probing a project-local
+root. Use a common `--state-root` or matching server `--context-root` when
+cross-surface first-start convergence matters.
+
+Use these operator commands when layout is unclear:
 
 ```bash
-rkat --realm team-alpha run "Draft release plan"
-rkat --realm team-alpha session list
-rkat-rpc --realm team-alpha
-rkat-rest --realm team-alpha
-rkat-mcp --realm team-alpha
+rkat realm current
+rkat realm show <realm>
+rkat realm list
+rkat storage doctor
+rkat storage migrate
 ```
 
-SDKs pass the same value when connecting:
+`rkat storage migrate` is a report-only dry run unless `--apply` is
+supplied. Adopting one root archives the other registered copy; it does not
+merge divergent state automatically.
+
+## Explicit Sharing
+
+```bash
+rkat --state-root /srv/meerkat/realms --realm team-alpha run "Draft release plan"
+rkat --state-root /srv/meerkat/realms --realm team-alpha session list
+rkat-rpc --state-root /srv/meerkat/realms --realm team-alpha
+rkat-rest --state-root /srv/meerkat/realms --realm team-alpha
+rkat-mcp --state-root /srv/meerkat/realms --realm team-alpha
+```
+
+SDK clients pass the same value when connecting:
 
 ```python
-await client.connect(realm_id="team-alpha")
+await client.connect(realm_id="team-alpha", state_root="/srv/meerkat/realms")
 ```
 
-```ts
-await client.connect({ realmId: "team-alpha" })
+```typescript
+await client.connect({ realmId: "team-alpha", stateRoot: "/srv/meerkat/realms" })
 ```
 
-## Backend pinning
+When separate hosts do not share a filesystem, use the same external
+`RealmStorageProvider` rather than assuming equal realm IDs make local disks
+shared.
 
-On first use, a realm writes a manifest with backend choice. Later opens must honor it.
+## Backend And Provider Pinning
 
-| First open | Manifest pins |
-|------------|----------------|
+The first open writes `realm_manifest.json`. It pins the built-in backend or
+external storage provider, so later surfaces cannot reinterpret the realm:
+
+| First-open choice | Pinned value |
+|-------------------|--------------|
 | `--realm-backend sqlite` | `sqlite` |
 | `--realm-backend jsonl` | `jsonl` |
 | `--realm-backend memory` | `memory` |
 | No hint | `sqlite` when compiled, otherwise `jsonl` |
+| External provider | `external:<provider-name>` plus the provider field |
 
-After pinning, all surfaces use the manifest backend for that realm.
+`sqlite` is the normal durable same-realm multi-process profile. `jsonl`
+keeps inspectable session files and a durable `runtime.sqlite3` companion for
+runtime authority. `memory` is explicitly ephemeral and process-local.
 
-Realms opened through an external `RealmStorageProvider` pin the provider
-the same way: the manifest records the provider name (manifest format 2,
-which also adds `ephemeral_domains`) and the backend as `external:<name>`.
-A realm pinned to an external provider refuses opens through the built-in
-disk composition — and vice versa — with a typed provider mismatch, and
-readers refuse manifest formats newer than they support instead of
-silently ignoring fields they do not understand.
+Manifest format 2 can also record operator-declared ephemeral domains. A storage provider
+must declare exactly one durability result for each required domain:
+`sessions`, `runtime`, `schedule`, `workgraph`, `jobs`, `blobs`, and
+`artifacts`. A durable domain resolving to undeclared non-persistent storage
+refuses startup unless the manifest explicitly declares that domain ephemeral.
+A provider can instead return the typed `DeclaredEphemeral` resolution itself,
+as the JSONL backend does for its disabled schedule store; that typed provider
+declaration does not require a duplicate manifest entry.
 
-## Default backend and same-realm sharing
+Readers reject a manifest format newer than they support and reject a provider
+or backend mismatch. Existing realms remain pinned when defaults change.
 
-When SQLite support is compiled in, new persistent realms default to `sqlite`.
+## Config And State
 
-- `sqlite` is the recommended backend for the normal Meerkat operating mode where multiple processes share one realm.
-- `jsonl` remains explicitly selectable for inspectable file-based persistence. Session documents live as JSONL files; runtime authority (queued inputs, run-boundary receipts, ops snapshots) is durable in a `runtime.sqlite3` companion under the realm root.
-- `memory` uses in-process session/blob/artifact stores and is useful for throwaway runs that should not persist conversation state.
+The realm's own config document is `<state-root>/<realm>/config.toml`, except
+for the reserved `global` realm, whose config is home-rooted at
+`~/.rkat/config.toml`.
 
-Existing realms stay pinned to the backend recorded in their manifest. Changing the default does not migrate old realms.
+Config can inherit from parent realms, but state never does. A child can inherit
+models, bindings, MCP servers, hooks, skills, and limits while keeping its
+sessions and every durable state domain local.
 
-## Config and CAS
+## See Also
 
-Config is realm-scoped and generation-based.
-
-- `config/get` returns the core envelope fields `config`, `generation`, `realm_id`, `instance_id`, and `backend`.
-- Some surfaces may also include diagnostic fields such as `resolved_paths`, but those should be treated as optional.
-- `config/set` and `config/patch` accept optional `expected_generation`.
-- Stale writes fail deterministically with generation conflict.
-
-`resolved_paths` should be treated as a diagnostic/admin field rather than a guaranteed universal field on every public config envelope.
-
-## Why this solves multi-surface concurrency
-
-1. 100 RPC servers from the same folder without `realm_id` do not collide.
-2. 100 agents across RPC/REST/MCP/CLI with the same `realm_id` see the same state.
-3. CLI workspace ergonomics remain simple without forcing filesystem identity onto non-CLI surfaces.
-
-## See also
-
-- [Sessions](/concepts/sessions)
+- [Realm guide](/guides/realms)
+- [Realm inheritance](/concepts/realm-inheritance)
+- [Storage operations](/guides/storage-operations)
 - [Configuration](/concepts/configuration)
-- [CLI commands](/cli/commands)
-- [JSON-RPC](/api/rpc)
+- [Sessions](/concepts/sessions)

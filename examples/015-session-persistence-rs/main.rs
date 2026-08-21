@@ -1,13 +1,14 @@
 //! # 015 — Session Persistence (Rust)
 //!
-//! Sessions can be persisted to disk so agents survive restarts. This example
-//! shows the different storage backends and how session lifecycle works.
+//! Sessions can be saved to durable stores and loaded by ID. This example
+//! writes to a temporary JSONL store and demonstrates a direct save/load
+//! roundtrip; it does not restart a runtime-backed session host.
 //!
 //! ## What you'll learn
 //! - JsonlStore vs MemoryStore vs SqliteSessionStore
 //! - Saving and loading sessions
-//! - Session lifecycle: create → turns → archive
-//! - Durable realm-backed session persistence
+//! - Session lifecycle and low-level store inspection
+//! - How JSONL compares with in-memory and SQLite session stores
 //!
 //! ## Run
 //! ```bash
@@ -44,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut agent = AgentBuilder::new()
         .model("claude-sonnet-4-6")
-        .system_prompt("You are a persistent assistant. You remember across restarts.")
+        .system_prompt("You are an assistant whose session is written to a store.")
         .max_tokens_per_turn(512)
         .build(Arc::new(llm), Arc::new(EmptyToolDispatcher), adapted_store)
         .await?;
@@ -98,7 +99,7 @@ SqliteSessionStore also supports:
 
 # Feature flags in Cargo.toml:
 [dependencies]
-meerkat = {{ version = "0.3", features = ["jsonl-store", "session-store"] }}
+meerkat = {{ version = "0.8.24", features = ["jsonl-store", "session-store"] }}
 "#
     );
 

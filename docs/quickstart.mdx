@@ -1,6 +1,6 @@
 ---
 title: "Quickstart"
-description: "Install Meerkat and run your first agent. Single binary, any provider."
+description: "Install Meerkat, configure one provider, and run a first realm-backed session."
 icon: "bolt"
 ---
 
@@ -11,96 +11,109 @@ icon: "bolt"
     ```bash
     brew install lukacf/meerkat/rkat
     ```
-    <Note>
-    The Homebrew tap supports macOS and Linux. On Linux, install Homebrew first from the [Homebrew on Linux](https://docs.brew.sh/Homebrew-on-Linux) instructions, then use the same tap command.
-    </Note>
+
+    The tap supports macOS and Linux. Release archives also contain `rkat`,
+    `rkat-rpc`, `rkat-rest`, and `rkat-mcp`.
   </Tab>
   <Tab title="Python">
     ```bash
     pip install meerkat-sdk
     ```
-    <Note>
-    The SDK resolves `rkat-rpc` automatically by default and downloads it when needed. Install the standalone binary only if you want to manage it yourself.
-    </Note>
+
+    The SDK resolves and can download a compatible `rkat-rpc` by default.
   </Tab>
   <Tab title="TypeScript">
     ```bash
     npm install @rkat/sdk
     ```
-    <Note>
-    The SDK resolves `rkat-rpc` automatically by default and downloads it when needed. Install the standalone binary only if you want to manage it yourself.
-    </Note>
+
+    The SDK resolves and can download a compatible `rkat-rpc` by default.
   </Tab>
-  <Tab title="Rust crate">
-    ```toml Cargo.toml
+  <Tab title="Web/WASM">
+    ```bash
+    npm install @rkat/web
+    ```
+
+    The web package runs Meerkat in the browser rather than spawning
+    `rkat-rpc`. Continue with the [Web/WASM example](/examples/wasm).
+  </Tab>
+  <Tab title="Rust">
+    Meerkat is pre-1.0, so exactly pin the crate family and bump deliberately:
+
+    ```toml
     [dependencies]
-    meerkat = { version = "0.8.25", features = ["anthropic", "jsonl-store"] }
-    meerkat-store = "0.8.25"
-    meerkat-tools = "0.8.25"
+    meerkat = { version = "=0.8.25", features = ["sqlite-store", "session-store"] }
+    meerkat-store = "=0.8.25"
+    meerkat-tools = "=0.8.25"
     tokio = { version = "1", features = ["full"] }
     ```
+
+    Start with the [Rust SDK overview](/rust/overview) for runtime-backed
+    `SessionService` construction.
   </Tab>
-  <Tab title="Cargo">
+  <Tab title="Cargo CLI">
     ```bash
     cargo install rkat
     ```
   </Tab>
 </Tabs>
 
-<Note>
-Before your first run, set up provider credentials. The fastest path is environment variables; for realm-scoped bindings and OAuth flows, see [Auth](/guides/auth) and [Providers](/concepts/providers).
-</Note>
+## Configure One Provider
+
+The fastest path is a dedicated Meerkat environment variable:
+
+<CodeGroup>
+
+```bash OpenAI
+export RKAT_OPENAI_API_KEY="sk-..."
+```
+
+```bash Anthropic
+export RKAT_ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+```bash Gemini
+export RKAT_GEMINI_API_KEY="AIza..."
+```
+
+</CodeGroup>
+
+Provider-native names also work. For OAuth, Azure, cloud IAM, managed-store
+credentials, and tenant-scoped bindings, see [Auth](/guides/auth).
 
 <Warning>
-Meerkat's OpenAI/global default, `gpt-5.6-sol`, is currently limited to
-preview-enabled API organizations and Codex workspaces. If the relevant account
-context does not have GPT-5.6 preview access, explicitly select the broadly
-available `gpt-5.5` model.
+Meerkat's OpenAI/global catalog default is `gpt-5.6-sol`. Catalog support does
+not guarantee that the active API organization or ChatGPT workspace has access.
+If it does not, select `gpt-5.5` explicitly or configure a binding
+`default_model`.
 </Warning>
 
-## Run an agent
+## Run A First Session
 
 <Tabs>
-  <Tab title="Rust">
-    ```rust
-    use std::sync::Arc;
-    use meerkat::{AgentBuilder, AgentFactory, AnthropicClient, JsonlStore};
-    use meerkat_store::StoreAdapter;
+  <Tab title="CLI">
+    With the OpenAI variable above:
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY")?;
-    let store_dir = std::env::current_dir()?.join(".rkat").join("sessions");
-    std::fs::create_dir_all(&store_dir)?;
+    ```bash
+    rkat run "What is the capital of France? Answer in one sentence."
+    ```
 
-    let factory = AgentFactory::new(store_dir.clone());
-    let client = Arc::new(AnthropicClient::new(api_key)?);
-    let llm = factory.build_llm_adapter(client, "claude-sonnet-4-6").await;
-    let store = Arc::new(JsonlStore::new(store_dir));
-    store.init().await?;
-    let store = Arc::new(StoreAdapter::new(store));
-    let tools = Arc::new(meerkat_tools::EmptyToolDispatcher);
+    With another provider, select a matching model:
 
-    let mut agent = AgentBuilder::new()
-        .model("claude-sonnet-4-6")
-        .system_prompt("You are a helpful assistant. Be concise in your responses.")
-        .max_tokens_per_turn(1024)
-        .build(Arc::new(llm), tools, store)
-        .await?;
-
-    let result = agent
-        .run("What is the capital of France? Answer in one sentence.".into())
-        .await?;
-    println!("Response: {}", result.text);
+    ```bash
+    rkat run --model claude-sonnet-4-6 "Explain async/await"
+    rkat run --model gemini-3.5-flash "Explain async/await"
     ```
   </Tab>
   <Tab title="Python">
     ```python
     from meerkat import MeerkatClient
 
-    client = MeerkatClient()
-    await client.connect()
-    result = await client.create_session(prompt="What is the capital of France?")
-    print(result.text)
-    await client.close()
+    async with MeerkatClient() as client:
+        session = await client.create_session(
+            "What is the capital of France? Answer in one sentence."
+        )
+        print(session.text)
     ```
   </Tab>
   <Tab title="TypeScript">
@@ -109,70 +122,105 @@ available `gpt-5.5` model.
 
     const client = new MeerkatClient();
     await client.connect();
-    const result = await client.createSession("What is the capital of France?");
-    console.log(result.text);
+    const session = await client.createSession(
+      "What is the capital of France? Answer in one sentence.",
+    );
+    console.log(session.text);
     await client.close();
-    ```
-  </Tab>
-  <Tab title="CLI">
-    ```bash
-    export ANTHROPIC_API_KEY=sk-...
-    rkat run "What is the capital of France?"
     ```
   </Tab>
 </Tabs>
 
-<Note>
-To share state across processes/surfaces, pass the same explicit realm (`--realm` for CLI, `realm_id`/`realmId` for SDK clients). See [realms](/concepts/realms).
-</Note>
+The SDKs connect to `rkat-rpc`; the CLI constructs the same runtime-backed
+session in-process.
 
-## Switch providers
+## Share State Across Surfaces
 
-Same code, different model. The provider is resolved from the model registry:
-
-```bash
-rkat run --model claude-sonnet-4-6 "Explain monads"
-rkat run --model gpt-5.6-sol "Explain monads"
-rkat run --model gemini-3.5-flash "Explain monads"
-```
-
-## Add tools
-
-Register an MCP server and its tools are available to the agent immediately:
+CLI commands derive a stable workspace realm by default. A bare RPC/REST/MCP
+server or SDK connection creates a fresh isolated realm. Pass one explicit ID
+when several processes should see the same sessions and config:
 
 ```bash
-rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp
-rkat run "List the files in /tmp"
+rkat --state-root /srv/meerkat/realms --realm team-alpha run "Draft a release note"
+rkat-rpc --state-root /srv/meerkat/realms --realm team-alpha
 ```
 
-Remote streamable HTTP MCP servers can be added with a URL. OAuth-protected
-servers keep config simple and authenticate when you log in or run
-interactively:
+```python
+client = MeerkatClient()
+await client.connect(realm_id="team-alpha", state_root="/srv/meerkat/realms")
+```
+
+```typescript
+const client = new MeerkatClient();
+await client.connect({
+  realmId: "team-alpha",
+  stateRoot: "/srv/meerkat/realms",
+});
+```
+
+The processes must also resolve the same physical storage root/provider. See
+[Realms](/concepts/realms).
+
+## Add An MCP Server
 
 ```bash
-rkat mcp add --transport http glean https://king-be.glean.com/mcp/default
-rkat mcp login glean
-rkat run "Use Glean to search for onboarding docs"
+rkat mcp add filesystem -- \
+  npx -y @modelcontextprotocol/server-filesystem /tmp
+rkat run --wait-for-mcp "List the files in /tmp"
 ```
 
-## Enforce budgets
+Config changes apply to newly built/resumed agents. MCP servers normally
+connect in the background and tools appear as each server becomes ready;
+`--wait-for-mcp` makes the first prompt wait for configured servers.
 
-Cap token usage, wall-clock time, or tool calls:
+For a remote streamable-HTTP server (replace the example URL with the service
+you use):
 
 ```bash
-rkat run --max-tokens 10000 --max-duration 30s --max-tool-calls 5 "Analyze this codebase"
+rkat mcp add --transport http knowledge https://mcp.example.com
+rkat mcp login knowledge
+rkat run --wait-for-mcp "Search the knowledge base for onboarding docs"
 ```
 
-The agent completes its current turn when a limit is hit, then stops.
+## Bound One Run
 
-## What's next
+```bash
+rkat run \
+  --max-tokens 4000 \
+  --max-duration 30s \
+  --max-tool-calls 5 \
+  "Inspect this project and summarize the main risks"
+```
 
-- [Examples gallery](/examples/gallery) -- the central real-code hub after your first successful run
-- [Sessions example](/examples/sessions) -- the best next stop if you want the core multi-turn flow first
-- [Auth](/guides/auth) -- environment vars, realms, bindings, and OAuth flows
-- [Providers](/concepts/providers) -- model tables and provider parameters
-- [Rust SDK](/rust/overview) / [Python SDK](/sdks/python/overview) / [TypeScript SDK](/sdks/typescript/overview) -- full API reference
+- `--max-tokens` caps LLM output per turn.
+- `--max-tool-calls` bounds tool use for the run.
+- `--max-duration` bounds the run's agent lifetime; a deadline is a hard
+  terminal failure rather than a warning.
 
-<Note>
-For a maintained repository starter, see the Rust example in the Meerkat repository under `meerkat/examples/simple.rs`.
-</Note>
+For aggregate turn deadlines, lifetime token budgets, retry policy, and
+admission limits, use realm [configuration](/concepts/configuration).
+
+## Add Built-In Capabilities
+
+The `full` preset enables the product CLI's broad tool composition, including
+shell, MCP, skills, comms, schedules, WorkGraph, and mob orchestration where
+compiled:
+
+```bash
+rkat run --tools full \
+  "Create a small mob to inspect src/, collect the findings, and summarize them."
+```
+
+Use `--allow-tool` and `--block-tool` for a narrower first-turn scope. Shell
+access and other effectful tools should be granted deliberately.
+
+## Next Steps
+
+- [Examples gallery](/examples/gallery) - choose a maintained workflow
+- [Sessions example](/examples/sessions) - continue a multi-turn conversation
+- [Auth](/guides/auth) - configure bindings and OAuth
+- [Providers](/concepts/providers) - inspect models and parameters
+- [Rust SDK](/rust/overview) - embed runtime-backed sessions
+- [Python SDK](/sdks/python/overview) - build from Python
+- [TypeScript SDK](/sdks/typescript/overview) - build from Node.js
+- [Web/WASM](/examples/wasm) - run in the browser

@@ -262,13 +262,14 @@ mod tests {
             MEERKAT_PLATFORM_SKILL_BODY.contains("rkat mcp add <NAME>"),
             "help skill must teach the actual MCP CLI config surface"
         );
+        let exact_facade_pin = format!("meerkat = \"={}\"", env!("CARGO_PKG_VERSION"));
         assert!(
-            MEERKAT_PLATFORM_SKILL_BODY.contains("meerkat = \"0.8\""),
-            "facade examples must track the current 0.8 release family"
+            MEERKAT_PLATFORM_SKILL_BODY.contains(&exact_facade_pin),
+            "facade examples must exact-pin the current release"
         );
         assert!(
-            MEERKAT_PLATFORM_SKILL_BODY.contains("Available facade features: `anthropic`, `openai`, `openai-realtime`, `gemini`, `all-providers`, `jsonl-store`, `memory-store`, `sqlite-store`, `session-store`, `session-compaction`, `memory-store-session`, `comms`, `mcp`, `skills`, `schedule`, `workgraph`, `live`."),
-            "facade feature inventory must include current realtime, sqlite, WorkGraph, and Live features"
+            MEERKAT_PLATFORM_SKILL_BODY.contains("Available facade features: `anthropic`, `openai`, `openai-realtime`, `gemini`, `all-providers`, `native-keyring`, `jsonl-store`, `memory-store`, `sqlite-store`, `session-store`, `session-compaction`, `memory-store-session`, `atif`, `comms`, `mcp`, `skills`, `schedule`, `workgraph`, `live`, and `live-webrtc`."),
+            "facade feature inventory must include the current facade features"
         );
         assert!(
             MEERKAT_PLATFORM_API_REFERENCE.contains("rkat help <QUESTION>"),
@@ -291,12 +292,15 @@ mod tests {
             "rkat models has no --json flag"
         );
         assert!(
-            MEERKAT_PLATFORM_SKILL_BODY.contains("rkat run --allow-tool generate_image"),
-            "help skill must teach image generation as an assistant-mediated rkat run workflow"
+            MEERKAT_PLATFORM_SKILL_BODY.contains(
+                "`--allow-tool generate_image` can narrow the visible catalog but cannot create"
+            ),
+            "help skill must distinguish image-tool filtering from dependency composition"
         );
         assert!(
-            MEERKAT_PLATFORM_SKILL_BODY.contains("rkat blob get <BLOB-ID> --output"),
-            "help skill must teach the actual blob download CLI"
+            MEERKAT_PLATFORM_API_REFERENCE
+                .contains("rkat blob get <BLOB-ID> [--output <FILE>] [--json]"),
+            "help API reference must teach the actual blob download CLI"
         );
         assert!(
             !MEERKAT_PLATFORM_SKILL_BODY.contains("rkat rpc blob/get"),
@@ -319,7 +323,7 @@ mod tests {
             "CLI reference must explicitly block the plural session hallucination"
         );
         assert!(
-            MEERKAT_CLI_REFERENCE_SKILL_BODY.contains("There is no `rkat live`"),
+            MEERKAT_CLI_REFERENCE_SKILL_BODY.contains("There is no root `rkat live` CLI group."),
             "CLI reference must explicitly block the unshipped live CLI group"
         );
         assert!(

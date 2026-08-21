@@ -1,21 +1,21 @@
-# 025 — Full-Stack Agent (Rust)
+# 025 - Composed Agent (Rust)
 
-The reference architecture for production Meerkat agents. Combines every
-feature: custom tools, built-in tools, skills, budget control, session
-persistence, event streaming, and composable dispatchers.
+A focused standalone example that composes built-in tools, two domain tools,
+budget limits, a file-backed store, inline behavior instructions, and event
+streaming. It is not an exhaustive production reference.
 
 ## Features Used
-- `AgentBuilder` with full configuration
-- `CompositeDispatcher` — merge built-in + domain tools
-- `BudgetLimits` — production cost control
-- Skills — injected behavioral instructions
-- Event streaming — real-time monitoring
-- Session persistence — survives restarts
+- `AgentBuilder` configuration
+- `CompositeDispatcher` - merge built-in and domain tools
+- `BudgetLimits` - cap total tokens and tool calls
+- Inline system-prompt behavior instructions
+- Event streaming with `spawn_event_logger`
+- `JsonlStore` in a temporary directory for this run
 
 ## Architecture
 ```
 ┌─────────────────────────────────┐
-│         Full-Stack Agent        │
+│         Composed Agent          │
 │                                 │
 │  ┌─────────┐   ┌────────────┐  │
 │  │ Builtins│   │ Domain     │  │
@@ -28,14 +28,18 @@ persistence, event streaming, and composable dispatchers.
 │  ┌────────────┴──────────────┐  │
 │  │      Agent Loop           │  │
 │  │  LLM → Tools → Events    │  │
-│  │  Budget │ Retry │ Hooks   │  │
+│  │  Budget + event stream    │  │
 │  └───────────────────────────┘  │
 │               │                 │
 │  ┌────────────┴──────────────┐  │
-│  │    JsonlStore (persist)   │  │
+│  │ JsonlStore (temporary dir)│  │
 │  └───────────────────────────┘  │
 └─────────────────────────────────┘
 ```
+
+This program does not configure the canonical skill engine, hooks, structured
+output, shell, MCP, comms, delegation, or runtime-backed restart recovery.
+Follow the focused examples for those surfaces.
 
 ## Run
 ```bash

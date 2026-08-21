@@ -1,187 +1,176 @@
-# Release Process
+# Meerkat Release Process
 
-This document describes the complete release workflow for the Meerkat project.
+This reference describes the current release workflow for this repository.
+The public distribution guide is `docs/guides/cd-and-distribution.md`.
 
 ## Overview
 
-```
-Development → make release-preflight → cargo release <level> → Push
+```text
+notes under Unreleased
+  -> make release-preflight
+  -> ./scripts/repo-cargo release <level> --execute
+  -> version commit and tag
+  -> exact-main GitHub Actions release
 ```
 
-The release pipeline enforces **version parity** across the entire stack:
-
-```
-  Cargo.toml ──→ pyproject.toml ──→ package.json     (package version)
-  version.rs ──→ version.json  ──→ SDK CONTRACT_VERSION  (contract version)
-```
+Cargo is the local command backend. Automatic workflow dispatch selects
+BuildBuddy validation and Linux/macOS packaging for the repository owner when
+the required repository variable is enabled; other actors fall back to
+GitHub-hosted runners. Neither path replaces exact-main GitHub Actions CI,
+Windows packaging, or credentialed registry publication.
 
 ## Version Concepts
 
-There are two independent version numbers:
+Two version projections move together for a release:
 
 | Concept | Source of truth | Consumers |
-|---------|----------------|-----------|
-| **Package version** | `workspace.package.version` in `Cargo.toml` | Python `pyproject.toml`, TS `package.json` |
-| **Contract version** | `ContractVersion::CURRENT` in `meerkat-contracts/src/version.rs` | `artifacts/schemas/version.json`, SDK `CONTRACT_VERSION` |
+|---------|-----------------|-----------|
+| Package version | `workspace.package.version` in `Cargo.toml` | Rust crates, Python, TypeScript, Web SDK, docs |
+| Contract version | `ContractVersion::CURRENT` in `meerkat-contracts/src/version.rs` | Generated schemas and SDK contract constants |
 
-Package version = "what release are you running?"
-Contract version = "what wire protocol do you speak?"
+Meerkat is pre-1.0. Patch releases may contain declared public API breaks, so
+downstream Rust users must exact-pin the crate family and read every intervening
+changelog section.
 
-These are bumped independently. A contract version bump means the wire format changed.
-A package version bump means any code changed (features, fixes, etc.).
+## 1. Prepare Release Notes
 
-## Step-by-Step Process
+Keep all pending notes under the existing `## [Unreleased]` section. Name each
+measured public API break under `### Breaking`; cargo-semver-checks cannot see
+behavior-only breaks, so declare those manually too.
 
-### 1. Pre-release Check
+Do not rename the pending heading to the new version. The pre-release hook is
+the authority that stamps the version and date in the same commit as the
+version bump.
+
+## 2. Run the Gates
 
 ```bash
 make release-preflight
 ```
 
-This runs the full CI pipeline plus:
-- **Version parity**: Rust, Python, TypeScript package versions match
-- **Contract parity**: Rust `ContractVersion::CURRENT` matches emitted schemas and SDK types
-- **Internal deps**: All `meerkat-*` deps in workspace `Cargo.toml` match workspace version
-- **Schema freshness**: Committed artifacts match what `emit-schemas` produces
-- **Changelog**: Warns if `CHANGELOG.md` has no uncommitted changes
-
-### 2. Update CHANGELOG.md
-
-Move items from `[Unreleased]` to a new version section:
-
-```markdown
-## [Unreleased]
-
-## [0.3.0] - 2026-02-14
-### Added
-- New feature description
-
-### Fixed
-- Bug fix description
-```
-
-Update the comparison links at the bottom of the file.
-
-### 3. Release with cargo-release
+The preflight covers the release environment, Cargo and Bazel lock consistency,
+normal CI, schema and wrapper freshness, Rust packaging, and declared public
+API breaks. For the larger no-upload rehearsal, run:
 
 ```bash
-# Install if needed
-cargo install cargo-release
-
-# Dry run first (shows what would happen)
-cargo release patch --dry-run
-cargo release minor --dry-run
-cargo release major --dry-run
-
-# Execute
-cargo release patch    # 0.2.0 → 0.2.1
-cargo release minor    # 0.2.0 → 0.3.0
-cargo release major    # 0.2.0 → 1.0.0
+make release-dry-run
 ```
 
-`cargo release` automatically:
-1. Bumps `workspace.package.version` and all internal dep versions
-2. Calls `scripts/release-hook.sh` which:
-   - Bumps Python `pyproject.toml` and TypeScript `package.json`
-   - Re-emits schemas (`emit-schemas`)
-   - Re-runs SDK codegen (`generate.py`)
-   - Runs `verify-version-parity.sh`
-   - Stages all changed files
-3. Creates a commit: `chore: release v0.3.0`
-4. Creates an annotated tag: `v0.3.0`
-5. Pushes commit + tag
+That also exercises Rust, Python, TypeScript, and Web package dry-runs and
+package smoke tests.
 
-### 4. Build Release Artifacts
+## 3. Create the Version Commit and Tag
+
+Install `cargo-release` if needed, then inspect the dry run:
 
 ```bash
-make release
+./scripts/repo-cargo release patch
 ```
 
-Creates optimized binaries in `target/release/`.
-
-### 5. Publish to crates.io (when ready)
-
-Currently disabled (`publish = false` in release config) due to the `hnsw_rs` vendor patch.
-Once resolved:
+Execute only after the dry run and preflight are clean:
 
 ```bash
-# Dry run
-make publish-dry-run
-
-# Publish (topological order handled by cargo-release)
-cargo release publish --execute
+./scripts/repo-cargo release patch --execute
 ```
 
-## Contract Version Bumps
+Use `minor` or an explicit version in place of `patch` when appropriate.
+Workspace release metadata in `Cargo.toml` owns the shared-version commit,
+annotated `v<version>` tag, and push behavior.
 
-When changing wire types in `meerkat-contracts`:
+During the version-bump commit, `scripts/release-hook.sh` runs once for the
+workspace and:
 
-1. Bump `ContractVersion::CURRENT` in `meerkat-contracts/src/version.rs`
-2. Run `make regen-schemas` to propagate to artifacts + SDKs
-3. Run `make verify-version-parity` to confirm sync
-4. Commit all generated files together
+1. bumps Python, TypeScript, Web, documentation, and contract versions;
+2. stamps `CHANGELOG.md` as `## [<version>] - <YYYY-MM-DD>`, creates a fresh
+   `## [Unreleased]` section, and advances the comparison links;
+3. regenerates schemas, SDK types/wrappers, BuildBuddy BUILD files, and the
+   Bazel module lock;
+4. verifies version, RPC, and wrapper parity; and
+5. stages the generated release files into the same commit.
 
-## Version Numbering (SemVer)
+Missing notes, malformed comparison links, or stale generated contracts fail the hook. Do not work around a
+hook failure by manually committing only part of its output.
 
-Follow [Semantic Versioning](https://semver.org/):
+## 4. Publication
 
-- **MAJOR** (1.x.x): Breaking API changes
-- **MINOR** (x.1.x): New features, backwards compatible
-- **PATCH** (x.x.1): Bug fixes, backwards compatible
+The pushed tag starts `.github/workflows/release.yml`. It verifies the
+tree-bound attestation from successful exact-main CI, then builds and publishes:
 
-### Pre-release Versions
+- `rkat`, `rkat-rpc`, `rkat-rest`, and `rkat-mcp` archives for Linux, macOS,
+  and Windows;
+- `checksums.sha256` and `index.json`;
+- the Homebrew formula update;
+- publishable Rust crates;
+- `meerkat-sdk` on PyPI;
+- `@rkat/sdk` and `@rkat/web` on npm.
+
+The workspace `cargo-release` setting has `publish = false`; registry
+publication belongs to the release workflow and its ordered package scripts,
+not to the local version-bump command.
+
+## Contract Changes Outside a Release
+
+When editing wire types in `meerkat-contracts`:
 
 ```bash
-cargo release alpha    # 0.2.0 → 0.3.0-alpha.1
-cargo release beta     # 0.2.0 → 0.3.0-beta.1
-cargo release rc       # 0.2.0 → 0.3.0-rc.1
+make regen-schemas
+make verify-version-parity
+make verify-sdk-codegen-freshness
+make verify-sdk-wrapper-freshness
 ```
 
-## Makefile Targets Reference
+Commit source, schemas, generated SDK types, and wrapper projections together.
+The release hook will later stamp their version for the release.
+
+## Recovery
+
+Do not move or delete a published release tag to repair one failed publication
+surface. The release workflow has narrow manual recovery modes for assets,
+packages, the Web SDK, and Web SDK publication. Each recovery selects an
+existing release tag and still requires successful exact-main CI for that
+commit.
+
+Use the local release facade to print a recovery invocation without dispatching
+it:
+
+```bash
+RELEASE_WORKFLOW_DRY_RUN=true \
+RELEASE_BACKEND=github-hosted \
+  make release-assets VERSION=vX.Y.Z
+```
+
+Use `release-packages` or `release-web-sdk` instead to inspect those narrow
+recovery modes. `release-workflow` is the full release mode, not a narrow
+recovery invocation.
+
+`REGISTRY_DRY_RUN=true` is an input to a real dispatched workflow. It does not
+suppress binary, GitHub Release, or Homebrew publication.
+
+If a local dry run fails before any version commit or tag exists, fix the
+cause, remove only the hook's documented local sentinel if necessary, rerun
+the preflight, and retry the dry run.
+
+## Useful Targets
 
 | Target | Purpose |
 |--------|---------|
-| `verify-version-parity` | Check Rust/Python/TS/contract version sync |
-| `verify-schema-freshness` | Check committed schemas match Rust source |
-| `bump-sdk-versions` | Bump Python + TS versions to match Cargo |
-| `regen-schemas` | Re-emit schemas + run SDK codegen |
-| `release-preflight` | Full pre-release checklist (CI + freshness) |
-| `publish-dry-run` | Dry-run cargo publish for all crates |
-| `verify-version` | Verify Cargo version matches git tag |
+| `release-doctor` | Validate release tooling and environment |
+| `release-preflight` | Full local release gate |
+| `release-dry-run` | No-upload package and artifact rehearsal |
+| `verify-version-parity` | Check package, docs, schema, and SDK version projections |
+| `verify-schema-freshness` | Compare committed schemas with Rust source |
+| `verify-sdk-codegen-freshness` | Check generated SDK contract types |
+| `verify-sdk-wrapper-freshness` | Check public generated RPC wrapper boundaries |
+| `semver-breaks` | Compare publishable Rust APIs with released baselines |
+| `release-workflow` | Run the selected release backend facade |
 
-## Troubleshooting
+## Checklist
 
-### Version Parity Failure
-
-```
-FAIL: Python SDK CONTRACT_VERSION is stale
-```
-
-**Fix**: Run `make regen-schemas` and commit the updated files.
-
-### Schema Freshness Failure
-
-**Fix**: Someone changed Rust types in `meerkat-contracts` without regenerating.
-Run `make regen-schemas` and commit.
-
-### Version Mismatch After Release Failure
-
-If something fails after `cargo release` creates a tag:
-
-```bash
-# Delete the tag locally and remotely
-git tag -d v0.3.0
-git push origin :refs/tags/v0.3.0
-
-# Fix the issue, then re-run
-cargo release <level>
-```
-
-## Pre-Release Checklist
-
-- [ ] All tests passing (`make ci`)
-- [ ] Version parity verified (`make verify-version-parity`)
-- [ ] Schemas fresh (`make verify-schema-freshness`)
-- [ ] CHANGELOG.md updated with all changes
-- [ ] On main branch with latest changes
-- [ ] Release builds successfully (`make release`)
+- [ ] Pending notes remain under `## [Unreleased]`.
+- [ ] Every measured and behavior-only break is declared.
+- [ ] `make release-preflight` is green.
+- [ ] `make release-dry-run` is green when a full rehearsal is required.
+- [ ] The release is cut from the intended exact-main commit.
+- [ ] The installed pre-push hook is allowed to run.
+- [ ] The tag workflow publishes checksums, index, binaries, registries, and
+      Homebrew state without version skew.

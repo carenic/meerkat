@@ -265,6 +265,11 @@ an SDK backlog.
 | Agent tools | `delegate` and `mob_spawn_member` accept optional `placement`. Host/grant/observation/live/hard-cancel console verbs are deliberately absent from the LLM-visible roster. |
 | Web / WASM | Single-host. Spawn carriers accept the source-compatible optional placement field, but a non-local placement is rejected by the typed capability boundary. No member-host, grant, observation-console, or member-live console exports. |
 
+Member-live open/control is WebSocket-only for both local and placed members.
+The generic session `live/*` family can negotiate WebRTC only when the session
+is local to that RPC host; a controlling host cannot use `session/*` or
+`live/*` to proxy a placed member's remote session.
+
 All console surfaces consume the same four classified failures:
 `scope_denied`, `host_unavailable`, `stale_cursor`, and `stale_fence`.
 Unclassified failures keep each route or protocol's legacy rendering.
@@ -276,12 +281,17 @@ Runtime-mode behavior is shared across these surfaces because dispatch comes fro
 
 ## External members
 
-External members run outside the local Meerkat runtime, usually in another
-process, sandbox, or host. They require an explicit `RuntimeBinding::External`
-at spawn time; a bare external backend tag is not enough. The current binding
-shape carries `kind: "external"`, the advertised comms address, the external
-runtime's Ed25519 public identity, and a typed `bootstrap_token` for supervisor
-bridge binding.
+This section covers one already-running peer process that Meerkat does not
+materialize or own. It does not cover a managed session-backed member placed on
+a bound member host. Managed cross-host members use `SpawnMemberSpec.placement`
+with `RuntimeBinding::Session`; placement is machine-owned and is not an
+`External` backend.
+
+An unmanaged external member usually runs in another process, sandbox, or
+host. It requires an explicit `RuntimeBinding::External` at spawn time; a bare
+external backend tag is not enough. The current binding shape carries `kind:
+"external"`, the advertised comms address, the external runtime's Ed25519
+public identity, and a typed `bootstrap_token` for supervisor bridge binding.
 
 For a remote `rkat` member, generate that binding from the target process:
 

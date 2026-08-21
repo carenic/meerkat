@@ -4,8 +4,16 @@ description: "Portable multi-agent deployment with signed .mobpack artifacts and
 icon: "box"
 ---
 
-`mobpack` is the portable artifact for mobs. You build it once, then invoke it
-as a typed callable run, install/deploy it for reuse, or build a browser bundle.
+`mobpack` is the portable runtime artifact for mobs. You build it once, then
+deploy it with an objective, invoke a typed callable flow, or build a browser
+bundle.
+
+<Note>
+A mobpack is not a VM, container, or complete host image. It carries a mob
+definition and reviewed runtime assets. It does not carry the Meerkat binary,
+OS packages, provider credentials, secret environment values, or operator
+network policy.
+</Note>
 
 ## What this guide is for
 
@@ -20,6 +28,9 @@ Use this guide when you want to:
 - Single-file artifact: `.mobpack`
 - Optional signing and trust verification
 - Deterministic `inspect` and `validate` boundaries
+- Closed capability and target-surface declarations
+- Typed, capability-gated deploy defaults
+- Optional adaptive FlowMaster policy and schema assets
 - Typed callable invocation (`mob run`) and browser bundle target (`mob web build`)
 
 ## Directory to artifact
@@ -35,6 +46,87 @@ Expected source files:
 - `manifest.toml`
 - `definition.json`
 - optional `skills/`, `hooks/`, `mcp/`, `config/defaults.toml`
+- optional adaptive content under `adaptive/` and `schemas/`
+
+The runtime recognizes `skills/`, `hooks/`, `mcp/`, `config/`, `adaptive/`,
+and `schemas/` as typed asset sections, plus the root manifest, definition,
+and signature records. Other safe files can be carried and are covered by the
+digest, but the runtime does not interpret them as assets. Paths are
+canonicalized and unsafe or duplicate entries fail closed. Required capability
+tokens and surface selectors use closed typed vocabularies, so an unknown
+token fails instead of silently downgrading execution.
+
+### Manifest contract
+
+A minimal manifest names and versions the artifact. Optional sections declare
+capabilities, model aliases, profile assets, supported target surfaces, and
+adaptive metadata:
+
+```toml
+surfaces = ["cli", "rpc"]
+
+[mobpack]
+name = "release-triage"
+version = "1.0.0"
+description = "Release regression triage team"
+
+[requires]
+capabilities = ["comms", "skills"]
+
+[models]
+lead_model = "gpt-5.5"
+
+[profiles.lead]
+model = "lead_model"
+skills = ["skills/lead.md"]
+```
+
+Known surface selectors are `cli`, `rpc`, `rest`, `mcp`, and `web`. Skill paths
+must be canonical paths under `skills/`. `definition.json` remains the one
+`MobDefinition` authority; the manifest describes packaging and deployment
+requirements around it.
+
+### Deploy defaults are an allow-list
+
+`config/defaults.toml` is parsed into `MobpackDeployPolicy`, not merged into the
+host's general `Config`. A pack may declare only:
+
+- top-level `max_tokens` for the per-turn output cap
+- `[models]` defaults for `anthropic`, `openai`, and `gemini`
+- `[budget]` values `max_tokens`, `max_duration_secs`, and `max_tool_calls`
+- `[compaction]` values `auto_compact_threshold`, `recent_turn_budget`, `max_summary_tokens`, and `min_turns_between_compactions`
+
+For example:
+
+```toml
+max_tokens = 4096
+
+[models]
+openai = "gpt-5.5"
+
+[budget]
+max_tokens = 200000
+max_duration_secs = 900
+max_tool_calls = 200
+
+[compaction]
+auto_compact_threshold = 64000
+recent_turn_budget = 12
+max_summary_tokens = 4096
+min_turns_between_compactions = 4
+```
+
+Compaction knobs require `session_compaction` in `[requires].capabilities` and
+on the selected runtime. Unknown sections and fields fail closed. In
+particular, a pack cannot set realm bindings, self-hosted endpoints, provider
+tool keys, comms credentials, hooks, shell security, storage, retry, or general
+agent/tool configuration. Operator realm and environment layers remain
+authoritative; pack values are deployment defaults, not overrides of
+operator-owned truth.
+
+The definition also cannot smuggle realm references. Optional hook and MCP
+assets are declarations that still require compatible host capabilities and
+host-local resources. Keep secrets outside the archive.
 
 ## Signed packs and trust policy
 
@@ -66,20 +158,79 @@ Strict mode rejects:
 - invalid signatures
 - signer key mismatches
 
+Permissive mode accepts unsigned packs and valid signatures from unknown
+signers with warnings. It still rejects an invalid signature, digest mismatch,
+or signer-key mismatch. Permissive means relaxed signer enrollment, not skipped
+integrity.
+
 ## Run Modes
 
-One-shot CLI run:
+Deploy a pack with one objective and optional host-owned model or budget
+overrides:
 
 ```bash
-rkat mob run ./dist/release-triage.mobpack --prompt "triage latest incidents" --trust-policy permissive
+rkat mob deploy ./dist/release-triage.mobpack \
+  "triage latest incidents" \
+  --max-duration 15m \
+  --trust-policy permissive
 ```
 
-Detached reusable run:
+Invoke a pack as a typed callable. When the pack includes
+`schemas/main-input.json`, parameters are validated against it before the flow
+starts. The resulting object is the flow's `params` context, so step messages
+can read values such as `{{ params.prompt }}`. `--prompt` is sugar for
+`--param prompt=<text>`:
 
 ```bash
-rkat mob run release-triage --flow main --param severity='"high"' --detach
+rkat mob run ./dist/release-triage.mobpack \
+  --flow main \
+  --param severity='"high"' \
+  --prompt "triage latest incidents" \
+  --trust-policy permissive
+```
+
+Pack runs use the realm's durable mob and run stores. `--detach` requires a
+callable flow and returns its run id; inspect the persisted mob and run
+afterward:
+
+```bash
+rkat mob run ./dist/release-triage.mobpack \
+  --flow main \
+  --prompt "triage latest incidents" \
+  --param severity='"high"' \
+  --detach \
+  --trust-policy permissive
+rkat mob runs release-triage --json
 rkat mob attach release-triage <RUN_ID>
 ```
+
+<Warning>
+`--detach` persists the run record but does not transfer execution custody to
+a daemon. The flow executes only while that CLI process lives. After the
+process exits, the next mob hydration converges any unfinished run to
+`canceled` with execution custody lost. Use a long-lived host process when the
+work itself must continue independently.
+</Warning>
+
+When the mob already exists in the realm, the target can be its mob id instead
+of a file path. That path invokes the installed definition and does not reload
+or re-verify a pack.
+
+## Adaptive mobpacks
+
+An adaptive mobpack declares `[adaptive]` with a FlowMaster profile, objective
+class, SHA-256 policy digest, required schemas, and target surfaces. It also
+supplies:
+
+- `adaptive/policies.toml`
+- `adaptive/flowmaster.prompt.md`
+- `schemas/registry.json` and every registered required schema
+
+`rkat mob pack` stamps the `adaptive_flow` requirement and generates the
+canonical `adaptive/layer-decision.schema.json`. Validation rejects a policy
+digest mismatch, incomplete policy with any zero limit, missing registered
+schema, or stale layer-decision schema. A runtime without `adaptive_flow`
+rejects the pack instead of running a non-adaptive fallback.
 
 ## Browser target: `mob web build`
 
@@ -99,10 +250,11 @@ placeholder bundle. Pass either the generated output **directory** or the
 rkat mob web build ./dist/release-triage.mobpack -o ./dist/release-triage-web --wasm ./meerkat-web-runtime/pkg --trust-policy permissive
 ```
 
-Output is a self-contained, runnable bundle — serve the directory (e.g.
-`python3 -m http.server` over the output) and open `index.html`:
+Output is a static asset bundle. It still needs provider access through a
+user-supplied key or your authenticated proxy. Serve the directory
+(for example with `python3 -m http.server`) and open `index.html`:
 
-- `index.html` — ready-to-run demo page: enter an API key, click Start, the mob boots in-browser
+- `index.html` - browser bootstrap page: trust-verifies the pack and initializes the WASM runtime, but does not create a mob or provide prompt/transcript UI
 - `meerkat-bootstrap.js` — reusable ES module exporting `bootMobpack(opts)`; import it from your own app
 - `meerkat_web_runtime.js` — the wasm-bindgen glue
 - `meerkat_web_runtime_bg.wasm` — the compiled meerkat agent stack

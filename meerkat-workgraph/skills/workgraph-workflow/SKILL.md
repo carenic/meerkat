@@ -12,22 +12,34 @@ scratch space and not semantic memory.
 
 ## Operating Rules
 
+- Use `workgraph_create` for a new durable commitment. Keep related work in the
+  same namespace; omitted namespace means `default`.
 - Use `workgraph_ready` to find eligible work. Do not infer readiness from item
   fields, blocker counts, due times, or edges yourself.
 - Claim an item before doing durable or shared work with `workgraph_claim`.
-  Include your typed owner and the current `revision`.
+  Include your typed owner and the current `expected_revision`. Choose either
+  `lease_seconds` or `lease_expires_at`, never both.
 - If a write fails with a stale revision, reload the item with `workgraph_get`
   or `workgraph_snapshot`, reconsider the current state, then retry only if the
   work still makes sense.
+- Every successful mutation advances the item revision. Use the returned item,
+  not an older cached revision, for the next claim, update, evidence, release,
+  block, or close operation.
 - Use `workgraph_link` for real dependencies and relationships. Use `blocks`
   only when the target should not be ready until the source is terminally
   resolved.
 - Attach evidence with `workgraph_add_evidence` for artifacts, PRs, logs,
   summaries, external tickets, or other proof that the work changed state.
 - Close with `workgraph_close` only when terminal truth exists. Use
-  `completed`, `failed`, or `cancelled` honestly.
+  `completed`, `failed`, or `cancelled` honestly. A non-self-attested
+  completion policy can require typed confirmation evidence before close.
 - Release a claim with `workgraph_release` when you are stopping before terminal
   completion and the work should be claimable by someone else.
+- Use `workgraph_events` for audit history and `workgraph_snapshot` for a
+  graph-wide view. Do not reconstruct either from peer chat or task lists.
+- `workgraph_policy_escalate` and `workgraph_attention_reassign` are available
+  only with a runtime-bound attention authority. Their absence on an unscoped
+  surface is intentional.
 
 ## Boundaries
 
@@ -43,7 +55,7 @@ scratch space and not semantic memory.
 
 1. Call `workgraph_ready` for the active realm and namespace.
 2. Pick an item that matches the current objective.
-3. Claim it with the current `revision`.
+3. Claim it with the current item revision as `expected_revision`.
 4. Do the work.
 5. Add evidence for durable outputs.
 6. Update the item if the scope, timing, priority, or labels changed.

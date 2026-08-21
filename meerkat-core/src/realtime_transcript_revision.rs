@@ -1,12 +1,13 @@
 //! Realtime-transcript revision shell — NON-generated MECHANISM.
 //!
 //! This module is the mechanical companion to the realtime-transcript region
-//! of the canonical [`crate::generated::session_document::SessionDocumentMachine`].
+//! of the canonical
+//! [`crate::generated::session_document::SessionDocumentMachineAuthority`].
 //!
 //! ## DECISION vs MECHANISM split
 //!
 //! Every SEMANTIC decision in the realtime-transcript flow is owned by the
-//! `SessionDocumentMachine` DSL (its realtime-transcript region):
+//! `SessionDocumentMachineAuthority` (its realtime-transcript region):
 //!   * the per-event **action vector** (observe/append/replace/promote/
 //!     mark-ready/record/discard/materialize),
 //!   * the per-item **materialize verdict** (`Wait` / `MarkSkipped` /
@@ -18,7 +19,7 @@
 //!   * the per-session item registry storage ([`SessionRealtimeTranscriptState`]
 //!     and its content-segment maps),
 //!   * `item.text()` string assembly over `content_segments`,
-//!   * the causal topological ordering ([`realtime_transcript_order`]),
+//!   * the causal topological ordering (`realtime_transcript_order`),
 //!   * the materialize loop / batching / `AssistantBlock`/`Message` assembly,
 //!   * `in_flight` filtering + dedup,
 //!   * the restore-consistency observation computations.

@@ -4,7 +4,12 @@ description: "Embed Meerkat as a Rust library: the full engine with no subproces
 icon: "code"
 ---
 
-The Rust SDK is the primary interface. The Python/TypeScript SDKs and all API servers are thin wrappers over this same engine. The default embedding path is runtime-backed `SessionService`, which keeps Rust aligned with the same session lifecycle semantics used by every other Meerkat surface while still avoiding subprocess or JSON-RPC overhead.
+The Rust SDK is the primary interface. The Python/TypeScript SDKs and all API
+servers are thin wrappers over this same engine. A production Rust host
+composes `PersistentSessionService` with `MeerkatMachine`; the service is the
+session substrate and the machine owns runtime transitions. The direct
+`EphemeralSessionService` path remains useful for small embedded programs and
+tests that intentionally do not need runtime-backed persistence or delivery.
 
 ## Method overview
 
@@ -13,16 +18,29 @@ The Rust SDK is the primary interface. The Python/TypeScript SDKs and all API se
 | **Setup** | `Config::load()` | Load configuration from disk |
 | | `AgentFactory::new(store_root)` | Create a factory for building agents |
 | | `open_realm_persistence_in(...)` | Open a realm-backed persistence bundle |
-| | `build_persistent_service(factory, config, cap, persistence)` | Build the runtime-backed persistent session substrate |
-| | `build_ephemeral_service(factory, config, cap)` | Build an in-memory Queue-only substrate |
-| **Sessions** | `service.create_session(req)` | Create a session and run the first turn |
-| | `service.start_turn(id, req)` | Continue an existing session |
-| | `service.read(id)` | Read session state |
-| | `service.list(query)` | List active sessions |
-| | `service.archive(id)` | Remove a session |
+| | `build_persistent_service_with_runtime_adapter(...)` | Build the persistent service and its shared `MeerkatMachine` |
+| | `build_persistent_service(...)` | Build only the low-level persistent service half |
+| | `build_ephemeral_service(factory, config, cap)` | Build a direct in-memory Queue-only service |
+| **Direct embedded sessions** | `service.create_session(req)` | Create an ephemeral session and run the first turn |
+| | `service.start_turn(id, req)` | Continue an ephemeral session |
+| | `service.read(id)` | Read ephemeral session state |
+| | `service.list(query)` | List ephemeral sessions |
+| | `service.archive(id)` | Remove an ephemeral session |
+| **Runtime-backed host** | `surface::materialize_session(...)` | Attach a persistent session actor and machine executor |
+| | `machine.accept_input_with_completion(...)` | Admit runtime-owned input and await its typed completion |
+| | `service.archive_with_machine_protocol(...)` | Archive through the machine-owned retire protocol |
 | **Agent** | `agent.run(prompt)` | Run agent with a prompt |
 | | `agent.run_with_events(prompt, tx)` | Run with event streaming |
 | | `agent.cancel()` | Cancel the current run |
+| **Platform services** | `ScheduleService` | Schedule lifecycle and delivery state; durability follows the configured store |
+| | `WorkGraphService` | Work items, goals, evidence, and attention projections |
+| | `DetachedJobService` | Detached job lifecycle, progress, results, and delivery state |
+| | `HostAuthService` | Native host login, credential, and auth-binding lifecycle |
+| | `ProviderRuntimeRegistry` | Provider runtime and realm-scoped auth resolution |
+
+Mob orchestration is layered on this facade by the separate `meerkat-mob`
+crate. The `live` feature composes `meerkat-live` into the runtime; direct
+adapter types remain owned by `meerkat-live`.
 
 ## Installation
 
@@ -30,34 +48,37 @@ The Rust SDK is the primary interface. The Python/TypeScript SDKs and all API se
   <Step title="Add the dependency">
     ```toml
     [dependencies]
-    meerkat = "0.8.25"
+    meerkat = "=0.8.25"
     tokio = { version = "1", features = ["full"] }
     ```
   </Step>
   <Step title="Choose feature flags">
-    The default includes all three LLM providers and nothing else — add subsystems as needed:
+    The default feature set enables all three standard LLM providers; add
+    optional gates as needed:
     <CodeGroup>
     ```toml Default (all providers, no storage)
     [dependencies]
-    meerkat = "0.8.25"
+    meerkat = "=0.8.25"
     ```
 
     ```toml Add persistence
     [dependencies]
-    meerkat = { version = "0.8.25", features = ["sqlite-store", "session-store"] }
+    meerkat = { version = "=0.8.25", features = ["sqlite-store", "session-store"] }
     ```
 
-    ```toml Full harness
+    ```toml Full native harness
     [dependencies]
-    meerkat = { version = "0.8.25", features = [
+    meerkat = { version = "=0.8.25", features = [
         "sqlite-store", "session-store", "session-compaction",
-        "memory-store-session", "comms", "mcp", "skills", "live"
+        "memory-store-session", "atif", "comms", "mcp", "skills",
+        "schedule", "workgraph", "openai-realtime", "live",
+        "live-webrtc", "native-keyring"
     ] }
     ```
 
     ```toml Minimal (single provider)
     [dependencies]
-    meerkat = { version = "0.8.25", default-features = false, features = ["anthropic"] }
+    meerkat = { version = "=0.8.25", default-features = false, features = ["anthropic"] }
     ```
     </CodeGroup>
   </Step>
@@ -68,55 +89,103 @@ The Rust SDK is the primary interface. The Python/TypeScript SDKs and all API se
 |---------|-------------|---------|
 | `anthropic` | Anthropic Claude API client | Yes |
 | `openai` | OpenAI API client | Yes |
+| `openai-realtime` | OpenAI realtime provider client; implies `openai` | No |
 | `gemini` | Google Gemini API client | Yes |
-| `all-providers` | Shorthand for all three providers | No |
-| `sqlite-store` | SQLite-backed persistent realms | No |
-| `jsonl-store` | File-based session persistence | No |
+| `all-providers` | Shorthand for the three default non-realtime providers | No |
+| `native-keyring` | Native provider credential keyring | No |
+| `sqlite-store` | SQLite store implementations; pair with `session-store` for realms | No |
+| `jsonl-store` | JSONL session store; pair with `session-store` for realms | No |
 | `memory-store` | In-memory session storage (testing) | No |
 | `session-store` | Persistent session lifecycle support | No |
 | `session-compaction` | Auto-compact long conversations | No |
 | `memory-store-session` | Semantic memory indexing | No |
+| `atif` | ATIF trajectory export vocabulary | No |
 | `comms` | Ed25519 inter-agent messaging | No |
 | `mcp` | MCP protocol client and tool routing | No |
-| `schedule` | Durable scheduler surfaces | No |
-| `workgraph` | WorkGraph goal and attention surfaces | No |
+| `schedule` | Predicate schedule runnable helpers; `ScheduleService` is always linked | No |
+| `workgraph` | Compatibility opt-in; `WorkGraphService` and its types are always linked | No |
 | `live` | Live-channel orchestration and realtime adapter helpers | No |
+| `live-webrtc` | WebRTC bootstrap for live channels; implies `live` | No |
 | `skills` | Composable knowledge packs | No |
+| `integration-real-tests` | Test-only real-provider integration gate | No |
+| `test-realtime-fixtures` | Test-only deterministic realtime fixtures | No |
 </Accordion>
 
 ---
 
 ## Quick start
 
-Production surfaces (CLI, REST, RPC, MCP) use the **runtime-backed** path where `SessionService` is substrate and `MeerkatMachine` owns keep-alive, Queue/Steer routing, and comms drain. See the [JSON-RPC API](/api/rpc) or [REST API](/api/rest) for those entry points.
-
-For the main production embedding path, use the runtime-backed persistent flow:
+Production surfaces (CLI, REST, RPC, MCP) use the **runtime-backed** path where
+`PersistentSessionService` is substrate and `MeerkatMachine` owns keep-alive,
+Queue/Steer routing, interruption, terminal publication, and archive. Start a
+native host with both halves:
 
 ```rust
 use meerkat::{
-    AgentFactory, Config, CreateSessionRequest, SessionService,
-    SystemPromptOverride, build_persistent_service, open_realm_persistence_in,
-    DeferredPromptPolicy,
+    AgentFactory, Config, build_persistent_service_with_runtime_adapter,
+    open_realm_persistence_in,
 };
-use meerkat_core::service::InitialTurnPolicy;
-use meerkat_store::RealmBackend;
+use meerkat_store::{RealmBackend, realm_paths_in};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load().await?;
     let realms_root = std::env::current_dir()?.join(".rkat").join("realms");
+    let realm_id = "team-alpha";
+    let realm_paths = realm_paths_in(&realms_root, realm_id);
     let (_manifest, persistence) = open_realm_persistence_in(
         &realms_root,
-        "team-alpha",
+        realm_id,
         Some(RealmBackend::Sqlite),
         None,
     ).await?;
-    let factory = AgentFactory::new(realms_root.clone()).runtime_root(realms_root);
-    let service = build_persistent_service(factory, config, 64, persistence);
+    let store_path = persistence
+        .store_path()
+        .unwrap_or(&realm_paths.root)
+        .to_path_buf();
+    let factory = AgentFactory::new(store_path).runtime_root(realm_paths.root);
+    let (service, machine) = build_persistent_service_with_runtime_adapter(
+        factory,
+        config,
+        64,
+        persistence,
+    );
+
+    // A host now materializes actors through meerkat::surface helpers and
+    // admits work through `machine`. Keep both values for the host lifetime.
+    let _host_parts = (service, machine);
+    Ok(())
+}
+```
+
+<Warning>
+`build_persistent_service()` returns only the persistent service half. Its
+direct `start_turn`, `interrupt`, and `archive` methods intentionally return
+`SessionError::Unsupported`; a runtime-backed host must use the machine commit,
+interrupt, and retire protocols. Use the public helpers in `meerkat::surface`
+when building a native host, or use the ready-made RPC, REST, CLI, or MCP host.
+</Warning>
+
+For a direct embedded or testing flow that does not need machine-owned runtime
+semantics, use the ephemeral service:
+
+```rust
+use meerkat::{
+    AgentFactory, Config, CreateSessionRequest, DeferredPromptPolicy,
+    SessionService, SystemPromptOverride, build_ephemeral_service,
+};
+use meerkat_core::service::InitialTurnPolicy;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::load().await?;
+    let factory = AgentFactory::new(std::env::current_dir()?);
+    let service = build_ephemeral_service(factory, config, 64);
 
     let result = service.create_session(CreateSessionRequest {
         model: "claude-sonnet-4-6".into(),
         prompt: "What is the capital of France?".into(),
+        injected_context: Vec::new(),
         system_prompt: SystemPromptOverride::Set("You are a helpful assistant.".into()),
         max_tokens: Some(1024),
         event_tx: None,
@@ -132,13 +201,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-For **testing or embedded use** where runtime semantics are intentionally not needed, `build_ephemeral_service` remains available as a direct Queue-only substrate.
-
 ---
 
 ## Sessions
 
-`SessionService` is the canonical lifecycle API. All surfaces (CLI, REST, MCP, RPC) route through it.
+The examples below use the direct `EphemeralSessionService` lifecycle. The
+same request and result types are used inside production hosts, but persistent
+follow-up turns, interruption, and archive are machine-owned transitions and
+must not call these trait methods directly.
 
 ### Multi-turn conversations
 
@@ -153,6 +223,7 @@ use meerkat_core::service::InitialTurnPolicy;
 let result = service.create_session(CreateSessionRequest {
     model: "claude-sonnet-4-6".into(),
     prompt: "My name is Alice.".into(),
+    injected_context: Vec::new(),
     system_prompt: SystemPromptOverride::Set("You are a helpful assistant with memory.".into()),
     max_tokens: None,
     event_tx: None,
@@ -167,6 +238,7 @@ let session_id = result.session_id;
 // Turn 2: agent remembers "Alice"
 let result = service.start_turn(&session_id, StartTurnRequest {
     prompt: "What's my name?".into(),
+    injected_context: Vec::new(),
     system_prompt: None,
     event_tx: None,
     runtime: StartTurnRuntimeSemantics::default(),
@@ -192,6 +264,7 @@ use meerkat_core::service::InitialTurnPolicy;
 let created = service.create_session(CreateSessionRequest {
     model: "claude-sonnet-4-6".into(),
     prompt: "Let's wait before we run.".into(),
+    injected_context: Vec::new(),
     system_prompt: SystemPromptOverride::Set("You are the original prompt.".into()),
     max_tokens: None,
     event_tx: None,
@@ -203,6 +276,7 @@ let created = service.create_session(CreateSessionRequest {
 
 let result = service.start_turn(&created.session_id, StartTurnRequest {
     prompt: "Continue under the new instruction.".into(),
+    injected_context: Vec::new(),
     system_prompt: Some("For this point forward, answer concisely.".into()),
     event_tx: None,
     runtime: StartTurnRuntimeSemantics::default(),
@@ -231,7 +305,9 @@ match service.start_turn(&id, req).await {
 ## Direct agent APIs
 
 <Warning>
-`Agent::run(...)` and `AgentBuilder` are expert-level escape hatches. Prefer `SessionService` for normal embedding so your Rust code follows the same runtime-backed session semantics as CLI, REST, RPC, MCP, Python, and TypeScript.
+`Agent::run(...)` and `AgentBuilder` are expert-level escape hatches. Prefer
+the persistent service plus machine composition for a production host, or the
+ephemeral session service for a deliberately direct embedded flow.
 </Warning>
 
 ## Running agents directly
@@ -258,7 +334,7 @@ tokio::spawn(async move {
             AgentEvent::ToolExecutionStarted { name, .. } => {
                 println!("[Calling {}...]", name);
             }
-            AgentEvent::TurnCompleted { usage, .. } => {
+            AgentEvent::TurnCompleted { usage: Some(usage), .. } => {
                 // `usage` is per-call `TurnUsage`; its `accounting` names the
                 // resolved provider/model and the normalized presented input.
                 println!(
@@ -267,6 +343,10 @@ tokio::spawn(async move {
                     usage.accounting().model,
                     usage.normalized_total_tokens()
                 );
+            }
+            AgentEvent::TurnCompleted { usage: None, .. } => {
+                // Accounting was absent. Skip this row - do not treat it as
+                // zero. TurnUsageAccountingUnmeasured carries the reason.
             }
             _ => {}
         }
@@ -277,9 +357,10 @@ let result = agent.run_with_events("Tell me a story".into(), tx).await?;
 ```
 
 <Note>
-`turn_completed` carries usage for one provider call while `run_completed`
+`turn_completed` carries optional usage for one provider call while `run_completed`
 carries the session-cumulative total, and their `input_tokens` fields use
-different denominators. Read
+different denominators. `usage: None` means no accounting exists for that
+turn, not zero usage. Read
 [Usage accounting](/reference/usage-accounting) before aggregating either.
 </Note>
 
@@ -369,7 +450,7 @@ match event {
 
     // Comms interaction lifecycle
     AgentEvent::InteractionComplete { interaction_id, result, .. } => {}
-    AgentEvent::InteractionCallbackPending { interaction_id, tool_name, args } => {}
+    AgentEvent::InteractionCallbackPending { interaction_id, tool_name, args, .. } => {}
     AgentEvent::InteractionFailed { interaction_id, reason } => {}
     AgentEvent::StreamTruncated { reason } => {}
 
@@ -379,6 +460,13 @@ match event {
     // Background jobs and transcript rewrites
     AgentEvent::BackgroundJobCompleted { job_id, display_name, terminal_status, detail } => {}
     AgentEvent::TranscriptRewriteCommitted { session_id, record } => {}
+    AgentEvent::TranscriptRewriteAuditReceiptCommitted { session_id, receipt, final_assistant_text } => {}
+
+    // Provider evidence and peer-content observability
+    AgentEvent::ProviderCacheBreakpointsDiscarded { session_id, retained, discarded } => {}
+    AgentEvent::PeerContentIngested { kind, peer, request_id, sender_taint } => {}
+    AgentEvent::TurnUsageAccountingUnmeasured { session_id, unmeasured } => {}
+    AgentEvent::TurnUsageAccountingIdentityDisputed { session_id, dispute } => {}
 
     _ => {} // non_exhaustive: forward compatibility
 }

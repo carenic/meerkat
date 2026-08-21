@@ -358,7 +358,7 @@ pub enum LiveAdapterObservation {
     ///
     /// Scope (T7): this observation invalidates **only** spoken-transcript
     /// and audio-playback state for the in-flight turn. Display-text state
-    /// (the [`Self::AssistantTextDelta`] / [`AssistantBlock::Text`] lane) is
+    /// (the [`Self::AssistantTextDelta`] / [`crate::types::AssistantBlock::Text`] lane) is
     /// **preserved** — the user did not speak over written output, so any
     /// already-buffered display-text final still commits at
     /// [`Self::TurnCompleted`] (or via the projection sink's text-only

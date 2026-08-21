@@ -1,9 +1,9 @@
 //! Pending-continuation admission, owned by the canonical
-//! [`session_document::SessionDocumentMachine`].
+//! [`session_document::SessionDocumentMachineAuthority`].
 //!
 //! The pending-boundary disposition (`RunPending` / `NoPendingBoundary`) is a
 //! session-document-tail-derived SEMANTIC fact. It is decided by a
-//! SessionDocumentMachine transition (`ResolvePendingContinuation`), not here:
+//! session-document authority transition (`ResolvePendingContinuation`), not here:
 //! this module only carries the PURE mechanical [`observe_session_tail`]
 //! encoder (the `messages.last()` → [`ObservedSessionTailKind`] map) and a thin
 //! driver that runs the machine op and MIRRORS the emitted disposition. No
@@ -13,14 +13,14 @@ use crate::session_document;
 use crate::types::Message;
 
 // Re-export the canonical pending-continuation vocabulary (owned by the
-// SessionDocumentMachine) under this module so consumers have one ergonomic
+// session-document authority) under this module so consumers have one ergonomic
 // path for the encoder, the typed tail/disposition, and the driver.
 pub use session_document::SessionDocumentError as PendingContinuationAdmissionError;
 pub use session_document::{
     ObservedSessionTailKind, PendingContinuationDisposition, PendingContinuationPublicTerminal,
 };
 
-/// Mirror of the [`session_document::SessionDocumentMachine`]
+/// Mirror of the [`session_document::SessionDocumentMachineAuthority`]
 /// pending-continuation decision for a single resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingContinuationResolution {
@@ -44,9 +44,9 @@ pub fn observe_session_tail(messages: &[Message]) -> ObservedSessionTailKind {
     }
 }
 
-/// Drive the canonical SessionDocumentMachine `ResolvePendingContinuation`
+/// Drive the canonical session-document authority's `ResolvePendingContinuation`
 /// transition and MIRROR the emitted disposition (and public terminal witness).
-/// The pending-continuation region of SessionDocumentMachine is stateless
+/// The pending-continuation region of the session-document authority is stateless
 /// (self-loop in `Ready`), so a fresh authority per resolution is canonical.
 pub fn resolve_pending_continuation(
     session_tail: ObservedSessionTailKind,

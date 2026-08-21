@@ -1,7 +1,8 @@
 //! Shared infrastructure for the MDM TUX example.
 //!
-//! Provides provider auto-detection, direct control payloads for comms-based
-//! target attach/stream, and the kennel protocol types.
+//! Provides provider auto-detection, legacy comms attachment payloads used by
+//! the target-side kennel state machine, and kennel protocol types. TUX agent
+//! commands and streaming use JSON-RPC rather than these comms payloads.
 
 use anyhow::Context as _;
 use meerkat_comms::agent::types::{CommsContent, CommsMessage};
@@ -10,8 +11,8 @@ use meerkat_core::AgentEvent;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-pub mod kennel;
 pub mod generated_comms_trust;
+pub mod kennel;
 pub mod machines;
 pub mod rpc_client;
 pub use generated_comms_trust::ExampleGeneratedCommsTrustRouter;
@@ -119,7 +120,6 @@ pub fn direct_control_request(
         reply_endpoint: None,
         content_taint: None,
         handling_mode: None,
-        content_taint: None,
     })
 }
 

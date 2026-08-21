@@ -2,9 +2,10 @@
 # Pre-release hook for cargo-release.
 #
 # Called with the new version as $1. Performs:
-#   1. Bump Python + TypeScript SDK versions
-#   2. Re-emit schemas + run SDK codegen
-#   3. Stage the changed files for the release commit
+#   1. Bump SDK, contract, and documentation versions
+#   2. Stamp the pending CHANGELOG section for the release
+#   3. Re-emit schemas, run SDK codegen, and refresh build metadata
+#   4. Verify generated surfaces and stage the release commit
 #
 # cargo-release calls this from each crate directory (with shared-version,
 # it runs once per crate). We cd to the workspace root and use a sentinel
@@ -130,7 +131,9 @@ echo "==> Verifying SDK wrapper freshness..."
 
 # 4. Stage SDK and artifact files for the release commit
 git add \
+    "$ROOT/README.md" \
     "$ROOT/CHANGELOG.md" \
+    "$ROOT/.claude/skills/meerkat-platform/SKILL.md" \
     "$ROOT/docs/" \
     "$ROOT/MODULE.bazel.lock" \
     "$ROOT/meerkat-contracts/src/version.rs" \

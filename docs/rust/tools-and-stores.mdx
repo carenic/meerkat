@@ -127,6 +127,23 @@ The built-in `view_image` tool uses the same content-block mechanism to read ima
 
 ## Session stores
 
+`SessionStore` owns the session persistence domain. A complete facade realm-backed
+runtime also needs runtime lifecycle and delivery state, schedules, WorkGraph
+state, detached jobs, blobs, and artifacts. `RealmStorageProvider` is that
+facade persistence boundary: one provider returns every required store in a
+`RealmStoreSet`, and the facade composes that set into the realm's
+`PersistenceBundle`.
+
+Mob state is intentionally not a `RealmStoreSet` slot. The separate
+`meerkat-mob` crate owns its mob store to avoid a facade dependency cycle;
+MobKit or another higher-level host composes it alongside the facade provider.
+
+Each required slot declares a `DurabilityClass` and its actual
+`DurabilityResolution`. Startup fails closed when a durable slot resolves to
+non-persistent storage unless the realm manifest explicitly declares that
+domain ephemeral. The required domains are `sessions`, `runtime`, `schedule`,
+`workgraph`, `jobs`, `blobs`, and `artifacts`.
+
 <Tabs>
   <Tab title="JsonlStore">
     File-based persistence using JSONL format:
@@ -157,7 +174,7 @@ The built-in `view_image` tool uses the same content-block mechanism to read ima
 </Tabs>
 
 <Accordion title="Implementing a custom store">
-Implement the `SessionStore` trait and pass it to `AgentFactory::session_store()`. Then build a runtime-backed `SessionService` so the custom store participates in the canonical session lifecycle instead of only a one-off direct agent.
+Implement the `SessionStore` trait and pass it to `AgentFactory::session_store()` when you are replacing only session persistence. Then compose the persistent service with `MeerkatMachine` so the custom store participates in the canonical runtime-backed lifecycle instead of only a one-off direct agent.
 
 ```rust
 use async_trait::async_trait;
@@ -213,6 +230,49 @@ implementations as a storage seam for custom builders or direct agent/store
 integration, not as a drop-in replacement for the entire runtime persistence
 bundle.
 </Note>
+</Accordion>
+
+<Accordion title="Implementing a realm storage provider">
+Implement `RealmStorageProvider` when an external backend must own the whole
+realm. `open()` receives the canonical `RealmOpenContext` and returns a
+`RealmStoreSet` with all seven required stores and exactly one durability
+declaration for each domain. `DiskStorageProvider` is the built-in reference
+implementation for SQLite, JSONL, and explicitly ephemeral memory realms.
+
+The snippet below is intentionally schematic and non-runnable: each backend
+must construct its own seven stores and durability declarations before it can
+return.
+
+Provider implementations should run the published `meerkat-store-conformance`
+chapters for each supplied session, blob, and artifact trait capability. The
+suite covers session round trips, guarded revisions, incremental/rewrite
+semantics, concurrency, blob/artifact survival, and dangling references.
+Runtime, scheduler, WorkGraph, and job stores retain their own crate-level
+conformance suites, while facade composition enforces the provider's complete
+durability declaration set.
+
+```rust
+use async_trait::async_trait;
+use meerkat::{
+    PersistenceError, RealmOpenContext, RealmStorageProvider, RealmStoreSet,
+};
+
+struct ExternalRealmProvider;
+
+#[async_trait]
+impl RealmStorageProvider for ExternalRealmProvider {
+    fn name(&self) -> &str { "external" }
+
+    async fn open(
+        &self,
+        ctx: &RealmOpenContext,
+    ) -> Result<RealmStoreSet, PersistenceError> {
+        // Open every store from ctx.locator / ctx.manifest and return one
+        // durability declaration for each required domain.
+        todo!()
+    }
+}
+```
 </Accordion>
 
 ---

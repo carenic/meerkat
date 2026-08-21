@@ -12,7 +12,9 @@
 //!   raw `SELECT`s (the session-view queries grouped under one deferred read
 //!   snapshot per database, so a live migration cannot hide a session
 //!   between them);
-//! - never creates files or directories;
+//! - never creates database files or directories, and never changes logical
+//!   database content; read-only SQLite opens may still create or update the
+//!   `-wal`/`-shm` sidecars needed for a coherent live WAL read;
 //! - never runs the schema ledger (versions are read with
 //!   [`meerkat_sqlite::domain_version`], nothing is applied);
 //! - reads **only** the roots named in the [`DiagnoseScope`] — no ambient

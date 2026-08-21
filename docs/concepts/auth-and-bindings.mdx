@@ -1,76 +1,125 @@
 ---
 title: "Auth And Bindings"
-description: "How Meerkat separates provider selection from credential resolution and binding identity."
+description: "How Meerkat resolves a model backend, account, and credential source without storing secrets in sessions."
 icon: "key"
 ---
 
-Meerkat separates **what model/backend you want** from **which credentials or account should be used**.
-
-The core pieces are:
-
-- realms
-- auth profiles
-- backend profiles
-- bindings
-- `auth_binding`
-
-This model matters because the same app/session/mob can:
-
-- switch providers without changing its overall structure
-- run different mob members under different tenants/accounts
-- use env-var fallback for fast paths and explicit bindings for controlled paths
-
-## Mental model
+Meerkat separates **where a provider request goes** from **how that request is
+authorized**. Sessions refer to a binding, and the binding joins one backend
+profile to one auth profile.
 
 ```text
 realm
-  -> backend profiles
-  -> auth profiles
-  -> bindings
+  backend profile -> provider + backend kind + endpoint
+  auth profile    -> provider + auth method + credential source
+  binding         -> backend profile + auth profile + model/policy defaults
 
-session / turn / mob member
-  -> auth_binding
-  -> provider runtime resolution
+session, turn, or mob member
+  auth_binding    -> realm + binding (+ optional profile)
 ```
 
-## Inheritance: reads inherit, writes are strict-owner
+This lets one process use several provider accounts or tenants, give mob
+members different credentials, and re-resolve credentials on resume without
+putting secret material in the session transcript or metadata.
 
-Realms can form a parent chain ending at the reserved `global` realm, and
-**credentials inherit down that chain** while **writes do not**:
+## The Four Identities
 
-- A child realm can resolve a binding defined in a parent or in `global`
-  (read-inherit). This is what makes `rkat auth login` — which provisions the
-  home-rooted `global` realm — usable from every workspace realm via the chain
-  tail.
-- `auth login` and config writes target the realm that **owns** the binding
-  (where its config section is defined). You cannot write into an inherited
-  binding's doc from a child; persisting a credential for a child realm whose
-  binding is inherited is rejected with a typed error naming the owning realm
-  (write-strict-owner).
-- A resolved binding records **owning-realm provenance**: its `realm` is the
-  realm that defines it, not the requesting realm. So an inherited `global`
-  binding used from realm `team` resolves and persists under `global`.
+| Identity | Owns |
+|----------|------|
+| Realm | Config and credential namespace |
+| Backend profile | Provider, wire backend, endpoint, and backend options |
+| Auth profile | Auth method, credential source, constraints, and metadata defaults |
+| Binding | Compatible backend/auth pair, optional default model, and binding policy |
 
-Store-backed credentials (`ManagedStore`, OAuth leases) are realm-namespaced and
-follow owning-realm provenance; `Env`, inline-secret, and command sources are
-realm-agnostic. See [Realm inheritance](/concepts/realm-inheritance) for the
-full model.
+The backend profile and auth profile must name the same provider, and that
+provider must support the selected `backend_kind` and `auth_method` pair.
+Meerkat validates the combination before constructing the provider client.
 
-## What this concept owns
+For self-hosted models, the backend profile can also identify the specific
+`self_hosted.servers.<id>` entry it authenticates. This prevents a credential
+for one OpenAI-compatible server from being selected for another server merely
+because both use the `self_hosted` provider class.
 
-- binding identity
-- credential resolution path
-- per-session / per-turn / per-member provider identity choice
+## Binding Selection
 
-## What it does not own
+A realm can declare one `default_binding`, and a binding can set
+`provider_default = true` to become the default for its provider. An explicit
+`auth_binding` always names the intended configured binding directly.
 
-- the general model catalog (`Providers`)
-- session lifecycle (`Sessions`)
-- config write/CAS mechanics (`Configuration`)
+When the model is omitted, session creation resolves in this order:
 
-## See also
+1. An explicit binding's `default_model`, if present.
+2. A configured model compatible with the explicit provider or binding.
+3. That provider's catalog default.
+4. With no provider/binding constraint, the configured global model and then
+   catalog defaults.
 
-- [Realms](/concepts/realms)
+An explicit model still wins, but a known provider/model mismatch fails before
+agent construction.
+
+## Structural References
+
+Public JSON surfaces use an object:
+
+```json
+{
+  "realm": "prod",
+  "binding": "openai",
+  "profile": "optional-profile"
+}
+```
+
+The CLI accepts `prod:openai` or `prod:openai:optional-profile` as an input
+convenience and converts it to the structural form at the CLI boundary. Runtime
+and persistence contracts do not carry the joined string.
+
+Configured references have `origin = "configured"` (the serialized default).
+The environment-variable fast path uses a typed
+`origin = "synthetic_env_default"`; it is ephemeral and is not a durable
+realm that can be configured or inherited.
+
+## Sessions Keep Intent, Not Secrets
+
+`SessionMetadata.auth_binding` persists the binding reference used by a
+session. On resume or a model hot-swap, the factory re-resolves that reference
+against the effective realm config and obtains a fresh credential lease.
+Access tokens and API keys are never stored in session metadata.
+
+If a turn changes provider, supply a matching model and binding together.
+Leaving the binding unchanged preserves the existing account intent and will
+fail closed if it is incompatible with the new provider.
+
+## Inheritance And Ownership
+
+Realm config is resolved through its configured parent chain and an optional
+`global` tail:
+
+- Binding reads inherit. A workspace realm can use a binding defined in a
+  parent or in `global`.
+- Credential writes are strict-owner and explicitly addressed. Login, logout,
+  refresh, and managed credential persistence must name the realm that defines
+  the binding. A child-addressed inherited write is rejected with the owner;
+  the service does not forward it automatically.
+- A resolved inherited binding retains its owning realm as provenance. That
+  realm keys managed credentials and auth leases.
+
+This is why `rkat auth login`, which provisions `global`, works from every
+workspace without copying the credential into each workspace config.
+
+## Credential Sources
+
+An auth profile can resolve credentials from environment variables, the
+managed token store, an inline secret, a platform default chain, a host
+resolver, a command, or a host-supplied file descriptor. Availability depends
+on the auth method and build features.
+
+Use environment variables for the simplest local path. Use managed-store OAuth
+or an explicit host resolver when account identity, refresh, or tenant
+isolation matters.
+
+## See Also
+
+- [Auth guide](/guides/auth)
 - [Realm inheritance](/concepts/realm-inheritance)
 - [Providers](/concepts/providers)
-- [Auth guide](/guides/auth)
+- [Sessions](/concepts/sessions)

@@ -1,4 +1,4 @@
-# 027 — Skills V2.1 Invocation (TypeScript SDK)
+# 027 - Canonical Skill Invocation (TypeScript SDK)
 
 Invoke a skill using canonical refs with
 `SkillKey` (`{ sourceUuid, skillName }`).
@@ -8,7 +8,7 @@ Invoke a skill using canonical refs with
 - Canonical `SkillKey` refs (recommended)
 - Capability gating via `client.requireCapability("skills")`
 
-## Optional Environment
+## Environment
 ```bash
 export ANTHROPIC_API_KEY=sk-...
 # Optional: override the project-local skill name.
@@ -22,7 +22,7 @@ export ANTHROPIC_API_KEY=sk-...
 # (cd examples && npm install)
 # ./scripts/repo-cargo build -p meerkat-rpc --bin rkat-rpc
 # export MEERKAT_BIN_PATH="$(./scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')/debug/rkat-rpc"
-npx tsx main.ts
+npx tsx examples/027-skills-v21-invoke-ts/main.ts
 ```
 
 The example writes a tiny conventional project-local skill under

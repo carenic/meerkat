@@ -102,11 +102,11 @@ export interface RuntimeModule {
   mob_spawn: (mobId: string, specsJson: string) => Promise<unknown>;
   mob_wire: (mobId: string, a: string, b: string) => Promise<void>;
   mob_unwire: (mobId: string, a: string, b: string) => Promise<void>;
-  mob_append_system_context: (mobId: string, meerkatId: string, requestJson: string) => Promise<string>;
-  mob_member_send: (mobId: string, meerkatId: string, requestJson: string) => Promise<string>;
-  mob_member_subscribe: (mobId: string, meerkatId: string) => Promise<number>;
-  poll_subscription: (handle: number) => string;
-  close_subscription: (handle: number) => void;
+  mob_append_system_context: (mobId: string, agentIdentity: string, requestJson: string) => Promise<string>;
+  mob_member_send: (mobId: string, agentIdentity: string, requestJson: string) => Promise<string>;
+  mob_member_subscribe: (mobId: string, agentIdentity: string) => Promise<string>;
+  poll_subscription: (handle: string) => string;
+  close_subscription: (handle: string) => void;
   mob_run_flow: (mobId: string, flowId: string, paramsJson: string) => Promise<unknown>;
   mob_flow_status: (mobId: string, runId: string) => Promise<unknown>;
   mob_list_members: (mobId: string) => Promise<unknown>;
@@ -116,7 +116,7 @@ export interface RuntimeModule {
 // ── Session ──
 export interface AgentSub {
   agentId: AgentId;
-  handle: number;
+  handle: string;
 }
 
 export interface OfficeSession {

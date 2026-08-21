@@ -6,9 +6,9 @@ icon: "landmark"
 
 # Meerkat Dogma
 
-Status: Draft primary architecture doctrine
+Status: Accepted canonical architecture doctrine
 Scope: All Meerkat runtime, surface, provider, SDK, protocol, storage, auth, mob, scheduling, WASM, and governance work
-Companion: A longer commentary document will explain examples, tensions, and repair patterns
+Companion: `docs/architecture/meerkat-dogma-commentary.md` explains examples, tensions, and repair patterns
 
 ## Purpose
 
@@ -379,8 +379,8 @@ rebuild path, never inferred from a caller-controlled reason string. Reasons
 remain audit/presentation data. Marker-free legacy commits may acquire the
 typed semantic only when their retained revision bodies prove the exact
 full-range shrinking compaction shape.
-Session metadata and compatibility checkpoints may carry the intent but cannot
-become commit authority. Cancellation, process loss, retry, and scope deletion
+Session metadata and released-format compatibility markers may carry the intent
+but cannot become commit authority. Cancellation, process loss, retry, and scope deletion
 must leave either the old transcript with no visible projection or the committed
 rewrite with its exact projection—never a half-published pair. Scope deletion
 must persist a deletion-wins tombstone that fences staged, finalized, cached,

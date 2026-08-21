@@ -6,8 +6,12 @@ and Gemini responses. Use provider-specific parameters.
 ## Concepts
 - Provider auto-detection from model name
 - Provider-specific parameters (thinking, reasoning effort)
-- Cost optimization by routing to cheaper models
-- Fallback chains for resilience
+- Per-session model routing across configured providers
+- Typed Anthropic and OpenAI provider parameters
+
+The runnable calls compare configured providers and demonstrate typed provider
+parameters. The final printed routing guide discusses cost and fallback
+patterns; it does not execute an automatic fallback chain.
 
 ## Supported Providers
 | Provider | Models | Env Var |
@@ -24,5 +28,6 @@ and Gemini responses. Use provider-specific parameters.
 # python -m pip install -e sdks/python
 # ./scripts/repo-cargo build -p meerkat-rpc --bin rkat-rpc
 # export MEERKAT_BIN_PATH="$(./scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')/debug/rkat-rpc"
-ANTHROPIC_API_KEY=sk-... OPENAI_API_KEY=sk-... python3 main.py
+ANTHROPIC_API_KEY=sk-... OPENAI_API_KEY=sk-... \
+  python3 examples/021-multi-provider-routing-py/main.py
 ```

@@ -1,5 +1,5 @@
 ---
-title: "Hooks"
+title: "Hooks examples"
 description: "Lifecycle hooks for audit and guardrails at 8 hook points."
 icon: "anchor"
 ---
@@ -307,6 +307,39 @@ Hooks receive typed projections of the request, response, tool call, and tool re
   </Tab>
 </Tabs>
 
+## Gate a tool by provenance
+
+Tool names are not sufficient authority when several MCP servers or bundles
+can publish the same logical operation. A `pre_tool_execution` hook can inspect
+the winning tool definition's typed provenance:
+
+```rust
+let engine = DefaultHookEngine::new(hooks_config)
+    .with_in_process_handler(
+        "trusted-mcp-only",
+        Arc::new(|invocation| Box::pin(async move {
+            let denied = invocation.tool_call.as_ref().is_some_and(|call| {
+                call.provenance.as_ref().is_some_and(|source| {
+                    source.kind == ToolSourceKind::Mcp
+                        && source.source_id.as_str() != "approved-server"
+                })
+            });
+            Ok(RuntimeHookResponse {
+                decision: denied.then(|| HookDecision::deny(
+                    HookId::new("trusted-mcp-only"),
+                    HookReasonCode::PolicyViolation,
+                    "MCP source is not approved",
+                    None,
+                )),
+            })
+        })),
+    );
+```
+
+The same provenance is present on `HookToolResult`, so post-execution audit
+hooks can attribute outputs to the exact selected source without re-resolving a
+tool name.
+
 ## HTTP hook
 
 A hook that POSTs the invocation payload to a remote URL. Useful for centralized policy servers.
@@ -445,7 +478,8 @@ A hook that POSTs the invocation payload to a remote URL. Useful for centralized
 | `run_failed` | post | After a run fails with an error |
 
 <Note>
-Pre-point hooks in `foreground` mode halt the agent loop until they return. Pre-point hooks in `background` mode are limited to observe-only capability.
+Foreground hooks halt loop progression until they return. Every hook in
+`background` mode is limited to `observe` capability, including post points.
 </Note>
 
 ## Disable a hook

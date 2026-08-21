@@ -5,7 +5,10 @@ Whatever you do, remember: All hail Clippy. Clippy sees all, knows all, and tole
 
 ## Project Overview
 
-Meerkat (`rkat`) is a minimal, high-performance agent harness for LLM-powered applications written in Rust. It provides the core execution loop for agents without opinions about prompts, tools, or output formatting.
+Meerkat (`rkat`) is a library-first Rust platform for building, hosting, and
+operating LLM-powered agents. It provides the agent loop, providers, tools,
+typed events, persistence, runtime control, and multi-agent orchestration
+behind CLI, REST, JSON-RPC, MCP, SDK, and browser/WASM surfaces.
 
 **Naming convention:**
 - Project/branding: **Meerkat**
@@ -88,7 +91,7 @@ ANTHROPIC_API_KEY=... ./scripts/repo-cargo run --example simple
 
 ## Build Efficiency
 
-This is a large workspace (~40 crates). Careless builds waste minutes. Follow these rules:
+This is a large workspace (49 members). Careless builds waste minutes. Follow these rules:
 
 **Use package-scoped commands during development.** Do NOT default to `--workspace` for every build or check. Scope to the crate you're changing and its immediate dependents:
 
@@ -107,11 +110,14 @@ This is a large workspace (~40 crates). Careless builds waste minutes. Follow th
 ./scripts/repo-cargo nextest run --workspace --status-level none --final-status-level fail
 ```
 
-**Never run parallel cargo commands.** They deadlock on the workspace file lock. Run builds sequentially.
+**Do not launch overlapping unisolated Cargo commands in one checkout.** Use
+the repository wrapper and a distinct `RUST_LANE_ID` for concurrent same-tree
+agents that need separate warm output roots. Separate worktrees are already
+isolated by their path hash.
 
 **Always use `./scripts/repo-cargo`** instead of bare `cargo`. The wrapper manages per-worktree build caches and avoids cross-worktree cache pollution.
 
-**Use BuildBuddy for broad final verification when available.** Prefix the normal broad lanes with `MEERKAT_BUILDBUDDY=1`: `make build`, `make lint`, `make test`, `make test-unit`, `make test-int`, `make e2e-fast`, and `make e2e-system` then use the optional macOS arm64 BuildBuddy/Bazel backend. `make buildbuddy-doctor` verifies credentials, the pinned `bb` CLI, Bazel metadata freshness, selector health, and lane isolation. For same-checkout multi-agent work, set a distinct `RUST_LANE_ID` when you want stable warm Bazel lanes.
+**Use BuildBuddy for broad final verification when available.** Prefix the normal broad lanes with `MEERKAT_BUILDBUDDY=1`: `make build`, `make lint`, `make test`, `make test-unit`, `make test-int`, `make e2e-fast`, and `make e2e-system` then use the optional macOS arm64 BuildBuddy/Bazel backend. `make buildbuddy-doctor` verifies credentials, the pinned `bb` CLI, Bazel metadata freshness, selector health, and lane isolation.
 
 **Key dependency chains to know** (touching a crate rebuilds everything downstream):
 - `meerkat-core` → rebuilds almost everything (~27s incremental)
@@ -124,9 +130,12 @@ This is a large workspace (~40 crates). Careless builds waste minutes. Follow th
 ```
 meerkat-sqlite    → Shared SQLite mechanics (connection profiles, meerkat_schema migration
                      ledger, JsonColumnBytes codec, per-operation maintenance-fence guards)
+meerkat-agent-build-authority → Retired compatibility marker only; factory build
+                     finalization authority is private to the facade/core seam
 meerkat-store-conformance → Published storage conformance harness (per-trait capability
                      profiles, capability-discovery, append-only media, blob chapters)
-meerkat-core      → Agent loop, types, budget, retry, state machine (no I/O deps)
+meerkat-core      → Agent loop, types, budget, retry, state machine, foundational contracts,
+                     and bounded native config/path/lock/fence I/O
                      Also: SessionService trait, Compactor + CompactionCurator traits, MemoryStore trait,
                      ToolExecutionPolicy/ExecutionPolicyGatedDispatcher (list-preserving call-level tool gate), SessionError
                      Owns the model-catalog vocabulary types + ModelCatalog mechanics (no provider data)
@@ -134,14 +143,13 @@ meerkat-core      → Agent loop, types, budget, retry, state machine (no I/O de
                      DurabilityClass vocabulary, StorageMigrator::diagnose seam
 meerkat-models    → Provider model catalog/capabilities data (core stays provider-free);
                      exposes `canonical()` ModelCatalog injected into core seams
-meerkat-llm-core  → LLM wire-client trait + streaming plumbing (LlmClient, BlockAssembler, LlmClientAdapter)
+meerkat-llm-core  → LLM wire-client, streaming, realtime, and provider-runtime contracts
 meerkat-anthropic / meerkat-openai / meerkat-gemini → Per-provider clients implementing AgentLlmClient
 meerkat-client    → Thin shim re-exporting meerkat-llm-core + the per-provider clients (B2 split)
-meerkat-auth-core → Auth primitives (tokens, OAuth types) shared by provider crates
-meerkat-providers → Provider runtime registry + OAuth + TokenStore + cloud authorizers (AWS/GCP/Azure)
-                     Owns `ProviderRuntimeRegistry`, `ResolverEnvironment`, and the typed
-                     `{backend_kind, auth_method}` matrix per provider. Consumed by the facade
-                     and surface crates for realm-scoped credential resolution.
+meerkat-auth-core → Cross-target credential resolver plus native token stores, OAuth, keyring,
+                     lockfile, and cloud-IAM authorizers
+meerkat-providers → Compatibility shim re-exporting provider-runtime contracts from
+                     meerkat-llm-core and auth primitives from meerkat-auth-core
 meerkat-store     → Session persistence (SqliteSessionStore, JsonlStore, MemoryStore) implementing SessionStore
 meerkat-tools     → Tool registry and validation implementing AgentToolDispatcher
 meerkat-session   → Session service orchestration (EphemeralSessionService, DefaultCompactor)
@@ -157,23 +165,27 @@ meerkat-comms     → Inter-agent communication (Ed25519-signed messaging, trans
 meerkat-capabilities → Typed capability vocabulary and feature-owned declaration collection
 meerkat-contracts → Wire types, error codes, generated schemas, supervisor bridge protocol
                      (canonical over all surfaces; BridgeCommand/BridgeReply for mob↔runtime boundary)
+meerkat-atif      → ATIF-v1.7 trajectory model and canonical committed-event exporter
 meerkat-skills    → Skill loading, resolution, rendering (filesystem, git, HTTP, embedded sources)
 meerkat-hooks     → Hook infrastructure (in-process, command, HTTP runtimes)
 meerkat-mob       → Multi-agent mob orchestration (spawn, provision, finalize, SQLite storage, flow frames/loops)
 meerkat-mob-pack  → Mobpack archive format, signing, trust policies, validation
-meerkat-schedule  → Scheduler: cron/interval triggers, occurrence lifecycle, delivery, schedule tools,
+meerkat-schedule  → Scheduler: once/interval/calendar triggers, occurrence lifecycle, delivery, schedule tools,
                      host-runnable targets (TargetBinding::HostRunnable + ScheduleRunnableHost registry)
+meerkat-jobs      → Durable detached-job lifecycle, atomic store/outbox contracts,
+                     predicate watches, health, and restart-safe delivery vocabulary
 meerkat-mob-mcp   → Expose mob tools as MCP interface + agent-facing delegation tools (MobMcpState, MobMcpDispatcher, AgentMobToolSurface)
 meerkat-workgraph → Work graph (work items, dependencies) + agent-facing workgraph tools
 meerkat-runtime   → Runtime control plane (MeerkatMachine, ops lifecycle, runtime handles) between surfaces and core
-meerkat-live      → Live multimodal WebSocket transport (LiveAdapterHost bridge, mountable axum router)
+meerkat-live      → Live multimodal WebSocket transport plus feature-gated WebRTC signaling/media
 meerkat-cli       → CLI binary (produces `rkat`)
 meerkat           → Facade crate, re-exports, AgentFactory, SDK helpers
 meerkat-web-runtime → WASM browser deployment target (wasm_bindgen exports)
 meerkat-machine-* → Machine authority toolchain (schema catalog, DSL, codegen, kernels, derive)
+meerkat-mob-adaptive → Transitional re-export of the mob-owned adaptive module
 ```
 
-**Key traits** (all in meerkat-core):
+**Selected foundational traits in meerkat-core**:
 - `AgentLlmClient` - LLM provider abstraction
 - `AgentToolDispatcher` - Tool routing abstraction
 - `AgentSessionStore` - Session persistence abstraction
@@ -185,7 +197,7 @@ meerkat-machine-* → Machine authority toolchain (schema catalog, DSL, codegen,
 
 **Agent loop state machine:** `CallingLlm` → `WaitingForOps` → `DrainingEvents` → `Completed` (with `ErrorRecovery` and `Cancelling` branches)
 
-**Crate ownership:** `meerkat-core` owns trait contracts. `meerkat-store` owns `SessionStore` implementations. `meerkat-session` owns session orchestration (`EphemeralSessionService`, `PersistentSessionService`) and `EventStore`. `meerkat-memory` owns `HnswMemoryStore`. The facade (`meerkat`) wires features, re-exports, and provides `FactoryAgentBuilder`/`FactoryAgent`/`build_ephemeral_service`.
+**Crate ownership:** `meerkat-core` owns foundational trait contracts. Feature crates own domain-specific contracts such as `DetachedJobStore`, `WorkGraphStore`, and `ScheduleStore`. `meerkat-store` owns `SessionStore` implementations. `meerkat-session` owns session orchestration (`EphemeralSessionService`, `PersistentSessionService`) and `EventStore`. `meerkat-memory` owns `HnswMemoryStore`. The facade (`meerkat`) wires features, re-exports, and provides `FactoryAgentBuilder`/`FactoryAgent`/`build_ephemeral_service`.
 
 **Machine authority rule:** For canonical machine-owned domains, semantic state mutation must flow through generated machine authority, not handwritten reducers. See `docs/reference/machine-authority.mdx` (canonical registry: `canonical_machine_schemas()` in `meerkat-machine-schema/src/catalog/mod.rs`).
 
@@ -193,11 +205,11 @@ meerkat-machine-* → Machine authority toolchain (schema catalog, DSL, codegen,
 
 **Runtime build mode:** All runtime-backed surfaces use `MeerkatMachine::prepare_bindings(session_id)` to obtain `SessionRuntimeBindings`, then pass `RuntimeBuildMode::SessionOwned(bindings)` via `SessionBuildOptions.runtime_build_mode`. Standalone/test/WASM surfaces use `RuntimeBuildMode::StandaloneEphemeral` (the default).
 
-**Session lifecycle:** All surfaces (CLI, REST, MCP Server, JSON-RPC, WASM, Rust/Python/TypeScript/Web SDKs) route through `SessionService` for the full session lifecycle (create/turn/interrupt/read/list/archive). `FactoryAgentBuilder` bridges `AgentFactory` into the `SessionAgentBuilder` trait. Per-request build data is passed in-band via `CreateSessionRequest.build` / `SessionBuildOptions`.
+**Session lifecycle:** Runtime-backed product surfaces (CLI, REST, MCP Server, JSON-RPC, and their process-backed Python/TypeScript clients) route through `SessionService` for create/turn/interrupt/read/list/archive. `FactoryAgentBuilder` bridges `AgentFactory` into the `SessionAgentBuilder` trait. Embedded Rust and WASM can construct standalone agents directly through `AgentFactory`; per-request service build data is passed in-band via `CreateSessionRequest.build` / `SessionBuildOptions`.
 
 **Capability matrix:** See `docs/reference/capability-matrix.mdx` for build profiles, error codes, and feature behavior. See `docs/reference/session-contracts.mdx` for concurrency, durability, and compaction semantics.
 
-**`.rkat/sessions/` files** are derived projection output (materialized by `SessionProjector`), NOT canonical state. Deleting them and replaying from the event store produces identical content.
+**`.rkat/sessions/` files** are derived projection output (materialized by `SessionProjector`), NOT canonical state. When the optional event projection is installed, complete, and healthy, those views can be rebuilt from successfully projected envelopes. The `RuntimeStore`/backend carrier remains session authority; `SessionStore` rows are component/content state.
 
 ## MCP Server Management
 
@@ -227,7 +239,7 @@ Config stored in `.rkat/mcp.toml` (project) or `~/.rkat/mcp.toml` (user).
 rkat-rpc
 ```
 
-The RPC server speaks JSON-RPC 2.0 over newline-delimited JSON (JSONL) on stdin/stdout. Unlike REST/MCP, it keeps agents alive between turns via `SessionRuntime` -- enabling fast multi-turn conversations, mid-turn cancellation, and event streaming without agent reconstruction overhead.
+The RPC server speaks JSON-RPC 2.0 over newline-delimited JSON (JSONL) on stdin/stdout. Like REST and MCP, it composes the shared runtime-backed service so agents can stay alive between turns. RPC adds a broad typed method catalog, mid-turn cancellation, and scoped event notifications for interactive clients.
 
 **Methods:** The full callable method catalog is generated and documented in `docs/api/rpc.mdx` (gated by `scripts/verify_rpc_surface_alignment.py`, which checks it against the generated `meerkat_contracts::rpc_method_catalog`).
 
@@ -341,13 +353,14 @@ The former GCP BuildBuddy CI lane (`buildbuddy.yml`) was retired from routing on
 | Job | Trigger | What it does |
 |-----|---------|-------------|
 | `require_ci_green` | Always | Requires successful Cargo CI for the release commit |
-| `release_validate_cargo` / `release_validate_buildbuddy` / `release_validate_gate` | Always (lane split) | Validate release state (incl. SDK smoke tests against `rkat-rpc`) + tag-version check |
-| `build_binaries` / `build_binaries_buildbuddy` / `build_binaries_gate` | Always (hybrid lane split) | BuildBuddy builds Linux/macOS (4 targets); Windows always builds on a GitHub-hosted runner (no self-hosted Windows RBE executors); each target packages 4 binaries (`rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp`); the gate requires both lanes |
-| `build_web_sdk_package` | Always | Builds the `@rkat/web` package artifact |
-| `publish_github_release` | Tags only | Downloads artifacts, generates `checksums.sha256` + `index.json`, publishes GitHub Release |
-| `update_homebrew` | After GitHub release | Updates the Homebrew tap formula |
+| `release_validate_cargo` / `release_validate_buildbuddy` | Eligible manual dispatches only | Validate release state through the selected lane; tag runs reuse exact-tree CI and skip both jobs |
+| `release_validate_gate` | Tags and full/package dispatches | Accept exact-tree CI on tags or the selected manual validation lane; Web-only and asset-only recovery skip it |
+| `build_binaries` / `build_binaries_buildbuddy` / `build_binaries_gate` | Tags or manual asset recovery | BuildBuddy builds Linux/macOS (4 targets); Windows always builds on a GitHub-hosted runner (no self-hosted Windows RBE executors); each target packages 4 binaries (`rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp`); the gate requires the selected lanes |
+| `build_web_sdk_package` | Tags or package/Web recovery without a reused artifact | Builds the `@rkat/web` package artifact |
+| `publish_github_release` | Tags or manual asset recovery | Downloads artifacts, generates `checksums.sha256` + `index.json`, publishes or repairs the GitHub Release |
+| `update_homebrew` | After GitHub release or asset recovery | Updates the Homebrew tap formula |
 | `publish_registries` | Tags or manual `publish_release_packages=true` | Publishes 42 Rust crates → crates.io, Python SDK → PyPI, TypeScript SDK → npm |
-| `publish_web_sdk` | Tags or manual | Publishes `@rkat/web` → npm |
+| `publish_web_sdk` | Tags or manual package/Web recovery | Publishes `@rkat/web` → npm |
 
 **Build matrix:**
 
@@ -359,17 +372,23 @@ The former GCP BuildBuddy CI lane (`buildbuddy.yml`) was retired from routing on
 | macOS x86_64 | `x86_64-apple-darwin` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` |
 
-**Manual dispatch options:**
+**Manual recovery through the release facade:**
 ```bash
-# Build-only validation (no publish)
-gh workflow run release.yml --ref main
+# Inspect the exact command without dispatching
+RELEASE_WORKFLOW_DRY_RUN=true VERSION=v0.8.24 make release-assets
+RELEASE_WORKFLOW_DRY_RUN=true VERSION=v0.8.24 make release-packages
+RELEASE_WORKFLOW_DRY_RUN=true VERSION=v0.8.24 make release-web-sdk
 
-# Dry-run publish (validate all registries without uploading)
-gh workflow run release.yml --ref main -f publish_release_packages=true -f registry_dry_run=true
+# Dispatch registry validation without uploading
+REGISTRY_DRY_RUN=true VERSION=v0.8.24 make release-packages
 
-# Recovery: re-publish after registry outage during a tag-triggered release
-gh workflow run release.yml --ref v0.4.0 -f publish_release_packages=true
+# Dispatch one narrow recovery after inspection
+VERSION=v0.8.24 make release-assets
 ```
+
+`make release-workflow` is the full release mode, not a recovery shortcut.
+Recovery modes run the current workflow definition from `main` while binding
+artifacts and package metadata to the selected existing tag.
 
 ### Pre-commit Hooks
 
@@ -440,17 +459,21 @@ This updates:
 
 ```bash
 make release-preflight       # Full CI + schema freshness + changelog check
-./scripts/repo-cargo release patch  # Bump, tag, push (uses cargo-release)
+./scripts/repo-cargo release patch  # Inspect cargo-release plan only
+./scripts/repo-cargo release patch --execute  # Bump, commit, tag, push
 ```
 
-**What `./scripts/repo-cargo release patch` does:**
+**What `./scripts/repo-cargo release patch --execute` does:**
 
 1. Bumps `workspace.package.version` in `Cargo.toml`
 2. Fires `scripts/release-hook.sh` (pre-release hook, sentinel-guarded to run once):
-   - `scripts/bump-sdk-versions.sh` — updates Python and TypeScript SDK versions
-   - `emit-schemas` + `generate.py` — regenerates schema artifacts and SDK types
-   - `verify-version-parity.sh` — sanity check before commit
-   - Stages all modified files (SDK configs, generated types, schema artifacts)
+   - `scripts/bump-sdk-versions.sh` - updates Python, TypeScript, and Web SDK versions
+   - `stamp-docs-contract-version.sh` - updates README, public docs, and platform skill versions
+   - `stamp-changelog-release.py` - stamps the release section and comparison links
+   - Updates `ContractVersion::CURRENT`
+   - Regenerates schemas, SDK types/wrappers, BuildBuddy BUILD files, and the Bazel module lock
+   - Verifies version parity, RPC surface alignment, and SDK wrapper freshness
+   - Stages all release projections for the version commit
 3. Creates release commit (`chore: release v{version}`)
 4. Tags as `v{version}`
 5. Pushes commit + tag to remote → triggers release workflow
@@ -489,7 +512,7 @@ The canonical publish order lives in `scripts/release-rust-crates.sh` (42 crates
 - **Never change `Cargo.lock` without refreshing `MODULE.bazel.lock`** - the lock is a crate_universe extension input; `make buildbuddy-lock-update` regenerates it, and `make verify-bazel-locks` proves it
 - **Never hand-maintain a second list of workspace crates** - `scripts/release-rust-crates.sh` is the one hand-ordered enumeration; the patch config derives from it and `make check-rust-release-config` fails when the documented order, count, or patch map disagrees
 - **Never write a bare crate count in this file that nothing derives** - `make check-rust-release-config` rejects any `N crates` / `N path deps` claim it cannot bind to a computed quantity. Register the new claim in `documented_count_claim_errors` (`scripts/check_rust_release_packaging.py`) alongside the artifact that owns the number, or write it as an approximation with a leading `~`. Release crate count and internal path-dep count are different facts with different owners; they are not interchangeable even when they happen to be equal
-- **Use `cargo release patch` for releases** — never manually bump versions or create tags; the release hook handles SDK sync, schema regen, and parity verification automatically
+- **Use `./scripts/repo-cargo release patch --execute` for releases** - never manually bump versions or create tags; the release hook handles version projections, changelog stamping, schema/codegen refresh, BuildBuddy metadata, and parity verification automatically
 
 ## Testing with Multiple Providers
 
@@ -515,14 +538,14 @@ See `docs/reference/design-philosophy.mdx` for the full treatment with code exam
 ### Architectural Principles
 
 - **Infrastructure, not application** — the agent loop is a composable primitive with no opinions about prompts, tools, or output
-- **Trait contracts own the architecture** — `meerkat-core` defines the core trait contracts (`AgentLlmClient`, `AgentToolDispatcher`, `AgentSessionStore`, `SessionService`, `Compactor`, `MemoryStore`, `HookEngine`, `SkillEngine`/`SkillSource`) with zero I/O dependencies; implementations live in satellite crates
-- **Surfaces are interchangeable skins** — CLI, REST, RPC, MCP Server all route through `SessionService` → `AgentFactory::build_agent()`; no surface constructs agents directly
+- **Trait contracts own the architecture** - `meerkat-core` defines foundational contracts (`AgentLlmClient`, `AgentToolDispatcher`, `AgentSessionStore`, `SessionService`, `Compactor`, `MemoryStore`, `HookEngine`, `SkillEngine`/`SkillSource`); feature crates define their domain stores and implementations
+- **Runtime-backed surfaces are interchangeable skins** - CLI, REST, RPC, and MCP Server route through `SessionService` to `AgentFactory::build_agent()`; embedded Rust and WASM may deliberately compose standalone agents directly
 - **Composition over configuration** — optional components (`CommsRuntime`, `HookEngine`, `Compactor`, `MemoryStore`) are `Option<Arc<dyn Trait>>`, not feature-flagged defaults
-- **Sessions are first-class, persistence is optional** — `EphemeralSessionService` (always available) and `PersistentSessionService` (event-sourced) share the same `SessionService` trait
+- **Sessions are first-class, persistence is optional** - `EphemeralSessionService` and the checkpoint-free, store-backed `PersistentSessionService` share the same `SessionService` trait; durable event projection is separate optional derived audit/replay state
 - **Errors separate mechanism from policy** — typed three-tier errors (`ToolError` → `AgentError` → `SessionError`) with stable `error_code()` for wire formats; the loop retries, callers decide to resume or abort
 - **Wire types ≠ domain types** — `meerkat-contracts` owns wire format and feeds SDK codegen; domain types in `meerkat-core` are richer and version-locked
-- **Configuration is layered and declarative** — `Config::default()` → file → env (keys only) → per-request `SessionBuildOptions`; no cascading merges, no global mutable state
-- **Testing is a design constraint** — core has no I/O so unit tests need no mocks; the repo standardizes on named lanes: `cargo unit`, `cargo int`, `cargo e2e-fast`, `cargo e2e-system`, `cargo e2e-live`, `cargo e2e-smoke`, and `cargo e2e-models`
+- **Configuration is layered and declarative** - realm config parent chains fold root-first with child-wins semantics, then env key fallback and per-request `SessionBuildOptions` apply; state never inherits
+- **Testing is a design constraint** - isolate pure domain logic where possible and test core's bounded native config/path/lock/fence I/O explicitly; the repo standardizes on named lanes: `cargo unit`, `cargo int`, `cargo e2e-fast`, `cargo e2e-system`, `cargo e2e-live`, `cargo e2e-smoke`, and `cargo e2e-models`
 
 ### Rust Implementation Principles
 

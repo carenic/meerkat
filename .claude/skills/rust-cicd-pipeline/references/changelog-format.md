@@ -1,6 +1,9 @@
 # Changelog Format
 
-This project uses [Keep a Changelog](https://keepachangelog.com/) format with [Semantic Versioning](https://semver.org/).
+This project uses [Keep a Changelog](https://keepachangelog.com/) headings.
+Meerkat's declared pre-1.0 policy permits public API breaks in patch releases;
+downstreams exact-pin the crate family, and each break must be named under
+`### Breaking` for the release that ships it.
 
 ## Template
 
@@ -9,10 +12,12 @@ This project uses [Keep a Changelog](https://keepachangelog.com/) format with [S
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/),
-and this project adheres to [Semantic Versioning](https://semver.org/).
+The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
+
+### Breaking
+- Named public signature or behavior break, including affected symbols
 
 ### Added
 - New features that have been added
@@ -47,6 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ```
 
 ## Section Guidelines
+
+### Breaking
+Public signature changes and behavior-only compatibility breaks. Name the
+affected symbols at the granularity reported by cargo-semver-checks. A type
+gaining a field and losing a derive are two findings. Behavior-only breaks are
+declared manually because the tool cannot observe them.
 
 ### Added
 New features or capabilities. Use for:
@@ -86,18 +97,14 @@ Security-related changes. Use for:
 - Security improvements
 - Dependency updates for CVEs
 
-## Version Extraction for Releases
+## Release notes
 
-The release process extracts changelog entries using this pattern:
+GitHub Release publication currently uses GitHub-generated release notes. The
+checked-in changelog remains the compatibility and operator history, and the
+release hook stamps its pending section and comparison links. Keep this shape:
 
-```bash
-# Extract section for version 1.2.0
-sed -n '/^## \[1.2.0\]/,/^## \[/p' CHANGELOG.md | sed '$d'
-```
-
-Ensure your changelog follows the exact format for automated extraction:
 - Version headers: `## [X.Y.Z] - YYYY-MM-DD`
-- Section headers: `### Added`, `### Changed`, etc.
+- Section headers: `### Added`, `### Changed`, `### Breaking`, and peers
 - List items: `- Description of change`
 
 ## Best Practices

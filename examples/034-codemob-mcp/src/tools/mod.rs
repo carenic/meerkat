@@ -44,17 +44,19 @@ impl ToolCallError {
 
 const MODEL_DESCRIPTION: &str = "\
 Available models: \
-claude-opus-4-8 (Anthropic, strongest reasoning), \
+claude-opus-5 (Anthropic, latest reasoning model), \
+claude-opus-4-8 (Anthropic, built-in advanced-pack default), \
 claude-sonnet-4-6 (Anthropic, fast + capable), \
 gpt-5.6-sol (OpenAI, frontier quality), \
 gpt-5.6-terra (OpenAI, balanced), \
 gpt-5.6-luna (OpenAI, efficient), \
 gpt-5.5 (OpenAI, prior generation), \
-gpt-5.5-pro (OpenAI, deep reasoning — slow, use sparingly), \
+gpt-5.5-pro (OpenAI, deep reasoning - slow, use sparingly), \
 gemini-3.1-pro-preview (Google, strong general), \
-gemini-3.1-flash-lite-preview (Google, fastest). \
+gemini-3.1-flash-lite-preview (Google, fastest), \
+gemini-3.5-flash (Google, current fast model). \
 Default: gpt-5.5 (broadly available). \
-Guidance: use opus/gpt-5.5-pro for complex reasoning (architecture, judging). \
+Guidance: use claude-opus-5/gpt-5.5-pro for complex reasoning (architecture, judging). \
 Use sonnet/gpt-5.5 for code tasks; use GPT-5.6 only with preview access. \
 Use gemini-3.1-flash-lite-preview for speed-sensitive roles. \
 Mix providers in multi-agent packs for perspective diversity";
@@ -70,7 +72,7 @@ pub fn tools_list() -> Vec<Value> {
             "name": "consult",
             "description": format!(
                 "Get a quick opinion from a single AI agent. No coordination overhead \
-                — like asking a colleague. Use this when you want a second opinion, \
+                - like asking a colleague. Use this when you want a second opinion, \
                 a sanity check, or a fresh perspective on something specific. \
                 Returns a session_id that can be passed in follow-up calls to continue \
                 the conversation with full history. Set shell=true to give the agent \
@@ -123,16 +125,17 @@ pub fn tools_list() -> Vec<Value> {
             "description": format!(
                 "Spawn a team of AI agents to collaboratively solve a problem. Each pack defines \
                 a different team composition optimized for specific tasks. Use list_packs to see all \
-                available packs including user-created ones. Returns structured results after agents \
-                deliberate. Returns a session_id — pass it in follow-up calls to continue with the \
-                same mob (agents keep their conversation history). {MODEL_DESCRIPTION}"
+                available packs including user-created ones. Returns the final flow output after agents \
+                run a machine-owned flow. The response labels the diagnostic mob id as session_id, \
+                but correct multi-call mob continuation is not implemented in this example; omit \
+                session_id and pass prior results through context for follow-up work. {MODEL_DESCRIPTION}"
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pack": {
                         "type": "string",
-                        "description": "Team pack to use. Built-in: advisor, review, architect, brainstorm, red-team, panel, implement, rct. User-created packs also accepted — use list_packs to see all."
+                        "description": "Team pack to use. Built-in: advisor, review, architect, brainstorm, red-team, panel, implement, rct. User-created packs are also accepted; use list_packs to see all."
                     },
                     "task": {
                         "type": "string",
@@ -157,7 +160,7 @@ pub fn tools_list() -> Vec<Value> {
                     },
                     "session_id": {
                         "type": "string",
-                        "description": "Continue an existing mob session. Pass the session_id from a previous deliberate response to reuse agents and their conversation history. The mob is kept alive between calls."
+                        "description": "Experimental mob reuse handle. Current reuse does not reliably preserve first-call history or replace an existing flow's baked task. Omit this field for normal deliberate calls."
                     }
                 },
                 "required": ["pack", "task"]

@@ -1,17 +1,17 @@
 //! # 018 — Mob: Research Team (Rust)
 //!
-//! A research team mob where a lead coordinates specialized researchers.
-//! Each researcher explores a different domain, and the lead synthesizes
-//! findings into a cohesive report.
+//! Builds and validates a research-team mob definition, spawns a lead plus two
+//! specialists, wires the team, and sends one question-generation prompt to
+//! the lead. It does not execute specialist research or synthesis turns.
 //!
 //! ## What you'll learn
 //! - Defining a research team from TOML
 //! - Custom profiles with specialized skills
-//! - Spawning multiple agents from a definition
+//! - Spawning and wiring multiple agents from a definition
 //!
 //! Note: Uses `build_ephemeral_service` (in-memory substrate) for simplicity.
 //! Production mob deployments use the runtime-backed path.
-//! - Running turns on specific agents and reading mob events
+//! - Running a turn on the lead and reading mob events
 //!
 //! ## Run
 //! ```bash
@@ -90,11 +90,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Part 1: Explore the research team definition ─────────────────────────
     println!("=== Mob: Research Team ===\n");
 
-    let prefab_def = MobDefinition::from_toml(RESEARCH_TEAM_TOML)?;
+    let definition = MobDefinition::from_toml(RESEARCH_TEAM_TOML)?;
 
-    println!("Mob ID: {}", prefab_def.id);
+    println!("Mob ID: {}", definition.id);
     println!("Profiles:");
-    for (name, binding) in &prefab_def.profiles {
+    for (name, binding) in &definition.profiles {
         if let Some(profile) = binding.as_inline() {
             println!(
                 "  {} -- model: {}, peer_description: {}",
@@ -106,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "Auto-wire orchestrator: {}",
-        prefab_def.wiring.auto_wire_orchestrator
+        definition.wiring.auto_wire_orchestrator
     );
 
     // ── Part 2: Custom research team definition (TOML) ───────────────────────

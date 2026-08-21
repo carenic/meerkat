@@ -1,4 +1,4 @@
-# 026 — Skills V2.1 Invocation (Python SDK)
+# 026 - Canonical Skill Invocation (Python SDK)
 
 Invoke a skill using canonical typed refs (`SkillKey`) with
 `{ source_uuid, skill_name }`.
@@ -8,7 +8,7 @@ Invoke a skill using canonical typed refs (`SkillKey`) with
 - Canonical `SkillKey` refs (recommended)
 - Runtime capability check via `client.require_capability("skills")`
 
-## Optional Environment
+## Environment
 ```bash
 export ANTHROPIC_API_KEY=sk-...
 # Optional: override the project-local skill name.
@@ -23,7 +23,7 @@ export ANTHROPIC_API_KEY=sk-...
 # python -m pip install -e sdks/python
 # ./scripts/repo-cargo build -p meerkat-rpc --bin rkat-rpc
 # export MEERKAT_BIN_PATH="$(./scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')/debug/rkat-rpc"
-python3 main.py
+python3 examples/026-skills-v21-invoke-py/main.py
 ```
 
 The example writes a tiny conventional project-local skill under

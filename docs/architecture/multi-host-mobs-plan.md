@@ -1,13 +1,17 @@
 ---
 title: "Multi-Host Mobs Plan"
-description: "Architecture and implementation plan for distributed multi-host mobs: identity-routed comms, mob-owned placement, cross-host observation, scoped control."
+description: "Implemented multi-host mob architecture and its preserved v4.1 adjudication and implementation record."
 icon: "diagram-project"
 ---
 
 # Multi-Host Mobs — Architecture & Implementation Plan (v4.1)
 
-> Status: **adjudicated v4.1** (2026-07-07, at HEAD 0.7.22 / da467fca8; v4.1 ecosystem expansion same day). Every substrate claim was re-verified against that HEAD (file:line anchors are from it). Structure: §§1-13 are the core plan; §§14-19 are the ecosystem chapters (realms/config, resource resolution, live channels, surfaces, orchestration-adjacent systems, session lifecycle), each independently substrate-mapped and adversarially red-teamed; §20 is the threat model; §21 is operations/packaging/governance. §4.1 is the cross-chapter adjudication ledger — every conflict between chapters was decided there, and the chapter texts already reflect those decisions.
-> This document is the merged, authoritative plan. It supersedes the v1 sketch (2026-06-03), the v2.1 adversarial adjudication (2026-06-15), and the pasted "RMAT-aware extension plan" draft; the v3 "leaderless peer fabric" concept is a **separate track**, not this plan (see Adjudication history).
+> Implementation status: **implemented**. The complete phase 1-8 plus 6b implementation merged in PR #867 at `fd1e275030c76af059eb7a2ab0a2f6a555617563` on 2026-07-16. Restart and rejected-run recovery follow-up #888 landed at `32510368852738e703e31b51b2a9192a96d7d205` on 2026-07-17. This file remains the historical adjudication and implementation record; current code plus the Mobs guide and Mob Architecture reference are authoritative for the shipping public surface.
+>
+> Post-plan amendment: PR #976 at `cbaca57cc38cc71656f1163bff1e1b7492cf3373` added optional `resume_from_role` to private `MaterializeLaunchMode::Resume`. It authorizes one exact cold durable role migration, fails closed when absent or wrong, and is not a public console, agent-tool, profile, or SDK spawn field. The v4.1 text below intentionally preserves the launch contract as originally designed; this amendment is the current delta.
+>
+> Historical design status: **adjudicated v4.1** (2026-07-07, at HEAD 0.7.22 / da467fca8; v4.1 ecosystem expansion same day). Every substrate claim was re-verified against that HEAD (file:line anchors are from it). Structure: §§1-13 are the core plan; §§14-19 are the ecosystem chapters (realms/config, resource resolution, live channels, surfaces, orchestration-adjacent systems, session lifecycle), each independently substrate-mapped and adversarially red-teamed; §20 is the threat model; §21 is operations/packaging/governance. §4.1 is the cross-chapter adjudication ledger - every conflict between chapters was decided there, and the chapter texts already reflect those decisions.
+> Historical v4.1 statement: this document was the merged, authoritative plan. It superseded the v1 sketch (2026-06-03), the v2.1 adversarial adjudication (2026-06-15), and the pasted "RMAT-aware extension plan" draft; the v3 "leaderless peer fabric" concept remains a **separate track** (see Adjudication history).
 > Companion doctrine: `docs/architecture/meerkat-dogma.md`. Machine registry: `canonical_machine_schemas()` in `meerkat-machine-schema/src/catalog/mod.rs`.
 
 ## 1. Goal
@@ -1078,6 +1082,8 @@ Substrate at HEAD, verified:
 - Owner-archive cascade runs controlling-host-local: `destroy_bridge_session_mobs` + orphan scavenging (`meerkat-mob-mcp/src/lib.rs:1784-1816, 1826-1863`), remote teardown bounded by `remote_destroy_cleanup_deadline` (actor.rs:15816-15823).
 
 ### 19.L1 — `MaterializeMember.launch_mode` carries `Fresh | Resume` only; `Fork` is unrepresentable on the wire; `Resume` executes on the member host.
+
+> Current amendment: the shipping private wire is `Fresh {}` or `Resume { session_id, resume_from_role? }`. The optional predecessor role is one-request authority for an exact cold durable role migration. Omission remains strict same-role resume. `Fork` is still structurally absent. The following section records the original v4.1 launch design before that additive trusted-host field.
 
 Wire enum (V4): `MaterializeLaunchMode { Fresh, Resume { session_id } }`. WHY the split: fork collapses to prompt text on the controlling host **before** any provisioning happens (actor.rs:9240-9248) — the rendered context travels inside the materialize `spec`'s initial prompt with zero member-side machinery — while the entire resume validation chain is realm-local by nature (live-session check, injector capability, comms presence, persisted snapshot: actor.rs:8978-9074) and the session being resumed lives in the member host's realm. A `Fork` payload on this wire would mean shipping one host's history into another host's admission path — exactly what §3 forbids. The exclusion is structural at BOTH carriers: `MaterializeMember.launch` is the closed `{Fresh, Resume}` wire enum, and `PortableMemberSpec` (§14.2/§15.3) has NO launch-mode field at all — the domain `SpawnMemberSpec.launch_mode: MemberLaunchMode` (serde-representable including `Fork`, handle.rs:1870, launch.rs:20-35) never serializes into the spec, so the second launch-mode channel the domain type would otherwise open is closed by construction (one semantic fact, one wire owner). `deny_unknown_fields` + per-command V4 decode make a fork payload a fail-closed decode error; if a future variant ever reaches admission, `MobHostBindingAuthority` rejects it with typed `LaunchModeUnsupported`.
 

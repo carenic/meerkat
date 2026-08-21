@@ -1,25 +1,32 @@
-//! # 035 — MDM TUX: Target Agent (Runtime-Backed Surface)
+//! # 035 - MDM TUX: Target Agent (Runtime-Backed Surface)
 //!
 //! Runs on managed machines. Serves a JSON-RPC TCP server for TUX to
 //! connect to (direct mode) or registers with a kennel for brokered
-//! adoption. Comms is retained for inter-agent traffic (delegate
-//! helpers, mob members).
+//! adoption. Comms is retained for inter-agent traffic in kennel mode.
 //!
-//! This target is a **runtime-backed surface** (same tier as CLI/RPC/REST):
+//! Kennel mode is the complete demo path:
 //! - Agent construction via `AgentFactory::build_agent()`
 //! - Session lifecycle via `PersistentSessionService`
 //! - Input routing via `MeerkatMachine` with `HandlingMode::Steer`
 //! - JSON-RPC over TCP for all command/control traffic
+//! - Mob, schedule, comms, and layered MCP tool wiring
 //!
-//! Sessions are persisted to disk. On restart the most recent session
-//! is automatically resumed.
+//! Direct mode is intentionally incomplete. It starts the RPC server but does
+//! not create a session, does not attach mob state to that RPC runtime, and
+//! does not start its RPC schedule host. TUX can only resume a session already
+//! persisted in the selected data directory. Direct-mode model/provider flags
+//! are parsed but are not applied to the RPC runtime.
 //!
 //! ```text
-//! mdm-target <HOST:PORT> [--name NAME] [--rpc-port PORT] [--model MODEL]
-//! mdm-target --kennel HOST:PORT [--advertise IP] [--rpc-port PORT] [--name NAME]
+//! mdm-target --rpc-port PORT [--name NAME] [--data-dir PATH]
+//! mdm-target --kennel HOST:PORT [--advertise IP] [--rpc-port PORT]
+//!            [--name NAME] [--data-dir PATH]
+//!            [--model MODEL --provider PROVIDER]
 //! ```
 //!
 //! Set one of: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY`.
+//! WARNING: the RPC listener binds to `0.0.0.0` and has no transport encryption
+//! or client authentication while exposing shell-capable sessions.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -46,7 +53,7 @@ use meerkat_core::lifecycle::core_executor::{
     CoreExecutorInterruptHandle, CoreExecutorPostStopCleanupHandle, CoreExecutorPublicationHandle,
     CoreExecutorTurnFinalizationBoundaryHandle,
 };
-use meerkat_core::lifecycle::run_primitive::{CoreRenderable, RunApplyBoundary, RunPrimitive};
+use meerkat_core::lifecycle::run_primitive::{RunApplyBoundary, RunPrimitive};
 use meerkat_core::mcp_config::McpConfig;
 use meerkat_core::service::{
     CreateSessionRequest, InitialTurnPolicy, SessionBuildOptions, SessionError, SessionService,
@@ -404,10 +411,12 @@ impl SurfaceScheduleSessionHost for TargetScheduleSessionHost {
                 transient_turn_context_appends: Vec::new(),
                 model: None,
                 provider: None,
+                self_hosted_server_id: None,
                 provider_params: None,
                 render_metadata: dispatch.render_metadata.clone(),
                 execution_kind: None,
                 peer_response_terminal_apply_intent: None,
+                directed_interaction_ids: Vec::new(),
                 auth_binding: None,
                 transcript_identity: Default::default(),
             },
@@ -663,13 +672,17 @@ async fn main() -> anyhow::Result<()> {
     // ── Parse CLI args ────────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
+        eprintln!("Usage: mdm-target --rpc-port PORT [--name NAME] [--data-dir PATH]");
         eprintln!(
-            "Usage: mdm-target <HOST:PORT> [--name NAME] [--model MODEL --provider PROVIDER]"
+            "   or: mdm-target --kennel HOST:PORT [--advertise IP] [--rpc-port PORT] [--name NAME] [--data-dir PATH] [--model MODEL --provider PROVIDER]"
         );
         eprintln!(
-            "   or: mdm-target --kennel HOST:PORT [--advertise IP] [--rpc-port PORT] [--name NAME] [--model MODEL --provider PROVIDER]"
+            "Direct mode requires an existing persisted session; its model/provider flags and kennel-mode mob/schedule wiring are not applied to the RPC runtime."
         );
         eprintln!("Set one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY");
+        eprintln!(
+            "WARNING: RPC is unauthenticated plaintext on 0.0.0.0 and exposes shell-capable sessions."
+        );
         std::process::exit(1);
     }
     if find_flag(&args, "--kennel").is_some() {
@@ -754,10 +767,12 @@ async fn main() -> anyhow::Result<()> {
     println!("=== MDM Target: {name} ===");
     println!("rpc       : tcp://0.0.0.0:{rpc_port}");
     println!("comms     : tcp://0.0.0.0:{comms_port}");
-    println!("provider  : {provider}");
+    println!("provider  : {provider} (startup selection only; not applied to direct RPC)");
+    println!("warning   : direct RPC requires an existing persisted session");
+    println!("warning   : RPC is unauthenticated plaintext on 0.0.0.0");
 
     let addr = format!("0.0.0.0:{rpc_port}");
-    eprintln!("[target] ready — serving RPC on {addr}\n");
+    eprintln!("[target] ready - serving RPC on {addr}\n");
     // RPC-host: inline-hosted TCP JSON-RPC server entry point; pairs with the
     // SessionRuntime + NotificationSink above to complete the RPC-host triad.
     meerkat_rpc::serve_tcp(&addr, rpc_runtime, rpc_config_store, None).await?;
@@ -816,7 +831,6 @@ fn spawn_heartbeat(
                     reply_endpoint: None,
                     content_taint: None,
                     handling_mode: None,
-                    content_taint: None,
                 },
             );
             let failed =
@@ -1323,9 +1337,9 @@ fn start_turn_request_from_primitive(
                 .unwrap_or(HandlingMode::Queue),
             metadata.and_then(|meta| meta.turn_tool_overlay.clone()),
             metadata.cloned(),
-        ),
-    }
-    .with_typed_turn_appends(primitive.typed_turn_appends()))
+        )
+        .with_typed_turn_appends(primitive.typed_turn_appends()),
+    })
 }
 
 #[async_trait::async_trait]
@@ -1703,6 +1717,7 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
     println!("comms     : tcp://0.0.0.0:{comms_port}");
     println!("kennel    : {kennel_addr}");
     println!("provider  : {provider} ({model})");
+    println!("warning   : RPC is unauthenticated plaintext on 0.0.0.0");
 
     let mut kennel_session_state = TksState::new();
 

@@ -40,6 +40,47 @@ Composability means the same decisions show up across surfaces:
 - release and deployment choices affect real users because SDKs and binaries
   share the same runtime surfaces
 
+## One construction path
+
+Public surfaces compose agents through the facade `AgentFactory`. The factory
+resolves model identity, realm-owned credentials, stores, tools, hooks, skills,
+memory, compaction, and runtime handles before it crosses the sealed core
+builder seam. The lower-level core `AgentBuilder` is an implementation detail,
+not a second public assembly path with weaker policy.
+
+This matters because an override replaces one typed dependency without
+discarding the surrounding contract. Examples include an `AgentLlmClient`,
+tool dispatcher, session store, blob store, detached-job store, or compaction
+curator. Model/provider identity and runtime authority are still validated at
+the factory boundary.
+
+## Two runtime modes
+
+`RuntimeBuildMode` makes the ownership boundary explicit:
+
+| Mode | Intended use | Authority available |
+|------|--------------|---------------------|
+| `StandaloneEphemeral` | Direct embedded runs and tests | Local agent loop and explicitly supplied dependencies; no invented session-owned runtime handles |
+| `SessionOwned` | CLI, REST, RPC, MCP, SDK, and MobKit service sessions | Canonical session, auth lease, tool scope, operations lifecycle, model routing, event and completion feeds |
+
+Queue-only ephemeral services are useful substrates, but they are not a
+durable control plane. Features that require session-owned authority fail
+closed instead of manufacturing a local substitute.
+
+## Independent capability composition
+
+Capabilities are not one monolithic "tools enabled" switch. General builtins,
+shell, semantic memory, schedules, WorkGraph, comms, mob tools, image
+generation, and web search are resolved independently, then flattened into one
+model-facing catalog. Compile-time feature gates decide which implementations
+exist; factory defaults and per-build overrides decide which are visible for a
+specific session.
+
+The same rule applies beyond tools. Skills use typed source identities, hooks
+observe typed runtime projections, memory is scoped to an owner, and providers
+lower one canonical request model. Composability means substitutable
+implementations behind stable contracts, not duplicated semantics per surface.
+
 ## See also
 
 - [Concepts overview](/concepts/overview)

@@ -46,11 +46,19 @@ For Ollama, LM Studio, vLLM, and most private gateways, use the
 OpenAI-compatible transport:
 
 ```toml config.toml
+[self_hosted]
+default_model = "gemma-4-31b"
+
 [self_hosted.servers.local]
 transport = "openai_compatible"
 base_url = "http://127.0.0.1:11434"
 api_style = "chat_completions"
 ```
+
+`self_hosted.default_model` must name one configured alias when more than one
+`self_hosted.models` entry exists. With exactly one alias it may be omitted and
+that alias becomes the default. Meerkat rejects an ambiguous multi-model
+configuration instead of choosing by table order.
 
 `api_style = "chat_completions"` is the conservative default for Gemma 4 and
 other self-hosted tool-calling models. Use another API style only after the
@@ -64,20 +72,20 @@ binding for `provider = "self_hosted"` in the same realm config, and make it
 the realm default (or select it per run with `--auth-binding`):
 
 ```toml config.toml
-[realm.dev]
+[realm.global]
 default_binding = "local"
 
-[realm.dev.backend.local]
+[realm.global.backend.local]
 provider = "self_hosted"
 backend_kind = "self_hosted"
 server = "local"                           # the [self_hosted.servers.<id>] this key authenticates
 
-[realm.dev.auth.local_auth]
+[realm.global.auth.local_auth]
 provider = "self_hosted"
 auth_method = "none"                       # or "api_key" / "static_bearer"
 source = { kind = "platform_default" }     # unused for auth_method = "none"
 
-[realm.dev.binding.local]
+[realm.global.binding.local]
 backend_profile = "local"
 auth_profile = "local_auth"
 ```
@@ -85,7 +93,7 @@ auth_profile = "local_auth"
 For a server that requires a bearer token, use:
 
 ```toml config.toml
-[realm.dev.auth.local_auth]
+[realm.global.auth.local_auth]
 provider = "self_hosted"
 auth_method = "static_bearer"
 source = { kind = "env", env = "LOCAL_LLM_TOKEN" }
@@ -131,18 +139,30 @@ tier = "supported"
 context_window = 256000
 max_output_tokens = 8192
 vision = true
-image_tool_results = true
+image_tool_results = false
 inline_video = false
 supports_temperature = true
 supports_thinking = true
 supports_reasoning = true
+supports_web_search = false
 call_timeout_secs = 600
 ```
+
+`vision = true` advertises image input. It is separate from image tool-result
+blocks: the registry forces `image_tool_results = false` for
+`api_style = "chat_completions"`; only a validated `responses` endpoint may
+advertise that result shape.
 
 `supports_thinking` and `supports_reasoning` describe the behavior Meerkat
 should expose through the configured transport. Gemma 4 is reasoning-capable,
 but normalized reasoning controls and trace streaming still vary by serving
 stack, so validate the behavior you plan to rely on.
+
+Keep `supports_web_search = false`. The current self-hosted factory path has no
+provider-native web-search lowering. Setting it to `true` would suppress the
+fallback without creating a native executor, so search requests would have no
+working path. An explicit Meerkat web-search enable fails closed when no
+fallback executor can be provisioned.
 
 <Warning>
 Meerkat's current self-hosted path does not expose self-hosted Gemma audio or a
@@ -183,6 +203,9 @@ lightest local setup.
   </Step>
   <Step title="Add aliases">
     ```toml config.toml
+    [self_hosted]
+    default_model = "gemma-4-31b"
+
     [self_hosted.models.gemma-4-e2b]
     server = "ollama"
     remote_model = "gemma4:e2b"
@@ -192,7 +215,7 @@ lightest local setup.
     context_window = 128000
     max_output_tokens = 8192
     vision = true
-    image_tool_results = true
+    image_tool_results = false
     inline_video = false
     supports_temperature = true
     supports_thinking = true
@@ -207,7 +230,7 @@ lightest local setup.
     context_window = 256000
     max_output_tokens = 8192
     vision = true
-    image_tool_results = true
+    image_tool_results = false
     inline_video = false
     supports_temperature = true
     supports_thinking = true
@@ -246,7 +269,7 @@ Use LM Studio when you want a desktop-managed OpenAI-compatible server.
     context_window = 128000
     max_output_tokens = 8192
     vision = true
-    image_tool_results = true
+    image_tool_results = false
     inline_video = false
     supports_temperature = true
     supports_thinking = true
@@ -284,6 +307,9 @@ Use vLLM when you want a private server with more deployment control.
     Point aliases at the exact model names your vLLM endpoint exposes.
 
     ```toml config.toml
+    [self_hosted]
+    default_model = "gemma-4-31b"
+
     [self_hosted.models.gemma-4-26b-a4b]
     server = "vllm"
     remote_model = "google/gemma-4-26b-a4b"
@@ -293,7 +319,7 @@ Use vLLM when you want a private server with more deployment control.
     context_window = 256000
     max_output_tokens = 8192
     vision = true
-    image_tool_results = true
+    image_tool_results = false
     inline_video = false
     supports_temperature = true
     supports_thinking = true
@@ -309,7 +335,7 @@ Use vLLM when you want a private server with more deployment control.
     context_window = 256000
     max_output_tokens = 8192
     vision = true
-    image_tool_results = true
+    image_tool_results = false
     inline_video = false
     supports_temperature = true
     supports_thinking = true
@@ -326,6 +352,8 @@ Run these after adding or editing self-hosted model config:
 ```bash
 rkat models
 rkat doctor
+rkat auth bindings --realm global
+rkat auth test --realm global local
 rkat run -m gemma-4-31b "Say hello in one sentence."
 ```
 
@@ -333,6 +361,9 @@ The expected result:
 
 - `rkat models` shows a `self_hosted` provider group and the aliases you added.
 - `rkat doctor` resolves the realm binding and reports the server as reachable.
+- `rkat auth bindings` shows which backend and auth profile the `local`
+  binding joins, and `rkat auth test local` resolves it without running a model
+  turn.
 - `rkat run -m ...` works without an explicit `--provider`.
 - The alias points at the exact upstream `remote_model` exposed by the server.
 

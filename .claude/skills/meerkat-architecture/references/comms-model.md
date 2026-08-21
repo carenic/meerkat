@@ -18,7 +18,7 @@ Shell-side data types live in `meerkat-comms/src/peer_types.rs` (`PeerId`, `RawP
 
 ## Comms drain lifecycle
 
-Background inbox consumption is a real lifecycle seam. Drain phase (`Inactive` / `Starting` / `Running` / `Stopped` / `ExitedRespawnable`) and drain mode (`PersistentHost` / `Timed` / `AttachedSession`) are MeerkatMachine DSL state (`drain_phase`, `drain_mode`). Spawn/stop/exit transitions flow through the DSL via `CommsDrainHandle` (for cross-crate callers) or direct `dsl_apply` (for in-runtime callers).
+Background inbox consumption is a real lifecycle seam. Drain phase (`Inactive` / `Running` / `Stopped` / `ExitedRespawnable`) and drain mode (`PersistentHost` / `Timed` / `AttachedSession`) are MeerkatMachine DSL state (`drain_phase`, `drain_mode`). A local starting mechanic is not a DSL phase. Spawn/stop/exit transitions flow through the DSL via `CommsDrainHandle` (for cross-crate callers) or direct `dsl_apply` (for in-runtime callers).
 
 Turn-boundary suppression is a local projection of that truth. Do not keep parallel drain-phase state in shell caches.
 

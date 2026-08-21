@@ -4,7 +4,7 @@ description: "How long-lived agents exchange messages and external events in Mee
 icon: "tower-broadcast"
 ---
 
-Comms is Meerkat’s inter-agent messaging model.
+Comms is Meerkat's inter-agent messaging model.
 
 It connects:
 
@@ -15,7 +15,7 @@ It connects:
 
 ## Why this is a concept
 
-Comms is not just “some tools”. It defines:
+Comms is not just "some tools". It defines:
 
 - what it means for a session to stay alive for future work
 - how peers are discovered and trusted
@@ -26,17 +26,44 @@ Comms is not just “some tools”. It defines:
 ```text
 keep-alive session
   -> comms runtime
-  -> peer messages / requests / responses
+  -> signed peer messages / requests / responses
   -> external events
   -> runtime-backed admitted work
 ```
 
+Peers are routed by canonical `PeerId`, derived from their Ed25519 public key.
+Names and metadata are for display and discovery, and names can collide. Trust
+is explicit, delivery is separate from runtime admission, and queueing an item
+does not itself prove that the session consumed it.
+
+Live trust is installed through generated machine or composition authority,
+such as mob wiring or a pairing/binding ceremony. A non-empty
+`trusted_peers.json` is a persisted projection, not a supported startup seed,
+and the runtime rejects it rather than treating hand-edited rows as authority.
+
 ## Key distinction
 
-- **Agent-side comms tools** are what the model can use during a turn.
-- **Host-side comms/session ingress APIs** are what applications use to feed work into the runtime.
+- **Agent-side comms tools** are what the model can use during a turn:
+  `send_message`, `reply_to_peer`, `send_request`, `send_response`, and
+  `peers`.
+- **Host-side comms/session ingress APIs** are what applications use to feed
+  work into the runtime: `comms/send`, `comms/peers`, and
+  `session/external_event`.
+- **Private supervisor traffic** uses the same signed transport but remains a
+  separate typed authority protocol. Naming `supervisor.bridge` in a request
+  never grants supervisor authority; machine admission still decides it.
 
 That distinction should stay visible across the docs.
+
+`reply_to_peer` is a turn-scoped capability. The runtime pre-addresses it from
+the peer message that caused the current turn, so the model does not supply a
+peer identity. `send_message` remains the path for unsolicited collaboration,
+and `send_response` remains only for typed `send_request` traffic.
+
+Content-bearing envelopes can carry a signed sender declaration of `clean` or
+`tainted`. No declaration is a third state, not an implicit `clean`. Host send
+surfaces can inherit, set, or suppress the runtime declaration; agent tools
+inherit the host-owned runtime declaration and cannot override it per send.
 
 ## See also
 

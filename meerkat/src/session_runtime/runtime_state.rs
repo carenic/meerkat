@@ -196,7 +196,7 @@ impl ArchiveRuntimeCleanup {
     }
 
     /// Run the durable-store archive step. Surfaces that already
-    /// archived through the service skip this and call [`run`]
+    /// archived through the service skip this and call [`Self::run`]
     /// directly.
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     pub async fn archive_service(

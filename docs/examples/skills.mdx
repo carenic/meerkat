@@ -1,5 +1,5 @@
 ---
-title: "Skills"
+title: "Skills examples"
 description: "Load, discover, inject, and inspect domain-specific knowledge packs."
 icon: "graduation-cap"
 ---
@@ -130,14 +130,18 @@ View the full body and metadata of a specific skill by canonical key.
 
 Use this when the skill should shape the whole session from the start.
 
-`CLI --skill` is the preload-oriented local path. `preload_skills` is the explicit session-build surface on the APIs.
+CLI `--skill` is a preload-oriented builtin-slug convenience.
+`preload_skills` is the explicit session-build surface on the APIs. Local
+filesystem paths are not a supported `rkat run --skill` preload in the current
+release, and custom-source slugs do not become builtin keys. Configure a
+filesystem repository and use its typed key instead.
 
 <Tabs>
   <Tab title="CLI">
     ```bash
-    rkat run "Extract emails" \
-      --skill email-extractor \
-      --skill markdown-formatter
+    rkat run "Track the implementation and use the shell safely" \
+      --skill task-workflow \
+      --skill shell-patterns
     ```
   </Tab>
   <Tab title="JSON-RPC">
@@ -366,7 +370,7 @@ Use `skill_refs` when the skill should be injected for the first turn rather tha
     // session deferred, then run the first turn with per-turn skill
     // references carried in `RuntimeTurnMetadata`.
     let created = service.create_session(CreateSessionRequest {
-        model: "claude-sonnet-4-6".into(),
+        model: "gpt-5.6-sol".into(),
         prompt: "".into(),
         system_prompt: SystemPromptOverride::Inherit,
         max_tokens: None,
@@ -401,13 +405,16 @@ Use `skill_refs` when the skill should be injected for the first turn rather tha
 
 ## Per-turn skill injection
 
-Inject skills into a specific turn on an existing session. The skill content is added to the context for that turn only. On the CLI, `--skill` remains the preload-style runtime-local path; the typed per-turn surface is `skill_refs`.
+Inject skills into a specific turn on an existing session. The skill content is
+added to the context for that turn only. On the CLI, `--skill` remains the
+embedded-builtin slug preload convenience; the typed per-turn surface is
+`skill_refs`.
 
 <Tabs>
   <Tab title="CLI">
     ```bash
-    rkat run --resume <session-id> "Now format the output" \
-      --skill markdown-formatter
+    rkat run --resume <session-id> "Now update the task plan" \
+      --skill task-workflow
     ```
   </Tab>
   <Tab title="JSON-RPC">

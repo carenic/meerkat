@@ -160,8 +160,8 @@ impl AtifExportBudget {
     }
 }
 
-/// Export the complete durable event log as an ATIF trajectory under this
-/// host's replay bounds.
+/// Export the currently projected event replay evidence as an ATIF trajectory
+/// under this host's replay bounds.
 pub async fn handle_export_atif(
     id: Option<RpcId>,
     params: Option<&RawValue>,

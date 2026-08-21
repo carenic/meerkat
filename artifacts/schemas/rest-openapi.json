@@ -1922,7 +1922,7 @@
             "type": "boolean"
           },
           "durable_sessions": {
-            "description": "Host persists sessions durably (event-sourced); `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
+            "description": "Host persists session state durably; `false` means\nreleases resolve `RuntimeReleasedOnly { NoDurableSessions }`.",
             "type": "boolean"
           },
           "engine_version": {
@@ -5016,7 +5016,7 @@
           },
           {
             "additionalProperties": false,
-            "description": "Transcript snapshot page for a remote member. Row type is the canonical\nwire transcript row (`WireSessionMessage`) — the same rows the local\n`SessionHistoryPage` projection produces — via the [`WireHistoryRow`]\nequality adapter.",
+            "description": "Transcript snapshot page for a remote member. Row type is the canonical\nwire transcript row (`WireSessionMessage`) - the same rows the local\n`SessionHistoryPage` projection produces via the\n[`WireHistoryRow`](crate::wire::WireHistoryRow)\nequality adapter.",
             "properties": {
               "generation": {
                 "description": "Member generation the page was read at; a bump means the visible\ngeneration window changed (the underlying session may be reused).",
@@ -8512,7 +8512,7 @@
             "type": "object"
           },
           {
-            "description": "A `pre_*` background hook attempted a non-observe action (patch or deny),\nwhich is not permitted for observe-only background hooks.",
+            "description": "A background hook attempted a non-observe action, which is not\npermitted for observe-only background hooks at any hook point.",
             "properties": {
               "reason_code": {
                 "const": "observe_only_violation",

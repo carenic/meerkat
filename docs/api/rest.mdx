@@ -17,8 +17,9 @@ Meerkat ships a REST server for running and managing agent sessions over HTTP. T
 
     </CodeGroup>
   </Step>
-  <Step title="Set API keys">
-    Export the key for your chosen provider:
+  <Step title="Configure provider credentials">
+    For the simplest environment-backed setup, export the key for your chosen
+    provider. Realm auth profiles and bindings are the persistent alternative:
 
     ```bash
     export ANTHROPIC_API_KEY="sk-..."
@@ -51,6 +52,14 @@ If `--realm` is omitted, the server creates a new isolated opaque realm (`realm-
 `--realm-backend` is a creation hint only; after first open, `realm_manifest.json`
 is authoritative.
 
+<Warning>
+The REST server has no general inbound HTTP authentication layer. The `auth/*`
+routes manage outbound provider credentials; they do not authenticate callers
+to this API. Keep the listener on loopback or put it behind an authenticated,
+encrypted reverse proxy. The webhook-secret check applies only to the external
+event route.
+</Warning>
+
 ## Endpoint overview
 
 This overview follows the generated OpenAPI artifact at
@@ -65,6 +74,7 @@ This overview follows the generated OpenAPI artifact at
 | `GET` | `/sessions/{id}/status` | Fetch current runtime state for a session |
 | `GET` | `/sessions/{id}/history` | Fetch committed session transcript messages |
 | `POST` | `/sessions/{id}/system_context` | Append one ordinary durable ordered System message |
+| `POST` | `/sessions/{id}/system_prompt` | Replace one durable versioned system-prompt key |
 | `POST` | `/sessions/{id}/messages` | Continue an existing session |
 | `POST` | `/sessions/{id}/external-events` | Queue a runtime-backed external event |
 | `POST` | `/sessions/{id}/peer-response-terminal` | Queue a typed peer terminal response event |
@@ -145,11 +155,24 @@ there is no nested `config` and persisted `machine_state` is not public.
 WorkGraph goal and attention mutation routes require trusted in-process
 host/session authority and are not part of the public REST catalog.
 
+Approvals, durable jobs and monitors, stable artifact record/download methods,
+and low-latency live channels are not REST routes. Those operator surfaces are
+available through JSON-RPC and the generated SDKs. REST history can carry blob
+references, but REST does not expose blob or artifact download paths.
+
 Multi-host mob administration (host bind/revoke, hard-cancel, member live
 channels, grant management) is deliberately NOT served by REST — REST carries
 observation GETs only. The complete admin family lives on JSON-RPC and the
 Python/TypeScript SDKs; host binding/revoke, grants, and live control also have
 CLI verbs, while hard cancel is RPC/SDK-only.
+
+Durable member role migration is also outside the public REST contract. The
+shared OpenAPI component catalog includes private member-host bridge schemas,
+including `MaterializeLaunchMode`, because components are generated from shared
+wire types. No REST path accepts `resume_from_role`; only a trusted Rust host or
+the private member-host materialization protocol can issue that one-shot
+declaration. The `paths` object, not component reachability, defines REST
+exposure.
 
 <Note>
 Generated images are not returned as inline bytes in history. `GET /sessions/{id}/history` returns assistant image blocks with `image_id`, `blob_ref`, dimensions, and metadata; fetch image bytes through the blob/artifact surface exposed by the runtime-backed RPC/SDK path.
@@ -440,6 +463,49 @@ Query parameters:
 
 History is returned oldest-to-newest and reflects the last committed session snapshot only.
 
+### POST /sessions/\{id\}/system_context
+
+Append one ordinary durable ordered System message at the admitted transcript
+boundary. `content` uses the `CoreRenderable` tagged shape, and the optional
+`idempotency_key` makes an exact caller retry safe.
+
+```json Request
+{
+  "content": {"type": "text", "text": "Treat the incident as severity one."},
+  "source": "incident-controller",
+  "idempotency_key": "incident-42-policy-v1"
+}
+```
+
+```json Response
+{
+  "session_id": "01936f8a-7b2c-7000-8000-000000000001",
+  "status": "applied"
+}
+```
+
+### POST /sessions/\{id\}/system_prompt
+
+Replace one keyed system-prompt slot with version CAS. The first explicit
+adoption supplies `target_message_index` for an existing unversioned System row
+and omits `expected_version`. Later updates omit the target and provide the
+latest `expected_version`. `expected_parent_revision` optionally adds a
+transcript-head CAS.
+
+```json Request
+{
+  "key": "operator-policy",
+  "expected_version": 1,
+  "content": "Escalate critical actions for human approval.",
+  "actor": "operator:alice"
+}
+```
+
+The result contains `session_id`, `key`, the new `version`, `message_index`,
+`status` (`applied` or `duplicate`), `transcript_revision`, and an optional
+rewrite `commit`. Mob-owned system prompts must be updated through their mob
+owner and are rejected on this session route.
+
 ### GET /sessions
 
 List sessions. Supports optional label filters via query parameters.
@@ -710,7 +776,16 @@ Event types:
 | `hook_denied` | Hook blocked operation |
 | `skills_resolved` | Skills loaded for turn |
 | `skill_resolution_failed` | Skill resolution failed |
+| `stream_truncated` | The bounded live subscriber lagged; the event carries the dropped count |
 | `done` | Emitted when the broadcast channel closes |
+
+The live SSE subscription is bounded and best-effort. A slow subscriber gets a
+typed `stream_truncated` marker and then retained live events. Built-in
+realm-backed persistent sessions can feed an optional durable audit projector
+through a separate unbounded queue, so SSE lag does not drop its input. The
+audit log is asynchronous derived state. Reconnect and reconcile from session
+history/status, or use the JSON-RPC `events/*` methods when that replay surface
+is healthy.
 
 ### GET /skills
 
@@ -762,6 +837,33 @@ Returns `404` if skills are not enabled.
 ### GET /health
 
 Returns `"ok"` (HTTP 200). Use for liveness checks.
+
+### GET /runtime/host_info
+
+Returns the read-only `RuntimeHostInfo` projection: process identity, host ID
+scope, realm and endpoint metadata, feature flags, and the same health payload
+as `GET /runtime/health`. It does not enroll a host or grant placement
+authority.
+
+### GET /runtime/capabilities
+
+Returns `RuntimeHostCapabilities`, a contract version plus boolean
+`RuntimeHostFeatureFlags`. These host feature flags are distinct from the
+generic status entries returned by `GET /capabilities`.
+
+### GET /runtime/health
+
+Returns `RuntimeHostHealth` with `status` and a `checks` map. The declared
+dimensions are `jobs`, `session_liveness`, `session_durability`,
+`session_runtime_loop`, and `session_run_start`. REST measures the four session
+dimensions. It has no detached-job service probe, so it reports
+`unmeasured:jobs` as a coverage marker and leaves that marker out of the status
+rollup.
+
+A plain dimension key is a measured result. `unreadable:<dimension>` means the
+probe ran but could not obtain a reading and rolls the overall status up to at
+least `degraded`. `unmeasured:<dimension>` means this surface has no probe and
+does not by itself make a healthy host permanently degraded.
 
 ### GET /models/catalog
 
@@ -819,7 +921,11 @@ Returns runtime capabilities with status resolved against config.
 }
 ```
 
-The full response includes all capabilities: `sessions`, `streaming`, `structured_output`, `hooks`, `builtins`, `shell`, `comms`, `memory_store`, `schedule`, `work_graph`, `session_store`, `session_compaction`, `skills`, `mcp_live`. See the [RPC capabilities endpoint](/api/rpc#capabilitiesget) for the complete example.
+The full response includes all registered capabilities from the running build,
+including `sessions`, `streaming`, `structured_output`, `hooks`, `builtins`,
+`shell`, `comms`, `memory_store`, `schedule`, `work_graph`, `session_store`,
+`session_compaction`, `skills`, and `mcp_live` when their owning crates are
+linked. See the [JSON-RPC API](/api/rpc) for the corresponding RPC surface.
 
 ### GET /config
 
@@ -1262,6 +1368,14 @@ All errors are returned as JSON with an HTTP status code:
 | 500 | `INTERNAL_ERROR` | Store initialization failure, unexpected server error |
 | 501 | `CAPABILITY_UNAVAILABLE` | Required capability not compiled in or disabled |
 | 502 | `PROVIDER_ERROR` | LLM provider issue (missing key, auth failure) |
+
+For a session that was durably created but whose first turn failed, the server
+returns `SESSION_CREATED_WITH_TURN_FAILURE` with resumable session identity in
+`details`. A genuinely unknown provider failure now runs the bounded retry
+policy; when that policy is exhausted, `details.error.kind` is
+`retry_exhausted` rather than `llm_failure`. Clients that branch on this nested
+kind should accept the new value. Known non-retryable LLM failures can still use
+`llm_failure`.
 
 <CodeGroup>
 ```json Session not found

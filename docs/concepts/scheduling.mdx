@@ -4,7 +4,7 @@ description: "Durable automated work over time: triggers, targets, occurrences, 
 icon: "clock"
 ---
 
-Scheduling is Meerkat’s durable automation model.
+Scheduling is Meerkat's durable automation model.
 
 It exists to answer:
 
@@ -28,18 +28,45 @@ Scheduling is more than a set of tool names. It introduces durable entities:
 ```text
 schedule
   -> projected occurrences
-  -> due delivery
-  -> session or mob target
+  -> store-fenced executor claims due work
+  -> occurrence-scoped delivery identity
+  -> session, identity, mob, or host-runnable target
 ```
+
+A schedule is the durable rule. An occurrence is one planned application of
+that rule. The store grants one executor incarnation the authority to plan and
+claim firing work at a time. Other drivers remain healthy standbys until that
+lease expires or is released.
+
+Delivery uses a stable identity for the occurrence. A crash after target
+admission but before the scheduler records success therefore retries the same
+delivery identity instead of minting a second logical firing. This is an
+idempotency boundary, not a promise that arbitrary target-side effects are
+exactly once.
+
+## Targets
+
+- Session targets address an exact, resumable, or materialized-on-demand
+  session.
+- Identity targets resolve a stable host-minted identity to its current
+  session at fire time. Mob member schedules use this form so a replaced
+  member session does not strand the schedule.
+- Mob targets send to a member or run a Flow/helper action.
+- Host-runnable targets invoke a callback registered by the embedding host.
+  They are host-local and the stock `rkat` binaries register none.
 
 ## What this concept owns
 
 - durable time-based automation semantics
 - occurrence lifecycle
 - target delivery model
+- singular firing authority and occurrence-level retry identity
 
-Scheduling owns time and delivery. WorkGraph owns live durable work state,
-readiness, claims, dependencies, and evidence.
+Scheduling owns time, recurrence, occurrence claims, and delivery. It does not
+own long-running execution. A host runnable that starts durable work should
+submit or ensure a [durable job](/guides/durable-jobs) and return after durable
+acceptance. WorkGraph owns durable commitment state, readiness, claims,
+dependencies, child joins, and evidence.
 
 ## See also
 
@@ -47,3 +74,4 @@ readiness, claims, dependencies, and evidence.
 - [Mobs](/concepts/mobs)
 - [WorkGraph](/concepts/workgraph)
 - [Scheduling guide](/guides/scheduling)
+- [Durable jobs and monitors](/guides/durable-jobs)

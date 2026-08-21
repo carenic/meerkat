@@ -1440,9 +1440,9 @@ impl From<RenderMetadata> for WireRenderMetadata {
 /// `mob/reconcile`.
 ///
 /// Mirrors the essential, codegen-friendly fields of
-/// [`meerkat_mob::SpawnMemberSpec`]. Complex sub-types (tool access policy,
+/// `meerkat_mob::SpawnMemberSpec`. Complex sub-types (tool access policy,
 /// budget split, inherited tool filter, override profile) are not on this
-/// wire surface — callers that need that parity should use the non-declarative
+/// wire surface - callers that need that parity should use the non-declarative
 /// `mob/spawn` method.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

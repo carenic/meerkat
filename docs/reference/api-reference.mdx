@@ -23,10 +23,16 @@ committed with the repository:
 | `artifacts/schemas/models.json` | Model catalog emission | Models catalog wire shapes |
 | `artifacts/schemas/runtime-host.json` | Runtime host schema emission | Runtime host info, capability, and health projections |
 
+These files are generated outputs. Change the owning Rust catalogs and run
+`make regen-schemas`; do not hand-edit committed schema JSON. Use
+`make verify-schema-freshness`, `make verify-rpc-surface-alignment`, and
+`make verify-rest-surface-alignment` to check source/catalog/router parity.
+
 `rkat-rpc initialize` returns the compiled feature subset at runtime. The
-catalog above is the full documented surface with blob, sessions, events,
-streams, schedule, skills, runtime, live channels, mob, MCP, comms, auth, realm, and
-approval methods enabled.
+catalog above is the full documented surface, including sessions, events,
+streams, blobs, artifacts, approvals, durable jobs and monitors, schedules,
+WorkGraph, runtime health, live channels, mobs, MCP, comms, models,
+capabilities, config, auth, realms, and usage.
 
 ## Surface entry points
 
@@ -68,6 +74,11 @@ approval methods enabled.
 | `AuthBindingRef` | `meerkat_core` | Realm-scoped provider credential binding reference carried by sessions and mob members |
 | `BlobPayload` | `meerkat_core` | Blob metadata and bytes returned by blob fetch APIs |
 | `ArtifactRecord` | `meerkat_core` | Stable artifact metadata for blob-backed generated content |
+| `ApprovalRecord` | `meerkat_core` | Typed approval request, status, decision audit, ownership, risk, and provenance |
+| `ApprovalService` | `meerkat_core` | Approval lifecycle authority over an `ApprovalStore` |
+| `JobReference` | `meerkat_jobs` | Realm-qualified durable job identity |
+| `JobSummary` | `meerkat_contracts` | Safe app-facing detached-job projection without attempt/fence authority |
+| `JobHealthSummary` | `meerkat_contracts` | Job census status, coverage, phase counts, and separate delivery backlogs |
 | `MobRun` | `meerkat_mob` | Persisted flow run aggregate |
 | `MobRunStatus` | `meerkat_mob` | Flow run lifecycle (`pending`, `running`, `completed`, `failed`, `canceled`) |
 | `StepLedgerEntry` | `meerkat_mob` | Per-target step execution record |
@@ -91,6 +102,8 @@ approval methods enabled.
 | `SkillSource` | `meerkat_core::skills` | Skill discovery from various sources | [Skills guide](/guides/skills) |
 | `HookEngine` | `meerkat_core` | Hook pipeline execution | [Hooks guide](/guides/hooks) |
 | `FlowTurnExecutor` | `meerkat_mob` | Runtime boundary between flow engine and dispatch/turn transport | [Mobs](/guides/mobs) |
+| `ApprovalStore` | `meerkat_core` | Persistent or process-local approval record storage; lifecycle legality remains service-owned | [JSON-RPC approvals](/api/rpc#approvals) |
+| `DetachedJobStore` | `meerkat_jobs` | Durable job records, attempts, subscriptions, and terminal outbox authority | [Durable jobs](/guides/durable-jobs) |
 
 ## Runtime-backed build seam
 
@@ -121,6 +134,7 @@ Mob runtime APIs live primarily in:
 | `MobState` | Lifecycle state (`Creating`, `Running`, `Stopped`, `Completed`, `Destroyed`) |
 | `MobRun` | Persisted flow run aggregate |
 | `SpawnMemberSpec` | Spawn input contract (`role_name`, `identity`, `initial_message`, `runtime_mode`, `backend`, `binding`, `labels`, launch mode) |
+| `MemberLaunchMode` | Fresh, resume, or fork policy for a trusted Rust host; resume can carry one-shot role migration intent |
 
 ### `MobBuilder` methods
 
@@ -149,6 +163,29 @@ Mob runtime APIs live primarily in:
 | `stop().await` / `resume().await` / `complete().await` / `destroy().await` | Lifecycle transitions |
 | `list_flows()` / `run_flow(...).await` / `flow_status(...).await` / `list_runs(...).await` / `cancel_flow(...).await` | Flow runtime and run-resource control |
 | `events().subscribe().await` / `poll_events(...).await` | Event stream access |
+
+### Durable member role migration
+
+`MemberLaunchMode::Resume` carries `bridge_session_id` and optional
+`resume_from_role`. Use
+`SpawnMemberSpec::with_resume_bridge_session_id_from_role(...)` for an explicit
+trusted resume, or `declare_resume_from_role(...)` from a
+`SpawnMemberCustomizer` handling `SpawnSource::Resume`.
+
+The declaration authorizes one exact `(mob, identity, stored role)` to
+requested-role transition for one cold resume. Mob ID, `AgentIdentity`, session
+ID, and transcript do not migrate. Omission when the durable role differs
+returns `MemberRoleMigrationRequired`; a wrong predecessor, inapplicable
+declaration, or exact session that is still live returns
+`MemberRoleMigrationRejected`. Success restamps current comms identity, typed
+member binding, role/profile labels, callback context, and explicitly
+configured tooling. Migration is forward-only; rollback is another declared
+forward migration or restoration of separately versioned durable state.
+
+The private remote-host equivalent is
+`MaterializeLaunchMode::Resume { session_id, resume_from_role }`. Public
+JSON-RPC/SDK spawn params, REST, MCP, CLI helpers, standing profiles, and the Web
+SDK deliberately do not expose this authority.
 
 ### Rust example
 
@@ -265,6 +302,13 @@ recover without another caller request. REST and generated JSON-RPC clients do
 not yet claim this composition contract; their ordinary Mob and WorkGraph
 surfaces remain independent.
 
+Shared generated schemas include supervisor-bridge component types. Public
+`comms/send` and MCP comms requests can carry a `BridgeCommand`, but acceptance
+remains receiver-machine-authorized; callers do not gain supervisor authority
+by constructing the payload. Exposure is established by route and method
+signatures, not by a type merely appearing in `wire-types.json`, `params.json`,
+or OpenAPI `components`.
+
 For cross-surface behavior and examples (CLI/RPC/REST/MCP/Python/TypeScript), see [Mobs](/guides/mobs).
 
 ## SDK entry points
@@ -339,6 +383,11 @@ See the [skills guide](/guides/skills) for usage details.
 | `CommsParams` | Keep-alive + comms identity parameters |
 | `HookParams` | Hook override entries |
 | `SkillsParams` | Skill enablement + references |
+| `RuntimeHostFeatureFlags` | Boolean host facts, including explicit `multi_host_mobs` and `durable_jobs` detection |
+| `ApprovalRequestParams` / `ApprovalDecideParams` | Approval creation and terminal decision requests |
+| `JobsGetParams` / `JobsHealthResult` / `MonitorsStartParams` | Detached-job observation, health, and trusted monitor start contracts |
+| `ArtifactListParams` / `ArtifactDownloadParams` | Stable artifact lookup and blob-backed download contracts |
+| `EventReplayCursor` / `EventsListSinceResult` | Scope-bound durable event replay and pagination |
 
 ## Error code reference
 
@@ -364,6 +413,10 @@ Every `ErrorCode` maps to a stable string, JSON-RPC code, HTTP status, and CLI e
 | Skill not found | `SKILL_NOT_FOUND` | -32021 | 404 | 41 |
 | Skill resolution failed | `SKILL_RESOLUTION_FAILED` | -32022 | 422 | 42 |
 | Supervisor rotation incomplete | `SUPERVISOR_ROTATION_INCOMPLETE` | -32024 | 409 | 44 |
+| Mob control scope denied | `SCOPE_DENIED` | -32025 | 403 | 45 |
+| Mob member host unavailable | `HOST_UNAVAILABLE` | -32026 | 503 | 46 |
+| Mob event cursor stale | `STALE_CURSOR` | -32027 | 410 | 47 |
+| Mob fence stale | `STALE_FENCE` | -32028 | 409 | 48 |
 | Invalid params | `INVALID_PARAMS` | -32602 | 400 | 2 |
 | Internal error | `INTERNAL_ERROR` | -32603 | 500 | 1 |
 

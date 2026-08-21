@@ -5,9 +5,10 @@ resilient agent execution.
 
 ## Concepts
 - `BudgetLimits` — hard caps on tokens, tool calls, and duration
-- `RetryPolicy` — exponential backoff for transient LLM failures (429, 500)
-- `BudgetPool` — share a budget across multiple agents (not shown in this example)
-- Error handling for `AgentError::TokenBudgetExceeded` / `ToolCallBudgetExceeded`
+- `RetryPolicy` - exponential backoff for provider failures classified as
+  retryable
+- Applying a retry policy to an `AgentBuilder`
+- Handling budget exhaustion returned by the agent run
 
 ## Budget Types
 | Limit | Description |
@@ -17,6 +18,11 @@ resilient agent execution.
 | `max_duration` | Wall clock timeout |
 
 ## Retry Strategy
+
+When the provider returns a typed retryable failure, the configured policy
+uses this schedule. The example prints the policy but does not force a live
+provider failure.
+
 ```
 Attempt 1 → fail → wait 500ms →
 Attempt 2 → fail → wait 1s →

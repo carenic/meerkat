@@ -17,46 +17,43 @@ Meerkat publishes one source project across several consumer surfaces:
 | TypeScript SDK | Node applications | `@rkat/sdk` on npm |
 | Web SDK | Browser applications | `@rkat/web` on npm |
 
-The public release path is GitHub Actions. BuildBuddy release lanes are an
-owner-only acceleration path and use the same Make-level contract.
+The public release path is GitHub Actions. Automatic dispatch selects
+BuildBuddy validation and Linux/macOS packaging for the repository owner when
+the required `MEERKAT_RELEASE_BUILDBUDDY` variable is enabled; other actors
+fall back to GitHub-hosted validation and binary builds. Either backend still
+uses exact-main GitHub Actions CI, GitHub-hosted Windows packaging, and
+GitHub-hosted credentialed registry publishing.
 
 ## Versioning and Compatibility
 
 Meerkat is pre-1.0 and releases on a fast `0.x.y` patch train. The policy,
 stated plainly so downstream embedders can build against it:
 
-- **Patch releases may change public APIs.** A `0.7.x` → `0.7.(x+1)` bump can
+- **Patch releases may change public APIs.** A `0.8.x` to `0.8.(x+1)` bump can
   add required fields, change function signatures, or remove items. Cargo's
-  default caret requirement (`meerkat = "0.7"`) treats the whole `0.7`
+  default caret requirement (`meerkat = "0.8"`) treats the whole `0.8`
   family as compatible, which is stronger than this project guarantees.
 - **Embedders must pin exact versions.** Libraries and applications that
-  build against Meerkat crates should declare `=0.7.19`-style exact pins and
+  build against Meerkat crates should declare `=0.8.24`-style exact pins and
   move deliberately, reading the changelog for each hop.
 - **The only supported crate combination is exact version parity.** All
   workspace crates (`meerkat`, `meerkat-core`, `meerkat-runtime`, …), the
   Python/TypeScript/Web SDKs, and `ContractVersion::CURRENT` are lock-stepped
   to one version per release. Mixing crate versions across releases is
   unsupported.
-- **Breaking API changes are flagged in the changelog.** Public-signature
-  changes land under a `### Breaking` heading in `CHANGELOG.md` for the
-  release that ships them; observable default-behavior changes land under
-  `### Changed`. A release with neither heading is intended to be a drop-in
-  replacement for the previous patch version.
+- **Breaking API changes are flagged in the changelog.** Public-signature and
+  behavior-only compatibility breaks land under a `### Breaking` heading in
+  `CHANGELOG.md` for the release that ships them. Non-breaking observable
+  behavior changes land under `### Changed`. A release with neither heading
+  is intended to be a drop-in replacement for the previous patch version.
 
-### Downstream compatibility matrix
+### Downstream compatibility
 
-Known downstream projects that embed Meerkat, and the exact versions they
-were built and verified against:
-
-| Downstream | Downstream version | Meerkat version |
-|------------|--------------------|-----------------|
-| meerkat-mobkit | 0.7.22 | =0.7.15 |
-| meerkat-mobkit | 0.7.23 | =0.7.17 |
-
-Downstream projects should declare their supported Meerkat version as an
-exact pin in their own `Cargo.toml` (not only in `Cargo.lock`), so consumers
-can read the supported combination without archaeologizing lockfiles at
-release tags.
+This repository does not maintain a live cross-repository compatibility
+matrix. Each downstream project owns its supported Meerkat version in its
+release manifest and release notes. Downstream Rust projects should declare
+that version as an exact pin in `Cargo.toml`, not only in `Cargo.lock`, so the
+supported combination is visible without reconstructing historical lockfiles.
 
 ## Release Checks
 
@@ -64,14 +61,13 @@ Run the release gate before cutting a tag:
 
 ```bash
 make release-preflight
-make verify-version-parity
-make verify-schema-freshness
-make release-dry-run
 ```
 
-These checks keep the Rust workspace version, Python package version,
-TypeScript package version, and generated contract artifacts aligned before any
-registry publish happens.
+This runs the release environment doctor, Cargo and Bazel lock checks, the
+normal CI lane, schema freshness, Rust packaging checks, and the declared-break
+gate. Use `make release-dry-run` for the larger no-upload rehearsal; it includes
+the preflight plus Rust, Python, TypeScript, and Web SDK publish dry-runs and
+package smoke tests.
 
 ## Declared Breaks (`semver-breaks`)
 
@@ -102,30 +98,30 @@ and `meerkat-machine-dsl` are proc-macro crates (a `--workspace` run emits no
 output for them at all), and `rkat` has no lib target. Breaks in those three are
 declared by hand or not at all.
 
-### Stamping is a manual step
+### Changelog stamping is part of the release commit
 
-Nothing stamps `CHANGELOG.md` automatically: neither `cargo release` nor
-`scripts/release-hook.sh` touches it. The order is:
+Write pending notes under `## [Unreleased]` and leave them there for
+`make release-preflight`. When `./scripts/repo-cargo release` creates the version-bump commit,
+its `scripts/release-hook.sh` pre-release hook:
 
-1. Write the release notes under `## [Unreleased]`. `make release-preflight`
-   runs before the version bump, so `## [Unreleased]` is the correct home at
-   that point and the gate accepts it.
-2. Before running `cargo release <patch|minor|major>`, rename that heading to
-   `## [<next version>] - <YYYY-MM-DD>` and leave a fresh empty
-   `## [Unreleased]` stub above it.
-3. Run `cargo release`, which bumps the version, commits, and pushes the tag.
+1. stamps the pending section as `## [<version>] - <YYYY-MM-DD>`, creates a
+   fresh `## [Unreleased]` stub, and advances the comparison links;
+2. bumps SDK, documentation, and contract versions;
+3. regenerates schemas, SDK wrappers, and Bazel metadata; and
+4. verifies and stages those generated release files in the same commit.
 
-Skipping step 2 is what happened in 0.8.23, and it is what
-`release_semver_gate` now fails the tag for: at the tag the workspace version
-has moved but the notes have not, so the release would publish notes titled
-"Unreleased".
+Missing release notes or malformed comparison links fail the hook. Do not stamp the heading by hand before
+the version bump: the hook is the authority that binds the notes and released
+version in one commit. The tag's `release_semver_gate` independently verifies
+the stamped section for tag releases and package recovery. Asset-only and
+Web-SDK-only recovery paths skip this Rust semver gate.
 
 Where it runs:
 
 | Lane | Entry point |
 |------|-------------|
 | Local preflight | `make semver-breaks` (part of `make release-preflight`) |
-| Release workflow | job `release_semver_gate`, required by `publish_github_release`, `publish_registries`, and `publish_unix_release_and_homebrew` |
+| Release workflow | job `release_semver_gate`, required on tag publication and package recovery; asset-only and Web-SDK-only recovery explicitly accept a skipped gate |
 | Every PR | `make semver-breaks-selftest` in the CI `ratchets` job: unit-tests the report parser against committed real reports, without needing cargo-semver-checks installed |
 
 The judgement lives in `scripts/check_semver_breaks.py`, which is a pure
@@ -191,34 +187,60 @@ embedding a separate runtime implementation.
 
 ## Release Workflow
 
-1. Complete CI on the exact release commit and emit its tree-bound
-   attestation.
-2. Push the tag for that same commit; the tag gate consumes the attestation
-   instead of recomputing CI.
-3. Build platform binaries.
-4. Create the GitHub release and upload binary assets.
-5. Update the Homebrew tap formula.
-6. Publish Rust crates.
-7. Publish Python, TypeScript, and Web SDK packages.
-8. Run install smoke checks for at least one platform.
+1. Complete GitHub Actions CI on the exact release commit and emit its
+   tree-bound attestation.
+2. Push the tag for that commit. The tag path verifies the attestation instead
+   of recomputing the broad Cargo CI lane.
+3. In parallel, verify registry credentials and declared breaks, build platform
+   binaries, and build the Web SDK package artifact.
+4. Publish the macOS/Linux assets early when available, then complete the
+   GitHub release with every platform archive, `checksums.sha256`, and
+   `index.json`.
+5. Update the Homebrew tap from the published assets.
+6. Publish Rust crates plus the Python and TypeScript SDKs on GitHub-hosted
+   runners. Their publish jobs build and smoke-test the package artifacts before
+   upload.
+7. Publish the prebuilt Web SDK artifact on a GitHub-hosted runner.
 
 The attestation binds the repository, commit SHA, Git tree SHA, CI workflow run
 and attempt, branch, event, and aggregate Cargo result. The release gate
 downloads it from the successful exact-main workflow run and verifies every
-field before any publish job starts. Manual recovery dispatches run the
-release-validation lane directly so releases older than the attestation
-retention window remain repairable.
+field before tag-triggered publication starts. Manual recovery dispatches still
+require successful exact-main CI for the selected release commit. When release
+validation applies, the dispatch runs the selected validation lane directly
+rather than requiring a retained attestation artifact. Narrow `assets`,
+`packages`, `web-sdk`, and `web-sdk-publish` modes repair one publication
+surface without rebuilding or republishing unrelated surfaces.
 
-Manual release dispatch supports dry-run registry validation. Locally, use:
+To inspect the exact GitHub CLI dispatch without starting a workflow, use:
 
 ```bash
-make release-workflow VERSION=vX.Y.Z REGISTRY_DRY_RUN=true
-MEERKAT_BUILDBUDDY=1 make release-workflow VERSION=vX.Y.Z REGISTRY_DRY_RUN=true
+RELEASE_WORKFLOW_DRY_RUN=true \
+  RELEASE_BACKEND=github-hosted \
+  make release-workflow VERSION=vX.Y.Z
 ```
+
+`REGISTRY_DRY_RUN=true` changes registry publication inside a dispatched
+workflow; it is not a workflow dry run and does not suppress binary, GitHub
+Release, or Homebrew publication.
 
 ## BuildBuddy
 
-Cargo is the default backend. BuildBuddy is selected explicitly:
+The repository owner's automatic release path selects BuildBuddy when the
+required repository variable is enabled. Any actor can make the backend choice
+explicit; for BuildBuddy validation plus Linux and macOS binary packaging:
+
+```bash
+RELEASE_BACKEND=buildbuddy make release-workflow VERSION=vX.Y.Z
+```
+
+Windows packaging and every credentialed registry publish still run on
+GitHub-hosted runners, and the exact-main GitHub Actions CI requirement remains
+in force. This release backend is separate from per-push CI, where BuildBuddy
+is no longer a required lane.
+
+For local Make commands, `MEERKAT_BUILDBUDDY=1` selects the optional BuildBuddy
+developer backend:
 
 ```bash
 MEERKAT_BUILDBUDDY=1 make release-preflight

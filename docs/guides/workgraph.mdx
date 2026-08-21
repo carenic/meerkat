@@ -1,10 +1,10 @@
 ---
-title: "WorkGraph"
+title: "WorkGraph Guide"
 description: "Use WorkGraph tools to create, link, claim, evidence, close, and observe durable work."
 icon: "diagram-project"
 ---
 
-# WorkGraph
+# WorkGraph Guide
 
 Use this guide when an agent should coordinate durable work across sessions,
 compaction, restarts, schedules, or multiple agents.
@@ -15,6 +15,17 @@ observability surfaces; the CLI also has narrow session-goal and attention
 controls for trusted local operators.
 </Note>
 
+## Start With The Namespace Grant
+
+An agent receives one host-issued `WorkGraphNamespaceGrant` containing its
+exact realm and namespace. Standard persistent surfaces grant `default`.
+Every tool call is scoped to that grant: omitting `namespace` uses the granted
+namespace, while a different namespace, realm, or `all_namespaces` request is
+rejected.
+
+Embedding hosts that need a domain namespace must issue that namespace in the
+agent build. Do not treat a caller-supplied namespace string as authority.
+
 ## Create Work
 
 Use `workgraph_create` for a durable commitment.
@@ -23,7 +34,7 @@ Use `workgraph_create` for a durable commitment.
 {
   "title": "Prepare dentist transport reminder",
   "description": "Create a reminder for L to explain to A that car P is in the workshop.",
-  "namespace": "homecare",
+  "namespace": "default",
   "priority": "high",
   "labels": ["family-logistics", "autism-support"],
   "due_at": "2026-05-19T08:00:00Z",
@@ -45,13 +56,33 @@ Use `workgraph_link` to describe relationships.
   "kind": "blocks",
   "from_id": "work_check_car_status",
   "to_id": "work_prepare_dentist_reminder",
-  "namespace": "homecare"
+  "namespace": "default"
 }
 ```
 
-For `blocks`, the target is not ready until the blocker is terminally resolved.
+For `blocks`, the target is not ready until the blocker reaches `completed`.
 Use `related`, `parent`, `supersedes`, or `derived_from` when readiness should
 not be blocked.
+
+### Join Parent And Child Work
+
+A `parent` edge points from child (`from_id`) to parent (`to_id`). A parent is
+not ready until every active direct child becomes terminal. Configure the
+parent when child failure or cancellation should be accepted or propagated:
+
+```json
+{
+  "title": "Complete release",
+  "namespace": "default",
+  "failed_child_join_policy": "propagate",
+  "cancelled_child_join_policy": "require_success"
+}
+```
+
+The policies are `require_success` (default), `propagate`, and `accept`.
+`propagate` terminalizes the parent when a claim/readiness observation
+reconciles the finished children. `require_success` leaves the join
+unsatisfied; it does not reinterpret failure as success.
 
 ## Find Ready Work
 
@@ -59,7 +90,7 @@ Use `workgraph_ready` instead of inferring readiness.
 
 ```json
 {
-  "namespace": "homecare",
+  "namespace": "default",
   "labels": ["family-logistics"],
   "limit": 10
 }
@@ -75,7 +106,7 @@ Use `workgraph_claim` before doing durable work. Include the current
 ```json
 {
   "id": "work_prepare_dentist_reminder",
-  "namespace": "homecare",
+  "namespace": "default",
   "expected_revision": 3,
   "owner": {
     "key": { "kind": "agent", "id": "homecore/logistics-agent" },
@@ -84,6 +115,13 @@ Use `workgraph_claim` before doing durable work. Include the current
   "lease_seconds": 1800
 }
 ```
+
+Omit both lease fields for a non-expiring claim. For an expiring claim, use
+exactly one of `lease_seconds` or absolute RFC3339 `lease_expires_at`.
+Relative leases must be 1-31,536,000 seconds (at most 365 days). Lease expiry
+alone does not mutate the item: a Schedule-owned sweep or another trusted host
+must observe it, after which WorkGraph commits the release and a
+`lease_expired` fact atomically.
 
 If a write returns a stale revision error, reload with `workgraph_get` or
 `workgraph_snapshot`, then decide whether the action still makes sense.
@@ -97,7 +135,7 @@ completion.
 ```json
 {
   "id": "work_prepare_dentist_reminder",
-  "namespace": "homecare",
+  "namespace": "default",
   "expected_revision": 4,
   "evidence": {
     "kind": "notification",
@@ -118,7 +156,7 @@ Use `workgraph_close` only when terminal truth exists.
 ```json
 {
   "id": "work_prepare_dentist_reminder",
-  "namespace": "homecare",
+  "namespace": "default",
   "expected_revision": 5,
   "status": "completed"
 }
@@ -126,6 +164,51 @@ Use `workgraph_close` only when terminal truth exists.
 
 Use `workgraph_release` if you stop before terminal completion and another
 agent should be able to claim the item.
+
+Completion policy still applies. Generic agent evidence is self-attested and
+cannot impersonate the reserved host, principal, supervisor, or reviewer
+confirmation kinds. Those typed confirmations are stamped only by trusted
+goal-confirm authority.
+
+## Goals And Attention
+
+A goal is a WorkGraph item plus a durable attention binding. The binding tells
+Meerkat which session or lowered owner should see the item, in which mode, and
+with how much delegated authority. Modes are `pursue`, `coordinate`, `review`,
+`falsify`, `judge`, and `observe`.
+
+Create a session-bound goal from the trusted local CLI:
+
+```bash
+rkat --realm home workgraph goal-create SESSION_ID \
+  "Prepare dentist transport reminder" \
+  --namespace default \
+  --mode pursue \
+  --completion-policy self-attest
+```
+
+The active binding projects bounded item and parent context into the target's
+turn. Its delegated authority may permit evidence, requesting closure,
+closing a review item, or closing when policy allows. The injected
+`workgraph_attention_reassign` and `workgraph_policy_escalate` tools require
+the current attention authority projection; they are not free-standing public
+RPC mutations.
+
+Use `goal-status` and `attention-list` to observe bindings. Pause/resume
+changes attention delivery only - it does not pause the WorkItem. Stopping or
+superseding a binding also does not rewrite the item's terminal truth.
+
+## Observe Durable Facts
+
+Events may carry typed `item_ready`, `lease_expired`, and
+`namespace_terminal` facts. The first qualifying observation commits the fact
+with the mutation that proved it. WorkGraph is a ledger, not a timer: Schedule
+owns recurring readiness and lease-expiry sweeps.
+
+For long execution, keep the ownership split. A durable job owns attempts and
+results, then `JobTerminalEvidenceProjector` can add typed terminal evidence
+and request WorkGraph closure. A Mob Flow binding follows the same rule: Mob
+owns the run, WorkGraph owns evidence and completion policy.
 
 ## Observe From Host Surfaces
 
@@ -148,3 +231,10 @@ public REST and JSON-RPC keep these as observability-only.
 
 When skills are enabled and WorkGraph capability is available, agents can load
 the `workgraph-workflow` companion skill for operating guidance.
+
+## See Also
+
+- [WorkGraph concept](/concepts/workgraph)
+- [WorkGraph reference](/reference/workgraph-reference)
+- [Durable jobs and monitors](/guides/durable-jobs)
+- [Scheduling guide](/guides/scheduling)

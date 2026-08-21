@@ -170,6 +170,36 @@ External events are queue-only runtime-backed inputs.
 - they do not invent a second direct execution path
 - “turn-boundary inbox draining” is not the primary mental model for the current runtime-backed design
 
+## Event delivery and durable projection
+
+Live delivery and durable evidence use separate lanes:
+
+- Ordinary session subscribers read a 256-entry broadcast. If a subscriber
+  falls behind, it receives a synthetic `StreamTruncated` event with
+  `reason.kind = "stream_lagged"` and the exact `reason.dropped` count, then
+  continues with retained events. The marker reports a gap in that subscriber's
+  live view; it is not a canonical durable-log event.
+- A persistent session whose host installs event projection has one internal
+  dedicated projector stream backed by an unbounded MPSC queue. Built-in
+  realm-backed persistence installs it; custom hosts must call the projection
+  composition seam explicitly. Event publication shares the same envelope with
+  the live lane, but projector latency does not block live subscribers or
+  depend on broadcast retention. The runtime emits a rate-limited degraded
+  warning when the queue reaches 1,024 entries and records its high-water mark.
+- The projector asynchronously appends each envelope to the durable event audit
+  log before updating derived `.rkat/` materialized files. UI-ring lag does not
+  drop projector input, but EventStore projection is still best-effort derived
+  state. The `RuntimeStore`/backend carrier remains session authority;
+  `SessionStore` rows and EventStore are component/content and projection seams.
+
+A durable audit-log append failure latches an
+`EventProjectionHalted` fault, records a durable projection-halt marker when
+possible, stops before appending later events across the sequence hole, and
+makes replay and later resume fail closed. It does not roll back or fail the
+already-committed turn. Clients that see live
+`stream_truncated` reconcile from `events/list_since`, a current snapshot, or
+ATIF export.
+
 ## Explicit override semantics
 
 Where the surface supports omission vs explicit override, these are distinct facts:
@@ -184,7 +214,8 @@ When all three meanings matter, the wire/API must preserve that distinction. Typ
 
 Sessions are realm-scoped.
 
-- Same `realm_id`: shared visibility and config context.
+- Same `realm_id` plus the same physical provider/root: shared visibility and
+  config context.
 - Different `realm_id`: strict isolation.
 - Backend is pinned per realm via `realm_manifest.json` (manifest format 2
   adds `provider` and `ephemeral_domains`; readers refuse formats newer than
@@ -193,10 +224,10 @@ Sessions are realm-scoped.
 - State roots resolve realm-id-first across the project-local and
   user-global candidates; a realm materialized under both is a typed
   split-brain refusal (see `rkat storage doctor`).
-- First materialization of a fresh realm reserves across every candidate
-  root before writing the manifest, so surfaces with different default
-  roots racing the same realm converge on one copy instead of minting
-  split-brain twins.
+- First materialization of a fresh realm reserves across the candidate set
+  resolved by that invocation before writing the manifest. Processes using
+  the same multi-root set converge; surfaces probing different sets do not.
+  Use one explicit root or matching server context for cross-surface starts.
 - A fresh prompt-first CLI run or `rkat help` whose workspace-derived realm
   cannot open may isolate storage into a newly generated durable SQLite realm
   under the same resolved state root. No historical session from the failed
@@ -207,6 +238,31 @@ Sessions are realm-scoped.
   runs, resumes, and session commands never take this fallback. Historical
   session access requires the explicit fenced pre-0.8.10 bridge; there is no
   in-memory compatibility fallback.
+
+## Mob-member role continuity
+
+A durable mob member normally resumes only when its stored and requested role
+match. Mob ID, member `AgentIdentity`, bridge `session_id`, and transcript are
+fixed identity facts; a profile edit alone cannot reinterpret the stored
+member as a different role.
+
+Trusted in-process hosts have one explicit migration seam. An exact
+`MemberLaunchMode::Resume` may carry `resume_from_role` naming the stored
+predecessor role for that request. Admission proves that the stored and current
+`comms_name` and `MobMemberBinding` refer to the same mob and member. An absent
+declaration returns `MemberRoleMigrationRequired`; the wrong predecessor or a
+contradictory identity returns `MemberRoleMigrationRejected`.
+
+Role migration is cold and one-shot. The exact session must have no live actor,
+the declaration is consumed rather than persisted as standing permission, and
+successful materialization restamps the current role into durable comms
+metadata while preserving the same session and transcript. There is no
+implicit rollback; a later role change requires a new exact cold migration.
+
+This seam is deliberately private. Public CLI, REST, JSON-RPC, MCP, generated
+SDK spawn requests, helpers, and standing profiles cannot set
+`resume_from_role`. The private member-host materialization protocol carries it
+only as part of the trusted remote-host resume path.
 
 ## Compaction contract
 
@@ -224,8 +280,12 @@ No durability across process restart.
 
 ### Persistent mode
 
-Durability follows the active persistent realm backend (`sqlite` or `jsonl`).
-Both persistent backends mount a SQLite runtime companion for runtime authority:
+Durability follows the selected realm storage provider and its declarations
+for the seven owned domains. The built-in persistent realm backends are
+`sqlite` and `jsonl`; an external `RealmStorageProvider` may supply other
+persistent stores, but it must declare every domain and may not silently
+substitute memory for one declared durable. Both built-in persistent backends
+mount a SQLite runtime companion for runtime authority:
 `sqlite` realms keep the `runtime_*` tables inside `sessions.sqlite3`, and
 `jsonl` realms carry a dedicated `runtime.sqlite3` alongside the JSONL session
 documents. Queued inputs, run-boundary receipts, ops snapshots, and
@@ -379,8 +439,10 @@ Declarations are complete by construction: a storage provider must declare
 exactly one class for each of the seven domains (`sessions`, `runtime`,
 `schedule`, `workgraph`, `jobs`, `blobs`, `artifacts`), so no slot dodges the rule
 by omission. A durable slot resolving to a non-persistent store without the
-realm manifest declaring that domain ephemeral is a startup error — never a
-silent in-memory fallback. Deployment tooling can rely on the classes (for
+realm manifest declaring that domain ephemeral is a startup error. A provider's
+typed `DeclaredEphemeral` resolution is already an explicit declaration and
+does not need a duplicate manifest entry. Neither path permits a silent
+in-memory fallback. Deployment tooling can rely on the classes (for
 example, cloning only durable domains between state generations).
 
 ### Session storage layout (0.7.25+): head-canonical strands

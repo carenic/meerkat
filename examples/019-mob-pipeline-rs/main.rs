@@ -1,13 +1,14 @@
 //! # 019 — Mob: Pipeline (Rust)
 //!
-//! A pipeline mob processes work in sequential stages. Each stage is handled
-//! by a specialized worker, with explicit handoffs between stages.
+//! Builds and validates a staged mob definition, spawns specialized workers,
+//! wires their topology, and manually submits illustrative lint and test turns.
+//! It does not execute the declared flow or enforce pass/fail gating.
 //!
 //! ## What you'll learn
-//! - Sequential stage processing with mobs
+//! - Staged profiles, skills, topology, limits, and a sample flow DAG
 //! - Spawning stage-specific workers
-//! - Running turns on individual pipeline stages
-//! - Defining a pipeline mob with flows, topology, and limits
+//! - Running manual turns on individual stage members
+//! - Validating a `MobDefinition` before creation
 //!
 //! Note: Uses `build_ephemeral_service` (in-memory substrate) for simplicity.
 //! Production pipelines use the runtime-backed path.
@@ -392,7 +393,7 @@ content = "Execute deployment: build release, run smoke tests. Report pass/fail.
 
     // Clean up.
     handle.retire_all().await?;
-    println!("All stage workers retired. Pipeline complete.");
+    println!("All stage workers retired. Demonstration complete.");
 
     Ok(())
 }

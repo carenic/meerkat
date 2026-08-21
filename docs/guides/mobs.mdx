@@ -1,5 +1,5 @@
 ---
-title: "Mobs"
+title: "Mobs Guide"
 description: "Build and operate Meerkat multi-agent teams: delegation, members, wiring, flows, work lanes, profiles, and mobpacks."
 icon: "users"
 ---
@@ -225,8 +225,9 @@ catalogued, custom-defined under `[models.<id>]`, nor provider-annotated
 (`unknown_model`), instead of failing at the member's first delivery.
 
 <Warning>
-Mobs do not use prefabs or templates. Create mobs from
-`MobDefinition` directly, or package that definition as a mobpack.
+Mobs do not use prefab or template object types. Create mobs from
+`MobDefinition` directly, or package that definition as a mobpack. Flow step
+message text can still use the runtime context placeholders described below.
 </Warning>
 
 ## Create And Spawn
@@ -351,6 +352,16 @@ Spawn defaults matter:
 Autonomous members run as long-lived peers. `turn_driven` members are useful
 when a host wants explicit dispatch control.
 
+### Trusted Rust member build overrides
+
+An in-process Rust host can attach a per-member
+`Arc<dyn CompactionCurator>` through
+`SpawnMemberSpec.compaction_curator_override`. The exact curator reaches the
+session build for that spawn or cold resume. It is executable process-local
+behavior, not durable configuration: re-supply it from a
+`SpawnMemberCustomizer` after restart. Remote placement rejects it before
+materialization instead of dropping the override.
+
 ## Identity And Respawn
 
 Mobs separate stable member identity from runtime binding details:
@@ -364,6 +375,49 @@ Mobs separate stable member identity from runtime binding details:
 
 Use `AgentIdentity` for facts that survive respawn, such as wiring and durable
 configuration. Runtime IDs and fence tokens protect the lower-level binding.
+
+### Durable role migration
+
+A durable member may keep the same mob id, `AgentIdentity`, session, and
+transcript while moving to a new role. This is a one-request cold Resume
+contract, not a profile alias or standing migration rule.
+
+For an explicit trusted Rust-host resume, declare the exact durable predecessor
+role on the spec:
+
+```rust
+let spec = SpawnMemberSpec::new(
+    "home-automation",
+    AgentIdentity::from("home-automation-1"),
+)
+.with_resume_bridge_session_id_from_role(session_id, "domain");
+
+handle.spawn_spec(spec).await?;
+```
+
+For automatic cold restoration after a process restart, install a
+`SpawnMemberCustomizer` and call `spec.declare_resume_from_role("domain")?`
+only when `ctx.spawn_source == SpawnSource::Resume`, after checking the exact
+member identity and requested target profile. The declaration is intentionally
+not persisted, so each later migration or restore must re-supply current host
+intent.
+
+The runtime enforces all of these facts:
+
+- mob id, `AgentIdentity`, and exact durable session stay fixed
+- the declaration must equal the one stored predecessor role
+- when the stored and requested roles differ, an omitted declaration returns `MemberRoleMigrationRequired`
+- an incorrect, inapplicable, or live-session declaration returns `MemberRoleMigrationRejected`
+- even an idle live actor cannot be migrated; the exact session must be cold
+- success restamps the current comms name, typed member binding, role/profile labels, callback context, and explicitly configured tooling
+- rollback is another declared forward migration or separately versioned durable state, never an old binary silently reclaiming the predecessor role
+
+<Warning>
+`resume_from_role` is available on trusted in-process `SpawnMemberSpec` and the
+private member-host materialization protocol. It is deliberately absent from
+agent-callable spawn tools, standing profiles, CLI spawn helpers, REST, public
+MCP, JSON-RPC/SDK spawn contracts, and the Web SDK.
+</Warning>
 
 ## Wire Peers
 
@@ -505,6 +559,27 @@ are not separate public machines.
   }
 }
 ```
+
+### Flow parameters and message templates
+
+Flow activation parameters are available to text in step messages. Use
+`{{ params.<path> }}` for input, `{{ steps.<step-id>.output.<path> }}` for a
+root-frame result, and
+`{{ loops.<loop-id>.iterations.<n>.steps.<step-id>.<path> }}` for an exact
+loop iteration. The `.output` segment on a root step is optional.
+
+```json
+{
+  "role": "lead",
+  "message": "Triage severity {{ params.severity }}: {{ params.prompt }}"
+}
+```
+
+String values render as text; other JSON values render as JSON. Placeholders
+are also rendered inside text blocks of multimodal messages, while non-text
+blocks are preserved. Invalid syntax, an unknown root, a missing field under a
+present value, or indexing into a scalar fails the step closed. A step or loop
+root that genuinely has not produced output renders as `null`.
 
 ### Advisory nodes (`failure_policy`)
 
@@ -797,13 +872,70 @@ The bind report's host id is the `placement` value for `mob/spawn` and
 }
 ```
 
+Placement does not transfer mob authority to the member host. The controlling
+host remains the sole owner of roster, topology, placement, route obligations,
+grants, merged observation, and teardown. The member host owns realm-local
+execution, session history, credentials, compaction, and memory. A remote
+member therefore uses its host's realm even when the controller has a realm
+with the same name.
+
+The placed session id is diagnostic identity in the owning member-host realm,
+not a controller-local `session/*` handle. Drive the member by
+`agent_identity`, and read its transcript with `mob/member_history`. Generic
+session history, transcript revision, and transcript edit operations are not
+proxied across hosts in v1.
+
+### Placed-member portability
+
+Remote placement compiles one digest-covered `PortableMemberSpec`. Admission
+rejects host-local or secret-bearing behavior before any materialization
+request; it never silently strips the field and launches a weaker member.
+
+The typed non-portable causes cover:
+
+- Rust tool bundles, per-spawn external tools, mob-default external tools, and a default LLM client override
+- an in-process compaction curator override
+- a host-surface MCP allow-list, an inherited tool filter, and WorkGraph tools
+- non-empty shell environment, MCP stdio environment, or MCP HTTP headers
+
+Placement is also mutually exclusive with an explicit `backend` or
+`RuntimeBinding`: one member has one execution transport story.
+
+WorkGraph commitments and stores stay on the controller, so a profile that
+requests WorkGraph tools cannot be placed remotely. Schedule tools are
+portable. Memory and declarative MCP servers can be portable, but only when
+the bound host advertises the required capability and the MCP declaration does
+not carry secret environment or header values. The same admission ladder
+fails closed when the host lacks required autonomous-member, durable-session,
+tracked-cancel, protocol-v4, memory-store, or MCP capability.
+
+Operator surface boundaries are intentional:
+
+| Surface | Multi-host contract |
+| --- | --- |
+| Trusted in-process Rust host | Full `MobHandle` authority when supplied the required principal, including `hard_cancel_member`; one-shot role migration remains a spawn-spec-only contract |
+| JSON-RPC and Python/TypeScript SDKs | Full placement, host, grant, observation, `mob/hard_cancel_member`, and live families |
+| REST and public MCP | Remote-transparent ordinary operations plus read-only hosts, route installs, and member history; no host/grant/live/hard-cancel administration |
+| CLI | Host bind/revoke/list, grant management, observation, and live verbs; `force-cancel` is cooperative and distinct from RPC/SDK hard cancel |
+| Agent tools | May request a bound placement during delegate/spawn; cannot bind hosts, administer grants, inspect operator state, control live channels, or hard-cancel |
+| Web/WASM | Single-host only; non-local placement fails through the typed capability boundary |
+
+The identity-routed mob member live family is WebSocket-only. An explicit
+`transport = "webrtc"` request to `mob/member_live_open` is rejected with
+`LiveTransportUnsupported` for both local and placed members. Use the
+session-scoped `live/open` path for a controller-local session when WebRTC is
+required; there is no controller `session/*` path to a placed session.
+
 Use `mob/hosts`, `mob/route_installs`, and `mob/member_history` (or the
 matching CLI commands) for placement diagnostics. Python and TypeScript expose
 the full typed RPC family. REST and public MCP intentionally expose the three
 read-only observations, while host binding, grants, hard cancel, and member
 live control remain outside REST and public MCP. Host binding, grants, and
-member live control also have explicit CLI verbs; hard cancel is RPC/SDK-only
-(`rkat mob force-cancel` is the distinct cooperative boundary cancel).
+member live control also have explicit CLI verbs. On public transport
+surfaces, hard cancel is RPC/SDK-only; trusted in-process `MobHandle` callers
+also expose it as `hard_cancel_member` (`mob/hard_cancel_member`, Python
+`Mob.hard_cancel`, and TypeScript `Mob.hardCancel`). `rkat mob force-cancel`
+is the distinct cooperative boundary cancel.
 Browser/WASM mobs remain single-host and reject non-local placement through
 their typed capability boundary.
 
@@ -844,10 +976,16 @@ runtime, such as another host, sandbox, or service process.
 
 ## Live Channels
 
-Live channels are per session. To use live audio/text or model-gated image input
-with a mob member, give that member a realtime-capable model such as
-`gpt-realtime-2`, spawn the member, then open a live channel against the
-member's session through the `live/*` surface.
+Live channels execute in the owning session. For a mob member, address the
+member by identity through `rkat mob live open`, RPC
+`mob/member_live_open`, Python `Mob.member_live_open`, or TypeScript
+`Mob.memberLiveOpen`. That path is placement-transparent and returns the
+owning host's WebSocket endpoint.
+
+The mob member family deliberately rejects explicit WebRTC for local and
+placed members. If a controller-local member needs WebRTC, use the generic
+session-scoped `live/open` surface with its local session id. A placed session
+cannot be opened through the controller's generic session surface.
 
 See [Live channels](/guides/realtime).
 
@@ -875,7 +1013,7 @@ wasm-pack output into that bundle; it does not compile wasm32.
 | `member_already_exists` | Pick a new `agent_identity` or `respawn` the existing member |
 | `profile_not_found` | Confirm the profile name exists in the `MobDefinition` or profile store |
 | `topology_violation` | Check role wiring and topology rules before sending work |
-| External spawn rejected | Verify the external binding includes address and trusted identity |
+| External spawn rejected | Verify the external binding includes address, Ed25519 identity, and typed bootstrap token |
 | Flow run missing | Use `mob/flows` first and confirm the `flow_id` exists in the definition |
 | Live open fails | Confirm the member's model has realtime capability and `rkat-rpc --live-ws` is enabled when using RPC audio |
 

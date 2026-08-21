@@ -834,10 +834,10 @@ class ForkSessionAtParams:
 class ForkSessionReplaceParams:
     """Request payload for `session/fork_replace`.
 
-`replacement` rides as the typed [`WireTranscriptReplacement`] mirror so
+`replacement` rides as the typed `WireTranscriptReplacement` mirror so
 the emitted JSON schema is the closed replacement enum rather than a bare
 `serde_json::Value`. The consuming surface lowers it into the core
-[`TranscriptReplacement`] via [`WireTranscriptReplacement::into_core`]."""
+[`TranscriptReplacement`] via `WireTranscriptReplacement::into_core`."""
     message_index: int
     replacement: WireTranscriptReplacement
     session_id: str
@@ -877,7 +877,9 @@ class InjectSystemContextParams:
     """Parameters for `session/inject_context`, which appends one ordinary durable
 ordered System message at the admitted transcript boundary.
 
-The injected body is the typed [`CoreRenderable`] owner rather than a bare
+The injected body is the typed
+[`CoreRenderable`](meerkat_core::lifecycle::run_primitive::CoreRenderable)
+owner rather than a bare
 `text` string: surfaces parse their inbound payload into the renderable at
 the ingress boundary and the handler threads it straight through to
 `AppendSystemContextRequest.content`. A plain-text client payload still
@@ -2903,9 +2905,9 @@ class MobMemberSpecWire:
 `mob/reconcile`.
 
 Mirrors the essential, codegen-friendly fields of
-[`meerkat_mob::SpawnMemberSpec`]. Complex sub-types (tool access policy,
+`meerkat_mob::SpawnMemberSpec`. Complex sub-types (tool access policy,
 budget split, inherited tool filter, override profile) are not on this
-wire surface — callers that need that parity should use the non-declarative
+wire surface - callers that need that parity should use the non-declarative
 `mob/spawn` method."""
     agent_identity: str
     profile: str
@@ -4765,7 +4767,7 @@ WireLiveAdapterErrorCode = WireLiveAdapterErrorCodeConnectionFailed | WireLiveAd
 #
 # FIX-SDK-OBS: closes the R5-4 verifier gap. The core enum is the canonical
 # shape adapters emit, but it is not registered for schema emission and is
-# therefore invisible at the SDK boundary — browser/Python clients receive
+# therefore invisible at the SDK boundary - browser/Python clients receive
 # observations as untyped JSON and cannot type-narrow on
 # `assistant_audio_chunk` (to read the new `item_id` / `response_id` /
 # `content_index` fields driving `live/truncate`) or on `command_rejected`
@@ -4778,7 +4780,7 @@ WireLiveAdapterErrorCode = WireLiveAdapterErrorCodeConnectionFailed | WireLiveAd
 # byte-identical (see `wire_live_adapter_observation_byte_compatible_with_core`).
 #
 # Field types reference other wire mirrors where they exist
-# ([`WireStopReason`], [`WireUsage`], [`WireLiveAdapterStatus`],
+# ([`WireStopReason`], [`crate::wire::WireUsage`], [`WireLiveAdapterStatus`],
 # [`WireLiveAdapterErrorCode`]) and the public-safe
 # [`WireRealtimeTranscriptEvent`].
 #

@@ -1,25 +1,26 @@
-# 029 — Web Incident War Room (Shell)
+# 029 - Web Incident War Room (Shell)
 
-Build a browser-deployable incident-response workspace that feels like a real
-SEV war room, not just a packaging demo. The example produces a browser bundle
-containing a multi-role incident team that can coordinate via comms.
+Package an incident-response mob and assemble a browser bootstrap bundle. The
+generated page trust-verifies the mobpack, initializes the Meerkat WASM
+runtime, and exposes a reusable `bootMobpack()` module. It does not create the
+mob, spawn its members, or provide a chat UI by itself.
 
 ## What This Example Teaches
-- No local install for responders beyond browser access
-- Same mob artifact can run in CLI and web
-- Useful for incident commanders, SRE triage, stakeholder comms, and timeline capture
-- Shows how to package a believable multi-agent workflow into a static browser bundle
+- How to package one mob artifact for CLI and browser-runtime consumers
+- How `rkat mob web build` assembles a static bootstrap from prebuilt WASM
+- Which files a host application receives and must integrate
+- How to model an incident-response team for a later `@rkat/web` integration
 
 ## Concepts
 - `.mobpack` as universal deployment artifact
-- `rkat mob web build` for browser bundle output
+- `rkat mob web build --wasm ...` for browser bundle assembly from a prebuilt runtime
 - browser-safe capability profile enforced at build time
-- role-specialized agents using `comms` and mob orchestration
+- a role-specialized mob definition that requests `comms`
 - `manifest.web.toml` as derived output that tells you what the browser build can do
 
 ## Team Design
 
-The generated incident room includes five roles:
+The packed definition declares five roles:
 
 | Role | What it does |
 |------|--------------|
@@ -29,17 +30,30 @@ The generated incident room includes five roles:
 | Customer Comms | Drafts status-page and exec-friendly updates |
 | Scribe | Maintains the timeline, decisions, owners, and open questions |
 
-This is intentionally designed to demonstrate why a browser-deployable mob is
-useful: you can hand one bundle to an incident commander and get a structured
-room with distinct viewpoints, without asking the team to install Rust, Python,
-or a local SDK.
+The definition is production-shaped, but this shell example stops at browser
+bootstrap assembly. A host application must separately import the source
+`definition.json`, pass it to `@rkat/web` `createMob()`, spawn the declared
+members, and add its own prompt and transcript UI before operators can use the
+team. Runtime initialization does not expose or instantiate the full packed
+definition.
 
 ## Prerequisites
 ```bash
 export ANTHROPIC_API_KEY=sk-...
 ./scripts/repo-cargo build -p rkat --bin rkat
-wasm-pack --version
 ```
+
+The script uses `sdks/web/wasm/meerkat_web_runtime_bg.wasm` by default. To
+rebuild that artifact after Rust changes, install Node.js and `wasm-pack`, then
+run:
+
+```bash
+npm --prefix sdks/web install
+npm --prefix sdks/web run build:wasm
+```
+
+Set `MEERKAT_WASM=/path/to/meerkat_web_runtime_bg.wasm` to use another
+prebuilt runtime.
 
 If you are running from this repo checkout instead of a global install, the
 script will automatically prefer repo-local binaries built by
@@ -47,7 +61,7 @@ script will automatically prefer repo-local binaries built by
 
 ## Run
 ```bash
-./examples.sh
+./examples/029-web-incident-war-room-sh/examples.sh
 ```
 
 ## What The Script Does
@@ -56,11 +70,12 @@ The script:
 1. Copies the source mobpack from `mobpack/` into `.work/`
 2. Packs it into `incident-war-room.mobpack`
 3. Inspects the artifact so you can see what was bundled
-4. Runs `rkat mob web build` to produce a browser bundle
+4. Runs `rkat mob web build --wasm ...` to assemble a browser bundle
 5. Prints the derived `manifest.web.toml`
 6. Prints a realistic incident kickoff prompt from `prompts/incident-kickoff.md`
 
-Generated artifacts land under `.work/incident-war-room-web/`.
+Generated artifacts land under
+`examples/029-web-incident-war-room-sh/.work/incident-war-room-web/`.
 
 ## What The Browser Bundle Contains
 
@@ -70,24 +85,27 @@ The browser bundle contains:
 - a derived `manifest.web.toml`
 - static assets you can serve with any dumb HTTP server
 
-That means the same incident workflow can be reviewed as source, packed as an
-artifact, and then shipped into a zero-install browser environment.
+The generated `index.html` is an initialization smoke page. Its Start button
+loads the WASM module and trust-verifies `mobpack.bin`; successful status does
+not mean the declared team has been instantiated.
 
 ## Serve The Bundle
 
 ```bash
-cd .work/incident-war-room-web
+cd examples/029-web-incident-war-room-sh/.work/incident-war-room-web
 python3 -m http.server 4173
 ```
 
 Then open `http://127.0.0.1:4173`.
 
-Bring your own LLM API key in the browser UI when prompted.
+Enter an API key to exercise runtime initialization. Provider calls do not run
+until a host application creates sessions or mob members.
 
-## Suggested Exercise
+## Suggested Integration Exercise
 
-After opening the app, paste the kickoff prompt from
-`prompts/incident-kickoff.md`. A good first turn is:
+In a custom `@rkat/web` host, import `mobpack/definition.json`, create the mob
+and its members, then add a prompt input that sends the kickoff scenario from
+`prompts/incident-kickoff.md` to the commander. A good first turn is:
 
 ```text
 Run this as a SEV-1 war room. State severity and customer impact, assign

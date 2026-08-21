@@ -1,4 +1,4 @@
-const { chromium } = require('/Users/luka/.npm/_npx/e41f203b7505f1fb/node_modules/playwright');
+const { chromium } = require('@playwright/test');
 const fs = require('node:fs');
 (async () => {
   const browser = await chromium.launch({
@@ -37,7 +37,7 @@ const fs = require('node:fs');
       pc.oniceconnectionstatechange = () => record('ice', pc.iceConnectionState);
       pc.onsignalingstatechange = () => record('signaling', pc.signalingState);
       pc.ontrack = (event) => record('remote-track', `${event.track.kind}:${event.track.readyState}`);
-      const dc = pc.createDataChannel('meerkat-live');
+      const dc = pc.createDataChannel('meerkat.live');
       dc.onopen = () => record('data', 'open');
       dc.onclose = () => record('data', 'closed');
       dc.onmessage = (message) => {
@@ -53,11 +53,23 @@ const fs = require('node:fs');
       const openPromise = fetchJson('/api/start', { turningMode: 'explicit_commit' });
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      if (pc.iceGatheringState !== 'complete') {
+        await new Promise((resolve) => {
+          const onState = () => {
+            if (pc.iceGatheringState === 'complete') {
+              pc.removeEventListener('icegatheringstatechange', onState);
+              resolve();
+            }
+          };
+          pc.addEventListener('icegatheringstatechange', onState);
+        });
+      }
       const open = await openPromise;
+      const gatheredOffer = pc.localDescription;
       const answer = await fetchJson('/api/webrtc/answer', {
         channel_id: open.channel_id,
         token: open.transport.token,
-        offer_sdp: offer.sdp,
+        offer_sdp: gatheredOffer.sdp,
       });
       await pc.setRemoteDescription({ type: 'answer', sdp: answer.answer_sdp });
       const deadline = Date.now() + 30000;
@@ -74,7 +86,7 @@ const fs = require('node:fs');
         capabilities: open.capabilities,
         continuity: open.continuity,
         tool_count: Array.isArray(open.tools) ? open.tools.length : null,
-        offer_sdp_len: offer.sdp.length,
+        offer_sdp_len: gatheredOffer.sdp.length,
         answer_sdp_len: answer.answer_sdp.length,
         final: { pc: pc.connectionState, ice: pc.iceConnectionState, signaling: pc.signalingState, dc: dc.readyState },
         states,

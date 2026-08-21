@@ -546,8 +546,8 @@ class HookFailureReasonConfigInvalid(TypedDict, total=False):
 
 
 class HookFailureReasonObserveOnlyViolation(TypedDict, total=False):
-    """A `pre_*` background hook attempted a non-observe action (patch or deny),
-    which is not permitted for observe-only background hooks.
+    """A background hook attempted a non-observe action, which is not
+    permitted for observe-only background hooks at any hook point.
     """
     reason_code: Required[Literal['observe_only_violation']]
 

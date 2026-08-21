@@ -1,6 +1,6 @@
 ---
 title: "Mobs"
-description: "Meerkat's multi-agent model: durable teams, stable member identity, profile-based roles, wiring, flows, and host-vs-agent surfaces."
+description: "Meerkat's multi-agent model: durable teams, stable member identity, role profiles, placement, wiring, flows, and operator boundaries."
 icon: "users"
 ---
 
@@ -32,6 +32,7 @@ multi-agent orchestration compile to mob members.
 | Member | A spawned agent session addressed by stable `AgentIdentity` |
 | Wiring | The peer graph that controls who can see and message whom |
 | Flow | A repeatable workflow across members |
+| Member host | A trusted Meerkat process that materializes placed members for a controlling mob |
 
 ## Stable Identity
 
@@ -49,6 +50,12 @@ Generation     -> respawn counter
 This is why callers wire `lead-1` to `analyst-1` instead of wiring internal
 session IDs.
 
+A role or profile is not the member's durable identity. A trusted Rust host can
+resume one cold durable session under a new role only by declaring the exact
+predecessor role on that one Resume request. The mob id and `AgentIdentity`
+stay fixed. An absent or incorrect declaration fails closed, and the
+declaration is never stored as permission for later resumes.
+
 ## Host Vs Agent Surfaces
 
 Mobs deliberately expose two kinds of interfaces:
@@ -58,9 +65,35 @@ Mobs deliberately expose two kinds of interfaces:
 | Agent tools | The model inside a session | `delegate`, `mob_create`, `mob_spawn_member`, `mob_wire` |
 | Host APIs | Apps, SDKs, CLI, and services | `mob/create`, `mob/spawn`, `mob/flow_run`, Python/TypeScript/Web `Mob` |
 | Public MCP tools | External MCP clients | `meerkat_mob_create`, `meerkat_mob_spawn`, `meerkat_mob_flow_run` |
+| Trusted Rust host | In-process application code | `MobBuilder`, `SpawnMemberSpec`, `SpawnMemberCustomizer` |
 
 Agent tools let an agent create or coordinate helpers while it is working. Host
 APIs let applications create, supervise, inspect, and drive teams directly.
+Some authority-sensitive operations are intentionally narrower: host binding,
+grants, and member live control are operator surfaces. Among public transport
+APIs, hard cancel is limited to JSON-RPC and its Python/TypeScript SDK
+wrappers as `mob/hard_cancel_member`; trusted in-process `MobHandle` callers
+also have that authority through `hard_cancel_member`.
+One-shot role migration is a trusted Rust-host and internal member-host
+materialization contract, not an agent, CLI, REST, public MCP, or SDK spawn
+field.
+
+## Local And Placed Members
+
+The controlling host owns mob identity, roster, topology, placement, routing
+obligations, grants, merged observation, and teardown. A bound member host owns
+the realm-local session execution, transcript, credentials, compaction, and
+memory of members placed there. Realms are not distributed.
+
+Placement is transparent to member identity and ordinary work APIs. Operators
+use `mob/hosts`, `mob/route_installs`, and `mob/member_history` to distinguish
+host reachability, route convergence, and remote session history when they need
+the underlying evidence.
+
+A placed member's raw session id belongs to the member host's realm. The
+controller's generic `session/*` APIs cannot read or mutate it. Use
+identity-routed mob operations and `mob/member_history`; remote transcript
+revision and edit APIs are not bridged in v1.
 
 ## Runtime Modes
 

@@ -39,7 +39,7 @@ repo-local binaries built by `./scripts/repo-cargo`.
 ## Run
 
 ```bash
-./setup.sh
+./examples/010-mcp-tool-server-sh/setup.sh
 ```
 
 ## What The Script Actually Does

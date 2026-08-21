@@ -10,6 +10,12 @@ WorkGraph is an optional realm-scoped subsystem. Agents mutate general work
 items through tools. Public RPC and REST expose observability/operator lookup.
 CLI and trusted in-process hosts add narrow goal and attention controls.
 
+Every enabled agent/service instance is constructed with one exact
+`WorkGraphNamespaceGrant { realm_id, namespace }`. The grant is immutable and
+authorizes one namespace only. Cross-realm, cross-namespace, and
+`all_namespaces` requests are rejected; callers cannot widen authority by
+supplying filter fields.
+
 ## WorkItem
 
 | Field | Type | Description |
@@ -22,6 +28,8 @@ CLI and trusted in-process hosts add narrow goal and attention controls.
 | `status` | `WorkStatus` | Lifecycle status |
 | `priority` | `low | medium | high` | Priority |
 | `completion_policy` | `WorkCompletionPolicy` | Closure policy for goal-like work |
+| `failed_child_join_policy` | `require_success | propagate | accept` | Policy for failed direct children |
+| `cancelled_child_join_policy` | `require_success | propagate | accept` | Policy for cancelled direct children |
 | `labels` | `string[]` | Filtering and grouping labels |
 | `owner` | `WorkOwner?` | Intended owner or assignee |
 | `claim` | `WorkClaim?` | Active claim owner and optional lease |
@@ -51,13 +59,18 @@ Terminal items cannot be claimed.
 
 ## Completion Policies
 
-| Policy | Meaning |
-|--------|---------|
-| `self_attest` | The assigned attention target can request closure directly |
-| `host_confirmed` | Host confirmation evidence is required before closure |
-| `principal_confirmed` | A named principal must confirm before closure |
-| `supervisor` | A supervisor owner key must authorize closure |
-| `reviewer_quorum` | The required reviewer threshold must be satisfied |
+| JSON shape | Meaning |
+|------------|---------|
+| `{"kind":"self_attest"}` | The assigned attention target can request closure directly |
+| `{"kind":"host_confirmed"}` | Typed host confirmation evidence is required |
+| `{"kind":"principal_confirmed"}` | Typed principal confirmation evidence is required |
+| `{"kind":"supervisor","owner_key":{...}}` | The exact supervisor owner key must confirm |
+| `{"kind":"reviewer_quorum","threshold":N}` | `N` distinct reviewer owners must confirm; `N` is 1-64 |
+
+General public goal creation exposes `self_attest`. Stronger policies and their
+typed confirmation evidence require trusted host authority. An attention-bound
+agent may only tighten a policy monotonically through the injected
+`workgraph_policy_escalate` operation.
 
 ## Edge Kinds
 
@@ -71,6 +84,17 @@ Terminal items cannot be claimed.
 
 WorkGraph rejects invalid endpoints, self edges, duplicate edges, and cycles for
 `blocks` and `parent`.
+
+For `blocks`, the source satisfies the edge only in `completed`; failed or
+cancelled blockers remain unsatisfied. A `parent` edge points from direct child
+to parent. Active children keep the parent join unsatisfied. For failed and
+cancelled children, each parent policy means:
+
+| Policy | Join result |
+|--------|-------------|
+| `require_success` | Keep waiting; default |
+| `propagate` | Terminalize the parent as failed/cancelled on reconciliation |
+| `accept` | Treat that terminal child as joined |
 
 ## Owners And Claims
 
@@ -86,6 +110,13 @@ Claims are revision-based. Mutating tools require the current `expected_revision
 Optional leases allow abandoned work to become recoverable through machine-
 approved transitions.
 
+Omit both `lease_seconds` and `lease_expires_at` for no expiry. Otherwise use
+exactly one. Relative leases are 1-31,536,000 seconds; absolute leases must be
+strictly later than the store observation time. Wall-clock expiry does not
+mutate a claim. A trusted observer, normally a Schedule-owned sweep, asks
+WorkGraph to validate the row and atomically commit release plus the
+`lease_expired` fact.
+
 ## Evidence Refs
 
 `WorkEvidenceRef` contains:
@@ -96,8 +127,46 @@ approved transitions.
 | `id` | `string` | External or Meerkat-owned artifact id |
 | `label` | `string?` | Human label |
 | `summary` | `string?` | Short explanation |
+| `confirmation_kind` | `self_attest | host_confirmation | principal_confirmation | supervisor_confirmation | reviewer_confirmation`? | Typed completion-policy evidence classification |
+| `confirming_owner_key` | `WorkOwnerKey?` | Distinct confirming owner for supervisor/reviewer policy |
+| `execution_binding_id` | `WorkExecutionBindingId?` | Typed provenance reserved to the execution bridge |
 
 Evidence refs are pointers. WorkGraph does not own the artifact content.
+Reserved confirmation classifications cannot be minted by generic
+`workgraph_add_evidence` calls.
+
+## Events And Durable Facts
+
+`WorkGraphEventKind` is one of `created`, `updated`, `readiness_observed`,
+`claimed`, `released`, `blocked`, `closed`, `linked`, `evidence_added`,
+`attention_created`, `attention_updated`, `execution_bound`, or
+`execution_transitioned`.
+
+An event may carry typed facts committed with the same mutation:
+
+| Fact | Meaning |
+|------|---------|
+| `item_ready` | This item revision was first observed ready |
+| `lease_expired` | This exact owner/lease was observed expired and released |
+| `namespace_terminal` | The namespace was observed to have no nonterminal work |
+
+These are ledger facts, not wake instructions. WorkGraph owns no timer.
+
+Snapshots are single-namespace atomic observations containing captured store
+time, event high-water mark, bounded items, included edges/attention bindings,
+and machine-derived `ready_item_ids`.
+
+## Goal Attention Bindings
+
+An attention binding targets a session or a lowered owner. Its mode is one of
+`pursue`, `coordinate`, `review`, `falsify`, `judge`, or `observe`. Its status
+is `active`, `paused`, `superseded`, or `stopped`; only the last two are
+terminal.
+
+Delegated authority is one of `add_evidence`, `close_own_review_item`,
+`request_closure`, or `close_if_policy_allows`. The active projection also
+carries bounded item/parent context and its exact binding and item revisions.
+Reassignment and policy escalation require that current projection.
 
 ## Flow Execution Bindings
 
@@ -185,6 +254,11 @@ launched under an older binding digest.
 | `workgraph_close` | Close as `completed`, `cancelled`, or `failed` |
 | `workgraph_link` | Add a graph edge |
 | `workgraph_add_evidence` | Add an evidence reference |
+| `workgraph_attention_reassign` | Reassign the active attention binding under its exact authority projection |
+| `workgraph_policy_escalate` | Monotonically tighten completion policy under active attention authority |
+
+The last two tools are injected only when a turn carries a matching active
+attention projection. Their arguments cannot manufacture delegated authority.
 
 ## RPC
 
@@ -219,6 +293,11 @@ The `GET` routes use query parameters such as `realm_id`, `namespace`,
 `after_seq` for events. The `POST /workgraph/goal/status` and
 `POST /workgraph/attention/list` routes accept JSON request bodies.
 
+`all_namespaces` remains present in generic filter wire shapes and CLI syntax,
+but the standard public services hold one namespace grant and reject it. A
+future/bespoke host needs a separate explicit multi-namespace capability; a
+namespace grant never implies one.
+
 ## CLI
 
 ```bash
@@ -237,6 +316,8 @@ rkat workgraph attention-resume <BINDING_ID> --expected-revision <N> [--namespac
 ```
 
 CLI commands use the same realm flags as other `rkat` commands.
+On standard surfaces, select the granted namespace (normally `default`) and do
+not pass `--all-namespaces`.
 
 ## Companion Skill
 

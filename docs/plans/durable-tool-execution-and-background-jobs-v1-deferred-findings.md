@@ -4,11 +4,17 @@ description: "Deferred findings discovered while delivering the durable tool exe
 icon: "list-check"
 ---
 
-# Durable Tool Execution v1 — Deferred Findings
+# Durable Tool Execution v1 - Deferred Findings
 
-This ledger records review findings that are adjacent to, but outside, the
-active delivery slice. Entries must identify the owning future slice and must
-not be absorbed into current work without re-triage.
+<Note>
+  This is a maintainer implementation ledger, not the current user contract.
+  See [Durable jobs](/guides/durable-jobs) for shipped behavior and
+  [Storage operations](/guides/storage-operations) for operator guidance.
+</Note>
+
+This post-implementation ledger records findings adjacent to the shipped v0.8.8
+durable-jobs arc. Open entries were re-audited against `8138813cb` on
+2026-08-20. They are follow-ups, not missing job-lifecycle authority.
 
 ## Open
 
@@ -41,6 +47,11 @@ not be absorbed into current work without re-triage.
   Preserving the original timestamp requires a versioned ops-snapshot format
   change and store-conformance migration, so it is deferred from Phase 6 rather
   than widening the composition slice.
+
+The machine-poster gap and operation-timestamp limitation remain present at
+the audited revision. The SDK/live-provider and broad parallel-test entries
+remain release-lane ownership questions; deterministic job protocol and SDK
+wrapper tests do not depend on them.
 
 ## Resolved in scope
 
